@@ -2547,6 +2547,158 @@ lftj_denial_tests(void)
     assert(lftj_denial_run(16, hi, true) == ENOSPC);
 }
 
+/* #2072: the nonrecursive TDD slice copy and the recursive TDD worker's
+ * dedup append their rows under one batch lease. */
+static col_rel_t *
+slice_source(uint32_t rows)
+{
+    col_rel_t *src = batch_relation("slice_src");
+    int64_t row[2];
+    for (uint32_t i = 0; i < rows; i++) {
+        batch_row_values(i, row);
+        assert(col_rel_append_row(src, row) == 0);
+        src->timestamps[i].iteration = i;
+        src->timestamps[i].stratum = i % 5u;
+        src->timestamps[i].worker = (uint16_t)(i % 3u);
+        src->timestamps[i].multiplicity = (int64_t)(i % 7u) - 3;
+    }
+    return src;
+}
+
+static void
+slice_copy_tests(void)
+{
+    enum { ROWS = 4096, BEGIN = 100, END = 4000 };
+    for (int governed = 0; governed < 2; governed++) {
+        wl_col_session_t *coord = join_session();
+        wl_columnar_memory_governor_ref_t *ref = governed
+            ? enforcing_governor(1u << 26) : NULL;
+        col_rel_t *src = slice_source(ROWS);
+        col_rel_t *slice = NULL;
+        uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+        assert(wl_columnar_eval_test_copy_relation_slice(coord, src,
+            "slice", BEGIN, END, ref, &slice) == 0);
+        uint64_t acquisitions
+            = wl_columnar_relation_test_mutation_nonce_peek() - before;
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        assert(slice && slice->nrows == END - BEGIN && slice->timestamps);
+        for (uint32_t c = 0; c < 2; c++)
+            assert(memcmp(slice->columns[c], src->columns[c] + BEGIN,
+                (END - BEGIN) * sizeof(int64_t)) == 0);
+        assert(memcmp(slice->timestamps, src->timestamps + BEGIN,
+            (END - BEGIN) * sizeof(*src->timestamps)) == 0);
+        assert(col_rel_destroy_checked(slice) == 0);
+        assert(col_rel_destroy_checked(src) == 0);
+        join_session_destroy(coord);
+        if (ref) {
+            assert(governor_reserved(ref) == 0);
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
+/* A slice of @rows rows from a 512-row source under @budget.  A refused
+ * growth leaves no slice and no reservation behind.  It currently surfaces
+ * as ENOMEM, without the session's denial flag, where other operators
+ * report ENOSPC (#2148); this pins that until the mapping changes. */
+static int
+slice_denial_run(uint32_t rows, uint64_t budget, bool check_cleanup)
+{
+    wl_col_session_t *coord = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    col_rel_t *src = slice_source(512);
+    uint64_t baseline = governor_reserved(ref);
+    col_rel_t *slice = NULL;
+    int rc = wl_columnar_eval_test_copy_relation_slice(coord, src, "slice",
+            0, rows, ref, &slice);
+    if (rc == 0) {
+        assert(slice->nrows == rows);
+        assert(col_rel_destroy_checked(slice) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOMEM && slice == NULL
+            && !coord->memory_budget_denied);
+        assert(governor_reserved(ref) == baseline);
+    }
+    assert(col_rel_destroy_checked(src) == 0);
+    join_session_destroy(coord);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+slice_denial_tests(void)
+{
+    /* Smallest budget at which a 128-row slice (one growth past the 64-row
+     * floor) succeeds; 256 rows need a second growth. */
+    uint64_t lo = 0, hi = 1u << 24;
+    assert(slice_denial_run(128, hi, false) == 0);
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (slice_denial_run(128, mid, false) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    assert(slice_denial_run(256, hi, true) == ENOMEM);
+}
+
+/* The image holds 1024 rows in its dedup set, then 4096 appended rows of
+ * which the even ones repeat an existing row.  The dedup keeps the 2048
+ * new rows in order, compacts them into the image after the existing rows
+ * and appends them to a delta sized as the worker sizes it. */
+static void
+dedup_append_tests(void)
+{
+    enum { EXISTING = 1024, APPENDED = 4096, NEW = APPENDED / 2 };
+    for (int governed = 0; governed < 2; governed++) {
+        wl_columnar_memory_governor_ref_t *ref = governed
+            ? enforcing_governor(1u << 26) : NULL;
+        col_rel_t *image = NULL;
+        if (ref)
+            assert(wl_columnar_relation_new_auto_governed("dedup_image", 2,
+                COL_REL_INIT_CAP, false, ref, &image) == 0);
+        else
+            image = col_rel_new_auto("dedup_image", 2);
+        assert(image);
+        for (uint32_t i = 0; i < EXISTING; i++) {
+            int64_t row[2] = { (int64_t)i, -(int64_t)i };
+            assert(col_rel_append_row(image, row) == 0);
+        }
+        assert(wl_columnar_eval_dedup_set_init_from_rel(image) == 0);
+        for (uint32_t i = 0; i < APPENDED; i++) {
+            uint32_t j = i / 2u;
+            int64_t row[2] = {
+                i % 2u ? 10000 + (int64_t)j : (int64_t)(j % EXISTING),
+                i % 2u ? (int64_t)j : -(int64_t)(j % EXISTING)
+            };
+            assert(col_rel_append_row(image, row) == 0);
+        }
+        col_rel_t *delta = NULL;
+        uint32_t keep = 0;
+        uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+        assert(wl_columnar_eval_test_dedup_append(image, EXISTING, ref,
+            &delta, &keep) == 0);
+        uint64_t acquisitions
+            = wl_columnar_relation_test_mutation_nonce_peek() - before;
+        /* Preparing the delta takes its own mutation sets; the rows add at
+         * most a few more. */
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        assert(keep == EXISTING + NEW && delta && delta->nrows == NEW);
+        for (uint32_t j = 0; j < NEW; j++) {
+            assert(image->columns[0][EXISTING + j] == 10000 + (int64_t)j
+                && image->columns[1][EXISTING + j] == (int64_t)j);
+            assert(delta->columns[0][j] == 10000 + (int64_t)j
+                && delta->columns[1][j] == (int64_t)j);
+        }
+        assert(col_rel_destroy_checked(delta) == 0);
+        assert(col_rel_destroy_checked(image) == 0);
+        if (ref) {
+            assert(governor_reserved(ref) == 0);
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
 int
 main(void)
 {
@@ -2584,6 +2736,9 @@ main(void)
     reduce_denial_tests();
     lftj_batch_tests();
     lftj_denial_tests();
+    slice_copy_tests();
+    slice_denial_tests();
+    dedup_append_tests();
     {
         col_rel_t root;
         fixture_t f = {0};

@@ -813,12 +813,21 @@ nonrec_copy_relation_slice(wl_col_session_t *coord, const col_rel_t *src,
         rc = ENOMEM;
         goto done;
     }
-    for (uint32_t r = begin; r < end && rc == 0; r++) {
-        for (uint32_t c = 0; c < src->ncols; c++)
-            row[c] = src->columns[c][r];
-        rc = col_rel_append_row(dst, row);
-        if (rc == 0 && src->timestamps)
-            dst->timestamps[dst->nrows - 1] = src->timestamps[r];
+    {
+        /* The slice appends to the fresh dst under one batch lease per
+         * storage epoch (#2072); src is read under its own reader. */
+        col_rel_append_batch_t batch = { 0 };
+        rc = col_rel_append_batch_begin(&batch, dst);
+        for (uint32_t r = begin; r < end && rc == 0; r++) {
+            for (uint32_t c = 0; c < src->ncols; c++)
+                row[c] = src->columns[c][r];
+            rc = col_rel_append_batch_row(&batch, row);
+            if (rc == 0 && src->timestamps)
+                dst->timestamps[dst->nrows - 1] = src->timestamps[r];
+        }
+        int end_rc = col_rel_append_batch_end(&batch, rc == 0);
+        if (rc == 0)
+            rc = end_rc;
     }
 done:
     free(row);
@@ -2016,6 +2025,79 @@ wl_columnar_eval_prepare_worker_delta(col_rel_t **out, const char *name,
     return 0;
 }
 
+/* Appends the rows of @image from @start on that are new to its dedup set
+ * to @delta, moves them down in @image to sit from @start on, and reports
+ * how many rows @image keeps.  Hash-set dedup mutates only the
+ * private image. Its eager row_scratch handles wide relations without
+ * another allocation.  @image and @delta are distinct relations; the rows
+ * go to @delta under one held lease (#2072), ended before returning. */
+static int
+tdd_worker_dedup_append(col_rel_t *image, col_rel_t *delta, uint32_t start,
+    uint32_t *keep_out)
+{
+    int64_t row_buf[8];
+    int64_t *rbuf = image->ncols <= 8 ? row_buf : image->row_scratch;
+    uint32_t keep = start;
+    col_rel_append_batch_t batch = { 0 };
+    int rc = col_rel_append_batch_begin(&batch, delta);
+    for (uint32_t i = start; i < image->nrows && rc == 0; i++) {
+        uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(image, i);
+        bool inserted = false;
+        rc = wl_columnar_eval_dedup_set_insert_checked(image, h, &inserted);
+        if (rc != 0)
+            break;
+        if (inserted) {
+            if (keep != i)
+                col_rel_row_move_raw(image, keep, i);
+            for (uint32_t c = 0; c < image->ncols; c++)
+                rbuf[c] = image->columns[c][keep];
+            rc = col_rel_append_batch_row(&batch, rbuf);
+            if (rc != 0)
+                break;
+            keep++;
+        }
+    }
+    int end_rc = col_rel_append_batch_end(&batch, rc == 0);
+    if (rc == 0)
+        rc = end_rc;
+    *keep_out = keep;
+    return rc;
+}
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int
+wl_columnar_eval_test_copy_relation_slice(wl_col_session_t *coord,
+    const col_rel_t *src, const char *name, uint32_t begin, uint32_t end,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    return nonrec_copy_relation_slice(coord, src, name, begin, end,
+               governor, out);
+}
+
+/* Runs the worker dedup over @image from @start into a delta prepared as
+ * the worker prepares it. */
+int
+wl_columnar_eval_test_dedup_append(col_rel_t *image, uint32_t start,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **delta_out,
+    uint32_t *keep)
+{
+    if (!image || !delta_out || !keep || start > image->nrows)
+        return EINVAL;
+    col_rel_t *delta = NULL;
+    int rc = wl_columnar_eval_prepare_worker_delta(&delta, "$delta", image,
+            image->nrows - start, governor);
+    if (rc != 0)
+        return rc;
+    rc = tdd_worker_dedup_append(image, delta, start, keep);
+    if (rc != 0) {
+        col_rel_destroy(delta);
+        return rc;
+    }
+    *delta_out = delta;
+    return 0;
+}
+#endif
+
 #ifdef WL_SESSION_TEST_HOOKS
 int
 wl_columnar_eval_test_prepare_worker_delta(col_rel_t **out,
@@ -2447,30 +2529,8 @@ tdd_worker_subpass_fn(void *arg)
                     image, delta);
 #endif
         if (rc2 == 0 && image->dedup_slots) {
-            /* Hash-set dedup mutates only the private image. Its eager
-             * row_scratch handles wide relations without another allocation. */
-            int64_t row_buf[8];
-            int64_t *rbuf = image->ncols <= 8 ? row_buf
-                : image->row_scratch;
             uint32_t keep = snap[ri];
-            for (uint32_t i = snap[ri]; i < image->nrows; i++) {
-                uint64_t h = WL_COLUMNAR_EVAL_DEDUP_ROW_HASH(image, i);
-                bool inserted = false;
-                rc2 = wl_columnar_eval_dedup_set_insert_checked(image, h,
-                        &inserted);
-                if (rc2 != 0)
-                    break;
-                if (inserted) {
-                    if (keep != i)
-                        col_rel_row_move_raw(image, keep, i);
-                    for (uint32_t c = 0; c < image->ncols; c++)
-                        rbuf[c] = image->columns[c][keep];
-                    rc2 = col_rel_append_row(delta, rbuf);
-                    if (rc2 != 0)
-                        break;
-                    keep++;
-                }
-            }
+            rc2 = tdd_worker_dedup_append(image, delta, snap[ri], &keep);
             if (rc2 == 0) {
                 image->nrows = keep;
                 image->sorted_nrows = keep;
