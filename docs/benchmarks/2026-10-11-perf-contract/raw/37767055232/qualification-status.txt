@@ -1,0 +1,4 @@
+acquisition_status=complete
+performance_verdict=fail
+crdt_perf_gate=pass
+cspa_w1_gate=target_miss
