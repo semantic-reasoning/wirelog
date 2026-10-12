@@ -6215,6 +6215,387 @@ wl_columnar_relation_writer_acquire_controlled(
     return rc;
 }
 
+/* Fixed source-work regions for one inline role (never a variable role scan):
+ * I=75: 54 inert meaningful-member predicates (18 set, 2 role, 5 descriptor,
+ *       10 owners, 15 lease, 4 journal), plus 21 inline initialization stores.
+ * L=1 initial nonce observation; N=1 per strong nonce CAS round.
+ * J=1 owner-presence branch; lazy J+=18 bounds identity/generation/borrow
+ *       predicates, four journal fields, journal count and four owner writes.
+ * R=12 bounds every raw one-hop resolver predicate, generation helper, owner
+ *       observation and output assignment. No chain walk occurs.
+ * B=32 bounds six binding predicates, two generation helpers, two owner slots,
+ *       fixed address ordering, owner count and all 15 lease member stores.
+ * Q=4 bounds self-owner predicate, borrow observation/test and lease identity.
+ * V=128: up to 64 binding/membership predicates (one lease), resolver12,
+ *       three writer validators at16 each, and four dispatch/result slots.
+ * These are fixed logical source-region budgets, not instruction counts.
+ * Wd and each Wo use the existing one-work writer admission. Tail polls cost0.
+ * Mandatory finalization/journal restoration is noncancellable and unmetered.
+ */
+static bool
+wl_columnar_relation_single_inert(
+    const wl_columnar_relation_mutation_single_t *single)
+{
+    const wl_columnar_relation_mutation_set_t *set = &single->set;
+    return !(set->identity || set->acquisition_nonce || set->roles
+           || set->descriptors || set->owners || set->leases ||
+           set->initializations
+           || set->descriptor_count || set->owner_count || set->lease_count
+           || set->initialization_count || set->descriptors_acquired
+           || set->owners_acquired || set->terminal_sequence
+           || set->terminal_expected_events || set->terminal_observed_events
+           || set->terminal_sequence_consumed || set->published
+           || single->role.relation || single->role.role_flags
+           || single->descriptor.relation
+           || !col_rel_mutation_writer_inert(&single->descriptor.writer)
+           || single->owners[0].owner || single->owners[1].owner
+           || !col_rel_mutation_writer_inert(&single->owners[0].writer)
+           || !col_rel_mutation_writer_inert(&single->owners[1].writer)
+           || single->lease.identity || single->lease.acquisition_nonce
+           || single->lease.set || single->lease.relation || single->lease.owner
+           || single->lease.descriptor_slot || single->lease.owner_slot
+           || single->lease.self_owner_slot || single->lease.relation_identity
+           || single->lease.relation_generation || single->lease.owner_identity
+           || single->lease.owner_generation || single->lease.role_flags
+           || single->lease.detached || single->lease.storage_transitioned
+           || single->initialization.relation ||
+           single->initialization.owner_identity
+           || single->initialization.owner_generation ||
+           single->initialization.borrows);
+}
+
+static int
+wl_columnar_relation_cleanup_result(int result, int cleanup)
+{
+    return cleanup > 0 && result <= 0 ? cleanup : result;
+}
+
+static int
+wl_columnar_relation_resolve_controlled(const col_rel_t *relation,
+    col_rel_t **owner, wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 12);
+    if (rc)
+        return rc;
+    rc = col_rel_storage_owner_resolve(relation, owner);
+    int tail = wl_columnar_relation_work_tail(control, 12);
+    return tail > 0 ? tail : rc ? rc : tail;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_before_nonce_cas)(
+    wl_evaluation_control_t *, uint64_t);
+int (*wl_columnar_relation_test_single_release)(
+    wl_columnar_relation_mutation_single_t *, unsigned);
+
+/* Quiescent test process only: save/restore the nonce exhaustion boundary. */
+uint64_t
+wl_columnar_relation_test_single_nonce_replace(uint64_t next)
+{
+    uint64_t previous = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_relaxed);
+    atomic_store_explicit(&wl_next_mutation_set_nonce, next,
+        memory_order_relaxed);
+    return previous;
+}
+#endif
+
+static int
+wl_columnar_relation_nonce_controlled(uint64_t *nonce,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        return rc;
+    uint64_t observed = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_relaxed);
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc)
+        return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc)
+            return rc;
+        if (!observed || observed == UINT64_MAX) {
+            rc = wl_columnar_relation_work_tail(control, 1);
+            return rc > 0 ? rc : EOVERFLOW;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_nonce_cas)
+            wl_columnar_relation_test_before_nonce_cas(control, observed);
+#endif
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#endif
+        if (acquired)
+            *nonce = observed;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc || acquired)
+            return rc;
+    }
+}
+
+/* Check only still-held prefixes, including incomplete acquisition. Nothing
+ * is released until the entire remaining authority validates on this thread. */
+static int
+wl_columnar_relation_single_cleanup_validate(
+    const wl_columnar_relation_mutation_single_t *single)
+{
+    const wl_columnar_relation_mutation_set_t *set = &single->set;
+    if (set->identity != (uintptr_t)set || !set->acquisition_nonce
+        || set->roles != &single->role ||
+        set->descriptors != &single->descriptor
+        || set->owners != single->owners || set->leases != &single->lease
+        || set->initializations != &single->initialization
+        || set->descriptor_count != 1 || set->lease_count != 1
+        || set->owner_count > 2 || set->owners_acquired > set->owner_count
+        || set->descriptors_acquired > 1 || set->initialization_count > 1
+        || set->terminal_sequence || set->terminal_expected_events
+        || set->terminal_observed_events || set->terminal_sequence_consumed
+        || !single->role.relation
+        || single->role.role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || single->descriptor.relation != single->role.relation)
+        return EINVAL;
+    if (set->descriptors_acquired) {
+        if (wl_columnar_source_access_writer_validate(
+                &single->descriptor.writer,
+                &single->descriptor.relation->descriptor_access))
+            return EINVAL;
+    } else if (!col_rel_mutation_writer_inert(&single->descriptor.writer)
+        || set->owners_acquired || set->initialization_count)
+        return EINVAL;
+    for (size_t i = 0; i < 2; ++i) {
+        if (i < set->owners_acquired) {
+            if (!single->owners[i].owner
+                || wl_columnar_source_access_writer_validate(
+                    &single->owners[i].writer,
+                    &single->owners[i].owner->source_access))
+                return EINVAL;
+        } else if (!col_rel_mutation_writer_inert(&single->owners[i].writer))
+            return EINVAL;
+    }
+    if (set->initialization_count
+        && single->initialization.relation != single->descriptor.relation)
+        return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_relation_single_release(
+    wl_columnar_relation_mutation_single_t *single, unsigned slot,
+    wl_columnar_source_access_writer_t *writer)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_single_release) {
+        int rc = wl_columnar_relation_test_single_release(single, slot);
+        if (rc)
+            return rc > 0 ? rc : EINVAL;
+    }
+#else
+    (void)single;
+    (void)slot;
+#endif
+    return wl_columnar_source_access_writer_release(writer);
+}
+
+int
+wl_columnar_relation_mutation_single_finish_controlled(
+    wl_columnar_relation_mutation_single_t *single, int result,
+    wl_evaluation_control_t *control)
+{
+    (void)control; /* Authority retirement cannot be cancelled. */
+    if (!single)
+        return wl_columnar_relation_cleanup_result(result, EINVAL);
+    int rc = wl_columnar_relation_single_cleanup_validate(single);
+    if (rc)
+        return wl_columnar_relation_cleanup_result(result, rc);
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    if (set->published && result < 0)
+        result = 0;
+    if (!result)
+        set->published = true;
+    while (set->owners_acquired) {
+        size_t index = set->owners_acquired - 1;
+        rc = wl_columnar_relation_single_release(single, (unsigned)index + 1,
+                &single->owners[index].writer);
+        if (rc)
+            return wl_columnar_relation_cleanup_result(result, rc);
+        --set->owners_acquired;
+    }
+    if (set->initialization_count) {
+        if (!set->published) {
+            col_rel_t *r = single->initialization.relation;
+            r->storage_owner = NULL;
+            r->storage_owner_identity = single->initialization.owner_identity;
+            r->storage_owner_generation =
+                single->initialization.owner_generation;
+            atomic_store_explicit(&r->storage_alias_borrows,
+                single->initialization.borrows, memory_order_relaxed);
+        }
+        set->initialization_count = 0;
+    }
+    if (set->descriptors_acquired) {
+        rc = wl_columnar_relation_single_release(single, 0,
+                &single->descriptor.writer);
+        if (rc)
+            return wl_columnar_relation_cleanup_result(result, rc);
+        set->descriptors_acquired = 0;
+    }
+    *single = (wl_columnar_relation_mutation_single_t){0};
+    return result;
+}
+
+int
+wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *relation,
+    wl_columnar_relation_mutation_single_t *single,
+    wl_evaluation_control_t *control)
+{
+    if (!relation || !single)
+        return EINVAL;
+    int rc = control ? wl_evaluation_control_charge(control, 75) : 0;
+    if (rc)
+        return rc;
+    if (!wl_columnar_relation_single_inert(single))
+        return EINVAL;
+    if (!control)
+        return col_rel_mutation_single_acquire(relation, single);
+    rc = wl_columnar_relation_work_tail(control, 75);
+    if (rc)
+        return rc;
+    uint64_t nonce;
+    rc = wl_columnar_relation_nonce_controlled(&nonce, control);
+    if (rc)
+        return rc;
+    single->role.relation = relation;
+    single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    *set = (wl_columnar_relation_mutation_set_t){
+        .identity = (uintptr_t)set, .acquisition_nonce = nonce,
+        .roles = &single->role, .descriptors = &single->descriptor,
+        .owners = single->owners, .leases = &single->lease,
+        .initializations = &single->initialization,
+        .descriptor_count = 1, .lease_count = 1
+    };
+    single->descriptor.relation = relation;
+    rc = wl_columnar_relation_writer_acquire_controlled(
+        &relation->descriptor_access, &single->descriptor.writer, control);
+    set->descriptors_acquired = single->descriptor.writer.owner ? 1u : 0u;
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc)
+        goto fail;
+    bool initialize = relation->storage_owner == NULL;
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc)
+        goto fail;
+    if (initialize) {
+        rc = wl_evaluation_control_charge(control, 18);
+        if (rc)
+            goto fail;
+        if (!relation->relation_identity ||
+            col_rel_storage_alias_borrow_count(relation)
+            || !wl_columnar_relation_generation_valid(
+                relation->storage_generation)) {
+            rc = EINVAL;
+            goto fail;
+        }
+        single->initialization =
+            (wl_columnar_relation_mutation_initialization_t){
+            .relation = relation,
+            .owner_identity = relation->storage_owner_identity,
+            .owner_generation = relation->storage_owner_generation,
+            .borrows = col_rel_storage_alias_borrow_count(relation)
+        };
+        set->initialization_count = 1;
+        relation->storage_owner = relation;
+        relation->storage_owner_identity = relation->relation_identity;
+        relation->storage_owner_generation = relation->storage_generation;
+        atomic_store_explicit(&relation->storage_alias_borrows, 0,
+            memory_order_relaxed);
+        rc = wl_columnar_relation_work_tail(control, 18);
+        if (rc)
+            goto fail;
+    }
+    col_rel_t *owner = NULL;
+    rc = wl_columnar_relation_resolve_controlled(relation, &owner, control);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control, 32);
+    if (rc)
+        goto fail;
+    if (!relation->relation_identity || !owner->relation_identity
+        || !wl_columnar_relation_generation_valid(relation->storage_generation)
+        || !wl_columnar_relation_generation_valid(owner->storage_generation)
+        || relation->storage_owner_identity != owner->relation_identity
+        || relation->storage_owner_generation != owner->storage_generation) {
+        rc = EINVAL;
+        goto fail;
+    }
+    single->owners[0].owner = owner;
+    set->owner_count = 1;
+    if (relation != owner) {
+        single->owners[1].owner = relation;
+        set->owner_count = 2;
+        if ((uintptr_t)&owner->source_access >
+            (uintptr_t)&relation->source_access) {
+            single->owners[0].owner = relation;
+            single->owners[1].owner = owner;
+        }
+    }
+    single->lease = (wl_columnar_relation_mutation_lease_t){
+        .set = set, .acquisition_nonce = nonce, .relation = relation,
+        .owner = owner,
+        .role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION,
+        .relation_identity = relation->relation_identity,
+        .relation_generation = relation->storage_generation,
+        .owner_identity = owner->relation_identity,
+        .owner_generation = owner->storage_generation,
+        .owner_slot = single->owners[0].owner == owner ? 0u : 1u,
+        .self_owner_slot = single->owners[0].owner == relation ? 0u : 1u
+    };
+    rc = wl_columnar_relation_work_tail(control, 32);
+    if (rc)
+        goto fail;
+    for (size_t i = 0; i < set->owner_count; ++i) {
+        rc = wl_columnar_relation_writer_acquire_controlled(
+            &single->owners[i].owner->source_access, &single->owners[i].writer,
+            control);
+        if (single->owners[i].writer.owner)
+            ++set->owners_acquired;
+        if (rc)
+            goto fail;
+    }
+    rc = wl_evaluation_control_charge(control, 4);
+    if (rc)
+        goto fail;
+    if (owner == relation && col_rel_storage_alias_borrow_count(owner)) {
+        rc = EBUSY;
+        goto fail;
+    }
+    single->lease.identity = (uintptr_t)&single->lease;
+    rc = wl_columnar_relation_work_tail(control, 4);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control, 128);
+    if (rc)
+        goto fail;
+    rc = col_rel_mutation_lease_validate(&single->lease, relation);
+    int tail = wl_columnar_relation_work_tail(control, 128);
+    rc = tail > 0 ? tail : rc ? rc : tail;
+    if (!rc)
+        return 0;
+fail:
+    return wl_columnar_relation_mutation_single_finish_controlled(single, rc,
+               control);
+}
+
 static int
 wl_columnar_relation_copy_cells_controlled(int64_t *to,
     const int64_t *from, uint32_t count, bool normalize,

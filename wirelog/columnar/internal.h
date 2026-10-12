@@ -661,6 +661,30 @@ typedef struct {
     wl_columnar_relation_mutation_initialization_t initialization;
 } wl_columnar_relation_mutation_single_t;
 
+/* Fixed one-role admission, fully inert original-frame storage only.
+ * Controlled failure cleanup and the dedicated finish are noncancellable:
+ * failed release retains remaining authority for retry in the original frame
+ * with the original execution result. Finish follows the caller's publication
+ * cutoff; terminal sequences are unsupported.
+ * NULL control delegates to raw admission after the inert preflight. Successful
+ * raw acquisition is compatible with dedicated finish. Raw admission failure
+ * keeps existing generic-unwind semantics, not the new retained-authority
+ * guarantee, and may leave role fields after resetting the set. Do not finish
+ * an already reset raw set or reuse its non-inert frame. Reinitialize role
+ * residue only after independently verifying all authority has retired. */
+int wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *,
+    wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_mutation_single_finish_controlled(
+    wl_columnar_relation_mutation_single_t *, int, wl_evaluation_control_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_before_nonce_cas)(
+    wl_evaluation_control_t *, uint64_t);
+/* slot0=descriptor, slot1/2=owner0/1; fail before touching live authority. */
+extern int (*wl_columnar_relation_test_single_release)(
+    wl_columnar_relation_mutation_single_t *, unsigned);
+uint64_t wl_columnar_relation_test_single_nonce_replace(uint64_t);
+#endif
+
 int col_rel_mutation_set_acquire(wl_columnar_relation_mutation_set_t *set,
     const wl_columnar_relation_mutation_role_t *roles, size_t role_count,
     wl_columnar_relation_mutation_descriptor_t *descriptors,
