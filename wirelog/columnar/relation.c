@@ -5006,6 +5006,23 @@ col_rel_append_batch_lease_check(col_rel_append_batch_t *batch)
     return rc;
 }
 
+/* Finishes the batch's lease and acquires the next one.  A finish that
+ * fails released nothing, so the batch stays active with the old lease; an
+ * acquire that fails leaves it inactive. */
+static int
+col_rel_append_batch_renew(col_rel_append_batch_t *batch)
+{
+    int rc = col_rel_mutation_set_finish(&batch->single.set, true);
+    if (rc)
+        return rc;
+    memset(&batch->single, 0, sizeof(batch->single));
+    batch->verified_generation = 0;
+    rc = col_rel_mutation_single_acquire(batch->relation, &batch->single);
+    if (rc)
+        batch->active = false;
+    return rc;
+}
+
 int
 col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
 {
@@ -5013,21 +5030,12 @@ col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
         return EINVAL;
     col_rel_t *r = batch->relation;
     /* A lease publishes at most one storage transition.  Once it has, a row
-     * that would replace storage again starts the next epoch's lease.  A
-     * finish that fails released nothing, so the batch stays active with
-     * the old lease. */
+     * that would replace storage again starts the next epoch's lease. */
     if (batch->single.lease.storage_transitioned
         && col_rel_append_replaces_storage(r)) {
-        int rc = col_rel_mutation_set_finish(&batch->single.set, true);
+        int rc = col_rel_append_batch_renew(batch);
         if (rc)
             return rc;
-        memset(&batch->single, 0, sizeof(batch->single));
-        batch->verified_generation = 0;
-        rc = col_rel_mutation_single_acquire(r, &batch->single);
-        if (rc) {
-            batch->active = false;
-            return rc;
-        }
     }
     int rc = col_rel_append_batch_lease_check(batch);
     if (rc)
@@ -5037,6 +5045,47 @@ col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
     return col_rel_append_row_impl(r, row,
                &batch->single.owners[batch->single.lease.owner_slot].writer,
                true, &batch->single.lease, true);
+}
+
+int
+col_rel_append_batch_set(col_rel_append_batch_t *batch, uint32_t row,
+    uint32_t col, int64_t val)
+{
+    if (!batch || !batch->active)
+        return EINVAL;
+    col_rel_t *r = batch->relation;
+    /* Copying a shared view publishes a storage transition, which a lease
+     * that already published one cannot do.  Defensive: an append on a
+     * shared view copies it before recording a transition, and while the
+     * batch holds the gates nothing else re-shares the relation. */
+    if (r->col_shared && batch->single.lease.storage_transitioned) {
+        int rc = col_rel_append_batch_renew(batch);
+        if (rc)
+            return rc;
+    }
+    int rc = col_rel_append_batch_lease_check(batch);
+    if (rc)
+        return rc;
+    /* Checked before a shared view is copied, as in col_rel_set, but bound
+     * by the rows the relation holds rather than by its capacity. */
+    if (!r->columns || row >= r->nrows || col >= r->ncols
+        || !r->columns[col])
+        return EINVAL;
+    if (r->column_types && r->column_types[col] == WIRELOG_TYPE_FLOAT) {
+        if (!wl_columnar_float_bits_valid(val))
+            return EINVAL;
+        if (wl_columnar_float_bits_zero(val))
+            val = 0;
+    }
+    if (r->col_shared) {
+        rc = col_rel_cow_unshare_publish_impl(r, 0, false,
+                &batch->single.lease);
+        if (rc)
+            return rc;
+    }
+    r->columns[col][row] = val;
+    wl_columnar_relation_touch_view(r);
+    return 0;
 }
 
 int
