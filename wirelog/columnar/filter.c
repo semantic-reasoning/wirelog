@@ -993,6 +993,7 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
             free(tmp);
             wl_columnar_filter_scratch_release(&scratch);
             (void)col_rel_append_batch_end(&batch, false);
+            batch_rc = wl_columnar_filter_status(sess, out, batch_rc);
             col_rel_destroy(out);
             return wl_columnar_filter_dispose_input(stack, &e, batch_rc);
         }
