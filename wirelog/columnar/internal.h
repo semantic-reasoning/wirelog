@@ -4002,6 +4002,14 @@ bool
 wl_columnar_eval_dedup_set_contains(const col_rel_t *r, uint64_t h);
 int
 wl_columnar_eval_dedup_set_init_from_rel(col_rel_t *r);
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int wl_columnar_eval_test_copy_relation_slice(wl_col_session_t *coord,
+    const col_rel_t *src, const char *name, uint32_t begin, uint32_t end,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+int wl_columnar_eval_test_dedup_append(col_rel_t *image, uint32_t start,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **delta_out,
+    uint32_t *keep);
+#endif
 /* Validate a persistent hash table and clear it after physical free. */
 int wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes);
 void wl_columnar_eval_dedup_set_clear(col_rel_t *r);
