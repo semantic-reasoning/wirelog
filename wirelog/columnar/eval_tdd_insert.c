@@ -269,33 +269,6 @@ insert_range_count(uint32_t nrows, uint32_t workers, uint64_t min_rows)
     return count < 1 ? 1 : (uint32_t)count;
 }
 
-/* Rows [@begin, @end) of @src as a private relation with @src's name and
- * schema and without delta timestamps. */
-static int
-insert_range_copy(wl_col_session_t *sess, const col_rel_t *src,
-    uint32_t begin, uint32_t end, col_rel_t **out)
-{
-    col_rel_t *copy = NULL;
-    int rc = wl_columnar_relation_new_like_governed_checked_mode(src->name,
-            src, sess->memory_governor, false, &copy);
-    if (rc != 0)
-        return rc;
-    col_rel_append_batch_t batch = { 0 };
-    rc = col_rel_append_batch_begin(&batch, copy);
-    for (uint32_t r = begin; rc == 0 && r < end; r++)
-        rc = col_rel_append_batch_row(&batch, col_rel_row(src, r));
-    if (rc == 0)
-        rc = col_rel_append_batch_end(&batch, true);
-    else
-        (void)col_rel_append_batch_end(&batch, false);
-    if (rc != 0) {
-        col_rel_destroy(copy);
-        return rc;
-    }
-    *out = copy;
-    return 0;
-}
-
 static void
 insert_split_free(insert_split_t *split)
 {
@@ -328,9 +301,10 @@ insert_split_get(wl_col_session_t *sess, insert_split_t *splits,
         return ENOMEM;
     uint32_t n = src->nrows;
     for (uint32_t k = 0; k < count; k++) {
-        int rc = insert_range_copy(sess, src,
+        int rc = wl_columnar_relation_copy_rows(src->name, src,
                 (uint32_t)((uint64_t)n * k / count),
-                (uint32_t)((uint64_t)n * (k + 1) / count), &split->range[k]);
+                (uint32_t)((uint64_t)n * (k + 1) / count),
+                sess->memory_governor, &split->range[k]);
         if (rc != 0)
             return rc;
     }

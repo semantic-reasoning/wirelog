@@ -3163,6 +3163,14 @@ int
 wl_columnar_relation_new_like_governed_checked_mode(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out);
+/* Rows [@begin, @end) of @src as a new private relation named @name with
+ * @src's schema and without delta timestamps, appended under one batch
+ * lease per storage epoch (#2072).  Requires @begin <= @end <= @src->nrows.
+ * On failure *@out is left unchanged and no copy remains. */
+WL_MUST_CHECK int
+wl_columnar_relation_copy_rows(const char *name, const col_rel_t *src,
+    uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out);
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,
@@ -4009,6 +4017,8 @@ int wl_columnar_eval_test_copy_relation_slice(wl_col_session_t *coord,
 int wl_columnar_eval_test_dedup_append(col_rel_t *image, uint32_t start,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **delta_out,
     uint32_t *keep);
+int wl_columnar_session_test_snapshot_insert(wl_session_t *session,
+    const wl_plan_t *plan);
 #endif
 /* Validate a persistent hash table and clear it after physical free. */
 int wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes);

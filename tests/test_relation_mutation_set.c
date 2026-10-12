@@ -2699,6 +2699,133 @@ dedup_append_tests(void)
     }
 }
 
+/* #2072: rows copied into a fresh relation, as the TDD insert route's
+ * splits and the snapshot insert's delta are, go under one batch lease. */
+static col_rel_t *
+copy_source(uint32_t rows)
+{
+    col_rel_t *src = col_rel_new_auto("copy_src", 2);
+    assert(src && col_rel_enable_timestamps(src) == 0);
+    for (uint32_t i = 0; i < rows; i++) {
+        int64_t row[2] = { (int64_t)i, -(int64_t)i * 3 };
+        assert(col_rel_append_row(src, row) == 0);
+    }
+    return src;
+}
+
+static void
+copy_rows_tests(void)
+{
+    enum { ROWS = 4096, BEGIN = 100 };
+    for (int governed = 0; governed < 2; governed++) {
+        wl_columnar_memory_governor_ref_t *ref = governed
+            ? enforcing_governor(1u << 26) : NULL;
+        col_rel_t *src = copy_source(ROWS);
+        col_rel_t *copy = NULL;
+        uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+        assert(wl_columnar_relation_copy_rows("copy", src, BEGIN, ROWS, ref,
+            &copy) == 0);
+        uint64_t acquisitions
+            = wl_columnar_relation_test_mutation_nonce_peek() - before;
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        assert(copy && copy->nrows == ROWS - BEGIN && !copy->timestamps
+            && strcmp(copy->name, "copy") == 0);
+        for (uint32_t c = 0; c < 2; c++)
+            assert(memcmp(copy->columns[c], src->columns[c] + BEGIN,
+                (ROWS - BEGIN) * sizeof(int64_t)) == 0);
+        assert(col_rel_destroy_checked(copy) == 0);
+        assert(col_rel_destroy_checked(src) == 0);
+        if (ref) {
+            assert(governor_reserved(ref) == 0);
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+    }
+}
+
+/* A copy of @rows rows from a 512-row source under @budget.  A refused
+ * growth returns ENOMEM and leaves no copy and no reservation behind. */
+static int
+copy_rows_denial_run(uint32_t rows, uint64_t budget, bool check_cleanup)
+{
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    col_rel_t *src = copy_source(512);
+    uint64_t baseline = governor_reserved(ref);
+    col_rel_t sentinel;
+    col_rel_t *copy = &sentinel;
+    int rc = wl_columnar_relation_copy_rows("copy", src, 0, rows, ref,
+            &copy);
+    if (rc == 0) {
+        assert(copy->nrows == rows);
+        assert(col_rel_destroy_checked(copy) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOMEM && copy == &sentinel);
+        assert(governor_reserved(ref) == baseline);
+    }
+    assert(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+copy_rows_denial_tests(void)
+{
+    /* Smallest budget at which a 128-row copy (one growth past the 64-row
+     * floor) succeeds; 256 rows need a second growth. */
+    uint64_t lo = 0, hi = 1u << 24;
+    assert(copy_rows_denial_run(128, hi, false) == 0);
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (copy_rows_denial_run(128, mid, false) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    assert(copy_rows_denial_run(256, hi, true) == ENOMEM);
+}
+
+/* A snapshot insert copies the inserted relation's rows past its base into
+ * a delta, under the session's governor, before evaluating the strata it
+ * reaches.  With no plan strata it copies the rows and evaluates nothing. */
+static void
+snapshot_insert_copy_tests(void)
+{
+    enum { BASE = 100, ROWS = 4096 };
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 26);
+    sess->memory_governor = ref;
+    col_rel_t *e = join_rel("e", 2);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        int64_t row[2] = { (int64_t)i, (int64_t)i + 1 };
+        assert(col_rel_append_row(e, row) == 0);
+    }
+    e->base_nrows = BASE;
+    assert(session_add_rel(sess, e) == 0);
+    sess->last_inserted_relation = "e";
+    wl_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    /* Registering e reserves session state that this bare session's
+     * teardown does not release; measure from here. */
+    uint64_t baseline = governor_reserved(ref);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    assert(wl_columnar_session_test_snapshot_insert((wl_session_t *)sess,
+        &plan) == 0);
+    uint64_t acquisitions
+        = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    assert(acquisitions >= 1 && acquisitions <= 16);
+    assert(e->nrows == ROWS && e->base_nrows == BASE);
+    assert(governor_reserved(ref) == baseline);
+    /* The copy is governed: with no headroom left it is refused with
+     * ENOSPC, and the refusal leaves nothing reserved. */
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline, memory_order_release);
+    assert(wl_columnar_session_test_snapshot_insert((wl_session_t *)sess,
+        &plan) == ENOSPC);
+    assert(governor_reserved(ref) == baseline);
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
 int
 main(void)
 {
@@ -2739,6 +2866,9 @@ main(void)
     slice_copy_tests();
     slice_denial_tests();
     dedup_append_tests();
+    snapshot_insert_copy_tests();
+    copy_rows_tests();
+    copy_rows_denial_tests();
     {
         col_rel_t root;
         fixture_t f = {0};
