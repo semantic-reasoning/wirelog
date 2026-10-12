@@ -842,6 +842,8 @@ test_growth_wide_and_same_owner(void)
     wl_evaluation_control_t *c = control(cost);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL, c) == 0);
     CHECK(finish(c, 0) == cost);
+    for (uint32_t lane = 0; lane < 300; lane++)
+        CHECK(dst->columns[lane][0] == (int64_t)lane * 10000);
     payload_equal(dst, src, 1);
     release(c); destroy(dst); destroy(src);
     dst = relation(1, 3, 3, true, NULL);
@@ -988,9 +990,9 @@ test_growth_faults(void)
 static void
 test_growth_partial_faults_and_overlap(void)
 {
-    const uint32_t ordinals[] = { 1, 4, 5, 0 };
-    const uint64_t prefixes[] = { 8, 15, 18, 52 };
-    for (uint32_t i = 0; i < 4; i++) {
+    const uint32_t ordinals[] = { 1, 2, 3, 4, 5, 0 };
+    const uint64_t prefixes[] = { 8, 9, 12, 15, 18, 52 };
+    for (uint32_t i = 0; i < sizeof(ordinals) / sizeof(ordinals[0]); i++) {
         col_rel_t *src = relation(3, 3, 3, true, NULL);
         col_rel_t *dst = relation(3, 2, 2, true, src->memory_governor);
         CHECK(col_rel_reserve_merge_grid(dst, 4) == 0);

@@ -6291,7 +6291,6 @@ wl_columnar_relation_growth_malloc(size_t bytes)
 
 static int
 wl_columnar_relation_prepare_growth_controlled(col_rel_t *dst,
-    const col_rel_payload_shape_t *old_shape, uint32_t capacity,
     uint64_t lane_bytes, uint64_t table_bytes, uint64_t timestamp_bytes,
     int64_t ***columns_out, col_delta_timestamp_t **timestamps_out,
     wl_evaluation_control_t *control)
@@ -6300,29 +6299,29 @@ wl_columnar_relation_prepare_growth_controlled(col_rel_t *dst,
     col_delta_timestamp_t *timestamps = NULL;
     uint32_t allocated = 0;
     int rc = 0;
-    (void)capacity;
-    if (table_bytes) {
-        rc = wl_evaluation_control_charge(control, 1);
-        if (rc != 0)
-            goto failed;
+    /* Sole caller admits positive-width allocated growth and has checked
+     * table_bytes = dst->ncols * sizeof(int64_t *). Allocate the table
+     * before any lane access, using the same width as later consumption. */
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto failed;
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
-        if (wl_columnar_relation_test_fail_prepare_resize) {
-            wl_columnar_relation_test_fail_prepare_resize = false;
-            rc = ENOMEM;
-            goto failed;
-        }
-#endif
-        columns =
-            (int64_t **)wl_columnar_relation_growth_malloc((size_t)table_bytes);
-        if (!columns) {
-            rc = ENOMEM;
-            goto failed;
-        }
-        rc = wl_columnar_relation_work_tail(control, 1);
-        if (rc != 0)
-            goto failed;
+    if (wl_columnar_relation_test_fail_prepare_resize) {
+        wl_columnar_relation_test_fail_prepare_resize = false;
+        rc = ENOMEM;
+        goto failed;
     }
-    for (uint32_t c = 0; c < old_shape->ncols; c++) {
+#endif
+    columns =
+        (int64_t **)wl_columnar_relation_growth_malloc((size_t)table_bytes);
+    if (!columns) {
+        rc = ENOMEM;
+        goto failed;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto failed;
+    for (uint32_t c = 0; c < dst->ncols; c++) {
         rc = wl_evaluation_control_charge(control, 1);
         if (rc != 0)
             goto failed;
@@ -6366,7 +6365,7 @@ wl_columnar_relation_prepare_growth_controlled(col_rel_t *dst,
 failed:
     for (uint32_t c = 0; c < allocated; c++)
         free(columns[c]);
-    free(columns);
+    free((void *)columns);
     free(timestamps);
     return rc;
 }
@@ -6594,8 +6593,8 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
             goto done;
         }
         transaction_active = rc > 0;
-        rc = wl_columnar_relation_prepare_growth_controlled(dst, &old_shape,
-                new_capacity, lane_bytes, table_bytes, timestamp_bytes,
+        rc = wl_columnar_relation_prepare_growth_controlled(dst,
+                lane_bytes, table_bytes, timestamp_bytes,
                 &prepared_columns, &prepared_timestamps, control);
         if (rc != 0)
             goto done;
