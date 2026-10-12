@@ -2398,6 +2398,155 @@ reduce_denial_tests(void)
     assert(reduce_denial_run(256, hi, true) == ENOSPC);
 }
 
+/* #2072: LFTJ appends its output rows under one batch lease.  Each input
+ * relation(k, v) has @rows rows; the first @matching take key i / @per_key
+ * and the rest keys no other relation holds; v is @tag + i. */
+static void
+lftj_add(wl_col_session_t *sess, const char *name, uint32_t rows,
+    uint32_t matching, uint32_t per_key, int64_t tag)
+{
+    col_rel_t *r = join_rel(name, 2);
+    for (uint32_t i = 0; i < rows; i++) {
+        int64_t row[2] = {
+            i < matching ? (int64_t)(i / per_key) : 1000 + (int64_t)i,
+            tag + (int64_t)i
+        };
+        assert(col_rel_append_row(r, row) == 0);
+    }
+    assert(session_add_rel(sess, r) == 0);
+}
+
+/* Join a, b and c on column 0 and report the mutation sets taken. */
+static int
+lftj_run(wl_col_session_t *sess, uint64_t *acquisitions, col_rel_t **out,
+    uint32_t *stack_top)
+{
+    static char name_a[] = "a", name_b[] = "b", name_c[] = "c";
+    static char *names[3] = { name_a, name_b, name_c };
+    static uint32_t keys[3] = { 0, 0, 0 };
+    wl_plan_op_lftj_t meta = { 3, names, keys };
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_LFTJ;
+    op.opaque_data = &meta;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    int rc = col_op_lftj(&op, &stack, sess);
+    *acquisitions = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    *stack_top = stack.top;
+    *out = NULL;
+    if (rc == 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        *out = result.rel;
+    }
+    return rc;
+}
+
+static void
+lftj_session_destroy(wl_col_session_t *sess)
+{
+    /* The probe may cache sorted arrangements of the inputs. */
+    col_session_free_sorted_arrangements(sess);
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+}
+
+/* a, b and c hold four rows for each of eight keys, so the join produces
+ * 8 * 4 * 4 * 4 = 512 rows, each once. */
+static void
+lftj_batch_tests(void)
+{
+    enum { KEYS = 8, PER_KEY = 4, ROWS = KEYS * PER_KEY,
+           OUT_ROWS = KEYS * PER_KEY * PER_KEY * PER_KEY };
+    for (int governed = 0; governed < 2; governed++) {
+        wl_col_session_t *sess = join_session();
+        wl_columnar_memory_governor_ref_t *ref = governed
+            ? enforcing_governor(1u << 26) : NULL;
+        sess->memory_governor = ref;
+        lftj_add(sess, "a", ROWS, ROWS, PER_KEY, 0);
+        lftj_add(sess, "b", ROWS, ROWS, PER_KEY, 1000);
+        lftj_add(sess, "c", ROWS, ROWS, PER_KEY, 2000);
+        /* Registering the inputs reserves session state that this bare
+         * session's teardown does not release; measure from here. */
+        uint64_t baseline = ref ? governor_reserved(ref) : 0;
+        uint64_t acquisitions = 0;
+        col_rel_t *out = NULL;
+        uint32_t top = 0;
+        assert(lftj_run(sess, &acquisitions, &out, &top) == 0);
+        assert(acquisitions >= 1 && acquisitions <= 16);
+        assert(out && out->nrows == OUT_ROWS && out->ncols == 6);
+        bool seen[OUT_ROWS] = { false };
+        for (uint32_t r = 0; r < OUT_ROWS; r++) {
+            int64_t key = out->columns[0][r];
+            assert(key >= 0 && key < KEYS && out->columns[2][r] == key
+                && out->columns[4][r] == key);
+            int64_t ja = out->columns[1][r] - key * PER_KEY;
+            int64_t jb = out->columns[3][r] - 1000 - key * PER_KEY;
+            int64_t jc = out->columns[5][r] - 2000 - key * PER_KEY;
+            assert(ja >= 0 && ja < PER_KEY && jb >= 0 && jb < PER_KEY
+                && jc >= 0 && jc < PER_KEY);
+            uint32_t index = (uint32_t)(((key * PER_KEY + ja) * PER_KEY + jb)
+                * PER_KEY + jc);
+            assert(!seen[index]);
+            seen[index] = true;
+        }
+        assert(col_rel_destroy_checked(out) == 0);
+        if (ref)
+            assert(governor_reserved(ref) == baseline);
+        lftj_session_destroy(sess);
+        if (ref)
+            wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+/* a holds 16 rows and c one row on key 0; @matching of b's 16 rows share
+ * that key, so the join produces 16 * @matching rows from inputs of a
+ * fixed size.  On a refusal with @check_cleanup, the output and its
+ * reservation are gone. */
+static int
+lftj_denial_run(uint32_t matching, uint64_t budget, bool check_cleanup)
+{
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    sess->memory_governor = ref;
+    lftj_add(sess, "a", 16, 16, 16, 0);
+    lftj_add(sess, "b", 16, matching, 16, 1000);
+    lftj_add(sess, "c", 1, 1, 1, 2000);
+    uint64_t baseline = governor_reserved(ref);
+    uint64_t acquisitions = 0;
+    col_rel_t *out = NULL;
+    uint32_t top = 0;
+    int rc = lftj_run(sess, &acquisitions, &out, &top);
+    if (rc == 0) {
+        assert(out->nrows == 16u * matching);
+        assert(col_rel_destroy_checked(out) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied && top == 0);
+        assert(governor_reserved(ref) == baseline);
+    }
+    lftj_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+lftj_denial_tests(void)
+{
+    /* Smallest budget at which 128 output rows succeed; 256 rows need one
+     * more growth. */
+    uint64_t lo = 0, hi = 1u << 24;
+    assert(lftj_denial_run(8, hi, false) == 0);
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (lftj_denial_run(8, mid, false) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    assert(lftj_denial_run(16, hi, true) == ENOSPC);
+}
+
 int
 main(void)
 {
@@ -2433,6 +2582,8 @@ main(void)
     reduce_batch_tests();
     reduce_error_tests();
     reduce_denial_tests();
+    lftj_batch_tests();
+    lftj_denial_tests();
     {
         col_rel_t root;
         fixture_t f = {0};
