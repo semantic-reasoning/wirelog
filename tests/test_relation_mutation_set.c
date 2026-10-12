@@ -3,6 +3,7 @@
 #include "../wirelog/thread.h"
 #include <assert.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1984,6 +1985,419 @@ map_error_tests(void)
     }
 }
 
+/* #2072: a batch updates a cell of a row its relation already holds under
+ * the held lease, with col_rel_set's checks and without a mutation set of
+ * its own. */
+typedef struct {
+    col_rel_append_batch_t *batch;
+    int rc;
+} batch_set_thread_arg_t;
+
+static void *
+batch_set_other_thread(void *arg)
+{
+    batch_set_thread_arg_t *a = arg;
+    a->rc = col_rel_append_batch_set(a->batch, 0, 0, -1);
+    return NULL;
+}
+
+static void
+batch_set_tests(void)
+{
+    enum { ROWS = 10, SETS = 1000 };
+    col_rel_t *r = batch_relation("batch_set");
+    col_rel_append_batch_t batch = { 0 };
+    int64_t row[2];
+    assert(col_rel_append_batch_set(&batch, 0, 0, 1) == EINVAL);
+    assert(col_rel_append_batch_begin(&batch, r) == 0);
+    for (uint32_t i = 0; i < ROWS; i++) {
+        batch_row_values(i, row);
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    uint64_t nonce_before = wl_columnar_relation_test_mutation_nonce_peek();
+    uint64_t validations_before
+        = wl_columnar_relation_test_lease_validations_peek();
+    for (uint32_t k = 0; k < SETS; k++)
+        assert(col_rel_append_batch_set(&batch, k % ROWS, 0,
+            (int64_t)k) == 0);
+    assert(wl_columnar_relation_test_mutation_nonce_peek() == nonce_before);
+    assert(wl_columnar_relation_test_lease_validations_peek()
+        - validations_before < SETS / 10u);
+    for (uint32_t i = 0; i < ROWS; i++)
+        assert(r->columns[0][i] == (int64_t)(SETS - ROWS + i));
+
+    /* Bounds are rows the relation holds, not its capacity. */
+    assert(r->nrows == ROWS && r->capacity > ROWS);
+    assert(col_rel_append_batch_set(&batch, ROWS, 0, 1) == EINVAL);
+    assert(col_rel_append_batch_set(&batch, 0, 2, 1) == EINVAL);
+    double inf = INFINITY, negative_zero = -0.0, one = 1.0;
+    int64_t bits;
+    memcpy(&bits, &inf, sizeof(bits));
+    assert(col_rel_append_batch_set(&batch, 1, 1, bits) == EINVAL);
+    memcpy(&bits, &one, sizeof(bits));
+    assert(r->columns[1][1] == bits);
+    memcpy(&bits, &negative_zero, sizeof(bits));
+    assert(col_rel_append_batch_set(&batch, 1, 1, bits) == 0);
+    assert(r->columns[1][1] == 0);
+
+    batch_set_thread_arg_t arg = { &batch, 0 };
+    wl_thread_t thread;
+    assert(wl_thread_create(&thread, batch_set_other_thread, &arg) == 0);
+    assert(wl_thread_join(&thread) == 0);
+    assert(arg.rc == EINVAL && batch.active
+        && r->columns[0][0] == (int64_t)(SETS - ROWS));
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(col_rel_append_batch_set(&batch, 0, 0, 1) == EINVAL);
+    assert_open(r);
+    assert(col_rel_destroy_checked(r) == 0);
+}
+
+/* A set on a shared view validates before it copies: a refused set leaves
+ * the view shared; the first accepted set copies it, leaving the source
+ * untouched, and later sets and appends need no further mutation sets of
+ * their own beyond growth renewals. */
+static void
+batch_set_shared_view_tests(void)
+{
+    enum { BASE = 8, ROWS = 300 };
+    col_rel_t *src = col_rel_new_auto("batch_set_src", 2);
+    col_rel_t *view = col_rel_new_auto("batch_set_view", 2);
+    assert(src && view);
+    int64_t row[2];
+    for (uint32_t i = 0; i < BASE; i++) {
+        row[0] = i;
+        row[1] = -(int64_t)i;
+        assert(col_rel_append_row(src, row) == 0);
+    }
+    assert(col_rel_install_shared_view(view, src) == 0);
+    col_rel_append_batch_t batch = { 0 };
+    assert(col_rel_append_batch_begin(&batch, view) == 0);
+    uint64_t storage = view->storage_generation;
+    assert(col_rel_append_batch_set(&batch, 0, 2, 7) == EINVAL);
+    assert(col_rel_append_batch_set(&batch, BASE, 0, 7) == EINVAL);
+    assert(view->col_shared && view->storage_generation == storage);
+    assert(col_rel_append_batch_set(&batch, 1, 1, 77) == 0);
+    assert(!view->col_shared && view->columns[1][1] == 77
+        && src->columns[1][1] == -1);
+    uint64_t nonce_before = wl_columnar_relation_test_mutation_nonce_peek();
+    for (uint32_t k = 0; k < 100; k++)
+        assert(col_rel_append_batch_set(&batch, k % BASE, 0,
+            1000 + (int64_t)k) == 0);
+    assert(wl_columnar_relation_test_mutation_nonce_peek() == nonce_before);
+    for (uint32_t i = BASE; i < ROWS; i++) {
+        row[0] = i;
+        row[1] = -(int64_t)i;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+        assert(col_rel_append_batch_set(&batch, i, 1, (int64_t)i) == 0);
+    }
+    assert(wl_columnar_relation_test_mutation_nonce_peek() - nonce_before
+        <= 8u);
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(view->nrows == ROWS && src->nrows == BASE);
+    for (uint32_t i = 0; i < BASE; i++)
+        assert(src->columns[0][i] == (int64_t)i
+            && src->columns[1][i] == -(int64_t)i
+            && view->columns[0][i]
+            == 1000 + (int64_t)(i + 8u * ((99u - i) / 8u))
+            && view->columns[1][i] == (i == 1 ? 77 : -(int64_t)i));
+    for (uint32_t i = BASE; i < ROWS; i++)
+        assert(view->columns[0][i] == (int64_t)i
+            && view->columns[1][i] == (int64_t)i);
+    assert(col_rel_destroy_checked(view) == 0);
+    assert(col_rel_destroy_checked(src) == 0);
+}
+
+/* #2072: reduce appends its groups and updates their aggregates under one
+ * batch lease.  The input has 4096 rows in 1024 groups of four, so updates
+ * interleave with the output's growths. */
+enum { REDUCE_ROWS = 4096, REDUCE_PER_GROUP = 4 };
+
+static int64_t
+reduce_int_value(uint32_t i)
+{
+    return (int64_t)((i * 7u) % 13u) - 6;
+}
+
+static double
+reduce_float_value(uint32_t i)
+{
+    return (double)((i * 7u) % 13u) - 6.5;
+}
+
+static int64_t
+reduce_bits(double value)
+{
+    int64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+/* reduce_in(k, col1): k = i / @per_group; col1 from @value, or the int or
+ * float value above when @value is NULL. */
+static col_rel_t *
+reduce_source(uint32_t rows, uint32_t per_group, bool float_values,
+    int64_t (*value)(uint32_t))
+{
+    static const wirelog_column_type_t float_types[2] = {
+        WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT
+    };
+    col_rel_t *in = col_rel_new_auto("reduce_in", 2);
+    assert(in);
+    if (float_values)
+        assert(col_rel_set_column_types(in, float_types, 2) == 0);
+    for (uint32_t i = 0; i < rows; i++) {
+        int64_t row[2] = { (int64_t)(i / per_group), 0 };
+        if (value)
+            row[1] = value(i);
+        else if (float_values)
+            row[1] = reduce_bits(reduce_float_value(i));
+        else
+            row[1] = reduce_int_value(i);
+        assert(col_rel_append_row(in, row) == 0);
+    }
+    return in;
+}
+
+static void
+reduce_op(wl_plan_op_t *op, wirelog_agg_fn_t fn, bool float_agg,
+    uint8_t *expr, uint32_t size)
+{
+    memset(op, 0, sizeof(*op));
+    op->op = WL_PLAN_OP_REDUCE;
+    op->group_by_count = 1;
+    op->aggregate_index = 1;
+    op->agg_fn = fn;
+    op->agg_operand_type = float_agg ? WL_PLAN_AGG_OPERAND_FLOAT
+        : WL_PLAN_AGG_OPERAND_SCALAR;
+    op->agg_expr.data = expr;
+    op->agg_expr.size = size;
+}
+
+/* Push @in, reduce it, and report the mutation sets taken and the stack
+ * depth after the operator. */
+static int
+reduce_run(wl_col_session_t *sess, const wl_plan_op_t *op, col_rel_t *in,
+    uint64_t *acquisitions, col_rel_t **out, uint32_t *stack_top)
+{
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, in, true) == 0);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    int rc = col_op_reduce(op, &stack, sess);
+    *acquisitions = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    *stack_top = stack.top;
+    *out = NULL;
+    if (rc == 0 || stack.top == 1) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        if (rc == 0)
+            *out = result.rel;
+        else if (result.owned)
+            assert(col_rel_destroy_checked(result.rel) == 0);
+    }
+    return rc;
+}
+
+static void
+reduce_batch_tests(void)
+{
+    static const struct {
+        wirelog_agg_fn_t fn;
+        bool float_agg;
+    } cases[] = {
+        { WIRELOG_AGG_COUNT, false }, { WIRELOG_AGG_SUM, false },
+        { WIRELOG_AGG_MIN, false }, { WIRELOG_AGG_MAX, false },
+        { WIRELOG_AGG_SUM, true }, { WIRELOG_AGG_MIN, true },
+        { WIRELOG_AGG_MAX, true }, { WIRELOG_AGG_AVG, true },
+    };
+    enum { GROUPS = REDUCE_ROWS / REDUCE_PER_GROUP };
+    for (int governed = 0; governed < 2; governed++) {
+        for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            wl_col_session_t *sess = join_session();
+            wl_columnar_memory_governor_ref_t *ref = governed
+                ? enforcing_governor(1u << 26) : NULL;
+            sess->memory_governor = ref;
+            wl_plan_op_t op;
+            reduce_op(&op, cases[k].fn, cases[k].float_agg, NULL, 0);
+            uint64_t acquisitions = 0;
+            col_rel_t *out = NULL;
+            uint32_t top = 0;
+            assert(reduce_run(sess, &op, reduce_source(REDUCE_ROWS,
+                REDUCE_PER_GROUP, cases[k].float_agg, NULL),
+                &acquisitions, &out, &top) == 0);
+            assert(acquisitions >= 1 && acquisitions <= 16);
+            assert(out && out->nrows == GROUPS && out->ncols == 2);
+            for (uint32_t g = 0; g < GROUPS; g++) {
+                int64_t isum = 0, imin = INT64_MAX, imax = INT64_MIN;
+                double fsum = 0.0, fmin = 1e300, fmax = -1e300;
+                for (uint32_t j = 0; j < REDUCE_PER_GROUP; j++) {
+                    uint32_t i = g * REDUCE_PER_GROUP + j;
+                    int64_t iv = reduce_int_value(i);
+                    double fv = reduce_float_value(i);
+                    isum += iv;
+                    imin = iv < imin ? iv : imin;
+                    imax = iv > imax ? iv : imax;
+                    fsum += fv;
+                    fmin = fv < fmin ? fv : fmin;
+                    fmax = fv > fmax ? fv : fmax;
+                }
+                int64_t expected = 0;
+                switch (cases[k].fn) {
+                case WIRELOG_AGG_COUNT:
+                    expected = REDUCE_PER_GROUP;
+                    break;
+                case WIRELOG_AGG_SUM:
+                    expected = cases[k].float_agg ? reduce_bits(fsum) : isum;
+                    break;
+                case WIRELOG_AGG_MIN:
+                    expected = cases[k].float_agg ? reduce_bits(fmin) : imin;
+                    break;
+                case WIRELOG_AGG_MAX:
+                    expected = cases[k].float_agg ? reduce_bits(fmax) : imax;
+                    break;
+                default:
+                    expected = reduce_bits(fsum / REDUCE_PER_GROUP);
+                    break;
+                }
+                assert(out->columns[0][g] == (int64_t)g
+                    && out->columns[1][g] == expected);
+            }
+            assert(col_rel_destroy_checked(out) == 0);
+            sess->memory_governor = NULL;
+            join_session_destroy(sess);
+            if (ref) {
+                assert(governor_reserved(ref) == 0);
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+}
+
+/* Values that fail reduce at row 2001, after the output grew past its
+ * 64-row floor: an int SUM that overflows, a float SUM that leaves the
+ * finite range, and a float operand that is not a finite float.  The two
+ * expressions over col1 = i fail at rows 2000 and 2001. */
+static int64_t
+reduce_overflow_value(uint32_t i)
+{
+    return i < 2000u ? 1 : INT64_MAX;
+}
+
+static int64_t
+reduce_float_overflow_value(uint32_t i)
+{
+    return reduce_bits(i < 2000u ? 1.0 : 1.5e308);
+}
+
+static int64_t
+reduce_invalid_float_value(uint32_t i)
+{
+    return reduce_bits(i < 2001u ? 1.0 : INFINITY);
+}
+
+static int64_t
+reduce_index_value(uint32_t i)
+{
+    return (int64_t)i;
+}
+
+/* A reduce that fails part-way through consumes its input and leaves no
+ * output and no reservation behind. */
+static void
+reduce_error_tests(void)
+{
+    static const struct {
+        wirelog_agg_fn_t fn;
+        bool float_agg;
+        bool float_input;
+        int64_t (*value)(uint32_t);
+        uint8_t *expr;
+        uint32_t size;
+        int rc;
+    } cases[] = {
+        { WIRELOG_AGG_SUM, false, false, reduce_overflow_value, NULL, 0,
+          ERANGE },
+        { WIRELOG_AGG_SUM, true, true, reduce_float_overflow_value, NULL, 0,
+          ERANGE },
+        /* A FLOAT column refuses the operand, so it comes from an INT64
+         * column the plan types as a float operand. */
+        { WIRELOG_AGG_MAX, true, false, reduce_invalid_float_value, NULL, 0,
+          EINVAL },
+        { WIRELOG_AGG_MAX, false, false, reduce_index_value,
+          map_add_overflows_mid_loop, sizeof(map_add_overflows_mid_loop),
+          ERANGE },
+        { WIRELOG_AGG_MAX, false, false, reduce_index_value,
+          map_div_fails_mid_loop, sizeof(map_div_fails_mid_loop), ERANGE },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        wl_col_session_t *sess = join_session();
+        wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 26);
+        sess->memory_governor = ref;
+        wl_plan_op_t op;
+        reduce_op(&op, cases[k].fn, cases[k].float_agg, cases[k].expr,
+            cases[k].size);
+        uint64_t baseline = governor_reserved(ref);
+        uint64_t acquisitions = 0;
+        col_rel_t *out = NULL;
+        uint32_t top = 1;
+        assert(reduce_run(sess, &op, reduce_source(REDUCE_ROWS,
+            REDUCE_PER_GROUP, cases[k].float_input, cases[k].value),
+            &acquisitions, &out, &top) == cases[k].rc);
+        assert(out == NULL && top == 0);
+        assert(governor_reserved(ref) == baseline);
+        sess->memory_governor = NULL;
+        join_session_destroy(sess);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+/* A COUNT over 256 rows in @groups groups under @budget.  On a refusal
+ * with @check_cleanup, the input is restored for a retry and the output
+ * and its reservation are gone. */
+static int
+reduce_denial_run(uint32_t groups, uint64_t budget, bool check_cleanup)
+{
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    sess->memory_governor = ref;
+    wl_plan_op_t op;
+    reduce_op(&op, WIRELOG_AGG_COUNT, false, NULL, 0);
+    uint64_t baseline = governor_reserved(ref);
+    uint64_t acquisitions = 0;
+    col_rel_t *out = NULL;
+    uint32_t top = 0;
+    int rc = reduce_run(sess, &op, reduce_source(256, 256 / groups, false,
+            NULL), &acquisitions, &out, &top);
+    if (rc == 0) {
+        assert(out->nrows == groups);
+        assert(col_rel_destroy_checked(out) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied && top == 1);
+        assert(governor_reserved(ref) == baseline);
+    }
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+reduce_denial_tests(void)
+{
+    /* Smallest budget at which 128 groups (one growth past the 64-row
+     * floor) succeed; 256 groups from as many input rows need a second
+     * growth. */
+    uint64_t lo = 0, hi = 1u << 24;
+    assert(reduce_denial_run(128, hi, false) == 0);
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (reduce_denial_run(128, mid, false) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    assert(reduce_denial_run(256, hi, true) == ENOSPC);
+}
+
 int
 main(void)
 {
@@ -2014,6 +2428,11 @@ main(void)
     join_denial_tests();
     map_op_batch_tests();
     map_error_tests();
+    batch_set_tests();
+    batch_set_shared_view_tests();
+    reduce_batch_tests();
+    reduce_error_tests();
+    reduce_denial_tests();
     {
         col_rel_t root;
         fixture_t f = {0};

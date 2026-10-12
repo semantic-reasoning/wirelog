@@ -2842,7 +2842,14 @@ wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
  * that runs the loop, pass it by pointer, never copy it.  A failed row leaves
  * the relation as that append's own contract says and the batch active; a
  * lease renewal that cannot finish the old lease leaves the batch active,
- * and one that cannot acquire the new lease leaves it inactive. */
+ * and one that cannot acquire the new lease leaves it inactive.
+ *
+ * set writes one cell of a row the relation already holds (row < nrows,
+ * where col_rel_set accepts row < capacity) under the held lease, with
+ * col_rel_set's column and float checks and storage contract: on a shared
+ * view it validates first and then copies the view, after which the batch
+ * keeps the former owner's source writer gate until its next renewal or
+ * its end.  A failed set writes no cell. */
 typedef struct {
     wl_columnar_relation_mutation_single_t single;
     col_rel_t *relation;
@@ -2855,6 +2862,8 @@ typedef struct {
 int col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r);
 int col_rel_append_batch_row(col_rel_append_batch_t *batch,
     const int64_t *row);
+int col_rel_append_batch_set(col_rel_append_batch_t *batch, uint32_t row,
+    uint32_t col, int64_t val);
 int col_rel_append_batch_end(col_rel_append_batch_t *batch, bool commit);
 
 int col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
