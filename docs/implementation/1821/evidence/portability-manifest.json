@@ -238,5 +238,35 @@
     "name": "fresh-seed-cost.json",
     "present": true,
     "sha256": "d2ca8066a3f4461c66d3caf7882847c4ba016dc1a8fb9940f3e2a85bf8b1da9a"
+  },
+  {
+    "name": "nullary-seed-plan.json",
+    "present": true,
+    "sha256": "ed843d255cdb619f23bc6eb1ba0573d306c57350a237d47a710dff643d5c4d47"
+  },
+  {
+    "name": "nullary-seed-plan-critique.json",
+    "present": true,
+    "sha256": "f66c3664b81371a95c9863a85fb0f1bd093c8381807a2109a35fc513431ea0f7"
+  },
+  {
+    "name": "nullary-seed-refinement.json",
+    "present": true,
+    "sha256": "990d16bcf055e033ab9b9f5c4af254b2f410583c4572fe7434239b643c07c5da"
+  },
+  {
+    "name": "nullary-seed-refinement-critique.json",
+    "present": true,
+    "sha256": "260bba11c2c7b2eb912dbe65150720cd02f5f9d33918e414a7f8b62a057ed905"
+  },
+  {
+    "name": "nullary-seed-cost.json",
+    "present": true,
+    "sha256": "5aa563721121cc33dae72814dad4440e18ffd305caf13d49d6c059115696ec40"
+  },
+  {
+    "name": "nullary-seed-qualification.json",
+    "present": true,
+    "sha256": "de191cf263cab71ccbb116f0b19cf393f9615a48f0a97e77836204019050db94"
   }
 ]

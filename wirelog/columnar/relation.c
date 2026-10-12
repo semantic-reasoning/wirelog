@@ -8121,6 +8121,9 @@ wl_columnar_relation_seed_installed_credit_valid(
     uintptr_t owner = atomic_load_explicit(&token->owner_bits,
             memory_order_acquire);
     if (token->replacement_bytes || token->transition_kind) return false;
+    if (!physical)
+        return !credited && wl_columnar_relation_seed_empty_credit_valid(token,
+                   dst);
     if (!dst->memory_governor)
         return !credited && !token->bytes && !token->governor && !owner
                && state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
@@ -8434,7 +8437,7 @@ static int wl_columnar_relation_seed_schema_fresh_controlled(
     wl_columnar_relation_bulk_append_t *,
     wl_columnar_eval_delta_seed_restore_t *, wl_evaluation_control_t *);
 
-/* Established private spare storage and fresh positive-width schemas only.
+/* Established private spare storage and fresh private schemas only.
  * Other allocation and schema/COW
  * purposes use separate original BULK preparation before reaching this copy
  * kernel; this entry does not admit those unfinished branches. */
@@ -11899,7 +11902,7 @@ static bool wl_columnar_relation_consolidate_reservation_empty(
 /* First canonical recursive schema installation. All ownership lives in the
  * original BULK record; names and row scratch occupy phase-exclusive slots. */
 /* The caller has validated the gathered rows and holds the original SINGLE.
- * Only a genuinely fresh, positive-width constructor image is admitted here.
+ * Only a genuinely fresh constructor image is admitted here.
  * Every pointer/token remains in the original BULK until typed retirement. */
 static int
 wl_columnar_relation_seed_schema_fresh_controlled(
@@ -11909,7 +11912,7 @@ wl_columnar_relation_seed_schema_fresh_controlled(
 {
     col_rel_t *dst = seed->dst;
     int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
-    if (!seed->ncols || dst->ncols || dst->nrows || dst->capacity
+    if (dst->ncols || dst->nrows || dst->capacity
         || dst->schema_ok || dst->schema.release || dst->columns
         || dst->col_names || dst->row_scratch || dst->column_types
         || dst->timestamps || dst->timestamp_capacity || dst->col_shared
@@ -11960,7 +11963,7 @@ wl_columnar_relation_seed_schema_fresh_controlled(
             &record->metadata_pending, control); if (rc) return rc;
     if (!col_rel_payload_private_bytes(dst, seed->ncols, capacity, 0,
         dst->memory_governor != NULL, &record->final_bytes)) return EOVERFLOW;
-    if (dst->memory_governor) {
+    if (dst->memory_governor && record->final_bytes) {
         wl_columnar_memory_admission_status_t status =
             WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
         rc = wl_columnar_memory_governor_reserve_checked_controlled(
@@ -11974,52 +11977,54 @@ wl_columnar_relation_seed_schema_fresh_controlled(
                 : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
                     ? EOVERFLOW : EINVAL;
     }
-    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
-    record->prepared_columns = malloc((size_t)table);
-    if (!record->prepared_columns) return ENOMEM;
-    rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
-    while (record->count < record->ncols) {
-        uint32_t n = record->ncols - record->count; if (n > 128) n = 128;
-        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
-        for (uint32_t i = 0; i < n; i++)
-            record->prepared_columns[record->count + i] = NULL;
-        record->count += n;
-        rc = wl_columnar_relation_work_tail(control, n); if (rc) return rc;
-    }
-    while (record->owned_columns < record->ncols) {
+    if (seed->ncols) {
         rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
-        int64_t *column = malloc((size_t)column_bytes);
-        if (!column) return ENOMEM;
-        record->prepared_columns[record->owned_columns++] = column;
+        record->prepared_columns = malloc((size_t)table);
+        if (!record->prepared_columns) return ENOMEM;
         rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
-    }
-    if (dst->memory_governor) {
+        while (record->count < record->ncols) {
+            uint32_t n = record->ncols - record->count; if (n > 128) n = 128;
+            rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+            for (uint32_t i = 0; i < n; i++)
+                record->prepared_columns[record->count + i] = NULL;
+            record->count += n;
+            rc = wl_columnar_relation_work_tail(control, n); if (rc) return rc;
+        }
+        while (record->owned_columns < record->ncols) {
+            rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+            int64_t *column = malloc((size_t)column_bytes);
+            if (!column) return ENOMEM;
+            record->prepared_columns[record->owned_columns++] = column;
+            rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
+        }
+        if (dst->memory_governor) {
+            rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+            record->prepared_row_scratch = malloc((size_t)row_bytes);
+            if (!record->prepared_row_scratch) return ENOMEM;
+            rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
+        }
         rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
-        record->prepared_row_scratch = malloc((size_t)row_bytes);
-        if (!record->prepared_row_scratch) return ENOMEM;
+        record->prepared_names = malloc((size_t)table);
+        if (!record->prepared_names) return ENOMEM;
         rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
-    }
-    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
-    record->prepared_names = malloc((size_t)table);
-    if (!record->prepared_names) return ENOMEM;
-    rc = wl_columnar_relation_work_tail(control, 1); if (rc) return rc;
-    while (record->base < record->ncols) {
-        uint32_t n = record->ncols - record->base; if (n > 128) n = 128;
-        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
-        for (uint32_t i = 0; i < n; i++)
-            record->prepared_names[record->base + i] = NULL;
-        record->base += n;
-        rc = wl_columnar_relation_work_tail(control, n); if (rc) return rc;
-    }
-    for (uint32_t col = 0; col < record->ncols; col++) {
-        char name[32];
-        rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
-        int length = snprintf(name, sizeof(name), "col%u", col);
-        if (length < 0 || (size_t)length >= sizeof(name)) return EOVERFLOW;
-        record->prepared_names[col] = malloc((size_t)length + 1u);
-        if (!record->prepared_names[col]) return ENOMEM;
-        memcpy(record->prepared_names[col], name, (size_t)length + 1u);
-        rc = wl_columnar_relation_work_tail(control, 64); if (rc) return rc;
+        while (record->base < record->ncols) {
+            uint32_t n = record->ncols - record->base; if (n > 128) n = 128;
+            rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+            for (uint32_t i = 0; i < n; i++)
+                record->prepared_names[record->base + i] = NULL;
+            record->base += n;
+            rc = wl_columnar_relation_work_tail(control, n); if (rc) return rc;
+        }
+        for (uint32_t col = 0; col < record->ncols; col++) {
+            char name[32];
+            rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+            int length = snprintf(name, sizeof(name), "col%u", col);
+            if (length < 0 || (size_t)length >= sizeof(name)) return EOVERFLOW;
+            record->prepared_names[col] = malloc((size_t)length + 1u);
+            if (!record->prepared_names[col]) return ENOMEM;
+            memcpy(record->prepared_names[col], name, (size_t)length + 1u);
+            rc = wl_columnar_relation_work_tail(control, 64); if (rc) return rc;
+        }
     }
     rc = wl_columnar_relation_build_schema_shape_controlled(record->ncols,
             record->prepared_names, NULL, NULL, &record->prepared_schema,
@@ -12030,13 +12035,15 @@ wl_columnar_relation_seed_schema_fresh_controlled(
 #endif
     if (dst->memory_governor) {
         bool accepted = false;
-        rc = wl_columnar_memory_governor_commit_controlled(
-            &record->pending.fresh, dst, &accepted, control);
-        if (rc || !accepted) return rc ? rc : EINVAL;
+        if (record->final_bytes) {
+            rc = wl_columnar_memory_governor_commit_controlled(
+                &record->pending.fresh, dst, &accepted, control);
+            if (rc || !accepted) return rc ? rc : EINVAL;
 #ifdef WL_SESSION_TEST_HOOKS
-        if (wl_columnar_relation_test_bulk_checkpoint)
-            wl_columnar_relation_test_bulk_checkpoint(control, 13, record);
+            if (wl_columnar_relation_test_bulk_checkpoint)
+                wl_columnar_relation_test_bulk_checkpoint(control, 13, record);
 #endif
+        }
         accepted = false;
         rc = wl_columnar_memory_governor_commit_controlled(
             &record->metadata_pending, dst, &accepted, control);
@@ -12076,13 +12083,15 @@ wl_columnar_relation_seed_schema_fresh_controlled(
     rc = wl_columnar_relation_work_tail(control, install_work);
     if (rc) return rc;
     if (dst->memory_governor) {
-        if (!wl_columnar_memory_reservation_move(&dst->retained_reservation,
-            &record->pending.fresh)) return EINVAL;
+        if (record->final_bytes) {
+            if (!wl_columnar_memory_reservation_move(&dst->retained_reservation,
+                &record->pending.fresh)) return EINVAL;
 #ifdef WL_SESSION_TEST_HOOKS
-        /* Defensive original-address fault seam; absent in production. */
-        if (wl_columnar_relation_test_bulk_checkpoint)
-            wl_columnar_relation_test_bulk_checkpoint(control, 17, record);
+            /* Defensive original-address fault seam; absent in production. */
+            if (wl_columnar_relation_test_bulk_checkpoint)
+                wl_columnar_relation_test_bulk_checkpoint(control, 17, record);
 #endif
+        }
         if (!wl_columnar_memory_reservation_move(&dst->metadata_reservation,
             &record->metadata_pending)) return EINVAL;
     }
@@ -12109,10 +12118,13 @@ wl_columnar_relation_seed_schema_fresh_controlled(
 #endif
     while (seed->row < seed->nrows) {
         rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
-        dst->columns[seed->column][seed->row] =
-            seed->rows[(size_t)seed->row * seed->ncols + seed->column];
-        if (++seed->column == seed->ncols) {
-            seed->column = 0; seed->row++;
+        if (!seed->ncols) seed->row++;
+        else {
+            dst->columns[seed->column][seed->row] =
+                seed->rows[(size_t)seed->row * seed->ncols + seed->column];
+            if (++seed->column == seed->ncols) {
+                seed->column = 0; seed->row++;
+            }
         }
 #ifdef WL_SESSION_TEST_HOOKS
         if (wl_columnar_relation_test_bulk_checkpoint)

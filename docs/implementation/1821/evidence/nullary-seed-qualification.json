@@ -1,0 +1,176 @@
+{
+  "artifact": "nullary_seed_qualification",
+  "producer": "/root",
+  "base_commit": "50d1ef8b29feb994b4ecf5deb1200338ab82418c",
+  "source_sha256": {
+    "wirelog/columnar/eval_delta.c": "1758562dc6b020a27feb4078bb4c50b07ad2a910bca0349174ecec7214c51ac5",
+    "wirelog/columnar/relation.c": "cc488363040fc024d2cc78eede1553fe503c120e3bf036d246f264cd00beec83",
+    "tests/test_evaluation_observer.c": "863f5b0f82df185e459326d64d3b25fc0b7d462033d33263af8a642fc7a8a9a8"
+  },
+  "profiles": {
+    "normal": [
+      {
+        "name": "abi - wirelog:source_access_contract",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.011980295181274414
+      },
+      {
+        "name": "abi - wirelog:source_access_contract_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.10383152961730957
+      },
+      {
+        "name": "abi - wirelog:state_map_anchors",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 2.7001047134399414
+      },
+      {
+        "name": "abi - wirelog:state_map_anchors_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.15992259979248
+      },
+      {
+        "name": "abi - wirelog:threading_doc",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 1.4645812511444092
+      },
+      {
+        "name": "abi - wirelog:threading_doc_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.8141605854034424
+      },
+      {
+        "name": "abi - wirelog:ownership_matrix",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 1.443807601928711
+      },
+      {
+        "name": "abi - wirelog:ownership_matrix_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 8.114583730697632
+      },
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 14.764508962631226
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.8273131847381592
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.877488851547241
+      }
+    ],
+    "asan": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 24.493255376815796
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.43590283393859863
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 30.277596712112427
+      }
+    ],
+    "psa": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 14.61147928237915
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.8237364292144775
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.387954950332642
+      }
+    ],
+    "psa-asan": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 24.701162099838257
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.439359188079834
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 29.549459218978882
+      }
+    ]
+  },
+  "constraints": {
+    "compiler_jobs": 7,
+    "lto_threads": 1,
+    "test_processes": 1,
+    "observer_timeout_seconds": 120,
+    "profile_order": [
+      "normal",
+      "asan",
+      "psa",
+      "psa-asan"
+    ]
+  },
+  "provider": "Same task-private official MbedTLS4.2.0 / TF PSA Crypto1.2.0 audited HMAC software provider recorded in fresh-seed-qualification.json; no host install.",
+  "production_library_build": "Fresh normal shared library build PASS after runtime changes; test hooks compiled out.",
+  "scope": "Nullary fresh seed helper and portable actual gather staging; established spare typed/FLOAT/TS raw parity. No whole STEP/defaultdiff admission or growth activation.",
+  "plan_history": "Initial plan blocked for malloc0/nullary payload omission; explicit original nonzero allocation refinement accepted before edits.",
+  "tests": [
+    "Zero/one-column fresh target raw twins, positive and zero retained authority, genuine metadata3 nullary credit",
+    "Source-derived exact/repeated/minusone; expected-128 consumed footer phase38 and original held authority",
+    "Nullary copy stop at first consumed row, before row count publication",
+    "Actual metadata denial; installed EMPTY retained and COMMITTED metadata identity refusal, positive primary precedence, identity restoration after host return and original-frame retry",
+    "Established spare INT64/FLOAT valid finite/negativezero/NaN/Inf with actual unchanged integer source bits; timestamps old preserved/newzero; width mismatch while source reader held then drained",
+    "All target/raw/session governor accounting and original source/descriptor gates retire to baseline"
+  ],
+  "limits": [
+    "No nullary child/root allocation failure claim; child hook deliberately skipped as unreachable.",
+    "No fresh typed/TS producer fabricated.",
+    "Whole observed/defaultdiff and evaluation_attempt_owner/retry/snapshot_cutoff integration blockers remain; no issue or PR completion.",
+    "No native Windows result claimed."
+  ],
+  "remote_prior_head": {
+    "head": "50d1ef8b29feb994b4ecf5deb1200338ab82418c",
+    "CodeQL": "SUCCESS",
+    "CLA signoff gate": "SUCCESS",
+    "current_candidate_remote_qualification": false
+  }
+}

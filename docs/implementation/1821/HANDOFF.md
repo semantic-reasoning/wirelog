@@ -7,6 +7,42 @@
 
 Updated UTC: 2026-10-12T06:21:39.932598+00:00. User explicitly replaced the final-only PR restriction with an unfinished draft checkpoint PR and detailed issue comment. This checkpoint is **not production approval, issue closure, or a merge request**. Lead stopped implementation before making the F1 code change. Root owns checkpoint commit/push/draft PR/comment. Implementation is stopped for the next agent.
 
+## Nullary seed continuation (2026-10-12)
+
+The next continuation extends the fresh helper to zero-column tuples. Seed
+staging now makes a real nonzero allocation for zero logical bytes; original
+frame ownership, nonNULL payload guards and the existing free remain intact.
+Nullary relation storage allocates no column, name or scratch tables. The raw
+footprint is retained F0 with Arrow metadata N3. With a governor, the original
+retained token stays exact self-EMPTY while metadata is actually reserved,
+committed and moved; installed validation accepts only that fresh zero history.
+
+Tests reach the real nullary constructor/session seed/gather/SINGLE/BULK path,
+compare the raw twin, and assert source-derived exact/repeated/minusone costs,
+consumed row-copy cancellation, metadata denial and original installed-credit
+refusal/retry. Unreachable payload-commit/intermove/child-allocation hooks are
+not reported as nullary witnesses. The planned malloc0 gap and its critique
+are preserved in `evidence/nullary-seed-*`; `nullary-seed-cost.json` binds the
+new independent arithmetic and accepted final prefix to source.
+
+Genuine established spare targets separately exercise INT64 and FLOAT, signed
+zero normalization, NaN/Inf rejection, timestamp preservation/new-row zeroing,
+and width mismatch. An integer shadow source preserves input bit patterns
+until the actual typed target validates them. These tests do not manufacture
+fresh typed or timestamped schema history and do not qualify capacity growth.
+
+Fresh work/membership/observer tests pass in normal, ASan/UBSan, PSA release
+and PSA ASan/UBSan builds with the existing120-second observer timeout. Eight
+normal ownership/threading/source audits and the production shared-library
+build pass. Exact source hashes and safe receipts are recorded in
+`evidence/nullary-seed-qualification.json`.
+
+The prior fresh-positive qualification below is historical to commit3d3196a8.
+CodeQL and CLA checks passed remotely on commit50d1ef8b after the separate test
+formatting fix. Whole observed STEP/default differential, the three recorded
+integration failures, growth/shared/arena paths and native Windows remain PR
+readiness work; this continuation does not close issue1821.
+
 ## Resumed fresh seed installation scope (2026-10-12)
 
 The pre-format identity and stopped state below remain historical checkpoint

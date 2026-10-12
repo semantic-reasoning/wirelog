@@ -1,0 +1,86 @@
+{
+  "artifact": "critique_findings",
+  "producer": "/root/architect_final_resume",
+  "plan_artifact": "/home/joykim/.tmp/2144-work/F2b-refinement.json",
+  "plan_sha256": "990d16bcf055e033ab9b9f5c4af254b2f410583c4572fe7434239b643c07c5da",
+  "base_plan": "/home/joykim/.tmp/2144-work/F2b-plan.json",
+  "runtime_baseline": "3d3196a88bf4b2c3ad499f072130f897eeabd476",
+  "verdict": "accepted_with_binding_conditions",
+  "blocking_findings": [],
+  "finding_rulings": [
+    {
+      "id": "F2b-P1",
+      "ruling": "resolved at planning level",
+      "reason": "Refinement adds eval_delta.c and specifies a genuine sizeof(int64_t) malloc for zero logical bytes, stored in original rows before tail. This removes malloc0 dependence while preserving nonNULL payload guards and the existing unconditional free(rows) owner. Logical cells/bytes remain zero; actual ENOMEM stays an error. No borrowed dummy pointer or fabricated frame state supplies the witness."
+    }
+  ],
+  "examined_plan_elements": [
+    {
+      "element": "eval_delta.c:seed_gather_controlled zero-cell allocation; eval_stack.c original payload/frame transitions; relation.c begin/append guards and seed_restore_retire",
+      "categories": [
+        "hidden coupling",
+        "unsafe state assumptions",
+        "weak failure handling"
+      ],
+      "ruling": "accepted: real positive allocation supports the existing original-payload protocol without weakening guards. Allocation charge1 precedes malloc, assignment precedes cancellation tail, existing cleanup frees the same original pointer after readers/SINGLE/BULK retirement. Logical cell iteration already has a width0 row-advance path."
+    },
+    {
+      "element": "nullary relation allocations, raw footprint/schema helpers and F0/N3",
+      "categories": [
+        "hidden coupling",
+        "unsafe state assumptions"
+      ],
+      "ruling": "accepted: inspected payload shape calculations produce F0 for restricted fresh noTS width0, and prospective metadata begins with root3 with no child/name/type/compound charges. Existing Arrow builder initializes real root with charge3 then returns for width0. Skip all zero-width column/name/scratch allocations; do not confuse separately owned gather storage with retained relation payload."
+    },
+    {
+      "element": "governed F0 retained authority and positive metadata admission/commit/move/footer",
+      "categories": [
+        "unsafe state assumptions",
+        "weak failure handling"
+      ],
+      "ruling": "accepted: skip payload operations iff computed final_bytes0, preserve exact governed selfEMPTY zero-affiliation original slots, and retain genuine positive metadata operations. Installed zero predicate must remain distinct from historical RELEASED acceptance and require credited scalar0. Existing noGov constructor NULL-or-self identity semantics remain valid only in noGov domain."
+    },
+    {
+      "element": "nullary row-copy cursor and phase10 checkpoint",
+      "categories": [
+        "weak failure handling",
+        "tests that would pass without proving behavior"
+      ],
+      "ruling": "accepted: precharge16, advance original row before tail without accessing columns, and invoke test checkpoint after consumed cursor for both widths. Separate final nrows/published witnesses preserve raw generation parity and stop semantics."
+    },
+    {
+      "element": "independent source-cost proposal",
+      "categories": [
+        "tests that would pass without proving behavior"
+      ],
+      "ruling": "accepted as a source-derived proposal: common352+shape128+root3+install384+2*sizeof(ArrowSchema)+row16*R+publish32+footer320 sums to1219+2*sizeof(ArrowSchema)+16*R; one reserve15+commit4 adds19*G. Setup/gather is outside this append interval. Final actual diff must independently confirm branch charges and expected-128/phase38 minusone; measured run must not define the oracle."
+    },
+    {
+      "element": "genuine nullary fixture and error/stop reachability",
+      "categories": [
+        "tests that would pass without proving behavior",
+        "weak failure handling"
+      ],
+      "ruling": "accepted: actual session insertion with a valid nonNULL input address, real shadow gather and raw twin establish reachability. Existing nullary gather fixture can assert logical bytes0/nonNULL actual allocation. Metadata denial, metadata commit stop, installed EMPTY/COMMITTED identity refusal and same-frame retry are appropriate. Skip payload-only checkpoints and child-allocation fault hooks that cannot execute for root-only schema."
+    },
+    {
+      "element": "established private-spare FLOAT/TS parity and unit boundary",
+      "categories": [
+        "hidden coupling",
+        "over-broad change boundaries",
+        "tests that would pass without proving behavior"
+      ],
+      "ruling": "accepted: integer source preserves FLOAT bits until separately typed target handles them; constructor/setter timestamp setup uses actual positive capacity. These remain existing-route parity tests, not fresh typed/TS activation or authority to fix unrelated production modes."
+    }
+  ],
+  "binding_conditions": [
+    "Keep allocation size physical and nonzero for zero logical cells; retain record.cells/bytes0 for shape checks and original rows ownership until cleanup. Never use a stack/static/dummy gathered pointer that cleanup will free.",
+    "Independently inspect the actual candidate for allocation assignment before tail, original reader/frame cleanup on ENOMEM/cancellation, and absence of any remaining zero-sized relation allocation in the new route. A runtime nullary pass alone is not proof of allocator portability.",
+    "F0 is only fresh zero-admission history. Require exact EMPTY state/identity/governor/owner/transition fields and scalar0; no RELEASED or growth-zero acceptance. Preserve positive F2a branches and exact metadata authority.",
+    "Confirm source-derived work arithmetic against actual candidate and assert final accepted prefix and phase, including row-copy cancellation progress and installed authority refusal after genuine publication.",
+    "Fault tests must use actual reachable seams. Do not claim root-allocation failure coverage using a child-allocation hook that width0 skips. Preserve complete governor/pin/lease accounting and initiating positive errors.",
+    "Qualify exact candidate across four planned profiles, then independent raw and final gates. Unit3 requires its own separately dispatched final checks; this critique makes no unit3 judgment."
+  ],
+  "approval_scope": "Pre-edit acceptance of original F2b plan as amended by this refinement and binding conditions. Not candidate/runtime approval, whole PR readiness, issue completion, or native Windows qualification.",
+  "verification": "Reused prior critique/source inspection and reread refinement, actual raw payload/metadata formulas and nullary gather fixture. No source/test edits or compilers."
+}

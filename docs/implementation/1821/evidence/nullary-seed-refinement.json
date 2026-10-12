@@ -1,0 +1,22 @@
+{
+  "artifact": "implementation_plan_refinement",
+  "producer": "/root",
+  "base_plan": "F2b-plan.json",
+  "prior_critique": "F2b-critique.json",
+  "base_runtime_commit": "3d3196a88bf4b2c3ad499f072130f897eeabd476",
+  "paths": [
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/relation.c",
+    "tests/test_evaluation_observer.c",
+    "docs/implementation/1821/HANDOFF.md",
+    "docs/implementation/1821/evidence"
+  ],
+  "F2b-P1": "In genuine controlled seed gather allocate record.bytes when positive, otherwise sizeof(int64_t), from real malloc after existing allocation charge1. Store returned pointer in original record.rows before tail; logical cells/bytes remain0. Preserve original begin/append nonNULL ownership guards and existing free(record.rows) retirement. No synthetic pointer, phase or token. Actual allocator failure remains ENOMEM; cancellation after allocation retains pointer for original cleanup. Nullary seed must still come from real session insertion/gather.",
+  "forward": "Skip all column/name/row-scratch allocations when ncols0. Build real nullary root schema via existing builder. Compute F0,N3 from raw nullary authority. Skip payload reserve/commit/move iff final_bytes0; metadata positive reserve/commit/move unchanged. Exact F0 installed target token must be original selfEMPTY zero-affiliation even with governor, not RELEASED. Common empty predicate may validate this state. Keep fresh positive branch unchanged.",
+  "cursor": "For nullary copy charge16 per logical tuple and advance seed.row before tail without column access. Existing phase10 test hook follows consumed cursor for both branches. Final nrows/published witnesses unchanged.",
+  "tests": "Extend genuine fresh fixture with width0 and one-column dimensions only. Use real nullary program, session_insert nonNULL input witness, raw append twin, exact/repeat/minusone from independently derived source oracle; metadata denial and allocation/root failure only if genuine existing hook reaches that failure, do not assume child allocation hook fires for width0. Stops12/14/15/10/16; skip payload-only13 and seam17 whenF0. Installed retained EMPTY identity refusal and metadata COMMITTED identity refusal tested with scalar restoration after host return; all ledger/gates baseline exact. Existing original_seed_gather nullary fixture must retain real nonNULL payload and logical bytes0.",
+  "source_cost": "Nullary fresh append: common352+fresh128+Arrow root3+install(384+2*sizeof(ArrowSchema))+16*R+rowpublish32+footer320 +G*(reserve15+commit4) =1219+2*sizeof(ArrowSchema)+16*R+19*G. All setup/gather charges remain outside this append interval. Minusone expects total-128 consumed phase38. This is proposed source algebra and must be independently checked against actual implementation.",
+  "typed_TS": "Only genuine established private spare target constructors/setters. Use int64 source to preserve FLOAT bit-pattern input; typed destination normalizes/rejects according to raw append. Timestamps enabled before control with genuine positive spare capacity. No manufactured unset schema/type/TS history. Keep parity tests separate enough to identify route and positive errors.",
+  "validation": "Fresh sequential normal/ASan/PSA/PSA-ASan focused registered tests+audits, unchanged120 timeout/jobs<=8; freeze exact candidate then RAW and independent finals. Whole observed/defaultdiff integration remains unfinished and failures explicit.",
+  "sequencing": "Unit3 test safety edits committed first; F2b production edits only after refinement critique acceptance."
+}

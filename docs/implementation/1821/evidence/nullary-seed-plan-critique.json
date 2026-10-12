@@ -1,0 +1,88 @@
+{
+  "artifact": "critique_findings",
+  "producer": "/root/architect_final_resume",
+  "plan_artifact": "/home/joykim/.tmp/2144-work/F2b-plan.json",
+  "plan_sha256": "ed843d255cdb619f23bc6eb1ba0573d306c57350a237d47a710dff643d5c4d47",
+  "runtime_baseline": "3d3196a88bf4b2c3ad499f072130f897eeabd476",
+  "verdict": "blocked",
+  "examined_plan_elements": [
+    {
+      "element": "eval_delta.c:wl_columnar_eval_delta_seed_gather_controlled; relation.c:seed_bulk_begin_controlled and seed_append_without_reserve_controlled; eval_stack.c original frame transitions",
+      "categories": [
+        "hidden coupling",
+        "unsafe state assumptions",
+        "tests that would pass without proving behavior"
+      ],
+      "ruling": "blocked: the candidate path list omits eval_delta.c despite a required portable nullary gather change. Gather computes bytes0 then unconditionally malloc(bytes), treats NULL as ENOMEM, and both relation entry guards require nonNULL seed.rows. Frame payload_ready is established by cleanup_seed and does not supply storage or override these guards. Current Linux malloc0 success would not prove portability."
+    },
+    {
+      "element": "relation.c fresh nullary allocation, raw col_rel_set_schema_impl_capacity and append twin",
+      "categories": [
+        "hidden coupling",
+        "weak failure handling"
+      ],
+      "ruling": "accepted direction: raw width0 skips columns/names/scratch while building Arrow root and capacity. Its retained physical F is zero in this restricted noTS domain, metadata remains positive. Fresh helper must branch before every zero-sized allocation and column access, retain distinct schema/row publication witnesses, and derive metadata from raw formula."
+    },
+    {
+      "element": "governed F0/Npositive token admission/install/retirement",
+      "categories": [
+        "unsafe state assumptions",
+        "weak failure handling"
+      ],
+      "ruling": "accepted direction with exact source authority: computed zero payload must skip reserve/commit/move and retain original exact selfEMPTY token, while genuine metadata admission/commit/move remains live. Validate zero identity/governor/owner/state/history and scalar amount, not just bytes0. Do not extend this acceptance to RELEASED growth history. Existing reverse can retire EMPTY fresh and positive metadata independently; new branch must preserve original-address checks and retry semantics."
+    },
+    {
+      "element": "typed/FLOAT and timestamp established private spare fixtures; col_rel_set_column_types_impl and col_rel_enable_timestamps_locked",
+      "categories": [
+        "hidden coupling",
+        "tests that would pass without proving behavior",
+        "over-broad change boundaries"
+      ],
+      "ruling": "accepted as compatibility tests only: type setter requires current width and sets schema_ok; timestamp enable returns at capacity0. Neither produces fresh typed/TS target. Real established constructor/setter setup before frame acquisition is reachable. Existing branch validates finite FLOAT bits, normalizes signed zero, and zeros appended timestamps. Source float predicate rejects NaN and both infinities. Preserve existing rows/timestamps and genuine setter ledger, and ensure sufficient spare payload and timestamp capacity."
+    },
+    {
+      "element": "nullary seed session insertion, gather and original cleanup fixture",
+      "categories": [
+        "tests that would pass without proving behavior",
+        "weak failure handling"
+      ],
+      "ruling": "requires refined proof: session insertion/raw append reject NULL data for positive rows even with width0. A valid caller-owned dummy address is permissible input to real zero-cell insertion, but the production gather must establish its own actual owned portable storage or explicitly support NULL zero-cell representation throughout. Assert real session shadow row count/width and original frame identity; do not supply a fabricated seed payload, phase or token."
+    },
+    {
+      "element": "exact/repeated/minusone and cancellation tests",
+      "categories": [
+        "tests that would pass without proving behavior",
+        "weak failure handling"
+      ],
+      "ruling": "require independent source-derived charge oracle and consumed-phase expectations, as in repaired F2a; measured unlimited cost alone cannot prove exact accounting. Include gather zero-cell allocation failure/stop and reader cleanup, nullary per-row cursor stop, metadata-only accepted-prefix cleanup and installed authority refusal with identity-only restoration."
+    },
+    {
+      "element": "candidate paths and atomic boundary",
+      "categories": [
+        "over-broad change boundaries"
+      ],
+      "ruling": "otherwise coherent fresh-nullary unit with established parity receipts; add necessary portable gather production path and any genuinely required audit/docs changes to revised path scope. Keep unrelated production parity fixes separately designed. No whole STEP/default differential, growth, shared/arena or Windows approval."
+    }
+  ],
+  "blocking_findings": [
+    {
+      "id": "F2b-P1",
+      "severity": "high",
+      "element": "Portable nullary gather-to-BULK reachability",
+      "reason": "The plan only guards zero-width allocations in relation.c. It neither changes nor designs around actual eval_delta.c malloc(record->bytes) where bytes0 can legally returnNULL, and original BULK/append require rows!=NULL. Therefore its promised genuine portable nullary fixture is not established by the proposed production edits.",
+      "required_resolution": "Revise the plan and candidate paths to specify one coherent representation. A small genuine nonzero gather allocation for zero-cell seeds can preserve nonNULL payload guards and existing free(record->rows) retirement while keeping logical cells/bytes zero; explicitly journal allocation before tail and retain real ENOMEM semantics. Alternatively specify and inspect every guard/caller change needed for a NULL zero-cell payload, with no dummy borrowed pointer later freed. State physical/logical allocation accounting, source charges, stop/failure cleanup and a test proving no malloc0 dependency. Obtain revised critique before edits."
+    }
+  ],
+  "required_refinements": [
+    "Use independent source cost algebra, including nullary gather representation and metadata-only commits; tests may observe measurements but must not use them as the sole exact/minusone oracle.",
+    "For FLOAT normalization/rejection tests, prove the actual gathered source still contains the intended negative-zero or nonfinite bits when testing the destination. An integer-declared session seed with genuine insertion and a separately typed target can supply raw bit patterns if a FLOAT-typed source would normalize/reject them before gather. Assert gathered bits and that the destination path is reached.",
+    "For timestamp fixtures explicitly establish capacity and nonzero preexisting timestamps through legitimate setup and compare unchanged prefix plus zero appended suffix. Do not claim timestamp-short growth coverage.",
+    "Clarify row-publication stop checkpoint and durable cursor expectations; distinguish schema installed from rows published and metadata authority retained."
+  ],
+  "verification": [
+    "Read critique-plan skill, plan, committed F2a runtime paths and original frame/gather/retirement flows.",
+    "HEAD equals stated committed F2a baseline and relevant runtime paths have no diff against it.",
+    "No source/test edits or compilation. This is pre-edit plan critique, not unit3 review/final gate."
+  ],
+  "approval_scope": "No F2b source edits approved by this blocked plan verdict. Accepted elements above do not waive F2b-P1. Whole PR readiness blockers remain separate."
+}

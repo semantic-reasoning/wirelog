@@ -1,0 +1,26 @@
+{
+  "artifact": "nullary_seed_source_cost",
+  "producer": "/root",
+  "domain": "Fresh nullary private target, positive R logical tuples, F0/N3, zero logical gather cells/bytes backed by actual nonzero malloc. Existing one-column source formula is unchanged; typed/TS fixtures are genuine established spare routes, not fresh activation.",
+  "source_bindings": {
+    "eval_delta.c:wl_columnar_eval_delta_seed_gather_controlled": "Allocation charge1 still precedes actual malloc, size is logical bytes when nonzero or sizeof(int64_t) otherwise. Original rows pointer stored before charge0 tail; same original seed retirement free. Setup/gather excluded from append interval.",
+    "relation.c:wl_columnar_relation_seed_append_without_reserve_controlled": "128 entry+5*32 original tokens+16 row shape+48 model/address=352; overlap/FLOAT loops absent for nullary fresh target.",
+    "relation.c:wl_columnar_relation_seed_schema_fresh_controlled": "Fresh shape128; zero name-metadata iterations, no zero-width table/lane/name/scratch allocation; raw F0,N3. Root builder3. Skip zero payload reserve/commit/move, retain positive governed metadata reserve15/commit4. Native install384+2*sizeof(ArrowSchema), nullary cursor16 per row with no column access, final rowpublish32.",
+    "relation.c:wl_columnar_relation_seed_bulk_retire_with_seed": "Installed healthy footer128+64+128=320; exact fresh retained EMPTYzero and metadata COMMITTED3 (or noGov EMPTYzero) required before terminal39. No RELEASED/growth history admitted."
+  },
+  "formula": "352+128+3+(384+2*sizeof(ArrowSchema))+16*R+32+320+19*G =1219+2*sizeof(ArrowSchema)+16*R+19*G",
+  "two_row_64bit_example": "With ArrowSchema72, R2: noGov1395, governed1414. Oracle derives from source, never from measured execution.",
+  "minus_one": "Reject final charge128; consumed=expected-128, row==R/column0, schema and rows published, phase38, transaction active and original SINGLE/frame held. Mandatory cleanup validates same authority without new allowance.",
+  "proofs": [
+    "Actual constructor and session nullary $in$H with two tuples; real nonzero staging and logical bytes0.",
+    "Exact/repeated/minusone oracle, stops12/14/15/10/16; copy stop asserts exactly first row consumed without publication.",
+    "Governed retained original selfEMPTY with no affiliation; metadata original COMMITTED governor/owner/bytes3. Identity-only corruption after genuine footer retains original frame; restore saved scalar after host return and retry.",
+    "Metadata denial actual enforcing governor; skip unreachable payload checkpoint13/intermove17 and child-allocation failure hook.",
+    "Established spare INT64/FLOAT negativezero/finite/NaN/Inf, timestamp prior preservation/newzero and width mismatch raw twins; integer source proves input FLOAT bits reached typed destination unchanged."
+  ],
+  "limits": [
+    "No nullary root malloc failure injection claim.",
+    "No fresh typed/TS producer, growth/shared/arena path or whole observed/defaultdiff admission claim.",
+    "Mandatory native allocator/Arrow/checked-credit cleanup execution time excluded; finite install remains explicit exception."
+  ]
+}

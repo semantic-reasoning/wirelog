@@ -1,0 +1,33 @@
+{
+ "artifact":"implementation_plan",
+ "producer":"/root/critic",
+ "unit":"Fresh nullary schema install and established private-spare typed/FLOAT/timestamp parity",
+ "paths_examined":["wirelog/columnar/relation.c:wl_columnar_relation_seed_schema_fresh_controlled","wirelog/columnar/relation.c:wl_columnar_relation_seed_append_without_reserve_controlled","wirelog/columnar/relation.c:col_rel_append_rows_atomic","wirelog/columnar/relation.c:col_rel_set_schema_impl_capacity","wirelog/columnar/relation.c:col_rel_set_column_types_impl","wirelog/columnar/relation.c:col_rel_enable_timestamps_locked","wirelog/columnar/eval_delta.c:wl_columnar_eval_delta_seed_gather_controlled","tests/test_evaluation_observer.c:original_seed_gather","/home/joykim/.tmp/2144-work/F2a-scope-critique.json"],
+ "sequencing":"Start only after F2a exact candidate review/final approval/commit. Rebind to actual committed source; do not treat currently running four-profile tests as this unit qualification.",
+ "candidate_paths":["wirelog/columnar/relation.c","tests/test_evaluation_observer.c","docs/implementation/1821/HANDOFF.md"],
+ "reachability_findings":[
+  "Fresh helper rejects seed.ncols0; its unconditional malloc(table), governed malloc(row_bytes), columns[seed.column] writes and payload commit/move assume positive width.",
+  "Raw lazy schema allocates no column/name/scratch tables for ncols0; it still constructs real Arrow root metadata and capacity. Governed retained F0 does not imply metadata N0.",
+  "Existing established spare branch already validates prospective width/FLOAT bits, normalizes signed zero and initializes timestamps per appended row.",
+  "Public column-type setter requires width equal to current relation width and publishes schema_ok=true. Timestamp enable is a no-op at fresh capacity0. These APIs cannot generate a genuine typed/TS schema-unset target; do not falsify schema_ok to manufacture one."
+ ],
+ "design":[
+  "Extend ONLY fresh-unallocated helper domain to nullary seed width0 with genuine constructor-owned target. Keep all old-payload/metadata/types/TS/compound/shared/arena exclusions. Use raw footprint/schema helpers as authority: capacity_for_rows remains required; physical retained F0 and metadata formula must match raw nullary construction exactly.",
+  "Guard column table/name table/row-scratch allocation behind width>0, so nullary does not depend on malloc0 success. Pointer prefixes remain zero. Build genuine nullary Arrow root using bounded existing schema builder with width0 and null names/types.",
+  "Governed finalF0 route performs no positive payload reservation/commit/move. Retained original target and pending.fresh stay exact selfEMPTY zero affiliation; positive metadata uses genuine reserve/commit/move. Condition token validation and installation on actual computed credited amount, not governor presence alone; never accept arbitrary RELEASED historical credit.",
+  "Preserve metadata-first admission and commit ordering for any present payload. Native publication prevalidates every actually moved slot and retains accepted prefixes as F2a. Nullary publication preserves real Arrow schema/capacity and live metadata obligation; F1 checks exact retained zero route and positive metadata authority before terminal39.",
+  "Row-copy loop handles width0 with bounded per-row cursor advancement and no column access. Advance seed.row once per nullary tuple with explicit precharge/post-effect tail and preserve consumed row cursor across stop. Final nrows publication retains separate seed.published/schema published semantics and raw generation parity.",
+  "No new typed/TS fresh activation in this unit. Add real-constructor established private spare tests using col_rel_new_auto or governed equivalent, genuine col_rel_set_column_types and col_rel_enable_timestamps BEFORE frame/control acquisition. Use existing established seed caller and raw twin; if a parity defect is discovered, derive separate measured source-specific design before broadening production edits."
+ ],
+ "tests":[
+  "Fresh nullary H from alloc/governed alloc; real session nullary $in$H seed with two tuples; gather/SINGLE/BULK/cleanup_seed_append actual original frame path. Match raw append twin schema, capacity, rows/generations and credited ledger. No fabricated phase/token/schema flags.",
+  "Governed fresh F0/Npositive and noGov physical metadata/creditedzero; metadata identity-only refusal after real install leaves consumed38/SINGLE held; restore saved identity after host return and checked retry. Exact selfEMPTY retained route rejection should fault only a saved original identity scalar, not manufacture live credit.",
+  "Deterministic preparation/metadata commit/install/nullary row-copy/row-publication/healthy-footer stops; exact/repeated/minusone measured allowance; initiating positive error precedence; complete terminal credit/pin/lease accounting.",
+  "Established private spare typed/FLOAT fixtures constructed through setters; valid finite and signed-zero input raw twins, invalid NaN/Inf bits only if raw float validity contract rejects them. Width mismatch failure before effect. Timestamp fixtures enabled with real spare capacity; appended timestamps are zero, existing rows/timestamps preserved. Nullary established width mismatch and zero-column count parity covered.",
+  "Every fixture remains no growth, timestamp-short, shared, arena or compound. Ensure governed baseline ledger derives from actual constructor/setter charges, not synthetic scalars."
+ ],
+ "validation":"Four fresh sequential normal/sanitize/PSA/PSA-sanitize profiles on exact candidate with unchanged registered timeout, LTOthreads1 and<=8 aggregate compiler jobs; current state/atomic audits; raw independent review then separate exact-tree design/risk gates. No compilers run by plan author.",
+ "explicit_holds":["Prospective typed/FLOAT schema-unset construction needs an identified actual producer and metadata history design before activation.","Fresh timestamp-enabled source likewise requires genuine producer; capacity0 enable does not establish it.","Existing timestamp-short/growth/shared/arena/compound and growthF0 historical release remain separate units.","Whole observed STEP/default differential/retry/snapshot and complete #1821/Windows qualification remain open."],
+ "atomic_boundary":"One fresh nullary compatibility extension plus directly related raw-parity regression coverage. Existing typed/TS branch compatibility receipts are bounded tests, not permission to patch unrelated modes.",
+ "readiness":"Proposed next-unit plan for independent critique; no source/test edits performed."
+}

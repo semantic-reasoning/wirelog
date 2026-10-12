@@ -1288,7 +1288,10 @@ wl_columnar_eval_delta_seed_gather_controlled(wl_col_session_t *session,
     record->row = 0; record->column = 0;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
-    record->rows = (int64_t *)malloc((size_t)record->bytes);
+    /* Nullary rows still own a real staging allocation. Logical bytes remain
+     * zero; original-frame retirement frees this same pointer. */
+    record->rows = (int64_t *)malloc(record->bytes
+            ? (size_t)record->bytes : sizeof(int64_t));
     if (!record->rows) return ENOMEM;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     while (record->row < record->nrows) {
