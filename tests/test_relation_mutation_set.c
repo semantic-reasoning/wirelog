@@ -1042,10 +1042,10 @@ join_session_destroy(wl_col_session_t *s)
     free(s);
 }
 
-/* #2072: the serial join probe loops append each joined pair under one
- * batch lease instead of a col_rel_set lease per cell.  Each case runs one
- * serial path on a 4096-row output and checks the mutation sets it took,
- * the rows it produced and which path ran. */
+/* #2072: the serial join probe loops append each joined pair under batch
+ * leases, one per storage epoch, instead of a col_rel_set lease per cell.
+ * Each case runs one serial path on a 4096-row output and checks the
+ * mutation sets it took, the rows it produced and which path ran. */
 static col_rel_t *
 join_rel(const char *name, uint32_t ncols)
 {
@@ -1163,6 +1163,17 @@ join_batch_tests(void)
     join_batch_case(JOIN_UNARY);
     join_batch_case(JOIN_DIFF_PERSISTENT);
     join_batch_case(JOIN_DIFF_EPHEMERAL);
+}
+
+/* One step of a budget search: true when the run fit the budget.  Any
+ * other result must be @refusal, the code the searched path reports a
+ * budget refusal with, so that a different failure cannot pass for one
+ * and move the search. */
+static bool
+budget_fits(int rc, int refusal)
+{
+    assert(rc == 0 || rc == refusal);
+    return rc == 0;
 }
 
 /* Batch failure paths (#2072 acceptance, covering #2073's appender). */
@@ -1566,8 +1577,9 @@ filter_denial_tests(void)
             cases[k].compiled, 128, hi, false) == 0);
         while (hi - lo > 1) {
             uint64_t mid = lo + (hi - lo) / 2u;
-            if (denial_run(cases[k].entry, cases[k].timestamped,
-                cases[k].compiled, 128, mid, false) == 0)
+            if (budget_fits(denial_run(cases[k].entry,
+                cases[k].timestamped, cases[k].compiled, 128, mid, false),
+                ENOSPC))
                 hi = mid;
             else
                 lo = mid;
@@ -1633,7 +1645,7 @@ join_denial_tests(void)
     assert(join_denial_run(16, hi, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (join_denial_run(16, mid, false) == 0)
+        if (budget_fits(join_denial_run(16, mid, false), ENOSPC))
             hi = mid;
         else
             lo = mid;
@@ -1642,8 +1654,9 @@ join_denial_tests(void)
 }
 
 /* #2072: antijoin and the serial semijoin probe append their output under
- * one batch lease.  left(k, v) has 4096 rows over 128 keys and right(k)
- * holds the even keys, so each operator keeps half the left rows. */
+ * batch leases, one per storage epoch.  left(k, v) has 4096 rows over 128
+ * keys and right(k) holds the even keys, so each operator keeps half the
+ * left rows. */
 enum { SEMI_KEYS = 128, SEMI_ROWS = 4096 };
 
 static col_rel_t *
@@ -1800,7 +1813,7 @@ semi_denial_tests(void)
         assert(semi_denial_run(anti, 128, hi, false) == 0);
         while (hi - lo > 1) {
             uint64_t mid = lo + (hi - lo) / 2u;
-            if (semi_denial_run(anti, 128, mid, false) == 0)
+            if (budget_fits(semi_denial_run(anti, 128, mid, false), ENOSPC))
                 hi = mid;
             else
                 lo = mid;
@@ -2107,9 +2120,9 @@ batch_set_shared_view_tests(void)
     assert(col_rel_destroy_checked(src) == 0);
 }
 
-/* #2072: reduce appends its groups and updates their aggregates under one
- * batch lease.  The input has 4096 rows in 1024 groups of four, so updates
- * interleave with the output's growths. */
+/* #2072: reduce appends its groups and updates their aggregates under
+ * batch leases, one per storage epoch.  The input has 4096 rows in 1024
+ * groups of four, so updates interleave with the output's growths. */
 enum { REDUCE_ROWS = 4096, REDUCE_PER_GROUP = 4 };
 
 static int64_t
@@ -2390,7 +2403,7 @@ reduce_denial_tests(void)
     assert(reduce_denial_run(128, hi, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (reduce_denial_run(128, mid, false) == 0)
+        if (budget_fits(reduce_denial_run(128, mid, false), ENOSPC))
             hi = mid;
         else
             lo = mid;
@@ -2398,9 +2411,10 @@ reduce_denial_tests(void)
     assert(reduce_denial_run(256, hi, true) == ENOSPC);
 }
 
-/* #2072: LFTJ appends its output rows under one batch lease.  Each input
- * relation(k, v) has @rows rows; the first @matching take key i / @per_key
- * and the rest keys no other relation holds; v is @tag + i. */
+/* #2072: LFTJ appends its output rows under batch leases, one per storage
+ * epoch.  Each input relation(k, v) has @rows rows; the first @matching
+ * take key i / @per_key and the rest key 1000 + i, which lies outside the
+ * matching keys of every call below; v is @tag + i. */
 static void
 lftj_add(wl_col_session_t *sess, const char *name, uint32_t rows,
     uint32_t matching, uint32_t per_key, int64_t tag)
@@ -2468,7 +2482,7 @@ lftj_batch_tests(void)
         lftj_add(sess, "b", ROWS, ROWS, PER_KEY, 1000);
         lftj_add(sess, "c", ROWS, ROWS, PER_KEY, 2000);
         /* Registering the inputs reserves session state that this bare
-         * session's teardown does not release; measure from here. */
+         * session's teardown does not fully release; measure from here. */
         uint64_t baseline = ref ? governor_reserved(ref) : 0;
         uint64_t acquisitions = 0;
         col_rel_t *out = NULL;
@@ -2539,7 +2553,7 @@ lftj_denial_tests(void)
     assert(lftj_denial_run(8, hi, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (lftj_denial_run(8, mid, false) == 0)
+        if (budget_fits(lftj_denial_run(8, mid, false), ENOSPC))
             hi = mid;
         else
             lo = mid;
@@ -2548,7 +2562,7 @@ lftj_denial_tests(void)
 }
 
 /* #2072: the nonrecursive TDD slice copy and the recursive TDD worker's
- * dedup append their rows under one batch lease. */
+ * dedup append their rows under batch leases, one per storage epoch. */
 static col_rel_t *
 slice_source(uint32_t rows)
 {
@@ -2634,7 +2648,7 @@ slice_denial_tests(void)
     assert(slice_denial_run(128, hi, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (slice_denial_run(128, mid, false) == 0)
+        if (budget_fits(slice_denial_run(128, mid, false), ENOMEM))
             hi = mid;
         else
             lo = mid;
@@ -2700,7 +2714,8 @@ dedup_append_tests(void)
 }
 
 /* #2072: rows copied into a fresh relation, as the TDD insert route's
- * splits and the snapshot insert's delta are, go under one batch lease. */
+ * splits and the snapshot insert's delta are, go under batch leases, one
+ * per storage epoch. */
 static col_rel_t *
 copy_source(uint32_t rows)
 {
@@ -2775,7 +2790,7 @@ copy_rows_denial_tests(void)
     assert(copy_rows_denial_run(128, hi, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (copy_rows_denial_run(128, mid, false) == 0)
+        if (budget_fits(copy_rows_denial_run(128, mid, false), ENOMEM))
             hi = mid;
         else
             lo = mid;
@@ -2804,7 +2819,7 @@ snapshot_insert_copy_tests(void)
     wl_plan_t plan;
     memset(&plan, 0, sizeof(plan));
     /* Registering e reserves session state that this bare session's
-     * teardown does not release; measure from here. */
+     * teardown does not fully release; measure from here. */
     uint64_t baseline = governor_reserved(ref);
     uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
     assert(wl_columnar_session_test_snapshot_insert((wl_session_t *)sess,
@@ -2814,8 +2829,8 @@ snapshot_insert_copy_tests(void)
     assert(acquisitions >= 1 && acquisitions <= 16);
     assert(e->nrows == ROWS && e->base_nrows == BASE);
     assert(governor_reserved(ref) == baseline);
-    /* The copy is governed: with no headroom left it is refused with
-     * ENOSPC, and the refusal leaves nothing reserved. */
+    /* The copy is governed: with no headroom left, building it is refused
+     * with ENOSPC, and the refusal leaves nothing reserved. */
     atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
             ref)->usable_bytes, baseline, memory_order_release);
     assert(wl_columnar_session_test_snapshot_insert((wl_session_t *)sess,
