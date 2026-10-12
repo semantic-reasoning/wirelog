@@ -3143,8 +3143,12 @@ wl_columnar_relation_writer_acquire_controlled(
 * Timestamped growth requires both sides tracked and destination timestamp
 * capacity equal to its old column capacity. Other growth shapes, aliases,
 * COW, arena, compound data and schema installation remain unsupported.
-* Raw owner resolution, governor/ledger operations, allocation runtime and
-* mandatory cleanup are excluded; this is not a whole-call work bound.
+* Governed growth requires positive committed retained credit. Its bounded
+* reservation preparation/admission/commit adds75 units plus one per extra
+* total-CAS round; interrupted begin restores its own credit, while interrupted
+* commit retains credit through staged-buffer disposal before rollback.
+* Raw owner resolution, ledger operations, allocation runtime and mandatory
+* credit/gate cleanup are excluded; this is not a whole-call work bound.
 * A stop leaves logical rows and generations unchanged. Preallocated spare
 * cells may be written; failed growth preserves the original physical image.
 * Descriptors must remain alive and externally serialized during the call. */

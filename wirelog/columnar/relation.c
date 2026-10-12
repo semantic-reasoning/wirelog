@@ -6670,6 +6670,90 @@ wl_columnar_relation_growth_malloc(size_t bytes)
     return malloc(bytes);
 }
 
+/* Governed allocated growth only: the retained token is the original
+ * committed positive credit. P40 counts txn zero9 + nested init10 + output1,
+ * guards7 + result predicates5 + denial flag1 + admitted stores3 + dispatch4.
+ * Nested init includes its null check, repeated seven-field zero, identity
+ * and state stores. Local transport and charge/tail plumbing are excluded.
+ * A refused charge does not initialize pending or touch the active output.
+ * A stopped primitive restores its own credit: active remains false, so the
+ * caller must not roll it back again. Successful begin records authority
+ * before any subsequent callback. */
+static int
+wl_columnar_relation_growth_begin_controlled(col_rel_t *r,
+    uint64_t incoming_bytes, col_rel_payload_txn_t *pending, bool *active,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 40);
+    if (rc != 0)
+        return rc;
+    wl_columnar_memory_admission_status_t status;
+    if (!r || !pending || !active || !control || !r->memory_governor
+        || !r->retained_reserved_bytes || !incoming_bytes) {
+        /* Invalid guards share the final typed-result dispatch below. */
+        status = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+    } else {
+        *active = false;
+        col_rel_payload_txn_init(pending);
+        rc = wl_columnar_relation_work_tail(control, 40);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_memory_governor_begin_growth_controlled(
+            &r->retained_reservation, incoming_bytes, &status, control);
+        if (rc != 0)
+            return rc;
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        pending->growth = true;
+        pending->incoming_bytes = incoming_bytes;
+        *active = true;
+        return 0;
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        r->memory_budget_denial_pending = true;
+        return ENOMEM;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+/* Caller establishes valid private pointers and active replacing authority.
+* K11: fault predicate/reset/return3, execution predicate/return2,
+* committed predicate/return2, three authority stores3 and success return1.
+* Fault slots are conservatively prepaid even in production. The primitive
+* adds its own9 units. Every error retains active authority until the caller
+* frees physical staging and rolls back; true commit starts mandatory
+* publication with no later callback, cancellation or fallible operation. */
+static int
+wl_columnar_relation_growth_commit_controlled(col_rel_t *r,
+    col_rel_payload_txn_t *pending, bool *active,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 11);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_relation_work_tail(control, 11);
+    if (rc != 0)
+        return rc;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_reservation_commit) {
+        wl_columnar_relation_test_fail_reservation_commit = false;
+        return ENOMEM;
+    }
+#endif
+    bool committed;
+    rc = wl_columnar_memory_governor_commit_growth_controlled(
+        &r->retained_reservation, &committed, control);
+    if (rc != 0)
+        return rc;
+    if (!committed)
+        return ENOMEM;
+    r->retained_reserved_bytes += pending->incoming_bytes;
+    pending->growth = false;
+    *active = false;
+    return 0;
+}
+
 static int
 wl_columnar_relation_prepare_growth_controlled(col_rel_t *dst,
     uint64_t lane_bytes, uint64_t table_bytes, uint64_t timestamp_bytes,
@@ -6767,7 +6851,6 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     int64_t **output_columns;
     col_delta_timestamp_t *output_timestamps;
     col_rel_payload_txn_t pending;
-    wl_columnar_memory_reservation_t previous;
     uint64_t final_bytes = 0, ledger_before = 0, ledger_after = 0;
     int rc;
     if (!control)
@@ -6968,12 +7051,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         }
         (void)old_bytes; /* Validated complete old shape, including auxiliaries. */
         dst->memory_budget_denial_pending = false;
-        rc = col_rel_payload_txn_begin(dst, final_bytes, incoming, &pending);
-        if (rc < 0) {
-            rc = -rc;
-            goto done;
+        if (dst->memory_governor) {
+            rc = wl_columnar_relation_growth_begin_controlled(dst, incoming,
+                    &pending, &transaction_active, control);
+            if (rc != 0)
+                goto done;
         }
-        transaction_active = rc > 0;
         rc = wl_columnar_relation_prepare_growth_controlled(dst,
                 lane_bytes, table_bytes, timestamp_bytes,
                 &prepared_columns, &prepared_timestamps, control);
@@ -6999,10 +7082,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     }
     rc = wl_evaluation_control_charge(control, 0);
     if (rc == 0 && growth) {
-        rc = col_rel_publish_payload_txn(dst, &pending, final_bytes, &previous);
-        if (rc != 0)
-            goto done;
-        transaction_active = false;
+        if (transaction_active) {
+            rc = wl_columnar_relation_growth_commit_controlled(dst, &pending,
+                    &transaction_active, control);
+            if (rc != 0)
+                goto done;
+        }
         int64_t **old_columns = dst->columns;
         col_delta_timestamp_t *old_timestamps = dst->timestamps;
         dst->columns = prepared_columns;
@@ -7016,7 +7101,6 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
          * every old physical buffer has been retired. No result work here. */
         col_columns_free(old_columns, dst->ncols);
         free(old_timestamps);
-        col_rel_release_retired_reservation(&previous);
         wl_columnar_relation_retire_payload_credit_known(dst, final_bytes);
         wl_columnar_relation_ledger_reconcile_known(dst, ledger_before,
             ledger_after);
