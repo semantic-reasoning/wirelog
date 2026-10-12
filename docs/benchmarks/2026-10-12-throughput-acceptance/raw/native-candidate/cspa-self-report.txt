@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 686  of event 'cpu_core/cycles/u'
+# Event count (approx.): 8295283314
+#
+# Overhead  Symbol                                                          IPC   [IPC Coverage]
+# ........  ..............................................................  ....................
+#
+    29.79%  [.] col_rel_append_row_impl.part.0.constprop.0                  -      -            
+     9.29%  [.] col_rel_mutation_lease_validate_binding.lto_priv.0          -      -            
+     8.74%  [.] wl_columnar_merge_consolidate_checked.lto_priv.0            -      -            
+     5.44%  [.] col_join_keys_match_rel.lto_priv.0                          -      -            
+     3.72%  [.] wl_columnar_source_access_writer_validate                   -      -            
+     3.68%  [.] col_rel_mutation_lease_validate                             -      -            
+     3.36%  [.] col_join_pair_value                                         -      -            
+     3.36%  [.] wl_columnar_hash_value.lto_priv.2                           -      -            
+     3.35%  [.] col_rel_append_all_impl.constprop.0                         -      -            
+     2.79%  [.] col_join_append_pair                                        -      -            
+     2.52%  [.] wl_columnar_join_diff_op                                    -      -            
+     2.40%  [.] wl_columnar_source_access_writer_thread_equal.lto_priv.1    -      -            
+     2.08%  [.] col_join_output_limit_reached                               -      -            
+     1.66%  [.] col_rel_prepare_resize.constprop.0                          -      -            
+     1.62%  [.] wl_columnar_value_key.lto_priv.0                            -      -            
+     1.46%  [.] col_rel_storage_owner_resolve                               -      -            
+     1.34%  [.] wl_columnar_value_equal                                     -      -            
+     1.32%  [.] wl_columnar_value_equal.lto_priv.1                          -      -            
+     1.31%  [.] col_rel_append_batch_row                                    -      -            
+     1.20%  [.] col_rel_timestamp_shape_valid.lto_priv.0                    -      -            
+     1.02%  [.] thrd_equal@plt                                              -      -            
+     0.99%  [.] col_op_consolidate_hash_rows_compare                        -      -            
+     0.92%  [.] wl_columnar_source_access_writer_release.lto_priv.0         -      -            
+     0.73%  [.] thrd_current@plt                                            -      -            
+     0.61%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0         -      -            
+     0.59%  [.] col_op_consolidate_hash_rows_sift_down                      -      -            
+     0.55%  [.] wl_columnar_relation_generation_advance.isra.0              -      -            
+     0.46%  [.] wl_columnar_semijoin_op                                     -      -            
+     0.45%  [.] col_rel_append_row                                          -      -            
+     0.44%  [.] col_rel_mutation_set_unwind.lto_priv.0                      -      -            
+     0.44%  [.] wl_columnar_radix_rows_prepared.isra.0                      -      -            
+     0.30%  [.] col_rel_append_row_impl.constprop.0                         -      -            
+     0.30%  [.] free@plt                                                    -      -            
+     0.30%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0         -      -            
+     0.28%  [k] 0xffffffffaf401280                                          -      -            
+     0.16%  [.] col_rel_merge_k                                             -      -            
+     0.15%  [.] col_rel_row_copy_out.lto_priv.0                             -      -            
+     0.15%  [.] col_diff_arrangement_deep_copy_with_memory_governor_status  -      -            
+     0.15%  [.] col_rel_row_copy_in_raw.isra.0                              -      -            
+     0.15%  [.] col_op_consolidate_incremental_delta                        -      -            
+     0.15%  [.] col_rel_mutation_set_finish                                 -      -            
+     0.14%  [.] col_op_consolidate_hash_rows_swap                           -      -            
+     0.14%  [.] wl_columnar_relation_touch_view.lto_priv.2                  -      -            
+     0.02%  [.] __libc_calloc                                               -      -            
+
+
+#
+# (Tip: For latency profiling, try: perf record/report --latency)
+#

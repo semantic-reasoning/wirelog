@@ -1,0 +1,7 @@
+{
+  "base_commit": "691116500ac45407b73244850641c646877fdb43",
+  "measured_source_tree": "7dcfdbf2f6604c20a9ae73191d06e1dfd50291af",
+  "source_head_tree_is_measured_tree": true,
+  "candidate_patch_sha256": null,
+  "note": "HEAD is the unmodified base commit; candidate source contains the recorded two-path working-tree patch. measured-source.sha256 and post-run integrity check identify actual compiled source."
+}

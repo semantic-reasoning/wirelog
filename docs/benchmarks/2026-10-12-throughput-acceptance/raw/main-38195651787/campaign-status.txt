@@ -1,0 +1,5 @@
+acquisition_status=complete
+evidence_eligibility=eligible
+performance_verdict=pass
+meson_exit=0
+coverage_status=partial_smoke

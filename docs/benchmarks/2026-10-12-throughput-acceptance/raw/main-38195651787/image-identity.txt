@@ -1,0 +1,3 @@
+tag=semantic-reasoning:ubuntu26
+image_id=sha256:c04b38dee72397a66dfe79ccc0ee5b3ef3f7c2d3181c03fdc3e358d7791da51e
+docker_network=host

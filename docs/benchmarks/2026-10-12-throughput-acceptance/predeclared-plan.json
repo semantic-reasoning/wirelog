@@ -1,0 +1,14 @@
+{
+  "base_commit": "691116500ac45407b73244850641c646877fdb43",
+  "base_tree": "7dcfdbf2f6604c20a9ae73191d06e1dfd50291af",
+  "candidate_code_tree": "924c5e8e921344b97ee18c4f5681548d6e58e669",
+  "code_diff_sha256": "f8050974061b60d54914cc003681c0dad2f9d19b6fcbb95930625367f61b31f8",
+  "order": [
+    "base-1",
+    "candidate-1",
+    "candidate-2",
+    "base-2"
+  ],
+  "acceptance": "all four blocks complete eligible, exact correctness, nine raw samples, existing CRDT38120/CSPA2050ms targets, CoV<=3%; retain all blocks regardless of outcome; no rerun until green",
+  "comparison": "same host/image/compiler/options/fixtures/CPU0/W1; compare both workloads and both order pairs; do not infer historical regression ownership"
+}

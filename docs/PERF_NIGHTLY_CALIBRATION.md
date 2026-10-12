@@ -63,6 +63,10 @@ them.
   separate. These acquisitions identify no regression owner and authorize no
   admission optimization or change to #1913's thresholds.
 
+The subsequent [#1913 measured admission optimization and controlled
+throughput acceptance](benchmarks/2026-10-12-throughput-acceptance/README.md)
+uses this adopted profile and keeps the same thresholds and correctness gates.
+
 ## Current execution contract
 
 Issue [#2022](https://github.com/semantic-reasoning/wirelog/issues/2022)

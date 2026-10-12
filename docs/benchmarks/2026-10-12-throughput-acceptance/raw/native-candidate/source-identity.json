@@ -1,0 +1,13 @@
+{
+  "base_commit": "691116500ac45407b73244850641c646877fdb43",
+  "measured_code_tree": "924c5e8e921344b97ee18c4f5681548d6e58e669",
+  "dirty_paths": [
+    "wirelog/columnar/relation.c",
+    "tests/test_memory_admission_relation.c"
+  ],
+  "source_sha256": {
+    "wirelog/columnar/relation.c": "6c54e0ccc73733898a774017530f0538cbfe7ee52d1ca357361e5899bcf04e10",
+    "tests/test_memory_admission_relation.c": "6bb89c19d3e605e3a76b763a8e1d6a1e7886f19b5d18d2630a0ceaad54d090f0"
+  },
+  "note": "Native GCC16 diagnostic attribution only; not Docker acceptance timings."
+}

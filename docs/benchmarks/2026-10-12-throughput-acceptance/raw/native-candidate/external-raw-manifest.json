@@ -1,0 +1,22 @@
+{
+  "cspa.perf.data": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-candidate-profile/evidence/cspa.perf.data",
+    "size_bytes": 5847808,
+    "sha256": "ac265e400b23f0b737f4d5706a17c4f444fb46b0a9220478cf1501ee860a818f"
+  },
+  "cspa-events.txt": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-candidate-profile/evidence/cspa-events.txt",
+    "size_bytes": 1117287,
+    "sha256": "0c8576409f7bee093fc2689222186440033f693eb10eff05ca0d46c55d353012"
+  },
+  "crdt.perf.data": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-candidate-profile/evidence/crdt.perf.data",
+    "size_bytes": 57930904,
+    "sha256": "9b7aed8da548bd40ed414999acd5679e50d1da5ac16035747582c9a339122799"
+  },
+  "crdt-events.txt": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-candidate-profile/evidence/crdt-events.txt",
+    "size_bytes": 9921512,
+    "sha256": "e52bae691e7e652832517e4b8ed498a19b3c604bfcb668e151446c0dfc57f838"
+  }
+}

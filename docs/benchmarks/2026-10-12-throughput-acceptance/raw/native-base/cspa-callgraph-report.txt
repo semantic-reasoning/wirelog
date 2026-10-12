@@ -1,0 +1,2257 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 754  of event 'cpu_core/cycles/u'
+# Event count (approx.): 9185572499
+#
+# Children      Self  Symbol                                                                 IPC   [IPC Coverage]
+# ........  ........  .....................................................................  ....................
+#
+    99.32%     0.00%  [.] col_session_snapshot_impl (inlined)                                -      -            
+            |
+            ---col_eval_stratum.part.0
+               |          
+                --99.19%--wl_columnar_eval_serial_framed_relation
+                          wl_columnar_eval_plan_body
+                          |          
+                           --98.92%--col_op_k_fusion (inlined)
+                                     col_op_k_fusion (inlined)
+                                     col_op_k_fusion_serial.lto_priv.0
+                                     |          
+                                     |--96.22%--wl_columnar_eval_plan_body
+                                     |          |          
+                                     |          |--74.63%--wl_columnar_join_diff_op
+                                     |          |          |          
+                                     |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+                                     |          |          |          |          
+                                     |          |          |          |--16.02%--col_rel_mutation_lease_validate
+                                     |          |          |          |          |          
+                                     |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                                     |          |          |          |          |          |          
+                                     |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+                                     |          |          |          |          |          
+                                     |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+                                     |          |          |          |                     |          
+                                     |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+                                     |          |          |          |                                |          
+                                     |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                                     |          |          |          |                                           |          
+                                     |          |          |          |                                            --1.21%--thrd_equal@plt
+                                     |          |          |          |          
+                                     |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+                                     |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                                     |          |          |          |          
+                                     |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+                                     |          |          |          |          col_rel_prepare_resize (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                                     |          |          |          |          
+                                     |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                                     |          |          |          
+                                     |          |          |--4.15%--col_join_output_limit_reached
+                                     |          |          |          
+                                     |          |          |--4.04%--col_join_append_pair
+                                     |          |          |          |          
+                                     |          |          |           --2.55%--col_join_pair_value
+                                     |          |          |                     |          
+                                     |          |          |                      --1.46%--col_join_pair_value
+                                     |          |          |          
+                                     |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |           --0.61%--wl_columnar_value_equal
+                                     |          |          |          
+                                     |          |           --0.96%--col_rel_append_batch_row
+                                     |          |                     |          
+                                     |          |                      --0.55%--col_rel_append_batch_row
+                                     |          |          
+                                     |          |--15.05%--col_op_consolidate_diff (inlined)
+                                     |          |          |          
+                                     |          |           --14.92%--col_op_consolidate_kway_merge (inlined)
+                                     |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                                     |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                                     |          |                     |          
+                                     |          |                      --14.85%--col_op_consolidate_hash_dedup (inlined)
+                                     |          |                                |          
+                                     |          |                                |--5.32%--col_op_consolidate_hash_row (inlined)
+                                     |          |                                |          |          
+                                     |          |                                |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                     |          |                                |                     |          
+                                     |          |                                |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                     |          |                                |          
+                                     |          |                                |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                     |          |                                |          |          
+                                     |          |                                |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                                     |          |                                |          
+                                     |          |                                 --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                     |          |                                           col_op_consolidate_hash_rows_sift_down
+                                     |          |                                           |          
+                                     |          |                                            --0.79%--col_op_consolidate_hash_rows_compare
+                                     |          |          
+                                     |          |--3.58%--wl_columnar_semijoin_op
+                                     |          |          |          
+                                     |          |           --3.30%--col_rel_append_row
+                                     |          |                     |          
+                                     |          |                     |--1.24%--col_rel_mutation_set_finish
+                                     |          |                     |          |          
+                                     |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                     |          |                     |          
+                                     |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                     |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                     |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                     |          |                     |          
+                                     |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+                                     |          |          
+                                     |           --2.91%--col_op_concat (inlined)
+                                     |                     col_op_concat (inlined)
+                                     |                     col_rel_append_all_impl.constprop.0
+                                     |          
+                                      --2.70%--col_rel_merge_k
+                                                |          
+                                                |--1.88%--col_rel_merge_k
+                                                |          |          
+                                                |           --1.75%--col_rel_append_row
+                                                |                     |          
+                                                |                      --0.79%--col_rel_mutation_set_finish
+                                                |          
+                                                 --0.82%--col_rel_append_row
+                                                           |          
+                                                            --0.68%--col_rel_mutation_set_finish
+
+    99.27%     0.00%  [.] run_cspa_once_ (inlined)                                           -      -            
+            |          
+             --99.26%--wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       |          
+                        --99.12%--wl_columnar_eval_serial_framed_relation
+                                  wl_columnar_eval_plan_body
+                                  |          
+                                   --98.86%--col_op_k_fusion (inlined)
+                                             col_op_k_fusion (inlined)
+                                             col_op_k_fusion_serial.lto_priv.0
+                                             |          
+                                             |--96.16%--wl_columnar_eval_plan_body
+                                             |          |          
+                                             |          |--74.63%--wl_columnar_join_diff_op
+                                             |          |          |          
+                                             |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+                                             |          |          |          |          
+                                             |          |          |          |--16.02%--col_rel_mutation_lease_validate
+                                             |          |          |          |          |          
+                                             |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                                             |          |          |          |          |          |          
+                                             |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+                                             |          |          |          |          |          
+                                             |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+                                             |          |          |          |                     |          
+                                             |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+                                             |          |          |          |                                |          
+                                             |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                                             |          |          |          |                                           |          
+                                             |          |          |          |                                            --1.21%--thrd_equal@plt
+                                             |          |          |          |          
+                                             |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+                                             |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                                             |          |          |          |          
+                                             |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+                                             |          |          |          |          
+                                             |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+                                             |          |          |          |          col_rel_prepare_resize (inlined)
+                                             |          |          |          |          
+                                             |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                                             |          |          |          |          
+                                             |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                                             |          |          |          |          
+                                             |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                                             |          |          |          
+                                             |          |          |--4.15%--col_join_output_limit_reached
+                                             |          |          |          
+                                             |          |          |--4.04%--col_join_append_pair
+                                             |          |          |          |          
+                                             |          |          |           --2.55%--col_join_pair_value
+                                             |          |          |                     |          
+                                             |          |          |                      --1.46%--col_join_pair_value
+                                             |          |          |          
+                                             |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+                                             |          |          |          |          
+                                             |          |          |           --0.61%--wl_columnar_value_equal
+                                             |          |          |          
+                                             |          |           --0.96%--col_rel_append_batch_row
+                                             |          |                     |          
+                                             |          |                      --0.55%--col_rel_append_batch_row
+                                             |          |          
+                                             |          |--14.98%--col_op_consolidate_diff (inlined)
+                                             |          |          |          
+                                             |          |           --14.85%--col_op_consolidate_kway_merge (inlined)
+                                             |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                                             |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                                             |          |                     col_op_consolidate_hash_dedup (inlined)
+                                             |          |                     |          
+                                             |          |                     |--5.32%--col_op_consolidate_hash_row (inlined)
+                                             |          |                     |          |          
+                                             |          |                     |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                             |          |                     |                     |          
+                                             |          |                     |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                             |          |                     |          
+                                             |          |                     |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                             |          |                     |          |          
+                                             |          |                     |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                                             |          |                     |          
+                                             |          |                      --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                             |          |                                col_op_consolidate_hash_rows_sift_down
+                                             |          |                                |          
+                                             |          |                                 --0.79%--col_op_consolidate_hash_rows_compare
+                                             |          |          
+                                             |          |--3.58%--wl_columnar_semijoin_op
+                                             |          |          |          
+                                             |          |           --3.30%--col_rel_append_row
+                                             |          |                     |          
+                                             |          |                     |--1.24%--col_rel_mutation_set_finish
+                                             |          |                     |          |          
+                                             |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                             |          |                     |          
+                                             |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                             |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                             |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                             |          |                     |          
+                                             |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+                                             |          |          
+                                             |           --2.91%--col_op_concat (inlined)
+                                             |                     col_op_concat (inlined)
+                                             |                     col_rel_append_all_impl.constprop.0
+                                             |          
+                                              --2.70%--col_rel_merge_k
+                                                        |          
+                                                        |--1.88%--col_rel_merge_k
+                                                        |          |          
+                                                        |           --1.75%--col_rel_append_row
+                                                        |                     |          
+                                                        |                      --0.79%--col_rel_mutation_set_finish
+                                                        |          
+                                                         --0.82%--col_rel_append_row
+                                                                   |          
+                                                                    --0.68%--col_rel_mutation_set_finish
+
+    99.26%     0.00%  [.] wl_session_snapshot (inlined)                                      -      -            
+            |
+            ---col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               |          
+                --99.12%--wl_columnar_eval_serial_framed_relation
+                          wl_columnar_eval_plan_body
+                          |          
+                           --98.86%--col_op_k_fusion (inlined)
+                                     col_op_k_fusion (inlined)
+                                     col_op_k_fusion_serial.lto_priv.0
+                                     |          
+                                     |--96.16%--wl_columnar_eval_plan_body
+                                     |          |          
+                                     |          |--74.63%--wl_columnar_join_diff_op
+                                     |          |          |          
+                                     |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+                                     |          |          |          |          
+                                     |          |          |          |--16.02%--col_rel_mutation_lease_validate
+                                     |          |          |          |          |          
+                                     |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                                     |          |          |          |          |          |          
+                                     |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+                                     |          |          |          |          |          
+                                     |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+                                     |          |          |          |                     |          
+                                     |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+                                     |          |          |          |                                |          
+                                     |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                                     |          |          |          |                                           |          
+                                     |          |          |          |                                            --1.21%--thrd_equal@plt
+                                     |          |          |          |          
+                                     |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+                                     |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                                     |          |          |          |          
+                                     |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+                                     |          |          |          |          col_rel_prepare_resize (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                                     |          |          |          |          
+                                     |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                                     |          |          |          
+                                     |          |          |--4.15%--col_join_output_limit_reached
+                                     |          |          |          
+                                     |          |          |--4.04%--col_join_append_pair
+                                     |          |          |          |          
+                                     |          |          |           --2.55%--col_join_pair_value
+                                     |          |          |                     |          
+                                     |          |          |                      --1.46%--col_join_pair_value
+                                     |          |          |          
+                                     |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |           --0.61%--wl_columnar_value_equal
+                                     |          |          |          
+                                     |          |           --0.96%--col_rel_append_batch_row
+                                     |          |                     |          
+                                     |          |                      --0.55%--col_rel_append_batch_row
+                                     |          |          
+                                     |          |--14.98%--col_op_consolidate_diff (inlined)
+                                     |          |          |          
+                                     |          |           --14.85%--col_op_consolidate_kway_merge (inlined)
+                                     |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                                     |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                                     |          |                     col_op_consolidate_hash_dedup (inlined)
+                                     |          |                     |          
+                                     |          |                     |--5.32%--col_op_consolidate_hash_row (inlined)
+                                     |          |                     |          |          
+                                     |          |                     |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                     |          |                     |                     |          
+                                     |          |                     |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                     |          |                     |          
+                                     |          |                     |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                     |          |                     |          |          
+                                     |          |                     |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                                     |          |                     |          
+                                     |          |                      --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                     |          |                                col_op_consolidate_hash_rows_sift_down
+                                     |          |                                |          
+                                     |          |                                 --0.79%--col_op_consolidate_hash_rows_compare
+                                     |          |          
+                                     |          |--3.58%--wl_columnar_semijoin_op
+                                     |          |          |          
+                                     |          |           --3.30%--col_rel_append_row
+                                     |          |                     |          
+                                     |          |                     |--1.24%--col_rel_mutation_set_finish
+                                     |          |                     |          |          
+                                     |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                     |          |                     |          
+                                     |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                     |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                     |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                     |          |                     |          
+                                     |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+                                     |          |          
+                                     |           --2.91%--col_op_concat (inlined)
+                                     |                     col_op_concat (inlined)
+                                     |                     col_rel_append_all_impl.constprop.0
+                                     |          
+                                      --2.70%--col_rel_merge_k
+                                                |          
+                                                |--1.88%--col_rel_merge_k
+                                                |          |          
+                                                |           --1.75%--col_rel_append_row
+                                                |                     |          
+                                                |                      --0.79%--col_rel_mutation_set_finish
+                                                |          
+                                                 --0.82%--col_rel_append_row
+                                                           |          
+                                                            --0.68%--col_rel_mutation_set_finish
+
+    99.20%     0.00%  [.] col_eval_stratum.part.0                                            -      -            
+            |          
+             --99.06%--wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       |          
+                        --98.80%--col_op_k_fusion (inlined)
+                                  col_op_k_fusion (inlined)
+                                  col_op_k_fusion_serial.lto_priv.0
+                                  |          
+                                  |--96.10%--wl_columnar_eval_plan_body
+                                  |          |          
+                                  |          |--74.63%--wl_columnar_join_diff_op
+                                  |          |          |          
+                                  |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+                                  |          |          |          |          
+                                  |          |          |          |--16.02%--col_rel_mutation_lease_validate
+                                  |          |          |          |          |          
+                                  |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                                  |          |          |          |          |          |          
+                                  |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+                                  |          |          |          |          |          
+                                  |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+                                  |          |          |          |                     |          
+                                  |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+                                  |          |          |          |                                |          
+                                  |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                                  |          |          |          |                                           |          
+                                  |          |          |          |                                            --1.21%--thrd_equal@plt
+                                  |          |          |          |          
+                                  |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+                                  |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                                  |          |          |          |          
+                                  |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+                                  |          |          |          |          
+                                  |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+                                  |          |          |          |          col_rel_prepare_resize (inlined)
+                                  |          |          |          |          
+                                  |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                                  |          |          |          |          
+                                  |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                                  |          |          |          |          
+                                  |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                                  |          |          |          
+                                  |          |          |--4.15%--col_join_output_limit_reached
+                                  |          |          |          
+                                  |          |          |--4.04%--col_join_append_pair
+                                  |          |          |          |          
+                                  |          |          |           --2.55%--col_join_pair_value
+                                  |          |          |                     |          
+                                  |          |          |                      --1.46%--col_join_pair_value
+                                  |          |          |          
+                                  |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+                                  |          |          |          |          
+                                  |          |          |           --0.61%--wl_columnar_value_equal
+                                  |          |          |          
+                                  |          |           --0.96%--col_rel_append_batch_row
+                                  |          |                     |          
+                                  |          |                      --0.55%--col_rel_append_batch_row
+                                  |          |          
+                                  |          |--14.98%--col_op_consolidate_diff (inlined)
+                                  |          |          |          
+                                  |          |           --14.85%--col_op_consolidate_kway_merge (inlined)
+                                  |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                                  |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                                  |          |                     col_op_consolidate_hash_dedup (inlined)
+                                  |          |                     |          
+                                  |          |                     |--5.32%--col_op_consolidate_hash_row (inlined)
+                                  |          |                     |          |          
+                                  |          |                     |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                  |          |                     |                     |          
+                                  |          |                     |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                  |          |                     |          
+                                  |          |                     |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                  |          |                     |          |          
+                                  |          |                     |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                                  |          |                     |          
+                                  |          |                      --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                  |          |                                col_op_consolidate_hash_rows_sift_down
+                                  |          |                                |          
+                                  |          |                                 --0.79%--col_op_consolidate_hash_rows_compare
+                                  |          |          
+                                  |          |--3.58%--wl_columnar_semijoin_op
+                                  |          |          |          
+                                  |          |           --3.30%--col_rel_append_row
+                                  |          |                     |          
+                                  |          |                     |--1.24%--col_rel_mutation_set_finish
+                                  |          |                     |          |          
+                                  |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                  |          |                     |          
+                                  |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                  |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                  |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                  |          |                     |          
+                                  |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+                                  |          |          
+                                  |           --2.91%--col_op_concat (inlined)
+                                  |                     col_op_concat (inlined)
+                                  |                     col_rel_append_all_impl.constprop.0
+                                  |          
+                                   --2.70%--col_rel_merge_k
+                                             |          
+                                             |--1.88%--col_rel_merge_k
+                                             |          |          
+                                             |           --1.75%--col_rel_append_row
+                                             |                     |          
+                                             |                      --0.79%--col_rel_mutation_set_finish
+                                             |          
+                                              --0.82%--col_rel_append_row
+                                                        |          
+                                                         --0.68%--col_rel_mutation_set_finish
+
+    98.92%     0.00%  [.] col_op_k_fusion (inlined)                                          -      -            
+            |
+            ---col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               |          
+               |--96.22%--wl_columnar_eval_plan_body
+               |          |          
+               |          |--74.63%--wl_columnar_join_diff_op
+               |          |          |          
+               |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+               |          |          |          |          
+               |          |          |          |--16.02%--col_rel_mutation_lease_validate
+               |          |          |          |          |          
+               |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+               |          |          |          |          |          |          
+               |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+               |          |          |          |          |          
+               |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+               |          |          |          |                     |          
+               |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+               |          |          |          |                                |          
+               |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+               |          |          |          |                                           |          
+               |          |          |          |                                            --1.21%--thrd_equal@plt
+               |          |          |          |          
+               |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+               |          |          |          |          wl_columnar_memory_reservation_init.part.0
+               |          |          |          |          
+               |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+               |          |          |          |          
+               |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+               |          |          |          |          col_rel_prepare_resize (inlined)
+               |          |          |          |          
+               |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+               |          |          |          |          
+               |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+               |          |          |          |          
+               |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+               |          |          |          
+               |          |          |--4.15%--col_join_output_limit_reached
+               |          |          |          
+               |          |          |--4.04%--col_join_append_pair
+               |          |          |          |          
+               |          |          |           --2.55%--col_join_pair_value
+               |          |          |                     |          
+               |          |          |                      --1.46%--col_join_pair_value
+               |          |          |          
+               |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+               |          |          |          |          
+               |          |          |           --0.61%--wl_columnar_value_equal
+               |          |          |          
+               |          |           --0.96%--col_rel_append_batch_row
+               |          |                     |          
+               |          |                      --0.55%--col_rel_append_batch_row
+               |          |          
+               |          |--15.05%--col_op_consolidate_diff (inlined)
+               |          |          |          
+               |          |           --14.92%--col_op_consolidate_kway_merge (inlined)
+               |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+               |          |                     col_op_consolidate_kway_merge_impl (inlined)
+               |          |                     |          
+               |          |                      --14.85%--col_op_consolidate_hash_dedup (inlined)
+               |          |                                |          
+               |          |                                |--5.32%--col_op_consolidate_hash_row (inlined)
+               |          |                                |          |          
+               |          |                                |           --4.53%--wl_columnar_hash_value.lto_priv.2
+               |          |                                |                     |          
+               |          |                                |                      --1.01%--wl_columnar_value_key.lto_priv.0
+               |          |                                |          
+               |          |                                |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+               |          |                                |          |          
+               |          |                                |           --1.30%--wl_columnar_value_equal.lto_priv.1
+               |          |                                |          
+               |          |                                 --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+               |          |                                           col_op_consolidate_hash_rows_sift_down
+               |          |                                           |          
+               |          |                                            --0.79%--col_op_consolidate_hash_rows_compare
+               |          |          
+               |          |--3.58%--wl_columnar_semijoin_op
+               |          |          |          
+               |          |           --3.30%--col_rel_append_row
+               |          |                     |          
+               |          |                     |--1.24%--col_rel_mutation_set_finish
+               |          |                     |          |          
+               |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+               |          |                     |          
+               |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+               |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+               |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+               |          |                     |          
+               |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+               |          |          
+               |           --2.91%--col_op_concat (inlined)
+               |                     col_op_concat (inlined)
+               |                     col_rel_append_all_impl.constprop.0
+               |          
+                --2.70%--col_rel_merge_k
+                          |          
+                          |--1.88%--col_rel_merge_k
+                          |          |          
+                          |           --1.75%--col_rel_append_row
+                          |                     |          
+                          |                      --0.79%--col_rel_mutation_set_finish
+                          |          
+                           --0.82%--col_rel_append_row
+                                     |          
+                                      --0.68%--col_rel_mutation_set_finish
+
+    98.92%     0.00%  [.] col_op_k_fusion_serial.lto_priv.0                                  -      -            
+            |          
+            |--96.22%--wl_columnar_eval_plan_body
+            |          |          
+            |          |--74.63%--wl_columnar_join_diff_op
+            |          |          |          
+            |          |          |--59.96%--col_rel_append_row_impl.constprop.0
+            |          |          |          |          
+            |          |          |          |--16.02%--col_rel_mutation_lease_validate
+            |          |          |          |          |          
+            |          |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          |          |          |          |          |          
+            |          |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+            |          |          |          |          |          
+            |          |          |          |           --5.10%--col_rel_mutation_lease_validate
+            |          |          |          |                     |          
+            |          |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+            |          |          |          |                                |          
+            |          |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |          |          |          |                                           |          
+            |          |          |          |                                            --1.21%--thrd_equal@plt
+            |          |          |          |          
+            |          |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+            |          |          |          |          wl_columnar_memory_reservation_init.part.0
+            |          |          |          |          
+            |          |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+            |          |          |          |          
+            |          |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+            |          |          |          |          col_rel_prepare_resize (inlined)
+            |          |          |          |          
+            |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+            |          |          |          |          
+            |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+            |          |          |          |          
+            |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+            |          |          |          
+            |          |          |--4.15%--col_join_output_limit_reached
+            |          |          |          
+            |          |          |--4.04%--col_join_append_pair
+            |          |          |          |          
+            |          |          |           --2.55%--col_join_pair_value
+            |          |          |                     |          
+            |          |          |                      --1.46%--col_join_pair_value
+            |          |          |          
+            |          |          |--3.49%--col_join_keys_match_rel.lto_priv.0
+            |          |          |          |          
+            |          |          |           --0.61%--wl_columnar_value_equal
+            |          |          |          
+            |          |           --0.96%--col_rel_append_batch_row
+            |          |                     |          
+            |          |                      --0.55%--col_rel_append_batch_row
+            |          |          
+            |          |--15.05%--col_op_consolidate_diff (inlined)
+            |          |          |          
+            |          |           --14.92%--col_op_consolidate_kway_merge (inlined)
+            |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+            |          |                     col_op_consolidate_kway_merge_impl (inlined)
+            |          |                     |          
+            |          |                      --14.85%--col_op_consolidate_hash_dedup (inlined)
+            |          |                                |          
+            |          |                                |--5.32%--col_op_consolidate_hash_row (inlined)
+            |          |                                |          |          
+            |          |                                |           --4.53%--wl_columnar_hash_value.lto_priv.2
+            |          |                                |                     |          
+            |          |                                |                      --1.01%--wl_columnar_value_key.lto_priv.0
+            |          |                                |          
+            |          |                                |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+            |          |                                |          |          
+            |          |                                |           --1.30%--wl_columnar_value_equal.lto_priv.1
+            |          |                                |          
+            |          |                                 --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+            |          |                                           col_op_consolidate_hash_rows_sift_down
+            |          |                                           |          
+            |          |                                            --0.79%--col_op_consolidate_hash_rows_compare
+            |          |          
+            |          |--3.58%--wl_columnar_semijoin_op
+            |          |          |          
+            |          |           --3.30%--col_rel_append_row
+            |          |                     |          
+            |          |                     |--1.24%--col_rel_mutation_set_finish
+            |          |                     |          |          
+            |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+            |          |                     |          
+            |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+            |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+            |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+            |          |                     |          
+            |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+            |          |          
+            |           --2.91%--col_op_concat (inlined)
+            |                     col_op_concat (inlined)
+            |                     col_rel_append_all_impl.constprop.0
+            |          
+             --2.70%--col_rel_merge_k
+                       |          
+                       |--1.88%--col_rel_merge_k
+                       |          |          
+                       |           --1.75%--col_rel_append_row
+                       |                     |          
+                       |                      --0.79%--col_rel_mutation_set_finish
+                       |          
+                        --0.82%--col_rel_append_row
+                                  |          
+                                   --0.68%--col_rel_mutation_set_finish
+
+    90.50%     0.00%  [.] col_session_snapshot.lto_priv.0                                    -      -            
+            |
+            ---col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               |          
+                --90.37%--wl_columnar_eval_serial_framed_relation
+                          wl_columnar_eval_plan_body
+                          |          
+                           --90.23%--col_op_k_fusion (inlined)
+                                     col_op_k_fusion (inlined)
+                                     col_op_k_fusion_serial.lto_priv.0
+                                     |          
+                                     |--88.03%--wl_columnar_eval_plan_body
+                                     |          |          
+                                     |          |--68.50%--wl_columnar_join_diff_op
+                                     |          |          |          
+                                     |          |          |--55.38%--col_rel_append_row_impl.constprop.0
+                                     |          |          |          |          
+                                     |          |          |          |--14.70%--col_rel_mutation_lease_validate
+                                     |          |          |          |          |          
+                                     |          |          |          |          |--9.33%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                                     |          |          |          |          |          |          
+                                     |          |          |          |          |           --0.55%--col_rel_storage_owner_resolve
+                                     |          |          |          |          |          
+                                     |          |          |          |           --4.58%--col_rel_mutation_lease_validate
+                                     |          |          |          |                     |          
+                                     |          |          |          |                      --4.04%--wl_columnar_source_access_writer_validate
+                                     |          |          |          |                                |          
+                                     |          |          |          |                                 --2.55%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                                     |          |          |          |                                           |          
+                                     |          |          |          |                                            --1.08%--thrd_equal@plt
+                                     |          |          |          |          
+                                     |          |          |          |--8.64%--wl_columnar_memory_reservation_init (inlined)
+                                     |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                                     |          |          |          |          
+                                     |          |          |          |--6.68%--col_rel_row_copy_in_raw (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.62%--col_rel_prepare_resize.constprop.0
+                                     |          |          |          |          col_rel_prepare_resize (inlined)
+                                     |          |          |          |          
+                                     |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                                     |          |          |          |          
+                                     |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                                     |          |          |          
+                                     |          |          |--3.89%--col_join_output_limit_reached
+                                     |          |          |          
+                                     |          |          |--3.38%--col_join_append_pair
+                                     |          |          |          |          
+                                     |          |          |           --2.16%--col_join_pair_value
+                                     |          |          |                     |          
+                                     |          |          |                      --1.06%--col_join_pair_value
+                                     |          |          |          
+                                     |          |          |--3.00%--col_join_keys_match_rel.lto_priv.0
+                                     |          |          |          |          
+                                     |          |          |           --0.61%--wl_columnar_value_equal
+                                     |          |          |          
+                                     |          |           --0.96%--col_rel_append_batch_row
+                                     |          |                     |          
+                                     |          |                      --0.55%--col_rel_append_batch_row
+                                     |          |          
+                                     |          |--13.83%--col_op_consolidate_diff (inlined)
+                                     |          |          |          
+                                     |          |           --13.70%--col_op_consolidate_kway_merge (inlined)
+                                     |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                                     |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                                     |          |                     col_op_consolidate_hash_dedup (inlined)
+                                     |          |                     |          
+                                     |          |                     |--5.19%--col_op_consolidate_hash_row (inlined)
+                                     |          |                     |          |          
+                                     |          |                     |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                     |          |                     |                     |          
+                                     |          |                     |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                     |          |                     |          
+                                     |          |                     |--3.74%--col_op_consolidate_hash_rows_equal (inlined)
+                                     |          |                     |          |          
+                                     |          |                     |           --1.05%--wl_columnar_value_equal.lto_priv.1
+                                     |          |                     |          
+                                     |          |                      --0.93%--col_op_consolidate_hash_rows_sort (inlined)
+                                     |          |                                col_op_consolidate_hash_rows_sift_down
+                                     |          |                                |          
+                                     |          |                                 --0.66%--col_op_consolidate_hash_rows_compare
+                                     |          |          
+                                     |          |--3.18%--wl_columnar_semijoin_op
+                                     |          |          |          
+                                     |          |           --2.90%--col_rel_append_row
+                                     |          |                     |          
+                                     |          |                     |--1.10%--col_rel_mutation_set_finish
+                                     |          |                     |          |          
+                                     |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                     |          |                     |          
+                                     |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                     |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                     |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                     |          |                     |          
+                                     |          |                      --0.69%--col_rel_append_row_impl.constprop.0
+                                     |          |          
+                                     |           --2.51%--col_op_concat (inlined)
+                                     |                     col_op_concat (inlined)
+                                     |                     col_rel_append_all_impl.constprop.0
+                                     |          
+                                      --2.20%--col_rel_merge_k
+                                                |          
+                                                |--1.51%--col_rel_merge_k
+                                                |          |          
+                                                |           --1.37%--col_rel_append_row
+                                                |          
+                                                 --0.69%--col_rel_append_row
+                                                           |          
+                                                            --0.55%--col_rel_mutation_set_finish
+
+    89.71%     0.00%  [.] wl_columnar_eval_serial_framed_relation                            -      -            
+            |
+            ---wl_columnar_eval_plan_body
+               |          
+                --89.57%--col_op_k_fusion (inlined)
+                          col_op_k_fusion (inlined)
+                          col_op_k_fusion_serial.lto_priv.0
+                          |          
+                          |--87.64%--wl_columnar_eval_plan_body
+                          |          |          
+                          |          |--68.50%--wl_columnar_join_diff_op
+                          |          |          |          
+                          |          |          |--55.38%--col_rel_append_row_impl.constprop.0
+                          |          |          |          |          
+                          |          |          |          |--14.70%--col_rel_mutation_lease_validate
+                          |          |          |          |          |          
+                          |          |          |          |          |--9.33%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                          |          |          |          |          |          |          
+                          |          |          |          |          |           --0.55%--col_rel_storage_owner_resolve
+                          |          |          |          |          |          
+                          |          |          |          |           --4.58%--col_rel_mutation_lease_validate
+                          |          |          |          |                     |          
+                          |          |          |          |                      --4.04%--wl_columnar_source_access_writer_validate
+                          |          |          |          |                                |          
+                          |          |          |          |                                 --2.55%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                          |          |          |          |                                           |          
+                          |          |          |          |                                            --1.08%--thrd_equal@plt
+                          |          |          |          |          
+                          |          |          |          |--8.64%--wl_columnar_memory_reservation_init (inlined)
+                          |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                          |          |          |          |          
+                          |          |          |          |--6.68%--col_rel_row_copy_in_raw (inlined)
+                          |          |          |          |          
+                          |          |          |          |--1.62%--col_rel_prepare_resize.constprop.0
+                          |          |          |          |          col_rel_prepare_resize (inlined)
+                          |          |          |          |          
+                          |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                          |          |          |          |          
+                          |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                          |          |          |          |          
+                          |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                          |          |          |          
+                          |          |          |--3.89%--col_join_output_limit_reached
+                          |          |          |          
+                          |          |          |--3.38%--col_join_append_pair
+                          |          |          |          |          
+                          |          |          |           --2.16%--col_join_pair_value
+                          |          |          |                     |          
+                          |          |          |                      --1.06%--col_join_pair_value
+                          |          |          |          
+                          |          |          |--3.00%--col_join_keys_match_rel.lto_priv.0
+                          |          |          |          |          
+                          |          |          |           --0.61%--wl_columnar_value_equal
+                          |          |          |          
+                          |          |           --0.96%--col_rel_append_batch_row
+                          |          |                     |          
+                          |          |                      --0.55%--col_rel_append_batch_row
+                          |          |          
+                          |          |--13.44%--col_op_consolidate_diff (inlined)
+                          |          |          |          
+                          |          |           --13.31%--col_op_consolidate_kway_merge (inlined)
+                          |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                          |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                          |          |                     col_op_consolidate_hash_dedup (inlined)
+                          |          |                     |          
+                          |          |                     |--5.05%--col_op_consolidate_hash_row (inlined)
+                          |          |                     |          |          
+                          |          |                     |           --4.40%--wl_columnar_hash_value.lto_priv.2
+                          |          |                     |                     |          
+                          |          |                     |                      --0.88%--wl_columnar_value_key.lto_priv.0
+                          |          |                     |          
+                          |          |                     |--3.61%--col_op_consolidate_hash_rows_equal (inlined)
+                          |          |                     |          |          
+                          |          |                     |           --1.05%--wl_columnar_value_equal.lto_priv.1
+                          |          |                     |          
+                          |          |                      --0.93%--col_op_consolidate_hash_rows_sort (inlined)
+                          |          |                                col_op_consolidate_hash_rows_sift_down
+                          |          |                                |          
+                          |          |                                 --0.66%--col_op_consolidate_hash_rows_compare
+                          |          |          
+                          |          |--3.18%--wl_columnar_semijoin_op
+                          |          |          |          
+                          |          |           --2.90%--col_rel_append_row
+                          |          |                     |          
+                          |          |                     |--1.10%--col_rel_mutation_set_finish
+                          |          |                     |          |          
+                          |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                          |          |                     |          
+                          |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                          |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                          |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                          |          |                     |          
+                          |          |                      --0.69%--col_rel_append_row_impl.constprop.0
+                          |          |          
+                          |           --2.51%--col_op_concat (inlined)
+                          |                     col_op_concat (inlined)
+                          |                     col_rel_append_all_impl.constprop.0
+                          |          
+                           --1.93%--col_rel_merge_k
+                                     |          
+                                     |--1.24%--col_rel_merge_k
+                                     |          col_rel_append_row
+                                     |          
+                                      --0.69%--col_rel_append_row
+                                                |          
+                                                 --0.55%--col_rel_mutation_set_finish
+
+    89.71%     0.00%  [.] wl_columnar_eval_plan_body                                         -      -            
+            |          
+             --89.57%--col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       |          
+                       |--87.64%--wl_columnar_eval_plan_body
+                       |          |          
+                       |          |--68.50%--wl_columnar_join_diff_op
+                       |          |          |          
+                       |          |          |--55.38%--col_rel_append_row_impl.constprop.0
+                       |          |          |          |          
+                       |          |          |          |--14.70%--col_rel_mutation_lease_validate
+                       |          |          |          |          |          
+                       |          |          |          |          |--9.33%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                       |          |          |          |          |          |          
+                       |          |          |          |          |           --0.55%--col_rel_storage_owner_resolve
+                       |          |          |          |          |          
+                       |          |          |          |           --4.58%--col_rel_mutation_lease_validate
+                       |          |          |          |                     |          
+                       |          |          |          |                      --4.04%--wl_columnar_source_access_writer_validate
+                       |          |          |          |                                |          
+                       |          |          |          |                                 --2.55%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                       |          |          |          |                                           |          
+                       |          |          |          |                                            --1.08%--thrd_equal@plt
+                       |          |          |          |          
+                       |          |          |          |--8.64%--wl_columnar_memory_reservation_init (inlined)
+                       |          |          |          |          wl_columnar_memory_reservation_init.part.0
+                       |          |          |          |          
+                       |          |          |          |--6.68%--col_rel_row_copy_in_raw (inlined)
+                       |          |          |          |          
+                       |          |          |          |--1.62%--col_rel_prepare_resize.constprop.0
+                       |          |          |          |          col_rel_prepare_resize (inlined)
+                       |          |          |          |          
+                       |          |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+                       |          |          |          |          
+                       |          |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+                       |          |          |          |          
+                       |          |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+                       |          |          |          
+                       |          |          |--3.89%--col_join_output_limit_reached
+                       |          |          |          
+                       |          |          |--3.38%--col_join_append_pair
+                       |          |          |          |          
+                       |          |          |           --2.16%--col_join_pair_value
+                       |          |          |                     |          
+                       |          |          |                      --1.06%--col_join_pair_value
+                       |          |          |          
+                       |          |          |--3.00%--col_join_keys_match_rel.lto_priv.0
+                       |          |          |          |          
+                       |          |          |           --0.61%--wl_columnar_value_equal
+                       |          |          |          
+                       |          |           --0.96%--col_rel_append_batch_row
+                       |          |                     |          
+                       |          |                      --0.55%--col_rel_append_batch_row
+                       |          |          
+                       |          |--13.44%--col_op_consolidate_diff (inlined)
+                       |          |          |          
+                       |          |           --13.31%--col_op_consolidate_kway_merge (inlined)
+                       |          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                       |          |                     col_op_consolidate_kway_merge_impl (inlined)
+                       |          |                     col_op_consolidate_hash_dedup (inlined)
+                       |          |                     |          
+                       |          |                     |--5.05%--col_op_consolidate_hash_row (inlined)
+                       |          |                     |          |          
+                       |          |                     |           --4.40%--wl_columnar_hash_value.lto_priv.2
+                       |          |                     |                     |          
+                       |          |                     |                      --0.88%--wl_columnar_value_key.lto_priv.0
+                       |          |                     |          
+                       |          |                     |--3.61%--col_op_consolidate_hash_rows_equal (inlined)
+                       |          |                     |          |          
+                       |          |                     |           --1.05%--wl_columnar_value_equal.lto_priv.1
+                       |          |                     |          
+                       |          |                      --0.93%--col_op_consolidate_hash_rows_sort (inlined)
+                       |          |                                col_op_consolidate_hash_rows_sift_down
+                       |          |                                |          
+                       |          |                                 --0.66%--col_op_consolidate_hash_rows_compare
+                       |          |          
+                       |          |--3.18%--wl_columnar_semijoin_op
+                       |          |          |          
+                       |          |           --2.90%--col_rel_append_row
+                       |          |                     |          
+                       |          |                     |--1.10%--col_rel_mutation_set_finish
+                       |          |                     |          |          
+                       |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                       |          |                     |          
+                       |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                       |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                       |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                       |          |                     |          
+                       |          |                      --0.69%--col_rel_append_row_impl.constprop.0
+                       |          |          
+                       |           --2.51%--col_op_concat (inlined)
+                       |                     col_op_concat (inlined)
+                       |                     col_rel_append_all_impl.constprop.0
+                       |          
+                        --1.93%--col_rel_merge_k
+                                  |          
+                                  |--1.24%--col_rel_merge_k
+                                  |          col_rel_append_row
+                                  |          
+                                   --0.69%--col_rel_append_row
+                                             |          
+                                              --0.55%--col_rel_mutation_set_finish
+
+    75.43%     1.89%  [.] wl_columnar_join_diff_op                                           -      -            
+            |          
+            |--73.54%--wl_columnar_join_diff_op
+            |          |          
+            |          |--60.22%--col_rel_append_row_impl.constprop.0
+            |          |          |          
+            |          |          |--16.02%--col_rel_mutation_lease_validate
+            |          |          |          |          
+            |          |          |          |--10.12%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          |          |          |          |          
+            |          |          |          |           --0.69%--col_rel_storage_owner_resolve
+            |          |          |          |          
+            |          |          |           --5.10%--col_rel_mutation_lease_validate
+            |          |          |                     |          
+            |          |          |                      --4.57%--wl_columnar_source_access_writer_validate
+            |          |          |                                |          
+            |          |          |                                 --2.81%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |          |          |                                           |          
+            |          |          |                                            --1.21%--thrd_equal@plt
+            |          |          |          
+            |          |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+            |          |          |          wl_columnar_memory_reservation_init.part.0
+            |          |          |          
+            |          |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+            |          |          |          
+            |          |          |--1.75%--col_rel_prepare_resize.constprop.0
+            |          |          |          col_rel_prepare_resize (inlined)
+            |          |          |          
+            |          |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+            |          |          |          
+            |          |          |--0.82%--col_rel_append_replaces_storage (inlined)
+            |          |          |          
+            |          |           --0.56%--wl_columnar_relation_generation_advance.isra.0
+            |          |          
+            |          |--4.18%--col_join_append_pair
+            |          |          |          
+            |          |           --2.69%--col_join_pair_value
+            |          |                     |          
+            |          |                      --1.60%--col_join_pair_value
+            |          |          
+            |          |--4.15%--col_join_output_limit_reached
+            |          |          
+            |          |--3.90%--col_join_keys_match_rel.lto_priv.0
+            |          |          |          
+            |          |           --0.61%--wl_columnar_value_equal
+            |          |          
+            |           --0.96%--col_rel_append_batch_row
+            |                     |          
+            |                      --0.55%--col_rel_append_batch_row
+            |          
+             --1.89%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+
+    61.61%    31.81%  [.] col_rel_append_row_impl.constprop.0                                -      -            
+            |          
+            |--30.99%--run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          wl_columnar_join_diff_op
+            |          col_rel_append_row_impl.constprop.0
+            |          |          
+            |          |--7.07%--col_rel_row_copy_in_raw (inlined)
+            |          |          
+            |           --0.82%--col_rel_append_replaces_storage (inlined)
+            |          
+            |--29.80%--col_rel_append_row_impl.constprop.0
+            |          |          
+            |          |--16.72%--col_rel_mutation_lease_validate
+            |          |          |          
+            |          |          |--10.68%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          |          |          |          
+            |          |          |           --0.83%--col_rel_storage_owner_resolve
+            |          |          |          
+            |          |           --5.24%--col_rel_mutation_lease_validate
+            |          |                     |          
+            |          |                      --4.70%--wl_columnar_source_access_writer_validate
+            |          |                                |          
+            |          |                                 --2.95%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |          |                                           |          
+            |          |                                            --1.34%--thrd_equal@plt
+            |          |          
+            |          |--9.04%--wl_columnar_memory_reservation_init (inlined)
+            |          |          wl_columnar_memory_reservation_init.part.0
+            |          |          
+            |          |--1.75%--col_rel_prepare_resize.constprop.0
+            |          |          col_rel_prepare_resize (inlined)
+            |          |          
+            |          |--1.33%--col_rel_timestamp_shape_valid.lto_priv.0
+            |          |          
+            |           --0.69%--wl_columnar_relation_generation_advance.isra.0
+            |          
+             --0.57%--main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+
+    23.42%     0.00%  [.] main                                                               -      -            
+            |
+            ---run_cspa_once_ (inlined)
+               |          
+                --23.41%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          col_eval_stratum.part.0
+                          |          
+                           --23.27%--wl_columnar_eval_serial_framed_relation
+                                     wl_columnar_eval_plan_body
+                                     |          
+                                      --23.01%--col_op_k_fusion (inlined)
+                                                col_op_k_fusion (inlined)
+                                                col_op_k_fusion_serial.lto_priv.0
+                                                |          
+                                                |--20.31%--wl_columnar_eval_plan_body
+                                                |          |          
+                                                |          |--13.79%--col_op_consolidate_diff (inlined)
+                                                |          |          col_op_consolidate_kway_merge (inlined)
+                                                |          |          wl_columnar_merge_consolidate_checked.lto_priv.0
+                                                |          |          col_op_consolidate_kway_merge_impl (inlined)
+                                                |          |          col_op_consolidate_hash_dedup (inlined)
+                                                |          |          |          
+                                                |          |          |--5.32%--col_op_consolidate_hash_row (inlined)
+                                                |          |          |          |          
+                                                |          |          |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                                |          |          |                     |          
+                                                |          |          |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                                |          |          |          
+                                                |          |           --4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                                |          |                     |          
+                                                |          |                      --1.30%--wl_columnar_value_equal.lto_priv.1
+                                                |          |          
+                                                |          |--3.58%--wl_columnar_semijoin_op
+                                                |          |          |          
+                                                |          |           --3.30%--col_rel_append_row
+                                                |          |                     |          
+                                                |          |                     |--1.24%--col_rel_mutation_set_finish
+                                                |          |                     |          |          
+                                                |          |                     |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                                |          |                     |          
+                                                |          |                     |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                                |          |                     |          col_rel_mutation_set_acquire_impl (inlined)
+                                                |          |                     |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                                |          |                     |          
+                                                |          |                      --0.82%--col_rel_append_row_impl.constprop.0
+                                                |          |          
+                                                |           --2.91%--col_op_concat (inlined)
+                                                |                     col_op_concat (inlined)
+                                                |                     col_rel_append_all_impl.constprop.0
+                                                |          
+                                                 --2.70%--col_rel_merge_k
+                                                           |          
+                                                           |--1.88%--col_rel_merge_k
+                                                           |          |          
+                                                           |           --1.75%--col_rel_append_row
+                                                           |                     |          
+                                                           |                      --0.79%--col_rel_mutation_set_finish
+                                                           |          
+                                                            --0.82%--col_rel_append_row
+                                                                      |          
+                                                                       --0.68%--col_rel_mutation_set_finish
+
+    16.72%     1.33%  [.] col_rel_mutation_lease_validate                                    -      -            
+            |          
+            |--15.38%--col_rel_mutation_lease_validate
+            |          |          
+            |          |--10.68%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          |          |          
+            |          |           --0.83%--col_rel_storage_owner_resolve
+            |          |          
+            |           --4.70%--col_rel_mutation_lease_validate
+            |                     wl_columnar_source_access_writer_validate
+            |                     |          
+            |                      --2.95%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |                                |          
+            |                                 --1.34%--thrd_equal@plt
+            |          
+             --1.33%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       col_rel_mutation_lease_validate
+                       |          
+                        --0.54%--col_rel_mutation_lease_validate
+
+    15.05%     0.00%  [.] col_op_consolidate_diff (inlined)                                  -      -            
+            |          
+             --14.92%--col_op_consolidate_kway_merge (inlined)
+                       wl_columnar_merge_consolidate_checked.lto_priv.0
+                       col_op_consolidate_kway_merge_impl (inlined)
+                       |          
+                        --14.85%--col_op_consolidate_hash_dedup (inlined)
+                                  |          
+                                  |--5.32%--col_op_consolidate_hash_row (inlined)
+                                  |          |          
+                                  |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                                  |                     |          
+                                  |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                                  |          
+                                  |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                                  |          |          
+                                  |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                                  |          
+                                   --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                             col_op_consolidate_hash_rows_sift_down
+                                             |          
+                                              --0.79%--col_op_consolidate_hash_rows_compare
+
+    14.95%     7.56%  [.] wl_columnar_merge_consolidate_checked.lto_priv.0                   -      -            
+            |          
+            |--7.56%--main
+            |          run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          col_op_consolidate_diff (inlined)
+            |          col_op_consolidate_kway_merge (inlined)
+            |          wl_columnar_merge_consolidate_checked.lto_priv.0
+            |          col_op_consolidate_kway_merge_impl (inlined)
+            |          col_op_consolidate_hash_dedup (inlined)
+            |          |          
+            |          |--2.94%--col_op_consolidate_hash_rows_equal (inlined)
+            |          |          
+            |           --0.79%--col_op_consolidate_hash_row (inlined)
+            |          
+             --7.38%--wl_columnar_merge_consolidate_checked.lto_priv.0
+                       col_op_consolidate_kway_merge_impl (inlined)
+                       |          
+                        --7.28%--col_op_consolidate_hash_dedup (inlined)
+                                  |          
+                                  |--4.53%--col_op_consolidate_hash_row (inlined)
+                                  |          wl_columnar_hash_value.lto_priv.2
+                                  |          |          
+                                  |           --1.01%--wl_columnar_value_key.lto_priv.0
+                                  |          
+                                  |--1.30%--col_op_consolidate_hash_rows_equal (inlined)
+                                  |          wl_columnar_value_equal.lto_priv.1
+                                  |          
+                                   --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                             col_op_consolidate_hash_rows_sift_down
+                                             |          
+                                              --0.79%--col_op_consolidate_hash_rows_compare
+
+    14.95%     0.00%  [.] col_op_consolidate_kway_merge_impl (inlined)                       -      -            
+            |          
+             --14.85%--col_op_consolidate_hash_dedup (inlined)
+                       |          
+                       |--5.32%--col_op_consolidate_hash_row (inlined)
+                       |          |          
+                       |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                       |                     |          
+                       |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                       |          
+                       |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                       |          |          
+                       |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                       |          
+                        --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                  col_op_consolidate_hash_rows_sift_down
+                                  |          
+                                   --0.79%--col_op_consolidate_hash_rows_compare
+
+    14.92%     0.00%  [.] col_op_consolidate_kway_merge (inlined)                            -      -            
+            |
+            ---wl_columnar_merge_consolidate_checked.lto_priv.0
+               col_op_consolidate_kway_merge_impl (inlined)
+               |          
+                --14.85%--col_op_consolidate_hash_dedup (inlined)
+                          |          
+                          |--5.32%--col_op_consolidate_hash_row (inlined)
+                          |          |          
+                          |           --4.53%--wl_columnar_hash_value.lto_priv.2
+                          |                     |          
+                          |                      --1.01%--wl_columnar_value_key.lto_priv.0
+                          |          
+                          |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+                          |          |          
+                          |           --1.30%--wl_columnar_value_equal.lto_priv.1
+                          |          
+                           --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                                     col_op_consolidate_hash_rows_sift_down
+                                     |          
+                                      --0.79%--col_op_consolidate_hash_rows_compare
+
+    14.85%     0.00%  [.] col_op_consolidate_hash_dedup (inlined)                            -      -            
+            |          
+            |--5.32%--col_op_consolidate_hash_row (inlined)
+            |          |          
+            |           --4.53%--wl_columnar_hash_value.lto_priv.2
+            |                     |          
+            |                      --1.01%--wl_columnar_value_key.lto_priv.0
+            |          
+            |--4.24%--col_op_consolidate_hash_rows_equal (inlined)
+            |          |          
+            |           --1.30%--wl_columnar_value_equal.lto_priv.1
+            |          
+             --1.18%--col_op_consolidate_hash_rows_sort (inlined)
+                       col_op_consolidate_hash_rows_sift_down
+                       |          
+                        --0.79%--col_op_consolidate_hash_rows_compare
+
+    11.50%    10.40%  [.] col_rel_mutation_lease_validate_binding.lto_priv.0                 -      -            
+            |          
+            |--9.43%--run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          wl_columnar_join_diff_op
+            |          col_rel_append_row_impl.constprop.0
+            |          col_rel_mutation_lease_validate
+            |          col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          
+            |--1.10%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          col_rel_storage_owner_resolve
+            |          
+             --0.54%--_start
+                       __libc_start_main
+                       0x7f7bb2a27780
+                       main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       col_rel_merge_k
+
+     9.04%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+            |
+            ---wl_columnar_memory_reservation_init.part.0
+
+     8.82%     0.00%  [.] col_session_snapshot.lto_priv.0                                    -      -            
+            |
+            ---col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               |          
+                --8.70%--col_op_k_fusion (inlined)
+                          col_op_k_fusion (inlined)
+                          col_op_k_fusion_serial.lto_priv.0
+                          |          
+                          |--8.19%--wl_columnar_eval_plan_body
+                          |          |          
+                          |          |--6.13%--wl_columnar_join_diff_op
+                          |          |          |          
+                          |          |          |--4.58%--col_rel_append_row_impl.constprop.0
+                          |          |          |          |          
+                          |          |          |           --1.32%--col_rel_mutation_lease_validate
+                          |          |          |                     |          
+                          |          |          |                     |--0.80%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                          |          |          |                     |          
+                          |          |          |                      --0.53%--col_rel_mutation_lease_validate
+                          |          |          |                                wl_columnar_source_access_writer_validate
+                          |          |          |          
+                          |          |           --0.66%--col_join_append_pair
+                          |          |          
+                          |           --1.21%--col_op_consolidate_diff (inlined)
+                          |                     col_op_consolidate_kway_merge (inlined)
+                          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                          |                     col_op_consolidate_kway_merge_impl (inlined)
+                          |                     |          
+                          |                      --1.15%--col_op_consolidate_hash_dedup (inlined)
+                          |                                |          
+                          |                                 --0.50%--col_op_consolidate_hash_rows_equal (inlined)
+                          |          
+                           --0.50%--col_rel_merge_k
+
+     8.81%     0.00%  [.] wl_columnar_eval_serial_framed_relation                            -      -            
+            |
+            ---wl_columnar_eval_plan_body
+               |          
+                --8.68%--col_op_k_fusion (inlined)
+                          col_op_k_fusion (inlined)
+                          col_op_k_fusion_serial.lto_priv.0
+                          |          
+                          |--8.18%--wl_columnar_eval_plan_body
+                          |          |          
+                          |          |--6.13%--wl_columnar_join_diff_op
+                          |          |          |          
+                          |          |          |--4.58%--col_rel_append_row_impl.constprop.0
+                          |          |          |          |          
+                          |          |          |           --1.32%--col_rel_mutation_lease_validate
+                          |          |          |                     |          
+                          |          |          |                     |--0.80%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                          |          |          |                     |          
+                          |          |          |                      --0.53%--col_rel_mutation_lease_validate
+                          |          |          |                                wl_columnar_source_access_writer_validate
+                          |          |          |          
+                          |          |           --0.66%--col_join_append_pair
+                          |          |          
+                          |           --1.21%--col_op_consolidate_diff (inlined)
+                          |                     col_op_consolidate_kway_merge (inlined)
+                          |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                          |                     col_op_consolidate_kway_merge_impl (inlined)
+                          |                     |          
+                          |                      --1.15%--col_op_consolidate_hash_dedup (inlined)
+                          |                                |          
+                          |                                 --0.50%--col_op_consolidate_hash_rows_equal (inlined)
+                          |          
+                           --0.50%--col_rel_merge_k
+
+     8.81%     0.00%  [.] wl_columnar_eval_plan_body                                         -      -            
+            |          
+             --8.68%--col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       |          
+                       |--8.18%--wl_columnar_eval_plan_body
+                       |          |          
+                       |          |--6.13%--wl_columnar_join_diff_op
+                       |          |          |          
+                       |          |          |--4.58%--col_rel_append_row_impl.constprop.0
+                       |          |          |          |          
+                       |          |          |           --1.32%--col_rel_mutation_lease_validate
+                       |          |          |                     |          
+                       |          |          |                     |--0.80%--col_rel_mutation_lease_validate_binding.lto_priv.0
+                       |          |          |                     |          
+                       |          |          |                      --0.53%--col_rel_mutation_lease_validate
+                       |          |          |                                wl_columnar_source_access_writer_validate
+                       |          |          |          
+                       |          |           --0.66%--col_join_append_pair
+                       |          |          
+                       |           --1.21%--col_op_consolidate_diff (inlined)
+                       |                     col_op_consolidate_kway_merge (inlined)
+                       |                     wl_columnar_merge_consolidate_checked.lto_priv.0
+                       |                     col_op_consolidate_kway_merge_impl (inlined)
+                       |                     |          
+                       |                      --1.15%--col_op_consolidate_hash_dedup (inlined)
+                       |                                |          
+                       |                                 --0.50%--col_op_consolidate_hash_rows_equal (inlined)
+                       |          
+                        --0.50%--col_rel_merge_k
+
+     8.64%     8.64%  [.] wl_columnar_memory_reservation_init.part.0                         -      -            
+            |
+            ---wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               wl_columnar_join_diff_op
+               col_rel_append_row_impl.constprop.0
+               wl_columnar_memory_reservation_init (inlined)
+               wl_columnar_memory_reservation_init.part.0
+
+     8.37%     0.00%  [.] 0x00007f7bb2a27780                                                 -      -            
+            |
+            ---main
+               run_cspa_once_ (inlined)
+               |          
+                --8.36%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          col_eval_stratum.part.0
+                          |          
+                           --8.22%--wl_columnar_eval_serial_framed_relation
+                                     wl_columnar_eval_plan_body
+                                     |          
+                                      --7.96%--col_op_k_fusion (inlined)
+                                                col_op_k_fusion (inlined)
+                                                col_op_k_fusion_serial.lto_priv.0
+                                                |          
+                                                |--5.68%--wl_columnar_eval_plan_body
+                                                |          |          
+                                                |          |--2.91%--col_op_concat (inlined)
+                                                |          |          col_op_concat (inlined)
+                                                |          |          col_rel_append_all_impl.constprop.0
+                                                |          |          
+                                                |           --2.75%--wl_columnar_semijoin_op
+                                                |                     |          
+                                                |                      --2.48%--col_rel_append_row
+                                                |                                |          
+                                                |                                |--1.24%--col_rel_mutation_set_finish
+                                                |                                |          |          
+                                                |                                |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                                |                                |          
+                                                |                                 --0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                                                |                                           col_rel_mutation_set_acquire_impl (inlined)
+                                                |                                           col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                                                |          
+                                                 --2.28%--col_rel_merge_k
+                                                           |          
+                                                           |--1.46%--col_rel_merge_k
+                                                           |          |          
+                                                           |           --1.33%--col_rel_append_row
+                                                           |                     |          
+                                                           |                      --0.79%--col_rel_mutation_set_finish
+                                                           |          
+                                                            --0.82%--col_rel_append_row
+                                                                      |          
+                                                                       --0.68%--col_rel_mutation_set_finish
+
+     7.34%     0.00%  [.] col_rel_row_copy_in_raw (inlined)                                  -      -            
+     6.98%     0.00%  [.] __libc_start_main                                                  -      -            
+            |
+            ---0x7f7bb2a27780
+               main
+               run_cspa_once_ (inlined)
+               |          
+                --6.97%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          col_eval_stratum.part.0
+                          |          
+                           --6.83%--wl_columnar_eval_serial_framed_relation
+                                     wl_columnar_eval_plan_body
+                                     |          
+                                      --6.57%--col_op_k_fusion (inlined)
+                                                col_op_k_fusion (inlined)
+                                                col_op_k_fusion_serial.lto_priv.0
+                                                |          
+                                                |--4.69%--wl_columnar_eval_plan_body
+                                                |          |          
+                                                |          |--2.91%--col_op_concat (inlined)
+                                                |          |          col_op_concat (inlined)
+                                                |          |          col_rel_append_all_impl.constprop.0
+                                                |          |          
+                                                |           --1.78%--wl_columnar_semijoin_op
+                                                |                     |          
+                                                |                      --1.51%--col_rel_append_row
+                                                |                                |          
+                                                |                                 --1.24%--col_rel_mutation_set_finish
+                                                |                                           |          
+                                                |                                            --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                                |          
+                                                 --1.88%--col_rel_merge_k
+                                                           |          
+                                                           |--1.06%--col_rel_merge_k
+                                                           |          |          
+                                                           |           --0.92%--col_rel_append_row
+                                                           |                     |          
+                                                           |                      --0.79%--col_rel_mutation_set_finish
+                                                           |          
+                                                            --0.82%--col_rel_append_row
+                                                                      |          
+                                                                       --0.68%--col_rel_mutation_set_finish
+
+     5.89%     0.54%  [.] col_rel_append_row                                                 -      -            
+            |          
+            |--5.35%--col_rel_append_row
+            |          |          
+            |          |--2.71%--col_rel_mutation_set_finish
+            |          |          |          
+            |          |          |--1.23%--col_rel_mutation_set_unwind.lto_priv.0
+            |          |          |          |          
+            |          |          |           --0.68%--wl_columnar_source_access_writer_release.lto_priv.0
+            |          |          |          
+            |          |           --0.68%--col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          |          
+            |          |--1.39%--col_rel_mutation_single_acquire.lto_priv.0
+            |          |          col_rel_mutation_set_acquire_impl (inlined)
+            |          |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+            |          |          
+            |           --1.26%--col_rel_append_row_impl.constprop.0
+            |                     |          
+            |                      --0.56%--col_rel_mutation_lease_validate
+            |                                col_rel_mutation_lease_validate_binding.lto_priv.0
+            |          
+             --0.54%--_start
+                       __libc_start_main
+                       0x7f7bb2a27780
+                       main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+
+     5.68%     0.00%  [.] _start                                                             -      -            
+            |
+            ---__libc_start_main
+               0x7f7bb2a27780
+               main
+               run_cspa_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               |          
+                --5.55%--wl_columnar_eval_serial_framed_relation
+                          wl_columnar_eval_plan_body
+                          |          
+                           --5.41%--col_op_k_fusion (inlined)
+                                     col_op_k_fusion (inlined)
+                                     col_op_k_fusion_serial.lto_priv.0
+                                     |          
+                                     |--4.03%--wl_columnar_eval_plan_body
+                                     |          |          
+                                     |          |--2.51%--col_op_concat (inlined)
+                                     |          |          col_op_concat (inlined)
+                                     |          |          col_rel_append_all_impl.constprop.0
+                                     |          |          
+                                     |           --1.52%--wl_columnar_semijoin_op
+                                     |                     |          
+                                     |                      --1.24%--col_rel_append_row
+                                     |                                |          
+                                     |                                 --1.10%--col_rel_mutation_set_finish
+                                     |                                           |          
+                                     |                                            --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                                     |          
+                                      --1.37%--col_rel_merge_k
+                                                |          
+                                                |--0.69%--col_rel_append_row
+                                                |          |          
+                                                |           --0.55%--col_rel_mutation_set_finish
+                                                |          
+                                                 --0.68%--col_rel_merge_k
+                                                           |          
+                                                            --0.55%--col_rel_append_row
+
+     5.32%     0.00%  [.] col_op_consolidate_hash_row (inlined)                              -      -            
+            |          
+             --4.53%--wl_columnar_hash_value.lto_priv.2
+                       |          
+                        --1.01%--wl_columnar_value_key.lto_priv.0
+
+     4.97%     2.02%  [.] wl_columnar_source_access_writer_validate                          -      -            
+            |          
+            |--2.95%--wl_columnar_source_access_writer_validate
+            |          wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |          |          
+            |           --1.34%--thrd_equal@plt
+            |          
+             --1.75%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       col_rel_mutation_lease_validate
+                       col_rel_mutation_lease_validate
+                       wl_columnar_source_access_writer_validate
+
+     4.81%     3.65%  [.] wl_columnar_hash_value.lto_priv.2                                  -      -            
+            |          
+            |--3.52%--main
+            |          run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          col_op_consolidate_diff (inlined)
+            |          col_op_consolidate_kway_merge (inlined)
+            |          wl_columnar_merge_consolidate_checked.lto_priv.0
+            |          col_op_consolidate_kway_merge_impl (inlined)
+            |          col_op_consolidate_hash_dedup (inlined)
+            |          col_op_consolidate_hash_row (inlined)
+            |          wl_columnar_hash_value.lto_priv.2
+            |          
+             --1.15%--wl_columnar_hash_value.lto_priv.2
+                       wl_columnar_value_key.lto_priv.0
+
+     4.24%     0.00%  [.] col_op_consolidate_hash_rows_equal (inlined)                       -      -            
+            |          
+             --1.30%--wl_columnar_value_equal.lto_priv.1
+
+     4.18%     1.49%  [.] col_join_append_pair                                               -      -            
+            |          
+            |--2.69%--col_join_append_pair
+            |          col_join_pair_value
+            |          |          
+            |           --1.60%--col_join_pair_value
+            |          
+             --1.49%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_join_append_pair
+
+     4.15%     4.15%  [.] col_join_output_limit_reached                                      -      -            
+            |
+            ---wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               wl_columnar_join_diff_op
+               col_join_output_limit_reached
+
+     4.02%     3.41%  [.] col_join_keys_match_rel.lto_priv.0                                 -      -            
+            |          
+            |--2.88%--run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          wl_columnar_join_diff_op
+            |          col_join_keys_match_rel.lto_priv.0
+            |          
+             --0.61%--col_join_keys_match_rel.lto_priv.0
+                       wl_columnar_value_equal
+
+     3.70%     0.00%  [.] wl_columnar_semijoin_op                                            -      -            
+            |          
+             --3.30%--col_rel_append_row
+                       |          
+                       |--1.24%--col_rel_mutation_set_finish
+                       |          |          
+                       |           --0.56%--col_rel_mutation_set_unwind.lto_priv.0
+                       |          
+                       |--0.97%--col_rel_mutation_single_acquire.lto_priv.0
+                       |          col_rel_mutation_set_acquire_impl (inlined)
+                       |          col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                       |          
+                        --0.82%--col_rel_append_row_impl.constprop.0
+
+     2.95%     1.61%  [.] wl_columnar_source_access_writer_thread_equal.lto_priv.1           -      -            
+            |          
+            |--1.61%--run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          wl_columnar_eval_plan_body
+            |          wl_columnar_join_diff_op
+            |          col_rel_append_row_impl.constprop.0
+            |          col_rel_mutation_lease_validate
+            |          col_rel_mutation_lease_validate
+            |          wl_columnar_source_access_writer_validate
+            |          wl_columnar_source_access_writer_thread_equal.lto_priv.1
+            |          
+             --1.34%--wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                       thrd_equal@plt
+
+     2.91%     2.77%  [.] col_rel_append_all_impl.constprop.0                                -      -            
+            |          
+             --2.77%--_start
+                       __libc_start_main
+                       0x7f7bb2a27780
+                       main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       col_op_concat (inlined)
+                       col_op_concat (inlined)
+                       col_rel_append_all_impl.constprop.0
+
+     2.91%     0.00%  [.] col_op_concat (inlined)                                            -      -            
+            |
+            ---col_op_concat (inlined)
+               col_rel_append_all_impl.constprop.0
+
+     2.70%     0.13%  [.] col_rel_merge_k                                                    -      -            
+            |          
+             --2.57%--col_rel_merge_k
+                       |          
+                       |--1.75%--col_rel_merge_k
+                       |          col_rel_append_row
+                       |          |          
+                       |           --0.79%--col_rel_mutation_set_finish
+                       |          
+                        --0.82%--col_rel_append_row
+                                  |          
+                                   --0.68%--col_rel_mutation_set_finish
+
+     2.69%     2.69%  [.] col_join_pair_value                                                -      -            
+            |          
+             --2.55%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_join_append_pair
+                       col_join_pair_value
+                       |          
+                        --1.46%--col_join_pair_value
+
+     2.59%     0.41%  [.] col_rel_mutation_set_finish                                        -      -            
+            |          
+             --2.18%--col_rel_mutation_set_finish
+                       |          
+                       |--1.23%--col_rel_mutation_set_unwind.lto_priv.0
+                       |          |          
+                       |           --0.68%--wl_columnar_source_access_writer_release.lto_priv.0
+                       |          
+                        --0.68%--col_rel_mutation_lease_validate_binding.lto_priv.0
+
+     1.75%     1.35%  [.] col_rel_prepare_resize.constprop.0                                 -      -            
+            |          
+             --1.35%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       col_rel_prepare_resize.constprop.0
+                       col_rel_prepare_resize (inlined)
+
+     1.53%     0.00%  [.] col_rel_mutation_set_acquire_impl (inlined)                        -      -            
+            |
+            ---col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+
+     1.51%     0.96%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0                -      -            
+            |          
+            |--0.82%--0x7f7bb2a27780
+            |          main
+            |          run_cspa_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum.part.0
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion (inlined)
+            |          col_op_k_fusion_serial.lto_priv.0
+            |          |          
+            |           --0.55%--wl_columnar_eval_plan_body
+            |                     wl_columnar_semijoin_op
+            |                     col_rel_append_row
+            |                     col_rel_mutation_single_acquire.lto_priv.0
+            |                     col_rel_mutation_set_acquire_impl (inlined)
+            |                     col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+            |          
+             --0.56%--col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+
+     1.51%     0.00%  [.] col_rel_mutation_single_acquire.lto_priv.0                         -      -            
+            |
+            ---col_rel_mutation_set_acquire_impl (inlined)
+               col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+
+     1.34%     1.34%  [.] thrd_equal@plt                                                     -      -            
+            |          
+             --1.21%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       col_rel_mutation_lease_validate
+                       col_rel_mutation_lease_validate
+                       wl_columnar_source_access_writer_validate
+                       wl_columnar_source_access_writer_thread_equal.lto_priv.1
+                       thrd_equal@plt
+
+     1.34%     0.00%  [.] col_rel_prepare_resize (inlined)                                   -      -            
+     1.33%     1.33%  [.] col_rel_timestamp_shape_valid.lto_priv.0                           -      -            
+            |
+            ---wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               wl_columnar_join_diff_op
+               col_rel_append_row_impl.constprop.0
+               col_rel_timestamp_shape_valid.lto_priv.0
+
+     1.30%     1.30%  [.] wl_columnar_value_equal.lto_priv.1                                 -      -            
+            |
+            ---run_cspa_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               col_op_consolidate_diff (inlined)
+               col_op_consolidate_kway_merge (inlined)
+               wl_columnar_merge_consolidate_checked.lto_priv.0
+               col_op_consolidate_kway_merge_impl (inlined)
+               col_op_consolidate_hash_dedup (inlined)
+               col_op_consolidate_hash_rows_equal (inlined)
+               wl_columnar_value_equal.lto_priv.1
+
+     1.30%     0.00%  [.] _start                                                             -      -            
+            |
+            ---__libc_start_main
+               0x7f7bb2a27780
+               main
+               run_cspa_once_ (inlined)
+               |          
+                --1.29%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          col_eval_stratum.part.0
+                          wl_columnar_eval_serial_framed_relation
+                          wl_columnar_eval_plan_body
+                          |          
+                           --1.16%--col_op_k_fusion (inlined)
+                                     col_op_k_fusion (inlined)
+                                     col_op_k_fusion_serial.lto_priv.0
+                                     |          
+                                     |--0.66%--wl_columnar_eval_plan_body
+                                     |          
+                                      --0.50%--col_rel_merge_k
+
+     1.23%     0.55%  [.] col_rel_mutation_set_unwind.lto_priv.0                             -      -            
+            |          
+            |--0.68%--col_rel_mutation_set_unwind.lto_priv.0
+            |          wl_columnar_source_access_writer_release.lto_priv.0
+            |          
+             --0.55%--_start
+                       __libc_start_main
+                       0x7f7bb2a27780
+                       main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+
+     1.18%     0.26%  [.] col_op_consolidate_hash_rows_sift_down                             -      -            
+            |          
+             --0.92%--col_op_consolidate_hash_rows_sift_down
+                       |          
+                        --0.79%--col_op_consolidate_hash_rows_compare
+
+     1.18%     0.00%  [.] col_op_consolidate_hash_rows_sort (inlined)                        -      -            
+            |
+            ---col_op_consolidate_hash_rows_sift_down
+               |          
+                --0.79%--col_op_consolidate_hash_rows_compare
+
+     1.15%     1.15%  [.] wl_columnar_value_key.lto_priv.0                                   -      -            
+            |          
+             --1.01%--main
+                       run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       col_op_consolidate_diff (inlined)
+                       col_op_consolidate_kway_merge (inlined)
+                       wl_columnar_merge_consolidate_checked.lto_priv.0
+                       col_op_consolidate_kway_merge_impl (inlined)
+                       col_op_consolidate_hash_dedup (inlined)
+                       col_op_consolidate_hash_row (inlined)
+                       wl_columnar_hash_value.lto_priv.2
+                       wl_columnar_value_key.lto_priv.0
+
+     1.10%     1.10%  [.] col_rel_storage_owner_resolve                                      -      -            
+            |          
+             --0.69%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       col_rel_mutation_lease_validate
+                       col_rel_mutation_lease_validate_binding.lto_priv.0
+                       col_rel_storage_owner_resolve
+
+     0.96%     0.82%  [.] col_rel_append_batch_row                                           -      -            
+            |          
+             --0.82%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_batch_row
+
+     0.82%     0.00%  [.] col_rel_append_replaces_storage (inlined)                          -      -            
+     0.79%     0.79%  [.] col_op_consolidate_hash_rows_compare                               -      -            
+            |
+            ---wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               col_op_consolidate_diff (inlined)
+               col_op_consolidate_kway_merge (inlined)
+               wl_columnar_merge_consolidate_checked.lto_priv.0
+               col_op_consolidate_kway_merge_impl (inlined)
+               col_op_consolidate_hash_dedup (inlined)
+               col_op_consolidate_hash_rows_sort (inlined)
+               col_op_consolidate_hash_rows_sift_down
+               col_op_consolidate_hash_rows_compare
+
+     0.69%     0.69%  [.] wl_columnar_relation_generation_advance.isra.0                     -      -            
+            |          
+             --0.56%--run_cspa_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum.part.0
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion (inlined)
+                       col_op_k_fusion_serial.lto_priv.0
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       col_rel_append_row_impl.constprop.0
+                       wl_columnar_relation_generation_advance.isra.0
+
+     0.68%     0.68%  [.] wl_columnar_source_access_writer_release.lto_priv.0                -      -            
+            |
+            ---__libc_start_main
+               0x7f7bb2a27780
+               main
+               run_cspa_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+
+     0.66%     0.00%  [.] wl_columnar_eval_serial_framed_relation                            -      -            
+            |
+            ---wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+
+     0.66%     0.00%  [.] wl_columnar_eval_plan_body                                         -      -            
+            |
+            ---col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+
+     0.61%     0.61%  [.] wl_columnar_value_equal                                            -      -            
+            |
+            ---wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum.part.0
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               col_op_k_fusion (inlined)
+               col_op_k_fusion (inlined)
+               col_op_k_fusion_serial.lto_priv.0
+               wl_columnar_eval_plan_body
+               wl_columnar_join_diff_op
+               col_join_keys_match_rel.lto_priv.0
+               wl_columnar_value_equal
+
+     0.54%     0.54%  [k] 0xffffffffaf401280                                                 -      -            
+     0.42%     0.42%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0                -      -            
+     0.41%     0.00%  [.] col_rel_prepare_resize (inlined)                                   -      -            
+     0.39%     0.39%  [.] wl_columnar_memory_reservation_init.part.0                         -      -            
+     0.28%     0.28%  [.] free@plt                                                           -      -            
+     0.28%     0.00%  [.] col_rel_append_replaces_storage (inlined)                          -      -            
+     0.28%     0.00%  [.] col_join_hash_rel_keys (inlined)                                   -      -            
+     0.27%     0.27%  [.] col_rel_row_copy_in_raw.isra.0                                     -      -            
+     0.20%     0.20%  [.] wl_columnar_radix_rows_prepared.isra.0                             -      -            
+     0.20%     0.00%  [.] radix_uniform_count_fused_avx2 (inlined)                           -      -            
+     0.14%     0.00%  [.] col_rel_row_copy_in_raw (inlined)                                  -      -            
+     0.14%     0.00%  [.] wl_columnar_source_access_writer_acquire (inlined)                 -      -            
+     0.14%     0.00%  [.] col_op_consolidate_incremental_delta                               -      -            
+     0.14%     0.00%  [.] col_op_consolidate_incremental_delta_impl (inlined)                -      -            
+     0.14%     0.00%  [.] col_op_consolidate_incremental_delta_append_with_lease (inlined)   -      -            
+     0.14%     0.00%  [.] col_join_hash_rel_keys (inlined)                                   -      -            
+     0.13%     0.13%  [.] col_diff_arrangement_deep_copy_with_memory_governor_status         -      -            
+     0.13%     0.00%  [.] wl_columnar_arrangement_diff_txn_begin                             -      -            
+     0.13%     0.00%  [.] col_rel_row_cmp2 (inlined)                                         -      -            
+     0.13%     0.13%  [.] col_op_consolidate_hash_rows_swap                                  -      -            
+     0.13%     0.00%  [.] wl_columnar_radix_sort_admitted.lto_priv.0                         -      -            
+     0.13%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease (inlined)               -      -            
+     0.13%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease_impl (inlined)          -      -            
+     0.13%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease_impl.part.0.lto_priv.0  -      -            
+     0.13%     0.00%  [.] _mm256_srlv_epi64 (inlined)                                        -      -            
+     0.13%     0.00%  [.] col_rel_mutation_set_nonce_allocate (inlined)                      -      -            
+     0.13%     0.00%  [.] col_eval_stratum.part.0                                            -      -            
+     0.12%     0.12%  [.] col_rel_mutation_set_finish                                        -      -            
+     0.07%     0.00%  [.] wl_columnar_relation_radix_sequence_execute_with_lease (inlined)   -      -            
+     0.07%     0.00%  [.] _mm256_extract_epi64 (inlined)                                     -      -            
+     0.07%     0.00%  [.] _mm256_extractf128_si256 (inlined)                                 -      -            
+     0.03%     0.03%  [.] col_rel_row_cmp.lto_priv.1                                         -      -            
+     0.03%     0.00%  [.] col_op_consolidate                                                 -      -            
+     0.03%     0.00%  [.] wl_columnar_merge_consolidate_entry                                -      -            
+     0.03%     0.00%  [.] wl_columnar_relation_radix_sequence_prepare_with_lease (inlined)   -      -            
+     0.03%     0.00%  [.] col_op_map.part.0                                                  -      -            
+     0.01%     0.01%  [.] 0x00000000000a7e27                                                 -      -            
+     0.01%     0.00%  [.] wirelog_parse_string (inlined)                                     -      -            
+     0.01%     0.00%  [.] wl_ir_parse_string_err (inlined)                                   -      -            
+     0.01%     0.00%  [.] wl_parser_parse_string (inlined)                                   -      -            
+     0.01%     0.00%  [.] parse_program                                                      -      -            
+     0.01%     0.00%  [.] parse_rule_or_fact (inlined)                                       -      -            
+     0.01%     0.00%  [.] parse_head (inlined)                                               -      -            
+     0.01%     0.00%  [.] parse_arithmetic_level                                             -      -            
+     0.01%     0.00%  [.] parse_integer_literal                                              -      -            
+     0.01%     0.00%  [.] wl_parser_ast_node_create                                          -      -            
+     0.01%     0.00%  [.] 0x00007f7bb2aa7e27                                                 -      -            
+     0.01%     0.01%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0                -      -            
+     0.01%     0.00%  [.] wl_columnar_eval_serial_framed_relation                            -      -            
+     0.01%     0.00%  [.] wl_columnar_eval_plan_body                                         -      -            
+     0.01%     0.00%  [.] col_rel_mutation_single_acquire.lto_priv.0                         -      -            
+     0.01%     0.00%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0                -      -            
+
+
+#
+# (Tip: See assembly instructions with percentage: perf annotate <symbol>)
+#

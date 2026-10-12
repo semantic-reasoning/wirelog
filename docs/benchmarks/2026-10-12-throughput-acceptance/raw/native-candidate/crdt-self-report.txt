@@ -1,0 +1,151 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 6K of event 'cpu_core/cycles/u'
+# Event count (approx.): 88297690829
+#
+# Overhead  Symbol                                                          IPC   [IPC Coverage]
+# ........  ..............................................................  ....................
+#
+    23.79%  [.] wl_columnar_join_diff_op                                    -      -            
+    15.83%  [.] 0x0000000000176e53                                          -      -            
+    11.78%  [.] col_rel_row_copy_in_raw.isra.0                              -      -            
+    10.21%  [.] wl_columnar_hash_value.lto_priv.2                           -      -            
+     5.80%  [.] col_rel_compact_runs_prepared.lto_priv.0                    -      -            
+     5.66%  [.] col_rel_row_copy_out.lto_priv.2                             -      -            
+     5.65%  [.] col_rel_row_cmp.lto_priv.1                                  -      -            
+     5.13%  [.] col_rel_row_cmp_raw                                         -      -            
+     3.64%  [.] col_join_keys_match_rel                                     -      -            
+     3.13%  [.] wl_columnar_value_key.lto_priv.0                            -      -            
+     3.06%  [.] col_diff_arrangement_deep_copy_with_memory_governor_status  -      -            
+     0.76%  [.] wl_columnar_value_equal                                     -      -            
+     0.44%  [.] col_rel_append_row_impl.part.0.constprop.0                  -      -            
+     0.33%  [.] wl_columnar_antijoin_op                                     -      -            
+     0.32%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0         -      -            
+     0.23%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0         -      -            
+     0.20%  [.] col_rel_mutation_lease_validate_binding.lto_priv.0          -      -            
+     0.20%  [.] col_arrangement_find_first_typed                            -      -            
+     0.19%  [.] wl_columnar_source_access_writer_release.lto_priv.4         -      -            
+     0.18%  [.] wl_columnar_radix_rows_prepared.isra.0                      -      -            
+     0.15%  [.] malloc                                                      -      -            
+     0.15%  [.] col_op_consolidate_incremental_delta                        -      -            
+     0.15%  [.] wl_columnar_memory_reservation_init.part.0                  -      -            
+     0.14%  [.] col_rel_mutation_set_unwind.lto_priv.0                      -      -            
+     0.13%  [.] col_rel_append_row                                          -      -            
+     0.11%  [.] wl_columnar_merge_consolidate_checked.lto_priv.0            -      -            
+     0.10%  [.] wl_columnar_expr_eval_compiled.constprop.0                  -      -            
+     0.10%  [.] wl_columnar_source_access_writer_validate                   -      -            
+     0.09%  [.] col_rel_mutation_set_finish                                 -      -            
+     0.07%  [.] 0x0000000000179121                                          -      -            
+     0.07%  [.] claim_reservation_state                                     -      -            
+     0.07%  [.] cfree                                                       -      -            
+     0.07%  [k] 0xffffffffaf401280                                          -      -            
+     0.07%  [.] expr_push                                                   -      -            
+     0.06%  [.] thrd_equal@plt                                              -      -            
+     0.06%  [.] col_join_append_pair                                        -      -            
+     0.04%  [.] col_rel_payload_live_shape.lto_priv.0                       -      -            
+     0.04%  [.] 0x00000000000a5002                                          -      -            
+     0.04%  [.] 0x000000000017911d                                          -      -            
+     0.04%  [.] ArrowSchemaSetName                                          -      -            
+     0.04%  [.] arr_index_rows.constprop.0                                  -      -            
+     0.04%  [.] credit_reservation                                          -      -            
+     0.04%  [.] col_op_map.part.0                                           -      -            
+     0.04%  [.] 0x000000000017898b                                          -      -            
+     0.04%  [.] wl_columnar_source_access_writer_thread_equal.lto_priv.1    -      -            
+     0.03%  [.] __libc_calloc                                               -      -            
+     0.03%  [.] wl_columnar_arrangement_diff_reset_state                    -      -            
+     0.03%  [.] col_rel_payload_txn_begin                                   -      -            
+     0.03%  [.] wl_columnar_source_access_gate_reader_acquire.lto_priv.1    -      -            
+     0.03%  [.] 0x00000000000a7754                                          -      -            
+     0.03%  [.] session_rel_hash_lookup                                     -      -            
+     0.03%  [.] 0x00000000000a4ee9                                          -      -            
+     0.03%  [.] wl_columnar_relation_terminal_sequence_finish               -      -            
+     0.03%  [.] wl_columnar_expr_compile_governed.constprop.0               -      -            
+     0.03%  [.] ArrowSchemaSetFormat                                        -      -            
+     0.03%  [.] wl_columnar_eval_plan_body                                  -      -            
+     0.03%  [.] finish_reservation                                          -      -            
+     0.03%  [.] reserve_internal.lto_priv.0                                 -      -            
+     0.03%  [.] session_rel_build_hash                                      -      -            
+     0.03%  [.] col_rel_free_contents_impl                                  -      -            
+     0.03%  [.] col_eval_stratum                                            -      -            
+     0.03%  [.] free@plt                                                    -      -            
+     0.03%  [.] col_rel_mutation_lease_validate                             -      -            
+     0.03%  [.] col_rel_row.lto_priv.0                                      -      -            
+     0.02%  [.] csv_parse_line_via_ctx.constprop.0                          -      -            
+     0.01%  [.] 0x00000000000a73a8                                          -      -            
+     0.01%  [.] 0x00000000000658b0                                          -      -            
+     0.01%  [.] 0x00000000000a7566                                          -      -            
+     0.01%  [.] 0x00000000000a789d                                          -      -            
+     0.01%  [.] 0x00000000000a616a                                          -      -            
+     0.01%  [.] col_rel_new_identity.lto_priv.0                             -      -            
+     0.01%  [.] 0x00000000000a70c7                                          -      -            
+     0.01%  [.] 0x00000000000651be                                          -      -            
+     0.01%  [k] 0xffffffffaf4015f0                                          -      -            
+     0.01%  [.] 0x0000000000178959                                          -      -            
+     0.01%  [.] ArrowSchemaReleaseInternal                                  -      -            
+     0.01%  [.] 0x00000000000a4efd                                          -      -            
+     0.01%  [.] ArrowSchemaRelease.lto_priv.0                               -      -            
+     0.01%  [.] 0x00000000000a4fc0                                          -      -            
+     0.01%  [.] 0x00000000000a4f17                                          -      -            
+     0.01%  [.] 0x000000000017896f                                          -      -            
+     0.01%  [.] 0x00000000000a61c1                                          -      -            
+     0.01%  [.] 0x0000000000178760                                          -      -            
+     0.01%  [.] ArrowSchemaInit                                             -      -            
+     0.01%  [.] 0x00000000000a4faa                                          -      -            
+     0.01%  [.] col_rel_source_writer_acquire                               -      -            
+     0.01%  [.] 0x00000000000651c8                                          -      -            
+     0.01%  [.] ArrowSchemaSetType                                          -      -            
+     0.01%  [.] 0x0000000000178cc2                                          -      -            
+     0.01%  [.] wl_columnar_memory_commit                                   -      -            
+     0.01%  [.] delta_pool_alloc_slot                                       -      -            
+     0.01%  [.] 0x00000000000a4edc                                          -      -            
+     0.01%  [.] 0x00000000000a78a4                                          -      -            
+     0.01%  [.] wl_columnar_relation_init_arrow_schema.lto_priv.0           -      -            
+     0.01%  [.] col_rel_storage_owner_ensure_initialized                    -      -            
+     0.01%  [.] 0x000000000005c2df                                          -      -            
+     0.01%  [.] reservation_identity_valid                                  -      -            
+     0.01%  [.] 0x00000000000a7298                                          -      -            
+     0.01%  [.] col_rel_enable_timestamps                                   -      -            
+     0.01%  [.] col_rel_publish_payload_txn.lto_priv.0                      -      -            
+     0.01%  [.] 0x00000000000a7580                                          -      -            
+     0.01%  [.] 0x00000000000a77b7                                          -      -            
+     0.01%  [.] col_rel_attach_memory_governor                              -      -            
+     0.01%  [.] wl_strdup.lto_priv.3                                        -      -            
+     0.01%  [.] col_op_resolve_key                                          -      -            
+     0.01%  [.] 0x0000000000064ec5                                          -      -            
+     0.01%  [.] col_session_mem_sample                                      -      -            
+     0.01%  [.] 0x00000000000a70dd                                          -      -            
+     0.01%  [.] 0x00000000000a6fa3                                          -      -            
+     0.01%  [.] session_rel_hash_string.lto_priv.0                          -      -            
+     0.01%  [.] 0x0000000000065038                                          -      -            
+     0.01%  [.] col_rel_timestamp_shape_valid.lto_priv.0                    -      -            
+     0.01%  [.] 0x00000000000a4f12                                          -      -            
+     0.01%  [.] col_rel_append_all_impl.constprop.0                         -      -            
+     0.01%  [.] eval_stack_dispose_entry                                    -      -            
+     0.01%  [.] col_rel_reserve_retained_shape.constprop.0                  -      -            
+     0.01%  [.] wl_columnar_value_equal.lto_priv.1                          -      -            
+     0.01%  [.] col_rel_destroy_checked                                     -      -            
+     0.01%  [.] col_join_output_limit_reached                               -      -            
+     0.01%  [.] 0x00000000000a7428                                          -      -            
+     0.01%  [.] wl_columnar_join_op                                         -      -            
+     0.01%  [.] thrd_current@plt                                            -      -            
+     0.01%  [.] col_rel_storage_owner_resolve                               -      -            
+     0.01%  [.] wl_columnar_source_access_gate_reader_release.lto_priv.2    -      -            
+     0.01%  [.] col_rel_mutation_single_acquire.lto_priv.0                  -      -            
+     0.01%  [.] 0x000000000017896b                                          -      -            
+     0.01%  [.] col_rel_append_row_impl.constprop.0                         -      -            
+     0.01%  [.] 0x0000000000050219                                          -      -            
+     0.01%  [.] csv_finish_line                                             -      -            
+     0.01%  [.] 0x00000000001759b9                                          -      -            
+     0.01%  [.] 0x0000000000050165                                          -      -            
+     0.01%  [.] 0x00000000000500e7                                          -      -            
+     0.01%  [.] __ctype_b_loc                                               -      -            
+     0.00%  [.] 0x00000000000500a0                                          -      -            
+     0.00%  [.] scan_identifier                                             -      -            
+
+
+#
+# (Tip: For memory address profiling, try: perf mem record / perf mem report)
+#

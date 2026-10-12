@@ -4615,8 +4615,6 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     int rc;
     uint64_t prior_storage_generation = 0;
 
-    wl_columnar_memory_reservation_init(&row_admission);
-
     if (!r || !row || !writer)
         return EINVAL;
     if (!lease) {
@@ -4704,6 +4702,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
             row = inline_row;
         } else {
             if (r->memory_governor) {
+                wl_columnar_memory_reservation_init(&row_admission);
                 wl_columnar_memory_admission_status_t status
                     = wl_columnar_memory_reserve_checked(
                         wl_columnar_memory_governor_ref_get(r->memory_governor),

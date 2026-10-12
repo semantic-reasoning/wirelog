@@ -1,0 +1,10 @@
+1/5 unit+tsan - wirelog:relation_mutation_set OK               0.11s
+2/5 wirelog:relation_append                   OK               0.01s
+3/5 unit - wirelog:memory_admission_relation  OK               0.09s
+4/5 unit - wirelog:memory_admission_join      OK               0.40s
+5/5 wirelog:wide_relation                     OK               0.62s
+
+Ok:                5   
+Fail:              0   
+
+Full log written to /srv/home/joykim/.cache/wirelog-1913-candidate-asan/meson-logs/testlog.txt
