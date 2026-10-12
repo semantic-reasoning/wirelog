@@ -426,8 +426,9 @@ col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
     if (limit == 0)
         return false;
     if (sess->join_output_shared_count) {
-        uint64_t n = atomic_fetch_add_explicit(
-            sess->join_output_shared_count, 1, memory_order_relaxed) + 1;
+        uint64_t n = (uint64_t)atomic_fetch_add_explicit(
+            sess->join_output_shared_count, 1,
+            memory_order_relaxed) + UINT64_C(1);
         return n >= limit;
     }
     return out && out->nrows >= limit;
@@ -784,9 +785,9 @@ col_join_keyed_count_worker_fn(void *arg)
                 count++;
                 if (ctx->limit > 0 && ctx->shared_count
                     && (count - reported) >= 1024u) {
-                    uint64_t seen = atomic_fetch_add_explicit(
+                    uint64_t seen = (uint64_t)atomic_fetch_add_explicit(
                         ctx->shared_count, 1024u, memory_order_relaxed)
-                        + 1024u;
+                        + UINT64_C(1024);
                     reported += 1024u;
                     if (seen >= ctx->limit && ctx->stop) {
                         atomic_store_explicit(ctx->stop, true,
@@ -799,7 +800,8 @@ col_join_keyed_count_worker_fn(void *arg)
     }
     if (count > reported && ctx->shared_count) {
         uint64_t delta = count - reported;
-        uint64_t seen = atomic_fetch_add_explicit(ctx->shared_count, delta,
+        uint64_t seen = (uint64_t)atomic_fetch_add_explicit(ctx->shared_count,
+                delta,
                 memory_order_relaxed) + delta;
         if (ctx->limit > 0 && seen >= ctx->limit && ctx->stop)
             atomic_store_explicit(ctx->stop, true, memory_order_relaxed);

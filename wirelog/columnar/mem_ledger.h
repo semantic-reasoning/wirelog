@@ -27,6 +27,7 @@
 /* MSVC: Use intrinsic functions instead of <stdatomic.h> */
 #include <windows.h>
 #include <intrin.h>
+#include <string.h>
 
 /* MSVC does not support C11 _Atomic as a type qualifier or keyword.
  * Use volatile uint64_t as the atomic field type; all mutations go through
@@ -38,13 +39,24 @@ typedef volatile uint64_t wl_atomic_u64;
  * Field accesses are paired with the atomic_*_explicit shims below; for
  * relaxed-order callers a volatile-qualified plain type is sufficient on
  * the architectures MSVC targets (x86/x64/ARM64), and the shimmed
- * fetch_add still routes through _InterlockedCompareExchange64 for the
+ * fetch_add routes through InterlockedExchangeAdd64 for the wide
  * read-modify-write ops. */
 typedef volatile bool atomic_bool;
 typedef volatile int atomic_int;
 typedef volatile uint_fast64_t atomic_uint_fast64_t;
 #define ATOMIC_VAR_INIT(x) (x)
 #define atomic_init(ptr, val) (*(ptr) = (val))
+
+typedef char wl_columnar_mem_ledger_long64_width[(sizeof(LONG64) ==
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_u64_width[(sizeof(wl_atomic_u64) ==
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_fast64_width[(sizeof(atomic_uint_fast64_t)
+        == 8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_u64_alignment[(__alignof(wl_atomic_u64) >=
+        8) ? 1 : -1];
+typedef char wl_columnar_mem_ledger_fast64_alignment[(__alignof(
+            atomic_uint_fast64_t) >= 8) ? 1 : -1];
 
 /* MSVC atomic macros using intrinsics that are guaranteed to exist */
 #define atomic_load_explicit(ptr, order) (*(ptr))
@@ -55,38 +67,49 @@ typedef volatile uint_fast64_t atomic_uint_fast64_t;
  * own width.  Routing every operand through the 64-bit intrinsics read and
  * overwrote the bytes next to a narrow atomic: a failure-injection flag that
  * was never armed read as set whenever its neighbour in .bss was non-zero,
- * and the exchange then zeroed that neighbour.  The 64-bit fetch_add keeps
- * its compare-exchange loop because _InterlockedExchangeAdd64 is not
- * available on every MSVC target. */
+ * and the exchange then zeroed that neighbour. Fetch arithmetic passes the
+ * addend's representation to the platform operation without signed C sums
+ * or a user retry loop. The signed prior return preserves narrow comparisons;
+ * unsigned wide consumers must convert it before further arithmetic. */
 static inline __int64
-wl_atomic_fetch_add_internal(volatile void *ptr, __int64 inc, size_t width)
+wl_atomic_fetch_add_internal(volatile void *ptr, uint64_t inc, size_t width)
 {
     switch (width) {
-    case 1:
-        return _InterlockedExchangeAdd8((volatile char *)ptr, (char)inc);
-    case 2:
-        return _InterlockedExchangeAdd16((volatile short *)ptr, (short)inc);
-    case 4:
-        return _InterlockedExchangeAdd((volatile long *)ptr, (long)inc);
+    case 1: {
+        uint8_t bits = (uint8_t)inc;
+        char addend;
+        memcpy(&addend, &bits, sizeof(addend));
+        return _InterlockedExchangeAdd8((volatile char *)ptr, addend);
+    }
+    case 2: {
+        uint16_t bits = (uint16_t)inc;
+        short addend;
+        memcpy(&addend, &bits, sizeof(addend));
+        return _InterlockedExchangeAdd16((volatile short *)ptr, addend);
+    }
+    case 4: {
+        uint32_t bits = (uint32_t)inc;
+        long addend;
+        memcpy(&addend, &bits, sizeof(addend));
+        return _InterlockedExchangeAdd((volatile long *)ptr, addend);
+    }
     default: {
-        volatile __int64 *wide = (volatile __int64 *)ptr;
-        __int64 old, updated;
-        do {
-            old = *wide;
-            updated = old + inc;
-        } while (_InterlockedCompareExchange64(wide, updated, old) != old);
-        return old;
+        LONG64 addend;
+        memcpy(&addend, &inc, sizeof(addend));
+        /* Requires eight-byte alignment, as did the previous wide CAS.
+         * The platform supplies the atomic operation and full barrier. */
+        return InterlockedExchangeAdd64((volatile LONG64 *)ptr, addend);
     }
     }
 }
 
 #define atomic_fetch_add_explicit(ptr, inc, order) \
-        wl_atomic_fetch_add_internal((ptr), (__int64)(inc), sizeof(*(ptr)))
+        wl_atomic_fetch_add_internal((ptr), (uint64_t)(inc), sizeof(*(ptr)))
 /* The subtrahend is negated in unsigned arithmetic so that a decrement of
  * any magnitude wraps rather than overflowing the signed negation. */
 #define atomic_fetch_sub_explicit(ptr, dec, order)                        \
         wl_atomic_fetch_add_internal((ptr),                               \
-            (__int64)(0ULL - (unsigned __int64)(dec)), sizeof(*(ptr)))
+            UINT64_C(0) - (uint64_t)(dec), sizeof(*(ptr)))
 
 /* On failure the observed value is written back through `expected` at the
  * operand's width, so a `bool *` or `int *` expected is never widened. */

@@ -29,9 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _WIN32
 #include "wirelog/thread.h"
-#endif
 
 /* ======================================================================== */
 /* Test Harness                                                             */
@@ -786,6 +784,20 @@ test_atomic_shim_widths(void)
             PASS();
     }
 
+    TEST("atomic_int negative prior values keep signed comparisons");
+    memset(&gi, GUARD_BYTE, sizeof(gi));
+    atomic_init(&gi.value, -7);
+    if (!(atomic_fetch_add_explicit(&gi.value, -2, memory_order_relaxed) < 0)
+        || atomic_load_explicit(&gi.value, memory_order_relaxed) != -9
+        || atomic_fetch_sub_explicit(&gi.value, -2, memory_order_relaxed) != -9
+        || atomic_load_explicit(&gi.value, memory_order_relaxed) != -7
+        || atomic_fetch_add_explicit(&gi.value, 3, memory_order_relaxed) != -7
+        || atomic_load_explicit(&gi.value, memory_order_relaxed) != -4
+        || !guards_intact(gi.before, gi.after))
+        FAIL("negative prior/delta semantics or neighbouring bytes changed");
+    else
+        PASS();
+
     TEST("atomic_int compare_exchange writes expected at its own width");
     memset(&gi, GUARD_BYTE, sizeof(gi));
     atomic_init(&gi.value, 7);
@@ -855,6 +867,157 @@ test_atomic_shim_widths(void)
     }
 }
 
+static int
+test_atomic_unsigned_bits(void)
+{
+    TEST("actual fetch macros unsigned bits and JOIN plus-one boundary");
+    wl_atomic_u64 value;
+    atomic_uint_fast64_t shared_join_count;
+    const uint64_t initial[] = {0, 1, INT64_MAX, UINT64_C(1) << 63, UINT64_MAX};
+    const uint64_t delta[] = {0, 1, UINT64_C(1) << 63, UINT64_MAX};
+#ifdef _MSC_VER
+    if (sizeof(value) != 8 || sizeof(shared_join_count) != 8
+        || (uintptr_t)&value % 8 || (uintptr_t)&shared_join_count % 8) {
+        FAIL("real stack atomic width/alignment"); return 1;
+    }
+    wl_mem_ledger_t *heap = calloc(1, sizeof(*heap));
+    if (!heap || (uintptr_t)&heap->current_bytes % 8
+        || (uintptr_t)&heap->subsys_bytes[7] % 8) {
+        free(heap); FAIL("real heap ledger field alignment"); return 1;
+    }
+    free(heap);
+#endif
+    for (unsigned i = 0; i < sizeof(initial) / sizeof(initial[0]); i++) {
+        for (unsigned d = 0; d < sizeof(delta) / sizeof(delta[0]); d++) {
+            atomic_init(&value, initial[i]);
+            uint64_t old = atomic_fetch_add_explicit(&value, delta[d],
+                    memory_order_relaxed);
+            if (old != initial[i] || atomic_load_explicit(&value,
+                memory_order_relaxed)
+                != initial[i] + delta[d]) {
+                FAIL("fetch add old/modulo bits"); return 1;
+            }
+            atomic_init(&value, initial[i]);
+            old = atomic_fetch_sub_explicit(&value, delta[d],
+                    memory_order_relaxed);
+            if (old != initial[i] || atomic_load_explicit(&value,
+                memory_order_relaxed)
+                != initial[i] - delta[d]) {
+                FAIL("fetch sub old/modulo bits"); return 1;
+            }
+        }
+        atomic_init(&shared_join_count, initial[i]);
+        /* Actual JOIN expressions convert the prior value before arithmetic. */
+        uint64_t n = (uint64_t)atomic_fetch_add_explicit(&shared_join_count, 1,
+                memory_order_relaxed) + UINT64_C(1);
+        if (n != initial[i] + UINT64_C(1)
+            || atomic_load_explicit(&shared_join_count,
+            memory_order_relaxed) != n) {
+            FAIL("JOIN unsigned old plus one"); return 1;
+        }
+        atomic_init(&shared_join_count, initial[i]);
+        n = (uint64_t)atomic_fetch_add_explicit(&shared_join_count, 1024u,
+                memory_order_relaxed) + UINT64_C(1024);
+        if (n != initial[i] + UINT64_C(1024)
+            || atomic_load_explicit(&shared_join_count,
+            memory_order_relaxed) != n) {
+            FAIL("JOIN unsigned old plus batch"); return 1;
+        }
+        for (unsigned d = 0; d < sizeof(delta) / sizeof(delta[0]); d++) {
+            atomic_init(&shared_join_count, initial[i]);
+            n = (uint64_t)atomic_fetch_add_explicit(&shared_join_count,
+                    delta[d],
+                    memory_order_relaxed) + delta[d];
+            if (n != initial[i] + delta[d]
+                || atomic_load_explicit(&shared_join_count,
+                memory_order_relaxed) != n) {
+                FAIL("JOIN unsigned old plus remainder"); return 1;
+            }
+        }
+    }
+
+    PASS(); return 0;
+}
+#define WL_COLUMNAR_MEM_LEDGER_TEST_THREADS 4
+#define WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS 512
+struct wl_columnar_mem_ledger_test_fetch_args {
+    wl_atomic_u64 *counter;
+    uint64_t old[WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS];
+};
+static void *
+wl_columnar_mem_ledger_test_fetch_worker(void *opaque)
+{
+    struct wl_columnar_mem_ledger_test_fetch_args *a = opaque;
+    for (unsigned i = 0; i < WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS; i++)
+        a->old[i] = atomic_fetch_add_explicit(a->counter, 1,
+                memory_order_relaxed);
+    return NULL;
+}
+static int
+test_atomic_unique_prior_values(void)
+{
+    TEST("actual fetch macro concurrent unique prior values");
+    const uint64_t start = (uint64_t)INT64_MAX - 1024;
+    wl_atomic_u64 counter; atomic_init(&counter, start);
+    wl_thread_t threads[WL_COLUMNAR_MEM_LEDGER_TEST_THREADS];
+    struct wl_columnar_mem_ledger_test_fetch_args args[
+        WL_COLUMNAR_MEM_LEDGER_TEST_THREADS];
+    unsigned created = 0;
+    for (; created < WL_COLUMNAR_MEM_LEDGER_TEST_THREADS; created++) {
+        args[created].counter = &counter;
+        if (wl_thread_create(&threads[created],
+            wl_columnar_mem_ledger_test_fetch_worker,
+            &args[created]) != 0) break;
+    }
+    bool ok = created == WL_COLUMNAR_MEM_LEDGER_TEST_THREADS;
+    for (unsigned i = 0; i < created; i++)
+        if (wl_thread_join(&threads[i]) != 0)
+            abort(); /* Never return while a worker may still use stack storage. */
+    const uint64_t total = WL_COLUMNAR_MEM_LEDGER_TEST_THREADS *
+        WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS;
+    bool seen[WL_COLUMNAR_MEM_LEDGER_TEST_THREADS *
+        WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS] = {false};
+    if (atomic_load_explicit(&counter,
+        memory_order_relaxed) != start + total) ok = false;
+    for (unsigned t = 0; t < created; t++)
+        for (unsigned i = 0; i < WL_COLUMNAR_MEM_LEDGER_TEST_INCREMENTS; i++) {
+            uint64_t old = args[t].old[i] - start;
+            if (old >= total || seen[old]) ok = false;
+            else seen[old] = true;
+        }
+    if (!ok) {
+        FAIL("atomic prior value uniqueness/final total"); return 1;
+    }
+    PASS(); return 0;
+}
+
+static void
+test_atomic_single_evaluation(void)
+{
+    TEST("fetch pointer and delta expressions evaluate once");
+    wl_atomic_u64 values[2];
+    atomic_init(&values[0], 10);
+    atomic_init(&values[1], 20);
+    uint64_t deltas[] = { 3, 4 };
+    unsigned pointer_index = 0, delta_index = 0;
+    uint64_t old = atomic_fetch_add_explicit(&values[pointer_index++],
+            deltas[delta_index++], memory_order_relaxed);
+    if (pointer_index != 1 || delta_index != 1 || old != 10
+        || atomic_load_explicit(&values[0], memory_order_relaxed) != 13
+        || atomic_load_explicit(&values[1], memory_order_relaxed) != 20) {
+        FAIL("fetch add evaluated arguments more than once");
+        return;
+    }
+    old = atomic_fetch_sub_explicit(&values[pointer_index++],
+            deltas[delta_index++], memory_order_relaxed);
+    if (pointer_index != 2 || delta_index != 2 || old != 20
+        || atomic_load_explicit(&values[0], memory_order_relaxed) != 13
+        || atomic_load_explicit(&values[1], memory_order_relaxed) != 16)
+        FAIL("fetch sub evaluated arguments more than once");
+    else
+        PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -880,6 +1043,9 @@ main(void)
     test_snapshot();
     test_subsys_table();
     test_atomic_shim_widths();
+    test_atomic_unsigned_bits();
+    test_atomic_unique_prior_values();
+    test_atomic_single_evaluation();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
