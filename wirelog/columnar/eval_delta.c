@@ -1180,10 +1180,11 @@ wl_columnar_eval_delta_private_lookup_controlled(wl_col_session_t *sess,
 static int
 wl_columnar_eval_delta_source_shape_controlled(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
-    col_rel_t *relation, uint32_t *nrows, uint32_t *ncols, uint32_t *base_nrows,
+    col_rel_t *relation, uint32_t *nrows, uint32_t *ncols,
+    uint32_t *base_nrows_out,
     wl_evaluation_control_t *control)
 {
-    if (!frame || !relation || !nrows || !ncols || !base_nrows || !control)
+    if (!frame || !relation || !nrows || !ncols || !base_nrows_out || !control)
         return EINVAL;
     wl_columnar_relation_source_group_t *sources =
         wl_columnar_eval_stack_cleanup_sources(frame);
@@ -1196,7 +1197,7 @@ wl_columnar_eval_delta_source_shape_controlled(
     if (!rc && relation->nrows > relation->capacity) rc = EINVAL;
     if (!rc) {
         *nrows = relation->nrows; *ncols = relation->ncols;
-        *base_nrows = relation->base_nrows;
+        *base_nrows_out = relation->base_nrows;
         rc = wl_evaluation_control_charge(control, 0);
     }
     if (rc) return wl_columnar_relation_source_group_drain(sources, rc);

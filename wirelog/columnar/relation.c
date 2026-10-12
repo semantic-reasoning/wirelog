@@ -21315,7 +21315,8 @@ wl_columnar_relation_replacement_image_publish_controlled(
     if (!record || !bulk || !control) return EINVAL;
     int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
     col_rel_replacement_t *tx = &record->transaction;
-    col_rel_t *target = record->target, *stage = tx->staged;
+    col_rel_t *target = record->target;
+    col_rel_t *stage = tx->staged;
     wl_columnar_relation_replacement_physical_t *physical =
         &bulk->replacement_physical;
     if (!record->ready || record->initialized_tokens != 3 || !bulk->ready

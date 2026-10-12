@@ -393,8 +393,11 @@ def main() -> int:
         # Right name, wrong place: `expect` is defined in this very repository,
         # but only under tests/, which the library symbol index does not carry.
         row_edit("a symbol defined only under tests/ fails",
-                 "`session_note_inserted_input` | `col_eval_stratum_tdd_recursive`",
-                 "`expect` | `col_eval_stratum_tdd_recursive`")
+                 "`session_note_inserted_input`,"
+                 " `wl_columnar_session_serial_attempt` |"
+                 " `col_eval_stratum_tdd_recursive`",
+                 "`expect`, `wl_columnar_session_serial_attempt` |"
+                 " `col_eval_stratum_tdd_recursive`")
 
         # The attribution check, read column: a function that exists, is
         # uniquely defined, and never touches the field beside it.
