@@ -17,6 +17,7 @@
  *   9. set_gauge moves the total by the difference and tracks the peak
  *  10. snapshot mirrors every counter
  *  11. subsystem table is complete (names, percentages sum to 100)
+ *  12. the atomic shim operates at the width of its operand (MSVC)
  *
  * Issue #224: Memory Observability and Graceful Degradation for DOOP OOM
  * Issue #1380: gauge/snapshot API and the CHANNEL/STORED/TEMPORARY classes
@@ -692,6 +693,169 @@ test_subsys_table(void)
 }
 
 /* ======================================================================== */
+/* Test 12: the atomic shim operates at the width of its operand            */
+/* ======================================================================== */
+
+/*
+ * mem_ledger.h provides the C11 atomic operations on MSVC through
+ * _Interlocked* intrinsics.  Every read-modify-write must use the intrinsic
+ * of the operand's width: a 64-bit intrinsic applied to an atomic_bool or
+ * atomic_int reads and overwrites the neighbouring bytes, so an exchange
+ * that should return false returns whatever follows the flag in memory
+ * (test_tdd_partition_metadata saw calloc "fail" from a never-armed
+ * failure-injection flag).  The guards are filled with a non-zero pattern
+ * and sit directly next to the atomic without padding, so both a wide read
+ * and a wide write are detected.  On <stdatomic.h> platforms the test
+ * passes trivially.
+ */
+
+#define GUARD_BYTE 0xA5u
+#define GUARD_LEN 8u
+
+struct guarded_bool {
+    uint8_t before[GUARD_LEN];
+    atomic_bool flag;
+    uint8_t after[GUARD_LEN];
+};
+
+struct guarded_int {
+    uint8_t before[GUARD_LEN];
+    atomic_int value;
+    uint8_t after[GUARD_LEN];
+};
+
+static bool
+guards_intact(const uint8_t *before, const uint8_t *after)
+{
+    for (size_t i = 0; i < GUARD_LEN; i++) {
+        if (before[i] != GUARD_BYTE || after[i] != GUARD_BYTE)
+            return false;
+    }
+    return true;
+}
+
+static void
+test_atomic_shim_widths(void)
+{
+    struct guarded_bool gb;
+    struct guarded_int gi;
+
+    TEST("atomic_bool exchange touches only its own byte");
+    memset(&gb, GUARD_BYTE, sizeof(gb));
+    atomic_init(&gb.flag, false);
+    {
+        bool prev = atomic_exchange_explicit(&gb.flag, false,
+                memory_order_acq_rel);
+        bool armed_prev;
+        if (prev) {
+            FAIL("exchange on a clear flag returned true");
+        } else if (!guards_intact(gb.before, gb.after)) {
+            FAIL("exchange on atomic_bool overwrote neighbouring bytes");
+        } else {
+            atomic_store_explicit(&gb.flag, true, memory_order_release);
+            armed_prev = atomic_exchange_explicit(&gb.flag, false,
+                    memory_order_acq_rel);
+            if (!armed_prev)
+                FAIL("exchange on an armed flag returned false");
+            else if (atomic_load_explicit(&gb.flag, memory_order_acquire))
+                FAIL("exchange did not store the new value");
+            else if (!guards_intact(gb.before, gb.after))
+                FAIL("second exchange overwrote neighbouring bytes");
+            else
+                PASS();
+        }
+    }
+
+    TEST("atomic_int fetch_add/fetch_sub touch only their own word");
+    memset(&gi, GUARD_BYTE, sizeof(gi));
+    atomic_init(&gi.value, 5);
+    {
+        /* The MSVC shim returns the widest integer; narrow it as the
+         * C11 call would have. */
+        int old = (int)atomic_fetch_add_explicit(&gi.value, 3,
+                memory_order_acq_rel);
+        int old2 = (int)atomic_fetch_sub_explicit(&gi.value, 1,
+                memory_order_acq_rel);
+        if (old != 5 || old2 != 8)
+            FAIL("fetch_add/fetch_sub returned the wrong prior value");
+        else if (atomic_load_explicit(&gi.value, memory_order_acquire) != 7)
+            FAIL("fetch_add/fetch_sub left the wrong value");
+        else if (!guards_intact(gi.before, gi.after))
+            FAIL("fetch_add/fetch_sub overwrote neighbouring bytes");
+        else
+            PASS();
+    }
+
+    TEST("atomic_int compare_exchange writes expected at its own width");
+    memset(&gi, GUARD_BYTE, sizeof(gi));
+    atomic_init(&gi.value, 7);
+    {
+        /* A failing CAS must write the observed value into `expected`
+         * without spilling past the int, so guard it as well. */
+        struct {
+            uint8_t before[GUARD_LEN];
+            int expected;
+            uint8_t after[GUARD_LEN];
+        } ge;
+        memset(&ge, GUARD_BYTE, sizeof(ge));
+        ge.expected = 1;
+        bool swapped = atomic_compare_exchange_weak_explicit(&gi.value,
+                &ge.expected, 9, memory_order_acq_rel, memory_order_acquire);
+        if (swapped)
+            FAIL("CAS with a stale expected value reported success");
+        else if (ge.expected != 7)
+            FAIL("failed CAS did not report the observed value");
+        else if (!guards_intact(ge.before, ge.after))
+            FAIL("failed CAS overwrote bytes next to `expected`");
+        else if (atomic_load_explicit(&gi.value, memory_order_acquire) != 7)
+            FAIL("failed CAS modified the target");
+        else {
+            swapped = atomic_compare_exchange_weak_explicit(&gi.value,
+                    &ge.expected, 9, memory_order_acq_rel,
+                    memory_order_acquire);
+            if (!swapped)
+                FAIL("CAS with the observed value did not swap");
+            else if (atomic_load_explicit(&gi.value, memory_order_acquire)
+                != 9)
+                FAIL("successful CAS stored the wrong value");
+            else if (!guards_intact(gi.before, gi.after))
+                FAIL("CAS overwrote bytes next to the target");
+            else
+                PASS();
+        }
+    }
+
+    TEST("64-bit atomics keep working through the same shim");
+    {
+        wl_atomic_u64 wide;
+        uint64_t expected = UINT64_C(0x0123456789abcdef);
+        atomic_init(&wide, UINT64_C(0x0123456789abcdef));
+        uint64_t prev = atomic_fetch_add_explicit(&wide, 1,
+                memory_order_acq_rel);
+        bool swapped = atomic_compare_exchange_weak_explicit(&wide,
+                &expected, UINT64_C(42), memory_order_acq_rel,
+                memory_order_acquire);
+        if (prev != UINT64_C(0x0123456789abcdef)) {
+            FAIL("64-bit fetch_add returned the wrong prior value");
+        } else if (swapped || expected != UINT64_C(0x0123456789abcdf0)) {
+            FAIL("64-bit CAS did not report the observed value");
+        } else if (!atomic_compare_exchange_weak_explicit(&wide, &expected,
+            UINT64_C(42), memory_order_acq_rel, memory_order_acquire)) {
+            FAIL("64-bit CAS with the observed value did not swap");
+        } else {
+            uint64_t exchanged = atomic_exchange_explicit(&wide,
+                    UINT64_C(7), memory_order_acq_rel);
+            if (exchanged != UINT64_C(42))
+                FAIL("64-bit exchange returned the wrong prior value");
+            else if (atomic_load_explicit(&wide, memory_order_acquire) != 7)
+                FAIL("64-bit exchange stored the wrong value");
+            else
+                PASS();
+        }
+    }
+}
+
+/* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
 
@@ -715,6 +879,7 @@ main(void)
     test_set_gauge();
     test_snapshot();
     test_subsys_table();
+    test_atomic_shim_widths();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

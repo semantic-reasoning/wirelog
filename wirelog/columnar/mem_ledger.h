@@ -50,56 +50,116 @@ typedef volatile uint_fast64_t atomic_uint_fast64_t;
 #define atomic_load_explicit(ptr, order) (*(ptr))
 #define atomic_store_explicit(ptr, val, order) (*(ptr) = (val))
 
-/* Implement fetch_add/fetch_sub using compare-exchange loop since _InterlockedAdd64
- * may not be available on all MSVC versions. This is slightly slower but portable. */
-static inline int64_t
-wl_atomic_fetch_add_internal(volatile __int64 *ptr, __int64 inc)
+/* Every read-modify-write below dispatches on sizeof(*ptr) so that an
+ * atomic_bool (1 byte) or atomic_int (4 bytes) uses the intrinsic of its
+ * own width.  Routing every operand through the 64-bit intrinsics read and
+ * overwrote the bytes next to a narrow atomic: a failure-injection flag that
+ * was never armed read as set whenever its neighbour in .bss was non-zero,
+ * and the exchange then zeroed that neighbour.  The 64-bit fetch_add keeps
+ * its compare-exchange loop because _InterlockedExchangeAdd64 is not
+ * available on every MSVC target. */
+static inline __int64
+wl_atomic_fetch_add_internal(volatile void *ptr, __int64 inc, size_t width)
 {
-    __int64 old, updated;
-    do {
-        old = *ptr;
-        updated = old + inc;
-    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
-    return old;
-}
-
-static inline int64_t
-wl_atomic_fetch_sub_internal(volatile __int64 *ptr, __int64 dec)
-{
-    __int64 old, updated;
-    do {
-        old = *ptr;
-        updated = old - dec;
-    } while (_InterlockedCompareExchange64(ptr, updated, old) != old);
-    return old;
+    switch (width) {
+    case 1:
+        return _InterlockedExchangeAdd8((volatile char *)ptr, (char)inc);
+    case 2:
+        return _InterlockedExchangeAdd16((volatile short *)ptr, (short)inc);
+    case 4:
+        return _InterlockedExchangeAdd((volatile long *)ptr, (long)inc);
+    default: {
+        volatile __int64 *wide = (volatile __int64 *)ptr;
+        __int64 old, updated;
+        do {
+            old = *wide;
+            updated = old + inc;
+        } while (_InterlockedCompareExchange64(wide, updated, old) != old);
+        return old;
+    }
+    }
 }
 
 #define atomic_fetch_add_explicit(ptr, inc, order) \
-        wl_atomic_fetch_add_internal((volatile __int64 *)(ptr), (__int64)(inc))
-#define atomic_fetch_sub_explicit(ptr, dec, order) \
-        wl_atomic_fetch_sub_internal((volatile __int64 *)(ptr), (__int64)(dec))
+        wl_atomic_fetch_add_internal((ptr), (__int64)(inc), sizeof(*(ptr)))
+/* The subtrahend is negated in unsigned arithmetic so that a decrement of
+ * any magnitude wraps rather than overflowing the signed negation. */
+#define atomic_fetch_sub_explicit(ptr, dec, order)                        \
+        wl_atomic_fetch_add_internal((ptr),                               \
+            (__int64)(0ULL - (unsigned __int64)(dec)), sizeof(*(ptr)))
 
+/* On failure the observed value is written back through `expected` at the
+ * operand's width, so a `bool *` or `int *` expected is never widened. */
 static inline bool
-wl_atomic_compare_exchange_weak_internal(volatile __int64 *ptr,
-    uint64_t *expected, uint64_t desired)
+wl_atomic_compare_exchange_weak_internal(volatile void *ptr, void *expected,
+    __int64 desired, size_t width)
 {
-    __int64 expected_value = (__int64)*expected;
-    __int64 observed = _InterlockedCompareExchange64(
-        ptr, (__int64)desired, expected_value);
-    if (observed != expected_value) {
-        *expected = (uint64_t)observed;
-        return false;
+    switch (width) {
+    case 1: {
+        char want = *(char *)expected;
+        char seen = _InterlockedCompareExchange8((volatile char *)ptr,
+                (char)desired, want);
+        if (seen != want) {
+            *(char *)expected = seen;
+            return false;
+        }
+        return true;
     }
-    return true;
+    case 2: {
+        short want = *(short *)expected;
+        short seen = _InterlockedCompareExchange16((volatile short *)ptr,
+                (short)desired, want);
+        if (seen != want) {
+            *(short *)expected = seen;
+            return false;
+        }
+        return true;
+    }
+    case 4: {
+        long want = *(long *)expected;
+        long seen = _InterlockedCompareExchange((volatile long *)ptr,
+                (long)desired, want);
+        if (seen != want) {
+            *(long *)expected = seen;
+            return false;
+        }
+        return true;
+    }
+    default: {
+        __int64 want = *(__int64 *)expected;
+        __int64 seen = _InterlockedCompareExchange64((volatile __int64 *)ptr,
+                desired, want);
+        if (seen != want) {
+            *(__int64 *)expected = seen;
+            return false;
+        }
+        return true;
+    }
+    }
 }
 
 #define atomic_compare_exchange_weak_explicit(ptr, expected, desired,        \
             succ_order, fail_order)        \
-        wl_atomic_compare_exchange_weak_internal(                              \
-            (volatile __int64 *)(ptr), (uint64_t *)(expected), \
-            (uint64_t)(desired))
+        wl_atomic_compare_exchange_weak_internal((ptr), (expected),           \
+            (__int64)(desired), sizeof(*(ptr)))
+
+static inline __int64
+wl_atomic_exchange_internal(volatile void *ptr, __int64 val, size_t width)
+{
+    switch (width) {
+    case 1:
+        return _InterlockedExchange8((volatile char *)ptr, (char)val);
+    case 2:
+        return _InterlockedExchange16((volatile short *)ptr, (short)val);
+    case 4:
+        return _InterlockedExchange((volatile long *)ptr, (long)val);
+    default:
+        return _InterlockedExchange64((volatile __int64 *)ptr, val);
+    }
+}
+
 #define atomic_exchange_explicit(ptr, val, order) \
-        _InterlockedExchange64((volatile __int64 *)(ptr), (__int64)(val))
+        wl_atomic_exchange_internal((ptr), (__int64)(val), sizeof(*(ptr)))
 
 /* Memory orders (ignored on MSVC - intrinsics always use acquire/release semantics) */
 #define memory_order_relaxed 0
