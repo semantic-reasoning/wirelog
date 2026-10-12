@@ -2455,20 +2455,28 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         aj_rc = ENOMEM;
         goto antijoin_done;
     }
-    for (uint32_t lr = 0; lr < left->nrows && aj_rc == 0; lr++) {
-        uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
-            & (aj_nbuckets - 1);
-        bool found = false;
-        for (uint32_t e = aj_head[h]; e != 0 && !found; e = aj_next[e - 1]) {
-            uint32_t rr = e - 1;
-            if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
-                found = true;
+    {
+        /* #2072: one batch lease for the output rather than one mutation
+         * set per row; it ends before out can be destroyed below. */
+        col_rel_append_batch_t aj_batch = { 0 };
+        aj_rc = col_rel_append_batch_begin(&aj_batch, out);
+        for (uint32_t lr = 0; lr < left->nrows && aj_rc == 0; lr++) {
+            uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
+                & (aj_nbuckets - 1);
+            bool found = false;
+            for (uint32_t e = aj_head[h]; e != 0 && !found;
+                e = aj_next[e - 1]) {
+                uint32_t rr = e - 1;
+                if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
+                    found = true;
+            }
+            if (!found) {
+                for (uint32_t c = 0; c < left->ncols; c++)
+                    lrow_buf[c] = left->columns[c][lr];
+                aj_rc = col_rel_append_batch_row(&aj_batch, lrow_buf);
+            }
         }
-        if (!found) {
-            for (uint32_t c = 0; c < left->ncols; c++)
-                lrow_buf[c] = left->columns[c][lr];
-            aj_rc = col_rel_append_row(out, lrow_buf);
-        }
+        aj_rc = col_join_pair_batch_end(&aj_batch, aj_rc);
     }
     free(lrow_buf);
 antijoin_done:
@@ -2901,28 +2909,39 @@ semijoin_parallel_done:
         }
     }
 
-    /* Probe: for each left row test membership, emit if found: O(|L|) */
-    for (uint32_t lr = 0; lr < left->nrows && sj_rc == 0; lr++) {
-        uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
-            & (nbuckets - 1);
-        bool found = false;
-        for (uint32_t e = ht_head[h]; e != 0 && !found; e = ht_next[e - 1]) {
-            uint32_t rr = e - 1;
-            if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
-                found = true;
-        }
-        if (found) {
-            if (op->project_count > 0 && op->project_indices) {
-                for (uint32_t c = 0; c < ocols; c++) {
-                    uint32_t si = op->project_indices[c];
-                    tmp[c] = (si < left->ncols) ? left->columns[si][lr] : 0;
-                }
-            } else {
-                for (uint32_t c = 0; c < left->ncols; c++)
-                    tmp[c] = left->columns[c][lr];
+    /* Probe: for each left row test membership, emit if found: O(|L|).
+     * Reached only after the parallel attempt above, which writes out
+     * directly, did not run or fell back.  #2072: the serial probe appends
+     * under one batch lease rather than one mutation set per row; it ends
+     * before out can be destroyed below. */
+    {
+        col_rel_append_batch_t sj_batch = { 0 };
+        sj_rc = col_rel_append_batch_begin(&sj_batch, out);
+        for (uint32_t lr = 0; lr < left->nrows && sj_rc == 0; lr++) {
+            uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
+                & (nbuckets - 1);
+            bool found = false;
+            for (uint32_t e = ht_head[h]; e != 0 && !found;
+                e = ht_next[e - 1]) {
+                uint32_t rr = e - 1;
+                if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
+                    found = true;
             }
-            sj_rc = col_rel_append_row(out, tmp);
+            if (found) {
+                if (op->project_count > 0 && op->project_indices) {
+                    for (uint32_t c = 0; c < ocols; c++) {
+                        uint32_t si = op->project_indices[c];
+                        tmp[c] = (si < left->ncols)
+                            ? left->columns[si][lr] : 0;
+                    }
+                } else {
+                    for (uint32_t c = 0; c < left->ncols; c++)
+                        tmp[c] = left->columns[c][lr];
+                }
+                sj_rc = col_rel_append_batch_row(&sj_batch, tmp);
+            }
         }
+        sj_rc = col_join_pair_batch_end(&sj_batch, sj_rc);
     }
 
 semijoin_done:
