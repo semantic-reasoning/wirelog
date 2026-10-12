@@ -749,6 +749,19 @@ coordinator's reads.
 
 The complete source audit now contains **232 atomic call sites**.
 
+### 5.23 `wirelog/columnar/relation.c` — lease-validation test counter (2 rows)
+
+Issue #2072: test builds that define `WL_TEST_MUTATION_SET_HOOK` count the
+calls of `col_rel_mutation_lease_validate`, so a test can bound the full
+lease validations a batch append takes.  Other builds compile neither row.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_test_lease_validations_peek` | `wl_lease_validations` | `atomic_load_explicit` | `relaxed` | Test-only seam reads the count of full lease validations so a single-threaded window can count the validations in it; only the delta matters, and no other state is read through it |
+| `relation.c:col_rel_mutation_lease_validate` | `wl_lease_validations` | `atomic_fetch_add_explicit` | `relaxed` | Test builds only (`WL_TEST_MUTATION_SET_HOOK`): count one full lease validation; the counter is read only as a delta and publishes no other state |
+
+The complete source audit now contains **234 atomic call sites**.
+
 ---
 
 ## 6. Lock-free SPSC delta queue
