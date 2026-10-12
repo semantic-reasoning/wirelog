@@ -375,6 +375,22 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
         .parallel_execution = sess ? sess->callback_parallel_execution : false,
         .session_key = sess ? sess->callback_session_key : NULL
     };
+    /* Issue #2122: append under one batch lease rather than one mutation
+     * set per row.  Every exit below ends the batch before destroying out. */
+    col_rel_append_batch_t batch = { 0 };
+    int batch_rc = col_rel_append_batch_begin(&batch, out);
+    if (batch_rc != 0) {
+        if (ce_map) {
+            for (uint32_t c = 0; c < ce_map_count; c++)
+                wl_columnar_expr_compiled_free(ce_map[c]);
+            free((void *)ce_map);
+        }
+        col_row_buf_release(&row_rb);
+        free(tmp);
+        col_rel_destroy(out);
+        WL_MAP_RELEASE_SCRATCH();
+        return wl_columnar_ops_dispose_entry(stack, &e, batch_rc);
+    }
     for (uint32_t r = 0; r < e.rel->nrows; r++) {
         col_rel_row_copy_out(e.rel, r, row);
         for (uint32_t c = 0; c < pc; c++) {
@@ -385,6 +401,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     if (wl_columnar_expr_eval_compiled(ce_map[c], row,
                         e.rel->ncols,
                         &val) != 0) {
+                        (void)col_rel_append_batch_end(&batch, false);
                         if (ce_map) {
                             for (uint32_t i = 0; i < ce_map_count; i++)
                                 wl_columnar_expr_compiled_free(ce_map[i]);
@@ -405,6 +422,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                     if (wl_columnar_expr_eval_run_ctx(
                             op->map_exprs[c].data, op->map_exprs[c].size, row,
                             e.rel->ncols, &val, &expr_ctx, &expr_status) != 0) {
+                        (void)col_rel_append_batch_end(&batch, false);
                         if (ce_map) {
                             for (uint32_t i = 0; i < ce_map_count; i++)
                                 wl_columnar_expr_compiled_free(ce_map[i]);
@@ -440,8 +458,9 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 tmp[c] = (src < e.rel->ncols) ? row[src] : 0;
             }
         }
-        int rc = col_rel_append_row(out, tmp);
+        int rc = col_rel_append_batch_row(&batch, tmp);
         if (rc != 0) {
+            (void)col_rel_append_batch_end(&batch, false);
             if (ce_map) {
                 for (uint32_t c = 0; c < ce_map_count; c++)
                     wl_columnar_expr_compiled_free(ce_map[c]);
@@ -454,6 +473,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             return wl_columnar_ops_dispose_entry(stack, &e, rc);
         }
     }
+    batch_rc = col_rel_append_batch_end(&batch, true);
 
     if (ce_map) {
         for (uint32_t c = 0; c < ce_map_count; c++)
@@ -464,6 +484,10 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     free(tmp);
     WL_MAP_RELEASE_SCRATCH();
 
+    if (batch_rc != 0) {
+        col_rel_destroy(out);
+        return wl_columnar_ops_dispose_entry(stack, &e, batch_rc);
+    }
     int input_rc = wl_columnar_ops_dispose_entry(stack, &e, 0);
     if (input_rc != 0) {
         col_rel_destroy(out);

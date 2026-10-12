@@ -1441,6 +1441,182 @@ join_denial_tests(void)
     assert(join_denial_run(32, hi, true) == ENOSPC);
 }
 
+/* The map operator appends its output rows under the batch appender (#2122):
+ * a map over 4096 rows acquires a handful of mutation sets, not one per row,
+ * with or without a governor, and produces exactly the per-row result. */
+static uint8_t map_compiled_add[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_ADD
+};
+/* col1 / 2 + hash(col1) * 0.  The compiler takes no hash, so the map
+ * evaluates this with the interpreter (map_run asserts so). */
+static uint8_t map_interpreted_div[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 2, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_DIV,
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_ARITH_HASH,
+    WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_MUL,
+    WL_PLAN_EXPR_ARITH_ADD
+};
+/* 1000 / (col1 - 2000) + hash(col1) * 0, by the interpreter: fails at row
+ * 2000 of a map over col1 = 0..4095. */
+static uint8_t map_div_fails_mid_loop[] = {
+    WL_PLAN_EXPR_CONST_INT, 0xe8, 0x03, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 0xd0, 0x07, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_SUB,
+    WL_PLAN_EXPR_ARITH_DIV,
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_ARITH_HASH,
+    WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+    WL_PLAN_EXPR_ARITH_MUL,
+    WL_PLAN_EXPR_ARITH_ADD
+};
+/* col1 + (INT64_MAX - 2000), compiled: overflows from row 2001 on. */
+static uint8_t map_add_overflows_mid_loop[] = {
+    WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+    WL_PLAN_EXPR_CONST_INT, 0x2f, 0xf8, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    WL_PLAN_EXPR_ARITH_ADD
+};
+
+enum { MAP_ROWS = 4096 };
+
+static col_rel_t *
+map_source(void)
+{
+    col_rel_t *src = col_rel_new_auto("map_src", 2);
+    assert(src);
+    for (uint32_t i = 0; i < MAP_ROWS; i++) {
+        int64_t row[2] = { (int64_t)(i * 3u), (int64_t)i };
+        assert(col_rel_append_row(src, row) == 0);
+    }
+    return src;
+}
+
+/* Run a two-column map: column 0 is col0, column 1 is @expr over the row,
+ * or col1 when @expr is NULL.  @interpreted says whether the compiler must
+ * refuse @expr, which sends the map to the interpreter. */
+static int
+map_run(wl_col_session_t *sess, uint8_t *expr, uint32_t size,
+    bool interpreted, uint64_t *acquisitions, col_rel_t **out,
+    uint32_t *stack_top)
+{
+    static const uint32_t project[2] = { 0, 1 };
+    wl_plan_expr_buffer_t exprs[2] = { { NULL, 0 }, { expr, size } };
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_MAP;
+    op.project_indices = project;
+    op.project_count = 2;
+    if (expr) {
+        int compile_rc = 0;
+        wl_columnar_expr_compiled_t *compiled
+            = wl_columnar_expr_compile_governed(expr, size, NULL, NULL, NULL,
+                &compile_rc);
+        assert((compiled == NULL) == interpreted);
+        wl_columnar_expr_compiled_free(compiled);
+        op.map_exprs = exprs;
+        op.map_expr_count = 2;
+    }
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, map_source(), true) == 0);
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    int rc = col_op_map(&op, &stack, sess);
+    *acquisitions = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    *stack_top = stack.top;
+    *out = NULL;
+    if (rc == 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        *out = result.rel;
+    }
+    return rc;
+}
+
+static void
+map_op_batch_tests(void)
+{
+    static const struct {
+        uint8_t *expr;
+        uint32_t size;
+        bool interpreted;
+        int64_t add;
+        int64_t div;
+    } cases[] = {
+        { NULL, 0, false, 0, 1 },
+        { map_compiled_add, sizeof(map_compiled_add), false, 1, 1 },
+        { map_interpreted_div, sizeof(map_interpreted_div), true, 0, 2 },
+    };
+    for (int governed = 0; governed < 2; governed++) {
+        for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            wl_col_session_t *sess = join_session();
+            wl_columnar_memory_governor_ref_t *ref = governed
+                ? enforcing_governor(1u << 26) : NULL;
+            sess->memory_governor = ref;
+            uint64_t acquisitions = 0;
+            col_rel_t *out = NULL;
+            uint32_t top = 0;
+            assert(map_run(sess, cases[k].expr, cases[k].size,
+                cases[k].interpreted, &acquisitions, &out, &top) == 0);
+            assert(out && out->nrows == MAP_ROWS && out->ncols == 2);
+            assert(acquisitions >= 1 && acquisitions <= 16);
+            for (uint32_t i = 0; i < MAP_ROWS; i++)
+                assert(out->columns[0][i] == (int64_t)(i * 3u)
+                    && out->columns[1][i]
+                    == (int64_t)i / cases[k].div + cases[k].add);
+            assert(col_rel_destroy_checked(out) == 0);
+            sess->memory_governor = NULL;
+            join_session_destroy(sess);
+            if (ref) {
+                assert(governor_reserved(ref) == 0);
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+}
+
+/* An expression that fails part-way through the rows, interpreted or
+ * compiled, fails the map with ERANGE after the rows before it were
+ * appended under the batch, consumes its input, and leaves no output and no
+ * reservation. */
+static void
+map_error_tests(void)
+{
+    static const struct {
+        uint8_t *expr;
+        uint32_t size;
+        bool interpreted;
+    } cases[] = {
+        { map_div_fails_mid_loop, sizeof(map_div_fails_mid_loop), true },
+        { map_add_overflows_mid_loop, sizeof(map_add_overflows_mid_loop),
+          false },
+    };
+    for (int governed = 0; governed < 2; governed++) {
+        for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            wl_col_session_t *sess = join_session();
+            wl_columnar_memory_governor_ref_t *ref = governed
+                ? enforcing_governor(1u << 26) : NULL;
+            sess->memory_governor = ref;
+            uint64_t acquisitions = 0;
+            col_rel_t *out = NULL;
+            uint32_t top = 1;
+            assert(map_run(sess, cases[k].expr, cases[k].size,
+                cases[k].interpreted, &acquisitions, &out, &top) == ERANGE);
+            assert(out == NULL && top == 0);
+            sess->memory_governor = NULL;
+            join_session_destroy(sess);
+            if (ref) {
+                assert(governor_reserved(ref) == 0);
+                wl_columnar_memory_governor_ref_release(ref);
+            }
+        }
+    }
+}
+
 int
 main(void)
 {
@@ -1463,6 +1639,8 @@ main(void)
     batch_renewal_failure_tests();
     filter_denial_tests();
     join_denial_tests();
+    map_op_batch_tests();
+    map_error_tests();
     {
         col_rel_t root;
         fixture_t f = {0};
