@@ -1,0 +1,38 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Narrow legitimate completed explicit INT64 fixture setup provenance, distinct from generated implicit target; no runtime/candidate approval.",
+  "assessment": "/home/joykim/.tmp/1821-work/serial-observed-seed-explicit-int64-setup-source-binding.json",
+  "assessment_sha256": "96a6e45b93a19da77c07d92aee564736885d7e253aba424bbb696167507ed6cf",
+  "assessment_full_read": true,
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes_verified": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/session.c:4205", "wirelog/columnar/relation.c:4167", "wirelog/columnar/relation.c:4213", "wirelog/columnar/relation.c:4275"],
+      "plan_elements": ["source_evidence", "completed setter before control/frame", "explicit metadata provenance"],
+      "categories": ["hidden generated-type policy coupling", "unsafe setup authority overlap", "synthetic representation evidence"],
+      "ruling": "Accepted. Actual session schema/type setup is gated by has_float_type, so an all-INT64 declaration does not establish nonNULL column_types. Actual completed col_rel_set_column_types on valid populated width1 implicit target permits INT64, acquires/releases actual published writer, reserves and installs real type/Arrow metadata with true credit retirement and one view touch. Running this before attached control/frame/SINGLE creates legitimate explicit helper provenance without pointer/type/token retag or bounded-production substitution. Rows/capacity/TS policy remains actual and must be asserted; view and metadata baseline must be captured afterward."
+    },
+    {
+      "paths": ["tests/test_evaluation_observer.c", "wirelog/columnar/relation.c:7993"],
+      "plan_elements": ["setup_contract", "separate568/567 and default564/563", "failed-premise history"],
+      "categories": ["fixtures using wrong type premise", "measured rebasing", "over-broad runtime claims"],
+      "ruling": "Accepted. Separate real setter-enriched explicit width1/noTS setup incurs the one explicit-type validation debit4, giving568 and final567 refusal at536 after strict5 preflight; untouched generated implicit typesNULL gives564 and563 refusal at532. Setter costs are completed fixture setup outside measured BEGIN, not refunded active work. Preserve actual older408/404 source algebra and work93/94 failed explicit premises; these failures concern setup provenance, not revised observed allowances. Existing work95 normal helper and sanitizer reports do not become broader source/candidate qualification through this ruling."
+    }
+  ],
+  "findings": [],
+  "binding_requirements": [
+    "Use actual successful completed setter before any control/frame/SINGLE setup; assert typeINT64, actual rows1/cap64/noTS and postsetter view/metadata baseline.",
+    "Label enriched explicit target as direct helper provenance and keep untouched generated implicit target564 independently. No session/parser global policy change or claim of generated explicit INT64 support.",
+    "Real strict original five-slot preflight, fresh genuine setup for repeats, current source/action binding and distinct runtime review remain required.",
+    "Historical failed setup and diagnostic timeout/resource history remain unchanged and unwaived; no whole STEP/admission/final qualification is supplied."
+  ],
+  "limits": {"source_modified": false, "builds_tests_run": false, "runtime_or_candidate_approval": false, "backend_admission_ready": false, "whole_STEP_qualification": false, "full_issue_complete": false, "historical_resource_deviations": "unwaived"}
+}

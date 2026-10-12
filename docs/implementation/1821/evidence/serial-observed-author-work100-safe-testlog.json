@@ -1,0 +1,9 @@
+[
+  {
+    "name": "unit - wirelog:evaluation_observer",
+    "result": "OK",
+    "returncode": 0,
+    "stdout": "evaluation_observer: original metadata disposal OK\n",
+    "stderr": null
+  }
+]

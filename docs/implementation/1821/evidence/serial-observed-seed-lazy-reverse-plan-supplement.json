@@ -1,0 +1,117 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-seed-lazy-reverse-plan-supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-seed-lazy-schema-plan-supplement.json",
+  "allowed_paths": [
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/eval_stack.c",
+    "tests/test_evaluation_observer.c",
+    "docs/SEMANTICS.md"
+  ],
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "ee55d7b894b701c6aa59c776d7bf4e5a8d08116e71506a1d4ec83f68d5133739",
+    "wirelog/columnar/internal.h": "38b6a9b94a44078580241d4a425def294f9345f00397834e001eb07a914c2a0b",
+    "wirelog/columnar/eval_stack.c": "04295c8094bbdd140748497c0b62767c946210513e6b8cf7a73a5847a37e1a1d"
+  },
+  "scope": "Only original-slot lazy-schema credit transport/reverse/accounting footer under external mode19, borrowed8. No governor API/path changes, frame growth, token reset, or backend admission.",
+  "source_anchors": [
+    "memory_governor.c528 reservation_move transfers actual RESERVED/COMMITTED state and owner and leaves source self-EMPTY; it does not initialize/reset another live token.",
+    "memory_governor.c1524 commit_growth changes REPLACING growth into COMMITTED bytes O+I and clears replacement_bytes. rollback_growth1590 accepts only REPLACING, so it is invalid after successful growth commit.",
+    "memory_governor.c1598 downsize accepts strictly positive final bytes and COMMITTED token; false leaves original quantity/state. finish_reservation1624 release accepts RESERVED/COMMITTED/REPLACING and leaves RELEASED historical affiliation on success.",
+    "relation.c2286 payload begin selects embedded growth iff governed old retained amount and incoming are positive, otherwise fresh final amount; governor-free/no-incoming covered by no-token route.",
+    "relation.c2465 raw payload publish eagerly updates scalar and clears growth; scoped seed must not call this aborting/automatic transport path. relation.c2210 raw metadata publish transports old then new and commits target; dedicated seed retains its accepted stop-order contract."
+  ],
+  "quantity_and_scalar_lifetimes": [
+    "O = original dst.retained_reserved_bytes; M = original dst.metadata_reserved_bytes. Keep BOTH descriptor scalars unchanged through every unpublished reserve/commit/move/reverse prefix. Embedded tokens can temporarily differ from those scalars ONLY under the dedicated original phase; generic helpers must not inspect that transient relation.",
+    "F = original BULK.final_bytes, I = original BULK.pending.incoming_bytes, N = original BULK.metadata_bytes. Preserve these until the lazy footer is terminal. Existing timestamps reused remain source-owned; newly allocated TS alone contributes incoming. No compact_retired scalar use while old_schema is live.",
+    "Before fixed schema installation save O into phase-exclusive borrowed.metadata_after (unused old-shared/COW metadata purpose in lazy), then publish installed scalar C = O+I for committed growth or F for fresh, and metadata scalar N. C overflow was checked before admission. The old baseline is no longer needed for reverse after installation; borrowed.metadata_after remains an honest original O witness until footer terminal. Keep prior_identity/generation and lease intact.",
+    "F is exact installed retained physical footprint, not a credit refund invented from observed usage. On installed growth, old physical retirement may reduce C to F. On unpublished growth, new physical retirement reduces C to O. Derived quantities must match source shape and actual token bytes before credit operation."
+  ],
+  "original_slot_state_table": [
+    {
+      "state": "Fresh RESERVED, no commit",
+      "owners": "pending.fresh RESERVED; original retained token untouched; metadata_pending RESERVED or absent",
+      "reverse": "Free/NULL only new physical prefixes. Checked rollback of genuine RESERVED pending credit; never release old target credit. Keep phase if identity refuses."
+    },
+    {
+      "state": "Fresh accepted, old not moved (phase33)",
+      "owners": "pending.fresh COMMITTED owner dst; dst retained still old; previous terminal",
+      "reverse": "After new physical NULL, release pending.fresh (not rollback). Preserve original old token exactly, including its raw accepted RESERVED/owner0 or COMMITTED/dst state."
+    },
+    {
+      "state": "Fresh old transported, new not transported (new lazy phase40)",
+      "owners": "previous actual old credit; dst retained self-EMPTY from actual move; pending.fresh COMMITTED",
+      "reverse": "Restore previous->dst when O>0 using checked move before finishing reverse; O0 has no old move. Release new pending only after new physical NULL. A refused restore keeps previous and writer live; no reservation_init."
+    },
+    {
+      "state": "Fresh new transported (phase34)",
+      "owners": "dst retained new COMMITTED; pending.fresh self-EMPTY; previous actual old or absent",
+      "reverse": "After new physical NULL, checked dst->pending.fresh, then previous->dst if O>0, then release pending.fresh. Each successful move is acknowledged immediately before any fallible tail. Refusal retains its actual prefix; do not restore over the live new token or lose previous."
+    },
+    {
+      "state": "Embedded growth REPLACING, before actual commit",
+      "owners": "dst retained owns O plus overlap I; pending.growth is route discriminator, fresh terminal",
+      "reverse": "After all new physical NULL, checked rollback_growth returns exact O COMMITTED. Original old physical model remains live. False retains original REPLACING identity/amount/phase."
+    },
+    {
+      "state": "Embedded growth COMMITTED (phase33 or later)",
+      "owners": "dst retained COMMITTED bytes O+I, no overlap, owner dst; pending.growth remains route witness until footer settled",
+      "reverse": "After all new physical NULL, checked downsize(dst.retained,O), with O>0 by actual growth selection. Never rollback_growth or release the whole token while old model survives. False leaves COMMITTED O+I and unchanged old scalar O; retain original phase/writers."
+    },
+    {
+      "state": "Metadata pending RESERVED",
+      "owners": "metadata_pending RESERVED; old dst metadata untouched",
+      "reverse": "After new metadata physical NULL, checked rollback pending; preserve old metadata state/owner."
+    },
+    {
+      "state": "Metadata accepted (phase35)",
+      "owners": "metadata_pending COMMITTED owner dst; old dst metadata untouched",
+      "reverse": "After new metadata physical NULL, checked release metadata_pending, not rollback."
+    },
+    {
+      "state": "Metadata old transported, new not transported (new lazy phase41)",
+      "owners": "old_metadata actual old credit; dst metadata self-EMPTY; metadata_pending COMMITTED",
+      "reverse": "Checked old_metadata->dst if M>0, then checked release new pending after physical NULL; M0 has no old move. Keep old scalar M until fixed installation."
+    },
+    {
+      "state": "Metadata new transported (phase36)",
+      "owners": "dst metadata new COMMITTED; metadata_pending self-EMPTY; old_metadata actual old or absent",
+      "reverse": "After new metadata physical NULL, checked dst->metadata_pending, checked old_metadata->dst if M>0, then release new pending. Token truth and acknowledged prefix decide next operation, never assumed self destination or reset."
+    },
+    {
+      "state": "Installed phases37/38",
+      "owners": "dst holds new physical model and new credits; previous/old_metadata hold old credits where actually moved; original old Arrow/TS physically journalled",
+      "reverse": "Consumed: no return to O/M or old descriptor. Dispose old physical first, then release actual previous/old_metadata. For growth, downsize embedded C to F after old physical NULL. Update retained scalar F only on success; metadata stays N. Refused footer retains consumed schema and original writer until checked retry; no install or row replay."
+    }
+  ],
+  "phase_and_retry_binding": [
+    "Existing32..39 remain lazy only. Add40=OLD_PAYLOAD_MOVED and41=OLD_METADATA_MOVED so failure before the following new-token move has an explicit original prefix. These numeric values are scoped by mode19/borrowed8/schema_install, never mode17 candidate/image phases.",
+    "Unpublished reverse can reuse dedicated42=NEW_PHYSICAL_RETIRED only after all new pointers/Arrow flags physically NULL; remaining original token identities/states/quantities plus pending.growth and old descriptor scalars determine each unfinished credit/move. No phase advance merely because cleanup was attempted. The new-token slot self-EMPTY versus COMMITTED and old previous slot live versus self-EMPTY unambiguously journal actual completed moves.",
+    "Before any reverse move, validate both exact original addresses, quantities, actual governor affiliation, transition NONE/replacement0, genuine source RESERVED/COMMITTED and destination EMPTY/RELEASED domain. A restored old token preserves its original state and owner, not blanket COMMITTED. Partial init token prefix is checked before looking at uninitialized slots.",
+    "Credit release success is terminal RELEASED with historical bytes/owner; it must not be initialized again during reverse. Existing terminal validator must accept legitimate historical RELEASED while refusing live affiliation inconsistent with that disposition. No subtraction or physical free repeated on resumed footer.",
+    "Unpublished return to ordinary purpose requires all new physical NULL, old token restoration exact, new tokens terminal and original scalars O/M unchanged. Installed return requires old physical NULL and all old credits terminal plus target exact F/N. Only then clear route/progress; original seed flat image/dimensions and SINGLE lifetime continue as prescribed."
+  ],
+  "no_governor_and_zero": [
+    "With dst governor NULL, no fresh/growth/meta reservation or move/commit/release occurs; physical construction/cleanup and scalar raw policy still execute. Actual original ungov embedded NULL identity is allowed only exact destination address, zero affiliation/state EMPTY and original amount zero. Dedicated initialized BULK slots remain strict self terminal. Do not fabricate self identity in target.",
+    "Governed zero-quantity no-credit route likewise validates inert original slots; no release/downsize(0). Growth with O0 is unreachable by actual begin selection. A final exact retained amount0 retires positive credit by checked release only when every physical byte attributed to that credit is gone; keep honest RELEASED terminal rather than reservation_init.",
+    "Fresh F0 with O positive and no incoming preserves the existing token until installed exact-quantity footer; it must not be treated as a fresh accepted/moved token. Metadata N0 has no new token; old metadata credit may retire only after its actual old metadata physical image is gone. Carried original types/map are not freed merely to justify zero."
+  ],
+  "cleanup_policy": "Healthy preparation, validation and physical new-prefix disposal use existing charged <=256 work with durable progress. Once a real stop or positive validation/identity refusal requires rollback, exact original physical cleanup and checked rollback/release/downsize belong to the accepted mandatory cleanup exclusion, with no fresh admission/poll/control reset. This exclusion is not forward allocation, hash/sort/schema construction, or an admission workaround. Positive primary dominates cleanup error; nonpositive primary can be replaced by genuine cleanup refusal. Retain frame/BULK/SINGLE on refusal until actual serialized drain, including real physicalNULL before identity fault.",
+  "acceptance": [
+    "Actual fresh COMMITTED pending, old-only move, new move, metadata old/new move prefixes: real identity scalar refusal at each current original slot, true physicalNULL then stop/refusal and saved scalar restoration after return followed by checked retry. No copied token or forced state.",
+    "Actual growth REPLACING cancel versus actual growth COMMITTED then later metadata cutoff: prove original target old physical/scalar O, token overlap or COMMITTED O+I as reached, then exact rollback versus downsize respectively; strict negative test forbids rollback_growth after commit.",
+    "Installed schema followed by genuine old-credit/downsize refusal is consumed cleanup-only; final raw physical/schema/scalars and sampled enforcing-budget usage match. Include honest ungov/zero/no-incoming cases; helper provenance stays separate from later selected backend STEP.",
+    "Four-profile actual original borrowed union/BULK1088/seed536/frame3864/completion80 fit before activation; no new layout or compile claim here. Work literal/source-binding required before exact tests; no observed allowance rebasing."
+  ],
+  "limits": {
+    "runtime_approval": false,
+    "source_authorized_by_artifact": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "resource_history": "Unwaived; read-only source audit and HOME artifact only."
+  }
+}

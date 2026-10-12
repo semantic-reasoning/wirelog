@@ -1,0 +1,46 @@
+{
+  "kind": "checkpoint-only normal focused validation",
+  "source_sha256": {
+    "tests/meson.build": "89f7334a099db420db359254b6bc13df922c67c0e7dd3d2cfafc5279b63303c6",
+    "tests/test_evaluation_observer.c": "97d39329c4c0dc0079ff183fc1042bd243dc9925013556b8ff6c80d1fb39a0a0",
+    "wirelog/arena/compound_arena.c": "e6f5ab25414f6b7f6214ec41a1f14d34698ff0039249489ce29fd66a12d6e894",
+    "wirelog/arena/compound_arena.h": "825069e794956b9750f68430554767a27059e9f3cc60d1b3e08d5418dd046841",
+    "wirelog/columnar/eval_delta.c": "859c48a245674d72fd5e8fe28d15ad129263d18b08f604e4adfbf33cd944d7b0",
+    "wirelog/columnar/eval_stack.c": "9b900516bb249492eefaf6952160756b7b28f7ceb94cbac74c7caf79ac5a68c5",
+    "wirelog/columnar/internal.h": "f7d775032e09aa675974891b0e401f8ebd7e6aeeabac3f9d67664b6d79475e94",
+    "wirelog/columnar/merge.c": "41c161866ca94318e8b70405adc0f6c09ff4b9e0fcb85e2ba38fc70db7c67f77",
+    "wirelog/columnar/relation.c": "04943df81f7f438ee634e74038c30aa4d42a05fdfea0d6f1b24deec628b60f3b",
+    "wirelog/columnar/session.c": "aee711b06ce247550b24a41bc90d2763d666de7b4d14b7e800e7f7278d0bbda8"
+  },
+  "commands": [
+    {
+      "command": [
+        "meson",
+        "compile",
+        "-C",
+        "/home/joykim/.tmp/1821-work/build",
+        "-j7",
+        "tests/test_evaluation_observer"
+      ],
+      "exit": 0,
+      "seconds": 40.37
+    },
+    {
+      "command": [
+        "meson",
+        "test",
+        "-C",
+        "/home/joykim/.tmp/1821-work/build",
+        "--no-rebuild",
+        "--num-processes",
+        "1",
+        "--logbase",
+        "1821-checkpoint-root",
+        "evaluation_observer"
+      ],
+      "exit": 0,
+      "seconds": 36.1
+    }
+  ],
+  "full_issue_complete": false
+}

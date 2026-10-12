@@ -1,0 +1,132 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/critic_1821_continue",
+  "verdict": "accepted",
+  "scope": "Source-derived handoff suffix arithmetic and real fresh fixture provenance only",
+  "binding": "serial-observed-normalization-replacement-handoff-exact-cost-binding.json",
+  "binding_sha256": "978241c8866e46e336a631ee3ec8d85af8c66d75f8ed5db09b762aa9fe2c05ef",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_binding": {
+    "path": "wirelog/columnar/eval_stack.c",
+    "function": "wl_columnar_eval_stack_cleanup_observer_normalized_replacement",
+    "sha256": "345353f4a57f190750882804d6d60abafc774919925afc84a35a89b743c45ef9",
+    "actual_source_hash_matched": true
+  },
+  "examined": [
+    {
+      "paths": [
+        "wirelog/columnar/eval_stack.c",
+        "wirelog/columnar/relation.c"
+      ],
+      "elements": [
+        "128 main/192 actual route predicates",
+        "five32 terminal validations",
+        "two group-terminal helpers",
+        "32 activation",
+        "336 clear",
+        "three128 init/three32 validation/final64"
+      ],
+      "categories": [
+        "tests that do not prove behavior",
+        "hidden coupling"
+      ],
+      "ruling": "Actual source and group helper match every listed charge. group_terminal contributes two64 per group; credit_terminal and private_batch_disposable add no evaluation-control work. Both TS and noTS branches use the single192 admission and actual route-specific original fields before overwrite. All charge0 tails add0 but remain real interruption points."
+    },
+    {
+      "paths": [
+        "wirelog/columnar/eval_stack.c",
+        "tests/test_evaluation_observer.c"
+      ],
+      "elements": [
+        "TRANSFER_INITIALIZING count/prefix",
+        "final fixed ready17 transition",
+        "serialized fresh normalized suffix setup",
+        "TSack272 limitation"
+      ],
+      "categories": [
+        "unsafe state assumptions",
+        "weak failure handling",
+        "atomic scope"
+      ],
+      "ruling": "Literal suffix fixtures require actual successful construction/normalization in a labeled prior setup attempt, original candidate/frame live and genuine NORMALIZED route metadata. They cannot manufacture phase/count or reset an active allowance. Prefix helper reads no replacement record below336 and validates only genuine initialized EMPTY originals afterward. Final nine stores occur after64 admission and final poll; following stop sees actual ready17 custom candidate owner. TSack272 remains source algebra only because normalizer automatically acknowledges and does not expose an isolated healthy TS_ACTIVE continuation."
+    }
+  ],
+  "arithmetic_rulings": {
+    "preclear": "128+192+5*32+2*(2*64)+32=768",
+    "full": "768+336+3*128+3*32+64=1648",
+    "cutoffs": [
+      {
+        "allowance": 896,
+        "consumed": 896,
+        "clear_count": 128
+      },
+      {
+        "allowance": 1024,
+        "consumed": 1024,
+        "clear_count": 256
+      },
+      {
+        "allowance": 1104,
+        "consumed": 1104,
+        "clear_count": 336,
+        "token_prefix": 0
+      },
+      {
+        "allowance": 1232,
+        "consumed": 1232,
+        "clear_count": 336,
+        "token_prefix": 1
+      },
+      {
+        "allowance": 1360,
+        "consumed": 1360,
+        "clear_count": 336,
+        "token_prefix": 2
+      },
+      {
+        "allowance": 1488,
+        "consumed": 1488,
+        "clear_count": 336,
+        "token_prefix": 3
+      },
+      {
+        "allowance": 1647,
+        "consumed": 1584,
+        "clear_count": 336,
+        "token_prefix": 3,
+        "reason": "Final64 admission rejected before any ready17 transfer store."
+      },
+      {
+        "allowance": 1648,
+        "consumed": 1648,
+        "state": "ready17 healthy return0 absent cancellation/fault"
+      }
+    ]
+  },
+  "findings": [],
+  "binding_requirements": [
+    "Retain actual setup/source provenance and finish/report then new serialized BEGIN before measuring this suffix; preserve same original allocation/candidate/credits/ref and no active reset/refund.",
+    "Each fresh exact/repeat/minus-one case needs fresh genuine normalized setup; an interrupted handoff is cleanup-only, not a forward resume used to reproduce fresh totals.",
+    "Assert actual count/initialized prefix/phase/consumed before mandatory checked disposal; cleanup outcome and reference/usage baseline are separate obligations.",
+    "No normalization/constructor/sample/TSack work is included in1648. Never claim full backend cost or retag TS_ACTIVE to fabricate isolated272 acknowledgment proof.",
+    "Bind final formatted source identity to this algebra before fixtures are credited. Subsequent charge/helper/control-flow changes require recalculation from source, not tolerances or measured rebasing.",
+    "Preserve historical handoff B1 upheld and actual R2 forward acknowledgment versus ABANDONED distinction; these suffix numbers do not replace lifecycle qualification."
+  ],
+  "limits": {
+    "source_modified": false,
+    "builds_or_tests_run": false,
+    "observed_totals_used": false,
+    "fixture_runtime_verified": false,
+    "candidate_approved": false,
+    "backend_admission_authorized": false,
+    "full_issue_complete": false,
+    "remaining": "Actual revised caller/retention/fault/finite qualification and all full #1821/latest-main/native Windows obligations remain before final PR."
+  },
+  "fixture_provenance_ruling": {
+    "disposition": "accepted within the source-derived suffix binding",
+    "setup": "Actual successful ctor/append/TS or noTS normalization with original active frame, then FINISH setup and configure/BEGIN a new serialized allowance; no phase reset/retag.",
+    "cases": "Each896/1024/1104/1232/1360/1488/1647/1648 case and full1648 repeat is a fresh genuine setup. Assert initialized prefix only after complete336 clear, and actual outside mode/count before real mandatory finish/drain.",
+    "prefix_fault": "At actual1232 prefix1, an identity-only fault on the genuinely initialized original EMPTY token is validation-refusal evidence, not live-credit release refusal. Preserve state/owner/bytes and original address; real prefix validation must retain the candidate/frame. Restore only saved identity after serialized return then true drain. Never inspect alias fields at count<336.",
+    "scope": "Both genuine TS and noTS route suffixes may be proved with these cases; no full backend total or isolated TSack272 claim."
+  }
+}

@@ -909,7 +909,13 @@ wl_columnar_session_source_lease_release(
 
     if (!lease)
         return 0;
-    rc = col_rel_source_reader_release(&lease->reader);
+    /* A controlled healthy release may have consumed storage and retained
+     * only the original descriptor pin. Legacy complete-reader release must
+     * never receive that partial object during destroy/error cleanup. */
+    rc = !lease->reader.owner && lease->reader.secondary_owner
+        ? wl_columnar_relation_reader_pair_release_controlled(lease->owner,
+            &lease->reader, NULL)
+        : col_rel_source_reader_release(&lease->reader);
     if (rc == 0)
         free(lease);
     return rc;
@@ -1017,6 +1023,61 @@ wl_columnar_session_retire_source_lease(wl_col_session_t *sess,
     if (rc != 0)
         wl_columnar_session_source_lease_restore(sess, lease);
     return rc;
+}
+
+int
+wl_columnar_session_retire_source_lease_controlled(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t *borrower,
+    wl_evaluation_control_t *control)
+{
+    if (!sess || !frame || sess->cleanup_active != frame
+        || !borrower || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    wl_columnar_relation_source_group_t *group =
+        wl_columnar_eval_stack_cleanup_sources(frame);
+    if (!group || group->descriptor_count || group->owner_count) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_columnar_relation_source_group_acquire_controlled(group,
+            borrower, NULL, control);
+    if (rc) return wl_columnar_relation_source_group_drain(group, rc);
+    rc = wl_evaluation_control_charge(control, 8);
+    if (!rc && (group->input_owner[0] >= group->owner_count
+        || group->owners[group->input_owner[0]].owner != borrower)) rc = EBUSY;
+    if (!rc) rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return wl_columnar_relation_source_group_drain(group, rc);
+    rc = wl_columnar_relation_source_group_finish_controlled(group, control);
+    if (rc) return wl_columnar_relation_source_group_drain(group, rc);
+    wl_columnar_session_source_lease_t **slot = &sess->source_leases;
+    while (*slot) {
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        wl_columnar_session_source_lease_t *lease = *slot;
+        bool selected = lease->borrower == borrower;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (!selected) {
+            slot = &lease->next; continue;
+        }
+        /* The original lease pins its actual root, not the now self-owned
+         * borrower. Validate before the final release can retire that root. */
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (!lease->owner ||
+            lease->owner->relation_identity != lease->owner_identity
+            || lease->reader.secondary_owner !=
+            &lease->owner->descriptor_access)
+            return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        /* Pay the fixed unlink/free disposition before consuming the pin. */
+        rc = wl_evaluation_control_charge(control, 8); if (rc) return rc;
+        rc = wl_columnar_relation_reader_pair_release_controlled(lease->owner,
+                &lease->reader, control);
+        if (!lease->reader.owner && !lease->reader.secondary_owner) {
+            *slot = lease->next;
+            free(lease);
+            /* A failed consumed tail still completes the admitted unlink. */
+            return rc ? rc : wl_evaluation_control_charge(control, 0);
+        }
+        return rc ? rc : EINVAL;
+    }
+    return 0;
 }
 
 static int
@@ -3613,9 +3674,10 @@ col_session_mem_sample(wl_col_session_t *sess)
         temporary);
 }
 
-int
-wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
-    wl_evaluation_control_t *control)
+static int
+wl_columnar_session_mem_sample_frame_controlled(wl_col_session_t *sess,
+    wl_evaluation_control_t *control,
+    wl_columnar_eval_stack_cleanup_frame_t *borrowed)
 {
     int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
     if (!sess || !control || sess->coordinator || sess->num_workers > 1
@@ -3625,9 +3687,37 @@ wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
     uint32_t used = pool && pool->slab ? pool->slot_used : 0;
     uint64_t stored = 0, temporary = 0;
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
-    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
-    rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
-    if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = borrowed;
+    wl_columnar_relation_source_group_t *group = NULL;
+    if (borrowed) {
+        /* Fixed purpose/authority and two-slot inert-state validation. No
+         * clear or frame acquisition can replace a previous live prefix. */
+        rc = wl_evaluation_control_charge(control, 96); if (rc) return rc;
+        group = wl_columnar_eval_stack_cleanup_observer_sampling_sources(sess,
+                frame, true);
+        if (!group || group->descriptor_count || group->owner_count ||
+            group->committed)
+            return EBUSY;
+        for (unsigned i = 0; i < 2; i++) {
+            wl_columnar_relation_source_group_descriptor_t *desc =
+                &group->descriptors[i];
+            wl_columnar_relation_source_group_owner_t *owner =
+                &group->owners[i];
+            if (desc->reader.owner || desc->reader.secondary_owner
+                || desc->reader.identity || desc->reader.thread_valid ||
+                desc->reader.transferable
+                || desc->writer.owner || desc->writer.secondary_owner
+                || desc->writer.identity || desc->writer.thread_valid
+                || desc->reader_held || desc->writer_held || desc->journal
+                || owner->reader.owner || owner->reader.secondary_owner
+                || owner->reader.identity || owner->reader.thread_valid
+                || owner->reader.transferable || owner->held) return EBUSY;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    } else {
+        rc = wl_columnar_eval_stack_cleanup_acquire(sess, &frame, control);
+        if (rc) return rc;
+    }
     rc = wl_evaluation_control_charge(control, 16);
     if (rc) goto done;
     temporary = sess->cleanup_reserved_bytes;
@@ -3636,8 +3726,7 @@ wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
     temporary = sess->delta_observer_reserved_bytes > UINT64_MAX - temporary
         ? UINT64_MAX : temporary + sess->delta_observer_reserved_bytes;
     rc = wl_evaluation_control_charge(control, 0); if (rc) goto done;
-    wl_columnar_relation_source_group_t *group =
-        wl_columnar_eval_stack_cleanup_sources(frame);
+    if (!borrowed) group = wl_columnar_eval_stack_cleanup_sources(frame);
     if (!group) {
         rc = EINVAL; goto done;
     }
@@ -3658,10 +3747,12 @@ wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
             if (!dead) {
                 rc = wl_columnar_relation_source_group_acquire_controlled(group,
                         r, NULL, control);
-                if (!rc) rc =
-                        wl_columnar_relation_transport_bytes_controlled(sess,
-                            frame,
-                            r, &bytes, control);
+                if (!rc) rc = borrowed
+                    ? wl_columnar_relation_observer_transport_bytes_controlled(
+                        sess,
+                        frame, r, &bytes, control)
+                    : wl_columnar_relation_transport_bytes_controlled(sess,
+                            frame, r, &bytes, control);
                 if (!rc) rc =
                         wl_columnar_relation_source_group_finish_controlled(
                         group, control);
@@ -3677,7 +3768,9 @@ wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
     }
 done:
     {
-        int cleanup = wl_columnar_eval_stack_cleanup_finish(&frame);
+        int cleanup = borrowed
+            ? wl_columnar_relation_source_group_drain(group, 0)
+            : wl_columnar_eval_stack_cleanup_finish(&frame);
         if (cleanup && rc <= 0) rc = cleanup;
     }
     if (rc) return rc;
@@ -3710,6 +3803,23 @@ done:
     rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
     wl_columnar_mem_ledger_apply_exclusive(&prepared);
     return 0;
+}
+
+int
+wl_columnar_session_mem_sample_controlled(wl_col_session_t *sess,
+    wl_evaluation_control_t *control)
+{
+    return wl_columnar_session_mem_sample_frame_controlled(sess, control, NULL);
+}
+
+int
+wl_columnar_session_observer_mem_sample_controlled(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    if (!frame) return EINVAL;
+    return wl_columnar_session_mem_sample_frame_controlled(sess, control,
+               frame);
 }
 
 void
@@ -4526,13 +4636,15 @@ col_session_destroy(wl_session_t *session)
         || wl_columnar_eval_delta_rollback_active(sess)) ? EBUSY
         : wl_columnar_eval_stack_cleanup_retry(sess);
     if (cleanup_rc == 0)
-        cleanup_rc = wl_columnar_eval_stack_cleanup_retained(sess);
-    if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_rollback_discard(sess);
     if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_observer_discard(sess);
     if (cleanup_rc == 0 && sess->recursive.active)
         cleanup_rc = wl_columnar_eval_serial_recursive_retire(sess, 0, NULL);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_stack_cleanup_retry(sess);
+    if (cleanup_rc == 0)
+        cleanup_rc = wl_columnar_eval_stack_cleanup_retained(sess);
     if (cleanup_rc != 0) {
         fputs("wirelog: evaluator cleanup failed during session destroy\n",
             stderr);

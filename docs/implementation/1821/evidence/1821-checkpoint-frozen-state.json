@@ -1,0 +1,80 @@
+{
+  "updated_at": "2026-10-12T06:19:25.092691+00:00",
+  "actor": "/root/implement_serial_attempt_1821",
+  "user_changed_scope": "Stop new implementation; publish unfinished checkpoint draft PR and detailed issue comment through root. Prior final-only restriction superseded.",
+  "worktree": "/home/joykim/wirelog-1821-serial-work-next",
+  "head": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "base_tree": "c46c55094b9786f14420295455047e99ebfc9071",
+  "frozen_checkpoint_tree": "810b16f66b182f4f4b220b4f77ee955a4e13f56b",
+  "dirty_paths": [
+    "tests/meson.build",
+    "tests/test_evaluation_observer.c",
+    "wirelog/arena/compound_arena.c",
+    "wirelog/arena/compound_arena.h",
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/merge.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/session.c"
+  ],
+  "source_manifest": {
+    "tests/meson.build": {
+      "sha256": "89f7334a099db420db359254b6bc13df922c67c0e7dd3d2cfafc5279b63303c6",
+      "bytes": 249566
+    },
+    "tests/test_evaluation_observer.c": {
+      "sha256": "566d10605be4384555f49a42d8e6a7a6198da00611f49d25127aaee63c754ff8",
+      "bytes": 185252
+    },
+    "wirelog/arena/compound_arena.c": {
+      "sha256": "d4bc6f1548e52f71b4d2d3ed6c685dc5f057419e918c50cd99e259c0acfecbfe",
+      "bytes": 40634
+    },
+    "wirelog/arena/compound_arena.h": {
+      "sha256": "7f43c4238906a9952f2ec69f4984080cd2082dee0491d58c89543db22bbdc03c",
+      "bytes": 18701
+    },
+    "wirelog/columnar/eval_delta.c": {
+      "sha256": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e",
+      "bytes": 185177
+    },
+    "wirelog/columnar/eval_stack.c": {
+      "sha256": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+      "bytes": 136687
+    },
+    "wirelog/columnar/internal.h": {
+      "sha256": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411",
+      "bytes": 286410
+    },
+    "wirelog/columnar/merge.c": {
+      "sha256": "224ffcbfeb64e3f4fb4472ae3f56f415f85a49ddd093d8bc20c2eae830b18904",
+      "bytes": 203843
+    },
+    "wirelog/columnar/relation.c": {
+      "sha256": "0f117086e41c81098f4146eedb67155610b5ea1225cd70c63ef25d9371d191ca",
+      "bytes": 1113997
+    },
+    "wirelog/columnar/session.c": {
+      "sha256": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+      "bytes": 342248
+    }
+  },
+  "patch_sha256": "1d7c65e8a5f665d2e49127425c1e652c21d67c3573d3c5113f66a11f0d5672ca",
+  "patch_bytes": 771842,
+  "real_index_diff": "",
+  "cached_origin_main_ahead": 51,
+  "running_ours_build_test": false,
+  "last_current_source_runtime": {
+    "build157": 0,
+    "work100_safe": "OK",
+    "log": "serial-observed-author-work100-safe-testlog.json",
+    "scope": "Registered observer helper compatibility only; no new lazy resource/whole STEP reach."
+  },
+  "F1_implemented": false,
+  "F1_plan_critique": "serial-observed-seed-lazy-installed-credit-critique.json",
+  "source_frozen": true,
+  "production_qualified": false,
+  "full_issue_complete": false,
+  "commit_push_by_lead": false
+}

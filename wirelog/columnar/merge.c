@@ -2051,14 +2051,42 @@ wl_columnar_merge_hash_execute(wl_columnar_consolidate_record_t *record,
 }
 
 static int
-wl_columnar_merge_consolidate_shape(col_rel_t *r, wl_evaluation_control_t *c)
+wl_columnar_merge_consolidate_shape_for(col_rel_t *r,
+    wl_evaluation_control_t *c,
+    bool observer)
 {
     int rc = wl_evaluation_control_charge(c, 48); if (rc) return rc;
     if (!r || r->nrows > r->capacity ||
         (r->ncols && !r->columns)) return EINVAL;
-    if (r->timestamps || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
-        || r->compound_arity_map || r->compound_arity_len) return ENOTSUP;
+    if (r->timestamps ||
+        (!observer && (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || r->compound_arity_map || r->compound_arity_len))) return ENOTSUP;
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    if (observer) {
+        rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
+        if ((r->compound_arity_map == NULL) != (r->compound_arity_len == 0)
+            || r->compound_arity_len > r->ncols
+            || (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            && r->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+            && r->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+            || (r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+                ? !r->compound_arity_len || !r->compound_count
+            || r->compound_count > r->compound_arity_len
+            || r->inline_physical_offset >= r->ncols
+                : r->compound_count ||
+            r->inline_physical_offset)) return EINVAL;
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        uint32_t width = 0;
+        for (uint32_t i = 0; i < r->compound_arity_len; i++) {
+            rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+            uint32_t arity = r->compound_arity_map[i];
+            if (!arity || arity > r->ncols - width) return EINVAL;
+            width += arity;
+            rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        }
+        if (r->compound_arity_len ? width != r->ncols
+            : r->compound_kind != WIRELOG_COMPOUND_KIND_NONE) return EINVAL;
+    }
     uint64_t visited = 0;
     for (uint32_t col = 0; col < r->ncols; col++) {
         rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
@@ -2082,10 +2110,16 @@ wl_columnar_merge_consolidate_shape(col_rel_t *r, wl_evaluation_control_t *c)
     return 0;
 }
 
+static int
+wl_columnar_merge_consolidate_shape(col_rel_t *r, wl_evaluation_control_t *c)
+{
+    return wl_columnar_merge_consolidate_shape_for(r, c, false);
+}
+
 /* Fresh actual MAP output only; borrowed shape validation remains separate. */
 static int
-wl_columnar_merge_consolidate_owned_shape(col_rel_t *r,
-    wl_evaluation_control_t *c)
+wl_columnar_merge_consolidate_owned_shape_for(col_rel_t *r,
+    wl_evaluation_control_t *c, bool observer)
 {
     int rc = wl_evaluation_control_charge(c, 64); if (rc) return rc;
     if (r->storage_owner != r || !r->relation_identity || r->arena_owned
@@ -2094,7 +2128,14 @@ wl_columnar_merge_consolidate_owned_shape(col_rel_t *r,
         || r->storage_owner_generation != r->storage_generation)
         return ENOTSUP;
     rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
-    return wl_columnar_merge_consolidate_shape(r, c);
+    return wl_columnar_merge_consolidate_shape_for(r, c, observer);
+}
+
+static int
+wl_columnar_merge_consolidate_owned_shape(col_rel_t *r,
+    wl_evaluation_control_t *c)
+{
+    return wl_columnar_merge_consolidate_owned_shape_for(r, c, false);
 }
 
 int
@@ -2562,6 +2603,148 @@ wl_columnar_merge_segment_finish(wl_columnar_consolidate_record_t *record,
 }
 
 static int
+wl_columnar_merge_normalize_private_core(
+    wl_columnar_consolidate_record_t *record,
+    wl_columnar_relation_private_batch_t *writer, col_rel_t *out,
+    const uint32_t *segments, uint32_t segment_count, bool owned,
+    wl_col_session_t *sess, wl_evaluation_control_t *c)
+{
+    int rc;
+    wl_columnar_relation_mutation_lease_t *lease = &writer->batch.single.lease;
+    if (out->nrows > 10000u) {
+        rc = wl_columnar_merge_hash_prepare(record, out, lease, c);
+        if (rc) return rc;
+        wl_columnar_merge_hash_outcome_t outcome;
+        rc = wl_columnar_merge_hash_execute(record, c, &outcome);
+        if (rc) return rc;
+        rc = wl_columnar_merge_hash_retire(record, 0, c);
+        if (rc) return rc;
+        if (outcome == WL_COLUMNAR_MERGE_HASH_COMPLETE) return 0;
+        /* Actual physical and credit drain precedes reuse at original addresses.
+         * Continue the same attempt without resetting or refunding consumption. */
+        rc = wl_columnar_merge_consolidate_reset(record, c);
+        if (rc) return rc;
+    }
+    uint32_t local_bounds[3] = {0, out->nrows, out->nrows};
+    const uint32_t *sort_bounds = local_bounds;
+    uint32_t sort_count = 1;
+    if (segments && segment_count >= 2u) {
+        sort_bounds = segments; sort_count = segment_count;
+    } else if (owned && out->sorted_nrows && out->sorted_nrows < out->nrows) {
+        local_bounds[1] = out->sorted_nrows; sort_count = 2;
+    }
+    if (sort_count > 1u) {
+        wl_columnar_relation_consolidate_checkpoint(c, 121, sort_count, record,
+            out);
+        rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+        rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
+            out, sort_bounds, sort_count, &record->sequence, lease, c);
+        if (rc) return rc;
+        rc = wl_columnar_merge_segment_allocate(record, out, c);
+        if (rc) return rc;
+        goto prepared;
+    }
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(out->memory_governor), 8,
+        &record->merge_admission, &status, c);
+    if (rc) return rc;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK &&
+        status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY){
+        if (status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_DENIED) sess->memory_budget_denied =
+                true;
+        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+        return rc;
+    }
+    record->merge_admission_active = true;
+    rc =
+        wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&record->starts,
+        sizeof(uint32_t), c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_allocate_controlled(
+        (void **)&record->ends,
+        sizeof(uint32_t), c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_consolidate_commit_controlled(
+        &record->merge_admission,
+        record->merge_admission_active, record, c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->starts[0] = 0; record->ends[0] = out->nrows;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    uint32_t bounds[] = {0, out->nrows};
+    wl_columnar_relation_consolidate_checkpoint(c, 37, 0, record, out);
+    rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
+        out, bounds, 1, &record->sequence, lease, c); if (rc) return rc;
+prepared:
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->phase = WL_COLUMNAR_CONSOLIDATE_PREPARED;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(c, 30, 0, record, out);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->phase = WL_COLUMNAR_CONSOLIDATE_EXECUTING;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc =
+        wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
+        &record->sequence, lease, c);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(c, 8); if (rc) return rc;
+    record->phase = WL_COLUMNAR_CONSOLIDATE_CONSUMED;
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(c, 31, out->view_generation,
+        record, out);
+    rc = wl_columnar_merge_consolidate_tail(c); if (rc) return rc;
+    rc = record->sequence.seg_count > 1u
+        ? wl_columnar_merge_segment_finish(record, writer, out, c)
+        : wl_columnar_merge_consolidate_dedup(record, writer, out, c);
+    if (rc) return rc;
+    wl_columnar_relation_consolidate_checkpoint(c, 32, out->view_generation,
+        record, out);
+    return 0;
+}
+
+int
+wl_columnar_merge_observer_normalize_controlled(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_consolidate_record_t *record = NULL;
+    wl_columnar_relation_private_batch_t *writer = NULL;
+    col_rel_t *candidate = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_observer_consolidate_owner(session,
+            frame, &record, &writer, &candidate, control);
+    if (rc) return rc;
+    rc = wl_columnar_relation_private_append_batch_begin_controlled(writer,
+            candidate, control);
+    if (rc) return rc;
+    rc = wl_columnar_merge_consolidate_owned_shape_for(candidate, control,
+            true);
+    if (rc) return rc;
+    if (candidate->nrows <= 1) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        rc = wl_columnar_merge_consolidate_tail(control); if (rc) return rc;
+        candidate->sorted_nrows = candidate->nrows; candidate->run_count = 1;
+        candidate->run_ends[0] = candidate->nrows;
+    } else {
+        rc = wl_columnar_merge_consolidate_reset(record, control);
+        if (rc) return rc;
+        rc = wl_columnar_merge_normalize_private_core(record, writer, candidate,
+                NULL, 0, true, session, control);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
+    if (rc) return rc;
+    rc = wl_columnar_relation_consolidate_retire(record, 0);
+    if (rc) return rc;
+    return wl_columnar_eval_stack_cleanup_observer_consolidate_consumed(session,
+               frame, control);
+}
+
+static int
 wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
     wl_col_session_t *sess, wl_evaluation_control_t *c)
 {
@@ -2753,100 +2936,9 @@ wl_columnar_merge_consolidate_controlled(eval_stack_t *stack,
     rc = wl_columnar_relation_private_append_batch_begin_controlled(writer, out,
             c); if (rc) goto cleanup;
 prepare:;
-    wl_columnar_relation_mutation_lease_t *lease = &writer->batch.single.lease;
-    if (out->nrows > 10000u) {
-        rc = wl_columnar_merge_hash_prepare(record, out, lease, c);
-        if (rc) goto cleanup;
-        wl_columnar_merge_hash_outcome_t outcome;
-        rc = wl_columnar_merge_hash_execute(record, c, &outcome);
-        if (rc) goto cleanup;
-        rc = wl_columnar_merge_hash_retire(record, 0, c);
-        if (rc) goto cleanup;
-        if (outcome == WL_COLUMNAR_MERGE_HASH_COMPLETE) goto owned_finish;
-        /* Actual physical and credit drain precedes reuse at original addresses.
-         * Continue the same attempt without resetting or refunding consumption. */
-        rc = wl_columnar_merge_consolidate_reset(record, c);
-        if (rc) goto cleanup;
-    }
-    uint32_t local_bounds[3] = {0, out->nrows, out->nrows};
-    const uint32_t *sort_bounds = local_bounds;
-    uint32_t sort_count = 1;
-    if (segments && segment_count >= 2u) {
-        sort_bounds = segments; sort_count = segment_count;
-    } else if (owned && out->sorted_nrows && out->sorted_nrows < out->nrows) {
-        local_bounds[1] = out->sorted_nrows; sort_count = 2;
-    }
-    if (sort_count > 1u) {
-        wl_columnar_relation_consolidate_checkpoint(c, 121, sort_count, record,
-            out);
-        rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-        rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
-            out, sort_bounds, sort_count, &record->sequence, lease, c);
-        if (rc) goto cleanup;
-        rc = wl_columnar_merge_segment_allocate(record, out, c);
-        if (rc) goto cleanup;
-        goto prepared;
-    }
-    wl_columnar_memory_admission_status_t status;
-    rc = wl_columnar_memory_governor_reserve_checked_controlled(
-        wl_columnar_memory_governor_ref_get(out->memory_governor), 8,
-        &record->merge_admission, &status, c);
+    rc = wl_columnar_merge_normalize_private_core(record, writer, out,
+            segments, segment_count, owned, sess, c);
     if (rc) goto cleanup;
-    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK &&
-        status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY){
-        if (status ==
-            WL_COLUMNAR_MEMORY_ADMISSION_DENIED) sess->memory_budget_denied =
-                true;
-        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
-            : status ==
-            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
-        goto cleanup;
-    }
-    record->merge_admission_active = true;
-    rc =
-        wl_columnar_relation_consolidate_allocate_controlled(
-        (void **)&record->starts,
-        sizeof(uint32_t), c); if (rc) goto cleanup;
-    rc =
-        wl_columnar_relation_consolidate_allocate_controlled(
-        (void **)&record->ends,
-        sizeof(uint32_t), c); if (rc) goto cleanup;
-    rc =
-        wl_columnar_relation_consolidate_commit_controlled(
-        &record->merge_admission,
-        record->merge_admission_active, record, c); if (rc) goto cleanup;
-    rc = wl_evaluation_control_charge(c, 8); if (rc) goto cleanup;
-    record->starts[0] = 0; record->ends[0] = out->nrows;
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    uint32_t bounds[] = {0, out->nrows};
-    wl_columnar_relation_consolidate_checkpoint(c, 37, 0, record, out);
-    rc = wl_columnar_relation_radix_sequence_prepare_with_lease_controlled(
-        out, bounds, 1, &record->sequence, lease, c); if (rc) goto cleanup;
-prepared:
-    rc = wl_evaluation_control_charge(c, 8); if (rc) goto cleanup;
-    record->phase = WL_COLUMNAR_CONSOLIDATE_PREPARED;
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    wl_columnar_relation_consolidate_checkpoint(c, 30, 0, record, out);
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    rc = wl_evaluation_control_charge(c, 8); if (rc) goto cleanup;
-    record->phase = WL_COLUMNAR_CONSOLIDATE_EXECUTING;
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    rc =
-        wl_columnar_relation_radix_sequence_execute_with_lease_controlled(
-        &record->sequence, lease, c);
-    if (rc) goto cleanup;
-    rc = wl_evaluation_control_charge(c, 8); if (rc) goto cleanup;
-    record->phase = WL_COLUMNAR_CONSOLIDATE_CONSUMED;
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    wl_columnar_relation_consolidate_checkpoint(c, 31, out->view_generation,
-        record, out);
-    rc = wl_columnar_merge_consolidate_tail(c); if (rc) goto cleanup;
-    rc = record->sequence.seg_count > 1u
-        ? wl_columnar_merge_segment_finish(record, writer, out, c)
-        : wl_columnar_merge_consolidate_dedup(record, writer, out, c);
-    if (rc) goto cleanup;
-    wl_columnar_relation_consolidate_checkpoint(c, 32, out->view_generation,
-        record, out);
 owned_finish:
     rc = wl_columnar_relation_private_append_batch_end_controlled(writer);
     if (rc) goto cleanup;

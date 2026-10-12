@@ -1,0 +1,64 @@
+{
+  "artifact_type": "implementation_plan",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "paths": [
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/session.c",
+    "tests/test_evaluation_observer.c"
+  ],
+  "scope": "Prevent controlled-origin forward rollback recovery before actual control BEGIN or through control-detached legacy raw fallback; mandatory original-owner drain/discard remains independent.",
+  "source_evidence": [
+    {
+      "path": "wirelog/evaluation_control.c",
+      "lines": "198-228",
+      "fact": "charge(control,0) returns EINVAL for NULL/inactive, otherwise polls original sticky accounting/stop/cancel state without new work consumption. No public active-state query is needed."
+    },
+    {
+      "path": "wirelog/columnar/session.c",
+      "lines": "1187-1241,5153,5253,5344,5417,5602",
+      "fact": "cleanup_ready first retries pending physical frame/recursive owners then invokes rollback_retry. Quiescent host mutation paths also invoke it, outside backend operation begin."
+    },
+    {
+      "path": "wirelog/columnar/session.c",
+      "lines": "7334-7348,8236-8250",
+      "fact": "Backend STEP/SNAPSHOT wrappers own BEGIN, poll0, implementation and FINISH. Selected bounded recovery must execute inside that same operation attempt."
+    },
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "lines": "2836-2847,2909-2918",
+      "fact": "Controlled retry first drains frame, then loops forward. Dispatcher currently tests controlled_origin AND control pointer, so detached control reaches legacy raw restoration; pointer alone cannot prove BEGIN."
+    },
+    {
+      "path": "wirelog/columnar/session.c",
+      "lines": "4419-4432",
+      "fact": "Destruction retries actual pending owner, then original-origin rollback/observer discard, then retained frame destruction. It must not invoke forward canonical restore to dispose metadata."
+    }
+  ],
+  "ruling": "Upheld source timing dependency. Mandatory consumed physical-owner settlement may occur without allowance; forward content recovery, record-wide decisions and source-lease retirement are admitted only after successful original active charge0. Controlled origin never falls through to raw retry.",
+  "contract": [
+    "Keep no-record/active-record existing nesting behavior and raw-origin dispatcher unchanged. For an inactive controlled-origin record, dispatch by origin unconditionally. With no attached control return EBUSY, preserving rollback image/phase flags/canonical content and mutation guard; no raw restore/record-wide completed loop is permitted.",
+    "With attached control, poll charge0 before any forward controlled recovery lookup, entry scan, content/finality acknowledgment, restore/re-detach or healthy lease retirement. Inactive EINVAL maps to EBUSY at the host-facing dispatcher; propagate real negative stop and positive accounting error. The direct controlled retry also validates actual poll0 before forward work, so a non-NULL inactive handle cannot bypass this rule.",
+    "Existing mandatory cleanup_retry of actually pending frame/credit/writer state may precede this poll and run without control. This can change only real consumed physical/authority disposition under existing original-mode contract; it cannot allocate replacement images, inspect/mark every snapshot, restore cells, clear pending content flags or declare recovery complete.",
+    "Selected backend STEP/SNAPSHOT must call actual bounded rollback recovery after their existing BEGIN/poll and before new baseline capture/evaluation. The same attempt/control remains active throughout recovery and later operation; no reset, private begin/finish, new owner or retry in the middle. A stopped recovery ends this operation and leaves actual original record/pending owner for the next host attempt.",
+    "Host quiescent cleanup still drains workers/pending originals first. An inactive controlled rollback then yields EBUSY before insertion/removal/schema or other canonical mutation. serial_completion.pending and original observer/pending mutation guards must remain, including after control detach. No swallowed EBUSY to make a host mutation succeed against protected saved identity.",
+    "Control detach is not origin conversion. It neither invokes legacy restore nor clears controlled_origin/pending guards. Original-origin rollback_discard is the explicit mandatory detach/destruction disposal path and uses already accepted retained-frame/object credit ordering; it never performs forward canonical recovery. If the public detach API promises automatic recovery/mutation availability, record that exact API conflict as a prerequisite before admission rather than silently weakening this rule.",
+    "Retained heads-final state still needs bounded actual entry/lease disposition when recovery is requested: no pre-BEGIN raw retained loop. Mandatory explicit destruction may physically discard an inactive record under its real guards. All forward retry success/lease acknowledgment remains existing consumed phase protocol with positive-primary precedence and actual caller finish."
+  ],
+  "finite_acceptance": [
+    "Actual inactive controlled rollback plus attached-but-inactive control: host cleanup/mutation returns EBUSY after only permitted original pending drain; image/flags/canonical payload remain unchanged.",
+    "Control detached: dispatcher never reaches raw restore, guards remain; explicit original discard/destruction truly frees physical metadata before credit.",
+    "Actual host-new STEP/SNAPSHOT BEGIN reaches bounded recovery then next operation under same control, no hidden reset; pre-cancelled and work-limited attempt cannot mutate content.",
+    "Real pending credit/lease refusal before forward poll remains at original address and positive primary preserved; fresh actual attempt drains then recovers once, raw canonical twin.",
+    "Raw-origin no-control retry and true active nesting unchanged; retained final canonical output not overwritten or marked through unmetered host loop."
+  ],
+  "limits": {
+    "source_mutated": false,
+    "tests_builds_run": false,
+    "candidate_approved": false,
+    "full_issue_complete": false,
+    "new_query_or_storage": false,
+    "resources": "HOME uv artifact only; coordinator FULL READ and distinct Critic before edits. This plan proves source timing, not current production admission/runtime coverage."
+  }
+}

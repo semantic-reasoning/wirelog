@@ -285,6 +285,17 @@ wl_compound_arena_free_checked(wl_compound_arena_t *arena);
  * already own a live arena when acquiring. A hold does not protect payload
  * pointers from relocation; use an ordinary borrow for pointer access.
  * Returns 0, EINVAL (invalid token), EBUSY (writer), or EOVERFLOW. */
+int wl_arena_compound_arena_borrow_acquire_controlled(wl_compound_arena_t *,
+    wl_compound_arena_borrow_t *, wl_evaluation_control_t *);
+int wl_arena_compound_arena_borrow_release_controlled(
+    wl_compound_arena_borrow_t *,
+    wl_evaluation_control_t *);
+int wl_arena_compound_arena_gc_hold_acquire_controlled(wl_compound_arena_t *,
+    wl_arena_compound_arena_gc_hold_t *, wl_compound_arena_borrow_t *,
+    wl_evaluation_control_t *);
+int wl_arena_compound_arena_gc_hold_release_controlled(
+    wl_arena_compound_arena_gc_hold_t *,
+    wl_evaluation_control_t *);
 int
 wl_arena_compound_arena_gc_hold_acquire(wl_compound_arena_t *arena,
     wl_arena_compound_arena_gc_hold_t *hold);

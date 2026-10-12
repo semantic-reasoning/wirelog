@@ -282,6 +282,11 @@ struct wl_columnar_eval_stack_cleanup_frame {
                 wl_columnar_merge_incremental_scratch_t incremental_scratch;
                 wl_columnar_session_promotion_scratch_t promotion;
                 wl_arena_compound_arena_gc_record_t compound_gc;
+                wl_columnar_eval_delta_preparation_t observer;
+                wl_columnar_eval_delta_replacement_t observer_replacement;
+                wl_columnar_eval_delta_timestamp_normalization_t
+                    observer_timestamp;
+                wl_columnar_eval_delta_seed_restore_t observer_seed;
             };
             wl_columnar_relation_bulk_append_t bulk_append;
         };
@@ -301,6 +306,12 @@ typedef struct wl_columnar_eval_stack_original_frame {
 _Static_assert(sizeof(wl_columnar_expr_operator_preparation_t)
     <= sizeof(wl_columnar_consolidate_record_t),
     "operator must fit original workspace");
+_Static_assert(sizeof(wl_columnar_eval_delta_preparation_t)
+    <= sizeof(wl_columnar_consolidate_record_t),
+    "observer preparation must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_eval_delta_preparation_t)
+    <= _Alignof(wl_columnar_consolidate_record_t),
+    "observer preparation alignment must fit original workspace");
 _Static_assert(_Alignof(wl_columnar_expr_operator_preparation_t)
     <= _Alignof(wl_columnar_consolidate_record_t),
     "operator alignment must fit workspace");
@@ -575,6 +586,14 @@ wl_columnar_eval_stack_cleanup_stack(
            WL_COLUMNAR_SERIAL_FRAME_RETIRED
            && wl_columnar_eval_stack_cleanup_mode(frame) !=
            WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         ? &frame->stack : NULL;
 }
 
@@ -586,6 +605,14 @@ wl_columnar_eval_stack_cleanup_result(
            WL_COLUMNAR_SERIAL_FRAME_RETIRED
            && wl_columnar_eval_stack_cleanup_mode(frame) !=
            WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         ? &frame->result : NULL;
 }
 
@@ -646,6 +673,10 @@ wl_columnar_eval_stack_cleanup_join_owner(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t *frame = sess->cleanup_active;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -692,6 +723,10 @@ wl_columnar_eval_stack_cleanup_private_batch_owner(wl_col_session_t *sess,
         return EINVAL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -729,6 +764,10 @@ wl_columnar_eval_stack_cleanup_reduce_batch(
     if (!frame || !frame->session) return NULL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -757,16 +796,436 @@ wl_columnar_eval_stack_cleanup_consolidate(
         ? &frame->consolidate : NULL;
 }
 
+int
+wl_columnar_eval_stack_cleanup_observer_consolidate_owner(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_consolidate_record_t **out,
+    wl_columnar_relation_private_batch_t **writer, col_rel_t **candidate,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !out || *out || !writer || *writer
+        || !candidate || *candidate || !control ||
+        session->cleanup_active != frame
+        || frame->session != session ||
+        session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR)
+        return EINVAL;
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (bulk->borrowed_mode != WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || !frame->result.owned || !frame->result.rel ||
+        bulk->dst != frame->result.rel
+        || frame->result.rel->timestamps ||
+        session->serial_completion.payload_ready
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || !wl_columnar_relation_private_batch_disposable(
+            &frame->reduce_batch)) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (bulk->exact_phase == WL_COLUMNAR_OBSERVER_COMPLETED_CLEAR) {
+        if (bulk->count != sizeof(frame->consolidate)) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_CONS_INITIALIZING;
+        bulk->count = 0;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        wl_columnar_memory_reservation_t *tokens[3] = {
+            &frame->consolidate.sequence.metadata_admission,
+            &frame->consolidate.sequence.workspace.admission,
+            &frame->consolidate.merge_admission
+        };
+        for (unsigned i = 0; i < 3; i++) {
+            rc = wl_evaluation_control_charge(control, 96); if (rc) return rc;
+            wl_columnar_memory_reservation_init(tokens[i]);
+            bulk->count = i + 1u;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        frame->consolidate.ready = true;
+        bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_CONS_ACTIVE;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    if (bulk->exact_phase != WL_COLUMNAR_OBSERVER_COMPLETED_CONS_ACTIVE
+        || bulk->count != 3 || !frame->consolidate.ready
+        || (frame->consolidate.phase != WL_COLUMNAR_CONSOLIDATE_INERT
+        && frame->consolidate.phase !=
+        WL_COLUMNAR_CONSOLIDATE_RETIRED)) return EBUSY;
+    *out = &frame->consolidate; *writer = &frame->reduce_batch;
+    *candidate = frame->result.rel;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_observer_consolidate_consumed(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!session || !frame || session->cleanup_active != frame ||
+        frame->session != session
+        || session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || frame->bulk_append.borrowed_mode !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || frame->bulk_append.exact_phase !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_CONS_ACTIVE
+        || !frame->consolidate.ready || !frame->result.owned
+        || frame->result.rel != frame->bulk_append.dst
+        || !wl_columnar_relation_private_batch_disposable(&frame->reduce_batch)
+        || (frame->consolidate.phase != WL_COLUMNAR_CONSOLIDATE_INERT
+        && frame->consolidate.phase !=
+        WL_COLUMNAR_CONSOLIDATE_RETIRED)) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    frame->bulk_append.exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_NORMALIZED;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+/* Actual terminal originals may retain RELEASED bookkeeping. EMPTY must be
+ * the genuinely initialized zero-obligation state, not a cleared live token. */
+static bool
+wl_columnar_eval_stack_observer_credit_terminal(
+    const wl_columnar_memory_reservation_t *token)
+{
+    if (token->identity != token || token->replacement_bytes ||
+        token->transition_kind)
+        return false;
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) return true;
+    return state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY && !token->governor
+           && !token->bytes && !atomic_load_explicit(&token->owner_bits,
+               memory_order_acquire);
+}
+
+static int
+wl_columnar_eval_stack_observer_group_terminal(
+    const wl_columnar_relation_source_group_t *group,
+    wl_evaluation_control_t *control)
+{
+    if (group->descriptor_count || group->owner_count ||
+        group->committed) return EBUSY;
+    for (unsigned i = 0; i < 2; i++) {
+        int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &group->descriptors[i];
+        const wl_columnar_relation_source_group_owner_t *owner =
+            &group->owners[i];
+        if (desc->reader_held || desc->writer_held || desc->journal ||
+            owner->held
+            || desc->reader.owner || desc->reader.secondary_owner ||
+            desc->reader.identity
+            || desc->reader.thread_valid || desc->reader.transferable
+            || desc->writer.owner || desc->writer.secondary_owner ||
+            desc->writer.identity
+            || desc->writer.thread_valid || owner->reader.owner ||
+            owner->reader.secondary_owner
+            || owner->reader.identity || owner->reader.thread_valid ||
+            owner->reader.transferable)
+            return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
+/* TRANSFER_INITIALIZING's count is the actual336-byte clear prefix. Before
+ * complete clear no aliased record field can be inspected. Initializer tokens
+ * have no forward resource owner; a refused original prefix pins the candidate. */
+static int
+wl_columnar_eval_stack_observer_transfer_prefix_retire(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    if (bulk->count > sizeof(frame->observer_replacement)) return EINVAL;
+    if (bulk->count < sizeof(frame->observer_replacement)) return 0;
+    wl_columnar_eval_delta_replacement_t *record = &frame->observer_replacement;
+    if (record->ready || record->initialized_tokens > 3) return EINVAL;
+    wl_columnar_memory_reservation_t *tokens[3] =
+    {&record->transaction.reservation,
+     &record->transaction.
+     metadata_reservation, &record->transaction.dedup_reservation};
+    for (unsigned i = 0; i < record->initialized_tokens; i++)
+        if (!wl_columnar_eval_stack_observer_credit_terminal(
+                tokens[i])) return EINVAL;
+    return 0;
+}
+
+wl_columnar_eval_delta_timestamp_normalization_t *
+wl_columnar_eval_stack_cleanup_observer_timestamp_record(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!session || !frame || session->cleanup_active != frame
+        || frame->session != session ||
+        session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || frame->bulk_append.borrowed_mode !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || frame->bulk_append.exact_phase !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_TS_ACTIVE)
+        return NULL;
+    return &frame->observer_timestamp;
+}
+
+/* Only the successful forward normalizer calls this after real index and
+ * writer retirement. Mandatory disposal never certifies forward success. */
+int
+wl_columnar_eval_stack_cleanup_observer_timestamp_consumed(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    wl_columnar_eval_delta_timestamp_normalization_t *record =
+        wl_columnar_eval_stack_cleanup_observer_timestamp_record(session,
+            frame);
+    if (!record) return EINVAL;
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    col_rel_t *candidate = frame->result.rel;
+    wl_columnar_memory_reservation_t *credit = &record->indices_reservation;
+    wl_columnar_source_access_writer_t *writer = &record->transaction.writer;
+    if (bulk->count != sizeof(frame->consolidate)
+        || session->serial_completion.payload_ready || !frame->result.owned
+        || !candidate || candidate != bulk->dst ||
+        record->candidate != candidate
+        || !session->memory_governor ||
+        candidate->memory_governor != session->memory_governor
+        || candidate->storage_owner != candidate || candidate->pool_owned
+        || candidate->arena_owned || candidate->col_shared ||
+        candidate->mem_ledger
+        || !record->normalized || record->ready || record->initialized != 1
+        || record->count < 2 || !record->output ||
+        record->output > record->count
+        || record->bytes != (uint64_t)record->count * sizeof(uint32_t)
+        || record->indices || record->accounting_installed
+        || candidate->nrows != record->output ||
+        candidate->sorted_nrows != record->output
+        || candidate->run_count != 1 || candidate->run_ends[0] != record->output
+        || !candidate->timestamps ||
+        candidate->timestamp_capacity < candidate->nrows
+        || credit->identity != credit || credit->bytes != record->bytes
+        || credit->governor !=
+        wl_columnar_memory_governor_ref_get(session->memory_governor)
+        || credit->replacement_bytes || credit->transition_kind
+        || atomic_load_explicit(&credit->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+        || writer->owner || writer->secondary_owner || writer->identity ||
+        writer->thread_valid
+        || record->transaction.writer_acquired || record->transaction.staged
+        || record->transaction.reservation_active ||
+        record->transaction.metadata_reservation_active
+        || record->transaction.dedup_reservation_active
+        || frame->stack.top || frame->result.continuation ||
+        frame->result.seg_boundaries
+        || !wl_columnar_relation_private_batch_disposable(&frame->reduce_batch)
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || frame->join_sources.committed) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (unsigned i = 0; i < 2; i++) {
+        rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &frame->join_sources.descriptors[i];
+        const wl_columnar_relation_source_group_owner_t *owner =
+            &frame->join_sources.owners[i];
+        if (desc->reader_held || desc->writer_held || desc->journal ||
+            owner->held
+            || desc->reader.owner || desc->reader.secondary_owner ||
+            desc->reader.identity
+            || desc->reader.thread_valid || desc->reader.transferable
+            || desc->writer.owner || desc->writer.secondary_owner ||
+            desc->writer.identity
+            || desc->writer.thread_valid || owner->reader.owner ||
+            owner->reader.secondary_owner
+            || owner->reader.identity || owner->reader.thread_valid ||
+            owner->reader.transferable)
+            return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_NORMALIZED;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_observer_timestamp(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_timestamp_normalization_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !out || *out || !control
+        || session->cleanup_active != frame || frame->session != session
+        || wl_columnar_eval_stack_cleanup_mode(frame) !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR)
+        return EINVAL;
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (bulk->borrowed_mode != WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || bulk->exact_phase != WL_COLUMNAR_OBSERVER_COMPLETED_CLEAR
+        || bulk->count != sizeof(frame->consolidate)
+        || session->serial_completion.payload_ready || !frame->result.owned
+        || !frame->result.rel || bulk->dst != frame->result.rel
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || frame->join_sources.committed) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_eval_delta_timestamp_normalization_t *record =
+        &frame->observer_timestamp;
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_TS_INITIALIZING;
+    record->candidate = frame->result.rel;
+    record->count = record->candidate->nrows;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    wl_columnar_memory_reservation_init(&record->indices_reservation);
+    record->initialized = 1;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    record->ready = true;
+    bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_TS_ACTIVE;
+    *out = record;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+/* The source group is outside the timestamp/constructor workspace. Mandatory
+ * retirement uses only the external purpose, including false readiness. */
+wl_columnar_relation_source_group_t *
+wl_columnar_eval_stack_cleanup_observer_sampling_sources(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool forward)
+{
+    if (!session || !frame || frame->session != session
+        || session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || frame->bulk_append.borrowed_mode !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR)
+        return NULL;
+    if (!forward) return &frame->join_sources;
+    if (session->cleanup_active != frame
+        || frame->bulk_append.exact_phase !=
+        WL_COLUMNAR_OBSERVER_COMPLETED_TS_ACTIVE)
+        return NULL;
+    wl_columnar_eval_delta_timestamp_normalization_t *record =
+        &frame->observer_timestamp;
+    col_rel_t *candidate = frame->result.rel;
+    wl_columnar_source_access_writer_t *writer = &record->transaction.writer;
+    wl_columnar_memory_reservation_t *index_credit =
+        &record->indices_reservation;
+    if (!record->ready || record->initialized != 1 ||
+        !record->accounting_installed
+        || !record->indices || !record->bytes
+        || index_credit->identity != index_credit ||
+        index_credit->bytes != record->bytes
+        || !session->memory_governor
+        || index_credit->governor !=
+        wl_columnar_memory_governor_ref_get(session->memory_governor)
+        || index_credit->replacement_bytes || index_credit->transition_kind
+        || atomic_load_explicit(&index_credit->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || atomic_load_explicit(&index_credit->owner_bits, memory_order_acquire)
+        != (uintptr_t)record->indices
+        || !candidate || candidate->memory_governor != session->memory_governor
+        || record->candidate != candidate
+        || frame->bulk_append.dst != candidate || !frame->result.owned
+        || candidate->storage_owner != candidate || candidate->pool_owned
+        || candidate->arena_owned || candidate->col_shared ||
+        candidate->mem_ledger
+        || !record->transaction.writer_acquired
+        || writer->identity != (uintptr_t)writer
+        || writer->owner != &candidate->source_access
+        || writer->secondary_owner != &candidate->descriptor_access
+        || !wl_columnar_source_access_writer_thread_equal(writer)) return NULL;
+    return &frame->join_sources;
+}
+
 static int
 wl_columnar_eval_stack_workspace_retire(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED)
+        return frame->session->serial_completion.payload_ready
+            ? wl_columnar_relation_seed_restore_retire(&frame->observer_seed,
+                   &frame->bulk_append, 0) : 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        && frame->bulk_append.borrowed_mode ==
+        WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR){
+        wl_columnar_relation_source_group_t *group =
+            wl_columnar_eval_stack_cleanup_observer_sampling_sources(
+            frame->session, frame, false);
+        int rc = group ? wl_columnar_relation_source_group_drain(group,
+                0) : EINVAL;
+        if (rc) return rc;
+        if (frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_TS_INITIALIZING
+            || frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_TS_ACTIVE){
+            rc = wl_columnar_eval_delta_timestamp_retire(frame->session,
+                    &frame->observer_timestamp, NULL, 0);
+            if (rc) return rc;
+            frame->bulk_append.exact_phase =
+                WL_COLUMNAR_OBSERVER_COMPLETED_ABANDONED;
+        }
+        if (frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_CONS_INITIALIZING
+            || frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_CONS_ACTIVE){
+            if (frame->bulk_append.count > 3) return EINVAL;
+            if (frame->consolidate.ready) {
+                rc =
+                    wl_columnar_relation_consolidate_retire(&frame->consolidate,
+                        0);
+                if (rc) return rc;
+            }
+            rc = wl_columnar_relation_private_batch_retire(&frame->reduce_batch,
+                    0);
+            if (rc) return rc;
+            frame->bulk_append.exact_phase =
+                WL_COLUMNAR_OBSERVER_COMPLETED_ABANDONED;
+        }
+        if (frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_NORMALIZED)
+            frame->bulk_append.exact_phase =
+                WL_COLUMNAR_OBSERVER_COMPLETED_ABANDONED;
+        if (frame->bulk_append.exact_phase ==
+            WL_COLUMNAR_OBSERVER_COMPLETED_TRANSFER_INITIALIZING){
+            rc = wl_columnar_eval_stack_observer_transfer_prefix_retire(frame);
+            if (rc) return rc;
+            frame->bulk_append.exact_phase =
+                WL_COLUMNAR_OBSERVER_COMPLETED_ABANDONED;
+        }
+        return wl_columnar_relation_observer_completed_retire(
+            &frame->bulk_append,
+            &frame->result, frame->session->memory_governor, NULL, 0);
+    }
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR)
+        return frame->session->serial_completion.payload_ready
+            ? wl_columnar_relation_observer_constructor_retire(
+            &frame->observer_replacement, &frame->bulk_append,
+            &frame->result, frame->session->memory_governor, 0) : 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT)
+        return frame->session->serial_completion.payload_ready
+            ? wl_columnar_eval_delta_replacement_retire(
+            &frame->observer_replacement, &frame->bulk_append,
+            &frame->result, frame->session->memory_governor, 0) : 0;
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER)
+        return frame->session->serial_completion.payload_ready
+            ? wl_columnar_eval_delta_preparation_retire(&frame->observer,
+                   0) : 0;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC)
         return frame->session->serial_completion.payload_ready
             ? wl_arena_compound_arena_gc_retire(&frame->compound_gc, 0,
                    NULL) : 0;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY) return EBUSY;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_WORKSPACE_INITIALIZING
@@ -810,6 +1269,10 @@ wl_columnar_eval_stack_workspace_clear(
     /* These two regions also replaced the old source/private authority.
      * They may leave the frame only through complete checked disposal. */
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -836,6 +1299,551 @@ wl_columnar_eval_stack_workspace_clear(
     }
     return 0;
 }
+int
+wl_columnar_eval_stack_cleanup_seed(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_seed_restore_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!control || !session || !frame || !out || *out) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (session->cleanup_active != frame || frame->session != session
+        || wl_columnar_eval_stack_cleanup_mode(frame) !=
+        WL_COLUMNAR_SERIAL_FRAME_EVALUATION
+        || frame->stack.top || frame->result.rel || frame->result.owned
+        || frame->result.continuation || frame->result.seg_boundaries
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || !wl_columnar_relation_private_batch_disposable(
+            &frame->reduce_batch)) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_columnar_eval_stack_observer_group_terminal(&frame->join_sources,
+            control);
+    if (rc) return rc;
+    rc = wl_columnar_relation_bulk_append_retire(&frame->bulk_append, 0);
+    if (rc || frame->bulk_append.active) return rc ? rc : EBUSY;
+    rc = wl_columnar_eval_stack_workspace_retire(frame); if (rc) return rc;
+    wl_columnar_serial_completion_t *state = &session->serial_completion;
+    if (state->mode_frame && state->mode_frame != frame) return EBUSY;
+    state->mode_frame = frame;
+    state->mode = WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED;
+    state->payload_ready = false;
+    for (size_t at = 0; at < sizeof(frame->observer_seed);) {
+        size_t chunk = sizeof(frame->observer_seed) - at;
+        if (chunk > 128) chunk = 128;
+        rc = wl_evaluation_control_charge(control, chunk); if (rc) return rc;
+        memset((char *)&frame->observer_seed + at, 0, chunk); at += chunk;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    frame->observer_seed.session = session;
+    frame->observer_seed.active = true; frame->observer_seed.ready = true;
+    state->payload_ready = true; *out = &frame->observer_seed;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_seed_single(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t *dst,
+    wl_columnar_eval_delta_seed_restore_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !dst || !out || *out || !control
+        || session->cleanup_active != frame || frame->session != session
+        || session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || !session->serial_completion.payload_ready) return EINVAL;
+    wl_columnar_eval_delta_seed_restore_t *record = &frame->observer_seed;
+    int rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    if (!record->active || !record->ready || record->session != session
+        || record->seed_reader.owner || record->seed_reader.secondary_owner
+        || record->seed_reader.identity || record->seed_reader.thread_valid
+        || record->seed_reader.transferable || record->published
+        || (record->phase != WL_COLUMNAR_OBSERVER_SEED_LOOKUP
+        && record->phase != WL_COLUMNAR_OBSERVER_SEED_GATHER)) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    record->phase = WL_COLUMNAR_OBSERVER_SEED_SINGLE_INITIALIZING;
+    record->row = 0; record->dst = dst;
+    while (record->row < sizeof(record->single)) {
+        size_t chunk = sizeof(record->single) - record->row;
+        if (chunk > 128) chunk = 128;
+        rc = wl_evaluation_control_charge(control, chunk); if (rc) return rc;
+        memset((char *)&record->single + record->row, 0, chunk);
+        record->row += (uint32_t)chunk;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    record->phase = WL_COLUMNAR_OBSERVER_SEED_SINGLE_ACTIVE;
+    record->row = 0; *out = record;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_seed_bulk(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_relation_bulk_append_t **out, wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !out || *out || !control
+        || session->cleanup_active != frame || frame->session != session
+        || session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || !session->serial_completion.payload_ready) return EINVAL;
+    /* Both borrowed objects come from this validated original frame. */
+    int rc =
+        wl_columnar_relation_seed_bulk_begin_controlled(&frame->bulk_append,
+            &frame->observer_seed, control);
+    if (frame->bulk_append.borrowed_mode ==
+        WL_COLUMNAR_RELATION_BULK_SEED_APPEND)
+        *out = &frame->bulk_append;
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_seed_append(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !control || session->cleanup_active != frame
+        || frame->session != session ||
+        session->serial_completion.mode_frame != frame
+        || session->serial_completion.mode !=
+        WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || !session->serial_completion.payload_ready) return EINVAL;
+    return wl_columnar_relation_seed_append_without_reserve_controlled(
+        &frame->bulk_append, &frame->observer_seed, control);
+}
+
+int
+wl_columnar_eval_stack_cleanup_observer(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_preparation_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (!session || !frame || !out || *out
+        || session->cleanup_active != frame || frame->session != session
+        || wl_columnar_eval_stack_cleanup_mode(frame) !=
+        WL_COLUMNAR_SERIAL_FRAME_EVALUATION
+        || frame->stack.top || frame->result.rel || frame->result.owned
+        || frame->result.continuation || frame->bulk_append.active
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || !wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))
+        return EBUSY;
+    for (uint32_t i = 0; i < 2; i++) {
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &frame->join_sources.descriptors[i];
+        const wl_columnar_relation_source_group_owner_t *owner =
+            &frame->join_sources.owners[i];
+        if (desc->reader_held || desc->writer_held || desc->journal ||
+            owner->held
+            || desc->reader.owner || desc->reader.secondary_owner
+            || desc->writer.owner || desc->writer.secondary_owner
+            || owner->reader.owner ||
+            owner->reader.secondary_owner) return EBUSY;
+    }
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_columnar_eval_stack_workspace_retire(frame); if (rc) return rc;
+    wl_columnar_serial_completion_t *state = &session->serial_completion;
+    if (state->mode_frame && state->mode_frame != frame) return EBUSY;
+    state->mode_frame = frame; state->mode = WL_COLUMNAR_SERIAL_FRAME_OBSERVER;
+    state->payload_ready = false;
+    rc = wl_evaluation_control_charge(control, sizeof(frame->observer));
+    if (rc) return rc;
+    memset(&frame->observer, 0, sizeof(frame->observer));
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    wl_columnar_memory_reservation_init(&frame->observer.metadata);
+    /* No object or credit is owned at a partial initialization boundary. */
+    frame->observer.ready = true; state->payload_ready = true;
+    *out = &frame->observer;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_eval_stack_cleanup_observer_record(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_replacement_t **out,
+    wl_columnar_relation_bulk_append_t **bulk, uint32_t mode,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !out || *out || !bulk || *bulk || !control)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (session->cleanup_active != frame || frame->session != session
+        || wl_columnar_eval_stack_cleanup_mode(frame) !=
+        WL_COLUMNAR_SERIAL_FRAME_EVALUATION
+        || frame->stack.top
+        || (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        && (frame->result.rel || frame->result.owned))
+        || frame->result.continuation
+        || frame->result.seg_boundaries
+        || frame->join_sources.descriptor_count ||
+        frame->join_sources.owner_count
+        || !wl_columnar_relation_private_batch_disposable(&frame->reduce_batch))
+        return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (uint32_t i = 0; i < 2; i++) {
+        const wl_columnar_relation_source_group_descriptor_t *desc =
+            &frame->join_sources.descriptors[i];
+        const wl_columnar_relation_source_group_owner_t *owner =
+            &frame->join_sources.owners[i];
+        if (desc->reader_held || desc->writer_held || desc->journal ||
+            owner->held
+            || desc->reader.owner || desc->reader.secondary_owner
+            || desc->writer.owner || desc->writer.secondary_owner
+            || owner->reader.owner ||
+            owner->reader.secondary_owner) return EBUSY;
+    }
+    rc = wl_columnar_relation_bulk_append_retire(&frame->bulk_append, 0);
+    if (rc || frame->bulk_append.active) return rc ? rc : EBUSY;
+    rc = wl_columnar_eval_stack_workspace_retire(frame); if (rc) return rc;
+    wl_columnar_serial_completion_t *state = &session->serial_completion;
+    if (state->mode_frame && state->mode_frame != frame) return EBUSY;
+    state->mode_frame = frame;
+    state->mode = mode;
+    state->payload_ready = false;
+    for (size_t at = 0; at < sizeof(frame->observer_replacement);) {
+        size_t extent = sizeof(frame->observer_replacement) - at;
+        if (extent > 128) extent = 128;
+        rc = wl_evaluation_control_charge(control, extent); if (rc) return rc;
+        memset((char *)&frame->observer_replacement + at, 0, extent);
+        at += extent;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    /* A zero-ready record can retire each genuinely initialized prefix. */
+    state->payload_ready = true;
+    wl_columnar_eval_delta_replacement_t *record = &frame->observer_replacement;
+    wl_columnar_memory_reservation_t *credits[3] = {
+        &record->transaction.reservation,
+        &record->transaction.metadata_reservation,
+        &record->transaction.dedup_reservation
+    };
+    for (uint32_t i = 0;
+        mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT && i < 3; i++) {
+        rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+        wl_columnar_memory_reservation_init(credits[i]);
+        record->initialized_tokens = i + 1u;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    record->ready = true;
+    *out = record; *bulk = &frame->bulk_append;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_observer_replacement(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_replacement_t **out,
+    wl_columnar_relation_bulk_append_t **bulk, wl_evaluation_control_t *control)
+{
+    return wl_columnar_eval_stack_cleanup_observer_record(session, frame, out,
+               bulk, WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT, control);
+}
+
+/* Dedicated same-frame candidate handoff. Generic EVALUATION initialization
+ * is intentionally not used: it retires the very candidate being transported. */
+int
+wl_columnar_eval_stack_cleanup_observer_normalized_replacement(
+    wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_replacement_t **out,
+    wl_columnar_relation_bulk_append_t **out_bulk,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !out || *out || !out_bulk || *out_bulk ||
+        !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+    wl_columnar_serial_completion_t *state = &session->serial_completion;
+    if (session->cleanup_active != frame || frame->session != session ||
+        state->mode_frame != frame
+        || state->mode != WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR ||
+        state->payload_ready)
+        return EINVAL;
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    col_rel_t *candidate = frame->result.rel;
+    if (bulk->borrowed_mode != WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || bulk->exact_phase != WL_COLUMNAR_OBSERVER_COMPLETED_NORMALIZED
+        || !bulk->ready || bulk->initialized_tokens != 5
+        || bulk->base != WL_COLUMNAR_OBSERVER_CANDIDATE_REFERENCE
+        || !candidate || candidate != bulk->dst || !frame->result.owned
+        || !session->memory_governor ||
+        candidate->memory_governor != session->memory_governor
+        || candidate->storage_owner != candidate || candidate->pool_owned ||
+        candidate->arena_owned
+        || candidate->col_shared || candidate->mem_ledger ||
+        frame->result.continuation
+        || frame->result.seg_boundaries || frame->stack.top || bulk->active
+        || bulk->transaction_active || bulk->pending.growth ||
+        bulk->prepared_columns
+        || bulk->old_columns || bulk->prepared_timestamps ||
+        bulk->old_timestamps
+        || bulk->prepared_types || bulk->lengths || bulk->prepared_schema_ok ||
+        bulk->old_schema_ok
+        || bulk->writer.owner || bulk->writer.secondary_owner ||
+        bulk->writer.identity
+        || bulk->writer.thread_valid || bulk->descriptor_writer.owner
+        || bulk->descriptor_writer.secondary_owner ||
+        bulk->descriptor_writer.identity
+        || bulk->descriptor_writer.thread_valid
+        || !wl_columnar_relation_private_batch_disposable(
+            &frame->reduce_batch)) return EBUSY;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 192); if (rc) return rc;
+    if (bulk->count == sizeof(frame->consolidate) && candidate->timestamps) {
+        wl_columnar_eval_delta_timestamp_normalization_t *ts =
+            &frame->observer_timestamp;
+        wl_columnar_source_access_writer_t *writer = &ts->transaction.writer;
+        wl_columnar_memory_reservation_t *credit = &ts->indices_reservation;
+        if (ts->candidate != candidate || !ts->normalized || ts->ready ||
+            ts->initialized != 1
+            || ts->indices || ts->accounting_installed || ts->count < 2 ||
+            !ts->output
+            || ts->output > ts->count || candidate->nrows != ts->output
+            || candidate->sorted_nrows != ts->output ||
+            candidate->run_count != 1
+            || candidate->run_ends[0] != ts->output
+            || candidate->timestamp_capacity < candidate->nrows
+            || ts->bytes != (uint64_t)ts->count * sizeof(uint32_t)
+            || credit->identity != credit || credit->bytes != ts->bytes
+            || credit->governor !=
+            wl_columnar_memory_governor_ref_get(session->memory_governor)
+            || credit->replacement_bytes || credit->transition_kind
+            || atomic_load_explicit(&credit->state, memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+            || ts->transaction.writer_acquired || writer->owner ||
+            writer->secondary_owner
+            || writer->identity || writer->thread_valid ||
+            ts->transaction.staged
+            || ts->transaction.reservation_active ||
+            ts->transaction.metadata_reservation_active
+            || ts->transaction.dedup_reservation_active) return EINVAL;
+    } else if (bulk->count == 3 && !candidate->timestamps) {
+        wl_columnar_consolidate_record_t *record = &frame->consolidate;
+        if (!record->ready || (record->phase != WL_COLUMNAR_CONSOLIDATE_INERT
+            && record->phase != WL_COLUMNAR_CONSOLIDATE_RETIRED)
+            || record->starts || record->ends || record->merge_admission_active
+            || !wl_columnar_eval_stack_observer_credit_terminal(
+                &record->merge_admission)) return EINVAL;
+        if (record->lane == WL_COLUMNAR_CONSOLIDATE_HASH) {
+            wl_columnar_merge_hash_record_t *h = &record->hash;
+            if (h->values || h->new_values || h->used || h->new_used ||
+                h->unique
+                || h->new_unique || h->row_scratch || h->admission_active
+                || !wl_columnar_eval_stack_observer_credit_terminal(
+                    &h->admission)) return EINVAL;
+        } else if (record->lane == WL_COLUMNAR_CONSOLIDATE_RADIX
+            || record->lane == WL_COLUMNAR_CONSOLIDATE_RADIX_MERGE) {
+            wl_columnar_relation_radix_sequence_t *seq = &record->sequence;
+            wl_columnar_radix_workspace_t *w = &seq->workspace;
+            if (seq->boundaries || seq->needs_sort ||
+                seq->metadata_admission_active
+                || w->admission_active || w->perm_a || w->perm_b ||
+                w->bucket_values
+                || w->byte_values || w->short_values || w->count16 ||
+                w->temp_column
+                || w->insertion_rows || w->timestamps
+                || !wl_columnar_eval_stack_observer_credit_terminal(
+                    &seq->metadata_admission)
+                || !wl_columnar_eval_stack_observer_credit_terminal(
+                    &w->admission)) return EINVAL;
+        } else return EINVAL;
+    } else return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    wl_columnar_memory_reservation_t *destinations[5] = {&bulk->scratch,
+                                                         &bulk->metadata_pending,
+                                                         &bulk->previous,
+                                                         &bulk->old_metadata,
+                                                         &bulk->pending.fresh};
+    for (unsigned i = 0; i < 5; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        if (!wl_columnar_eval_stack_observer_credit_terminal(
+                destinations[i])) return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_columnar_eval_stack_observer_group_terminal(&frame->join_sources,
+            control); if (rc) return rc;
+    rc = wl_columnar_eval_stack_observer_group_terminal(&bulk->sources,
+            control); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_TRANSFER_INITIALIZING;
+    bulk->count = 0;
+    for (size_t at = 0; at < sizeof(frame->observer_replacement);) {
+        size_t n = sizeof(frame->observer_replacement) - at;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+        memset((char *)&frame->observer_replacement + at, 0, n);
+        at += n; bulk->count = (uint32_t)at;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    wl_columnar_eval_delta_replacement_t *record = &frame->observer_replacement;
+    wl_columnar_memory_reservation_t *tokens[3] =
+    {&record->transaction.reservation,
+     &record->transaction.
+     metadata_reservation, &record->transaction.dedup_reservation};
+    for (unsigned i = 0; i < 3; i++) {
+        rc = wl_evaluation_control_charge(control, 128); if (rc) return rc;
+        wl_columnar_memory_reservation_init(tokens[i]);
+        record->initialized_tokens = i + 1u;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+        if (!wl_columnar_eval_stack_observer_credit_terminal(
+                tokens[i])) return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+    if (record->ready || record->initialized_tokens != 3 ||
+        record->transaction.staged
+        || record->transaction.writer.owner ||
+        record->transaction.writer.secondary_owner
+        || record->transaction.writer.identity ||
+        record->transaction.writer.thread_valid
+        || record->reader.owner || record->reader.secondary_owner ||
+        record->reader.identity
+        || record->reader.thread_valid || record->reader.transferable
+        || frame->result.rel != candidate || !frame->result.owned ||
+        bulk->dst != candidate)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    /* Ten scalar stores, all prepaid. Candidate retains its real embedded
+    * credits/reference; mode17's checked custom disposer is now ready. */
+    record->ready = true;
+    state->mode = WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT;
+    state->payload_ready = true; bulk->dst = NULL; bulk->borrowed_mode = 0;
+    bulk->exact_phase = 0;
+    bulk->count = 0; bulk->base = 0;
+    *out = record; *out_bulk = bulk;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_observer_constructor(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_delta_replacement_t **out,
+    wl_columnar_relation_bulk_append_t **bulk, eval_entry_t **result,
+    wl_evaluation_control_t *control)
+{
+    if (!result || *result) return EINVAL;
+    int rc = wl_columnar_eval_stack_cleanup_observer_record(session, frame, out,
+            bulk, WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR, control);
+    if (!rc) *result = &frame->result;
+    return rc;
+}
+
+/* The completed candidate remains checked-owned throughout the entire
+ * workspace erase and subsequent purpose initialization. No EVALUATION mode
+ * or generic owned-result destructor is exposed at any partial boundary. */
+int
+wl_columnar_eval_stack_cleanup_observer_completed(wl_col_session_t *session,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control)
+{
+    if (!session || !frame || !control || session->cleanup_active != frame
+        || frame->session != session ||
+        wl_columnar_eval_stack_cleanup_mode(frame)
+        != WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR) return EINVAL;
+    wl_columnar_relation_bulk_append_t *bulk = &frame->bulk_append;
+    wl_columnar_serial_completion_t *state = &session->serial_completion;
+    int rc;
+    if (!bulk->borrowed_mode) {
+        rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+        wl_columnar_eval_delta_replacement_t *record =
+            &frame->observer_replacement;
+        col_rel_t *candidate = frame->result.rel;
+        if (!state->payload_ready || !record->ready || record->phase != 12
+            || record->initialized_tokens != 5 || !record->published
+            || record->reader.owner || record->reader.secondary_owner
+            || record->reader.identity || record->reader.thread_valid ||
+            record->reader.transferable
+            || record->transaction.staged || frame->result.owned || !candidate
+            || candidate->memory_governor != session->memory_governor
+            || !session->memory_governor ||
+            candidate->storage_owner != candidate
+            || candidate->col_shared || candidate->arena_owned ||
+            candidate->pool_owned
+            || candidate->mem_ledger || bulk->active || bulk->dst
+            || bulk->transaction_active || bulk->pending.growth
+            || bulk->prepared_columns || bulk->old_columns
+            || bulk->prepared_timestamps || bulk->old_timestamps
+            || bulk->prepared_types || bulk->lengths || bulk->old_schema_ok
+            || bulk->prepared_schema_ok || bulk->writer.owner ||
+            bulk->descriptor_writer.owner
+            || bulk->sources.descriptor_count || bulk->sources.owner_count
+            || bulk->sources.committed || !bulk->ready) return EBUSY;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        wl_columnar_memory_reservation_t *slots[5] = {
+            &bulk->scratch, &bulk->metadata_pending, &bulk->previous,
+            &bulk->old_metadata, &bulk->pending.fresh
+        };
+        wl_columnar_memory_reservation_t *embedded[5] = {
+            &candidate->descriptor_reservation,
+            &candidate->metadata_reservation,
+            &candidate->pool_name_reservation, &candidate->dedup_reservation,
+            &candidate->retained_reservation
+        };
+        for (uint32_t i = 0; i < 5; i++) {
+            rc = wl_evaluation_control_charge(control, 32); if (rc) return rc;
+            const wl_columnar_memory_reservation_t *slot = slots[i],
+                *token = embedded[i];
+            uint64_t terminal = atomic_load_explicit(&slot->state,
+                    memory_order_acquire);
+            uint64_t actual = atomic_load_explicit(&token->state,
+                    memory_order_acquire);
+            if (slot->identity != slot || slot->replacement_bytes ||
+                slot->transition_kind
+                || atomic_load_explicit(&slot->owner_bits, memory_order_acquire)
+                || (terminal != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+                && terminal != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED)
+                || token->identity != token || token->replacement_bytes ||
+                token->transition_kind
+                || (token->bytes || token->governor ?
+                token->governor !=
+                wl_columnar_memory_governor_ref_get(session->memory_governor)
+                || (actual != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+                && actual != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+                || atomic_load_explicit(&token->owner_bits,
+                memory_order_acquire)
+                != (actual ==
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED ?
+                (uintptr_t)candidate : 0)
+                    : actual !=
+                WL_COLUMNAR_MEMORY_RESERVATION_EMPTY)) return EINVAL;
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        for (uint32_t i = 0; i < 5; i++) {
+            rc = wl_evaluation_control_charge(control, 96); if (rc) return rc;
+            wl_columnar_memory_reservation_init(slots[i]);
+            rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        }
+        rc = wl_evaluation_control_charge(control, 64); if (rc) return rc;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        bulk->borrowed_mode = WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR;
+        bulk->exact_phase = WL_COLUMNAR_OBSERVER_COMPLETED_CLEAR;
+        bulk->count = 0; bulk->base = WL_COLUMNAR_OBSERVER_CANDIDATE_REFERENCE;
+        bulk->initialized_tokens = 5; bulk->dst = candidate;
+        frame->result.owned = true; record->published = false;
+        state->payload_ready = false;
+    }
+    if (bulk->borrowed_mode != WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR
+        || bulk->exact_phase != WL_COLUMNAR_OBSERVER_COMPLETED_CLEAR
+        || bulk->count > sizeof(frame->consolidate)) return EBUSY;
+    while (bulk->count < sizeof(frame->consolidate)) {
+        size_t n = sizeof(frame->consolidate) - bulk->count;
+        if (n > 128) n = 128;
+        rc = wl_evaluation_control_charge(control, n); if (rc) return rc;
+        memset((char *)&frame->consolidate + bulk->count, 0, n);
+        bulk->count += (uint32_t)n;
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    }
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_cleanup_compound_gc(wl_col_session_t *session,
     wl_columnar_eval_stack_cleanup_frame_t *frame,
@@ -912,6 +1920,10 @@ wl_columnar_eval_stack_cleanup_incremental_owner(wl_col_session_t *session,
         return EINVAL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -973,6 +1985,10 @@ wl_columnar_eval_stack_cleanup_promotion_owner(wl_col_session_t *session,
         return EINVAL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
         || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -1396,6 +2412,14 @@ wl_columnar_eval_stack_cleanup_bulk_append(
            WL_COLUMNAR_SERIAL_FRAME_RETIRED
            && wl_columnar_eval_stack_cleanup_mode(frame) !=
            WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+           && wl_columnar_eval_stack_cleanup_mode(frame) !=
+           WL_COLUMNAR_SERIAL_FRAME_OBSERVER
            && frame->bulk_append.ready
         ? &frame->bulk_append : NULL;
 }
@@ -1407,6 +2431,10 @@ wl_columnar_eval_stack_cleanup_sources(
     if (!frame || !frame->session) return NULL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     return mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+           || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+           || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+           || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+           || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
            || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
            || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
            || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -1423,7 +2451,11 @@ wl_columnar_eval_stack_cleanup_continuations(
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
-        || mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC) return;
+        || mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER) return;
     if (frame->result.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
         (void)eval_entry_dispose(&frame->result);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY
@@ -1438,7 +2470,14 @@ wl_columnar_eval_stack_cleanup_dispose_payload(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
-    if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC)
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR)
+        return wl_columnar_eval_stack_workspace_retire(frame);
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT) {
+        return wl_columnar_eval_stack_workspace_retire(frame);
+    }
+    if (mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
+        || mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC)
         return wl_columnar_eval_stack_workspace_retire(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_INLINE_OUTPUT) return EBUSY;
     if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT) {
@@ -1575,6 +2614,34 @@ wl_columnar_eval_stack_cleanup_idle(wl_col_session_t *sess,
            && !token->governor && !token->bytes && !owner ? 0 : EINVAL;
 }
 
+/* Only mandatory self-containing object retirement may activate this
+ * dead original overlay without forward charges or evaluator initialization. */
+int
+wl_columnar_eval_stack_cleanup_observer_mandatory(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out,
+    wl_columnar_eval_delta_preparation_t **preparation)
+{
+    if (!sess || !out || *out || !preparation || *preparation
+        || sess->cleanup_active || sess->cleanup_pending
+        || !sess->serial_completion.frame) return EBUSY;
+    int rc = wl_columnar_eval_stack_cleanup_retained_drain(sess);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_idle(sess, NULL); if (rc) return rc;
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        sess->serial_completion.frame;
+    wl_columnar_serial_completion_t *state = &sess->serial_completion;
+    state->mode_frame = frame; state->mode = WL_COLUMNAR_SERIAL_FRAME_OBSERVER;
+    state->payload_ready = false;
+    /* Idle validated true retirement, not merely zero-looking token bytes. */
+    memset(&frame->observer, 0, sizeof(frame->observer));
+    wl_columnar_memory_reservation_init(&frame->observer.metadata);
+    frame->observer.ready = true; state->payload_ready = true;
+    frame->next = NULL; sess->cleanup_active = frame;
+    sess->cleanup_active_count = 1;
+    *out = frame; *preparation = &frame->observer;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_cleanup_acquire(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out,
@@ -1671,6 +2738,10 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
         if (mode == WL_COLUMNAR_SERIAL_FRAME_OUTPUT
             || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
             || mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+            || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+            || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+            || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+            || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
             || mode == WL_COLUMNAR_SERIAL_FRAME_REGISTRY
             || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY
             || mode == WL_COLUMNAR_SERIAL_FRAME_INCREMENTAL
@@ -1827,6 +2898,10 @@ wl_columnar_eval_stack_cleanup_registry(
     if (!frame || !out || !control) return EINVAL;
     uint32_t mode = wl_columnar_eval_stack_cleanup_mode(frame);
     if (mode == WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED
+        || mode == WL_COLUMNAR_SERIAL_FRAME_OBSERVER
         || mode == WL_COLUMNAR_SERIAL_FRAME_RETIRED
         || mode == WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY) return EBUSY;
     int rc = 0;

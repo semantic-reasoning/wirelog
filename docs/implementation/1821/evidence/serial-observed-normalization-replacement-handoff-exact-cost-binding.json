@@ -1,0 +1,130 @@
+{
+  "artifact_type": "source_derived_exact_cost_binding",
+  "producer": "/root/architect_reduce_final",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-normalization-replacement-handoff-plan-supplement-r2.json",
+  "function": "wl_columnar_eval_stack_cleanup_observer_normalized_replacement",
+  "scope": "Implemented dedicated normalized candidate handoff and original transfer-prefix mandatory validation only.",
+  "ruling": "Narrow source arithmetic and ownership mapping coherent: both original route predicates precede workspace overwrite, outside18/BULK7 survives336 clear and real3token prefix, final fixed nine-store transition enables actual mode17 custom disposal. Prefix helper does not read aliased fields until count336 and validates only actual initialized terminal originals; no physical resource retirement falsely claimed for these freshly initialized EMPTY tokens. This is not runtime/candidate approval.",
+  "charge_trajectory": [
+    {
+      "term": "main original ownership/purpose validation",
+      "work": 128
+    },
+    {
+      "term": "actual TS552 or noTS3 route validation",
+      "work": 192
+    },
+    {
+      "term": "five original BULK destination terminal validations",
+      "work": "5*32=160"
+    },
+    {
+      "term": "two original groups with two fixed slots each",
+      "work": "2 groups*2 slots*64=256"
+    },
+    {
+      "term": "outside transfer marker activation",
+      "work": 32
+    },
+    {
+      "term": "typed replacement clear",
+      "work": "C=sizeof(replacement)=336=128+128+80"
+    },
+    {
+      "term": "three actual original transaction token initializations",
+      "work": "3*128=384"
+    },
+    {
+      "term": "three final original token terminal validations",
+      "work": "3*32=96"
+    },
+    {
+      "term": "final validation plus fixed9 stores preadmission",
+      "work": 64
+    }
+  ],
+  "formulas": {
+    "preclear": "P=128+192+5*32+2*(2*64)+32=768",
+    "full": "F=P+C+3*128+3*32+64=768+336+384+96+64=1648",
+    "actual_group_helper": "group_terminal has two charge64 and charge0 tails; credit_terminal/private_batch_disposable used in this path add no evaluation-control work. Each zero-work tail contributes0 but can deliver real stop/cancel.",
+    "clear_chunks": [
+      128,
+      128,
+      80
+    ],
+    "prior_normalization_cost": "Excluded: actual constructor/append/completed activation/normalizer/sample/index/private retire and TS consumed272. This is the reached dedicated handoff suffix, not total backend work."
+  },
+  "cutoffs": [
+    {
+      "allowance": 896,
+      "consumed": 896,
+      "state": "external18/BULK7 TRANSFER_INITIALIZING count128; next128 clear refused, no aliased record/prefix read"
+    },
+    {
+      "allowance": 1024,
+      "consumed": 1024,
+      "state": "same outside purpose count256; final80 clear refused"
+    },
+    {
+      "allowance": 1104,
+      "consumed": 1104,
+      "state": "actual full336 clear, genuine zero typed record, initialized prefix0; first128 token admission refused"
+    },
+    {
+      "allowance": 1232,
+      "consumed": 1232,
+      "state": "full336 clear, actual token prefix1; second128 refused"
+    },
+    {
+      "allowance": 1360,
+      "consumed": 1360,
+      "state": "full336 clear, actual token prefix2; third128 refused"
+    },
+    {
+      "allowance": 1488,
+      "consumed": 1488,
+      "state": "full336 clear, actual token prefix3/readyfalse; first32 final validation refused"
+    },
+    {
+      "allowance": 1647,
+      "consumed": 1584,
+      "state": "three actual final validations complete; last64 admission refused before any fixed mode17 store; outside18/BULK7/prefix3 persists"
+    },
+    {
+      "allowance": 1648,
+      "consumed": 1648,
+      "state": "healthy fixed transition to actual ready17 with original candidate/result/BULK unchanged except dead transfer bookkeeping; return0 if no cancel/fault"
+    }
+  ],
+  "mapping": [
+    "Actual main predicate requires NORMALIZED with unchanged actual candidate/frame/session/selfownership/governor and BULK referencebit. TS branch count552+timestamps checks original initialized1/normalizedtrue/readyfalse/indexNULL/accountfalse/RELEASED actual extent; noTS branch count3+noTS checks real hash/radix lane and terminal sequence/merge/private owners. No pointer-only or fabricated retired producer inference.",
+    "Activation has two fixed outside stores exact_phase6/count0 after its charge32+poll. All clear chunks journal actual count before tail; typed record is not read by mandatory prefix helper if count<336.",
+    "After complete336 zeroing, each actual original token init and initialized_tokens prefix write occurs between charge128 and zero-work tail. The final three validations run at original addresses. Prefix helper uses no charge/release/reservation operation because this phase has only initialized terminal EMPTY originals and no physical owner; malformed self identity returnsEINVAL and retains actual candidate and uncleared workspace.",
+    "Final charge64 covers fixed validation and nine stores: record.ready,state.mode,state.payload_ready,bulk.borrowed_mode,bulk.exact_phase,bulk.count,bulk.base,outrecord,outbulk. Real zero-work poll precedes stores; no fallible call between stores. Following zero-work tail can stop with actual mode17 already valid; checked custom mode17 disposal owns original candidate, not repeated handoff or canonical publication.",
+    "Mandatory workspace retirement recognizes TRANSFER_INITIALIZING, checks count before any typed record read, validates original initialized prefix then switches ABANDONED and custom completed-candidate disposal. False prefix validation returns first and retains actual outside transfer owner. Generic mode17 replacement_retire is not used under partially cleared18.",
+    "Original embedded five candidate credits and actual governor reference stay in candidate throughout. No token move/reference retain/release, extra frame/governor admission or raw candidate destructor is introduced by handoff. Earlier generic initializer is separate and retains its own original contract."
+  ],
+  "prior_receipt_clarification": {
+    "artifact": "serial-observed-timestamp-consumed-exact-cost-binding.json",
+    "ruling": "272 acknowledgment algebra remains source-only unless a genuine independently reachable production continuation setup is demonstrated. Current normalizer automatically acknowledges on success and returns NORMALIZED; isolated healthy TS_ACTIVE setup cannot be fabricated by resetting phase or using failed forward state. Its previously conditional exact272/minusone expectations are not runtime acceptance claims or authorization to retag state."
+  },
+  "proof_limits": {
+    "source_mutated": false,
+    "builds_tests_run": false,
+    "observed_work_used": false,
+    "runtime_claim": false,
+    "candidate_approved": false,
+    "full_issue_complete": false,
+    "backend_admission_open": false,
+    "source_mutable": true,
+    "frozen_binding_required": true,
+    "layout": "Actual code adds no record field; prior author current-definition witnesses unchanged. No independent compile/fit run here."
+  },
+  "source_hashes_read": {
+    "wirelog/columnar/eval_stack.c": "345353f4a57f190750882804d6d60abafc774919925afc84a35a89b743c45ef9",
+    "wirelog/columnar/internal.h": "73bc487efe80503f71aaba0e756e60d02fef0ed3bcb45d894898ed818ce3005f",
+    "wirelog/columnar/relation.c": "02bab3f2c48b2cc0f7be8f4a693b60553e63ac8b9410d532d60677bf700bacbb",
+    "wirelog/columnar/eval_delta.c": "210d6add4eb62b68fdb5c37ab89c7331d3195caea96906124a81c4f262fea3f1"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Plan judgment only on F1 installed NEW target credit validation and inherited footer readiness requirements. Actual F1 code remains missing and activation held.",
+  "assessment": "/home/joykim/.tmp/1821-work/serial-observed-seed-lazy-footer-readiness-source-binding.json",
+  "assessment_sha256": "76eb5b0fa1eb96fc1faead44190d7f013ea4618ec4d633da01654d93c9612c65",
+  "assessment_full_read": true,
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes_verified": {
+    "wirelog/columnar/relation.c": "0f117086e41c81098f4146eedb67155610b5ea1225cd70c63ef25d9371d191ca",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/relation.c:7996", "wirelog/columnar/relation.c:8131", "wirelog/columnar/relation.c:8137", "wirelog/columnar/relation.c:8364"],
+      "plan_elements": ["F1 actual gap", "installed current F/N before terminal39", "retained consumed footer"],
+      "categories": ["unsafe terminal accounting assumptions", "hidden outer authority release", "weak failure handling"],
+      "ruling": "Accepted F1 plan; concrete current-source gap confirmed. Installed non-growth branch retires previous/old_metadata and sets39 without validating current embedded new retained/metadata credits. Growth validates retained token during goal settlement but omits installed new metadata. Final five BULK token terminal proof does not establish current target token authority. Typed seed_restore_retire releases original SINGLE after footer success, so missing installed-target checks could release protection around malformed new target accounting. Validate before terminal39; on mismatch preserve installed38/consumed state and original SINGLE/frame. Do not release or repair live new target credit to force success."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:7919", "wirelog/columnar/relation.c:8093", "wirelog/columnar/memory_governor.c:528", "wirelog/columnar/memory_governor.c:1598", "wirelog/columnar/memory_governor.c:1621"],
+      "plan_elements": ["positive governed F/N", "governed zero dispositions", "ungoverned credited-zero domain"],
+      "categories": ["unsafe zero/history interpretation", "credit owner/state mismatch", "tests using fabricated noGovernor credit"],
+      "ruling": "Accepted with precise domain binding below. Installed positive governed quantities need strict COMMITTED ownerdst, exact original self/governor/bytes and no overlap/transition; existing seed_credit_live also accepts RESERVEDowner0 and is too broad if used alone here. Actual move leaves source selfEMPTY, actual release leaves RELEASED positive historical bytes/governor/owner, and downsize(0) is not an operation. Zero validation must recognize exact actual completed move/release/no-admission path, not bytes0 or arbitrary historical RELEASED. Ungoverned physical F/N may be positive while actual credited scalars remain0 with exact original NULL-or-self EMPTYzero affiliation; never compare those scalar credits to raw positive physical F/N as a governed amount."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:7996", "wirelog/columnar/relation.c:8047", "wirelog/columnar/relation.c:8050", "wirelog/columnar/relation.c:8126", "tests/test_evaluation_observer.c"],
+      "plan_elements": ["F2/F3/F4/F5", "actual installed identity-only refusal", "unactivated forward holds"],
+      "categories": ["unsafe phase/physical prefix assumptions", "weak consumed retry handling", "fixtures not proving real transitions"],
+      "ruling": "Accepted readiness binding. Forward must preserve O/M, pendinggrowth, savedO and real phases through all effect prefixes; physical cleanup and disposal journals remain original before credit operations. Originalscratch staysEMPTY. Installed schema consumption is set/BULK, separate from seed rowpublished. Healthy negative disposition must survive later successful mandatory drain. Identity-only installed refusal witness must be reached through actual future schema publication, then observe consumed38 with original held SINGLE and no new target release. Forward branch currently unactivated, so there is no runtime qualification from this assessment."
+    }
+  ],
+  "findings": [],
+  "actual_current_readiness": {"F1_implemented": false, "lazy_forward_activation_permitted": false},
+  "precise_installed_validation_binding": [
+    "Perform installed target validation after real old physical/credit retirement and growth goal settlement, before transaction/purpose terminal39 and outer SINGLE release. A genuine refusal leaves original consumed phase38, target model and new credit untouched; already retired old credits remain legitimate historical RELEASED for checked retry.",
+    "For governed positive F/N, actual respective retained_reserved_bytes/metadata_reserved_bytes must equal exact final_bytes/metadata_bytes and respective embedded original token must be self, governor affiliated to actual target governor, bytes exact, stateCOMMITTED, ownerdst, replacement0 and transitionNONE. RESERVEDowner0 is not installed new credit authority.",
+    "For governed zero scalar, require no live credit. Accept actual selfEMPTY zero affiliation from no-admission or genuine completed move; accept RELEASED only when source-derived original route proves the actual release and its exact historical amount/governor/owner. An arbitrary RELEASED token with positive bytes is not justified solely by scalar0.",
+    "For installed growth release to F0, actual prior combinedO+I is the historical release amount and ownerdst remains history; original savedO/incoming witness must remain available for postrelease validation/retry even after pendinggrowth becomesfalse. Do not re-release or reset this slot on validation retry.",
+    "If a fresh/no-incoming governed F0 route preserves an old positive live token, it cannot declare scalar0/terminal39 until the accepted exact physical/credit footer actually disposes that old obligation. Do not free carried physical model merely to justify zero or manufacture a fresh accepted token.",
+    "For governorNULL require credited retained/metadata scalars0 and exact original target token addresses with NULL-or-self identity, EMPTY, bytes/governor/owner/replacement/transition0. Physical final_bytes/metadata_bytes remain raw quantity witnesses and may be positive. BULK five initialized token identities remain self.",
+    "Mismatch is genuine EINVAL under primary precedence; retain actual installed model, original SINGLE/frame and consumed schema markers. Restore only an actual saved identity scalar after serialized host return for the fault witness; no token-state/amount repair or new-target release.",
+    "Bind implemented forward zero-route table and changed source before runtime evidence; F2-F5, fit/action/source algebra and all inherited branch/admission holds remain unchanged."
+  ],
+  "limits": {"source_modified": false, "builds_tests_run": false, "runtime_or_candidate_approval": false, "backend_admission_ready": false, "whole_STEP_qualification": false, "full_issue_complete": false, "historical_resource_deviations": "unwaived"}
+}

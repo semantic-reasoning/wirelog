@@ -1,0 +1,67 @@
+{
+  "actor": "root",
+  "kind": "checkpoint formatting only",
+  "idempotent": true,
+  "files": [
+    {
+      "path": "tests/meson.build",
+      "before": "89f7334a099db420db359254b6bc13df922c67c0e7dd3d2cfafc5279b63303c6",
+      "after": "89f7334a099db420db359254b6bc13df922c67c0e7dd3d2cfafc5279b63303c6",
+      "changed": false
+    },
+    {
+      "path": "tests/test_evaluation_observer.c",
+      "before": "566d10605be4384555f49a42d8e6a7a6198da00611f49d25127aaee63c754ff8",
+      "after": "97d39329c4c0dc0079ff183fc1042bd243dc9925013556b8ff6c80d1fb39a0a0",
+      "changed": true
+    },
+    {
+      "path": "wirelog/arena/compound_arena.c",
+      "before": "d4bc6f1548e52f71b4d2d3ed6c685dc5f057419e918c50cd99e259c0acfecbfe",
+      "after": "e6f5ab25414f6b7f6214ec41a1f14d34698ff0039249489ce29fd66a12d6e894",
+      "changed": true
+    },
+    {
+      "path": "wirelog/arena/compound_arena.h",
+      "before": "7f43c4238906a9952f2ec69f4984080cd2082dee0491d58c89543db22bbdc03c",
+      "after": "825069e794956b9750f68430554767a27059e9f3cc60d1b3e08d5418dd046841",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "before": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e",
+      "after": "859c48a245674d72fd5e8fe28d15ad129263d18b08f604e4adfbf33cd944d7b0",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/eval_stack.c",
+      "before": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+      "after": "9b900516bb249492eefaf6952160756b7b28f7ceb94cbac74c7caf79ac5a68c5",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/internal.h",
+      "before": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411",
+      "after": "f7d775032e09aa675974891b0e401f8ebd7e6aeeabac3f9d67664b6d79475e94",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/merge.c",
+      "before": "224ffcbfeb64e3f4fb4472ae3f56f415f85a49ddd093d8bc20c2eae830b18904",
+      "after": "41c161866ca94318e8b70405adc0f6c09ff4b9e0fcb85e2ba38fc70db7c67f77",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/relation.c",
+      "before": "0f117086e41c81098f4146eedb67155610b5ea1225cd70c63ef25d9371d191ca",
+      "after": "04943df81f7f438ee634e74038c30aa4d42a05fdfea0d6f1b24deec628b60f3b",
+      "changed": true
+    },
+    {
+      "path": "wirelog/columnar/session.c",
+      "before": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+      "after": "aee711b06ce247550b24a41bc90d2763d666de7b4d14b7e800e7f7278d0bbda8",
+      "changed": true
+    }
+  ]
+}

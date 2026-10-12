@@ -1,0 +1,26 @@
+{
+ "artifact_type":"critique_findings",
+ "producer":"/root/critic_1821_continue",
+ "plan_producer":"/root/architect_reduce_final",
+ "plan":"/home/joykim/.tmp/1821-work/serial-observed-rollback-caller-timing-plan-supplement.json",
+ "plan_sha256":"00c37102217f86b183fec720345d1d5d4f062f4f1ddf3d86ea5b47c313d33365",
+ "base_commit":"4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+ "base_tree":"c46c55094b9786f14420295455047e99ebfc9071",
+ "verdict":"accepted",
+ "paths":["wirelog/columnar/eval_delta.c","wirelog/columnar/session.c","tests/test_evaluation_observer.c"],
+ "findings":[],
+ "examined_elements":[
+  {"element":"Origin-first retry dispatch and actual active poll","paths":["wirelog/columnar/eval_delta.c","wirelog/columnar/session.c"],"categories":["unsafe raw fallback","hidden caller timing","work-accounting validity"],"actual_source":"rollback_retry dispatcher; evaluation_control.c:198-228; backend STEP BEGIN/poll/FINISH","ruling":"Accepted. Current dispatcher tests origin AND pointer and otherwise reaches raw restore; this loses controlled lifecycle when host detaches handle. Dispatch origin unconditionally. Actual charge0 verifies active attempt and sticky stop without consumption; nonNULL alone proves neither. Current active accounting_error is EOVERFLOW, so host-facing inactive EINVAL-to-EBUSY mapping does not swallow existing positive accounting errors. Direct controlled helper must also poll before forward work."},
+  {"element":"Mandatory pending drain versus forward rollback recovery","paths":["wirelog/columnar/session.c","wirelog/columnar/eval_delta.c"],"categories":["cleanup exemption misuse","mutation and baseline lifetime","positive error precedence"],"actual_source":"cleanup_ready pending-frame/recursive drain then rollback retry; quiescent host mutation callers","ruling":"Accepted. Pending actual physical/credit/writer cleanup may precede active poll, but cannot scan/complete snapshots, restore content or allocate new image. Inactive/missing-control controlled record returns EBUSY before canonical host mutation, preserving original image/flags and selected target lifetime. Active real stopped attempt propagates its stop rather than silently applying raw restore. Existing raw origin/no-record/active nesting policy remains distinct."},
+  {"element":"Same-attempt backend recovery and explicit destruction/discard","paths":["wirelog/columnar/session.c","tests/test_evaluation_observer.c"],"categories":["attempt reset/replay","teardown ownership","weak compatibility assumptions"],"ruling":"Accepted with public-detach contract HOLD. Actual STEP/SNAPSHOT wrappers own BEGIN and FINISH, so selected recovery belongs after that BEGIN before baseline/evaluation under the same accounting. Explicit origin-aware inactive discard disposes original owners without canonical restoration; destruction must preserve object-before-frame ordering and true refusal. No private control or reset is authorized. Public control-detach compatibility must be independently bound before admission if its actual contract promises mutation availability or automatic recovery."}
+ ],
+ "binding_requirements":[
+  "A mandatory pending drain may terminalize only its actual consumed owner state. Do not reinterpret successful drain as entire rollback recovery complete, clear all entry flags or discard a valid recovery snapshot implicitly before active forward policy decides it.",
+  "After successful actual poll0, every forward lookup/entry scan/finality acknowledgment/lease operation remains charged and bounded. Repeated helper poll0 is a real stop check, not a BEGIN/reset; record-wide retained loop is not allowed pre-BEGIN.",
+  "Host mutation guards must honor EBUSY and controlled origin after control detachment. Configuration/reset required by recovery contract must remain possible between stopped attempts without allowing canonical input mutation; do not convert origin merely to make insert/remove pass.",
+  "Active-record nesting remains existing behavior only under genuine owner/attempt context; it is not permission for host reentrant mutation or disposal of active rollback/observer/publication.",
+  "Validate actual no-control detach API/session lifecycle semantics before admission, or return the named prerequisite. This accepted narrow guard is not a permanent supported-default exclusion, public API behavior waiver or full recovery claim.",
+  "Real attached-inactive/detached host call, active pre-cancel/new STEP recovery and physical-credit refusal fixtures must use production timing and original owners. No manually assigned recovery flags, synthetic BEGIN or control state mutation."
+ ],
+ "limits":{"candidate_approved":false,"runtime_proof_by_critic":false,"full_issue_complete":false,"pr_authorized":false,"source_or_test_mutations":false,"resources":"Read-only source and HOME receipt only; no builds/tests/index/CI/perf. Public-detach and all parent layout/admission HOLDs, full-task/latest-main/native Windows obligations and unwaived historical resource deviations remain."}
+}

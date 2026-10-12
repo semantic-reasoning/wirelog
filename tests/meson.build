@@ -6357,6 +6357,17 @@ test_evaluation_membership_exe = executable(
 test('evaluation_membership', test_evaluation_membership_exe,
      suite: ['unit'], timeout: 120)
 
+# #1821 persistent observer ownership and default observed STEP.
+test_evaluation_observer_exe = executable(
+  'test_evaluation_observer', files('test_evaluation_observer.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_observer', test_evaluation_observer_exe,
+     suite: ['unit'], timeout: 120)
+
 test_evaluation_recursive_exe = executable(
   'test_evaluation_recursive', files('test_evaluation_recursive.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],

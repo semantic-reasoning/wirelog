@@ -1,0 +1,104 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-differential-evaluator-plan-supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique_and_original_lifetime_fit",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "repository": "/home/joykim/wirelog-1821-serial-work-next",
+  "parent": "serial-post-recursive-aggregate-closure-plan.json",
+  "caller_assessment": "serial-observed-production-stratum-step-source-assessment.json",
+  "scope": "P_DIFF_EVALUATOR: actual default observed nonrecursive generated AUTO VAR/MAP/CONS and VAR/FILTER/MAP/CONS with true dirty partial-mask activation, controlled differential CONS and original canonical rule publication. Differential JOIN/recursive/TDD/retraction remain required later and closed here.",
+  "source_hashes": {
+    "wirelog/columnar/diff.c": "8f55cf0e28574b6e96d864c5ea0554e22210ceb16d8c07ab28befd3e2f2c138b",
+    "wirelog/columnar/eval_plan.c": "abaf275bcf11d0fc1e031bff86945431a96c410f6b25a53696c883910481cc6d",
+    "wirelog/columnar/eval_serial.c": "1db3f01f4546ee4546d0ee267479cb7629ef97493e1cbe523d54cf092c51d8dd",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_stack.c": "52e4ee744c90823826b83371a8730d64eec04733bac356fd9a712ddf836923e9",
+    "wirelog/columnar/relation.c": "e52d2ac27cd81f1c4d94ba9d00718e914a24b14887a1cb3093d97a891836ba9c",
+    "wirelog/columnar/internal.h": "8b9423c13190260f158710f064b8f88f08833ddf3bdac4250be5d2c7cd72d084",
+    "wirelog/columnar/ops.c": "497597d080703897bc76675acf90e275eb40200fa46aa20afd021a2dbd4fd769",
+    "wirelog/columnar/filter.c": "ca92cefae79fcb268ed95b8b646945d1a41a3f9211821c653087f994d239238f",
+    "wirelog/columnar/merge.c": "224ffcbfeb64e3f4fb4472ae3f56f415f85a49ddd093d8bc20c2eae830b18904"
+  },
+  "allowed_paths": [
+    "wirelog/columnar/diff.c",
+    "wirelog/columnar/eval_plan.c",
+    "wirelog/columnar/eval_serial.c",
+    "wirelog/columnar/session.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/ops.c",
+    "wirelog/columnar/filter.c",
+    "wirelog/columnar/merge.c",
+    "tests/test_evaluation_observer.c",
+    "tests/test_diff_consolidate.c",
+    "docs/SEMANTICS.md"
+  ],
+  "necessary_additional_parent_paths": [
+    {
+      "path": "wirelog/columnar/ops.c",
+      "reason": "Actual controlled MAP424 and VARIABLE214 context/selection checks must validate the selected observed caller; MAP currently rejects diff_operators_active and delta_observer. The implementation lives here, not in eval_plan alone."
+    },
+    {
+      "path": "wirelog/columnar/filter.c",
+      "reason": "Actual selected generated FILTER820 rejects observer/diff context. Preserve reached bounded compiler/output owners and raw is_delta disposition, rather than dispatching raw FILTER."
+    },
+    {
+      "path": "wirelog/columnar/merge.c",
+      "reason": "Existing original consolidation/private-writer, bounded radix sequence, dedup/kway and borrowed-grid kernels reside here. Differential policy cannot use unmodified hash-first ordinary normalization or raw prefix loops."
+    }
+  ],
+  "actual_source_rulings": [
+    "session col_should_activate_diff3354 is exactly diff_enabled && affected_mask!=UINT64_MAX && affected_mask!=0; legacy STEP7086 sets it before actual per-stratum wrapper. Preserve default environment/session switch and mask computation. Initial full fallback and genuine dirty partial mask are different required witnesses.",
+    "eval_plan435 selects differential CONS when diff_operators_active; current col_op_consolidate_diff is raw. eval_plan563 rejects active diff and589 rejects observer. Guard deletion alone would expose raw loops. Differential JOIN369 already returns ENOTSUP under control and must remain closed in selected preflight before canonical mutation.",
+    "Current controlled AUTO VARIABLE selects full but returns ENOTSUP when real delta is nonempty and strictly smaller. Raw AUTO uses that delta and is_delta=true; full and delta lookup/source pins are already bounded but selection publication must preserve raw semantics. Selected nonrecursive current_iteration0 is not a reason to force full input.",
+    "Current MAP output is_delta=false, matching its actual raw output policy; FILTER preserves input is_delta. Do not propagate delta flags by mathematical intuition. Preserve operator-specific raw timestamps/type/schema policy; current MAP source timestamp guard remains a real separate prerequisite if a reached selected input carries timestamps.",
+    "Raw diff CONS82 validates FLOAT before nr<=1. Borrowed small input is an entry no-op. Owned small nonnormalized acquires real writer, checks alias borrows, frees segment metadata and publishes sorted/run scalars; no sort scratch. Borrowed larger input uses actual pool_new_like_governed_checked($consol_diff) then append_all. Failure retains original borrowed input or true partial owned clone as source dictates.",
+    "Raw differential large fallback never attempts ordinary hash-first, whereas controlled ordinary merge_normalize_private_core2602 does when nrows>10000. Differential prefix uses suffix-only radix+suffix dedup, persistent merge_columns reuse/growth then swap, not ordinary controlled two-segment transient starts/ends+full merged image. Differences change governed overlap and must remain explicit.",
+    "Raw prefix compaction uses col_rel_row_move_raw and column-only persistent merge copying, then grid/cap swap, storage touch, nrows/sorted/run publication and view touch. It does not explicitly permute timestamps with persistent merge cells. Preserve actual raw policy and verify timestamps with raw twin rather than repair semantics silently. Raw ungov optional right-size branch does not run for normally governed backend producer, but remains a real compatibility branch for supported direct input.",
+    "Existing ordinary CONS requires original RETIRED private provenance, rejects is_delta/observer/diff and has its own clone/algorithm admission. Existing incremental canonical merge takes two-role authority and emits delta events. Neither is a direct replacement for diff CONS; no fabricated private RETIRED marker or incremental authority."
+  ],
+  "caller_authority_and_layout": [
+    "Use existing original frame3864/completion80 and original CONS552 record purpose. Keep input evaluator slot at its true address until output ownership transfer; never pop into an automatic owning entry before original cleanup journal exists. Bind selected observer invocation to current active original rollback, stratum/rule cursor and active same control, not observer-pointer presence alone. New context validator must reject unsupported combinations before observer capture/canonical reset through whole-plan preflight.",
+    "Actual MAP/FILTER own original group/compiler/private producer as already implemented. Narrow admission permits only proven observed nonrecursive invocation and preserves all their raw representation guards/error/cost behavior outside it. Retired producer identity is obtained from real bounded producer release. On next operator the live source/compiler/private owners must retire before original workspace overlay changes.",
+    "Differential CONS needs an explicit durable policy discriminator outside overwritten radix bytes, at the existing frame mode/record lane location after actual unused-value mapping. It must distinguish full radix, segment kway and persistent-prefix policies; no new field or record size silently. Original sequence token/lease preparation is reused only while corresponding private writer is live at original address.",
+    "For prefix lane radix suffix owner must physically/credit-retire before repurposing original sequence bytes for scalar merge cursors. Retain exact input relation/identity/generation and original SINGLE lease outside every cleared prefix. Persistent merge grid pointers are relation-owned and remain reachable through original destination descriptor/lease; reserve transaction and retired old grid credit/pointers stay in original BULK1088, borrowing EXACT single lease, not reacquiring gates or copying it.",
+    "The selected partial-prefix state and BULK borrowing must compile actual simultaneous owner table in all four profiles: original private writer/SINGLE plus CONS scratch/merge state plus BULK growth must fit original frame without overlapping authority. Early HOLD if source cannot express this. Adding another governed frame or raw header/token copy is not authorized.",
+    "Borrowed clone constructor requires the exact raw pool/heap placement, named descriptor credit, metadata/payload ordering, default pool tombstone and source pin lifetime. Existing normalized mode18 constructor is not automatically equivalent to pool $consol_diff; bind its real phase/state/credit overlap before reuse or provide a narrow constructor prerequisite. This is mandatory parent borrowed CONS coverage, not a permanent selected-lane exemption."
+  ],
+  "implementation_sequence": [
+    "Add bounded plan/context preflight recognizing genuine nonrecursive selected lowerings and default mask policy; retain precise unsupported differential JOIN/recursive/TDD/retraction failure before mutation. No manual plan flags, FORCE_FULL retag, current_iteration rewrite, diff=false or full-mask replacement.",
+    "Implement AUTO actual selected full/delta push using existing bounded name/lookup/pair validation and cleanup. Keep the actual input identity/is_delta, true descriptor/generation lifetime and no reader retained across wrong operator overlay. Unsupported timestamp/representation encountered on a real selected producer is a returned prerequisite, not false runtime success.",
+    "Connect controlled differential CONS at real eval_plan dispatch. If control is absent, preserve the existing raw function unchanged. The selected ordinary full-fallback CONS also needs explicit observed context binding; it must retain ordinary hash-first policy, not silently use differential policy merely because a callback exists.",
+    "Implement raw small branch and FLOAT validation with charged width/cell visits, actual original writer and segment-metadata owner. Every no-op still proves and polls its actual branch; descriptor-only/empty input is not an arbitrary engine exemption. Preserve positive primary and consumed terminal writer tails.",
+    "Implement differential full radix+dedup with original durable sequence and no added8-byte or whole-input scratch admission not present in raw. Match raw prepared sort scratch/algorithm fallback memory, view generation and run bookkeeping. Do not use ordinary hash heuristic; large direct fixture must prove differential radix lane actually visited.",
+    "Segmented differential branch may share actual raw-equivalent bounded kway core only after differential hash-first is excluded and raw clone/segment metadata ownership remains correct. Real malloc/reservation outcomes and maximum overlap remain same as raw; physical metadata free precedes checked credit retirement.",
+    "Prefix: suffix sort and dedup are separate bounded phases; compare and move every scalar with <=256 interval. Grow/reuse persistent merge grid at raw max_rows/max(oldcap*2,max_rows) after suffix d_unique determined, retaining raw allocation ordering. Merge into persistent grid cell-by-cell, drain retired preparation, then prevalidate/preadmit fixed grid/cap swap and storage/lease advancement. Publish nrows/sorted/run/view only with true finite final cutoff. Preserve original old primary as merge grid after swap, not freeing it as disposable scratch.",
+    "On failure, real original rule frame drains physical/sort/grid/lease owners before whole-stratum rollback recovery; incomplete in-place candidate may have moved cells. A fresh host attempt restores canonical baseline/recomputes actual rule, rather than resuming a half-mutated prefix as raw preimage. Published result followed by cleanup refusal is consumed cleanup-only until owner drain.",
+    "Actual rule output to canonical head and serial relation cursor follow existing framed_relation publication, but must validate observer/rollback context instead of ordinary preflight assumptions. Reset cursor only at actual fresh stratum after rollback recovery, keep heads_final separate from overall success. Whole session observer final comparison/callback cutoff remains outside differential CONS; it produces no host callbacks itself."
+  ],
+  "early_holds": [
+    "Actual original policy-specific CONS/SINGLE/BULK simultaneous fit and phase/consumer map before source activation; no diagnostic size assertion as runtime/lifetime proof.",
+    "Raw-compatible suffix/persistent merge-grid reserve entrypoint taking original SINGLE lease: existing two-role incremental reserve cannot be used through an invented adapter. P_SEED single borrowed API may share only proven common physical policy, not schema/type/timestamp behavior.",
+    "Borrowed $consol_diff exact pool constructor/append original ownership and checked destructor; no arbitrary borrowed rejection as final closure.",
+    "Actual reached timestamp MAP/FILTER behavior and private constructor type/schema policy. General timestamp MAP is still mandatory full task if encountered outside selected plain nonrecursive source; do not confuse already reached observer normalized constructor with MAP producer.",
+    "Whole dirty activation requires existing selected affected-mask/observer integration and P_SEED prerequisite. Do not open backend from this local CONS helper alone."
+  ],
+  "finite_acceptance": [
+    "Use actual generator shape intake for plain and filtered AUTO rules in at least two genuine independent strata: default session initial missing heads full-mask fallback, then EDB insertion affecting a strict nonzero subset. Record real selected diff_operators_active and actual differential CONS visit during the call, compare known canonical tuples and signed whole observer events to raw. No postreturn stale flag assertion as activation proof.",
+    "Actual AUTO strictly smaller nonempty delta selection and full fallback with identical raw tuple/is_delta disposition; label supplied direct input helper separately from genuine backend lowering.",
+    "Direct raw/control differential CONS parent branches: borrowed/owned, empty/one row, FLOAT invalid before small no-op, full radix above10000 proving no hash policy, sorted prefix with merge-grid reuse and real growth, segments2/3 and typed/timestamp raw representation twins. Do not fake prefix/segment production provenance; direct fixture truth is explicitly labelled.",
+    "At least257 completed compare/copy visits in suffix dedup/persistent merge and segment copyback with deterministic cancellation, original lease/pending credit drain, canonical whole-stratum recovery and fresh raw retry. Actual source-derived exact/repeat/minusone and publication cutoff arithmetic before test literals; no observed work rebasing.",
+    "Real original RESERVED/COMMITTED credit identity faults after physical NULL and terminalized writer negative tail; positive primary precedence, original scalar restoration after return, true cleanup-only published retry without duplicated rows/events.",
+    "Sampled shared enforcing governor raw/control initial/dirty and persistent merge reuse/regrowth with raw memory policy; parent metadata/frame witnesses plus complete branch ownership proof. Same finite four profiles/docs/registered observer+diff tests and actual target union; no extra matrix."
+  ],
+  "limits": {
+    "backend_admission_ready": false,
+    "source_authorized_by_artifact": false,
+    "runtime_or_compiled_fit_claim": false,
+    "qualification": "Read-only source planning; requires coordinator FULL READ and distinct Critic. Current author consolidation helper tests do not establish this differential evaluator path.",
+    "full_issue_complete": false,
+    "remaining": "Differential JOIN/default recursive unchanged evaluation_retry/snapshot_cutoff, signed/TDD/retraction/general timestamp/typed/seed/alias/fallback/checkpoint-table lanes, full acceptance matrix, latest-main and nativeWindows before final ready PR. Resource history unwaived."
+  }
+}

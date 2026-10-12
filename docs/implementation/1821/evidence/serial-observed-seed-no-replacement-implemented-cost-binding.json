@@ -1,0 +1,58 @@
+{
+  "artifact_type": "source_cost_binding",
+  "name": "serial-observed-seed-no-replacement-implemented-cost-binding",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "lineage": {
+    "serial-observed-seed-no-replacement-exact-cost-intake.json": "25878d4998d2ff64e6e72ea4df006c92abd9623078df3df6199fa0b460eefacf",
+    "serial-observed-seed-no-replacement-token-preflight-plan-supplement.json": "e984e3054ab78b28c1ee7ba09b9ca1cd7699e17f17765dcf3892f58a4b44ddd0",
+    "serial-observed-seed-no-replacement-token-preflight-plan-critique.json": "dff1157827c9179b91dca94df5805260b85cd8ed2fcf460f2acba7b6032059db"
+  },
+  "ruling": "Implemented source matches accepted five-slot preflight and revised arithmetic. This is only actual mutable-source/action binding, not runtime or candidate approval. Prior actual408/404 receipt preserved unchanged.",
+  "implemented_delta": [
+    "relation7985 actual publisher after128 entrychecks/tail builds nonowning const original token pointerlist scratch,metadata_pending,old_metadata,previous,pending.fresh. Loop five times explicitly charge32, then exact identityself/governorNULL/bytes0/replacement0/transitionNONE/stateEMPTY/owner0 checks, tail0. No tokeninit/move/release/reset/canonical or stale-denial mutation in this loop.",
+    "Five checks are current initializedpurpose strictEMPTY, not prioractivation newbornNULL/RELEASED domain. Validated outer original BULK initialized5 is necessary but not substituted for actualstate. Real identity-only refusal remains reachable before copy and original footer retains malformedslot/SINGLE/frame until postreturn scalarrestore.",
+    "Remaining rawproduct16, validation48, lane4, typedcell4, cursor32, copy16, finalvalidate128 and cutoff32 are unchanged inactualsource. Framebridge1301 has no positivecharge. All relation6174 tails charge0 only."
+  ],
+  "actual_formula": {
+    "explicit_INT64": "128 +5*32 +16 +48 +4 +4 +32 +16 +128 +32 =568",
+    "implicit_NULL_types": "128 +5*32 +16 +48 +4 +0 +32 +16 +128 +32 =564",
+    "explicit_before_cell": 392,
+    "explicit_after_cell": 408,
+    "explicit_before_final32": 536,
+    "implicit_before_final32": 532,
+    "explicit_full_minus_one": "567 rejects final32 atconsumed536; inputunusedcell copied, targetnrows1/viewold/allpublishedfalse",
+    "implicit_full_minus_one": "563 rejects final32 atconsumed532",
+    "token_prefix_check_cumulatives": [
+      160,
+      192,
+      224,
+      256,
+      288
+    ],
+    "scope": "Actual one inputrow width1 INT64 targetnrows1/cap64/private established schema/noTS; genuine completed held setup before newBEGIN, as prior receipt. No observed work totals used."
+  },
+  "fixed_action_rebind": [
+    "Final128 validation checks actual completecopy, originallease, oldnrows=base/count, relationidentity/storagegeneration, and valid viewheadroom. Final32 preadmission followed by real zero-cost cancellation poll occurs beforecanonicalstores.",
+    "Exactlyfive fixed successful effects: targetnrows2, viewincrementonce, originalsetpublishedtrue, seedpublishedtrue, BULKpublishedtrue. No falliblegap/poll/charge/callback between canonical publication and markers; returns0 immediately. No storagegeneration or creditmutation.",
+    "Therefore purebudget568 exact succeeds, and567 fails beforepublication. Consumednegative requires genuine later SINGLErelease cancel/refusal caller, separate from this helpercost. Actual work91 coordinator diagnostic is not independent runtime evidence from this binding; fresh profile qualification/reviewer still future."
+  ],
+  "holds_and_limits": [
+    "Registered literals may bind568/564 under genuine setup/freshrepeat assumptions after this codebinding FULL READ. Do not infer wholeSTEP/backend cost or broaden noreserve guards.",
+    "Mutable currenthashes need finalfreeze rebind. No new layout/fit/build/test/source change performed by Architect.",
+    "All lazy/privategrowth/TSshort/COW/arena preparation and defaultdiff/observer/recursive/fullissue/main/nativeWindows/resourcehistory duties remain mandatory/unwaived."
+  ],
+  "limits": {
+    "source_only": true,
+    "runtime_approval": false,
+    "candidate_approved": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "tests_builds_edits": false
+  }
+}

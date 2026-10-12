@@ -1,0 +1,207 @@
+[
+  {
+    "name": "serial-observed-seed-lazy-footer-readiness-source-binding.json",
+    "present": true,
+    "sha256": "76eb5b0fa1eb96fc1faead44190d7f013ea4618ec4d633da01654d93c9612c65"
+  },
+  {
+    "name": "serial-observed-seed-lazy-installed-credit-critique.json",
+    "present": true,
+    "sha256": "7e7e0cc2b53771662aafffd72db4b5bd29d413933b979274146a83392076c7a8"
+  },
+  {
+    "name": "serial-observed-seed-lazy-original-address-plan-supplement.json",
+    "present": true,
+    "sha256": "d77d42b401cb02ff2710e9532dab07b982f334f950937aa2c66acb42825d25fc"
+  },
+  {
+    "name": "serial-observed-seed-lazy-original-address-plan-critique.json",
+    "present": true,
+    "sha256": "65e3f2b5e86f2807cc0b8328f90674b81672ade4c5261825cfbcbb44497cd9f1"
+  },
+  {
+    "name": "serial-observed-seed-lazy-schema-plan-supplement.json",
+    "present": true,
+    "sha256": "36f7ad2cf613eac38558e1b4ee3144cf82ada0879cd4b3fcce7a7a88c34315a2"
+  },
+  {
+    "name": "serial-observed-seed-lazy-schema-critique.json",
+    "present": true,
+    "sha256": "7b6bb622346ce281fefa6e03b31b5100b441411b4f1c060a6d212d6330a825b4"
+  },
+  {
+    "name": "serial-observed-seed-lazy-reverse-plan-supplement.json",
+    "present": true,
+    "sha256": "a976b851be5be0f98cfc8232242bdb61ff6cdce554c268f92843d7f10fdaa39c"
+  },
+  {
+    "name": "serial-observed-seed-lazy-reverse-critique.json",
+    "present": true,
+    "sha256": "52e222efc4708b1050e285ee28b89a0831e133317b114cc64405991847ca79aa"
+  },
+  {
+    "name": "serial-observed-seed-lazy-current-source-sequencing.json",
+    "present": true,
+    "sha256": "8cca870b6387f43318342d72b38e0a4930219280d7169c5d5ef4deed8684441b"
+  },
+  {
+    "name": "serial-observed-seed-lazy-current-source-sequencing-critique.json",
+    "present": true,
+    "sha256": "004249548b2606c94f71f72cd7c70ec5d8065f9a8b8327b8f379423355199db3"
+  },
+  {
+    "name": "serial-observed-seed-target-branches-plan-supplement.json",
+    "present": true,
+    "sha256": "197a4cee72ad1eda6220b571017ee99cddfbf6eaea7870a526ef29c6660856aa"
+  },
+  {
+    "name": "serial-observed-seed-target-branches-critique.json",
+    "present": true,
+    "sha256": "232cd9e2ba3abbd535152254747869b5420c921156856725db2f303afbbcd957"
+  },
+  {
+    "name": "serial-observed-differential-evaluator-plan-supplement.json",
+    "present": true,
+    "sha256": "22b44a712e37eac26d8c1a8e174cc2db0d4ede36676308109bbdf90d91f38c59"
+  },
+  {
+    "name": "serial-observed-differential-evaluator-critique.json",
+    "present": true,
+    "sha256": "cb05937791d2febb37629f30c35b32498db4f63ca53f53bb70da70eb63f44ea2"
+  },
+  {
+    "name": "serial-observed-production-stratum-step-source-assessment.json",
+    "present": true,
+    "sha256": "9b8b2edbe095350aaa1b728cd3b1824b25218eae7e2a160c5c8be786a94fa29c"
+  },
+  {
+    "name": "serial-observed-production-stratum-step-source-critique.json",
+    "present": true,
+    "sha256": "b42fe902397995cd22ec0cd7b035aa663e372fe09dc67579926d479e9317b9b7"
+  },
+  {
+    "name": "serial-observed-author-work100-safe-testlog.json",
+    "present": true,
+    "sha256": "efdde820efd941f2b9ba931745d6f25a75899fabb27b32e7cc04c1bd2e8c4ea0"
+  },
+  {
+    "name": "serial-observed-author-work99-safe-testlog.json",
+    "present": true,
+    "sha256": "efdde820efd941f2b9ba931745d6f25a75899fabb27b32e7cc04c1bd2e8c4ea0"
+  },
+  {
+    "name": "serial-observed-author-sanitize-work26-diagnostic-safe-testlog.json",
+    "present": true,
+    "sha256": "24a743cfe5e9ab78ccc20a69b282f29b5e419210e50c341c8fa9de4f61d65d05"
+  },
+  {
+    "name": "serial-observed-author-sanitize-work25-safe-testlog.json",
+    "present": true,
+    "sha256": "ee0ff3e7a3565103894f9d3c390cc0872e4655828dc685b2d688b90ab7d1775f"
+  },
+  {
+    "name": "serial-observed-seed-no-replacement-implemented-cost-binding.json",
+    "present": true,
+    "sha256": "f353d2bcb808e183c41097a498f360ae7adbcd2a805dea8d4b4d6179bc71be00"
+  },
+  {
+    "name": "serial-observed-seed-explicit-int64-setup-source-binding.json",
+    "present": true,
+    "sha256": "96a6e45b93a19da77c07d92aee564736885d7e253aba424bbb696167507ed6cf"
+  },
+  {
+    "name": "serial-observed-seed-explicit-int64-setup-source-critique.json",
+    "present": true,
+    "sha256": "a01b44bcd7292502f2393fb2b6fff5181493522c9331926620004b3d87c4ae33"
+  },
+  {
+    "name": "serial-observed-seed-gather-exact-cost-intake-r2.json",
+    "present": true,
+    "sha256": "c8c246065d159c8664274643fed1a91ecce3d7901b1652fc2c8d448d3c050e02"
+  },
+  {
+    "name": "serial-observed-seed-gather-exact-cost-critique-r2.json",
+    "present": true,
+    "sha256": "d2993878e13fdda35efd235f41d52beea41bdef5e2967ed5ee96271f0e806e60"
+  },
+  {
+    "name": "serial-observed-seed-bulk-lifecycle-source-binding-r2.json",
+    "present": true,
+    "sha256": "f34c54508e789565bd58bd8b806da0e1bb1c83c736a73fc736a903df7fbc7866"
+  },
+  {
+    "name": "serial-observed-seed-bulk-lifecycle-source-critique-r2.json",
+    "present": true,
+    "sha256": "7675501baee48a7a03230b93f257b08b1a21e1e55f77dd04613c93aeca0fab12"
+  },
+  {
+    "name": "serial-observed-seed-bulk-activation-exact-cost-intake.json",
+    "present": true,
+    "sha256": "f01618c3d00e00a0602b3421dd7684559aeb4133df367049d7abd16f8c1010b2"
+  },
+  {
+    "name": "serial-observed-seed-bulk-activation-exact-cost-critique.json",
+    "present": true,
+    "sha256": "b8b5e72e7851890b782966a30eaa37f13b40e6da6df6742b6a315bb5493dead9"
+  },
+  {
+    "name": "serial-observed-final-install-phase-source-table.json",
+    "present": true,
+    "sha256": "dd13a6e2e3a81b396c39b242efbb689cc7bd20d4ac349675b478efb0c705a2a1"
+  },
+  {
+    "name": "serial-observed-final-install-phase-source-critique.json",
+    "present": true,
+    "sha256": "6ccd5686de7100961de9e217533128865505071b04cae5f2ce0c3dfcc55c3cbc"
+  },
+  {
+    "name": "serial-observed-final-install-fixed-action-implemented-binding.json",
+    "present": true,
+    "sha256": "080588b7556103c4b22dee3e41190742ceae948d9d6523c9dbe9995c3cf1455c"
+  },
+  {
+    "name": "serial-observed-normalization-replacement-handoff-plan-supplement-r2.json",
+    "present": true,
+    "sha256": "512f9cb8ea52545b5d13875621405752ef155543b363f36bf9d2d08d90ae7811"
+  },
+  {
+    "name": "serial-observed-normalization-replacement-handoff-critique-r2.json",
+    "present": true,
+    "sha256": "dce004b488734daac187ab8ca6bff179b19e4ecd18371e07d4a9b4b99d1139ea"
+  },
+  {
+    "name": "serial-observed-normalization-replacement-handoff-exact-cost-binding.json",
+    "present": true,
+    "sha256": "978241c8866e46e336a631ee3ec8d85af8c66d75f8ed5db09b762aa9fe2c05ef"
+  },
+  {
+    "name": "serial-observed-normalization-replacement-handoff-exact-cost-critique.json",
+    "present": true,
+    "sha256": "dead59dc180a6442185cdf60a93832c10dd00a9add17ca95f90f2c0cdc5dab68"
+  },
+  {
+    "name": "serial-observed-timestamp-consumed-exact-cost-binding.json",
+    "present": true,
+    "sha256": "e11905ee6551383e24d82052231f3d3516baf8cd26d4185534346a878136fb3b"
+  },
+  {
+    "name": "serial-observed-source-preflight-plan-supplement.json",
+    "present": true,
+    "sha256": "dcb0e7ba0cda3cb8acb12f953f4cbfdb2885c86bf2b7aac6eeb82561849c0cbc"
+  },
+  {
+    "name": "serial-observed-source-preflight-critique.json",
+    "present": true,
+    "sha256": "07181c16d13c530b60ecfb3a71f2129352b090191725cd9f3f65778311c69ba9"
+  },
+  {
+    "name": "serial-observed-rollback-caller-timing-plan-supplement.json",
+    "present": true,
+    "sha256": "00c37102217f86b183fec720345d1d5d4f062f4f1ddf3d86ea5b47c313d33365"
+  },
+  {
+    "name": "serial-observed-rollback-caller-timing-critique.json",
+    "present": true,
+    "sha256": "a3dd5f23710f658c969b0fb04ddf562ec1aca1f10f87316e14c5e42f38983cac"
+  }
+]

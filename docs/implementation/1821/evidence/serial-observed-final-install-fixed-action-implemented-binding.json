@@ -1,0 +1,74 @@
+{
+  "artifact_type": "implemented_source_arithmetic_binding",
+  "producer": "/root/architect_reduce_final",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "accepted_binding": "serial-observed-final-install-fixed-action-source-binding-r2.json",
+  "history": "R1/B1 blanketoldCOMMITTED blocked/upheld; R2 correct raw state domain, not retroactive approval.",
+  "source_sha256": {
+    "wirelog/columnar/relation.c": "34c83c9aff7825d32c5bf36dc5385fedeaf90067b8abab4429fa3ab5d32a9e47",
+    "wirelog/columnar/internal.h": "6b5bbf4c4dd4c0a9879e06e7daf5912de56030afe6e5cb5bc2f9eede1e418de3",
+    "wirelog/columnar/memory_governor.c": "38d4a083566f4363afe30ff7946fc2de094a738e4cb41025a687c176b5e98d56",
+    "subprojects/nanoarrow/src/nanoarrow/common/inline_types.h": "e8c90c188a825bf7edc17d1848632ae9d179f328a36ae9ef2039bf55aa2d399d"
+  },
+  "rulings": [
+    {
+      "id": "S1_R2",
+      "disposition": "Actual implemented predicate matches accepted R2",
+      "source": "relation.c19785+ quantitypositive branch",
+      "proof": "Both side branches require actual identity/quantity/governor/transition and RESERVED/owner0 or COMMITTED/target. Additional i==0 COMMITTED applies to OLD retained and FRESH payload only. No i1/i2 blanket oldCOMMITTED guard. m increments only side=fresh RESERVED; oldmetadata/dedup RESERVED is not counted."
+    },
+    {
+      "id": "S2_R2",
+      "disposition": "Actual native transfers match accepted R2",
+      "source": "relation.c19832+",
+      "proof": "Save old physical.schema_ok, then ArrowSchemaMove(target.schema,physical.schema), then ArrowSchemaMove(stage.schema,target.schema); real source.release=NULL via inline_types.h330. No Arrow release/alloc/callback/poll in fixed region. Actual37 stage scalar/pointer assignments exclude schema; additional native2 releaseNULL stores fit named group58<=64."
+    },
+    {
+      "id": "slack/cutoff",
+      "disposition": "Source formula and cutoff order preserved",
+      "proof": "456 prefix, actual fixed formula856 conditional schema72/run32 witness, genuine fresh commit4 each, F1312+4m. No control call after last successful commit before sixmoves/fieldinstall/published40; m0 explicit zero poll. AtF actual positive oldwidth first8 retirement can stop publishedtrue. F is publication suffix, not successful-call total. m0 F-1 consumed456; m>=1 F-1 consumedF-2/cutoff restores actual lastRESERVED."
+    }
+  ],
+  "action_groups": {
+    "sixmoves_or_inertpairs": 384,
+    "named_scalar_group": 128,
+    "two_native_schema_byte_transfers": "2*sizeofArrow; expected144",
+    "two_run_array_copies": "2*sizeofrun_ends; expected64",
+    "transient_stage_name_header_disposition": 8,
+    "prepared_exclusive_ledger_apply": 64,
+    "touch_generation_selfowner": 32,
+    "consumed_phase_flags": 32,
+    "expected_sum": 856
+  },
+  "authority_and_disposition": [
+    "Actual source preserves original descriptor/name/poolname/gov/ref/gates/deferred links; changes only named stage physical/shape fields and real newcredit quantities. Source touch_storage updates self storage_owner_generation, so no stale self generation remains after successful install.",
+    "Actual active booleans distinguish new livecredit quantity from nongoverned measured payload, for both forward and reverse. Fixed body six operation prefix advances only actual move/inert acknowledgment; unexpected refusal invokes original mandatory reverse before logical install.",
+    "Published phase40 and both publication scalars set before actual retirement. Original old physical journal owns image only then; oldcredit retirement follows actual physicalNULL and original target writer release comes after old3 retirement. No candidate/header wholecopy or new frame."
+  ],
+  "pending_qualification": [
+    "Author actual r4 four-profile layout receipt FULL READ and current definition hashes match; no independent compile, publisher runtime proof or frozen source qualification yet.",
+    "Actual registered m0/m1/m2/cutoff/cleanup/refusal/positiveprecedence/raw twin runtime not yet seen for this publisher. No admission or frozen final verdict.",
+    "Final frozen source hashes/action mapping must be rebound; current mutable hashes only."
+  ],
+  "limits": {
+    "source_mutated": false,
+    "builds_tests_run": false,
+    "candidate_approved": false,
+    "backend_admitted": false,
+    "independent_fit": false,
+    "runtime_cost_observed": false,
+    "full_issue_complete": false
+  },
+  "consumed_author_layout_witness": {
+    "artifact": "serial-observed-final-install-r4-fit.json",
+    "full_read": true,
+    "actor": "/root/implement_serial_attempt_1821",
+    "four_profiles_compile_run0": true,
+    "actual": "physical168/8 <=sources368/8; BULK1088/8 original1088/8; schema72/run32; frame3864/8 original3864/8; completion80/8",
+    "source_hashes_current_match": {
+      "wirelog/columnar/internal.h": true,
+      "wirelog/columnar/eval_stack.c": true
+    },
+    "scope": "Actual-definition layout receipt consumed, author/coordinator not independent Architect compile. Does not establish runtime publisher/admission qualification."
+  }
+}

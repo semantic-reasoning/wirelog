@@ -1,0 +1,113 @@
+{
+  "artifact_type": "source_cost_binding",
+  "name": "serial-observed-seed-bulk-activation-exact-cost-intake",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "78a434905ad811f33a8b2c4d6ab0720fd9623c696da43fbdbcd0202368a1befe",
+    "wirelog/columnar/eval_stack.c": "bb800d3764f8056d241e2acc016ded34e4cbfd0d623aaa68c21661779b7b278d",
+    "wirelog/columnar/internal.h": "db09fcf5760a3d777d20daf2018a49859e0d071e3f3e7abfa3f3fbdc49b19663"
+  },
+  "parent": "serial-observed-seed-bulk-lifecycle-source-binding-r2.json",
+  "scope": "Only initial no-physical-allocation BULK8 begin/retire and frame-local bridge. Source cost/action binding, not candidate approval or later lazy/growth/append implementation.",
+  "actual_callees": [
+    "eval_stack1283 cleanup_seed_bulk checks current original session/frame/mode19/readiness, calls seed_bulk_begin on actual original frame BULK+seed record; adds no positive charge. It can expose actual original BULK through out on error if existing mode8: output is ownership/disposal access, never forward-success permission.",
+    "relation7897 begin checks actual outer original seed/SINGLE under128. col_rel_mutation_lease_validate735 loops exactly one lease, descriptors1 and owner_count<=2 established before call, original identities/generation/gates; no positive charge inside validator.",
+    "relation7842 credit_dead loads original state/owner and validates no overlap. RELEASED requires actual self/governor/positive historical bytes, EMPTY requires owner0/governorNULL/bytes0 and self or allowed newbornNULL. Caller controls newborn flag from real prior prefix provenance.",
+    "relation7856 physical_dead checks all real physical owner pointers/Arrow flags, transaction/growth/journal and owned writer terminal. Generic historical compact/growth/reset/exact flags are not uniformly live obligations; actual owned compact merge/ledger must be dead. Dedicated8 flags strict false.",
+    "relation7874 lifecycle-only retire accepts phase32/39 and real physical+five-slot terminal truth, never borrowed SINGLE/lease dereference; marks39/inactive. It is not implementation of future allocation/committed reverse footer.",
+    "relation6174 work_tail has charge0 only; work parameter is test observation metadata."
+  ],
+  "charge_trajectory": [
+    {
+      "purpose": "Original current seed/SINGLE checks",
+      "charge": 128
+    },
+    {
+      "purpose": "Prior BULK/physical/group origin checks",
+      "charge": 64
+    },
+    {
+      "purpose": "Five original credit slots validation",
+      "charge": "5*32 =160"
+    },
+    {
+      "purpose": "Activation preadmission and zero-cost stop BEFORE scalar stores",
+      "charge": 64
+    },
+    {
+      "purpose": "Five original dead-token initializations in scratch,metadata_pending,old_metadata,previous,pending.fresh order",
+      "charge": "5*128 =640"
+    }
+  ],
+  "formula": {
+    "activation": "A=128+64+5*32+64=416",
+    "full": "F=A+5*128=1056",
+    "prefix_k": "A+k*128 for k0..5",
+    "prefix_values": [
+      416,
+      544,
+      672,
+      800,
+      928,
+      1056
+    ],
+    "sizeof_dependency": "No sizeof added to literal debit: initialization is explicitly charged128 per actual token (sizeof current reservation56, fits finite region). Original token init fixed-size stores plus prefix publication; no heap/governor/CAS ownership transfer."
+  },
+  "fixed_activation_actions": {
+    "preadmitted_work": 64,
+    "scalar_store_count": 29,
+    "stores": [
+      "borrowed_mode",
+      "exact_phase",
+      "active",
+      "initialized_tokens",
+      "dst",
+      "borrowed.single",
+      "borrowed.lease",
+      "borrowed.old_shared",
+      "borrowed.metadata_after",
+      "borrowed.old_arena",
+      "borrowed.metadata_retire",
+      "prior_identity",
+      "prior_generation",
+      "schema_install",
+      "published",
+      "metadata_committed",
+      "growth",
+      "compact",
+      "reset",
+      "exact_capacity",
+      "metadata_bytes",
+      "final_bytes",
+      "ledger_timestamps",
+      "pending.incoming_bytes",
+      "ncols",
+      "base",
+      "count",
+      "new_capacity",
+      "owned_columns"
+    ],
+    "bound": "29 fixed scalar assignments after preadmitted64 and zero-cost cancellation check, before next positive charge. No loop/malloc/Arrow callback/credit action in this region; 29 fits64 fixed action allowance. Two target identity/generation reads and schema flag read are fixed prevalidated stable SINGLE-held descriptor fields. Prior owned pointers and pending.growth/journal were proven dead/false, not silently cleared to erase ownership."
+  },
+  "boundary_dispositions": [
+    "A416 exact: preactivation poll0 succeeds absent real cancel,29 stores execute, active8 phase32 initialized0; first tokencharge128 refuses with consumed416. Original dead token slots remain actual prior provenance and true retire validates them, leaves39/inactive. Not success or physical/credit admission.",
+    "544 exact: scratch actualinit succeeds, prefix1 published beforepoll0; metadata tokencharge128 refuses consumed544. No invented identity or other token repair. Mandatory terminal footer validates actualprefix1+prior dead suffix.",
+    "F-1=1055: four actual token inits succeed, prefix4/consumed928; fresh128 charge refuses with127 allowanceleft. It is not prefix5 or consumed1055. Real fifth original slot retains actual dead prior provenance.",
+    "F1056 exact: allfive initializedself EMPTY, prefix5, readyoriginalBULK phase32 active8; helper0. No positive tail charge. Follow real lifecycle retire before new purpose, then genuinely begin another caller attempt preserving original held SINGLE and frame; repeat same source trajectory.",
+    "Cancellation at activation work_tail occurs BEFORE stores and may leave prior mode0 or prior inactive8/39, not new prefix0. Distinguish from pure-budget416 which does activate. Cancellation after actual initializedtoken occurs after prefixpublication; true mandatory footer uses actual reached state."
+  ],
+  "fixture_state_and_holds": [
+    "Complete actual seed gather plus original SINGLE acquire in separately finished CONTROL setup. Retain same actual original mode19 frame, complete record and held token/lease across next BEGIN; do not call whole frame finish/SINGLE retire then fabricate ready flags. No active-attempt reset or core config mutation.",
+    "Budget constants measure only cleanup_seed_bulk forwarding API/begin. Prior gather999, frame allocation, SINGLE initialization/acquisition and subsequent append/full STEP are excluded by honest setup, not refund.",
+    "Use genuine newborn original BULK and real generic stopped/reused scratch-first prefix sources; actual existing original mode8 terminal39 can be reused without dereferencing old dead borrowed pointer. Never write phase/count/identity to create proof.",
+    "Current initial lifecycle retire physically owns nothing and will reject future resource states. Extend accepted lazy/reverse/TS/COW/arena footer BEFORE any allocation/admission/transport activation. Current compile141 is author diagnostic not a four-profile source qualification or actual runtime evidence for this receipt.",
+    "Mutable source hashes must be rebound to frozen candidate. Proposed exact fixtures remain implementation followed by distinct runtime review; no builds/tests/source changes or finaldesign approval performed. Fullissue/latestmain/nativeWindows/resource obligations remain."
+  ],
+  "limits": {
+    "source_only": true,
+    "runtime_approval": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false
+  }
+}

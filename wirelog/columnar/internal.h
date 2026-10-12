@@ -683,6 +683,10 @@ extern void (*wl_columnar_relation_test_after_single_reader_release)(
 int wl_columnar_relation_reader_acquire_controlled(
     wl_columnar_source_access_gate_t *,
     wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_reader_pair_acquire_controlled(const col_rel_t *,
+    wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_reader_pair_release_controlled(const col_rel_t *,
+    wl_columnar_source_access_reader_t *, wl_evaluation_control_t *);
 int wl_columnar_relation_writer_acquire_controlled(
     wl_columnar_source_access_gate_t *,
     wl_columnar_source_access_writer_t *, wl_evaluation_control_t *);
@@ -800,6 +804,10 @@ typedef struct col_rel_replacement {
     bool dedup_reservation_active;
     bool writer_acquired;
 } col_rel_replacement_t;
+int wl_columnar_relation_replacement_writer_acquire_controlled(col_rel_t *,
+    col_rel_replacement_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_replacement_writer_release_controlled(col_rel_t *,
+    col_rel_replacement_t *, wl_evaluation_control_t *);
 
 /* Private governed source image. The source writer remains held until commit
  * or discard; callers may mutate only the image returned by get(). */
@@ -3795,16 +3803,69 @@ typedef struct {
     uint64_t incoming_bytes;
     bool growth;
 } wl_columnar_relation_payload_transaction_t;
+/* Mode17 publication owns this physical image only after its fixed install.
+ * No relation authority, descriptor/name credit or governor reference is
+ * stored here. Before publication these are protected nonowning references. */
+typedef struct {
+    int64_t **columns, **merge_columns, **backup_columns;
+    bool *shared;
+    char **names;
+    wirelog_column_type_t *types;
+    uint32_t *arity_map;
+    uint64_t *dedup_slots;
+    int64_t *row_scratch;
+    col_delta_timestamp_t *timestamps, *backup_timestamps;
+    struct ArrowSchema schema;
+    uint32_t ncols;
+    bool arena_owned, schema_ok;
+} wl_columnar_relation_replacement_physical_t;
+_Static_assert(sizeof(wl_columnar_relation_replacement_physical_t)
+    <= sizeof(wl_columnar_relation_source_group_t),
+    "replacement physical journal fits original source region");
+_Static_assert(_Alignof(wl_columnar_relation_replacement_physical_t)
+    <= _Alignof(wl_columnar_relation_source_group_t),
+    "replacement physical journal preserves original alignment");
+#define WL_COLUMNAR_RELATION_BULK_OWNED 0u
+#define WL_COLUMNAR_RELATION_BULK_INCREMENTAL_RESERVE 1u
+#define WL_COLUMNAR_RELATION_BULK_INCREMENTAL_COW 2u
+#define WL_COLUMNAR_RELATION_BULK_INCREMENTAL_GRID 3u
+#define WL_COLUMNAR_RELATION_BULK_INCREMENTAL_APPEND 4u
+#define WL_COLUMNAR_RELATION_BULK_FLAT_RESTORE 5u
+#define WL_COLUMNAR_RELATION_BULK_DELTA_DETACH 6u
+#define WL_COLUMNAR_RELATION_BULK_SEED_APPEND 8u
 typedef struct {
     union {
         wl_columnar_relation_source_group_t sources;
+        wl_columnar_relation_replacement_physical_t replacement_physical;
         struct {
-            wl_columnar_merge_incremental_authority_t *authority;
+            union {
+                wl_columnar_merge_incremental_authority_t *authority;
+                wl_columnar_relation_mutation_single_t *single;
+            };
             wl_columnar_relation_mutation_lease_t *lease;
             bool *old_shared;
             uint64_t metadata_after;
             bool old_arena, metadata_retire;
         } borrowed;
+        struct {
+            wl_col_session_t *session;
+            const wl_columnar_eval_delta_rollback_t *rollback;
+            const int64_t *rows;
+            uint64_t expected_identity;
+            uint32_t index, nrows, ncols;
+            bool overwrite;
+        } restore;
+        /* DETACH owns an alias-root reader only while its old primary image
+         * retires. This region is dead before ordinary source-group reuse. */
+        struct {
+            col_rel_t *root;
+            wl_columnar_source_access_reader_t reader;
+            bool *old_shared;
+            bool *detached;
+            uint64_t ledger_before, metadata_before, metadata_after;
+            bool old_arena, had_shared, alias_consumed;
+            bool metadata_settled, payload_settled;
+        } detach;
     };
     wl_columnar_source_access_writer_t descriptor_writer, writer;
     col_rel_t *dst;
@@ -3820,7 +3881,8 @@ typedef struct {
     wl_columnar_memory_reservation_t metadata_pending, old_metadata;
     wl_columnar_memory_reservation_t previous, scratch;
     union { uint64_t *lengths; int64_t *prepared_row_scratch; };
-    union { wirelog_column_type_t *prepared_types; char **prepared_names; };
+    union { wirelog_column_type_t *prepared_types; char **prepared_names;
+            uint32_t *prepared_arity_map; };
     struct ArrowSchema prepared_schema;
     union {
         struct ArrowSchema old_schema;
@@ -4673,6 +4735,160 @@ typedef struct wl_columnar_session_hash_controlled_registry {
     uint32_t initialized_tokens;
     bool ready, published;
 } wl_columnar_session_hash_controlled_registry_t;
+
+/* Sequential observer/snapshot construction and disposal uses this original
+ * frame slot. Object metadata moves here before the containing object is freed;
+ * embedded payload and staging authorities remain in their original objects. */
+typedef struct wl_columnar_eval_delta_preparation {
+    wl_columnar_memory_reservation_t metadata;
+    wl_columnar_memory_governor_ref_t *governor;
+    void *object;
+    union {
+        struct { uint64_t bytes; uint32_t total, initialized; };
+        wl_compound_arena_borrow_t hold_borrow;
+    };
+    uint32_t cursor, phase;
+    bool active, ready, physical_disposed;
+} wl_columnar_eval_delta_preparation_t;
+/* Phase-exclusive staged replacement journal. The candidate remains owned by
+ * frame.result; these tokens retain the separately allocated raw staged image. */
+/* External observer replacement purpose; phase36 is intentionally unused.
+ * The source-region physical journal must be interpreted before source groups. */
+#define WL_COLUMNAR_OBSERVER_IMAGE_CLEAR 30u
+#define WL_COLUMNAR_OBSERVER_IMAGE_CAPTURE 31u
+#define WL_COLUMNAR_OBSERVER_IMAGE_PREPARE 32u
+#define WL_COLUMNAR_OBSERVER_IMAGE_MOVES 33u
+#define WL_COLUMNAR_OBSERVER_IMAGE_REVERSE 34u
+#define WL_COLUMNAR_OBSERVER_IMAGE_INSTALL 35u
+#define WL_COLUMNAR_OBSERVER_IMAGE_PRIMARY 40u
+#define WL_COLUMNAR_OBSERVER_IMAGE_MERGE 41u
+#define WL_COLUMNAR_OBSERVER_IMAGE_BACKUP 42u
+#define WL_COLUMNAR_OBSERVER_IMAGE_NAMES 43u
+#define WL_COLUMNAR_OBSERVER_IMAGE_FOOTER 44u
+#define WL_COLUMNAR_OBSERVER_IMAGE_CREDITS 45u
+#define WL_COLUMNAR_OBSERVER_IMAGE_WRITER 46u
+#define WL_COLUMNAR_OBSERVER_IMAGE_DONE 47u
+typedef struct wl_columnar_eval_delta_replacement {
+    col_rel_replacement_t transaction;
+    wl_columnar_source_access_reader_t reader;
+    col_rel_t *target;
+    uint64_t identity, view_generation, storage_generation;
+    uint32_t initialized_tokens, column_cursor, phase;
+    bool ready, published, candidate_disposed;
+} wl_columnar_eval_delta_replacement_t;
+/* Timestamp normalization is exclusive with constructor/replacement and
+ * consolidate workspace purposes. Only transaction.writer is acquired;
+ * transaction staging/credits remain inert. Candidate ownership and its
+ * embedded-credit cleanup stay outside this region in completed BULK7. */
+typedef struct wl_columnar_eval_delta_timestamp_normalization {
+    col_rel_replacement_t transaction;
+    wl_columnar_memory_reservation_t indices_reservation;
+    col_rel_t *candidate;
+    uint32_t *indices;
+    uint64_t bytes;
+    uint32_t count, initialized, root, end, output, row;
+    bool ready, accounting_installed, normalized;
+} wl_columnar_eval_delta_timestamp_normalization_t;
+/* Seed dimensions survive the source pin and the phase-exclusive name/single
+ * region. The flat rows remain the only append source after that pin retires. */
+typedef struct wl_columnar_eval_delta_seed_restore {
+    union {
+        char shadow_name[256];
+        wl_columnar_relation_mutation_single_t single;
+    };
+    wl_columnar_source_access_reader_t seed_reader;
+    wl_col_session_t *session;
+    col_rel_t *dst, *seed;
+    int64_t *rows;
+    uint64_t cells, bytes;
+    uint32_t nrows, ncols, row, column, phase;
+    bool denied, published, active, ready;
+} wl_columnar_eval_delta_seed_restore_t;
+/* Seed caller owns initialization and checked deferred-prefix retirement. */
+int wl_columnar_relation_seed_single_acquire_controlled(col_rel_t *,
+    wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_seed_single_retire_controlled(
+    wl_columnar_relation_mutation_single_t *, int, wl_evaluation_control_t *);
+int wl_columnar_relation_seed_bulk_begin_controlled(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_eval_delta_seed_restore_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_seed_bulk(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_relation_bulk_append_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_seed_append_without_reserve_controlled(
+    wl_columnar_relation_bulk_append_t *,
+    wl_columnar_eval_delta_seed_restore_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_seed_append(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_seed_restore_retire(
+    wl_columnar_eval_delta_seed_restore_t *,
+    wl_columnar_relation_bulk_append_t *, int);
+int wl_columnar_eval_stack_cleanup_seed(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_seed_restore_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_seed_single(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *,
+    wl_columnar_eval_delta_seed_restore_t **, wl_evaluation_control_t *);
+_Static_assert(sizeof(wl_columnar_eval_delta_seed_restore_t)
+    <= sizeof(wl_columnar_merge_consolidate_original_record_t),
+    "seed restore must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_eval_delta_seed_restore_t)
+    <= _Alignof(wl_columnar_merge_consolidate_original_record_t),
+    "seed restore alignment must fit original workspace");
+_Static_assert(sizeof(wl_columnar_eval_delta_timestamp_normalization_t)
+    <= sizeof(wl_columnar_merge_consolidate_original_record_t),
+    "timestamp normalization must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_eval_delta_timestamp_normalization_t)
+    <= _Alignof(wl_columnar_merge_consolidate_original_record_t),
+    "timestamp normalization alignment must fit original workspace");
+_Static_assert(sizeof(wl_columnar_eval_delta_replacement_t)
+    <= sizeof(wl_columnar_merge_consolidate_original_record_t),
+    "replacement must fit original workspace");
+_Static_assert(_Alignof(wl_columnar_eval_delta_replacement_t)
+    <= _Alignof(wl_columnar_merge_consolidate_original_record_t),
+    "replacement must fit original workspace alignment");
+/* Accounting/init scalars are dead only after the real object metadata move.
+ * HOLD_BORROW must be interpreted before either member of this union. */
+#define WL_COLUMNAR_EVAL_DELTA_PREPARATION_HOLD_BORROW 3u
+typedef struct wl_columnar_eval_delta_preparation_original {
+    wl_columnar_memory_reservation_t metadata;
+    wl_columnar_memory_governor_ref_t *governor;
+    void *object;
+    uint64_t bytes;
+    uint32_t total, initialized, cursor, phase;
+    bool active, ready, physical_disposed;
+} wl_columnar_eval_delta_preparation_original_t;
+_Static_assert(sizeof(wl_columnar_eval_delta_preparation_t)
+    == sizeof(wl_columnar_eval_delta_preparation_original_t),
+    "observer prep original size");
+_Static_assert(_Alignof(wl_columnar_eval_delta_preparation_t)
+    == _Alignof(wl_columnar_eval_delta_preparation_original_t),
+    "observer prep original alignment");
+_Static_assert(sizeof(wl_compound_arena_borrow_t) == 16u,
+    "original compound borrow extent");
+_Static_assert(offsetof(wl_columnar_eval_delta_preparation_t, hold_borrow)
+    == offsetof(wl_columnar_eval_delta_preparation_original_t, bytes),
+    "observer borrow offset");
+_Static_assert(offsetof(wl_columnar_eval_delta_preparation_t, cursor)
+    == offsetof(wl_columnar_eval_delta_preparation_original_t, cursor),
+    "observer cursor offset");
+_Static_assert(offsetof(wl_columnar_eval_delta_preparation_t, phase)
+    == offsetof(wl_columnar_eval_delta_preparation_original_t, phase),
+    "observer phase offset");
+int wl_columnar_eval_delta_compare_controlled(const int64_t *, const int64_t *,
+    uint32_t, int *, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_swap_controlled(int64_t *, uint32_t, uint32_t,
+    uint32_t, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_sort_controlled(int64_t *, uint32_t, uint32_t,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_normalize_controlled(int64_t *, uint32_t,
+    uint32_t, uint32_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_subtract_controlled(int64_t *, uint32_t,
+    const int64_t *, uint32_t, uint32_t, uint32_t *, wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
 (*wl_columnar_session_hash_test_registry_retirement_checkpoint)(
@@ -4695,6 +4911,235 @@ extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
 #define WL_COLUMNAR_SERIAL_FRAME_DESCRIPTOR_REGISTRY 13u
 #define WL_COLUMNAR_SERIAL_FRAME_RETIRED 14u
 #define WL_COLUMNAR_SERIAL_FRAME_COMPOUND_GC 15u
+#define WL_COLUMNAR_SERIAL_FRAME_OBSERVER 16u
+#define WL_COLUMNAR_SERIAL_FRAME_OBSERVER_REPLACEMENT 17u
+#define WL_COLUMNAR_SERIAL_FRAME_OBSERVER_CONSTRUCTOR 18u
+#define WL_COLUMNAR_SERIAL_FRAME_OBSERVER_SEED 19u
+#define WL_COLUMNAR_OBSERVER_SEED_LOOKUP 0u
+#define WL_COLUMNAR_OBSERVER_SEED_PIN 1u
+#define WL_COLUMNAR_OBSERVER_SEED_GATHER 2u
+#define WL_COLUMNAR_OBSERVER_SEED_SINGLE_INITIALIZING 10u
+#define WL_COLUMNAR_OBSERVER_SEED_SINGLE_ACTIVE 11u
+#define WL_COLUMNAR_OBSERVER_SEED_SINGLE_CLEARING 12u
+#define WL_COLUMNAR_OBSERVER_SEED_RETIRED 13u
+/* BULK outside-workspace purpose. Its count is clear/init progress and base
+ * is the exact embedded-credit prefix plus actual reference obligation. */
+#define WL_COLUMNAR_OBSERVER_COMPLETED_CONSTRUCTOR 7u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_CLEAR 0u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_TS_INITIALIZING 1u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_TS_ACTIVE 2u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_CONS_INITIALIZING 3u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_CONS_ACTIVE 4u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_NORMALIZED 5u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_TRANSFER_INITIALIZING 6u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_ABANDONED 7u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_PHYSICAL 10u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_MOVE 11u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_HEADER_NULL 12u
+#define WL_COLUMNAR_OBSERVER_COMPLETED_DONE 13u
+/* External REPLACEMENT selects these phases. Transaction token readiness
+ * remains three; candidate credit readiness belongs to the original BULK. */
+#define WL_COLUMNAR_OBSERVER_SOURCE_PREFLIGHT 14u
+#define WL_COLUMNAR_OBSERVER_SOURCE_PREFLIGHT_VALID 15u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_PAIR 20u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_PHYSICAL 21u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_MOVE 22u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_HEADER_NULL 23u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_DONE 24u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_PREFIX_MASK 7u
+#define WL_COLUMNAR_OBSERVER_CANDIDATE_REFERENCE 8u
+int wl_columnar_relation_observer_candidate_retire(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, wl_columnar_memory_governor_ref_t *,
+    wl_evaluation_control_t *, int);
+int wl_columnar_relation_observer_completed_retire(
+    wl_columnar_relation_bulk_append_t *, eval_entry_t *,
+    wl_columnar_memory_governor_ref_t *, wl_evaluation_control_t *, int);
+int wl_columnar_eval_stack_cleanup_observer_consolidate_owner(
+    wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_consolidate_record_t **,
+    wl_columnar_relation_private_batch_t **, col_rel_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer_consolidate_consumed(
+    wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
+int wl_columnar_merge_observer_normalize_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
+wl_columnar_eval_delta_timestamp_normalization_t *
+wl_columnar_eval_stack_cleanup_observer_timestamp_record(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_stack_cleanup_observer_timestamp_consumed(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer_timestamp(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_timestamp_normalization_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_timestamp_retire(wl_col_session_t *,
+    wl_columnar_eval_delta_timestamp_normalization_t *,
+    wl_evaluation_control_t *, int);
+int wl_columnar_eval_delta_timestamp_normalize_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_timestamp_normalization_t *,
+    wl_evaluation_control_t *);
+wl_columnar_relation_source_group_t *
+wl_columnar_eval_stack_cleanup_observer_sampling_sources(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, bool);
+int wl_columnar_relation_observer_transport_bytes_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *, uint64_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_session_observer_mem_sample_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer_completed(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer_normalized_replacement(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_replacement_t **,
+    wl_columnar_relation_bulk_append_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer_constructor(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_replacement_t **,
+    wl_columnar_relation_bulk_append_t **, eval_entry_t **,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_observer_source_preflight_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, const col_rel_t *, uint64_t *, uint64_t *, uint64_t *,
+    bool *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_observer_source_finish_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_observer_descriptor_from_preflight_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, const col_rel_t *, wl_columnar_memory_governor_ref_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_observer_descriptor_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, const col_rel_t *, wl_columnar_memory_governor_ref_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_observer_timestamps_controlled(
+    wl_columnar_eval_delta_replacement_t *constructor,
+    wl_columnar_relation_bulk_append_t *record, eval_entry_t *result,
+    const col_rel_t *source, wl_evaluation_control_t *control);
+int wl_columnar_relation_observer_append_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, const col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_observer_compound_controlled(
+    wl_columnar_eval_delta_replacement_t *constructor,
+    wl_columnar_relation_bulk_append_t *record, eval_entry_t *result,
+    const col_rel_t *source, wl_evaluation_control_t *control);
+int wl_columnar_relation_observer_types_controlled(
+    wl_columnar_eval_delta_replacement_t *constructor,
+    wl_columnar_relation_bulk_append_t *record, eval_entry_t *result,
+    const col_rel_t *source, wl_evaluation_control_t *control);
+int wl_columnar_relation_observer_schema_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, const col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_observer_constructor_retire(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, wl_columnar_memory_governor_ref_t *, int);
+int wl_columnar_eval_stack_cleanup_observer_replacement(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_replacement_t **,
+    wl_columnar_relation_bulk_append_t **, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_replacement_retire(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    eval_entry_t *, wl_columnar_memory_governor_ref_t *, int);
+int wl_columnar_relation_replacement_stage_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    const col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_replacement_stage_retire(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *);
+int wl_columnar_relation_replacement_image_prepare_controlled(
+    wl_columnar_eval_delta_replacement_t *record,
+    wl_columnar_relation_bulk_append_t *bulk, const eval_entry_t *result,
+    wl_evaluation_control_t *control);
+int wl_columnar_relation_replacement_image_publish_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_replacement_image_retire(
+    wl_columnar_eval_delta_replacement_t *record,
+    wl_columnar_relation_bulk_append_t *bulk,
+    wl_evaluation_control_t *control, int primary);
+int wl_columnar_relation_replacement_prepare_controlled(
+    wl_columnar_eval_delta_replacement_t *,
+    wl_columnar_relation_bulk_append_t *,
+    col_rel_t *, const col_rel_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_hold_controlled(wl_col_session_t *,
+    wl_columnar_eval_delta_preparation_t *, bool, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_observer_prepare_controlled(wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_observer_publish_controlled(wl_col_session_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_observer_begin_controlled(wl_col_session_t *,
+    uint64_t, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_capture_controlled(const wl_plan_stratum_t *,
+    wl_col_session_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_rollback_finish(wl_col_session_t *, int);
+int wl_columnar_eval_delta_rollback_lease_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, uint32_t, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_rollback_empty_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, uint32_t, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_detach_target_controlled(wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, const col_rel_t *,
+    bool **, bool **, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_recovery_detach_target_controlled(wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, const col_rel_t *,
+    bool **, bool **, uint32_t *, wl_evaluation_control_t *);
+int wl_columnar_relation_delta_detach_controlled(
+    wl_columnar_relation_bulk_append_t *, wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_relation_delta_recovery_detach_controlled(
+    wl_columnar_relation_bulk_append_t *, wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_session_retire_source_lease_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_observer_allocate_controlled(wl_col_session_t *,
+    uint64_t, wl_columnar_eval_delta_preparation_t *,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_preparation_retire(
+    wl_columnar_eval_delta_preparation_t *, int);
+#ifdef WL_SESSION_TEST_HOOKS
+extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_eval_delta_test_gather_checkpoint)(wl_evaluation_control_t *,
+    const int64_t *, uint32_t, uint64_t);
+extern WL_COLUMNAR_SESSION_HASH_TEST_THREAD_LOCAL void
+(*wl_columnar_eval_delta_test_physical_disposal)(
+    const wl_columnar_eval_delta_preparation_t *,
+    wl_columnar_memory_reservation_t *);
+#endif
+int wl_columnar_eval_stack_cleanup_observer_mandatory(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t **,
+    wl_columnar_eval_delta_preparation_t **);
+int wl_columnar_eval_delta_seed_gather_controlled(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *,
+    wl_columnar_eval_delta_seed_restore_t **, wl_evaluation_control_t *);
+int wl_columnar_eval_delta_gather_controlled(
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t *, uint32_t,
+    uint32_t, uint32_t, int64_t *, wl_evaluation_control_t *);
+int wl_columnar_eval_stack_cleanup_observer(wl_col_session_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_delta_preparation_t **, wl_evaluation_control_t *);
 int wl_columnar_eval_stack_cleanup_compound_gc(
     wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_arena_compound_arena_gc_record_t **, wl_evaluation_control_t *);
@@ -5501,6 +5946,14 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
 /* Retry after evaluator frames drain. Active evaluation permits nested entry.
  * Pending snapshots survive any refusal; discard is teardown-only while an
  * error remains and never allocates replacement columns. */
+int wl_columnar_relation_restore_flat_controlled(
+    wl_columnar_relation_bulk_append_t *, col_rel_t *, wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, uint64_t, bool,
+    wl_evaluation_control_t *);
+int wl_columnar_eval_delta_restore_snapshot_controlled(wl_col_session_t *,
+    const wl_columnar_eval_delta_rollback_t *, uint32_t, uint64_t, bool,
+    const int64_t **, uint32_t *, uint32_t *, bool **, bool **,
+    wl_evaluation_control_t *);
 int wl_columnar_eval_delta_rollback_retry(wl_col_session_t *sess);
 int wl_columnar_eval_delta_rollback_discard(wl_col_session_t *sess);
 bool wl_columnar_eval_delta_rollback_active(const wl_col_session_t *sess);

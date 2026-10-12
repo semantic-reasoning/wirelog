@@ -1,0 +1,71 @@
+{
+  "artifact_type": "implementation_plan",
+  "producer": "/root/architect_reduce_final",
+  "revision": 2,
+  "status": "proposed_requires_distinct_critique",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "supersedes_only_entry_discriminant": "serial-observed-normalization-replacement-handoff-plan-supplement.json",
+  "paths": [
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/internal.h",
+    "tests/test_evaluation_observer.c"
+  ],
+  "extra_paths": [],
+  "historical_ruling": "R1 omission upheld: genuine TS normalization returns timestamp_retire with readyfalse but outside phase TS_ACTIVE/count552; noTS consumed acknowledgment sets NORMALIZED/count3. R1 NORMALIZED-only entry is unreachable for healthy TS without an explicit production consumed acknowledgment. Preserve R1 and critique/history.",
+  "actual_source": [
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "anchors": "3377-3412,3579-3586",
+      "fact": "Algorithm writes normalizedtrue before final zero-work tail; timestamp_retire frees index/subtracts installed accounting, checks original credit and retires writer, then readyfalse. A negative final tail followed by mandatory cleanup can also leave normalizedtrue/readyfalse, so terminal pointers/flag alone cannot attest healthy completion."
+    },
+    {
+      "path": "wirelog/columnar/eval_stack.c",
+      "anchors": "cleanup_observer_timestamp,cleanup_observer_consolidate_consumed,workspace_retire",
+      "fact": "TS purpose retains count552 and initialized1 in its record. noTS initialized3 is journalled in outside count3; existing consumed helper transitions CONS_ACTIVE to NORMALIZED. Current mandatory workspace retirement also sets NORMALIZED after TS/CONS drain, conflating abandonment with healthy forward acknowledgment."
+    },
+    {
+      "path": "wirelog/columnar/memory_governor.c",
+      "anchor": "finish_reservation",
+      "fact": "Successful release sets RELEASED and clears transition state but does not erase historical bytes/governor/owner_bits. Do not require a released committed index token to look EMPTY or owner_bits0."
+    }
+  ],
+  "production_TS_ack": [
+    "Within timestamp_normalize_controlled replace direct tail return with actual rc=timestamp_retire(session,record,control,0); if(rc) return rc; only this real forward0 branch calls new narrow original-frame timestamp_consumed acknowledgment. No acknowledgment from timestamp_retire itself, mandatory cleanup, resumed cleanup or a predicate-only caller. No synthetic success boolean, copied status or public API.",
+    "Acknowledgment uses existing timestamp_record accessor valid under TS_ACTIVE even readyfalse. Validate exact session/frame/mode_frame external18/BULK7 TS_ACTIVE/countsizeof(consolidate)=552, payload_readyfalse, actual record pointer/candidate==result.rel==BULK.dst/ownedtrue/session governor/private selfowner. Require record.normalizedtrue, readyfalse, initialized1, original count>=2, output1..count, bytes==count*sizeof(uint32), actual candidate nrows/sorted_nrows==output/run1/run_endoutput, timestamps present with capacity>=nrows.",
+    "Require indicesNULL/accounting_installedfalse; actual index token identity self, RELEASED, correct original bytes/governor, transitionNONE/replacementbytes0. Do NOT require bytes/governor/owner_bits cleared on RELEASED, dereference stale owner_bits or re-release credit. Full transaction.writer owner/secondary/identity/thread_valid inert and writer_acquiredfalse; no stage or other transaction credit obligation. Real sampling join_sources fully terminal; no candidate append/outer constructor reader or private batch live.",
+    "Charge bounded source-derived fixed validation/actions and poll before the one outside exact_phase store. Set NORMALIZED only after true forward0 retire and complete terminal validation; leave count552 unchanged as genuine TS route discriminator. A post-store tail stop is a real error with safe normalized candidate cleanup, not canonical publication. Exact new acknowledgment cost requires actual source binding before fixture literal changes."
+  ],
+  "handoff_R2_entry": [
+    "Require outside NORMALIZED plus route discriminator BEFORE336 overwrite. If count552: actual candidate.timestamps must be present; validate the original TS record normalizedtrue/readyfalse/initialized1/indexNULL/accountfalse/RELEASED original token/full inert writer and successful production consumed phase provenance described above. If count3: timestamps must beNULL; validate actual original consolidate.ready, INERT/RETIRED and all real hash/sequence/merge original obligations terminal, original reduce_batch disposable, no sample group authority. Any other count/purpose combination refuses unchanged; never choose by candidate pointer or timestamps alone.",
+    "Count552 versus3 is actual existing producer-written phase metadata, not a fixture-set tag or new field. Preserve it through entry validation, then preadmitted TRANSFER_INITIALIZING/count0 activates R1 typed336 clear. Retain all R1 partial clear/token prefix/mode17 fixed ownership transfer, reference and cleanup rules; no other R1 changes."
+  ],
+  "abandonment_disposition": [
+    "Prevent mandatory cleanup from minting forward NORMALIZED. Add one named unused outside exact_phase ABANDONED value (currently7 unused in this exact_phase namespace; borrowed_mode7 is a separate discriminator) or equivalent explicit nonforward value, no field/frame growth. After actual TS/CONS resources settle in workspace_retire, use ABANDONED then dedicated completed-candidate disposer, never NORMALIZED. Extend completed_retire eligibility for ABANDONED using same original candidate/gate/physical/credit checks; no algorithm forward accessor or handoff accepts it.",
+    "When resource drain itself refuses, retain actual TS_ACTIVE/CONS_ACTIVE original fields for mandatory retry. When real forward normalization fails after normalizedtrue, mandatory retirement may settle owners but still selects ABANDONED; canonical unchanged and candidate disposable. After consumed ack succeeds then its following tail stops, cleanup also selects nonforward abandonment before candidate retirement. Positive primary dominates true cleanup refusal; never rerun timestamp sort on a normalized but stopped candidate.",
+    "Partial transfer continues TRANSFER_INITIALIZING until its actual initialized transaction prefix settles; then abandonment owns candidate physical/credit disposal. Do not clear old purpose prefix before true original drain, and do not turn readyfalse into implicit successful handoff."
+  ],
+  "finite_acceptance": [
+    "Healthy real TS normalization reaches new acknowledgment from actual retire0, external NORMALIZED/count552, then R1 handoff; healthy noTS continues NORMALIZED/count3 without TS union reads.",
+    "Real final-normalized-store cancellation and successful writer-release followed by real negative tail never create healthy consumed acknowledgment; mandatory drain selects ABANDONED and handoff refuses. Real released index retains actual historical bytes/governor and is accepted terminal without fabricated zeroing.",
+    "Actual index identity/credit or consumed writer refusal leaves original TS_ACTIVE and candidate/index disposal prefix; postreturn scalar restoration and true mandatory drain selects abandonment, no sort replay.",
+    "Mismatched count/timestamps/normalized flag/original credit identity fails preoverwrite at actual original frame, no artificial producer retag. Existing R1 clear/prefix/fixed mode17/ref accounting tests remain required.",
+    "No new test matrix or runtime/fit claim; original TS360/BULK1088/workspace552/frame3864/completion80 immutable definitions retained. Final exact acknowledgment/transfer algebra frozen-source binding required."
+  ],
+  "limits": {
+    "source_mutated": false,
+    "tests_builds_run": false,
+    "candidate_approved": false,
+    "runtime_claim": false,
+    "full_issue_complete": false,
+    "backend_admission_open": false
+  },
+  "source_hashes_read": {
+    "wirelog/columnar/eval_stack.c": "8675b1249d6f037c5f029ec0e2ad2e9c75b40fa20f086588f86e0dc10519183d",
+    "wirelog/columnar/eval_delta.c": "c0b566dbfe05cc9df06edbcd712f9867ae7022b5f4acaa184f6e03b4c8ea2267",
+    "wirelog/columnar/relation.c": "38870ae84dd86b555f7faf22d17fbbb14f025eadf07bb7ca733449a1c0b0add7",
+    "wirelog/columnar/internal.h": "7b1a09e05c9ea056ac125d8a11c455c85cafc0f8437fb2776b33875737b033b8",
+    "wirelog/columnar/merge.c": "224ffcbfeb64e3f4fb4472ae3f56f415f85a49ddd093d8bc20c2eae830b18904"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Narrow current-source implementation sequencing and inherited owner/phase prerequisite binding only. No allocation/admission or implementation/runtime/candidate approval.",
+  "sequence": "/home/joykim/.tmp/1821-work/serial-observed-seed-lazy-current-source-sequencing.json",
+  "sequence_sha256": "8cca870b6387f43318342d72b38e0a4930219280d7169c5d5ef4deed8684441b",
+  "sequence_full_read": true,
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes_verified": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/eval_delta.c": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e"
+  },
+  "full_read_lineage": [
+    "serial-observed-seed-target-branches-plan-supplement.json",
+    "serial-observed-seed-lazy-schema-plan-supplement.json",
+    "serial-observed-seed-lazy-reverse-plan-supplement.json",
+    "serial-observed-seed-bulk-lifecycle-source-binding-r2.json"
+  ],
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/relation.c:7842", "wirelog/columnar/relation.c:7856", "wirelog/columnar/relation.c:7874", "wirelog/columnar/internal.h:3784"],
+      "plan_elements": ["ordered_work1", "precise_prerequisite_holds", "current lifecycle-only footer"],
+      "categories": ["unsafe cleanup activation", "hidden union/borrowed-authority coupling", "weak partial-state disposal"],
+      "ruling": "Accepted. Current footer accepts only32/39 and insists all physical/transaction/growth obligations are dead; it cannot dispose allocated lazy preparation or accepted credits. Extending actual purpose-scoped partial/unpublished/installed footer before first reserve or malloc is necessary and correctly sequenced. Terminal inactive39 must validate surviving obligations without dereferencing dead borrowed pointers. Active model-sensitive phases need actual original held SINGLE, not two-role/source-group aliases. R2 partial init provenance remains required."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:3947", "wirelog/columnar/relation.c:5163", "wirelog/columnar/relation.c:1864", "wirelog/columnar/internal.h"],
+      "plan_elements": ["ordered_work2-4", "bounded metadata/physical quantities", "governor/free and ledger holds"],
+      "categories": ["hidden shape traversal coupling", "unsafe raw branch/error assumptions", "over-broad support exclusions"],
+      "ruling": "Accepted. Actual raw unset helper validates compound map and reserves metadata before payload; physical quantity depends on retained auxiliaries, not only prospective grid scalars. Sequence preserves whole atomic prevalidation before reserve, raw metadata/payload status order, actual admitted original RESERVED/REPLACING journalling before a tail, and unchanged ungoverned credit-zero domain. Existing shape/map walks need bounded equivalents; direct incremental/helper substitution or a single scalar debit around a width walk would not satisfy this sequence. Unrepresentable simultaneously owned shapes remain explicit dependencies before allocation, not implicit permanent restrictions."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:3947", "wirelog/columnar/internal.h:3831", "wirelog/columnar/internal.h:3839"],
+      "plan_elements": ["ordered_work5-6", "new physical prefixes", "raw two-pass Arrow order"],
+      "categories": ["unsafe uninitialized table reads", "owner alias coupling", "tests missing real partial allocation"],
+      "ruling": "Accepted. New grid/table lanes, governed scratch, synthetic names, optional new TS and Arrow follow actual raw allocation order with original pointers/prefixes published before polls. Count/grid and base/names are independent; prepared TS must remain NULL when existing target TS is merely carried. Native Arrow old/new slots are separate but old_schema aliases compact_retired, so no compact ledger use is possible during this purpose. Pointer NULL-initialization and child allocation prefixes must make every destructor read valid. Existing interleaved Arrow helper cannot be treated as matching two-pass raw order."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:2210", "wirelog/columnar/relation.c:2465", "wirelog/columnar/memory_governor.c:528", "wirelog/columnar/memory_governor.c:1524", "wirelog/columnar/memory_governor.c:1590", "wirelog/columnar/memory_governor.c:1598", "wirelog/columnar/relation.c:7993"],
+      "plan_elements": ["ordered_work7-9", "accepted phases32-42 and40/41", "final install and next append purpose"],
+      "categories": ["unsafe accounting/publication coupling", "weak real-prefix reverse", "consumed schema versus row replay"],
+      "ruling": "Accepted under unchanged reverse lineage. Preserve original O/M until fixed install, pending.growth through actual commit, and actual40/41 move acknowledgments before tails. After new physicalNULL, real COMMITTED growth must downsizeO; REPLACING alone allows rollback_growth. Fresh/meta moved states reverse only original actual moves, preserving historical RELEASED after successful retirement. Last true commit must have no negative controlled tail before prepaid field/native Arrow install and phase37 acknowledgement. Published schema footer never restores descriptor O/M; old physical must precede credit/downsize. Next row purpose may begin only after true39 terminality, with schema consumption recorded independently from final seed row publication."
+    }
+  ],
+  "findings": [],
+  "required_owner_phase_predicates": [
+    "Apply lazy phase32..42 logic only to external original mode19, borrowed8 and actual schema_install purpose. Generic owned mode0, no-replacement phase32 and stale inactive39 must not be treated as lazy resources solely because numeric phase matches.",
+    "Any new admitted credit or physical owner requires initialized_tokens5. A partial0..4 phase32 accepts only individually validated dead suffix provenance and no resource; preserve scratch-first order. Physical prefixes must satisfy owned_columns<=count<=ncols and initialized-name base<=ncols before table reads; cleanup cannot read uninitialized suffix cells.",
+    "Before active model-sensitive forward/reverse actions validate exact original borrowed.single/lease/dst, SINGLE geometry/acquired actual gates, role/nonce and current target identities/generations. Plain prepared-pointer disposal may proceed under the existing mandatory cleanup policy before a credit identity refusal; never release/clear SINGLE while any original BULK obligation remains.",
+    "Phase40/41 and42 must describe actual completed effects, not intent. Retained/metadata original token addresses, state/owner/governor/amount/overlap and O/M or installed savedO determine remaining moves/releases/downsizes; pending.growth must not disappear at COMMITTED acceptance.",
+    "Terminal39 requires actual all owned old/new physical NULL, Arrow flags false, new/old credit terminal and route/footer obligations settled. Inactive flag alone cannot bypass validation; do not dereference an expired old SINGLE merely to inspect an already physically/credit-terminal purpose.",
+    "Schema install marks original SINGLE set and BULK schema consumed; preserve that consumed disposition through footer refusal. The accepted lineage distinguishes final seed row published from schema consumed: do not mark seed.published as final row publication during schema install and then bypass its existing anti-replay guard to append. Any required outer phase/disposition encoding must be bound before implementing that transition.",
+    "Current no-replacement publisher requires a fresh strict five-slot selfEMPTY copy purpose. Historical RELEASED lazy footer slots must remain honest during same-purpose retirement and may initialize only after all lazy obligations are proved terminal and a new purpose is accepted; no same-purpose reset to satisfy its preflight.",
+    "Healthy pre-install physical cleanup still needs actual bounded charged progress; mandatory stop/refusal cleanup remains excluded as accepted. Existing raw retire signature alone does not supply a healthy control trajectory; implement the controlled path explicitly without changing unrelated callers/costs."
+  ],
+  "preserved_holds": [
+    "All lineage fit/owner/phase/action/work/runtime holds remain unchanged. No first allocation/admission is authorized by this source-only critique.",
+    "Rebind actual simultaneous definitions/offsets in four profiles if helper types/unions change; preserved original size is necessary but insufficient lifetime evidence.",
+    "Source-derived final action/slack and actual fresh/growth/move/installed-refusal/partial257/Arrow/native/raw-governor witnesses precede lazy backend admission. No observed allowance rebasing.",
+    "Remaining branch integration, whole STEP, latest-main/native-Windows and all unwaived historical resource obligations remain required."
+  ],
+  "limits": {"source_modified": false, "builds_tests_run": false, "runtime_or_candidate_approval": false, "backend_admission_ready": false, "whole_STEP_qualification": false, "full_issue_complete": false, "historical_resource_deviations": "unwaived"}
+}

@@ -1,0 +1,45 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Narrow original typed caller-address witness and generic refusal versus terminality only; inherited lazy/reverse/fit/action holds unchanged.",
+  "plan": "/home/joykim/.tmp/1821-work/serial-observed-seed-lazy-original-address-plan-supplement.json",
+  "plan_sha256": "d77d42b401cb02ff2710e9532dab07b982f334f950937aa2c66acb42825d25fc",
+  "plan_full_read": true,
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes_verified": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/eval_stack.c:1073", "wirelog/columnar/eval_stack.c:2290", "wirelog/columnar/relation.c:8120", "wirelog/columnar/internal.h:4740"],
+      "plan_elements": ["caller_address_table owner paths", "typed footer pre-dereference address comparison", "forward guarded bridge"],
+      "categories": ["unsafe borrowed-pointer authority inference", "hidden frame/disposal coupling", "weak mismatch failure handling"],
+      "ruling": "Accepted. Actual mode19 workspace retirement receives original frame and passes actual seed/BULK addresses; mode19 dispose_payload routes there before generic result/source-group cleanup. This supplies a real typed owner rather than recovering seed from borrowed.single. New forward bridge must establish current cleanup/frame/session/mode19/payload provenance. Comparing borrowed.single/lease and bulk.dst with known original seed addresses before any borrowed-pointer/target dereference prevents mismatched address from becoming authority. Original SINGLE geometry/gates/nonce/generation checks then validate the actual owner. Address refusal retains original frame/SINGLE/physical/credit obligations with primary precedence."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:7874", "wirelog/columnar/relation.c:11115", "wirelog/columnar/eval_stack.c:1226", "wirelog/columnar/eval_stack.c:2344", "wirelog/columnar/eval_stack.c:2730"],
+      "plan_elements": ["generic bulk-only context refusal", "context-free terminal/partial lifecycle", "all disposal/resume/getter callers"],
+      "categories": ["unsafe terminal bypass", "weak retained-purpose handling", "over-broad generic cleanup"],
+      "ruling": "Accepted. Existing context-free lifecycle footer is safe only after actual token/physical/transaction/growth/writer terminal proof at32/39; it deliberately never dereferences borrowed pointers. Extended active lazy accounting needs known typed seed and may not be inferred from numeric phase, active flag or stored pointer. Generic retire must retain/refuse true model-sensitive preparation/transport/footer without mutation; typed original frame owner is the retry route. Getter/initializer paths must resolve pending mode19 through typed disposal before any workspace overwrite. Generic call sites in other modes can refuse safely; they cannot synthesize owner context or silently reclassify active8 as inactive terminal."
+    },
+    {
+      "paths": ["tests/test_evaluation_observer.c", "wirelog/columnar/relation.c:8120", "wirelog/columnar/eval_stack.c:2290"],
+      "plan_elements": ["ordering_and_interface", "pointer scalar mismatch acceptance", "terminal after SINGLE retirement"],
+      "categories": ["tests not proving address safety", "cleanup lifetime and bounded-control assumptions"],
+      "ruling": "Accepted. Typed footer precedes original SINGLE retirement, seed reader/flat free and workspace clear. Optional healthy control must retain bounded progress, mandatory NULL remains checked cleanup. Real saved pointer-scalar mismatch after original setup followed by host-return restoration and true drain proves refusal without arbitrary borrowed-address dereference. Genuine terminal39 after outer SINGLE retirement must remain context-free. Actual generic refusal on a model-sensitive resource prefix must show no mutation before typed physical-before-credit reverse. These are future runtime requirements, not current qualification."
+    }
+  ],
+  "findings": [],
+  "binding_requirements": [
+    "Only actual guarded frame owner supplies seed address. Never container_of, borrowed-pointer cast, fabricated seed or arbitrary bulk.dst dereference establishes original ownership.",
+    "Compare original addresses first; inspect only actual seed.single afterward. Preserve real SINGLE and flat allocation on any unresolved typed footer obligation.",
+    "Mode8 dispatch precedes generic inactive/>5 logic. Context-free32/39 success requires actual complete terminal predicates; model-sensitive phase returns retained EBUSY or real malformed EINVAL with no mutation.",
+    "Audit cleanup retry/destroy/dispose/getter/reinitialize call paths in changed source before allocation/admission. Mode19 uses typed owner path; all other insufficient contexts retain/refuse.",
+    "Keep all accepted phase/reverse/growth/resource/fit/action/runtime holds unchanged. No allocations/admission or candidate approval is granted here."
+  ],
+  "limits": {"source_modified": false, "builds_tests_run": false, "runtime_or_candidate_approval": false, "backend_admission_ready": false, "whole_STEP_qualification": false, "full_issue_complete": false, "historical_resource_deviations": "unwaived"}
+}

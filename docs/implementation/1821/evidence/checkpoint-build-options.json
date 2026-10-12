@@ -1,0 +1,58 @@
+{
+  "historical_cache_options": {
+    "build": {
+      "buildtype": "release",
+      "default_library": "shared",
+      "b_lto_threads": 1,
+      "b_sanitize": [
+        "none"
+      ],
+      "b_lto": true,
+      "tests": true,
+      "mbedTLS": "disabled",
+      "wirelog_log_max_level": "trace"
+    },
+    "build-sanitize": {
+      "buildtype": "debug",
+      "default_library": "shared",
+      "b_lto": false,
+      "b_sanitize": [
+        "address",
+        "undefined"
+      ],
+      "b_lto_threads": 1,
+      "tests": true,
+      "mbedTLS": "disabled",
+      "wirelog_log_max_level": "trace"
+    },
+    "build-psa-enabled": {
+      "buildtype": "release",
+      "default_library": "shared",
+      "b_sanitize": [
+        "none"
+      ],
+      "b_lto_threads": 0,
+      "b_lto": true,
+      "tests": true,
+      "mbedTLS": "enabled",
+      "wirelog_log_max_level": "trace"
+    },
+    "build-psa-enabled-sanitize": {
+      "buildtype": "debug",
+      "default_library": "shared",
+      "b_lto": false,
+      "b_sanitize": [
+        "address",
+        "undefined"
+      ],
+      "b_lto_threads": 0,
+      "tests": true,
+      "mbedTLS": "enabled",
+      "wirelog_log_max_level": "trace"
+    }
+  },
+  "before_next_build": "Configure b_lto_threads=1 explicitly on every profile; source/provider identity must be rechecked.",
+  "current_checkpoint_executed_profiles": [
+    "build"
+  ]
+}

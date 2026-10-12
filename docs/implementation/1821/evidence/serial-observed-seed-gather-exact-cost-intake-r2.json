@@ -1,0 +1,103 @@
+{
+  "artifact_type": "source_cost_intake",
+  "name": "serial-observed-seed-gather-exact-cost-intake-r2",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/eval_delta.c": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e",
+    "wirelog/columnar/eval_stack.c": "04295c8094bbdd140748497c0b62767c946210513e6b8cf7a73a5847a37e1a1d",
+    "wirelog/columnar/relation.c": "6c0c8e70fd2b1c2546b6acbf7a13362001828a39c0cd659b8d801bea3f556b6f",
+    "wirelog/columnar/join.c": "93da4fd23f5e593843100433679a32e8b155cab32cd33e6c048237211cef3e9b",
+    "wirelog/columnar/internal.h": "a1c999783ffa41765fbc0777e636cb9abb1ff25198c93f67e991cc608579b2fc"
+  },
+  "source_only": true,
+  "fixture_contract": [
+    "Genuine H(v):-A(v), actual raw empty STEP then genuine host H(0) insert. Before measured attempt assert registry is exactly three nonNULL slots A,H,$in$H in that order (not inferred from plan), nrels3. Names literal include NUL:2/2/6 bytes. If actual extra registry exists derive its source comparison terms rather than forcing registry contents.",
+    "Original frame acquired/initialized in separately completed CONTROL setup attempt before measured BEGIN. Preserve actual active original frame in EVALUATION mode, empty stack/result/source group, inactive ready BULK, disposable ready private batch and terminal CONS. Finish setup CONTROL, not cleanup_finish on frame if that changes mode to RETIRED; do not retag mode. Measured API calls cleanup_seed itself. No cleanup_acquire inside measured attempt, no reset within active attempt.",
+    "Real $in$H self owner initialized by real allocator; one row width1/capacity sufficient; target H width1; source columns valid. No writer/readers/alias pins concurrent and no test hooks modifying CAS. Existing strong-CAS native path succeeds first try; weak-CAS spurious retries are separate platform bound below. No ensure/init charges because actual allocator provenance already established.",
+    "Measured result is helper gather only, not target append, frame finish, whole STEP, observer callbacks or baseline rollback. Fresh setup per exact/repeat/minus-one trial; host restores/disposes actual previous purpose, never clears live token manually."
+  ],
+  "components": [
+    {
+      "name": "cleanup_seed",
+      "formula": "64 + 2*64 + S + 32",
+      "reason": "eval_stack1211 validation64; observer_group_terminal882 two slots64; BULK inactive and terminal workspace retirement are mandatory uncharged; memset original seed S in128-byte chunks charged exact chunk lengths; ready/store32. Polls charge0.",
+      "value_for_S536": 760
+    },
+    {
+      "name": "destination and name spelling",
+      "formula": "16 + 4 + 2*2",
+      "reason": "eval_delta1203 dststore16, prefix4, H character plus NUL two iterations2.",
+      "value": 24
+    },
+    {
+      "name": "registry lookup",
+      "formula": "(1+1)+(1+1)+(1+6)",
+      "reason": "join1269 visit1 each; equal_name1250 mismatches A and H at first byte against $, matched $in$H compares five bytes and NUL.",
+      "value": 11
+    },
+    {
+      "name": "PIN activation",
+      "formula": "16",
+      "value": 16
+    },
+    {
+      "name": "pair acquisition",
+      "formula": "16 + (1+16) + 6 + (1+16)",
+      "reason": "relation6450 validation16; descriptor load1/CAS16; owner resolve6; storage load1/CAS16. Each relation work tail is charge0.",
+      "value": 56
+    },
+    {
+      "name": "dimensions and batch checks",
+      "formula": "32 + 16 + 2",
+      "reason": "saved dimensions32 (no extra tail debit); width/product16; one physical column check2.",
+      "value": 50
+    },
+    {
+      "name": "gather activation, allocation, one copied cell",
+      "formula": "16 + 1 + 8",
+      "reason": "phase/cursor16, real raw malloc1, cell read/store/progress8. Fixed scalar tails charge0.",
+      "value": 25
+    },
+    {
+      "name": "healthy reader release",
+      "formula": "16 + 6 + 1 + (1+16) + (1+16)",
+      "reason": "relation6540 validation16, owner resolve6, descriptor-held state load1; storage and descriptor each load1/CAS16. Last successful descriptor CAS terminalizes original token before charge0 tail.",
+      "value": 57
+    }
+  ],
+  "formulas": {
+    "S": "sizeof(wl_columnar_eval_delta_seed_restore_t); current author actual-definition witness536, not independent new compile",
+    "full": "(224+S)+24+11+16+56+50+25+57 = S+463",
+    "full_at_S536": 999,
+    "before_last_descriptor_CAS": "P=F-16=S+447",
+    "P_at_S536": 983,
+    "final_positive_charge": "16 before actual last descriptor CAS; no positive post-CAS charge",
+    "failed_weak_CAS_extra": "16 each actual failed gate CAS iteration; zero-cost poll remains required"
+  },
+  "boundary_dispositions": [
+    "F999 exact first-try isolated native trajectory: final descriptor CAS succeeds, helper0 and complete original pair inert, flat[0]0 and dimensions/cursors correct. Fresh identical genuine setups repeat same literal.",
+    "F-1=998: final CAS16 charge refuses at consumed983; owner/storage gate already released, original descriptor remains held. Actual mandatory drain consumes only that descriptor and frees flat before next genuine caller attempt. No claim of terminal pair or budget-tail cancellation.",
+    "P983 and any allowance983..998 have the same descriptor-held cutoff because remaining allowance cannot admit final16. Consumed work is983, not allowance. This is source-sized admission slack, not an observed rebasing.",
+    "A genuine existing after_single_reader_release cancellation at the successful final descriptor CAS can make subsequent charge0 tail return negative with both original gates terminal. This is separate cancellation evidence; budgetF alone cannot stop the zero-cost tail. No fabricated status or token state."
+  ],
+  "holds_and_limits": [
+    "Preserve R1 fixture contract: real A,H,$in$H registry order asserted, genuine initialized owner, one-row scalar source, original frame in EVALUATION initialized in separately finished CONTROL setup BEFORE measuredBEGIN; no cleanup_finish/retag and no measured frame acquisition.",
+    "Exact first-try native strong-CAS proof is distinct from Windows weak-CAS spurious retries or concurrent peers. Each failed attempt adds16, not32. NativeWindows remains mandatory with honest deterministic trajectory/provenance disposition.",
+    "Mutable-source hashes are current binding, not frozen approval. Final formatted candidate requires rebind. Actual exact/repeat/minusone fixtures remain subsequent reviewed implementation; no builds/tests or runtime approval here.",
+    "Historical R1/B1 and helper-only normal/ASan lifecycle diagnostics remain distinct; no wholeSTEP/backend/full1821 claim, and all operational resource deviations unwaived."
+  ],
+  "revision": 2,
+  "historical_r1": {
+    "path": "/home/joykim/.tmp/1821-work/serial-observed-seed-gather-exact-cost-intake.json",
+    "sha256": "3d7ec346c5b1659264fe57a5f7919f4591991990351bdd54f3e4c27eb4e241e4",
+    "verdict": "blocked",
+    "finding": "B1 upheld: relation work_tail argument is observation metadata, actual debit0. Original F1112, claimed budget-only post-CAS tail rejection and failed retry32 were incorrect; preserved unchanged."
+  },
+  "critique_full_read": {
+    "path": "/home/joykim/.tmp/1821-work/serial-observed-seed-gather-exact-cost-critique.json",
+    "sha256": "2b9d3be71a738e68883e106f2bd29d93f59c66938555e4713f11962226849bcb",
+    "disposition": "B1 upheld and algebra/provenance corrected; distinct R2 critique still required."
+  },
+  "source_correction": "relation.c6174 wl_columnar_relation_work_tail invokes test checkpoint(control,work) then charge(control,0). Do not count work argument again. Every explicitly charged gate CAS is16; load1, resolve6 and validation16 each charged only once. No production change or measured cost was used."
+}

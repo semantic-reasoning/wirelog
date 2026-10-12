@@ -1,0 +1,117 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-seed-lazy-schema-plan-supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique_and_actual_borrowed_fit",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-seed-target-branches-plan-supplement.json",
+  "single_contract": "serial-observed-seed-single-plan-supplement.json",
+  "allowed_paths": [
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/eval_stack.c",
+    "tests/test_evaluation_observer.c",
+    "docs/SEMANTICS.md"
+  ],
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "4734bcee0dbf25db732e3507af199446e28fd64a1e003f01c444c2854bf3eb52",
+    "wirelog/columnar/internal.h": "00cb4cc25d670a35a1fd55ddb0618e538527482f3d03f474e8a04389da42953c",
+    "wirelog/columnar/eval_stack.c": "4f25ca0954b627dcdef2300f6d5448d53d4a8cac0ff6fc18910cbb17bf357ac5"
+  },
+  "scope": "P_SEED schema_was_unset branch only: exact original BULK physical/readiness/credit slots borrowing real original SINGLE, bounded raw-compatible synthetic Arrow schema construction. No new frame/field/governor/length-cache/admission gate.",
+  "source_evidence": [
+    "relation col_rel_set_schema_impl_capacity3947: metadata reserve then payload txn; primary+scratch+synthetic names; optional timestamp allocation; Arrow; payload publication then field install and metadata transport/commit; old Arrow/metadata retirement; view touch.",
+    "relation build_schema_shape_controlled8081: original Arrow flag before tail, durable pointer children/n_children prefix and bounded child name copying; existing helper formats child as each is allocated.",
+    "relation canonical_schema_controlled10900: existing slot/prefix machinery but different source inheritance, target guards and commit order; not a substitute for seed synthetic schema.",
+    "relation col_rel_publish_metadata2210: actual raw moves old metadata then pending into destination, commits destination, no extra constructor credit.",
+    "relation init_arrow_schema3911: raw struct allocates all child headers before per-child format/name initialization; formats only FLOAT g else l."
+  ],
+  "activation_and_phase": [
+    "Caller has completed whole flat batch target validation under exact original SINGLE and determined !dst.schema_ok; do not conflate established nullary with unset. Frame external mode19, original seed536 dimensions/flat image remain alive outside BULK. Descriptor and owner writers already live at original single slots; no source acquisition or schema helper re-acquisition.",
+    "Validate inert original BULK five tokens/physical slots and exact borrowed pointer shape, then activate borrowed_mode8/SINGLE pointer+lease and schema_install=true BEFORE any bounded token initialization can stop. Every custom destructor dispatches seed mode before generic borrowed_mode>5 rejection and before generic schema-name interpretation. Initialize each actual BULK token separately with initialized_tokens prefix; ready does not become true from an incomplete prefix.",
+    "Use dedicated lazy exact_phase values32=PREPARING,33=PAYLOAD_ACCEPTED,34=PAYLOAD_TRANSPORTED,35=METADATA_ACCEPTED,36=METADATA_TRANSPORTED,37=SCHEMA_INSTALLED,38=OLD_RETIREMENT,39=SCHEMA_RETIRED, within seed borrowed purpose only. Commit/move progress is real original status and these phase values, never stale union bytes. Growth payload branch retains transaction_active/pending.growth and actual incoming quantity; accepted growth records that actual terminal disposition, no second pending token.",
+    "Generic BULK exact_phase1-4 logic is not invoked for these dedicated lazy phases. Custom seed disposer validates exact phase and actual embedded/original token states. It must remain callable through partial token initialization, every physical pointer prefix, accepted credit, real transport prefix and consumed schema publication. original SINGLE cannot retire or clear while borrowed BULK is pending."
+  ],
+  "physical_slot_table": [
+    {
+      "purpose": "Destination header and metadata",
+      "slots": "Original dst descriptor/name/pool/governor/reference/access gates and SINGLE set/lease stay unchanged. Original dst column_types and compound_arity_map are immutable borrowed metadata under writer, not newly copied/freeable image. Saved seed ncols/nrows remain outside BULK and single.",
+      "lifetime": "No automatic owning col_rel_t image or token/header copy; prospective schema builder receives plain shape/name/type parameters."
+    },
+    {
+      "purpose": "Grid",
+      "slots": "BULK.prepared_columns is table pointer, count initialized table entries, owned_columns actual allocated lane prefix, ncols prospective width, new_capacity raw selected initial capacity.",
+      "lifetime": "Allocate table and immediately store pointer before poll. Initialize NULL slots in bounded chunks and publish count before tail. Allocate each lane into actual table slot before poll; preserve nonowning unused pointers outside initialized count. No column-wide frees reading uninitialized entries."
+    },
+    {
+      "purpose": "Governed row scratch",
+      "slots": "BULK.prepared_row_scratch (aliases lengths) is sole physical owner. scratch TOKEN is separate original reservation slot and is not the row scratch pointer.",
+      "lifetime": "Allocate only when dst.memory_governor && ncols>0, after grid, before names, raw ncols*8. Never create a name-length cache. On publish pointer transfers to actual dst.row_scratch and original slot NULL."
+    },
+    {
+      "purpose": "Names",
+      "slots": "BULK.prepared_names (aliases prepared_types) and base initialized-name-table prefix.",
+      "lifetime": "Always synthetic col%u from index, no seed-name inheritance. Bounded initialize table before strdup-equivalent allocations. All initialized entries NULL or sole owned names; store actual allocation before tail. count remains grid prefix independently of base. No type allocation coexists in this pointer union."
+    },
+    {
+      "purpose": "Timestamps",
+      "slots": "BULK.prepared_timestamps ONLY newly allocated/calloc-equivalent array. ledger_timestamps is raw prospective timestamp capacity for this phase. Old dst timestamp remains borrowed until actual install; old_timestamps becomes owner only if genuinely replaced.",
+      "lifetime": "with_timestamps=false as actual atomic append. Retain existing pointer if capacity enough; allocate zeroed new array only if old timestamp exists and its capacity is too small. Bound zero and old row copy; preserve nrows timestamp contents then append-zero policy. Do not set prepared pointer to a borrowed old array, which would make failed disposer free live dst."
+    },
+    {
+      "purpose": "Arrow",
+      "slots": "BULK.prepared_schema/prepared_schema_ok real new tree; BULK.old_schema/old_schema_ok old tree only after actual schema install.",
+      "lifetime": "Old Arrow union aliases compact_retired merge/ledger, so no compact_retired owner/scalars are used in this lazy phase. New and old Arrow objects coexist at disjoint original addresses during install. Use native ArrowSchemaMove(dst.schema,old_schema) then prepared_schema->dst, not owning struct/token copy. Stop after root/child initialization retains exact partial tree."
+    },
+    {
+      "purpose": "Credits",
+      "slots": "metadata_pending original new metadata, old_metadata original prior metadata; pending.fresh original new payload or dst.retained_reservation growth; previous original old payload after real move. scratch remains initialized inert unless a documented raw credit exists; no additional reservation.",
+      "lifetime": "metadata and retained quantities calculated before allocation; fresh payload/meta amounts not confused with physical pointer readiness. Committed/moved token stays original until explicit checked reverse/drain. Old physical storage retirement precedes old credit release/downsize."
+    }
+  ],
+  "raw_quantities_and_order": [
+    "Before reservation, preserve timestamp-shape and compound-map-for-prospective-width validation plus checked capacity arithmetic and all atomicappend validations already done. Shape/name-size loops are charged <=256. Do not borrow canonical_schema target guards requiring ncols0/no types/no compound if raw set_schema accepts the actual prospective target state.",
+    "Metadata quantity is col_rel_prospective_metadata_bytes(ncols,NULL,ncols>0,true,dst.column_types!=NULL,true,dst.compound_arity_len,false). Calculate bounded synthetic name sizes, Arrow children/format/name and carried type/map quantities with raw saturation/overflow/error. Metadata reserve FIRST; ENOSPC and true denied flag as raw. Existing prospective types/map allocations remain carried, not reallocated.",
+    "Retained quantity is raw private shape at selected initial capacity and prospective timestamp_capacity, governed scratch only if governor && ncols!=0. Incoming grid includes every prospective column/table plus governed row scratch; add new timestamp bytes ONLY if actually allocating replacement TS. Preserve embedded growth-versus-fresh reserve policy and governor-free absent slots.",
+    "Allocate grid, governed scratch, synthetic names, optional timestamp array, then Arrow exactly as raw preparer. No heap descriptor, governor reference, separate schema image or extra owner allocation. Empty/nullary schema still gets raw Arrow struct and metadata quantity; no column table/name/scratch allocation for ncols0.",
+    "Preserve failure distinctions and budget evidence: metadata reserve ENOSPC direct; payload denies may become ENOMEM+denied and outer seed maps to ENOSPC. Physical malloc/Arrow ENOMEM without denial stays ENOMEM. Positive primary dominates actual cleanup errors."
+  ],
+  "bounded_arrow_contract": [
+    "Use scoped internal seed Arrow builder with plain ncols/prepared_names/dst.column_types and original BULK prepared_schema flag. Existing generic builder may be factored with an explicit two-pass policy; its unrelated callers retain current cost/order. No new header/path or automatic owning ArrowSchema.",
+    "Match raw struct construction allocation order: root Arrow init/format; children pointer table; bounded NULL initialization; allocate+ArrowSchemaInit ALL child headers, storing each original pointer and n_children immediately before poll; only then perform per-child type format and name copy. Existing8081 interleaves child format/name allocation, so do not assert its unmodified allocation order equals raw.",
+    "Each child format is g iff original prospective target type FLOAT, otherwise l, including STRING raw numeric representation. Native Arrow format setters are fixed format bytes and library work; no unbounded user name passed to a library setter. Synthetic col%u name format takes uint32 index, bounded32 stack buffer as raw; duplicate and copy length includingNUL bounded. Existing readonly scalar format/name buffer owns no authority.",
+    "Root/child flag and pointer publication occur before tail; mandatory ArrowSchemaRelease of real partial tree belongs to existing cleanup/library exclusion, never wrapper around forward children creation. Publish prepared_schema_ok before first fallible tail and clear only after actual physical release/ownership transfer. Failed builder may mandatory-drain immediately if no refusal-bearing credit is touched, but cannot erase pending BULK credit journal."
+  ],
+  "publication_and_old_retirement": [
+    "Prevalidate exact original SINGLE lease/gates and all original credit source/destination states, quantities, Arrow ownership and generation headroom. Prepay finite actual transport+native two Arrow moves+field/view/phase/ready stores before real commits. Derive literal action/work bound from implementation before fixtures; no invented numeric total here.",
+    "Raw success performs payload publication before metadata publication. Controlled path preserves payload-first then metadata actual commit sequence, journalling every accepted effect. To keep cancellation from observing half-installed schema, perform both commits before fixed schema field installation, with last real commit immediately followed by prepaid install and no new charge/poll/library gather. This is explicit stop contract, not a claim of byte-identical raw intermediate callbacks: governor reservations were already both admitted, physical allocation/order/peak remain raw-equivalent and successful schema/generation/model unchanged.",
+    "If payload commitment/transport succeeds and later metadata cutoff rejects, retain true original accepted payload/old previous/new metadata slots and untouched descriptor fields. Checked reversal/drain must restore old accounting before generic frame reuse; only actual moved/accepted prefixes can be reversed. Never fabricate accepted-negative primitive result or reset original embedded tokens. This sequence requires real fixture proof and explicit phase-consumer validation.",
+    "After last success: field-wise install ncols/capacity/grid/scratch/names/TS/schema and original metadata transports, mark original schema/lease published and true view touch. No storage epoch added merely for this schema helper: match raw installer generation effect; later row publication contributes its distinct raw view touch. Prospective original types/map/descriptor/name/pool/gates/ref remain untouched.",
+    "Old Arrow and replaced old TS are mandatory old-image cleanup after installation, not fresh forward work. Free/NULL original old physical pointers before checked old_metadata/previous credit retirement; keep original phase and target SINGLE if credit identity refuses. Same mandatory cleanup exclusion applies after stop, with no fresh allowance. Schema published flag survives refusal/negative tail; no schema replay or automatic primary overwrite.",
+    "Only truly terminal BULK reset returns to the next seed append purpose. Seed flat rows/nrows/ncols still original and live; schema capacity covers batch so no second reserve. Actual copy/row publication proceeds as separate accepted seed clause. Whole-stratum rollback owns any consumed schema failure; no invented physical undo of all headers."
+  ],
+  "consumer_mapping": [
+    "Mode19 seed lazy getter/constructor require original frame and active original SINGLE; no mode18 observer constructor adapter.",
+    "BULK borrowed8 lazy phases32-39 custom retire before generic phase/old_schema/compact logic; metadata_pending/old_metadata/pending/previous token truth validated even when initprefix<5.",
+    "Seed healthy finish/retry/destroy drains lazy BULK before SINGLE gates, flat free and partially-cleared workspace.",
+    "Resume/getter cannot clear schema-owned pointers or native Arrow old/new tree while any phase/credit is pending.",
+    "Existing generic canonical_schema and other controlled constructors remain unchanged unless safe private builder factoring preserves their exact callers/policy."
+  ],
+  "acceptance": [
+    "Actual raw/direct seed lazy schema width0/1/300, prospective FLOAT and STRING representation, compound map validity, original existing timestamps reused versus genuine replacement; known synthetic names and exact Arrow native g/l tree. Direct branch witnesses labelled helper, selected backend remains separately proven.",
+    "Real partial table initialized prefix, allocated lane/name/Arrow child257 stop and original all physicalNULL cleanup, real RESERVED/COMMITTED credit identity refusal; preserve original SIMPLE authority and metadata/payload quantities.",
+    "Payload accepted then true later metadata cutoff stop: descriptor not installed, original real credit prefix reversal/drain and fresh serialized retry. Last metadata success then actual installed schema retirement refusal: consumed cleanup-only, no extra schema or row publication.",
+    "Four actual profiles borrowed-union/BULK1088/frame3864/completion80 definition witness; healthy/full finite tests and sampled raw enforcing-budget overlap, source-derived exact/repeat/minusone only after implementation. No observed rebasing or matrix expansion."
+  ],
+  "holds": [
+    "Actual original borrowed8/lazy phase field map, rollback/move reversal and simultaneous original complete-frame definition proof before activation.",
+    "If moving payload accounting before later metadata commit cannot reverse exact raw credit in current original slots, return precise dependency before implementation; no unconditional commit wrapper or silently reorder metadata-first.",
+    "No source activation or backend admission until coordinator FULL READ and distinct Critic accepted."
+  ],
+  "limits": {
+    "source_authorized_by_artifact": false,
+    "runtime_approval": false,
+    "full_issue_complete": false,
+    "resource": "Architect source reads/HOME JSON only; author definition fit is structural and all historical resource deviations remain unwaived."
+  }
+}

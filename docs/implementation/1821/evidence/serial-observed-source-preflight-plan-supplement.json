@@ -1,0 +1,80 @@
+{
+  "artifact_type": "implementation_plan",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-production-consolidation-source-assessment.json",
+  "scope": "Bounded source preflight in original mode18 reader, exact adoption into existing named constructor; no separate source group or m0 token guard change.",
+  "paths": [
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "tests/test_evaluation_observer.c"
+  ],
+  "source_sha256": {
+    "wirelog/columnar/relation.c": "34c83c9aff7825d32c5bf36dc5385fedeaf90067b8abab4429fa3ab5d32a9e47",
+    "wirelog/columnar/eval_stack.c": "52e4ee744c90823826b83371a8730d64eec04733bac356fd9a712ddf836923e9",
+    "wirelog/columnar/eval_delta.c": "b7e6b48dbab62064b3d64b570754b0175bb6ad4c9b7a0b1bb3151c91d8f34e7e",
+    "wirelog/columnar/internal.h": "6b5bbf4c4dd4c0a9879e06e7daf5912de56030afe6e5cb5bc2f9eede1e418de3"
+  },
+  "discriminators": [
+    {
+      "phase": 14,
+      "name": "SOURCE_PREFLIGHT",
+      "external": "18 with payload_ready/record.ready",
+      "state": "No candidate/result.ownedfalse/resultNULL, no embedded candidate tokens/ref or stage, record.initialized_tokens0. Original record.target binds actual source before reader acquisition; record.reader journals actual descriptor-only/full pair acquisition. Bulk original initialized prefix0 before constructor adoption."
+    },
+    {
+      "phase": 15,
+      "name": "SOURCE_PREFLIGHT_VALID",
+      "state": "Only actual full original reader pair and completed bounded FLOAT validation allow transition. Immutable source identity/view/storage baseline has been exported from actual pin to caller scalar outputs. No candidate/ref/stage. Same record.reader retained for descriptor adoption."
+    },
+    {
+      "phase": "existing1..12",
+      "name": "EXISTING_CONSTRUCTOR",
+      "state": "Adoption retains original pair and pointer, initializes only actual BULK5 originals then named descriptor reservation/physical allocation. First real result allocation immediately changes phase1 before tail; existing header/schema/types/compound/TS/append phases and five embedded prefixes unchanged."
+    }
+  ],
+  "interfaces": [
+    "Add narrowly named internal observer_source_preflight_controlled(record,bulk,result,source,baseline scalar outputs,control). Requires actual ready zero mode18 constructor from cleanup_observer_constructor and no other original owners/stage/result/prefix; no automatic reader or source-group adapter. Establish phase14/target binding only after bounded fixed validation+admission/poll, before acquire. Use existing reader_pair_acquire_controlled on exact record.reader; incomplete acquisition retains phase14 and real prefix.",
+    "After actual pair ready, bounded fixed source shape/identity capture and exact raw FLOAT validation. Export three immutable uint64 baseline values only on genuine successful preflight; caller copies scalars before descriptor helper reuses identity/view/storage for existing named extent/length bookkeeping. These are scalar observations, not gate/credit copies. Return target row-count<=1 decision via genuine source nrows under pin or scalar output; no partially scanned readiness claim.",
+    "Add dedicated descriptor_from_preflight_controlled entry sharing current descriptor constructor core. It requires phase15, record.target==actual source, full original reader ready, no result/ref/stage or candidate embedded prefix, and actual same BULK prefix0. It does NOT acquire over/copy existing pair. Existing direct observer_descriptor_controlled entry keeps phase0/inert reader precondition, original target binding/acquire sequence and literal cost exactly unchanged.",
+    "Adopted core validates actual existing pair and initializes BULK5 using same bounded terminal validation/original init-prefix trajectory; preserves raw required compound shape validation, name/descriptor charge/reserve and same original allocation/commit order. Do not reset reader or record.target. Keep phase15 until actual descriptor allocation changes phase1; initialization/descriptor pending credit failures with resultNULL remain distinguishable phase15 no-header states.",
+    "Whole synchronous controlled consolidate caller initializes original mode18 record before preflight, invokes preflight, takes immutable baseline outputs. If <=1 it releases exact record.reader through bounded healthy pair release and mandatory pending drain then finishes original frame. It never calls named constructor/normalizer/prepare/publisher; no new descriptor/index/credit or view touch. Otherwise invoke adopted descriptor core and existing schema/types/compound/TS/append sequence; append releases same actual original source pair after source copy. Before later fixed publication compare target to initial preflight baseline, not prepare-time selfsnapshot."
+  ],
+  "float_raw_semantics": [
+    "Preserve inline raw1046 order exactly: NULL relation invalid; nrows0 valid immediately without columns/types scan. ncols0 with positive rows valid iff actual identity/view/storage all nonzero. Positive rows/width with columnsNULL invalid. Missing column_types valid without scanning lanes. Explicit types: scan all declared columns; only FLOAT lanes load/check each row bits; other type values follow raw skip policy, no new enum rejection.",
+    "Use bounded fixed admission/poll for each header branch; charge/poll per column type visit and actual FLOAT cell visit, including rejected invalid cell. Match raw wl_columnar_float_bits_valid (finite/invariant/signed-zero behavior), no canonicalization/store in preflight. No raw inline whole-array call, no hidden qsort/row gather.",
+    "Under real reader both descriptor and ultimate source are pinned; lazily initialized storage admission must use existing supported bounded reader helper and real initialized-owner provenance, never raw ensure wrapper or permanent supported ENOTSUP. If actual selected reader cannot acquire default legitimate source, report exact additional dependency before caller admission."
+  ],
+  "mandatory_retirement": [
+    "Extend constructor custom retire with explicit phase14/15 branch BEFORE existing candidate/header logic. Validate no result pointer/owned/continuation, no transaction stage/writer or candidate govref/embedded readiness. Phase14 owns only source pair and original zero BULK prefix; phase15 may own initialized BULK token prefix0..5 and genuine scratch reservation before malloc, but still no candidate physical header.",
+    "Validate initialized BULK destinations at original addresses and actual prefix before touching slots. Retire only actual initialized pending credit obligations, after proof no physical candidate/partial allocation exists; do not inspect or reset uninitialized suffix identities. No generic owned destructor or phase7 path falsely assuming candidate5.",
+    "Always release exact source reader through existing mandatory partial pair routine with NULL control, preserving refusal in original record.target/reader. Positive primary dominates cleanup, negative/zero replaced by actual refusal. Clear record target/phase/readiness scalars only after pair and genuine initialized temporary obligations terminal. No governor ref release because none was retained.",
+    "After source preflight reaches phase15 but descriptor fails after actual malloc, phase1 journals result immediately; existing checked partial constructor retirement handles physical NULL/header/token/ref. Mandatory drain never manufactures phase15 from unfinished FLOAT scan and never forward resumes constructor on stopped attempt.",
+    "No additional join_sources acquisition/accessor or array; same original reader40/constructor336/BULK1088/frame3864/completion80 layout. Every mode18 getter/disposer must distinguish new phases without widening completed candidate18/B7 or replacement17 interpretation."
+  ],
+  "cost_and_fit_holds": [
+    "Choose explicit bounded admission for phase14 binding/FLOAT header/phase15 export and actual percolumn/percell work based final actions. Source-derived literals before exact tests; do not count raw invalid/empty/implicit shortcuts as width scan or observed-rebase previous descriptor costs.",
+    "Direct descriptor helper current work order/charges unchanged; new adoption branch adds preflight owner readiness checks and skips duplicate acquisition only at true phase15. Derive complete new caller cost separately; old helper suffix formulas remain unchanged.",
+    "Author four current-definition profiles must witness unchanged original record/object/frame sizes and mode mapping before backend admission; no new fields/frame/heap. Layout-only proof is not caller runtime acceptance."
+  ],
+  "finite_acceptance": [
+    "Genuine default parsed nonrecursive source0/1 with TS/noTS, known canonical and schema/gens preserved, no candidate/index/stage allocation; invalid singletonFLOAT rejects before shortcut; empty explicitFLOAT raw shortcut remains valid.",
+    "Width300 and actual FLOAT rows: stop after real completed257 cell/type visits before first descriptor allocation, zero events, original pair/phase14 preserved, actual mandatory drain and true serialized new attempt reconstructs/raw twin.",
+    "Original descriptor-only acquire stop/refusal and fullsource reader identity fault after preflight retain exact real prefix; saved scalar restore only postreturn then true checked drain. No invented gate or global source replacement.",
+    "Actual full preflight->descriptor adoption->append releases original pair once; boundary1 has source reader truly inert. Boundary2 mutates real target generation through existing seam, caller rejects original baseline mismatch before canonical publication.",
+    "Positive EOVERFLOW primary combined with actual reader retirement refusal preserved; negative stop with refusal records actual pending cleanup. Existing direct descriptor helper fixtures/literals unchanged."
+  ],
+  "historical_and_scope_limits": {
+    "source_mutated": false,
+    "builds_tests_run": false,
+    "candidate_approved": false,
+    "backend_admitted": false,
+    "independent_fit": false,
+    "full_issue_complete": false,
+    "m0": "Separate pending ungov zeroEMPTY oldtoken/source guard dependency expressly excluded.",
+    "full_remaining": "Whole default observed caller, default recursive/signed/seed/TDD/retraction/general acceptance, unchanged evaluation_retry/snapshot_cutoff, checkpoint table/latestmain/nativeWindows before finalreadyPR remain mandatory."
+  }
+}

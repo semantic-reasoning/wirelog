@@ -1,0 +1,69 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Narrow source-derived initial allocation-free BULK8 activation charge/action receipt; no implementation or runtime/candidate approval.",
+  "receipt": "/home/joykim/.tmp/1821-work/serial-observed-seed-bulk-activation-exact-cost-intake.json",
+  "receipt_sha256": "f01618c3d00e00a0602b3421dd7684559aeb4133df367049d7abd16f8c1010b2",
+  "receipt_full_read": true,
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes_verified": {
+    "wirelog/columnar/relation.c": "78a434905ad811f33a8b2c4d6ab0720fd9623c696da43fbdbcd0202368a1befe",
+    "wirelog/columnar/eval_stack.c": "bb800d3764f8056d241e2acc016ded34e4cbfd0d623aaa68c21661779b7b278d",
+    "wirelog/columnar/internal.h": "db09fcf5760a3d777d20daf2018a49859e0d071e3f3e7abfa3f3fbdc49b19663"
+  },
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/relation.c:7897", "wirelog/columnar/relation.c:6174", "wirelog/columnar/eval_stack.c:1283", "wirelog/columnar/relation.c:735"],
+      "elements": ["actual_callees", "charge_trajectory", "formula"],
+      "categories": ["hidden callee debit coupling", "incorrect literal arithmetic", "measured rebasing"],
+      "ruling": "Accepted. Bridge contains no charge. Begin has positive charges128,64,five32,64,then five128. work_tail debits0; original finite SINGLE lease validation has no debit and is bounded by the already checked one-lease/original-array geometry. A=416 and F=1056 follow source, not observed consumed values."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:7897", "wirelog/columnar/memory_governor.c:347"],
+      "elements": ["fixed_activation_actions", "original five-slot init"],
+      "categories": ["unsafe bounded-region assumptions", "unaccounted state publication"],
+      "ruling": "Accepted. Counted29 scalar assignments exactly match current activation block. Positive64 is prepaid and its cancellation check precedes all29 stores. No variable loop, allocation, Arrow/credit operation or authority acquisition occurs in that block. Each subsequent original token init has separate128 preadmission, fixed reservation clear/identity/EMPTY stores and immediate prefix increment before its zero-cost poll. Physical size is not an extra debit and does not derive the literals."
+    },
+    {
+      "paths": ["wirelog/evaluation_control.c:198", "wirelog/columnar/relation.c:7874", "wirelog/columnar/relation.c:7897"],
+      "elements": ["boundary_dispositions", "pure budget versus genuine cancellation"],
+      "categories": ["weak cutoff failure handling", "fixtures that confuse stop timing"],
+      "ruling": "Accepted. Failed charge does not increment consumed. With no cancellation, budget416 reaches active8/prefix0 before refusing first128;544 reaches actual scratch/prefix1;1055 reaches prefix4/consumed928 before refusing fifth128 with127 remaining.1056 completes prefix5. Cancellation in preactivation work_tail64 occurs before stores, so it cannot be described as newly activated prefix0; cancellation after init sees published prefix. Lifecycle retire validates original slots and preserves historical terminal states while setting39/inactive, without borrowed pointer dereference."
+    },
+    {
+      "paths": ["wirelog/evaluation_control.c:237", "wirelog/columnar/eval_stack.c:1283", "wirelog/columnar/relation.c:7840", "tests/test_evaluation_observer.c"],
+      "elements": ["fixture_state_and_holds", "separately FINISHed gather plus acquired original SINGLE setup", "repeat terminal39 lifecycle reuse"],
+      "categories": ["hidden frame lifecycle coupling", "tests that would pass without original authority", "over-broad evidence claims"],
+      "ruling": "Accepted. CONTROL finish records the completed attempt and makes control inactive; it does not release original frame/SINGLE/flat image. A genuinely finished setup can retain acquired original mode19 frame and SINGLE, followed by configure/begin for the scoped bridge cost. Whole-frame finish or SINGLE retirement would invalidate that setup. Repeats require real terminal lifecycle retirement and new CONTROL attempt, preserving original objects. Existing gather999 and compatibility diagnostics are outside this receipt and cannot qualify lifecycle or whole STEP. Generic256 prior-purpose setup awaits its separately source-bound artifact."
+    }
+  ],
+  "findings": [],
+  "source_arithmetic": {
+    "activation": 416,
+    "full": 1056,
+    "prefix_values": [416,544,672,800,928,1056],
+    "budget1055_consumed": 928,
+    "budget1055_prefix": 4,
+    "fixed_activation_scalar_stores": 29,
+    "fixed_activation_preadmission": 64
+  },
+  "binding_requirements": [
+    "Bind literals only to the exact verified mutable source identifiers above; rebind any changed candidate before runtime claims.",
+    "Budget fixture allowance must apply solely to the bridge/begin after a real completed setup, without active-attempt reset/refund or manufactured phase/count/token identities.",
+    "Pure budget416/544/1055 and true cancellation witnesses remain distinct. Nonzero out on error grants disposal access only, never successful forward admission.",
+    "Actual runtime execution and distinct runtime review remain required; current compatibility/build diagnostics do not prove newly reached lifecycle.",
+    "Await separately bound genuine generic canonical-schema256 partial-prefix setup before literal fixtures for that historical route.",
+    "Allocation/credit transport, growth/lazy/TS/COW/arena footer, whole STEP and admission remain outside this allocation-free receipt."
+  ],
+  "limits": {
+    "source_modified": false,
+    "builds_tests_run": false,
+    "runtime_approval": false,
+    "candidate_approval": false,
+    "backend_admission_ready": false,
+    "whole_STEP_qualification": false,
+    "full_issue_complete": false,
+    "historical_resource_deviations": "unwaived"
+  }
+}

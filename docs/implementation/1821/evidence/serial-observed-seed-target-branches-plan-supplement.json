@@ -1,0 +1,128 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-seed-target-branches-plan-supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-seed-restore-plan-supplement.json",
+  "dimension_binding": "serial-observed-seed-dimension-plan-supplement.json",
+  "allowed_paths": [
+    "wirelog/columnar/session.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/eval_delta.c",
+    "tests/test_evaluation_observer.c",
+    "docs/SEMANTICS.md"
+  ],
+  "source_hashes": {
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/relation.c": "e52d2ac27cd81f1c4d94ba9d00718e914a24b14887a1cb3093d97a891836ba9c",
+    "wirelog/columnar/eval_stack.c": "4f25ca0954b627dcdef2300f6d5448d53d4a8cac0ff6fc18910cbb17bf357ac5",
+    "wirelog/columnar/internal.h": "c8d25a6a310e1e6c82461ae05aac62c5d67310f616f51779cee8f5df9d4ea09c",
+    "wirelog/columnar/eval_delta.c": "d8d0f3d1cf7cea3e795b3d509b19715e163fdaab9cf07987690870a828b03c7b",
+    "tests/test_evaluation_observer.c": "6563d7e204a92f1a33acd014b2886e125f06e8511fa8304151237030f19b0a4b"
+  },
+  "scope": "Resolve P_SEED raw target branch and bounded original SINGLE contracts. No evaluator/session/backend gate change.",
+  "actual_fit_evidence": {
+    "receipt": "serial-observed-seed-r1-fit.json",
+    "sha256": "5395ff732e2b7d7ef050244e92f288d4481b93d877b7510dcbdb2c72e0f9cfde",
+    "actor": "author/coordinator, FULL READ by Architect",
+    "result": "Four actual-definition compile/run0; seed536/8, single424, reader40; nrows512/ncols516/cursor520; seed2160 vs BULK2712; frame3864/completion80 exact. Definition-only, no acquisition/branch runtime evidence. Borrowed BULK union change must repeat actual definition fit."
+  },
+  "raw_preappend_boundary": [
+    "All target branches start AFTER the raw-equivalent ungoverned flat malloc/gather and true seed-reader release. Saved nrows/ncols and original rows pointer remain outside the aliased SINGLE bytes. No second governed scratch image, source-shaped constructor or relation-header adapter.",
+    "Under original destination SINGLE, first clear stale target budget-denial evidence, then validate timestamp shape/nrows<=capacity, required_rows overflow, prospective width, generation headroom, each existing physical lane and prospective target FLOAT values in flat input. Preserve raw validation order and error classification. Source dimensions are immutable saved fields; no seed dereference.",
+    "Gathered image cannot overlap any live destination allocation because it is a distinct live malloc block; skip only the raw overlap scratch-copy branch with this proven allocator provenance. Preserve raw nullary malloc(0) success/failure. Validate input address/byte overflow exactly as raw atomic append.",
+    "Raw schema_was_unset is !dst.schema_ok. Do not take the general schema helper nullary-promotion branch for an already schema_ok nullary destination: atomic append treats that as established schema and rejects mismatched width. Do not infer unset from ncols0."
+  ],
+  "scoped_original_single": {
+    "acquire": "Add scoped original-seed SINGLE acquisition entrypoint in relation.c. Factor/reuse forward acquisition from existing7490 only if every unrelated caller retains its existing behavior/charges. The seed route never calls legacy finish_controlled on fail: return with original set/descriptors/owners/initialization and lease journal reachable in seed536. Original nonce and set links are real, role payloadmutation, exactly1 lease/descriptor and <=2 ordered owner writers. No two-role adapter or token/lease copy.",
+    "consumed_counts": "Use a new scoped deferred writer acquisition helper for the seed original slots. Existing6582 must remain unchanged for unrelated callers: it raw-unwinds after negative tail. New helper preserves raw weak-CAS retry/spurious policy with per-attempt admission/poll, initializes actual original writer after successful CAS, updates its exact original descriptor/owner acquired count BEFORE the fallible tail, then returns without raw-unwind. Counter and initializer actions are explicitly prepaid together. Partial malformed identity retains the true original token and count for checked refusal; no repair.",
+    "initialization": "Original owner metadata initialization is journalled before its fallible tail as current source does. Unpublished failure may restore that initialization under original descriptor writer, after validating exact original initialization tuple. If storage/schema/row publication occurred, retain published initialization/generation and do not restore stale owner metadata on a negative retirement tail.",
+    "healthy_finish": "Visit acquired owners in raw reverse order, then descriptor. Use existing single_writer_release_controlled per load/CAS; it terminalizes original slot before negative tail. Counts and set remain available until every real gate and initialization obligation is settled. Preserve published flag through these operations. Zero SINGLE only in charged<=256 chunks AFTER all real tokens terminal, with seed phase/cursor outside SINGLE recording clear progress; no raw424-byte struct clear as an unmetered wrapper.",
+    "mandatory_finish": "Failed allowance/refusal invokes checked mandatory drain with NULL control, without fresh work admission. Validate original slots before raw checked release, preserve positive primary precedence, and retain mode/remaining pointers/counts on refusal. Finish retained BULK physical/credit work before releasing borrowed destination authority. Never clear a still-live set or initialization tuple. Exact original mode19 remains until rows=NULL/readers+SINGLE+BULK terminal."
+  },
+  "branch_table": [
+    {
+      "branch": "LAZY_SCHEMA",
+      "raw_condition": "schema_was_unset; after all whole-batch target validations",
+      "capacity": "col_rel_capacity_for_rows(current capacity,required_rows), including raw overflow order",
+      "raw_order": "set_schema_impl_capacity3947: compound-map validity; prospective metadata quantity using NULL names; metadata reserve FIRST; payload txn next; primary table/lanes; governed row_scratch; name table and synthetic col%u names; optional timestamp calloc/copy; Arrow schema build; payload publish; field install; metadata publish; old Arrow/metadata retire; one view touch. Then no reserve_rows call.",
+      "original_slots": "BULK.schema_install marks dedicated lazy branch. ncols saved BULK.ncols; prepared_columns/count/owned_columns grid readiness; lengths/prepared_row_scratch actual owned scratch; prepared_names/base actual name prefix; prepared_schema/prepared_schema_ok actual Arrow; prepared_timestamps only newly allocated timestamp owner; old_timestamps only genuinely replaced array; old_schema/old_schema_ok old Arrow; metadata_pending/old_metadata original metadata credits; pending.fresh/growth and previous original payload ownership; new_capacity/final_bytes/metadata_bytes quantities. Original prospective column_types and compound map remain in destination at original addresses, not copied or retired. No additional length cache or inherited seed names/types.",
+      "lease_disposition": "Schema install view touch and ordinary row publication view touch are separate raw effects. Preserve existing timestamp reuse when old capacity sufficient. If schema publication is consumed then later copy/retirement stops, original state records that storage/schema is installed; stratum rollback owns fresh recomputation. No generic result destructor/whole col_rel image copy."
+    },
+    {
+      "branch": "TIMESTAMP_SHORT",
+      "raw_condition": "established schema; required_rows<=capacity && timestamps && required_rows>timestamp_capacity (highest established-branch precedence)",
+      "capacity": "exact existing column capacity; NO doubling",
+      "raw_order": "reserve_rows_impl5415 refuses canonical owner with live alias borrows, then grow_owned_transition even if column capacity is unchanged; full new primary grid plus new timestamp array; reserve transition, primary copy, timestamp malloc/copy, payload commit/install, old image/credits, alias detach, storage touch and original lease advancement. Raw transition does NOT initialize all unused timestamp tail; incoming appended timestamps are zeroed later.",
+      "original_slots": "Same original borrowed BULK target grow journal. Old shared flags/old_arena and metadata_after/metadata_retire in borrowed union; prepared/old grid+timestamps; pending/previous original credits; ledger_prepared and before/after scalars. Preserve old auxiliaries in target.",
+      "lease_disposition": "Prevalidate exact single role/lease and old owner/self owner slots, alias borrow counts, storage generation headroom. Use fixed alias release locked (actual atomic_fetch_sub, no weak-CAS loop) and touch/advance only after staged publication; no raw owner-acquisition wrapper."
+    },
+    {
+      "branch": "COW_WITHIN_CAPACITY",
+      "raw_condition": "established schema; timestamp-short false; col_shared && required_rows<=capacity",
+      "capacity": "existing capacity (or raw COL_REL_INIT_CAP fallback only when corresponding raw helper uses it)",
+      "raw_order": "reserve_transition covers full private shape with existing timestamp_capacity but incoming ONLY new primary grid. Allocate/copy primary; preserve original timestamp pointer/capacity without new allocation; commit/install; old nonshared lanes/table/sharedflags retire; exact shared metadata decrement; alias detach + storage touch + original lease advance.",
+      "original_slots": "prepared_columns/old_columns; borrowed.old_shared/old_arena; pending/previous; borrowed.metadata_after/metadata_retire. prepared_timestamps/old_timestamps remain NULL. No extra timestamp admission or source-type installation."
+    },
+    {
+      "branch": "NO_REPLACEMENT",
+      "raw_condition": "established schema; required_rows<=capacity, no timestamp short and no col_shared",
+      "capacity": "unchanged",
+      "raw_order": "reserve_capacity_impl4632 with target=current capacity has no new allocation. Arena-owned storage WITH spare capacity remains arena-backed in this branch; do not migrate it merely because arena_owned. Append into inactive slots, zero incoming timestamps, publish nrows/view.",
+      "original_slots": "Original SINGLE only; BULK need not acquire fresh transaction/metadata/grid owner. Preserve raw arena_owned/generation flags and all auxiliary pointers."
+    },
+    {
+      "branch": "SHARED_OR_ARENA_GROWTH",
+      "raw_condition": "established schema; required_rows>capacity and (col_shared||arena_owned), after capacity doubling/overflow and owner-alias refusal",
+      "capacity": "start existing capacity or COL_REL_INIT_CAP, double to required_rows",
+      "raw_order": "grow_owned_transition: raw full private retained quantity plus incoming grid/new TS; columns allocation/copy then timestamp malloc/copy; payload publish; capture old ownership; install owned grid/TS, clear shared and arena flags; free only actual owned old lanes or arena table; shared-table metadata retirement, old payload retirement/reconcile; alias detach/storage touch/lease advance. No freeing arena slab or borrowed root lanes.",
+      "original_slots": "Borrowed BULK as TIMESTAMP_SHORT with old_arena and exact per-lane old_shared proof. Old auxiliary merge/retraction/scratch remain physically in target; final retained quantity includes them. New TS only if dst originally had timestamps, capacity doubled. Lease retains real original root/self gate slots until retirement."
+    },
+    {
+      "branch": "PRIVATE_GROWTH",
+      "raw_condition": "established schema; required_rows>capacity and neither shared nor arena",
+      "capacity": "same raw doubling",
+      "raw_order": "reserve retained before resize; prepare_resize1631 allocates primary table/lanes, copies old rows, optional TS malloc/copy and zeros unused timestamp range; publish payload, publish resize, old credit retire, exact ledger reconcile, storage touch and exact lease advance.",
+      "original_slots": "pending fresh/growth, previous; prepared/old primary and TS; ledger_prepared. Original row scratch, merge and backup grids/map/type/name/Arrow remain unchanged. Do not use prepare_growth_controlled automatic partial pointers; all physical prefixes are journalled in BULK before poll."
+    }
+  ],
+  "borrowed_bulk_contract": [
+    "Add a dedicated seed borrowed purpose (new unused borrowed_mode8 after actual source mapping; outside source-union bytes). Existing completed-constructor marker7 is not a lease mode. In the current borrowed union use an anonymous union of authority* and single* at the same pointer offset, preserving lease*, old_shared*, metadata_after and old_arena/metadata_retire. No new authority storage. New source types must compile against original BULK witness in four profiles.",
+    "Entry validates exact single pointer and &single.lease, set self-links/nonce/counts/roles, actual acquired gates and lease dst/generation. Read only matching original target lease; do not expand two-role incremental API domain by suppressing its validation. Share only safe common allocation kernels with explicit policy args; retain old callers costs and guards.",
+    "Seed purpose is dispatched before generic BULK retire mode>5 rejection. It does not acquire/release borrowed target writers. Return after original BULK physical/credit drain or retain it pending with pointer to still-live original SINGLE; evaluator seed cleanup must not clear/release SINGLE first.",
+    "Keep whole raw compound metadata/map behavior, using bounded actual physical/logical coordinate helpers for flat values as necessary. Do not inherit incremental_reserve_rows12195 compound ENOTSUP or generic source append guards. Existing generic helpers are evidence of raw algorithms, not permission to broaden their domain by deleting guards.",
+    "Compute exact old/new ledger and retained bytes by bounded shape scans under original writers BEFORE irreversible transition. No raw col_rel_retained_live_bytes width walk after one poll. Prevalidated fixed ledger apply, alias detach and lease advancement fit finite publication admission; actual work scalar formula/action bound is required before literals.",
+    "Old image retirement after irreversible install is mandatory physical/credit cleanup, covered by existing parent cleanup exclusion (including Arrow library release). It may run without fresh admission after a stop. Pre-install preparation/validation/copy and healthy SINGLE CAS retirement remain charged<=256. Preserve actual physical NULL progress before each checked release/downsize, whether primary is0/negative/positive. Original borrowed metadata_after survives a downsize refusal; no abort or false retirement/refund.",
+    "Reserve metadata/payload rejects retain exact status and existing raw budget denial evidence. Translate outer seed final ENOMEM with true denial to ENOSPC as raw wrapper does; preserve EOVERFLOW/EINVAL and positive-primary cleanup precedence. Do not claim any failure from an unreachable accepted-negative governor commit; real final-cutoff rejection leaves RESERVED/unpublished, last actual success immediately publishes prepaid fixed effects."
+  ],
+  "partial_and_consumed_disposition": [
+    "BULK exact_phase or dedicated seed branch phase journals actual committed/moved credits before pointer install; reverse only real transport prefix on a genuine checked refusal. No phase value inferred from stale union bytes or fabricated success.",
+    "Original seed phase/published differentiates target storage/schema transition from final row publication; single.set.published records any actual canonical mutation. A stopped copy into inactive slots does not publish nrows. An installed schema/capacity may remain after failure under existing logical retry contract; do not require physical undo of every head.",
+    "Final seed row publication preadmits fixed nrows/view/published stores after all cell copies and real required credits are valid. There is no unbounded row copy after final cutoff. Consumed gate/footer failure is cleanup-only; the next whole-stratum attempt restores/recomputes according to original rollback, not another append onto consumed rows.",
+    "Mode-first mandatory path is valid through partial SINGLE initialization, descriptor-only prefix, acquired owner prefix with negative tail, old-grid physical drain, credit move/rollback prefix and partial final clear. No getter or resume may overwrite these original owners."
+  ],
+  "acceptance": [
+    "Each exact branch has a truthful direct raw/control twin; default genuine seeded head fixture separately proves reached branch. Direct synthetic valid representation is labelled helper provenance, not generated backend type proof.",
+    "Timestamp-short with unchanged columns capacity; COW-within-capacity retaining TS pointer; arena spare no migration; arena/shared growth; private growth with unused TS zeroing; lazy missing/schema-unset width300/nullary/prospective FLOAT/native Arrow quantities.",
+    "Successful descriptor and owner CAS followed by true negative tail yields real acquired counts and checked drain; malformed original identities retain tokens; healthy bounded reverse owner/descriptor release including post-CAS stop.",
+    "Real type/gather/copy257 stops, actual full original borrowed credit refusal after physicalNULL, positive primary+cleanup error and consumed append tail retry. Save identity scalar only; no state repair/adapters.",
+    "Same sampled enforcing governor raw malloc-first overlap and no extra descriptor/length-cache/scratch credit. Exact source-derived cutoff formulas before fixture constants; old unrelated routes preserve their existing contracts."
+  ],
+  "holds": [
+    "Actual borrowed union/consumer definition fit and current complete-frame witness before purpose activation.",
+    "Actual simultaneous lazy schema physical slots and bounded Arrow construction must be implemented/proved before lazy branch admission; no new schema image owning header.",
+    "Any reached branch whose original physical owner cannot fit or whose raw status/order cannot be expressed returns exact dependency before editing that clause, not permanent ENOTSUP.",
+    "Backend observer/differential admission remains held until accepted whole-caller integration and finite qualification."
+  ],
+  "limits": {
+    "source_authorized_by_artifact": false,
+    "runtime_or_final_design_approval": false,
+    "fit_actor": "Author four-profile definition witness consumed as evidence, no independent Architect compile.",
+    "full_issue_complete": false,
+    "resource_history": "Unwaived. Architect only read source/receipt and writes HOME artifact."
+  },
+  "historical_source_correction": "Pre-delivery R1 wording universally implied existing writer helper retains a CAS-acquired token on negative tail. Actual6582 raw-unwinds it; normal successful unwind leaves no token. R1 is preserved separately. The real defect is unbounded/raw unwind and possible refusal retention, not universally retained ordinary negative return."
+}

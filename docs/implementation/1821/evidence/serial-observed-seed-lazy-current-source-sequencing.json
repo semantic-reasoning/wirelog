@@ -1,0 +1,73 @@
+{
+  "artifact_type": "source_implementation_sequence",
+  "name": "serial-observed-seed-lazy-current-source-sequencing",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/eval_delta.c": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e"
+  },
+  "accepted_contract_lineage": {
+    "serial-observed-seed-target-branches-plan-supplement.json": "197a4cee72ad1eda6220b571017ee99cddfbf6eaea7870a526ef29c6660856aa",
+    "serial-observed-seed-lazy-schema-plan-supplement.json": "36f7ad2cf613eac38558e1b4ee3144cf82ada0879cd4b3fcce7a7a88c34315a2",
+    "serial-observed-seed-lazy-reverse-plan-supplement.json": "a976b851be5be0f98cfc8232242bdb61ff6cdce554c268f92843d7f10fdaa39c",
+    "serial-observed-seed-bulk-lifecycle-source-binding-r2.json": "f34c54508e789565bd58bd8b806da0e1bb1c83c736a73fc736a903df7fbc7866"
+  },
+  "scope": "Implement already accepted P_SEED actual schema_was_unset branch using existing mode19/SINGLE/BULK8 original slots. Sequencing and early holds, not new framework, admission or candidate verdict.",
+  "ordered_work": [
+    {
+      "step": 1,
+      "implementation": "Extend lifecycle-only seed_bulk_retire7874 BEFORE any reserve/allocation. Keep terminal inactive39 no borrowedpointer dereference. Active32 partial5/noowner cleanup remains valid. Add actual phase32..42 and40/41 move prefixes with custom physical-prefix cleanup/reverse/installed footer, borrowing actual held SINGLE only for active model-sensitive operations. Preserve current no-replacement publisher and1056/568 helper trajectories."
+    },
+    {
+      "step": 2,
+      "implementation": "Factor common raw atomic batch prevalidation out of no-replacement-only selection or add dedicated private validator with existing caller-cost unchanged. Genuine flat/dimensions/original SINGLE checks, checked product/stale denial, timestamp/row/capacity/width/view-two-step and storage headroom, physical/address range and prospective type/FLOAT batch all BEFORE metadatareserve or target mutation. Determine actual !schema_ok, not established-nullary promotion. Bound every actual width/type/map visit <=256; raw compound accepted states retained."
+    },
+    {
+      "step": 3,
+      "implementation": "Derive selected initialcapacity by rawcapacity doubling requiredrows. Calculate metadataN in original BULK.metadata_bytes with raw prospective formula: root3, ownednames table, existing targettypes table, child pointer/header/format bytes, twice synthetic col%u name+NUL, existing compoundmap bytes. Synthetic decimal bounded uint32, no lengthcache. Compound_map_valid_for2099 has a loop; implement bounded equivalent and rawkind/count/offset/width errors, no rawwrapper. Calculate exact finalF and incomingI from original held target physical shape with bounded owned-column scan; payload_private_bytes1864 calls live_shape and cannot be assumed scalar. Preserve TS/scratch/merge/backup/dedup auxiliary policy, not unsupported ledger equality."
+    },
+    {
+      "step": 4,
+      "implementation": "Metadata reserve FIRST into original metadata_pending; actual status maps ENOSPC/true denial. Then payload fresh or embeddedgrowth with actual finalF/incomingI. Existing payload_begin_controlled initializes automatic/subrecord and may miss consumed status on negative; seed scope must journal actual original admitted RESERVED/REPLACING disposition before tail/return. No wholehelper wrapper/init across live fresh. No governorNULL creates credit; all5 initializedscratch-first."
+    },
+    {
+      "step": 5,
+      "implementation": "Allocate in exact raw order: prepared grid table+all lanes; governed-only row scratch; syntheticname table andnames; optional replacementTS; Arrow. Immediately publish each physical pointer/NULL-initialization/allocated prefix before poll. table count, lane owned_columns, namesbase remain independent; prepared_row_scratch aliaseslengths, names aliasesprepared_types, no carried targettype copy. Existing targetTS stays borrowed unless genuinely new allocated; newTS zero/copy bounded. Preserve raw ungoverned allocations if actualtarget governorNULL, no extra name cache/descriptorgovref."
+    },
+    {
+      "step": 6,
+      "implementation": "Implement scoped two-pass seedArrow root then pointer table/all childheaders BEFORE childformats/names, matching raw init_arrow_schema allocation order. Original prepared_schema flag/pointers/n_children prefix before tails; native library disposal exclusion only for actual cleanup. Formats g iff prospective targetFLOAT else l (STRING rawnumeric). Existing build_schema_shape_controlled interleaves children and is not drop-in raworder; factor private policy without changing unrelatedcaller costs or newpath."
+    },
+    {
+      "step": 7,
+      "implementation": "Before commits validate exact raw oldO/M, originalsource/destinationtoken quantities/states/owner, original SINGLE and generation headroom, physicalready/prefixes/Arrow. Bind actual finite preadmitted transport/install actions before literal tests. Preserve accepted payload-first commit then real metadata commit BEFORE fixed field install, with actualsuccess journals33/34/40 and35/36/41. Current targetscalarsO/M stay unchanged untilinstall. Actualmetadata cutoff after payload success goes to checked reverse after NEWphysicalNULL, embeddedCOMMITTEDgrowth downsizeO not rollback_growth."
+    },
+    {
+      "step": 8,
+      "implementation": "After last true successful commit immediately run prepaid no-fallible fixed fieldinstall/native2Arrowmoves plus schema_ok/ncols/capacity/grid/scratch/names/TS fields and viewtouch once, published/setdisposition markers and phase37; no intervening poll/gather/library allocation. Save originalO into existing borrowed.metadata_after before scalaroverwrite. Preserve targettypes/map/descriptor/name/pool/gates/governorref addresses and raw metadata/timestamp policy."
+    },
+    {
+      "step": 9,
+      "implementation": "Retire oldactualTS/Arrow physicalbefore originalprevious/old_metadata credit; growth C=O+I downsizeF only after relevantoldphysicalNULL. Truefalse leaves exactoriginal phase/quantity and heldSINGLE. Consumed schemaerror never reinstalls or rolls backdescriptor. After full terminal39, prepare real next append purpose with schema-published flaghistory and existingflat/dimensions intact; later rawrowcopy publishes second viewtouch. No fallback to no-replacement helper before original BULK terminality. A fresh no-credit append validation can only read targettokens after exactschema footer settled."
+    }
+  ],
+  "precise_prerequisite_holds": [
+    "Current seed_bulk_retire only accepts phase32/39 and requires physical_dead. Therefore no allocations/admissions may be activated until phase-aware custom partial/accepted/installed cleanup actually exists; this is code prerequisite, not an extra teardown project.",
+    "Original pending.growth must remain route witness after actualcommit. OldO/M remain protected descriptor scalars beforeinstall; installed savedO uses existing borrowed.metadata_after solely inlazy. compact_retired must not coexist with old_schema, and source-group overlay cannot be repurposed while borrowed.single/lease are live.",
+    "Accepted physicalslot mapping requires actual implementation-definition witness rebind when helpertypes/unions are altered: all4 originalseed536/BULK1088/workspace552/frame3864/completion80, initializedprefix/body offsets and Arrow old/new coexistence. No proposed new field/type is needed currently, but sizealone cannot prove pointer/credit lifetimes.",
+    "Need actual ledger before/after derivation and allocation-shape policy: do not silently reuse reserve_incremental compoundENOTSUP or add private-only schema guards contradicting raw. If raw accepts a simultaneously owned shape the chosen slots cannot retain, return concrete dependency before allocation; selected backend descriptor-only shape is a fixture, not universaladmission proof.",
+    "Governor-free originaltarget credited scalars are0 even when physicalF/Npositive. StrictnoGov domain and actual EMPTYoriginal targettokens from raw constructor; initialized BULK selftokens. No fabricated positivecredited scalar, rawtokenrepair or releaseof0.",
+    "Fixed action/slack/sourcealgebra, partialArrow child/lane/name257stop, real freshRESERVED/COMMITTED and embeddedgrowth COMMITTEDlatermetadata rejection, originalmove-prefix identity faults, installed oldcreditrefusal and actual sampled rawgovernor overlap must be reached before actuallazy backendadmission. No observedconstant rebasing or broadmatrix."
+  ],
+  "limits": {
+    "source_only": true,
+    "source_edits_builds_tests": false,
+    "runtime_or_candidate_approval": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "resource_history": "All historical deviations unwaived; current author work92 is separate helper evidence, not fullSTEP."
+  }
+}

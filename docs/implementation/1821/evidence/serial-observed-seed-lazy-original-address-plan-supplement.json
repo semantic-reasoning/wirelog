@@ -1,0 +1,67 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-seed-lazy-original-address-plan-supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "allowed_paths": [
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "tests/test_evaluation_observer.c"
+  ],
+  "parents": [
+    "serial-observed-seed-lazy-current-source-sequencing.json",
+    "serial-observed-seed-lazy-reverse-plan-supplement.json",
+    "serial-observed-seed-bulk-lifecycle-source-binding-r2.json"
+  ],
+  "ruling": "Generic bulk-only retire cannot establish actual original seed/SINGLE address. Add typed seed-aware footer for model-sensitive active lazy preparation/reverse/installed accounting; retain existing context-free terminal lifecycle validation. No container_of or borrowedpointer-to-authority conversion.",
+  "caller_address_table": [
+    {
+      "caller": "eval_stack workspace_retire mode19 / cleanup_retry / original frame destruction",
+      "witness": "Current eval_stack1078 already calls seed_restore_retire(&frame.observer_seed,&frame.bulk_append,primary) while originalframe alive and actual mode19 readiness holds. This typed owner path supplies actual seed/BULK addresses; implement seed_restore_retire using new typed footer before SINGLE retirement, reader/flatfree/workspaceclear."
+    },
+    {
+      "caller": "Forward lazy prepare/commit/finish",
+      "witness": "New frame-local guarded bridge validates cleanup_active==frame/frame.session/currentmode19/mode_frame/payload_ready and passes &frame.observer_seed plus &frame.bulk_append to typed relation kernel/footer. It must not derive seed from bulk.borrowed.single. Direct internal fixture uses actual original guarded frame bridge, not arbitrary auto seed object."
+    },
+    {
+      "caller": "Typed footer active model-sensitive phase",
+      "witness": "Given known original seed from trusted frame owner, first compare bulk.borrowed.single == &seed.single AND bulk.borrowed.lease == &seed.single.lease, bulk.dst==seed.dst, seed.session/currentready/activephase11 and exact expectedmode8/lazyphase. Compare address without dereferencing borrowedpointer. Only after match inspect original seed.single/set/lease originalself arrays/gates/nonce/identity/generation and actual target pointer. Mismatch retains wholeframe and returns genuinepositiveEINVAL underprimaryprecedence; no raw unwind or reset."
+    },
+    {
+      "caller": "Typed footer terminal phase39 or partial init with no model owners",
+      "witness": "Inactive terminal proof validates originalBULK tokens/prefix/physical/ownedwriter/transaction/phase only; do NOT dereference borrowed.single/lease, even when oldworkspace overwritten. Originalframe lifetime supplies BULK. For active allocation/reserve/transport prefixes actual original SINGLE must remain live; no model-sensitive reverse after it is retired."
+    },
+    {
+      "caller": "generic bulk_append_retire(bulk,primary)",
+      "witness": "Dispatch mode8 before genericinactive and>5. It may use context-free lifecycle footer for true phase32 physical/tokendead or phase39 terminal proof. Any activeallocation/admission/acceptedmove/embeddedgrowth/installfooter needing target/original SINGLE requires typed caller; generic API returns genuine retained EBUSY (or actual malformedcontextEINVAL), preserving positiveprimary, without touchingphysical/token/gates/cursor. Do not silently inferauthority from storedborrowedpointer or call typedfooter with syntheticseed."
+    }
+  ],
+  "ordering_and_interface": [
+    "Declare narrow internal typed seed_bulk_retire_with_seed(bulk,seed,primary[,healthycontrol]) or equivalently named private interface within existingrelation/internal; actual source signature must preserve optional healthy charging vs mandatoryNULL policy. No new field/frame/heap/token or publicAPI.",
+    "seed_restore_retire must call typedfooter FIRST, then originalseed_SINGLE when appropriate, thenreader/flatdeadclear. Any refusedaddress/credit/physicalstep returns while actualframe reachable and SINGLE/gatherbuffer lifetimes retained. Primarypositive stayspositive; consumed schemas/rows never reset/replay.",
+    "cleanup_seed activation generic priorBULK retirement cannot erase active lazypurpose. It must first resolve original pending mode19 via actual cleanup_retry/typedowner path before any new workspace/gather initializer. A missing validowner cannot be treated terminal merely because activefalse.",
+    "Future readonly validation must not dereference bulk.dst until actual equality with knownseed.dst and actual originallease/gate checks justify it; embeddedtokenoperations use actual validateddst originalslots. No arbitrary addressmask, offsetcast, tokenadapter or liveness inferred fromphasealone.",
+    "Generic dispatch and all disposal/resume/getter callers must retain purpose until typed reverse fully settles. Actual model-sensitive originalsource owners/canonical state must not be handed to a generic disposer after workspaceclear."
+  ],
+  "acceptance": [
+    "Actual original borrowed.single/lease pointer scalar mismatch after genuine setup causes typedfooter refusedcleanup with originalcredits/physical/frame/SINGLE retained; restore only savedscalar afterreturn and truecheckeddrain, no pointerdereference through mismatchedaddress.",
+    "Generic bulk-only attempt on true active model-sensitive lazypurpose retains/refuses with no mutation; genuine typedoriginalframe retry performs actualphysical-before-credit reverse. Terminal39 after outerSINGLE retirement succeeds without accessing deadborrowedpointer.",
+    "All true fresh/growth/move-prefix physicalNULL/creditidentity refusal fixtures remain actual originalslots; completeframe/BULK/seed fit unchanged. This supplement supplies callerwitness only, not new algorithms/costconstants or backendgate."
+  ],
+  "limits": {
+    "source_only": true,
+    "source_edits_builds_tests": false,
+    "runtime_or_candidate_approval": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "resource_history": "Unwaived."
+  }
+}

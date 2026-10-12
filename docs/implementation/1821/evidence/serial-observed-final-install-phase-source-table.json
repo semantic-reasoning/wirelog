@@ -1,0 +1,243 @@
+{
+  "artifact_type": "implementation_plan_supplement",
+  "producer": "/root/architect_reduce_final",
+  "status": "proposed_requires_distinct_critique",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-final-install-journal-plan-supplement-r2.json",
+  "source_intake": "serial-observed-final-install-author-intake.json",
+  "paths": [
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "tests/test_evaluation_observer.c"
+  ],
+  "source_sha256": {
+    "wirelog/columnar/relation.c": "02bab3f2c48b2cc0f7be8f4a693b60553e63ac8b9410d532d60677bf700bacbb",
+    "wirelog/columnar/eval_delta.c": "210d6add4eb62b68fdb5c37ab89c7331d3195caea96906124a81c4f262fea3f1",
+    "wirelog/columnar/eval_stack.c": "52e4ee744c90823826b83371a8730d64eec04733bac356fd9a712ddf836923e9",
+    "wirelog/columnar/internal.h": "73bc487efe80503f71aaba0e756e60d02fef0ed3bcb45d894898ed818ce3005f"
+  },
+  "activation": "Only external17/ready/payload_ready, candidate DONE24, result NULL/ownedfalse, candidate pair inert, all real BULK5 terminal, refbit0 and both source-group slots genuinely terminal. Target transaction original combined writer and stage/tx3 remain live. Add named phases, not generic mode widening.",
+  "phase_table": [
+    {
+      "phase": 30,
+      "name": "OLD_IMAGE_CLEAR",
+      "purpose": "After charged fixed setup, BULK.count=0 and explicit new phase before first memset. Clear only sizeof(replacement_physical) in <=128 byte chunks; journal count after each actual clear before poll. Until count reaches sizeof, never read journal fields or aliased source-group fields."
+    },
+    {
+      "phase": 31,
+      "name": "OLD_IMAGE_CAPTURE",
+      "purpose": "Clear complete. Bounded scan target old columns/shared ownership and stage new columns to compute exact ledger quantities; actual target writer protects both target metadata and old references. Capture physical-only journal fields with bounded fixed preadmission; no ownership/free before publication."
+    },
+    {
+      "phase": 32,
+      "name": "FINAL_PREPARATION",
+      "purpose": "Journal valid, old nonowning physical references protected, fixed install allowance prepaid and ledger exclusive prepared. Metadata and dedup actual RESERVED->COMMITTED sequentially; true successful preparation is reversible until logical install. Last required commit0/outtrue immediately enters fixed region; no postcommit poll. No required commits uses explicit final cutoff."
+    },
+    {
+      "phase": 33,
+      "name": "TOKEN_MOVE_PREFIX",
+      "purpose": "BULK.base counts actual acknowledged operations0..6: old retained->previous, old metadata->old_metadata, old dedup->scratch, new payload->target retained, new metadata->target metadata, new dedup->target dedup. Genuine absent quantities acknowledge validated inert pair without MOVE. Journal prefix immediately after actual successful move. Unexpected refusal invokes true reverse while unpublished; stage and old physical remain live."
+    },
+    {
+      "phase": 34,
+      "name": "REVERSE_PREFIX",
+      "purpose": "Unpublished mandatory reversal only. Decrement actual base immediately after successful reverse or legitimate inert acknowledgement, in reverse order. Preserve original refusal state and target writer. Never free old nonowning physical image. Base0 then abandonment may dispose stage/new credits; canonical unchanged."
+    },
+    {
+      "phase": 35,
+      "name": "FIXED_INSTALL",
+      "purpose": "Reached only within admitted no-poll region after base6. Field-wise install complete stage into original target, consume stage name/header, exclusive ledger apply, touch_replacement and published acknowledgment; no forward calls or callback between these steps. Phase36/published true precedes any later interruptible cleanup."
+    },
+    {
+      "phase": 40,
+      "name": "OLD_PRIMARY_ROWS",
+      "purpose": "Published only; record.column_cursor actual original width progress. Shared/arena predicates from physical journal govern owned frees; NULL actual consumed lanes before tail. After width, free/NULL grid only; shared map remains until all primary lane tests consumed."
+    },
+    {
+      "phase": 41,
+      "name": "OLD_MERGE_ROWS",
+      "purpose": "Published; cursor reset0 only at prior grid terminal transition; free/NULL each old merge lane and grid."
+    },
+    {
+      "phase": 42,
+      "name": "OLD_BACKUP_ROWS",
+      "purpose": "Published; free/NULL owned backup grid lanes under raw old-image ownership rules, cursor as actual prefix."
+    },
+    {
+      "phase": 43,
+      "name": "OLD_COLUMN_NAMES",
+      "purpose": "Published; free/NULL actual old column names then array; no descriptor/name credit or target name disposal."
+    },
+    {
+      "phase": 44,
+      "name": "OLD_PHYSICAL_FOOTER",
+      "purpose": "Dispose/NULL old type/map/shared/scratch/dedup/TS/backupTS/Arrow actual pointers with named footer progress in BULK.count. Schema native release/library cleanup uses existing honest exclusion; no stale old_schema union access."
+    },
+    {
+      "phase": 45,
+      "name": "OLD_CREDIT_RETIRE",
+      "purpose": "All old physical NULL/schema consumed. BULK.base reused only now as retirement prefix0..3 for previous/old_metadata/scratch; true original RESERVED/COMMITTED checked retirement. Refusal retains original token and physicalNULL cursor."
+    },
+    {
+      "phase": 46,
+      "name": "TARGET_WRITER_RETIRE",
+      "purpose": "Old credits terminal. Release only original transaction combined writer; consumed storage then descriptor prefix recorded in original token. Negative tail never re-installs."
+    },
+    {
+      "phase": 47,
+      "name": "PUBLISHED_DONE",
+      "purpose": "Actual stage/result/old physical/old credits/writer all inert; published canonical remains. Only then frame final retirement/reuse allowed."
+    }
+  ],
+  "slots": [
+    {
+      "slot": "BULK.sources/replacement_physical",
+      "live": "phase30..47",
+      "meaning": "Only physical168 pointers/scalars/Arrow. Never tokens, descriptor/gate/governor/ref or whole relation. Before published, nonowning; after fixed install owns old image. Width and arena/shared rules captured explicitly."
+    },
+    {
+      "slot": "BULK.count",
+      "live": "30, then44",
+      "meaning": "Physical168 clear bytes until phase31; after publication footer step progress. Not old grid cursor or token prefix."
+    },
+    {
+      "slot": "record.column_cursor",
+      "live": "31, then40..43",
+      "meaning": "Ledger scan column prefix then actual grid/name physical progress. Candidate DONE cursor must first show prefix5/refbit0; purpose transition then resets cursor. No aliased candidate progress interpretation later."
+    },
+    {
+      "slot": "BULK.owned_columns",
+      "live": "31",
+      "meaning": "Saturating ledger-owned column count for target old scan; new scan resets only after old ledger-before stored. Dead before fixed install/physical cleanup."
+    },
+    {
+      "slot": "BULK.compact_retired.ledger_before/ledger_after",
+      "live": "31..47",
+      "meaning": "Exact raw primary owned capacity bytes before and after install. old_schema is DEAD in this purpose; old Arrow lives exclusively physical.schema. compact_retired.merge_columns unused NULL, not second old merge authority."
+    },
+    {
+      "slot": "BULK.ledger_timestamps",
+      "live": "31..47",
+      "meaning": "Prospective timestamp ledger bytes for actual stage pointer/capacity. Original target.ledger_ts_bytes remains unchanged until exclusive ledger apply; no old TS scalar needed after prepared requests capture difference."
+    },
+    {
+      "slot": "BULK.ledger_prepared",
+      "live": "32..35",
+      "meaning": "Existing exclusive prepared ledger deltas RELATION then TIMESTAMP; prepared before last cutoff, fixed apply reads current protected counters. Do not call raw reconcile which rescans ncols after cutoff."
+    },
+    {
+      "slot": "BULK.base",
+      "live": "33..34 then45",
+      "meaning": "Six actual checked move prefix and reverse count; after published physical retirement reaches45, reuse for actual old3 retirement. Phase guards prevent meaning overlap."
+    },
+    {
+      "slot": "BULK.previous/old_metadata/scratch",
+      "live": "33..47",
+      "meaning": "Old payload/metadata/dedup original credits. Actual quantities carried by tokens; no extra copied live authority. metadata_pending and pending.fresh must be terminal unused."
+    },
+    {
+      "slot": "record.transaction/record.target/identity/generations",
+      "live": "entire purpose",
+      "meaning": "Same original transaction3/staged/combined writer and target identity captured during prepare. Never copy writer/gates. Preserve target descriptor/name/poolname/gov/ref/ledger/deferred links and identity at original addresses."
+    },
+    {
+      "slot": "record.published + BULK.published",
+      "live": "35..47",
+      "meaning": "Set together with actual completed fixed install before first fallible tail. Neither used for preparation commitment or candidate governor-ref bit."
+    }
+  ],
+  "field_map": {
+    "install_from_stage": [
+      "ncols",
+      "columns",
+      "column_types",
+      "nrows",
+      "capacity",
+      "col_names",
+      "schema (native ownership move, not duplicate release)",
+      "schema_ok",
+      "sorted_nrows",
+      "merge_columns",
+      "merge_buf_cap",
+      "base_nrows",
+      "timestamps",
+      "timestamp_capacity",
+      "arena_owned",
+      "row_scratch",
+      "retract_backup_columns",
+      "retract_backup_timestamps",
+      "retract_backup_timestamp_capacity",
+      "retract_backup_nrows",
+      "retract_backup_base_nrows",
+      "retract_backup_capacity",
+      "retract_backup_sorted_nrows",
+      "col_shared",
+      "run_count",
+      "run_ends[8]",
+      "retract_backup_run_count",
+      "retract_backup_run_ends[8]",
+      "dedup_slots",
+      "dedup_cap",
+      "dedup_count",
+      "has_graph_column",
+      "graph_col_idx",
+      "compound_kind",
+      "compound_count",
+      "compound_arity_map",
+      "compound_arity_len",
+      "inline_physical_offset",
+      "declared_ncols",
+      "memory_budget_denial_pending"
+    ],
+    "preserve_original": [
+      "name",
+      "pool_owned",
+      "mem_ledger",
+      "memory_governor and real ref",
+      "descriptor_reservation/quantity",
+      "pool_name_reservation/quantity",
+      "relation_identity",
+      "source_access/descriptor_access complete original gate objects",
+      "storage alias atomic lifetime (validated zero)",
+      "deferred_relation_next/session"
+    ],
+    "fixed_explicit": [
+      "metadata/dedup/retained quantities from real prepared transaction after checked moves",
+      "storage_owner=target; storage_owner_identity=original identity; storage_owner_generation matches raw stage logical default policy (do not leave stale preimage)",
+      "view/storage generations incremented once via existing touch_replacement",
+      "ledger_ts_bytes updated only actual exclusive ledger apply",
+      "transaction staged/header/name consumed and three active/quantity dispositions cleared only after transfer",
+      "record/BULK published before tail"
+    ]
+  },
+  "action_bound_proposal": {
+    "formula": "B_fixed = 6*64 + 2*64 + 2*sizeof(struct ArrowSchema) + 2*sizeof(((col_rel_t*)0)->run_ends) + 8 + 64 + 32 + 32",
+    "meaning": [
+      "six bounded reservation_move branches including local prefix acknowledgement, at most64 logical accesses/stores each; actual move has no CAS retry loop",
+      "at most64 named scalar/pointer assignments at conservative two actions each; run arrays and Arrow separately counted",
+      "Arrow ownership move reads/writes each byte at most twice, native fixed object operation with actual original ownership validation",
+      "two immutable 8-entry uint32 run array copies, byte work explicitly counted; no ncols loops inside fixed region",
+      "eight stage name/header free/NULL actions using existing mandatory physical-library exclusion, no destructor",
+      "exclusive ledger apply <=64 fixed actions after actual prior controlled prepare; touch replacement <=32; final consumed flags/phase/scalar clear<=32"
+    ],
+    "qualification": "Conservative PREIMPLEMENTATION admission bound, not observed expected runtime total. Author must bind final actual statement/action map and compile immutable array/schema sizes. This aggregate can exceed256; it is an explicit finite preadmitted terminal publication region, not <=256 poll claim. Distinct Critic must accept this exact region against existing final-install contract; if strict quantum applies to fixed aggregate, return dependency before editing/admission. Reversal is stopped mandatory checked ownership cleanup, not healthy forward extra budget."
+  },
+  "additional_source_policy": [
+    "Raw old ledger helper1709 scans arbitrary ncols and raw reconcile3377 repeats that scan. Compute old/new ledger amounts with actual per-column charged scan before terminal region, preserving arena/shared/capacity/null-lane/saturation policy; use existing exclusive prepared ledger functions3330 onward. No assumed retained-token equality.",
+    "Generic replacement_retire currently accepts only0..3/20..24 and maps candidate DONE to3. It must dispatch phases30..47 BEFORE that guard/rewrite; source-group drains and generic stage getter/disposer must not read physical journal alias.",
+    "Phase36 deliberately unused: use published physical start40 immediately during fixed acknowledgment; no undefined stage gap. Phase35 is transient inside no-poll region; unexpected fixed move failure remains33/34, never partially published35 with interruptible return.",
+    "Initial activation charge/count and fixed budget formulas require final source binding before exact literals. No measured rebasing. Same frame/BULK/object definition fit must be witnessed across four profiles by author before admission."
+  ],
+  "limits": {
+    "source_mutated": false,
+    "tests_builds_run": false,
+    "candidate_approved": false,
+    "new_frame_fields_paths": false,
+    "independent_fit": false,
+    "full_issue_complete": false,
+    "runtime_bound_proved": false,
+    "remaining": "Default recursive diff/observer and full signed/general acceptance, latest-main and native Windows remain mandatory before final PR."
+  }
+}

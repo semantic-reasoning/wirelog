@@ -1,0 +1,123 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-production-stratum-step-source-assessment",
+  "producer": "/root/architect_reduce_final",
+  "status": "source_grounded_caller_assessment_with_prerequisite_holds_requires_distinct_critique",
+  "repository": "/home/joykim/wirelog-1821-serial-work-next",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "base_tree": "c46c55094b9786f14420295455047e99ebfc9071",
+  "source_hashes": {
+    "wirelog/columnar/eval_delta.c": "d8d0f3d1cf7cea3e795b3d509b19715e163fdaab9cf07987690870a828b03c7b",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_serial.c": "1db3f01f4546ee4546d0ee267479cb7629ef97493e1cbe523d54cf092c51d8dd",
+    "wirelog/columnar/eval_plan.c": "abaf275bcf11d0fc1e031bff86945431a96c410f6b25a53696c883910481cc6d",
+    "wirelog/columnar/eval_stack.c": "52e4ee744c90823826b83371a8730d64eec04733bac356fd9a712ddf836923e9",
+    "wirelog/columnar/relation.c": "e52d2ac27cd81f1c4d94ba9d00718e914a24b14887a1cb3093d97a891836ba9c",
+    "wirelog/columnar/internal.h": "8b9423c13190260f158710f064b8f88f08833ddf3bdac4250be5d2c7cd72d084",
+    "wirelog/columnar/diff.c": "8f55cf0e28574b6e96d864c5ea0554e22210ceb16d8c07ab28befd3e2f2c138b"
+  },
+  "objective": "Connect the real observed nonrecursive col_stratum_step_with_delta caller to existing original-frame capture, detach, recovery and consolidation. This assessment identifies necessary seed and differential evaluator prerequisites before backend admission; it is not permission to bypass them.",
+  "paths_in_existing_parent_scope": [
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/session.c",
+    "wirelog/columnar/eval_serial.c",
+    "wirelog/columnar/eval_plan.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/diff.c",
+    "tests/test_evaluation_observer.c",
+    "tests/test_diff_consolidate.c",
+    "tests/meson.build",
+    "docs/SEMANTICS.md"
+  ],
+  "parent": "serial-post-recursive-aggregate-closure-plan.json",
+  "reuse_accepted_contracts": [
+    "serial-observed-disposal-frame-plan-supplement.json",
+    "serial-observed-reader-pair-plan-supplement.json",
+    "serial-observed-detach-replacement-plan-supplement.json",
+    "serial-observed-restore-consumption-plan-supplement.json",
+    "serial-observed-restore-ack-order-plan-supplement.json",
+    "serial-observed-recovery-detach-plan-supplement.json",
+    "serial-observed-rollback-caller-timing-plan-supplement.json",
+    "serial-observed-source-preflight-plan-supplement.json",
+    "serial-observed-final-install-journal-plan-supplement-r2.json",
+    "serial-observed-final-install-fixed-action-source-binding-r2.json",
+    "serial-observed-ungoverned-old-credit-plan-supplement-r2.json"
+  ],
+  "actual_source_findings": [
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "anchor": "col_stratum_step_with_delta, 3920-4132",
+      "finding": "The production wrapper still calls raw capture, raw registry lookup, raw detach, raw source-lease retirement and raw seed restoration. Its two aliases-first scans and consolidation head scan are uncharged. Existing attached-control consolidation dispatch does not meter these surrounding stages."
+    },
+    {
+      "path": "wirelog/columnar/session.c",
+      "anchor": "session_seed_shadow_name/session_seed_shadow, 369-389; wl_columnar_session_restore_seed, 680-711",
+      "finding": "Seed lookup builds a fixed 256-byte name via snprintf then raw lookup. Overlong names result in absent seed (NULL), not propagated EOVERFLOW. Nonempty seed restoration allocates an ungoverned transient flat image, gathers every row/column, then calls atomic append and frees it. Governor-denied append ENOMEM is translated to ENOSPC. No controlled counterpart is present."
+    },
+    {
+      "path": "wirelog/columnar/eval_serial.c",
+      "anchor": "col_eval_stratum, 2000-2055; framed_relation, 1332 onward",
+      "finding": "The pending ordinary branch uses serial_completion.relation as its rule cursor. Entry comments assume seed/cache/pool occupancy absent. This cursor is not a rollback recovery journal and must not skip fresh recomputation after an incomplete observed evaluation."
+    },
+    {
+      "path": "wirelog/columnar/eval_plan.c",
+      "anchor": "controlled context checks, 563-589",
+      "finding": "Actual diff_operators_active remains rejected; observer presence also remains rejected. Removing observer rejection alone does not implement genuine dirty differential CONS or any other differential operator. Parent explicitly requires preserved affected-mask policy."
+    },
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "anchor": "STEP cleanup 4076-4132; delta_events_clear 99; rollback_retry_controlled 2900 onward",
+      "finding": "Cleanup currently returns cleanup_rc in preference to any positive primary. Controlled recovery correctly gates forward restoration on an active attempt while allowing prior consumed drain. Event clear frees an arbitrary event array and uses raw release. The actual observed production branch creates no local delta events; that fact must be validated before taking its empty fast path."
+    }
+  ],
+  "caller_sequence_contract": [
+    "At a fresh selected stratum entry, drain existing original pending owners and complete bounded rollback recovery using the active same control before capture or rule-cursor initialization. Never reset control work/cancellation. Recovery retains its previous heads-final decision until it finishes; do not clear heads_final before inactive recovery or use a fresh-capture reset to reinterpret previous final content.",
+    "Use capture_controlled for the actual new stratum. Its existing charged8 clears heads_final at that boundary, and successful complete capture provides the original rollback entries. Do not duplicate the raw uncharged reset or treat a partially copied baseline as ready.",
+    "Charge and poll before inspecting each entry in both alias/root passes, including skipped entries. Use bounded registry lookup and exact detach target accessor. Acquire the existing original frame, invoke controlled detach, then controlled source-lease retirement; always finish the frame. The helper acknowledgment owns detached/completed flags and consumed leases. A refused prefix retains its original journal; no raw detach or synthetic flag repair.",
+    "Visit each detached head for real bounded seed lookup/restoration. Absence or empty seed is a legitimate raw shortcut only after bounded lookup/shape validation proves it. A permanent host-rule-input refusal, skipped seed call, or blanket empty assumption does not close this obligation.",
+    "After baseline restoration and seed preparation have truly completed, start fresh rule evaluation from its actual first rule. Retain the ordinary rule cursor only during this forward evaluation. On failure, original rollback finish/recovery decides retained final content versus recompute; a next caller attempt must not reuse an end cursor to skip rebuilding a restored head.",
+    "Keep the raw retraction flag save/restore order and only suppress diff when raw retraction policy does so. Restore flags even on negative stop or cleanup refusal. Selected nonretraction dirty execution must retain its real diff_operators_active and route actual differential operators through bounded implementations.",
+    "After all rules reach genuine finality, charge each head occurrence and bounded lookup, invoke the reached controlled production consolidation, and keep whole-step observer baseline intact. Do not publish callbacks per stratum; evaluated delivery and final cutoff belong to the whole session after every selected stratum and compaction.",
+    "Always execute rollback_finish and actual checked retirement. Positive primary dominates cleanup; cleanup replaces a nonpositive primary. Consumed publication/lease failure permits cleanup-only continuation, not another detach/replacement or callback replay.",
+    "After rollback discard, use existing same-frame bounded compound GC owner for the selected standard GC boundary if requested; no fixed precharge around generic rotation callback. Preserve coalesced collection after holds retire and never replay it from failed recovery. Any nonstandard callback/rotation path needs its own proven boundary."
+  ],
+  "prerequisite_holds": [
+    {
+      "id": "P_SEED",
+      "status": "concrete_required_dependency",
+      "contract": "Before changing restore_seed, provide a narrow original-address owner/phase table for its exact raw transient malloc plus pinned immutable seed, gathered cells and target atomic publication. Preserve raw temporary-image allocation overlap, no governor credit for raw ungoverned scratch, existing target growth/admission order, shape errors and ENOMEM/ENOSPC distinction. Physical pointer must be journalled before a stopped return and freed before accounting retirement. Bound each name, registry and cell visit <=256; retain actual destination writer and consumed-publication disposition. Prove simultaneous fit in current original frame/BULK without assuming append helper raw-policy equivalence. If that cannot fit, return the precise layout prerequisite; no new owner/frame silently. The fixed name buffer must preserve raw overlong-name-as-absent semantics without an unbounded snprintf scan."
+    },
+    {
+      "id": "P_DIFF_EVALUATOR",
+      "status": "parent_required_integration_unimplemented_here",
+      "contract": "Actual observer-context evaluator entry and actual dirty differential CONS dispatch require source-grounded lifetime/generation and ownership validation. Keep differential JOIN and recursive observer contexts closed until their own real implementation, as parent requires. Do not set diff=false or force affected_mask full to make this STEP wrapper pass. One-head initial full fallback is not proof of the required genuine dirty partial-mask activation."
+    },
+    {
+      "id": "P_SESSION_ADMISSION",
+      "status": "later_actual_caller_integration",
+      "contract": "The current serial attempt preflight/session route still excludes observer lanes. Connect observer begin/evaluated/prepare/publish/finish and final bookkeeping only after STEP and selected operators are bounded. This artifact does not authorize backend gate opening."
+    },
+    {
+      "id": "P_EVENTS_AND_GC",
+      "status": "exact_context_proof_before_call",
+      "contract": "Observed production STEP skips the direct local event-emission body, but raw event clear is not an automatic general engine exclusion. Prove the selected local queue is empty using original scalar authority, or provide checked physical-before-credit disposal. The direct no-observer legacy gather/search/emission branch and generic rotation callbacks remain separate supported-path work; do not fall through to them under attached control."
+    }
+  ],
+  "finite_acceptance": [
+    "Genuine unchanged optimizer-generated default observed nonrecursive initial missing head and dirty host EDB input, actual affected-mask/differential checkpoints, canonical rows and signed events match raw twins. Preserve the already reached consolidation helper tests; they are not backend acceptance.",
+    "Add actual seeded rule-head input (not just EDB): true seed lookup/gather/publication then original detached head restoration/recompute. Exercise width300 gather stop after257 completed cells, zero events, real original owner drain and host-newattempt raw twin. Include absent, empty, nullary, width mismatch and long-name raw lookup policy.",
+    "Stop in actual alias/root entry traversal, detach, source lease retirement and later rule/consolidation. Check original rollback finality and lease/candidate consumed state; fresh caller must reconstruct or cleanup only as dictated by the real record, never skip rules due to stale ordinary cursor.",
+    "Positive primary plus real cleanup identity refusal; negative cancellation plus real refusal; serialized scalar restore and actual original drain. No invented release result or token state.",
+    "Whole-session evaluated boundary cancellation gives zero events and delivery-only retry without evaluator hook. Callback-first late cancellation delivers full admitted signed batch and sticky next attempt. Preserve unchanged recursive evaluation_retry/snapshot_cutoff for later genuine default recursive integration.",
+    "Use existing four-profile registered observer/diff and broad finite target union, docs4, original current-definition frame3864/completion80 witnesses and sampled enforcing-governor raw twins; no additional broad matrix. Qualification actor remains author/coordinator."
+  ],
+  "limits": {
+    "source_edits_authorized_by_this_artifact": false,
+    "backend_admission_ready": false,
+    "runtime_or_fit_claim": "Read-only source assessment. No tests/builds performed; author-reported work71/work72 are not independent qualification. Current helper layouts remain subject to actual simultaneous prerequisite fit.",
+    "full_issue_complete": false,
+    "remaining": "Default recursive differential/observer unchanged fixtures; signed/retraction/TDD/seed/general AUTO/alias/typed/fallback checkpoint coverage, complete live acceptance matrix, latest-main integration and actual native Windows before final ready PR. Historical resource deviations remain unwaived."
+  }
+}

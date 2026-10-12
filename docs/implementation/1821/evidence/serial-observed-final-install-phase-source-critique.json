@@ -1,0 +1,70 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/critic_1821_continue",
+  "verdict": "accepted",
+  "scope": "Selected final-install phase/scalar/lifetime plan; conditional source implementation only, not candidate, runtime-bound or backend admission approval",
+  "plan": "serial-observed-final-install-phase-source-table.json",
+  "plan_sha256": "dd13a6e2e3a81b396c39b242efbb689cc7bd20d4ac349675b478efb0c705a2a1",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "paths": ["wirelog/columnar/relation.c", "wirelog/columnar/eval_delta.c", "wirelog/columnar/eval_stack.c", "wirelog/columnar/internal.h", "tests/test_evaluation_observer.c"],
+  "source_sha256_verified": {
+    "wirelog/columnar/relation.c": "02bab3f2c48b2cc0f7be8f4a693b60553e63ac8b9410d532d60677bf700bacbb",
+    "wirelog/columnar/eval_delta.c": "210d6add4eb62b68fdb5c37ab89c7331d3195caea96906124a81c4f262fea3f1",
+    "wirelog/columnar/eval_stack.c": "52e4ee744c90823826b83371a8730d64eec04733bac356fd9a712ddf836923e9",
+    "wirelog/columnar/internal.h": "73bc487efe80503f71aaba0e756e60d02fef0ed3bcb45d894898ed818ce3005f"
+  },
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/internal.h", "wirelog/columnar/relation.c"],
+      "elements": ["replacement_physical journal", "phase30 initialized byte prefix", "phase31 old/new ledger scan", "compact_retired versus old_schema", "BULK.count/base/owned_columns and record.column_cursor lifetime"],
+      "categories": ["hidden coupling", "unsafe state assumptions", "failure handling"],
+      "ruling": "The actual physical journal contains the old width, ownership predicates, all primary/merge/backup grids, names/types/map/dedup/scratch/timestamps and Arrow object, without live credits or gate authority. It overlays only sources; compact_retired ledger fields occupy the distinct old_schema union. The proposed mode-first initialized-prefix rule and phase-separated cursor meanings avoid reading incomplete or reinterpreted storage. Actual sizeof/alignment assertions exist, but fresh four-definition fit of final implemented fields remains a hold. Raw owned ledger scanning at relation.c:1709 is width-dependent and is correctly moved before the terminal region rather than inferred from retained credit quantities."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c", "wirelog/columnar/internal.h", "wirelog/columnar/eval_delta.c"],
+      "elements": ["six original token moves and reverse prefix", "actual metadata/dedup commit outcomes", "field-wise raw replacement map", "published old-image cleanup phases40..47"],
+      "categories": ["unsafe state/concurrency assumptions", "weak failure handling", "atomic scope"],
+      "ruling": "memory_governor.c:528 reservation_move is finite with no CAS retry and clears the original source only on success. Recording each actual move/inert acknowledgment before proceeding, and reversing only the acknowledged unpublished prefix, can preserve the original ownership on refusal. Original identity, descriptor/name/pool credits, governor ref, gates, deferred links and ledger remain outside the installed physical map. The map accounts for the actual col_rel_t physical fields and updates storage-owner generation through the existing single touch. Published physical retirement uses the old journal width, keeps the shared bitmap until primary lane decisions finish, then retires original old credits and target combined writer. This preserves physical-before-credit and cleanup-only retry without raw whole-structure copying or canonical rollback promises."
+    },
+    {
+      "paths": ["wirelog/columnar/eval_delta.c", "wirelog/columnar/eval_stack.c", "wirelog/columnar/relation.c"],
+      "elements": ["all purpose dispatchers", "partial clear/prepublication abandonment", "published disposal", "prepared exclusive ledger apply"],
+      "categories": ["hidden coupling", "weak failure handling"],
+      "ruling": "Actual replacement_retire currently rejects phases outside0..3/20..24 and rewrites candidate DONE to3. Actual stage_retire accepts only0..3. New-purpose dispatch must precede both; it cannot pass a physical journal to old source-group or stage interpretations. eval_stack workspace/dispose paths already delegate external17 to replacement_retire, while stack/result accessors and continuation cleanup exclude external17. Their exclusions must remain. Existing exclusive ledger preparation is controlled and final apply uses current protected counters without a width scan, matching the proposed before/after and timestamp scalar slots."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c", "tests/test_evaluation_observer.c", "docs/SEMANTICS.md under the retained parent scope"],
+      "elements": ["B_fixed proposal", "last actual commit cutoff", "finite terminal publication exception", "failure and fixture provenance"],
+      "categories": ["unsafe budget assumptions", "tests that would not prove behavior", "atomic scope"],
+      "ruling": "Accept a narrowly disclosed finite preadmitted terminal installation region, not a <=256 quantum claim. The existing admitted terminal publication contract already distinguishes same-attempt prepaid pure work from ordinary forward polls. Here the exception is limited to six bounded original moves, fixed field/native-object assignments, stage header/name consumption, prepared ledger apply, touch and consumed acknowledgment. It does not authorize variable scans, new allocation, callback, authority acquisition or unbounded governor-total operations after cutoff. B_fixed is a conservative proposal, not an actual expected runtime total or permission to omit actions. A failed commit or move can leave unused admitted slack exceeding256; that exception and lack of refunds/reset must be explicitly disclosed for this installation path. Current library schema destruction remains separately identified mandatory cleanup. Final statement-expanded action map, actual sizes and charge binding are still required before admission/exact assertions."
+    }
+  ],
+  "finding_rulings": [
+    {"id": "prior-final-install-B1", "disposition": "historical block upheld; R2 outcome correction retained", "reason": "No required accepted-negative last-commit case is reintroduced. Initialize accepted=false per invocation; actual successful last commit returns0/out=true, cutoff rejection restores preparation, and later cleanup refusal is a distinct consumed-publication witness."},
+    {"id": "phase36-text", "disposition": "binding textual correction", "reason": "Phase35 purpose mentions phase36, but the explicit additional policy correctly makes36 unused. Implement and document the atomic published transition directly to40, never expose undefined36."},
+    {"id": "governed-backup-provenance", "disposition": "retained binding", "reason": "Both actual raw and controlled preparers refuse governed targets with backup columns/timestamps. Preserve EBUSY; any backup-journal success evidence needs genuinely raw-accepted distinct provenance, not a governed-success claim."}
+  ],
+  "findings": [],
+  "binding_requirements": [
+    "Activation must validate actual candidate DONE24/prefix5/refbit0, resultNULL/ownedfalse, source groups and all five temporary obligations terminal before switching purpose and clearing journal bytes. Do not use a ready flag alone as retirement proof.",
+    "While phase30 count is incomplete, cleanup must not read journal or source alias fields. Prepublication phase31/32 disposal preserves all old nonowning references and abandons only actual staged/new resources. Phase33/34 cleanup must complete actual reverse before any new credit release or stage free.",
+    "Absent move branches require validated inert original source/destination states and quantities. A reverse refusal retains the original frame, prefix and writer; preserve initiating positive error precedence. No abort, memcpy, local live token, forged repair or raw automatic destruction.",
+    "Last required successful commit enters the fully admitted fixed region without a poll. No-required-commit case uses an explicit final cutoff. No fallible field validation, ledger preparation, source/group read, allocation, name scan or width loop may be hidden after that cutoff.",
+    "Bind every actual fixed statement/native byte operation against B_fixed, including move validation/local acknowledgments, token quantity/active dispositions and terminal flags. If the final action map exceeds the proposed bound, obtain a precise source-derived correction before admission; do not rebase to observed work or report the aggregate as <=256.",
+    "Document the selected finite terminal-region and unused-slack exception in the already-authorized semantics scope; retain <=256 charging/polls for all preceding scans and healthy physical lane retirement. Mandatory stopped reverse/drain remains checked and uncharged, without refund/reset.",
+    "Dispatch new purpose before every old phase guard/source alias read/stage getter/disposer. Published phases never map to3 or call raw reconcile/destruction. All old physical pointers and schema ownership must be consumed exactly once before their corresponding original credits are retired.",
+    "Phase45 must reset the reused base from the completed move prefix only after physical completion, and retire actual original three credits. Writer storage/descriptor partial refusal remains durable at46;47 requires all real obligations terminal before frame reuse.",
+    "Use actual old ncols for all old grid/name cleanup despite installing a different target width; retain shared/arena primary ownership rules and raw unconditional merge/backup owned-image rules. Keep Arrow solely in physical.schema and never reinterpret the old_schema ledger overlay.",
+    "Required finite tests retain actual original move-prefix/refusal and reverse/drain, true intermediate prepared commit stop, genuine cutoff rejection, raw-accepted Arrow/merge ownership and distinct backup provenance, postpublished physicalNULL credit/writer refusal, same canonical consumed retry without second install/touch, and actual four-profile final fit. No new matrix or fictitious primitive outcome."
+  ],
+  "limits": {
+    "source_modified": false,
+    "tests_builds_run": false,
+    "candidate_approved": false,
+    "runtime_bound_proved": false,
+    "fit_qualified": false,
+    "backend_admission_authorized": false,
+    "full_issue_complete": false,
+    "remaining": "Actual final action/source binding and four-profile layout/finite runtime qualification remain held. Full #1821 default recursive differential/observer, signed/general lanes, latest main and native Windows remain mandatory before final closing PR."
+  }
+}

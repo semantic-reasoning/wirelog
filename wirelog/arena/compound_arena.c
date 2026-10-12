@@ -524,6 +524,139 @@ wl_arena_compound_arena_gc_hold_release(wl_arena_compound_arena_gc_hold_t *hold)
     }
 }
 
+/* Forward lifecycle uses the real original tokens and meters every CAS.
+ * NULL control is reserved for checked mandatory release, never acquisition. */
+int
+wl_arena_compound_arena_borrow_acquire_controlled(wl_compound_arena_t *arena,
+    wl_compound_arena_borrow_t *borrow, wl_evaluation_control_t *control)
+{
+    if (!arena || !borrow || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if (borrow->arena || borrow->identity) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    uint64_t observed = compound_gate_load(&arena->access_gate);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (observed == WL_COMPOUND_GATE_WRITER
+            || observed >= WL_COMPOUND_GATE_READERS_MAX) return EBUSY;
+        bool acquired =
+            atomic_compare_exchange_weak_explicit(&arena->access_gate,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) {
+            borrow->arena = arena; borrow->identity = (uintptr_t)borrow;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (acquired) return 0;
+    }
+}
+
+int
+wl_arena_compound_arena_borrow_release_controlled(
+    wl_compound_arena_borrow_t *borrow,
+    wl_evaluation_control_t *control)
+{
+    if (!control) return wl_compound_arena_borrow_release(borrow) ? 0 : EINVAL;
+    if (!borrow) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if (!borrow->arena || borrow->identity != (uintptr_t)borrow) return EINVAL;
+    wl_compound_arena_t *arena = borrow->arena;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    uint64_t observed = compound_gate_load(&arena->access_gate);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (!observed || observed == WL_COMPOUND_GATE_WRITER) return EINVAL;
+        bool released =
+            atomic_compare_exchange_weak_explicit(&arena->access_gate,
+                &observed, observed - 1u, memory_order_release,
+                memory_order_relaxed);
+        if (released) {
+            borrow->arena = NULL; borrow->identity = 0;
+        }
+        /* No arena access after the decrement which can end its lifetime. */
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (released) return 0;
+    }
+}
+
+int
+wl_arena_compound_arena_gc_hold_acquire_controlled(wl_compound_arena_t *arena,
+    wl_arena_compound_arena_gc_hold_t *hold, wl_compound_arena_borrow_t *borrow,
+    wl_evaluation_control_t *control)
+{
+    if (!arena || !hold || !borrow || !control) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if ((hold->arena &&
+        (hold->arena != arena || hold->identity != (uintptr_t)hold))
+        || (!hold->arena && hold->identity)
+        || (borrow->arena &&
+        (borrow->arena != arena || borrow->identity != (uintptr_t)borrow))
+        || (!borrow->arena && borrow->identity)) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    if (hold->arena) return borrow->arena
+        ? wl_arena_compound_arena_borrow_release_controlled(borrow,
+                   control) : 0;
+    if (!borrow->arena) {
+        rc = wl_arena_compound_arena_borrow_acquire_controlled(arena, borrow,
+                control);
+        if (rc) return rc;
+    }
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    uint64_t observed = compound_gate_load(&arena->gc_hold_count);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (observed == UINT64_MAX) {
+            (void)wl_arena_compound_arena_borrow_release_controlled(borrow,
+                control);
+            return EOVERFLOW;
+        }
+        bool acquired =
+            atomic_compare_exchange_weak_explicit(&arena->gc_hold_count,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed);
+        if (acquired) {
+            hold->arena = arena; hold->identity = (uintptr_t)hold;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (acquired) return wl_arena_compound_arena_borrow_release_controlled(
+                borrow, control);
+    }
+}
+
+int
+wl_arena_compound_arena_gc_hold_release_controlled(
+    wl_arena_compound_arena_gc_hold_t *hold,
+    wl_evaluation_control_t *control)
+{
+    if (!control) return wl_arena_compound_arena_gc_hold_release(hold);
+    if (!hold) return EINVAL;
+    int rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+    if (!hold->arena || hold->identity != (uintptr_t)hold) return EINVAL;
+    wl_compound_arena_t *arena = hold->arena;
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    rc = wl_evaluation_control_charge(control, 1); if (rc) return rc;
+    uint64_t observed = compound_gate_load(&arena->gc_hold_count);
+    rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control, 16); if (rc) return rc;
+        if (!observed) return EINVAL;
+        bool released =
+            atomic_compare_exchange_weak_explicit(&arena->gc_hold_count,
+                &observed, observed - 1u, memory_order_release,
+                memory_order_relaxed);
+        if (released) {
+            hold->arena = NULL; hold->identity = 0;
+        }
+        rc = wl_evaluation_control_charge(control, 0); if (rc) return rc;
+        if (released) return 0;
+    }
+}
+
 bool
 wl_compound_arena_free_checked(wl_compound_arena_t *arena)
 {

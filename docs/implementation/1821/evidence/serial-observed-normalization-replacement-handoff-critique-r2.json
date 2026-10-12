@@ -1,0 +1,25 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/critic_1821_continue",
+  "verdict": "accepted",
+  "scope": "Narrow R2 successful-normalization provenance and abandonment correction; retained R1 handoff protocol remains binding",
+  "plan": "serial-observed-normalization-replacement-handoff-plan-supplement-r2.json",
+  "plan_sha256": "512f9cb8ea52545b5d13875621405752ef155543b363f36bf9d2d08d90ae7811",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "examined": [
+    {"paths": ["wirelog/columnar/eval_delta.c", "wirelog/columnar/eval_stack.c"], "elements": ["actual forward TS retire0 acknowledgement", "NORMALIZED/count552 TS versus count3 noTS", "before-overwrite route validation", "mandatory ABANDONED disposition"], "categories": ["unsafe state assumptions", "hidden coupling", "tests that do not prove behavior"], "ruling": "Actual TS record accessor is valid under TS_ACTIVE without requiring ready=true, so it can validate genuine successful retirement. Current forward retire sets readyfalse without NORMALIZED; current mandatory workspace drain wrongly conflates abandonment with NORMALIZED. R2 explicitly introduces healthy acknowledgement only after the real forward rc0 branch and a separate ABANDONED phase for cleanup. Existing producer-written count552 versus3 with candidate timestamp consistency provides route binding before union overwrite, not a fixture tag."},
+    {"paths": ["wirelog/columnar/memory_governor.c", "wirelog/columnar/relation.c", "wirelog/columnar/internal.h"], "elements": ["RELEASED index original state", "historical bytes/governor/owner", "completed retirement eligibility", "original handoff prefix/ref ownership"], "categories": ["unsafe lifetime assumptions", "weak failure handling"], "ruling": "Actual finish_reservation leaves historical bytes/governor/owner_bits after RELEASED while clearing transition state; the R2 validator correctly does not require EMPTY/zero historical fields or dereference old index owner. ABANDONED value7 is unused in current exact_phase namespace and is separate from borrowed_mode7. Original five candidate destinations, ref marker, partial replacement prefix and mode17 fixed transfer rules remain unchanged."},
+    {"paths": ["tests/test_evaluation_observer.c", "wirelog/columnar/eval_stack.c", "wirelog/columnar/eval_delta.c"], "elements": ["healthy TS/noTS forward entry", "normalized flag followed by real stop", "mandatory no-forward provenance", "prefix and posttransfer failure"], "categories": ["tests that do not prove behavior", "atomic scope"], "ruling": "Tests must reach real successful TS acknowledgement and separately actual stopped terminal work, not synthesize readyfalse/NORMALIZED. A stop after acknowledgement remains an error requiring mandatory abandonment/drain before fresh retry, not continued forward handoff. Current candidate or diagnostic success cannot substitute for revised source/gate evidence."}
+  ],
+  "finding_rulings": [{"id":"B1","historical_disposition":"upheld; delivered R1 blocked remains preserved","current_disposition":"resolved in R2 planning binding","reason":"Explicit forward TS consumed acknowledgement supplies the missing NORMALIZED entry, route validation precedes overwrite, and mandatory cleanup no longer manufactures healthy completion."}],
+  "findings": [],
+  "binding_requirements": [
+    "Only actual timestamp_normalize forward retire0 may invoke the new acknowledgement; no predicate-only, timestamp_retire-internal or mandatory-cleanup acknowledgement. Validate actual terminal index/accounting/writer, normalized output and sampling group before charged phase publication.",
+    "Preserve RELEASED historical token fields and validate identity/state/bytes/governor without rereleasing credit or dereferencing freed owner_bits.",
+    "Every cleanup consumer must select/accept ABANDONED after owner drain and before candidate disposal. No forward accessor or handoff accepts it, including after negative acknowledgement tail.",
+    "Require NORMALIZED plus count552/timestamps-present genuine TS or count3/timestamps-NULL genuine noTS readiness before clear; inconsistent provenance refuses unchanged.",
+    "Retain all original count<336 no-record-read, count336 initialized-prefix-only cleanup, candidate-before-transfer ownership, fixed ready-mode17 switch and actual ref obligations. Preserve positive primary and no token/phase fabrication.",
+    "Actual source-expanded new acknowledgement/transfer costs, immutable layout and reachable revised fixtures precede final candidate approval. No new matrix/path/frame is authorized."
+  ],
+  "limits": {"source_modified":false,"builds_or_tests_run":false,"implementation_verified":false,"candidate_approved":false,"backend_admission_authorized":false,"full_issue_complete":false,"remaining":"All actual caller/handoff/cleanup qualification and full #1821/latest-main/native Windows/final PR duties remain."}
+}

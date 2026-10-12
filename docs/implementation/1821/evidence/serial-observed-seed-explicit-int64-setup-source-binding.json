@@ -1,0 +1,30 @@
+{
+  "artifact_type": "source_assessment",
+  "name": "serial-observed-seed-explicit-int64-setup-source-binding",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "0dbab1befe6ac472e826d01d9e69941225f6ee9ab7416e12e4ec478faa3b37d0",
+    "wirelog/columnar/session.c": "c8310ce2349fc883187cd33259abb5a68338353a10323125107fc7d747ea481b",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "ruling": "Actual completed col_rel_set_column_types(target,&INT64,1) is legitimate internal typed-metadata provenance for separate direct explicit568 helper proof, before any control/frame/SINGLE/setup. It is not evidence that parser/decl installs explicitINT64 metadata in default generated H.",
+  "source_evidence": [
+    "session4205 detects anyFLOAT before declared-type schema installation; all-INT64 declaration alone does not guarantee column_types nonNULL. Actual H typesNULL/noTS/cap64 diagnostic disproves prior explicit premise before BEGIN; no workcost mismatch.",
+    "relation4275 setter acquires actual published writer, clears stale denial, calls real metadata preparation/install, then releases actualwriter. impl4213 reserves metadata, creates typecopy/newArrow, real token publication/oldphysical retirement, viewtouch once. prepare_column_types4167 permits populated implicitINT64 -> explicitINT64; rejects prospectiveFLOAT reinterpretation of populated implicit lanes. No manual pointer/type/token/state retag.",
+    "Setter retains actual rows/capacity and target descriptor identity, real schema/type/metadata credit now explicit; genuine newviewbaseline and metadata amount must be captured AFTER success before laterSINGLE/frame."
+  ],
+  "setup_contract": [
+    "Use actual width1 existing target with row1/cap64/noTS. Before attached control/frame, run setter0 and assert actualtypesnonNULL/typeINT64, same realrows/cap/noTS; baseline view taken AFTER setter. Setter costs/admission are setup and not refund/excluded within activeattempt.",
+    "Default untouched generated implicittarget uses564 and563 refusalat532. Separate setter-enriched helper target uses568 and567 refusalat536 with same publishersource; actual strict5 original checks still required. Preserve work93/94 failed-premise history and older actual408/404 historicalsource receipt.",
+    "Do not call setter under held SINGLE or during measured controlledattempt: raw setter loops/credit cleanup are legitimate completed fixtureconstruction only, not a bounded production path substitution. No globalschema/type policy change or claimed generated explicitINT64 provenance."
+  ],
+  "limits": {
+    "runtime_approval": false,
+    "candidate_approved": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "source_edits_builds_tests": false
+  }
+}

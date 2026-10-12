@@ -1,0 +1,59 @@
+{
+  "artifact_type": "source_readiness_assessment",
+  "name": "serial-observed-seed-lazy-footer-readiness-source-binding",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "0f117086e41c81098f4146eedb67155610b5ea1225cd70c63ef25d9371d191ca",
+    "wirelog/columnar/eval_stack.c": "370146fcfb35c56e87b800a908b78b6660310081dfd022d9e2503c8646a1202b",
+    "wirelog/columnar/internal.h": "6724992ee4b346104740399023e522ae1f4cc43e7bba49daca522f02eb2c2411"
+  },
+  "scope": "Actual typed footer before forward lazy admission/allocation, source-only. No final candidate review.",
+  "ruling": "Original-address and physical-before-credit structure is implemented; forward activation remains held until phase/scalar/current-target credit requirements below are implemented and actual fixtures reached.",
+  "implemented_source_witness": [
+    "relation7996 typed footer receives actual seed from frame-owned caller; compares bulk.borrowed.single/lease exactaddresses against seed.single before model-sensitive lease/set validation. Terminal39/context-free dead partial handling does not dereference deadborrowedpointer.",
+    "Unpublished physical cleanup uses owned_columns and namesbase decrement journals before tails; frees grid/name/scratch/newTS pointers and releases preparedArrow before phase42. Installed branch releases original oldTS/oldArrow then phase38; real checked credit operations follow physicalNULL.",
+    "Fresh payload/meta reverse uses actual original current/fresh/previous slots with state/identity/quantity checks and checkedmoves, preserving RELEASEDhistory. Embeddedgrowth REPLACING invokesrollback_growth; COMMITTED branch onlydownsizesafterNULL. Originalreleased/newslot neverinitialized to manufacture reverse destination.",
+    "Generic mode8 model-sensitive context refusesEBUSY; actual seed_restore_retire routes through typedfooter before SINGLE and flat teardown. Current lifecycle prefix32/39 contracts and no-reserve rowpublisher remain separate."
+  ],
+  "concrete_required_bindings": [
+    {
+      "id": "F1",
+      "subject": "Installed current-target accounting before terminal39",
+      "actual_gap": "For installed fresh branch current footer releases previous/old_metadata but does not independently validate actual dst new retained credit/F or metadata credit/N; growth branch validates retained goal but likewise omits current new metadata. It may mark39/inactive and release SINGLE while a malformed embedded new target identity/amount is present. Historical fiveBULK terminal checks cannot establish targetcredit authority.",
+      "required": "Before marking terminal39 validate actual installed target retained_reserved_bytes equals finalF (growthscalarupdated onlyafterrealdownsize) and metadata_reserved_bytes equals metadataN. Positive governed F/N requires exact embeddedoriginal self/governor/bytes/stateCOMMITTED/ownerdst/replacement0/transitionNONE, following actualpublication contract. For governedzero require precise terminal original disposition from realmove/release/no-admission; for ungovernedtarget creditedscalars0 and actual NULL-or-self EMPTYzero affiliation, not physicalF/N positive ascredit. Do not release live installedtargetcredit to fixmismatch. Refuse/retain original consumedphase/SINGLE/frame; restore genuine identity scalaronlypostreturn thentruecheckedretry. This is narrow footer validation, not newstorage/creditpolicy."
+    },
+    {
+      "id": "F2",
+      "subject": "Forward scalar/phase table must match actualfooter",
+      "required": "Set raw oldO/M unchanged beforeinstall; newF=final_bytes, N=metadata_bytes, I=pending.incoming_bytes. Maintain pending.growth as actualroutewitness aftercommituntilfooter settles. Beforeinstalledscalaroverwrite saveO toborrowed.metadata_after. Commit/move phases33/34/35/36/40/41, install37/oldretire38/physicaldone42 must be realeffects. bulk.published true exactly37/38; seed.published remains row-levelfalse until laterappend, while original set.published marks consumed schema to prevent owner-initialization rollback."
+    },
+    {
+      "id": "F3",
+      "subject": "Partial physical ownership before actualallocation",
+      "required": "Footer validates owned_columns<=count<=ncols andbase<=ncols beforearrayaccess. Forward must publish table NULLinitcount and allocated-lane owned_columns separately; each allocated lane slot nonNULL untilrealfree anddecrement. Namebase currently physicaldisposalprefix may include initializedNULL nameentries according acceptedtable; do not falsely claim everynameallocated. prepared_row_scratch/names aliasfields cannot simultaneouslycarry types/lengthcache; preparedTS cannotpoint toborrowedoldTS. prepared_schema flag means realrelease-safe partialtree. No workspaceclear whileanypointer/credit/livelease remains."
+    },
+    {
+      "id": "F4",
+      "subject": "Scratch and fresh-zero strictness",
+      "required": "Originalscratch stays trueEMPTY inlazy; no rawscratchcreditinvented. Footer final5slotvalidator may accept legitRELEASEDhistory after realretirement, but forwardallocator/admission muststartstrictEMPTY atall5. token.bytes0 alone cannotproveinert. Originaltarget oldpositive states preserve raw RESERVEDowner0 versusCOMMITTEDdst whereactualmovepermits; embeddedgrowth startsactualCOMMITTED O>0. Never fabricatefreshstate or positive creditedscalarundergovernorNULL."
+    },
+    {
+      "id": "F5",
+      "subject": "Healthy / mandatory disposition",
+      "required": "Forwardhelper on any realstop/positivevalidationrefusal invokes typedmandatoryfooter withhealthyNULL, preserving actualprimary. Healthy explicitretirement maycharge128/16 perphysloop/64finalgroup andzero-costtails; Arrowcallback cleanup exclusion remainsnarrow. Anegativehealthy tail mustbe returned evenifsubsequentmandatorydrain succeeds. Footer onlyphase39 terminalmayrelease outerSINGLE; no row/schema replay afterconsumedinstall."
+    }
+  ],
+  "next_sequence": [
+    "Implement F1 exact installed-targetvalidation/disposition and bind actual F2/F3 scalar/prefix contracts before lazy forward publishes or permits resourceownerstates. No extrafield/frame/pathrequired by these checks.",
+    "Then actual metadatafirst admission,rawordered physicalbuilder,two-passArrow,payloadcommit\u2192metacommit\u2192preadmittednativeinstall canuse typedfooter. Anyallocationstage must prove originalpartial/pointer readiness beforepoll; anyacceptedcommit must proveactualrollback/downsize/moveprefix beforelatercutoff.",
+    "First actualfixtures should reach unpublishedRESERVED/FRESHCOMMITTED/growthCOMMITTEDlatermeta cancellation, actualoriginalmove-prefix refusal, installedembeddednewtargetidentity-only refusal, oldcreditphysicalNULLrefusal, and realnoGovzero. Do not populatepurposebywriting fakephase/token states. Exactcost/action and all4originaldefinitionfitrebind arestillactualfuturegates."
+  ],
+  "limits": {
+    "source_edits_builds_tests": false,
+    "runtime_or_candidate_approval": false,
+    "backend_admission_ready": false,
+    "full_issue_complete": false,
+    "resources": "Unwaived histories; authorbuild156 diagnostic is not qualification from thisassessment."
+  }
+}

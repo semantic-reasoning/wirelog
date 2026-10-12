@@ -1,0 +1,21 @@
+{
+ "artifact_type":"critique_findings","producer":"/root/critic_1821_continue","verdict":"accepted",
+ "scope":"Corrected narrow source arithmetic and fixture boundary contract only",
+ "plan":"serial-observed-seed-gather-exact-cost-intake-r2.json","plan_sha256":"c8c246065d159c8664274643fed1a91ecce3d7901b1652fc2c8d448d3c050e02",
+ "base_commit":"4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+ "examined":[
+  {"paths":["wirelog/columnar/relation.c:6174","wirelog/columnar/relation.c:6450","wirelog/columnar/relation.c:6540","wirelog/evaluation_control.c:198"],"elements":["correct charge0 tails","acquire56/release57","final16 rejection versus actual postCAScancel","weak retry16"],"categories":["incorrect arithmetic remediation","weak stop provenance"],"ruling":"R2 resolves actual B1: work_tail contributes0; pair56/release57 and totalS+463 are consistent with actual explicit debits. F999 exact first-try succeeds; F-1=998 refuses final16 before descriptor CAS at consumed983, with storage already terminal and descriptor held. A post-terminalization negative tail is genuine callback cancellation, not a budget-only case. Weak failed CAS contributes16, not32."},
+  {"paths":["wirelog/columnar/eval_stack.c:1211","wirelog/columnar/eval_stack.c:882","wirelog/columnar/eval_delta.c:1203","wirelog/columnar/join.c:1250","serial-observed-seed-gather-exact-cost-intake-r2.json"],"elements":["completed setup exclusion","real registry3/name lengths","one row one column","helper scope and immutable history"],"categories":["fixture provenance","hidden setup cost","atomic scope"],"ruling":"Other unchanged source terms remain224+S,24,11,16,50,25. Separate completed CONTROL setup must retain true EVALUATION frame rather than RETIRED retag or measured acquisition. Real A,H,$in$H order is asserted, not forced. Source helper suffix excludes target append, frame finish, STEP and callbacks. Preserving wrong R1 and blocked critique avoids retroactive qualification."}
+ ],
+ "findings":[],
+ "prior_finding_rulings":[{"id":"B1","historical_disposition":"upheld R1 blocked; original false1112 and budget tail/retry assumptions preserved","current_disposition":"resolved by R2 corrected source algebra and actual boundary/cancellation separation; not runtime proof"}],
+ "accepted_source_formula":{"full":"S+463","S536_full":999,"before_final_descriptor_CAS":983,"final_charge":16,"F_minus_one_consumed":983,"failed_weak_CAS_extra":16},
+ "binding_requirements":[
+  "Fresh genuine completed CONTROL setup for each exact/repeat/minusone trial, true original EVALUATION frame and actual three-slot registry. If actual changed registry or source trajectory violates premise, derive source difference before literals; no forced contents or observed rebasing.",
+  "At998 assert original descriptor-only remaining pin, real consumed983 and checked mandatory drain; never assert inert pair or an extra16 debit after successful CAS. Pure allowance983..998 shares the same indivisible16 slack.",
+  "Real existing post-single-reader-release cancellation separately proves original token terminalization before negative charge0 tail. No synthetic status or token mutation and no forward SINGLE permission after stopped gather.",
+  "First-try exact trajectory is scoped to isolated strong-CAS path, not unconditional MSVC weak-CAS or concurrency guarantee. Each real retry must remain charged/polled, with honest nativeWindows validation later.",
+  "Current mutable-source binding is not final formatted candidate approval. Actual source cost and setup invariants must be rebound to frozen candidate, and runtime exact/repeat/minusone proof must follow. All parent ownership, target preparation, backend/fullissue gates remain unchanged."
+ ],
+ "limits":{"source_modified":false,"tests_builds_run":false,"runtime_qualified":false,"candidate_approved":false,"backend_admission_ready":false,"full_issue_complete":false,"historical_resource_deviations":"unwaived"}
+}

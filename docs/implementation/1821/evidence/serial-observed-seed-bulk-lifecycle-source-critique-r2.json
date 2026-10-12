@@ -1,0 +1,74 @@
+{
+  "artifact_type": "critique_findings",
+  "producer": "/root/implement_serial_attempt_1821/critic_seed_bulk_r2",
+  "verdict": "accepted",
+  "scope": "Narrow R2 original BULK lifecycle/source provenance binding only; no implementation, candidate, runtime, whole STEP or admission approval.",
+  "plan": "/home/joykim/.tmp/1821-work/serial-observed-seed-bulk-lifecycle-source-binding-r2.json",
+  "plan_sha256": "f34c54508e789565bd58bd8b806da0e1bb1c83c736a73fc736a903df7fbc7866",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "base_verified": true,
+  "all_four_source_hashes_verified": true,
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "6c0c8e70fd2b1c2546b6acbf7a13362001828a39c0cd659b8d801bea3f556b6f",
+    "wirelog/columnar/eval_stack.c": "04295c8094bbdd140748497c0b62767c946210513e6b8cf7a73a5847a37e1a1d",
+    "wirelog/columnar/internal.h": "a1c999783ffa41765fbc0777e636cb9abb1ff25198c93f67e991cc608579b2fc",
+    "wirelog/columnar/eval_delta.c": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e"
+  },
+  "full_read": [
+    "serial-observed-seed-bulk-lifecycle-source-binding-r2.json",
+    "serial-observed-seed-bulk-lifecycle-source-critique.json",
+    "serial-observed-seed-lazy-reverse-plan-supplement.json",
+    "serial-observed-seed-single-plan-supplement.json"
+  ],
+  "examined": [
+    {
+      "paths": ["wirelog/columnar/eval_stack.c:501", "wirelog/columnar/relation.c:11088", "wirelog/columnar/relation.c:13274", "wirelog/columnar/relation.c:14276", "wirelog/columnar/relation.c:11038"],
+      "plan_elements": ["Five token origins", "Bounded new-purpose initialization", "acceptance_addendum"],
+      "categories": ["hidden reuse coupling", "unsafe partial initialization provenance", "tests that could miss real stopped reuse"],
+      "ruling": "Accepted. Actual constructor marks ready without initializing these five tokens. Actual generic initialization order is scratch, metadata_pending, old_metadata, previous, pending.fresh; actual terminal cleanup leaves initialized_tokens unchanged. R2 adopts that same order and independently validates suffix storage as constructor-zero or genuine self-terminal historical storage. This fixes R1 B1 without deriving suffix lifetime from prefix count or repairing live identity. Real generic first-token stop/cleanup and complete-then-partial reuse are required acceptance cases."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:10835", "wirelog/columnar/relation.c:10522", "wirelog/columnar/internal.h:3784", "wirelog/columnar/internal.h:3826"],
+      "plan_elements": ["Prior BULK terminal proof before alias read", "Activate before first fallible initialization", "phase32 partial disposer", "bulk_append_retire mapping"],
+      "categories": ["unsafe union alias interpretation", "weak failure handling", "purpose lifetime coupling"],
+      "ruling": "Accepted. Current generic retire returns on inactive before discriminant handling, then rejects mode>5; the proposed mode8 dispatch must precede both. Original borrowed.single/lease overlay source-group bytes, while mode and prefix remain outside the union. R2 proves actual generic group/gates terminal before overlay and prevents generic source/schema/compact interpretation afterward. All five slots are proved dead before new-purpose init; prefix publication precedes polls, suffix terminal provenance survives a stop, and no physical owner or reservation begins before prefix5. Mode8 remains until a dedicated terminal proof, including inactive records. Generic bytes-only retire/reset is explicitly excluded from this footer."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c:735", "wirelog/columnar/relation.c:7734", "wirelog/columnar/relation.c:7840", "wirelog/columnar/relation.c:12324", "wirelog/columnar/eval_stack.c:1079", "wirelog/columnar/eval_stack.c:1248", "wirelog/columnar/eval_stack.c:2197", "wirelog/columnar/internal.h:4740"],
+      "plan_elements": ["Original outer purpose", "outer_consumer_mapping", "first_subset_and_holds"],
+      "categories": ["hidden authority coupling", "unsafe cleanup lifetime", "over-broad change boundaries"],
+      "ruling": "Accepted. R2 validates actual SINGLE geometry and acquired prefixes before original lease validator use; the validator itself traverses set arrays and checks original descriptor/owner gates and generations. Incremental helper instead expects original two-role arrays and cannot act as a SINGLE adapter. Existing seed retire already drains BULK before SINGLE and flat rows; R2 retains that ordering and closes getter/reinitialize paths against pending mode8. Retired source reader and immutable dimensions/flat input remain a precondition. Initial unchanged private no-replacement behavior is a bounded implementation unit; growth/lazy/TS/COW/arena and final admission remain held dependencies."
+    },
+    {
+      "paths": ["wirelog/columnar/relation.c", "wirelog/columnar/internal.h:3839", "wirelog/columnar/memory_governor.c:528", "wirelog/columnar/memory_governor.c:1524", "wirelog/columnar/memory_governor.c:1590", "wirelog/columnar/memory_governor.c:1598", "wirelog/columnar/memory_governor.c:1621", "tests/test_evaluation_observer.c", "docs/SEMANTICS.md"],
+      "plan_elements": ["phase_consumer_table32-42", "Metadata/payload shape", "no_governor_zero_domain", "truthful acceptance cases"],
+      "categories": ["unsafe publication/accounting coupling", "weak reverse refusal handling", "fixtures that would pass without real transitions"],
+      "ruling": "Accepted as source binding to the separately accepted reverse plan. Actual move preserves RESERVED/COMMITTED state and owner, leaving source selfEMPTY; growth commit clears overlap and makes COMMITTED O+I, so later cancellation requires downsize to O rather than rollback_growth. R2 distinguishes accepted/moved prefixes40/41, phase42 physicalNULL, and installed consumed37-39; it preserves O/M until fixed install and original route/identities on refusal. Old Arrow aliases compact ledger, which is expressly excluded in lazy phases. RELEASED history remains terminal rather than reset during reverse. NoGovernor target-null identity is restricted to exact zero-credit original target; BULK initialized tokens stay self. Raw positive physical size does not fabricate positive noGovernor credit. These clauses require later genuine reached-state proof, not scalar phase or token fabrication."
+    }
+  ],
+  "findings": [],
+  "historical_r1": {
+    "plan_sha256": "fec225cc09d31fab05988232540e095a458a31cd63143345aaa1baec19c1d80b",
+    "critique_path": "/home/joykim/.tmp/1821-work/serial-observed-seed-bulk-lifecycle-source-critique.json",
+    "critique_sha256": "c6fdcc7115be648182895c5fece0a6bf4ae84ab8bd29f7f899861163aa6f4c6d",
+    "verdict": "blocked",
+    "B1": "Upheld for R1 unchanged. R2 resolves the binding by scratch-first initialization and individually validated newborn/reused suffix provenance; acceptance of R2 does not rewrite the historical defect."
+  },
+  "binding_requirements": [
+    "Acceptance attaches to the exact R2 bytes and verified source/base above. Preserve all activation/phase/consumer clauses; no general approval of future implementation.",
+    "Mode8 dispatch and dedicated inactive-purpose proof precede generic inactive success, mode>5 rejection and every source/schema/compact alias read.",
+    "Validate all original prior group/gates/physical/token obligations before overlay or new-purpose init. Partial init suffix is individually dead with real prior provenance; prefix count is not whole-slot lifetime evidence.",
+    "Keep original SINGLE and flat input alive until every borrowed physical/credit footer is terminal; no authority copies, early clear, generic reset during reverse, or source-union repair.",
+    "Required runtime witnesses must use production initialization and real admission stop/cleanup/reuse. Reverse witnesses must arise from actual commits/moves and physicalNULL with saved scalar identity restoration only after host return.",
+    "Source-derived finite action/work literals, actual four-profile fit and current runtime/final review remain required before their respective gates. No new compile/test/runtime evidence is asserted by this critique."
+  ],
+  "limits": {
+    "source_modified": false,
+    "tests_builds_run": false,
+    "runtime_or_candidate_approved": false,
+    "backend_admission_ready": false,
+    "whole_STEP_qualification": false,
+    "full_issue_complete": false,
+    "historical_resource_deviations": "unwaived"
+  }
+}

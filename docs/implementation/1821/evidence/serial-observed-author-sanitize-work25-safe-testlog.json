@@ -1,0 +1,9 @@
+[
+  {
+    "name": "unit - wirelog:evaluation_observer",
+    "result": "TIMEOUT",
+    "returncode": -15,
+    "stdout": "",
+    "stderr": null
+  }
+]

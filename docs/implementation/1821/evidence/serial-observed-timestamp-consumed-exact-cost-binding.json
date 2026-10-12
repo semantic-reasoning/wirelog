@@ -1,0 +1,79 @@
+{
+  "artifact_type": "source_derived_exact_cost_binding",
+  "producer": "/root/architect_reduce_final",
+  "base": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "parent": "serial-observed-normalization-replacement-handoff-plan-supplement-r2.json",
+  "scope": "Implemented TS forward consumed acknowledgment and mandatory abandonment discriminator only; replacement handoff not implemented/approved here.",
+  "ruling": "Source binding coherent for this narrow acknowledgment. Actual normalizer calls timestamp_retire and returns any nonzero result before acknowledgment; only genuine forward retire0 reaches consumed helper. Mandatory workspace retirement selects ABANDONED after true drain, never healthy NORMALIZED. No final design/runtime approval.",
+  "source_anchors": [
+    {
+      "path": "wirelog/columnar/eval_stack.c",
+      "anchors": "876-935",
+      "function": "wl_columnar_eval_stack_cleanup_observer_timestamp_consumed",
+      "fact": "Main128 validation, two original group-slot64 validations, terminal16 admission/poll, one outside phase store and zero-work tail."
+    },
+    {
+      "path": "wirelog/columnar/eval_delta.c",
+      "anchors": "3579-3586",
+      "fact": "normalizedtrue before algorithm tail; real retire0 required before consumed helper. Failure prior to acknowledgment does not claim consumed success."
+    },
+    {
+      "path": "wirelog/columnar/eval_stack.c",
+      "anchors": "1011-1044",
+      "fact": "Original borrowed group drains first; TS/CONS retire failures retain original active purposes. Success mandatory drain maps ACTIVE and prior NORMALIZED to ABANDONED, then dedicated completed-candidate disposer."
+    },
+    {
+      "path": "wirelog/columnar/relation.c",
+      "anchors": "13306-13318",
+      "fact": "Original completed disposer accepts ABANDONED via same actual candidate ownership/gate validation, no generic destructor."
+    },
+    {
+      "path": "wirelog/columnar/internal.h",
+      "anchor": "4797",
+      "fact": "ABANDONED7 is an existing outside exact_phase value, no new field/frame."
+    }
+  ],
+  "formula": {
+    "main_validation": 128,
+    "original_group_slots": "2*64=128",
+    "terminal_store_admission": 16,
+    "helper_total": "A=128+2*64+16=272",
+    "zero_work_tails": "All helper charge0 calls contribute0; actual record getter and private_batch_disposable used here have no evaluation-control charges. No allocation/move/reserve/release helper is called inside consumed acknowledgment.",
+    "full_normalizer_delta": "Actual normalizer success adds272 after its existing true timestamp_retire costs. This receipt does not derive total normalization/constructor/sampling/restore/backend work."
+  },
+  "fixed_actions": {
+    "store": "bulk.exact_phase=NORMALIZED",
+    "stores": 1,
+    "admission": 16,
+    "order": "charge16 then charge0 before one fixed store, then charge0 tail. No fallible transition within the store itself. Main/group validations are charged blocks <=128 with real zero-work tails between blocks.",
+    "provenance": "Existing outside count552 is unchanged. Released index bytes/governor are compared against actual original extent/session; no owner_bits0 or EMPTY-looking token assumption. Candidate remains original frame.result/BULK.dst owned pointer and actual embedded credit/reference owner."
+  },
+  "exact_cutoff_binding": [
+    "For isolated actual consumed-helper trajectory with correct original completed TS state established in a separately labelled setup: exact272/repeat272 returns0 with actual NORMALIZED/count552 if no cancel/fault. This is helper-only phase proof, not fresh normalization/backend total.",
+    "A-1=271 consumes256 through main128 and both group64 validations, then actual16 admission fails; outside phase remains TS_ACTIVE and original candidate/index terminal record unchanged. Mandatory retirement then selects ABANDONED before checked candidate disposal.",
+    "Budgets128/192/256 correspond completed main/first-group/both-group validation blocks respectively, and fail at next64/64/16 admissions. No partial charge consumption or measured rebasing.",
+    "A genuine cancellation at the final post-store tail may return negative with NORMALIZED alreadystored; actual mandatory workspace-retire mapping to ABANDONED prevents later healthy handoff. This is no canonical publication/observer event acknowledgment."
+  ],
+  "disposition_limits": [
+    "A nonzero actual timestamp_retire means no consumed-helper call, even if normalizedtrue/readyfalse later appears after mandatory drain. Do not infer completion from physicalNULL or flag alone.",
+    "ABANDONED is forward-ineligible; TS and noTS handoff route validation and partial336 token-prefix cleanup remain separate accepted R2 implementation obligations. No evidence of their execution in this receipt.",
+    "Positive primary must dominate original cleanup refusal; actual original identity/gate fault runtime and final finite qualification remain required. Source examination does not attest tests passed or layout freshly compiled."
+  ],
+  "limits": {
+    "source_mutated": false,
+    "tests_builds_run": false,
+    "observed_totals_used": false,
+    "candidate_approved": false,
+    "runtime_claim": false,
+    "full_issue_complete": false,
+    "source_mutable": true,
+    "final_frozen_binding_required": true,
+    "layout": "Definitions retain original552 workspace/TS360/BULK1088/fullframe3864/completion80; no independent fit run here."
+  },
+  "source_hashes_read": {
+    "wirelog/columnar/eval_stack.c": "ecfff78954c0a25a8e60269640be58b278c32acb9643baaa8bf22785911cbe98",
+    "wirelog/columnar/eval_delta.c": "210d6add4eb62b68fdb5c37ab89c7331d3195caea96906124a81c4f262fea3f1",
+    "wirelog/columnar/relation.c": "02bab3f2c48b2cc0f7be8f4a693b60553e63ac8b9410d532d60677bf700bacbb",
+    "wirelog/columnar/internal.h": "71c8688e79d4552dc5875b1542d1ca207c74d082019fdd27f51bb66bd5f2d6cb"
+  }
+}

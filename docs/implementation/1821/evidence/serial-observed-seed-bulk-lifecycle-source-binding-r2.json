@@ -1,0 +1,130 @@
+{
+  "artifact_type": "implementation_plan",
+  "name": "serial-observed-seed-bulk-lifecycle-source-binding-r2",
+  "producer": "/root/architect_reduce_final",
+  "base_commit": "4e2e1272189921bd4b3d8ab167517c6d52ecc81c",
+  "status": "source_binding_requires_distinct_critique",
+  "source_hashes": {
+    "wirelog/columnar/relation.c": "6c0c8e70fd2b1c2546b6acbf7a13362001828a39c0cd659b8d801bea3f556b6f",
+    "wirelog/columnar/eval_stack.c": "04295c8094bbdd140748497c0b62767c946210513e6b8cf7a73a5847a37e1a1d",
+    "wirelog/columnar/internal.h": "a1c999783ffa41765fbc0777e636cb9abb1ff25198c93f67e991cc608579b2fc",
+    "wirelog/columnar/eval_delta.c": "0a43d4b062af24e44f50424034584ee080f86ab8580dd0f2983897e0c8d19d6e"
+  },
+  "allowed_paths": [
+    "wirelog/columnar/relation.c",
+    "wirelog/columnar/eval_stack.c",
+    "wirelog/columnar/internal.h",
+    "wirelog/columnar/eval_delta.c",
+    "wirelog/columnar/session.c",
+    "tests/test_evaluation_observer.c",
+    "docs/SEMANTICS.md"
+  ],
+  "parents": [
+    "serial-observed-seed-target-branches-plan-supplement.json",
+    "serial-observed-seed-lazy-schema-plan-supplement.json",
+    "serial-observed-seed-lazy-reverse-plan-supplement.json",
+    "serial-observed-seed-single-plan-supplement.json"
+  ],
+  "source_findings": [
+    "eval_stack constructor501 sets BULK.ready=true after whole frame zero; it does NOT imply five original token identities initialized or initialized_tokens5. Newborn original BULK is ready, inactive, zero prefix, zero NULL-identity slots. Distinguish this from a genuinely initialized reused BULK.",
+    "relation10835 generic retire dispatches DETACH6 then rejects borrowed_mode>5. Add mode8 dispatch before that refusal AND before any generic sources/schema_install/compact/metadata interpretation. Inactive mode8 still requires dedicated terminal validation, not generic inactive-success bypass if any held purpose remains.",
+    "relation10522 generic bulk_retire_token tests bytes, releases then reservation_init; this skips malformed zero slots and erases RELEASED history. It is not the selected reverse footer. Do not call it for still-live/moved seed credit or assume bytes0 proves inert.",
+    "relation12324 incremental reserve validates two-role arrays/leases and applies different guard/scalar policies. New original seed route validates actual SINGLE and preserves separately accepted private/lazy/COW/arena branch ordering; no two-role adapter or unchanged helper substitution.",
+    "internal BULK borrowed.single offset0 and lease offset8 alias original sources region, so source-group terminal proof must precede overlay. pending.fresh,metadata_pending,old_metadata,previous,scratch remain separate original outside slots; old_schema aliases compact_retired and forbids using compact ledger in lazy phases.",
+    "relation11088,13274,14276 actual generic initializers use scratch,metadata_pending,old_metadata,previous,pending.fresh. Generic retirement can set activefalse while preserving initialized_tokens partial prefix. Count describes last initializer progress, not every slot lifetime: suffix may retain genuine self-terminal from an earlier purpose."
+  ],
+  "activation_table": [
+    {
+      "step": "Original outer purpose",
+      "binding": "Require actual external mode19, payload_ready, original seed record ready/active phase11; complete seed reader terminal, dimensions/flat input valid, original single acquired and live. Expected dst must equal record.dst. Validate exact SINGLE set/self pointers, single descriptor relation/writer, owner array and acquired counts<=2, initialization journal, single.lease identity/address=&single.lease and its actual set/ref/generation/role via original finite lease validator. No lease copy. Bulk borrows gates only; never releases them."
+    },
+    {
+      "step": "Prior BULK terminal proof before alias read",
+      "binding": "Inspect external borrowed_mode, ready, active, initialization prefix FIRST. With mode0 generic sources region still valid, verify actual descriptor/owner/group held flags and every original reader/writer terminal under bounded slot validation; with existing8 use dedicated terminal proof and never reinterpret it as sources. Verify no owned pointers/Arrow flags/active growth/pending transaction/journal/reverse obligations, no scalar prior-purpose published status used as new publication. Prior purpose must be truly retired before reactivation."
+    },
+    {
+      "step": "Five token origins",
+      "binding": "Use fixed existing generic order scratch, metadata_pending, old_metadata, previous, pending.fresh ALSO for seed mode8. Require initialized_tokens<=5. For prior mode0, interpret prefix in that actual generic order: initialized prefix identities must be self with true EMPTY zero affiliation or legitimate RELEASED historical terminal disposition. Each suffix may be actual constructor-zero NULL identity/stateEMPTY/zero affiliation, OR genuine self-terminal retained from a previous fully disposed purpose; validate its actual state/identity/affiliation rather than infer newborn from count. Reject any live RESERVED/COMMITTED/REPLACING, malformed identity, hidden overlap/transition or false zero-byte owner. Count0 does not prove every slot NULL; count1 specifically identifies scratch, not fresh. Original frame origin and prior-mode terminal gates/physical proof establish lifetime; no fabricated token repair."
+    },
+    {
+      "step": "Activate before first fallible initialization",
+      "binding": "Charge/prevalidate finite activation, then write external borrowed_mode8, exact_phase32, schema_install as selected actual lazy branch, dst/identity/generation and exact original single/lease pointers; set active before first token-init tail. Overlay original source bytes only after previous-group terminal proof. All physical owner pointers remain NULL and ready still identifies original BULK readiness; initialized_tokens separately identifies safe token prefix. Dedicated disposer can retain partial init without reading nonexistent schema/tree or token suffix. Seed uses the SAME scratch-first order, so no new ordering discriminator is needed, but mode8 remains through partial initialization/retirement until all obligations terminal; never relabel it mode0 merely because activefalse."
+    },
+    {
+      "step": "Bounded new-purpose initialization",
+      "binding": "After full prior physical/group/token terminal proof, begin dedicated mode8/prefix0 and initialize each genuine dead original token in scratch,metadata_pending,old_metadata,previous,pending.fresh order, publishing prefix immediately before poll. During this new-purpose prefix the suffix retains its individually validated prior terminal provenance (NULL newborn or self-terminal), so custom disposer must not assume all suffix NULL. No reserve/malloc/Arrow owner before prefix5. Never normalize/repair token identity during validation or reverse; accepted new-purpose initialization is only of already-proved dead storage. Partial init stop retains external mode8 and original prefix, no live token/header reset."
+    },
+    {
+      "step": "Metadata/payload shape",
+      "binding": "New metadataN=metadata_bytes; finalphysicalF=final_bytes; growthincomingI=pending.incoming_bytes. Lazy prospective timestampcapacity=ledger_timestamps, not compact scalar. Old amountsO/M remain dst retained/metadata scalars unchanged until fixed install, protected by SINGLE. Immediately before fixed install saveO in existing borrowed.metadata_after (lazy-only; not COW metadata purpose), then update actual target quantities as accepted plan. No governorNULL with positive credited scalar invented."
+    }
+  ],
+  "phase_consumer_table": [
+    {
+      "phase": "32 PREPARING / token prefix0..5",
+      "binding": "Validate mode8/schema purpose and prefix<=5 before union use. Scratch-first prefix slots have actual initialized self identity; suffix slots remain individually validated prior terminal origins and cannot hold a new resource beforeprefix5. Physical ownership begins onlyafter5. Dedicated partial typed disposer validates prefix and allowed dead suffix before purpose retirement, no inactive generic bypass. Physical count/owned_columns/base are independent of authority initialization prefix; actual pointer NULL precedes credit."
+    },
+    {
+      "phase": "33 PAYLOAD_ACCEPTED",
+      "binding": "Fresh genuine COMMITTED at pending.fresh versus growth embedded COMMITTED O+I are distinct original routes. Keep growth route discriminator through footer. New physical still original prepared pointers; descriptor unchanged. Before commit REPLACING is checked rollback_growth only; after actualcommit downsizeO only after newphysicalNULL."
+    },
+    {
+      "phase": "40 OLD_PAYLOAD_MOVED /34 PAYLOAD_TRANSPORTED",
+      "binding": "40 acknowledges actual old->previous and target selfEMPTY;34 acknowledges actual fresh->target. Exact source/destination original identities/state/quantities validated before move; each effect phase stores before fallible tail. Reverse new target->fresh then previous->target (only actualpositiveold); retain current phase on refusal, never reservation_init to restore."
+    },
+    {
+      "phase": "35 METADATA_ACCEPTED /41 OLD_METADATA_MOVED /36 METADATA_TRANSPORTED",
+      "binding": "35 actual newpending COMMITTED;41 actualold->old_metadata and targetselfEMPTY;36 actualnew->target. M unchanged beforefixedinstall. Reverse targetnew->pending then old->target using original truth; new RESERVED rollback vs COMMITTED release separate, physicalmetadataNULL first."
+    },
+    {
+      "phase": "42 NEW_PHYSICAL_RETIRED unpublished reverse",
+      "binding": "Only after allnewphysicalNULL/Arrow flagsfalse. Original tokenstate/amount/owner+growthroute+oldscalarO/M identify remaining exact checked move/downsize/release. Retain original lease/writer/frame on refusal, including no-byte malformed original identity. No target generation/model publication or synthetic forced owner state."
+    },
+    {
+      "phase": "37 SCHEMA_INSTALLED /38 OLD_RETIREMENT /39 SCHEMA_RETIRED",
+      "binding": "Published target consumed; no restoreO/M or reinstall. Old physicalNULL then old previous/metadata retirement, growthC=O+I downsizeF after actualoldphysicalNULL. Footer refusal retains published marker and original SINGLE. Terminal39 means allowned old/new slots settled; only then returnBULK to new append purpose. Seed row publication is separately consumed, not implied by schema publication."
+    }
+  ],
+  "outer_consumer_mapping": [
+    "bulk_append_retire: scoped8 before generic>5 and alias use. Dispatch validates actual owner purpose regardless active scalar, retains exact original credit prefix onfalse.",
+    "seed_restore_retire: drains8 first then original SINGLE; reader/flat image cannot retire while any borrowedBULK forward/drain may reference them. Exact positive primary preserved; healthy negative tail propagated even after successful mandatory cleanup.",
+    "workspace_retire/cleanup_retry/frame destroy mode19 remain outer discriminant; no generic result/source-group disposal reads over borrowed.single. cleanup_seed_single refuses live reader and initialized/current purpose; cannotclear live borrowed SINGLE.",
+    "All bulk getters/resume/reinitialization require terminal8 proof, not merely !active or old ready5. No clearing source union/token storage on a failed move."
+  ],
+  "no_governor_zero_domain": [
+    "Original target governorNULL implies credited O/M0 for this real branch; raw physical quantity remains distinct and maypositive. Actual ungov embedded NULLidentity only allowed exact original target slot, stateEMPTY/zeroaffiliation, amount0. Five dedicated BULK tokens remain initializedself; never manufacturepositive scalar noGov test state.",
+    "Actual F0/N0 no-credit operations have no reserve/commit/move/release; preserved carried target physical cannot be retired merely to satisfyzero. Governed oldpositive with freshquantity0 is separate oldcredit retirement after realphysicalNULL. No growthO0 admission (actual begin choosesfresh)."
+  ],
+  "first_subset_and_holds": [
+    "Implement dedicated lifecycle activation/partial-prefix/terminal/drain machinery and unchanged no-replacement established private target validation/copy without claiming all reserve branches. Supported pending growth/lazy/TS/COW/arena remain held until their exact original physical/credit order implemented and proven, not permanent rejected lanes.",
+    "Before lazy commit/transport implementation follow accepted phase32..42 reverse table and actual readonly/held guards; do not call incrementalreserve with compoundENOTSUP, automatic pointers, early scalarupdate or aborting generic token retirement.",
+    "Actual original536/BULK1088/frame3864/completion80 fit is prior author structural proof, not fresh independentcompile. Source-algebra and action-count binding required before exact literals. Existing gatherF999 proof is helper-only and excludes subsequenttarget purpose."
+  ],
+  "limits": {
+    "source_only": true,
+    "runtime_approval": false,
+    "backend_admission_ready": false,
+    "whole_STEP_qualification": false,
+    "full_issue_complete": false,
+    "no_builds_tests_edits": true,
+    "resource_history": "Unwaived."
+  },
+  "revision": 2,
+  "historical_r1": {
+    "path": "/home/joykim/.tmp/1821-work/serial-observed-seed-bulk-lifecycle-source-binding.json",
+    "sha256": "fec225cc09d31fab05988232540e095a458a31cd63143345aaa1baec19c1d80b",
+    "verdict": "blocked",
+    "finding": "B1 upheld. Proposed universal pending.fresh-first prefix and newborn-only suffix assumption contradicted actual generic scratch-first stopped/reused state; R1 preserved unchanged."
+  },
+  "critique_full_read": {
+    "path": "/home/joykim/.tmp/1821-work/serial-observed-seed-bulk-lifecycle-source-critique.json",
+    "sha256": "c6fdcc7115be648182895c5fece0a6bf4ae84ab8bd29f7f899861163aa6f4c6d",
+    "ruling": "B1 upheld; choose existing generic scratch-first order for seed, preserve actual prior/reused terminal provenance; distinct R2 critique required."
+  },
+  "acceptance_addendum": [
+    "Genuine newborn frame prefix0 with allzero original slots; no manufactured identities.",
+    "Actual prior generic initializer first scratch success then next charge stop, followed by true generic cleanup with inactive prefix1: reuse validates actual scratchself and pending.fresh newbornNULL (or genuine earlier terminal suffix) without reset/repair.",
+    "Actual prior complete generic purpose followed by partial new generic initialization may have self-terminal suffix beyond count; preserve and accept real validated dead provenance rather than overwrite it to satisfy test.",
+    "Seed stopped scratch-first prefix0/1/5 and real cleanup/reuse preserve mode8 until terminal; source-group union never interpreted after borrowed pointer overlay. No fabricated scalarphase/identity to construct fixture; real production initializer and genuine admission stop must establish state."
+  ]
+}
