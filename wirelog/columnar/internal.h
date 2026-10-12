@@ -788,6 +788,8 @@ extern wl_columnar_set_transition_hook_t wl_columnar_set_transition_hook;
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 /* Test-only seam for forcing the private resize preparation to fail. */
 extern bool wl_columnar_relation_test_fail_prepare_resize;
+/* One-based real allocation ordinal; zero disables the growth fault. */
+extern uint32_t wl_columnar_relation_test_growth_fail_allocation;
 extern void (*wl_columnar_relation_test_reader_after_descriptor)(
     const col_rel_t *);
 extern void (*wl_columnar_relation_test_rebind_after_descriptor)(
@@ -3111,13 +3113,17 @@ wl_columnar_relation_writer_acquire_controlled(
     wl_columnar_source_access_gate_t *gate,
     wl_columnar_source_access_writer_t *token,
     wl_evaluation_control_t *control);
-/* Metered preallocated scalar append. Forward gate rounds, width/type
- * validation, scalar copying and timestamp copying are charged. Raw storage
- * owner resolution and mandatory cleanup remain outside these work bounds.
- * No growth, aliases, COW, arena,
- * compound data or schema installation. Negative control dispositions leave
- * logical rows and generation unchanged; spare cells may have been written.
- * Descriptors must remain alive and externally serialized during the call. */
+/* Metered private scalar append. Forward gate rounds, width/type validation,
+* doubling, allocation attempts, scalar and timestamp copies are charged.
+* Established positive-width allocated heap grids may grow transactionally.
+* Timestamped growth requires both sides tracked and destination timestamp
+* capacity equal to its old column capacity. Other growth shapes, aliases,
+* COW, arena, compound data and schema installation remain unsupported.
+* Raw owner resolution, governor/ledger operations, allocation runtime and
+* mandatory cleanup are excluded; this is not a whole-call work bound.
+* A stop leaves logical rows and generations unchanged. Preallocated spare
+* cells may be written; failed growth preserves the original physical image.
+* Descriptors must remain alive and externally serialized during the call. */
 int
 wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,
