@@ -349,19 +349,11 @@ wl_columnar_source_access_cohort_restore(
     return 0;
 }
 
-static inline int
-wl_columnar_source_access_reader_acquire_common(
+static inline void
+wl_columnar_source_access_reader_initialize(
     wl_columnar_source_access_gate_t *owner_gate,
     wl_columnar_source_access_reader_t *token, bool transferable)
 {
-    int rc;
-
-    if (!owner_gate || !token || token->owner || token->secondary_owner
-        || token->identity != 0 || token->thread_valid || token->transferable)
-        return EINVAL;
-    rc = wl_columnar_source_access_gate_reader_acquire(owner_gate);
-    if (rc != 0)
-        return rc;
     token->owner = owner_gate;
     token->secondary_owner = NULL;
     token->identity = (uintptr_t)token;
@@ -378,6 +370,23 @@ wl_columnar_source_access_reader_acquire_common(
         token->thread_valid = true;
     }
     token->transferable = transferable;
+}
+
+static inline int
+wl_columnar_source_access_reader_acquire_common(
+    wl_columnar_source_access_gate_t *owner_gate,
+    wl_columnar_source_access_reader_t *token, bool transferable)
+{
+    int rc;
+
+    if (!owner_gate || !token || token->owner || token->secondary_owner
+        || token->identity != 0 || token->thread_valid || token->transferable)
+        return EINVAL;
+    rc = wl_columnar_source_access_gate_reader_acquire(owner_gate);
+    if (rc != 0)
+        return rc;
+    wl_columnar_source_access_reader_initialize(owner_gate, token,
+        transferable);
     return 0;
 }
 
@@ -434,6 +443,24 @@ wl_columnar_source_access_reader_release(
     return 0;
 }
 
+static inline void
+wl_columnar_source_access_writer_initialize(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_writer_t *token)
+{
+    token->owner = gate;
+    token->secondary_owner = NULL;
+    token->identity = (uintptr_t)token;
+#if defined(WL_HAVE_C11_THREADS)
+    token->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    token->owner_thread = GetCurrentThreadId();
+#else
+    token->owner_thread = pthread_self();
+#endif
+    token->thread_valid = true;
+}
+
 static inline int
 wl_columnar_source_access_writer_acquire(
     wl_columnar_source_access_gate_t *gate,
@@ -452,17 +479,7 @@ wl_columnar_source_access_writer_acquire(
         if (expected != 0)
             return EBUSY;
     }
-    token->owner = gate;
-    token->secondary_owner = NULL;
-    token->identity = (uintptr_t)token;
-#if defined(WL_HAVE_C11_THREADS)
-    token->owner_thread = thrd_current();
-#elif defined(_WIN32) || defined(_WIN64)
-    token->owner_thread = GetCurrentThreadId();
-#else
-    token->owner_thread = pthread_self();
-#endif
-    token->thread_valid = true;
+    wl_columnar_source_access_writer_initialize(gate, token);
     return 0;
 }
 

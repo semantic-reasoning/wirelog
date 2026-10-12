@@ -3097,9 +3097,23 @@ wl_columnar_relation_delta_restore_flat_overwrite(col_rel_t *rel,
     uint32_t nrows, uint32_t ncols);
 int
 col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena);
-/* Metered preallocated scalar append. Width/type validation, scalar copying
- * and timestamp copying are charged; existing gate admission and mandatory
- * cleanup are not covered by these materialization work bounds.
+/* One unit admits a bounded gate check and at most one strong CAS. Reader
+ * contention retries are separately charged. A stopped acquired token is
+ * released before return; mandatory release retries are not metered.
+ * NULL control delegates to raw acquisition. Tokens must start inert. */
+int
+wl_columnar_relation_reader_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_reader_t *token,
+    wl_evaluation_control_t *control);
+int
+wl_columnar_relation_writer_acquire_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_writer_t *token,
+    wl_evaluation_control_t *control);
+/* Metered preallocated scalar append. Forward gate rounds, width/type
+ * validation, scalar copying and timestamp copying are charged. Raw storage
+ * owner resolution and mandatory cleanup remain outside these work bounds.
  * No growth, aliases, COW, arena,
  * compound data or schema installation. Negative control dispositions leave
  * logical rows and generation unchanged; spare cells may have been written.
@@ -3109,6 +3123,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,
     wl_evaluation_control_t *control);
 #ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_before_reader_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
+extern void (*wl_columnar_relation_test_after_reader_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, bool);
+extern void (*wl_columnar_relation_test_before_writer_cas)(
+    wl_evaluation_control_t *, wl_columnar_source_access_gate_t *);
 extern void (*wl_columnar_relation_test_work_checkpoint)(
     wl_evaluation_control_t *control, uint64_t work);
 #endif
