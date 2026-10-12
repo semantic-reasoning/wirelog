@@ -1,0 +1,209 @@
+{
+  "artifact": "fresh_seed_qualification",
+  "producer": "/root",
+  "scope": "Fresh positive-width private seed helper and installed-credit footer only; whole observed STEP/default differential remain unfinished.",
+  "source_sha256": {
+    "wirelog/columnar/internal.h": "a4a76e77ec67ed1168da8d291689bd59319fabd92660d98fe4e85b1847ff56d0",
+    "wirelog/columnar/relation.c": "08899a59b473bc876442588dd1fb1b33bd0a891ade0a2b5f68e959d32af01b0d",
+    "tests/test_evaluation_observer.c": "4b48656f39c6872c611804a37b91c7dec451f9851e9178a941f8d34f5c3ffff5"
+  },
+  "profiles": {
+    "normal": [
+      {
+        "name": "abi - wirelog:source_access_contract",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.011373519897460938
+      },
+      {
+        "name": "abi - wirelog:source_access_contract_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.06621289253234863
+      },
+      {
+        "name": "abi - wirelog:state_map_anchors",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 2.692405939102173
+      },
+      {
+        "name": "abi - wirelog:state_map_anchors_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.145365476608276
+      },
+      {
+        "name": "abi - wirelog:threading_doc",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 1.469240665435791
+      },
+      {
+        "name": "abi - wirelog:threading_doc_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.7562620639801025
+      },
+      {
+        "name": "abi - wirelog:ownership_matrix",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 1.4226956367492676
+      },
+      {
+        "name": "abi - wirelog:ownership_matrix_selftest",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 8.062612533569336
+      },
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 14.561540842056274
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.8155350685119629
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.179354429244995
+      }
+    ],
+    "asan": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 25.315593719482422
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.4492809772491455
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 30.08320665359497
+      }
+    ],
+    "psa": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 14.725533962249756
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.8716878890991211
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 11.11486554145813
+      }
+    ],
+    "psa-asan": [
+      {
+        "name": "unit - wirelog:evaluation_work",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 24.91120719909668
+      },
+      {
+        "name": "unit - wirelog:evaluation_membership",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 0.4550457000732422
+      },
+      {
+        "name": "unit - wirelog:evaluation_observer",
+        "result": "OK",
+        "returncode": 0,
+        "duration": 29.403244972229004
+      }
+    ]
+  },
+  "constraints": {
+    "compiler_jobs": 7,
+    "lto_threads": 1,
+    "test_processes": 1,
+    "observer_timeout_seconds": 120,
+    "profile_order": [
+      "normal",
+      "asan",
+      "psa",
+      "psa-asan"
+    ]
+  },
+  "provider": {
+    "mbedtls_tag": "mbedtls-4.2.0",
+    "mbedtls_commit": "ece41aa84d7879d7e55c59e955a5884b541f7f3b",
+    "tf_psa_crypto_version": "1.2.0",
+    "tf_psa_crypto_commit": "73c5da561c8e5253db7b1fb440eda86fde8d8024",
+    "controlled_hmac_audited_profile": true,
+    "version_getter": "TF PSA public version getter",
+    "installation": "Task-private prefix; no host installation"
+  },
+  "preserved_failures": [
+    "Test initially treated copy phase10 as prepublication; corrected phase assertion to12..14.",
+    "Budget-denial fixture initially used advisory session; replaced with actual enforcing governor constructor.",
+    "PSA sanitizer setup initially used incorrect case mbedtls; retry used repository option mbedTLS.",
+    "Standalone TF PSA installation lacked MbedTLS headers for audited HMAC profile; qualified profiles use full official MbedTLS4.2 installation."
+  ],
+  "coverage": [
+    "Real session $in$H gather to constructor target with original frame/SINGLE/BULK",
+    "governed and ungoverned raw twins, three rows and capacity-doubling300 rows",
+    "source-derived exact/repeated/minusone admitted work and exact final accepted prefix",
+    "prepared, committed, installed, row-copy and installed-credit-check cancellation",
+    "metadata and payload admission denial; Arrow child allocation failure",
+    "actual first credit move, second move refusal, reverse, original identity restore after host return and retry",
+    "actual installed credit identity refusal at consumed footer; retained authority; positive primary error precedence"
+  ],
+  "limits": [
+    "Fresh positive width only; nullary/typed/TS/growth/alias routes not qualified.",
+    "No whole STEP or default differential acceptance.",
+    "Linux local qualification; native Windows remains pending.",
+    "Exact/minusone fixtures measure admitted work, not allocator CPU time."
+  ],
+  "review_repairs": {
+    "superseded_candidate_tree": "6f3da2115b1a956712f375ecc0af823fe4c23c72",
+    "R1": "Source-derived cost and exact minusone consumed phase38 prefix asserted; fresh-seed-cost.json.",
+    "R2": "Actual original-slot identity/governor/owner/exact amount/state checks before and after partial move; raw twin ledger bound; exactly payload F released and metadata N retained until same-frame retry."
+  },
+  "integration_failures": [
+    {
+      "name": "wirelog:evaluation_retry",
+      "result": "FAIL",
+      "returncode": 1
+    },
+    {
+      "name": "wirelog:evaluation_snapshot_cutoff",
+      "result": "FAIL",
+      "returncode": 1
+    }
+  ],
+  "remote_baseline_failure": {
+    "head": "0d4e42624ddef9e4aa3d27ce9d40d5e37ad95a18",
+    "job": 114706310331,
+    "failing_tests": [
+      "evaluation_attempt_owner",
+      "evaluation_retry",
+      "evaluation_snapshot_cutoff"
+    ],
+    "diagnosis": "Inherited held observed/default differential admission, unchanged by fresh helper; PR not ready."
+  }
+}

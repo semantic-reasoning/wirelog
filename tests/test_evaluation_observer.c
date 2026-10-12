@@ -1,4 +1,5 @@
 /* #1821: original observer ownership and genuine observed STEP callers. */
+#define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/wirelog.h"
@@ -3632,8 +3633,343 @@ static void original_seed_bulk(unsigned prior)
     wl_plan_free(plan); wirelog_program_free(program);
 }
 
+static wl_columnar_relation_bulk_append_t *fresh_seed_bulk;
+static unsigned fresh_seed_stop, fresh_seed_fault, fresh_seed_seen;
+static uint64_t fresh_seed_payload_bytes, fresh_seed_metadata_bytes;
+static wl_columnar_memory_reservation_t *fresh_seed_bad;
+static const wl_columnar_memory_reservation_t *fresh_seed_identity;
+
+/* Independent one-column, uncontended enforcing-governor source oracle.
+ * See evidence/fresh-seed-cost.json; setup/gather/SINGLE/BULK precede configure. */
+static uint64_t fresh_seed_expected(bool governed, uint32_t rows)
+{
+    const uint64_t common = 128u + 5u * 32u + 16u + 48u;
+    const uint64_t shape = 128u + 32u;
+    const uint64_t allocation = 1u + 1u + 1u + 1u + 1u + 64u;
+    const uint64_t schema = 3u + 1u + 1u + 1u + 2u + 1u + 5u + 5u;
+    const uint64_t install = 4u * 64u + 2u * sizeof(struct ArrowSchema) + 128u;
+    const uint64_t footer = 128u + 64u + 128u;
+    const uint64_t admission = 2u * (3u + 1u + 5u + 4u + 1u + 1u);
+    const uint64_t commit = 2u * (1u + 1u + 2u);
+    return common + shape + allocation + schema + install + 16u * rows
+           + 32u + footer + (governed ? admission + commit + 1u : 0u);
+}
+
+static void fresh_seed_credit(const wl_columnar_memory_reservation_t *token,
+    const wl_columnar_memory_reservation_t *identity,
+    wl_columnar_memory_governor_t *governor, const col_rel_t *owner,
+    uint64_t bytes, uint64_t state)
+{
+    CHECK(token->identity == identity && token->governor == governor
+        && token->bytes == bytes && !token->replacement_bytes
+        && !token->transition_kind
+        && atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+        == (uintptr_t)owner
+        && atomic_load_explicit(&token->state, memory_order_acquire) == state);
+}
+
+static void fresh_seed_checkpoint(wl_evaluation_control_t *control, int phase,
+    wl_columnar_relation_bulk_append_t *bulk)
+{
+    if (bulk != fresh_seed_bulk || fresh_seed_seen) return;
+    if (fresh_seed_fault == 3 && phase == 17) {
+        CHECK(!bulk->published && bulk->exact_phase == 33
+            && bulk->pending.fresh.identity == &bulk->pending.fresh
+            && atomic_load_explicit(&bulk->pending.fresh.state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+            && atomic_load_explicit(&bulk->dst->retained_reservation.state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        col_rel_t *dst = bulk->dst;
+        wl_columnar_memory_governor_t *governor =
+            wl_columnar_memory_governor_ref_get(dst->memory_governor);
+        CHECK(governor && bulk->final_bytes == fresh_seed_payload_bytes
+            && bulk->metadata_bytes == fresh_seed_metadata_bytes
+            && bulk->final_bytes && bulk->metadata_bytes
+            && bulk->prepared_columns && bulk->prepared_names
+            && bulk->prepared_row_scratch && bulk->prepared_schema_ok
+            && bulk->prepared_schema.release && !dst->columns
+            && !dst->col_names && !dst->schema_ok);
+        fresh_seed_credit(&bulk->pending.fresh, &bulk->pending.fresh,
+            NULL, NULL, 0, WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        fresh_seed_credit(&dst->retained_reservation,
+            &dst->retained_reservation, governor, dst, bulk->final_bytes,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        fresh_seed_credit(&bulk->metadata_pending, &bulk->metadata_pending,
+            governor, dst, bulk->metadata_bytes,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        fresh_seed_credit(&dst->metadata_reservation,
+            &dst->metadata_reservation,
+            NULL, NULL, 0, WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        fresh_seed_credit(&bulk->previous, &bulk->previous, NULL, NULL, 0,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        fresh_seed_credit(&bulk->old_metadata, &bulk->old_metadata,
+            NULL, NULL, 0, WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        fresh_seed_credit(&bulk->scratch, &bulk->scratch, NULL, NULL, 0,
+            WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        fresh_seed_bad = &bulk->dst->metadata_reservation;
+        fresh_seed_identity = fresh_seed_bad->identity;
+        fresh_seed_bad->identity = &bulk->scratch;
+        fresh_seed_seen++;
+    } else if (fresh_seed_fault && phase == 16) {
+        CHECK(bulk->published && bulk->exact_phase == 38
+            && bulk->active && bulk->borrowed.seed_schema_fresh);
+        fresh_seed_bad = fresh_seed_fault == 1
+            ? &bulk->dst->retained_reservation :
+            &bulk->dst->metadata_reservation;
+        fresh_seed_identity = fresh_seed_bad->identity;
+        fresh_seed_bad->identity = &bulk->scratch;
+        fresh_seed_seen++;
+    } else if (fresh_seed_stop == (unsigned)phase) {
+        CHECK(control);
+        fresh_seed_seen++;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+/* This target is a real separate constructor-owned relation. Name lookup
+ * gathers the session's real $in$H, without claiming whole STEP activation. */
+static uint64_t fresh_seed_schema_rows(bool governed, unsigned stop,
+    unsigned fault,
+    uint64_t allowance, bool limited, uint32_t rows)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl A(v:int64)\n.decl H(v:int64)\nH(v):-A(v).\n", &error);
+    wl_plan_t *plan = NULL; wl_session_t *base = NULL;
+    int64_t *input = malloc((size_t)rows * sizeof(*input));
+    CHECK(input && rows);
+    for (uint32_t i = 0; i < rows; i++) input[i] = (int64_t)i * 11 + 7;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    wl_columnar_memory_governor_ref_t *owner =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = owner;
+    CHECK(program && wl_plan_from_program(program, &plan) == 0
+        && owner && wl_session_create_with_options(wl_backend_columnar(), plan,
+        1, &options, &base) == 0
+        && wl_backend_columnar()->session_step(base) == 0
+        && wl_backend_columnar()->session_insert(base, "H", input, rows,
+        1) == 0);
+    wl_columnar_memory_governor_ref_release(owner);
+    wl_col_session_t *session = COL_SESSION(base);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(session->memory_governor);
+    uint64_t initial_reserved = wl_columnar_memory_reserved(governor);
+    uint64_t usable = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_relaxed);
+    col_rel_t *target = NULL, *raw = NULL;
+    CHECK((governed ? wl_columnar_relation_alloc_governed(&target, "H",
+        session->memory_governor) : col_rel_alloc(&target, "H")) == 0);
+    CHECK((governed ? wl_columnar_relation_alloc_governed(&raw, "H",
+        session->memory_governor) : col_rel_alloc(&raw, "H")) == 0);
+    CHECK(!target->schema_ok && !target->columns && !target->capacity
+        && col_rel_append_rows_atomic(raw, input, rows, 1, NULL) == 0);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(wl_evaluation_control_create(0, &control) == 0
+        && wl_evaluation_control_attach(control,
+        session->base.operation_admission) == 0);
+    session->base.evaluation_control = control;
+    session->serial_completion.pending = true;
+    CHECK(wl_evaluation_control_begin(control,
+        session->base.operation_admission) == 0);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_eval_delta_seed_restore_t *seed = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_acquire(session, &frame, control) == 0
+        && wl_columnar_eval_delta_seed_gather_controlled(session, frame, target,
+        &seed, control) == 0 && seed->nrows == rows && seed->ncols == 1);
+    if (fault == 4 || fault == 5) {
+        CHECK(governed && governor->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            && !seed->seed_reader.owner && !seed->seed_reader.secondary_owner);
+        atomic_store_explicit(&governor->usable_bytes,
+            wl_columnar_memory_reserved(governor)
+            + (fault == 5 ? raw->metadata_reserved_bytes : 0),
+            memory_order_relaxed);
+    }
+    seed = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_seed_single(session, frame, target,
+        &seed, control) == 0
+        && wl_columnar_relation_seed_single_acquire_controlled(target,
+        &seed->single, control) == 0);
+    fresh_seed_bulk = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_seed_bulk(session, frame,
+        &fresh_seed_bulk, control) == 0
+        && wl_evaluation_control_finish(control,
+        session->base.operation_admission, 0, 0) == 0
+        && wl_evaluation_control_configure(control, allowance) == 0
+        && wl_evaluation_control_begin(control,
+        session->base.operation_admission) == 0);
+    fresh_seed_stop = stop; fresh_seed_fault = fault; fresh_seed_seen = 0;
+    fresh_seed_bad = NULL;
+    uint64_t before_append = wl_columnar_memory_reserved(governor);
+    fresh_seed_payload_bytes = raw->retained_reserved_bytes;
+    fresh_seed_metadata_bytes = raw->metadata_reserved_bytes;
+    if (fault == 6) wl_columnar_relation_test_fail_next_metadata_alloc();
+    wl_columnar_relation_test_bulk_checkpoint = fresh_seed_checkpoint;
+    int result = wl_columnar_eval_stack_cleanup_seed_append(session, frame,
+            control);
+    wl_columnar_relation_test_bulk_checkpoint = NULL;
+    CHECK(fault == 6 ? result == ENOMEM && !fresh_seed_seen
+        : fault >= 4 ? result == ENOSPC && !fresh_seed_seen
+        : fault ? result == EINVAL && fresh_seed_seen == 1
+        : stop ? result == WL_EVALUATION_CONTROL_CANCELLED &&
+        fresh_seed_seen == 1
+        : limited ? result == WL_EVALUATION_CONTROL_WORK_LIMIT : result == 0);
+    CHECK(wl_evaluation_control_finish(control,
+        session->base.operation_admission, result, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(control, &report) == 0);
+    if (limited) {
+        CHECK(allowance == fresh_seed_expected(governed, rows) - 1u
+            && report.consumed == fresh_seed_expected(governed, rows) - 128u
+            && fresh_seed_bulk->exact_phase == 38 && fresh_seed_bulk->active
+            && fresh_seed_bulk->transaction_active && fresh_seed_bulk->published
+            && seed->published && seed->row == rows && !seed->column
+            && seed->single.set.descriptors_acquired == 1
+            && seed->single.set.owners_acquired == 1);
+    } else if (!stop && !fault)
+        CHECK(report.consumed == fresh_seed_expected(governed, rows));
+    if (!stop && fault < 3) {
+        CHECK(target->schema_ok && target->nrows == raw->nrows
+            && target->ncols == raw->ncols && target->capacity == raw->capacity
+            && target->view_generation == raw->view_generation
+            && target->storage_generation == raw->storage_generation
+            && target->retained_reserved_bytes == raw->retained_reserved_bytes
+            && target->metadata_reserved_bytes == raw->metadata_reserved_bytes
+            && strcmp(target->schema.format, raw->schema.format) == 0
+            && strcmp(target->col_names[0], raw->col_names[0]) == 0);
+        for (uint32_t i = 0; i < rows; i++)
+            CHECK(target->columns[0][i] == raw->columns[0][i]);
+    }
+    if (stop >= 12 && stop <= 14)
+        CHECK(!target->schema_ok && !target->columns && !target->nrows
+            && !target->retained_reserved_bytes &&
+            !target->metadata_reserved_bytes);
+    if (fault >= 4) {
+        CHECK(target->memory_budget_denial_pending == (fault != 6)
+            && !target->schema_ok
+            && !target->columns && !target->retained_reserved_bytes
+            && !target->metadata_reserved_bytes);
+        CHECK(atomic_load_explicit(&fresh_seed_bulk->metadata_pending.state,
+            memory_order_acquire) == (governed && fault != 4
+            ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            : WL_COLUMNAR_MEMORY_RESERVATION_EMPTY));
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 && !frame
+            && wl_columnar_memory_reserved(governor) == before_append);
+        atomic_store_explicit(&governor->usable_bytes, usable,
+            memory_order_relaxed);
+    } else if (fault) {
+        uint64_t reserved = wl_columnar_memory_reserved(governor);
+        if (fault == 3)
+            CHECK(reserved == before_append + fresh_seed_payload_bytes
+                + fresh_seed_metadata_bytes);
+        wl_columnar_eval_stack_cleanup_frame_t *original = frame;
+        if (fault == 1)
+            CHECK(wl_columnar_relation_seed_restore_retire(seed,
+                fresh_seed_bulk, EOVERFLOW) == EOVERFLOW
+                && fresh_seed_bulk->active &&
+                seed->single.set.owners_acquired == 1
+                && wl_columnar_memory_reserved(governor) == reserved);
+        CHECK(fresh_seed_bulk->exact_phase == (fault == 3 ? 33 : 38)
+            && fresh_seed_bulk->active
+            && seed->single.set.descriptors_acquired == 1
+            && seed->single.set.owners_acquired == 1
+            && wl_columnar_eval_stack_cleanup_finish(&frame) == EINVAL
+            && !frame && session->cleanup_pending
+            && session->serial_completion.frame == original);
+        if (fault == 3) {
+            CHECK(!target->schema_ok && !target->columns && !target->nrows
+                && fresh_seed_bulk->exact_phase == 42
+                && atomic_load_explicit(&fresh_seed_bulk->pending.fresh.state,
+                memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+                && atomic_load_explicit(&target->retained_reservation.state,
+                memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+                && wl_columnar_memory_reserved(governor)
+                == reserved - fresh_seed_bulk->final_bytes
+                && wl_columnar_memory_reserved(governor)
+                == before_append + fresh_seed_bulk->metadata_bytes
+                && !fresh_seed_bulk->prepared_columns
+                && !fresh_seed_bulk->prepared_names
+                && !fresh_seed_bulk->prepared_row_scratch
+                && !fresh_seed_bulk->prepared_timestamps
+                && !fresh_seed_bulk->prepared_schema_ok
+                && !fresh_seed_bulk->prepared_schema.release
+                && !fresh_seed_bulk->count && !fresh_seed_bulk->owned_columns
+                && !fresh_seed_bulk->base);
+            fresh_seed_credit(&fresh_seed_bulk->pending.fresh,
+                &fresh_seed_bulk->pending.fresh, governor, target,
+                fresh_seed_bulk->final_bytes,
+                WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+            fresh_seed_credit(&fresh_seed_bulk->metadata_pending,
+                &fresh_seed_bulk->metadata_pending, governor, target,
+                fresh_seed_bulk->metadata_bytes,
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+            fresh_seed_credit(&target->retained_reservation,
+                &target->retained_reservation, NULL, NULL, 0,
+                WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+            fresh_seed_credit(&target->metadata_reservation,
+                &fresh_seed_bulk->scratch, NULL, NULL, 0,
+                WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+        } else CHECK(wl_columnar_memory_reserved(governor) == reserved);
+        CHECK(session->serial_completion.frame == original);
+        fresh_seed_bad->identity = fresh_seed_identity;
+        CHECK(wl_columnar_eval_stack_cleanup_retry(session) == 0
+            && !session->cleanup_pending
+            && wl_columnar_memory_reserved(governor)
+            == (fault == 3 ? before_append : reserved));
+    } else CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 && !frame);
+    CHECK(!atomic_load_explicit(&target->descriptor_access.state,
+        memory_order_acquire)
+        && !atomic_load_explicit(&target->source_access.state,
+        memory_order_acquire)
+        && wl_columnar_eval_stack_cleanup_retained(session) == 0
+        && wl_evaluation_control_detach(control,
+        session->base.operation_admission) == 0);
+    CHECK(col_rel_destroy_checked(raw) == 0
+        && col_rel_destroy_checked(target) == 0
+        && wl_columnar_memory_reserved(governor) == initial_reserved);
+    session->base.evaluation_control = NULL;
+    wl_evaluation_control_release(control); wl_session_destroy(base);
+    wl_plan_free(plan); wirelog_program_free(program);
+    free(input);
+    fresh_seed_bulk = NULL; fresh_seed_bad = NULL;
+    return report.consumed;
+}
+
+static uint64_t fresh_seed_schema(bool governed, unsigned stop, unsigned fault,
+    uint64_t allowance, bool limited)
+{
+    return fresh_seed_schema_rows(governed, stop, fault, allowance, limited, 3);
+}
+
 int main(void)
 {
+    for (unsigned governed = 0; governed < 2; governed++) {
+        uint64_t full = fresh_seed_expected(governed != 0, 3);
+        CHECK(fresh_seed_schema(governed != 0, 0, 0, 0, false) == full);
+        CHECK(fresh_seed_schema(governed != 0, 0, 0, full, false) == full);
+        CHECK(fresh_seed_schema(governed != 0, 0, 0, full, false) == full);
+        CHECK(fresh_seed_schema(governed != 0, 0, 0, full - 1, true)
+            == full - 128u);
+        fresh_seed_schema(governed != 0, 0, 1, 0, false);
+        fresh_seed_schema(governed != 0, 0, 2, 0, false);
+        fresh_seed_schema(governed != 0, 0, 6, 0, false);
+        if (governed) {
+            fresh_seed_schema(true, 0, 3, 0, false);
+            fresh_seed_schema(true, 0, 4, 0, false);
+            fresh_seed_schema(true, 0, 5, 0, false);
+        }
+        fresh_seed_schema(governed != 0, 12, 0, 0, false);
+        if (governed) fresh_seed_schema(true, 13, 0, 0, false);
+        fresh_seed_schema(governed != 0, 14, 0, 0, false);
+        fresh_seed_schema(governed != 0, 15, 0, 0, false);
+        fresh_seed_schema(governed != 0, 10, 0, 0, false);
+        fresh_seed_schema(governed != 0, 16, 0, 0, false);
+        fresh_seed_schema_rows(governed != 0, 0, 0, 0, false, 300);
+    }
     original_seed_single();
     original_seed_gather();
     original_seed_name_boundaries();

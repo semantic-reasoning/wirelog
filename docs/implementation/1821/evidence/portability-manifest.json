@@ -203,5 +203,40 @@
     "name": "serial-observed-rollback-caller-timing-critique.json",
     "present": true,
     "sha256": "a3dd5f23710f658c969b0fb04ddf562ec1aca1f10f87316e14c5e42f38983cac"
+  },
+  {
+    "name": "fresh-seed-plan.json",
+    "present": true,
+    "sha256": "6566aa0ae63e26c5f656c25ef7e3ee315ce87496ce42f78d9ffddbb8676dd7aa"
+  },
+  {
+    "name": "fresh-seed-plan-critique.json",
+    "present": true,
+    "sha256": "1b632a326b8618102133a7fc323b6ea828297ad9a8be7580f266d8ed12af3e5b"
+  },
+  {
+    "name": "fresh-seed-scope.json",
+    "present": true,
+    "sha256": "9564a4ac954cbc395a03993ef296a3537b32a11b2c0f748432c89156f653cfda"
+  },
+  {
+    "name": "fresh-seed-scope-critique.json",
+    "present": true,
+    "sha256": "5ecfcd498d6894a64678b2c9d2ece0e80b9ca814a6b1e5ed8e31ba29ed187692"
+  },
+  {
+    "name": "fresh-seed-move-proof-critique.json",
+    "present": true,
+    "sha256": "c49418115b754a9f59aa38aac4de94ce50e0cd9b39c065597227580bbdcfd7b8"
+  },
+  {
+    "name": "fresh-seed-qualification.json",
+    "present": true,
+    "sha256": "82f689931df071870ef77b77eac4f557c885e155091d797d093d6a4445c60b0f"
+  },
+  {
+    "name": "fresh-seed-cost.json",
+    "present": true,
+    "sha256": "d2ca8066a3f4461c66d3caf7882847c4ba016dc1a8fb9940f3e2a85bf8b1da9a"
   }
 ]

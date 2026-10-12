@@ -1,0 +1,19 @@
+{
+  "artifact": "fresh_seed_source_cost",
+  "producer": "/root",
+  "domain": "Exactly one int64 column named col0, fresh private target, positive row count R, no timestamps/types; uncontended enforcing governor when present. Setup/gather/SINGLE/BULK charges are outside the separately configured append interval.",
+  "source_bindings": {
+    "wirelog/columnar/eval_stack.c:wl_columnar_eval_stack_cleanup_seed_append": "Direct delegation; no charge.",
+    "wirelog/columnar/relation.c:wl_columnar_relation_seed_append_without_reserve_controlled": "128 entry + five32 original tokens +16 gathered shape +48 model/address checks =352. Fresh columns/types absent, overlap/FLOAT loops execute zero iterations.",
+    "wirelog/columnar/relation.c:wl_columnar_relation_seed_schema_fresh_controlled": "128 fresh shape +32 col0 metadata derivation; column table malloc1/clear1/lane malloc1, optional governed scratch malloc1, names table malloc1/clear1/default name64 =69+G; native install4*64+2*sizeof(ArrowSchema)+128; row cells16*R; row publication32.",
+    "wirelog/columnar/relation.c:wl_columnar_relation_build_schema_shape_controlled": "Root init/format3 +child table malloc1 +table clear1 +child malloc/init1 +format2 +name allocation1 +col0 NUL-inclusive length scan5 +copy5 =19.",
+    "wirelog/columnar/memory_governor.c:wl_columnar_memory_governor_reserve_checked_controlled": "Each successful EMPTY uncontended reservation3 validation+1 stateCAS+5 snapshot+4 preparation+1 admit totalCAS+1 RESERVED publication=15. Metadata and payload each positive, two reservations30. NoGov metadata early-return and payload branch skipped cost0.",
+    "wirelog/columnar/memory_governor.c:wl_columnar_memory_governor_commit_private": "Each fresh commit1 identity+1 stateCAS+2 publication=4; two commits8.",
+    "wirelog/columnar/relation.c:wl_columnar_relation_seed_bulk_retire_with_seed": "Installed route128 validation+64 old physical disposal+128 installed authority validation=320. Old token slots EMPTY; no healthy charges in mandatory credit retirement or terminal scalar BULK retirement."
+  },
+  "formula": "352 +160 +69 +19 +(384+2*sizeof(ArrowSchema)) +16*R +32 +320 +G*(30+8+1) =1336+2*sizeof(ArrowSchema)+16*R+39*G",
+  "three_row_formula": "1384+2*sizeof(ArrowSchema)+39*G; on sizeof(ArrowSchema)==72: noGov1528, governed1567.",
+  "minus_one": "Final installed-authority charge128 cannot fit. Exact accepted prefix is expected-128, not expected-1: schema/rows published, seed.row==R/column0, consumed phase38, transaction_active and original SINGLE/frame retained. Mandatory cleanup then validates without new allowance and releases original gates; installed credits remain live until relation destruction.",
+  "boundaries": "Every tail is charge0, not a second debit. Capacity doubling has uint32 finite bound; fixed shape/arithmetic is admitted as fixed128. Pointer tables cleared<=128; builder header pass one child and name scan/copy five bytes here. Row16/cell. Native installation finite exception is384+2*sizeof(ArrowSchema), not a256 claim. Native allocator/Arrow calls and mandatory credit cleanup CPU time excluded.",
+  "oracle": "fresh_seed_expected computes this algebra independently of measured report; unlimited/exact/repeat must match it, minusone must match expected-128 and phase38/published cursor. R300 verifies capacity path with same formula and16*R."
+}

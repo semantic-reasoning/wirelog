@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **465**). The earlier audit sections
+match the script's count (currently **469**). The earlier audit sections
 retain their historical per-section counts.
 
 Format: `file:function[#N]` | field | operation | order | justification.
@@ -1831,3 +1831,15 @@ listed separately, including each MSVC and non-MSVC source branch.
 | `relation.c:wl_columnar_relation_image_embedded_absent#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate the exact empty ungoverned embedded credit domain before accepting absence of admission. |
 | `relation.c:wl_columnar_relation_replacement_image_publish_controlled` | `token->state` | `atomic_load_explicit` | acquire | Validate original old and incoming credit states and exact owners before the finite replacement move/install region. |
 | `relation.c:wl_columnar_relation_replacement_image_publish_controlled#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate original old and incoming credit states and exact owners before the finite replacement move/install region. |
+
+### 5.27 Fresh seed schema authority (4 rows)
+
+These checks cover the fresh positive-width seed helper, including its mandatory
+retirement retry. Whole observed STEP admission remains closed.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_seed_empty_credit_valid` | `token->state` | `atomic_load_explicit` | acquire | Require exact EMPTY original source/destination credit before fresh schema preparation and moves. |
+| `relation.c:wl_columnar_relation_seed_empty_credit_valid#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Require zero owner on original empty credit; constructor-zero identity is allowed only without a governor. |
+| `relation.c:wl_columnar_relation_seed_installed_credit_valid` | `token->state` | `atomic_load_explicit` | acquire | Require COMMITTED new governed credit, or exact EMPTY ungoverned credit, before terminal retirement. |
+| `relation.c:wl_columnar_relation_seed_installed_credit_valid#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate exact installed relation owner, or zero ungoverned owner, before releasing the original SINGLE. |

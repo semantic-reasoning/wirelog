@@ -7,6 +7,58 @@
 
 Updated UTC: 2026-10-12T06:21:39.932598+00:00. User explicitly replaced the final-only PR restriction with an unfinished draft checkpoint PR and detailed issue comment. This checkpoint is **not production approval, issue closure, or a merge request**. Lead stopped implementation before making the F1 code change. Root owns checkpoint commit/push/draft PR/comment. Implementation is stopped for the next agent.
 
+## Resumed fresh seed installation scope (2026-10-12)
+
+The pre-format identity and stopped state below remain historical checkpoint
+records. The continuation rebased onto main and reconciled the ownership audits.
+It now implements the first genuine fresh, positive-width, private seed schema
+installation through the original frame/SINGLE/BULK caller. Governed payload and
+metadata are committed in that order, then moved and installed after one finite
+precharge. Ungoverned physical storage retains zero credited scalar amounts.
+Installed new credits are checked before phase39 or SINGLE release; refusal keeps
+phase38 and the original frame. No installed live credit is repaired or released.
+
+The registered observer fixtures use a real constructor and session seed, compare
+the raw append twin, and cover exact/repeated/minusone work, prepared/committed/
+installed/copy/retirement stops, metadata and payload denial, real Arrow child
+allocation failure, installed identity refusal/retry, and a test-only intermove
+identity fault after an actual retained-credit move. The latter is defensive
+fault evidence, not a production cancellation checkpoint. The source-only seam
+is absent from production builds. Both small and capacity-doubling row batches
+are exercised. Plan, critique and refinements are archived in `evidence/fresh-seed-*`.
+
+Fresh registered work/membership/observer tests pass sequentially in normal,
+ASan/UBSan, PSA release and PSA ASan/UBSan builds. The unchanged observer timeout
+is120 seconds; observed durations are11.18/30.08/11.11/29.40 seconds. The PSA
+profiles use official MbedTLS4.2.0 with TF PSA Crypto1.2.0 and the audited HMAC
+software profile. Source hashes, safe receipts and preserved setup/test failures
+are recorded in `evidence/fresh-seed-qualification.json`. The source-derived
+cost oracle and exact final accepted prefix are recorded in
+`evidence/fresh-seed-cost.json`. Partial-move tests verify original-slot
+authority and exact retained F release versus remaining metadata N.
+
+Current unchanged `evaluation_retry` and `evaluation_snapshot_cutoff` tests
+still fail. The pushed baseline also fails `evaluation_attempt_owner` because
+default differential admission is held; it emits no tuples. These remain
+explicit PR readiness blockers.
+
+This is helper qualification, not registered-H whole STEP admission. Nullary,
+typed, timestamp, shared/arena, nonempty old-credit and growth-to-zero routes remain
+unfinished. The historical F1 gap below is addressed only for this new reached
+fresh domain; no historical RELEASED-token route is accepted on its behalf.
+Whole observed STEP/default differential and the seven issue acceptance items
+remain open. Existing retry/snapshot tests must pass before PR readiness.
+
+Forward pointer clearing uses at most128 entries per charge/tail, name creation
+is fixed at32-byte buffers, schema construction retains its existing bounded
+header/name passes, and row copy charges16 per cell. The native install has an
+explicit finite noninterruptible precharge of
+`4*64 + 2*sizeof(struct ArrowSchema) + 128`; it is not a <=256 forward chunk.
+Typed healthy retirement validates installed authority with128 work; mandatory
+retirement repeats the same predicate without a new allowance and preserves a
+positive initiating error. Allocator/library calls and mandatory checked credit
+retirement retain their explicitly excluded native execution time.
+
 ## Frozen identity and execution state
 
 - Source worktree: `/home/joykim/wirelog-1821-serial-work-next`. HEAD `4e2e1272189921bd4b3d8ab167517c6d52ecc81c`; last approved ordinary recursive MIN/MAX commit.

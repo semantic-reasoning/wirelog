@@ -3846,6 +3846,7 @@ typedef struct {
             bool *old_shared;
             uint64_t metadata_after;
             bool old_arena, metadata_retire;
+            bool seed_schema_fresh;
         } borrowed;
         struct {
             wl_col_session_t *session;
