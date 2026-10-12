@@ -362,6 +362,9 @@ static int col_rel_cow_unshare_publish_impl(col_rel_t *r, uint32_t new_cap,
 static int col_rel_mutation_lease_advance_storage(
     wl_columnar_relation_mutation_lease_t *lease, uint64_t prior_generation);
 static bool col_rel_timestamp_shape_valid(const col_rel_t *r);
+static bool col_rel_image_token_valid(
+    const wl_columnar_memory_reservation_t *token, const col_rel_t *owner,
+    uint64_t bytes);
 static int col_rel_mutation_lease_validate_binding(
     const wl_columnar_relation_mutation_lease_t *lease,
     const col_rel_t *expected_relation);
@@ -6816,7 +6819,7 @@ wl_columnar_relation_prepare_growth_controlled(col_rel_t *dst,
     col_delta_timestamp_t *timestamps = NULL;
     uint32_t allocated = 0;
     int rc = 0;
-    /* Sole caller admits positive-width allocated growth and has checked
+    /* Callers admit positive-width allocated growth and have checked
      * table_bytes = dst->ncols * sizeof(int64_t *). Allocate the table
      * before any lane access, using the same width as later consumption. */
     rc = wl_evaluation_control_charge(control, 1);
@@ -7181,6 +7184,207 @@ done:
         int cleanup = wl_columnar_source_access_reader_release(&reader);
         if (cleanup != 0 && rc <= 0)
             rc = cleanup;
+    }
+    return rc;
+}
+
+/* Timestamp padding is unspecified; initialize the five observable fields. */
+static int
+wl_columnar_relation_zero_timestamp_tail_controlled(
+    col_delta_timestamp_t *timestamps, uint32_t first, uint32_t capacity,
+    wl_evaluation_control_t *control)
+{
+    for (uint32_t row = first; row < capacity;) {
+        uint32_t count = capacity - row;
+        if (count > WL_EVALUATION_CONTROL_QUANTUM / 5u)
+            count = (uint32_t)(WL_EVALUATION_CONTROL_QUANTUM / 5u);
+        uint64_t work = (uint64_t)count * 5u;
+        int rc = wl_evaluation_control_charge(control, work);
+        if (rc != 0)
+            return rc;
+        for (uint32_t i = 0; i < count; i++) {
+            timestamps[row + i].iteration = 0;
+            timestamps[row + i].stratum = 0;
+            timestamps[row + i].worker = 0;
+            timestamps[row + i]._reserved = 0;
+            timestamps[row + i].multiplicity = 0;
+        }
+        row += count;
+        rc = wl_columnar_relation_work_tail(control, work);
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+int
+wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
+    uint32_t requested, bool *denied, wl_evaluation_control_t *control)
+{
+    col_rel_payload_txn_t pending;
+    int64_t **columns = NULL;
+    col_delta_timestamp_t *timestamps = NULL;
+    bool active = false;
+    int rc;
+
+    if (!control)
+        return col_rel_reserve_capacity_admitted(r, requested, denied);
+    if (denied)
+        *denied = false;
+    if (r)
+        r->memory_budget_denial_pending = false;
+    if (!r)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        return rc;
+    if (!col_rel_timestamp_shape_valid(r) || r->nrows > r->capacity
+        || (r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+        && (r->compound_count || r->inline_physical_offset))
+        || (r->columns && r->columns == r->merge_columns)
+        || (r->columns && r->columns == r->retract_backup_columns)
+        || (r->merge_columns &&
+        r->merge_columns == r->retract_backup_columns))
+        return EINVAL;
+    if (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || r->compound_arity_map || r->compound_arity_len || r->col_shared
+        || r->arena_owned || (r->storage_owner && r->storage_owner != r)
+        || !r->ncols || !r->capacity)
+        return ENOTSUP;
+    if (!r->columns || r->storage_owner != r
+        || !wl_columnar_relation_generation_valid(r->relation_identity)
+        || !wl_columnar_relation_generation_valid(r->view_generation)
+        || !wl_columnar_relation_generation_valid(r->storage_generation)
+        || r->storage_owner_identity != r->relation_identity
+        || r->storage_owner_generation != r->storage_generation)
+        return EINVAL;
+    if (col_rel_storage_alias_borrow_count(r))
+        return EBUSY;
+    bool growth = requested > r->capacity;
+    if (growth &&
+        r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return EOVERFLOW;
+    col_rel_payload_shape_t old_shape = {
+        .ncols = r->ncols, .column_capacity = r->capacity,
+        .timestamp_capacity = r->timestamp_capacity,
+        .merge_capacity = r->merge_buf_cap,
+        .backup_capacity = r->retract_backup_capacity,
+        .backup_timestamp_capacity = r->retract_backup_timestamp_capacity,
+        .active_table = true,
+        .merge_table = r->merge_columns != NULL,
+        .backup_table = r->retract_backup_columns != NULL,
+        .scratch = r->row_scratch != NULL,
+    };
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            return rc;
+        if (!r->columns[c])
+            return EINVAL;
+        old_shape.owned_columns++;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            return rc;
+    }
+    uint64_t old_bytes;
+    if (!col_rel_payload_shape_bytes(&old_shape, &old_bytes))
+        return EOVERFLOW;
+    if (r->memory_governor) {
+        const wl_columnar_memory_reservation_t *token =
+            &r->retained_reservation;
+        if (token->identity != token || token->replacement_bytes
+            || token->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+            || !col_rel_image_token_valid(token, r, r->retained_reserved_bytes)
+            || (r->retained_reserved_bytes
+            && !wl_columnar_relation_retirement_reservation_valid(r)))
+            return EINVAL;
+        if (!r->retained_reserved_bytes ||
+            r->retained_reserved_bytes < old_bytes)
+            return ENOTSUP;
+    }
+    if (!growth)
+        return wl_evaluation_control_charge(control, 0);
+
+    col_rel_payload_shape_t final_shape = old_shape;
+    final_shape.column_capacity = requested;
+    final_shape.timestamp_capacity = r->timestamps ? requested : 0;
+    uint64_t final_bytes, incoming, lane_bytes, table_bytes;
+    uint64_t timestamp_bytes = 0;
+    uint64_t ledger_before, ledger_after;
+    if (!col_rel_payload_shape_bytes(&final_shape, &final_bytes)
+        || !col_rel_payload_grid_bytes(r->ncols, r->ncols, requested,
+        true, &incoming)
+        || !wl_columnar_memory_size_mul(requested, sizeof(int64_t), &lane_bytes)
+        || !wl_columnar_memory_size_mul(r->ncols, sizeof(int64_t *),
+        &table_bytes)
+        || (r->timestamps && !wl_columnar_memory_size_mul(requested,
+        sizeof(col_delta_timestamp_t), &timestamp_bytes))
+        || !wl_columnar_memory_size_add(incoming, timestamp_bytes, &incoming)
+        || !wl_columnar_memory_size_mul(r->ncols, r->capacity, &ledger_before)
+        || !wl_columnar_memory_size_mul(ledger_before, sizeof(int64_t),
+        &ledger_before)
+        || !wl_columnar_memory_size_mul(r->ncols, requested, &ledger_after)
+        || !wl_columnar_memory_size_mul(ledger_after, sizeof(int64_t),
+        &ledger_after)
+        || lane_bytes > SIZE_MAX || table_bytes > SIZE_MAX
+        || timestamp_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    if (r->memory_governor) {
+        rc = wl_columnar_relation_growth_begin_controlled(r, incoming,
+                &pending, &active, control);
+        if (rc != 0) {
+            if (denied)
+                *denied = r->memory_budget_denial_pending;
+            return rc;
+        }
+    }
+    rc = wl_columnar_relation_prepare_growth_controlled(r, lane_bytes,
+            table_bytes, timestamp_bytes, &columns, &timestamps, control);
+    if (rc != 0)
+        goto done;
+    if (timestamps) {
+        rc = wl_columnar_relation_zero_timestamp_tail_controlled(timestamps,
+                r->nrows, requested, control);
+        if (rc != 0)
+            goto done;
+    }
+    /* Prepay columns, timestamps, capacity and timestamp_capacity stores.
+     * After the commit cutoff they and all retirement are mandatory. */
+    rc = wl_evaluation_control_charge(control, 4);
+    if (rc == 0)
+        rc = wl_columnar_relation_work_tail(control, 4);
+    if (rc == 0)
+        rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        goto done;
+    if (active) {
+        rc = wl_columnar_relation_growth_commit_controlled(r, &pending,
+                &active, control);
+        if (rc != 0)
+            goto done;
+    }
+    int64_t **old_columns = r->columns;
+    col_delta_timestamp_t *old_timestamps = r->timestamps;
+    r->columns = columns;
+    r->timestamps = timestamps;
+    r->capacity = requested;
+    r->timestamp_capacity = timestamps ? requested : 0;
+    columns = NULL;
+    timestamps = NULL;
+    wl_columnar_relation_touch_storage(r);
+    col_columns_free(old_columns, r->ncols);
+    free(old_timestamps);
+    wl_columnar_relation_retire_payload_credit_known(r, final_bytes);
+    wl_columnar_relation_ledger_reconcile_known(r, ledger_before, ledger_after);
+done:
+    if (columns)
+        col_columns_free(columns, r->ncols);
+    free(timestamps);
+    if (active) {
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+        wl_columnar_relation_test_note_resize_columns_retired();
+#endif
+        col_rel_payload_txn_rollback(r, &pending);
     }
     return rc;
 }

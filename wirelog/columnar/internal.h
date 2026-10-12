@@ -3175,6 +3175,35 @@ extern void (*wl_columnar_relation_test_before_writer_cas)(
 extern void (*wl_columnar_relation_test_work_checkpoint)(
     wl_evaluation_control_t *control, uint64_t work);
 #endif
+/* Exact-capacity reserve for an exclusively owned unpublished relation or a
+ * caller-held canonical writer, with descriptor lifetime/metadata serialized.
+ * Does not acquire gates, advance a live mutation lease or publish a mutation
+ * set: do not use behind a lease whose generations cannot legally be refreshed.
+ * NULL control delegates raw before these restrictions. Controlled mode supports
+ * initialized self-owned, positive-width allocated scalar heap storage only;
+ * independent timestamp capacity >= nrows is supported. Malformed shape/token
+ * is EINVAL, unsupported compound/shared/arena/alias/nullary/detached storage
+ * ENOTSUP, and borrowers EBUSY. Growing an exhausted generation is EOVERFLOW.
+ * Valid but missing/insufficient retained credit is ENOTSUP, even on no-growth;
+ * no token repair is attempted. Status outputs are cleared before polling and
+ * indicate only actual budget denial, not allocator ENOMEM or cancellation.
+ * A supported requested <= capacity call validates W lanes and otherwise leaves
+ * storage, timestamp spare fields, generations, credit and ledger unchanged.
+ * Growth installs exactly requested capacity, preserving rows/view and live
+ * cells/timestamp fields; every spare timestamp field is zero (padding is
+ * unspecified). Storage generation advances once. Failure preserves the old
+ * image and disposes staging before returning its credit. Success finishes
+ * publication/retirement without another cancellation point after commit.
+ * For W columns, L live rows, C requested rows and T timestamp presence, work
+ * is 2W+W*L+5+T*(1+5C), plus75 for governed growth and1 per extra total-CAS
+ * attempt. No-growth costs W. Fixed preflight/helper reads/arithmetic, caller
+ * gates, allocator runtime, shared ledger atomics and mandatory cleanup are
+ * excluded; this is not a whole-call bound. Scalar spare cells are unspecified.
+ */
+int
+wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
+    uint32_t requested, bool *denied, wl_evaluation_control_t *control);
+
 /* Append only while dst is still empty after canonical storage admission.
  * EBUSY means another writer populated it before this operation acquired
  * the destination gate.  The source and destination descriptors must remain
