@@ -1,0 +1,17 @@
+ 1/12 unit+tsan - wirelog:source_access         OK               0.00s
+ 2/12 unit - wirelog:join_pipeline              OK               0.01s
+ 3/12 wirelog:join_arrangement                  OK               0.39s
+ 4/12 wirelog:join_limit                        OK               0.16s
+ 5/12 wirelog:join_overflow                     OK               0.19s
+ 6/12 wirelog:simd_join                         OK               0.27s
+ 7/12 wirelog:diff_join                         OK               0.07s
+ 8/12 wirelog:join_batch_resume                 OK               0.05s
+ 9/12 wirelog:join_right_filter_cleanup         OK               0.01s
+10/12 unit+tsan - wirelog:relation_mutation_set OK               0.03s
+11/12 wirelog:relation_generations              OK               0.12s
+12/12 wirelog:wide_relation                     OK               0.53s
+
+Ok:                12  
+Fail:              0   
+
+Full log written to /srv/home/joykim/.cache/wirelog-1913-candidate-native/meson-logs/testlog.txt

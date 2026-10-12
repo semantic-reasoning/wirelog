@@ -1,0 +1,32 @@
+commit=691116500ac45407b73244850641c646877fdb43
+source_tree=7dcfdbf2f6604c20a9ae73191d06e1dfd50291af
+runner=atlas-perf os=Linux arch=X64
+runner_labels=self-hosted,Linux,X64,perf
+image_tag=semantic-reasoning:ubuntu26 image_id=sha256:c04b38dee72397a66dfe79ccc0ee5b3ef3f7c2d3181c03fdc3e358d7791da51e pull=never
+requested_affinity=0
+pid 28104's current affinity list: 0-19
+kernel=Linux 7.2.9-arch1-1 x86_64 GNU/Linux
+cpu_model=Intel(R) Core(TM) i5-14600
+boot_id=13294565-7197-443f-bea2-62c3e5d3e55f
+loadavg=1.39 1.24 1.08 1/530 28131
+[/sys/fs/cgroup/cpuset.cpus.effective]
+0-19
+[/sys/fs/cgroup/cpu.stat]
+usage_usec 3332980507
+user_usec 2826063209
+system_usec 506917298
+nice_usec 151136
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+[/proc/pressure/cpu]
+some avg10=0.00 avg60=0.00 avg300=0.20 total=34834160
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+scaling_governor=performance
+scaling_cur_freq=800000
+scaling_min_freq=800000
+scaling_max_freq=5200000
+cpuinfo_cur_freq=unavailable

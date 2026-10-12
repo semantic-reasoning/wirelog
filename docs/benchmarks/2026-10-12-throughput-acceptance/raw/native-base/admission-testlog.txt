@@ -1,0 +1,225 @@
+Log of Meson test suite run on 2026-10-12T11:34:21.519591
+
+Inherited environment: SHELL=/bin/bash COLORTERM=truecolor TERM_PROGRAM_VERSION=3.7c TMUX=/tmp/tmux-1000/default,9149,0 CODEX_VERSION=0.162.1 GH_PAGER=cat PWD=/home/joykim/.cache/wirelog-1913-current-69111650/source LOGNAME=joykim XDG_SESSION_TYPE=tty MOTD_SHOWN=pam HOME=/home/joykim CODEX_SESSION_ID=01a12dd7-44ba-7452-96c1-1a031bcdd841 LANG=en_US.UTF-8 VIRTUAL_ENV=/home/joykim/.cache/wirelog-1913-current-69111650/venv TMPDIR=/home/joykim/.cache/wirelog-1913-current-69111650/tmp SSH_CONNECTION='10.2.0.1 34314 10.2.1.109 22' XDG_SESSION_CLASS=user TERM=tmux-256color CODEX_THREAD_ID=01a12dd7-44ba-7452-96c1-1a031bcdd841 USER=joykim GIT_PAGER=cat TMUX_PANE=%0 CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS=1 SHLVL=4 PAGER=cat XDG_SESSION_ID=3 VIRTUAL_ENV_PROMPT=venv NO_COLOR=1 CODEX_CI=1 LC_CTYPE=C.UTF-8 XDG_RUNTIME_DIR=/run/user/1000 PS1='(venv) ' SSH_CLIENT='10.2.0.1 34314 22' DEBUGINFOD_URLS='https://debuginfod.archlinux.org ' LC_ALL=C.UTF-8 PATH=/home/joykim/.cache/wirelog-1913-current-69111650/venv/bin:/srv/home/joykim/.codex/packages/app-server-daemon/releases/0.162.1-x86_64-unknown-linux-musl/codex-path:/home/joykim/.codex/tmp/arg0/codex-arg0TmPfRY:/srv/home/joykim/.codex/packages/app-server-daemon/releases/0.162.1-x86_64-unknown-linux-musl/codex-path:/home/joykim/.codex/tmp/arg0/codex-arg0df4VQW:/srv/home/joykim/.codex/packages/standalone/releases/0.162.1-x86_64-unknown-linux-musl/codex-path:/home/joykim/.local/bin:/home/joykim/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus MAIL=/var/spool/mail/joykim SSH_TTY=/dev/pts/0 OLDPWD=/home/joykim/git/wirelog TERM_PROGRAM=tmux _=/home/joykim/.cache/wirelog-1913-current-69111650/venv/bin/meson 
+
+==================================== 1/7 =====================================
+test:         unit - wirelog:memory_admission_intern
+start time:   02:34:21
+duration:     0.00s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MALLOC_PERTURB_=203 MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_intern
+----------------------------------- stdout -----------------------------------
+memory admission intern tests passed
+==============================================================================
+
+==================================== 2/7 =====================================
+test:         unit - wirelog:memory_governor
+start time:   02:34:21
+duration:     0.01s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MALLOC_PERTURB_=239 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_governor
+----------------------------------- stdout -----------------------------------
+Memory Governor Unit Tests (Issue #1368)
+=========================================
+  [1] strict explicit budget parsing ... PASS
+  [2] automatic source reduction and advisory fallback ... PASS
+  [3] headroom cap and small-budget arithmetic ... PASS
+  [4] reservation token lifecycle and denial ... PASS
+  [5] concurrent reservations share one limit ... PASS
+  [6] typed admission, growth overlap, arithmetic, and token identity ... PASS
+  [7] committed reservation downsizing and invalid states ... PASS
+  [8] controlled claim, credit, and publication interleavings ... PASS
+  [9] downsize/release/transfer contention conserves unrelated reservations ... PASS
+  [10] replacement reservation admits overlap and rolls back  [11] replacement teardown release reclaims stranded overlap ... PASS
+  [12] committed growth exact fit, one-byte denial, and rollback ... PASS
+  [13] growth advisory and stranded-overlap teardown ... PASS
+  [14] growth token and governor arithmetic overflow ... PASS
+  [15] growth commit, rollback, and release conserve credit under race ... PASS
+
+Passed 15/15; Failed 0
+==============================================================================
+
+==================================== 3/7 =====================================
+test:         unit - wirelog:memory_admission_arena
+start time:   02:34:21
+duration:     0.00s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MALLOC_PERTURB_=244 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_arena
+----------------------------------- stdout -----------------------------------
+memory admission arena: PASS
+==============================================================================
+
+==================================== 4/7 =====================================
+test:         unit - wirelog:memory_admission_delta
+start time:   02:34:21
+duration:     0.00s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MALLOC_PERTURB_=67 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_delta
+----------------------------------- stdout -----------------------------------
+memory admission delta pool: PASS
+==============================================================================
+
+==================================== 5/7 =====================================
+test:         unit - wirelog:memory_admission_compound
+start time:   02:34:21
+duration:     0.00s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MALLOC_PERTURB_=47 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_compound
+----------------------------------- stdout -----------------------------------
+memory admission compound arena: PASS
+==============================================================================
+
+==================================== 6/7 =====================================
+test:         unit - wirelog:memory_admission_relation
+start time:   02:34:21
+duration:     0.15s
+result:       exit status 0
+command:      MALLOC_PERTURB_=71 ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 LD_LIBRARY_PATH=/srv/home/joykim/.cache/wirelog-1913-current-69111650/build/subprojects/xxHash-0.8.4:/srv/home/joykim/.cache/wirelog-1913-current-69111650/build/subprojects/nanoarrow MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_relation
+----------------------------------- stdout -----------------------------------
+memory admission relation: PASS
+==============================================================================
+
+==================================== 7/7 =====================================
+test:         unit - wirelog:memory_admission_join
+start time:   02:34:21
+duration:     0.09s
+result:       exit status 0
+command:      ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1 MALLOC_PERTURB_=108 MSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_summary=1:print_stacktrace=1 LD_LIBRARY_PATH=/srv/home/joykim/.cache/wirelog-1913-current-69111650/build/subprojects/xxHash-0.8.4:/srv/home/joykim/.cache/wirelog-1913-current-69111650/build/subprojects/nanoarrow MESON_TEST_ITERATION=1 /srv/home/joykim/.cache/wirelog-1913-current-69111650/build/tests/test_memory_admission_join
+----------------------------------- stdout -----------------------------------
+Memory admission: JOIN output capacity (Issue #1477)
+  [ 1] materialized join output is attached to the session governor     PASS
+  [ 2] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 3] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 4] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 5] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 6] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 7] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 8] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [ 9] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [10] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [11] REDUCE governs groups and preserves the defined denial retry boundary PASS
+  [12] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [13] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [14] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [15] MAP preadmits full output before callbacks and retries exact input PASS
+  [16] MAP preadmits full output before callbacks and retries exact input PASS
+  [17] MAP preadmits full output before callbacks and retries exact input PASS
+  [18] MAP preadmits full output before callbacks and retries exact input PASS
+  [19] MAP preadmits full output before callbacks and retries exact input PASS
+  [20] MAP preadmits full output before callbacks and retries exact input PASS
+  [21] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [22] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [23] unmanaged MAP/REDUCE retains heap/pool/arena allocation policy   PASS
+  [24] MAP preadmits full output before callbacks and retries exact input PASS
+  [25] MAP preadmits full output before callbacks and retries exact input PASS
+  [26] MAP preadmits full output before callbacks and retries exact input PASS
+  [27] MAP preadmits full output before callbacks and retries exact input PASS
+  [28] VARIABLE empty admission pool=0 governor=0 condition=0           PASS
+  [29] VARIABLE empty admission pool=0 governor=0 condition=1           PASS
+  [30] VARIABLE empty admission pool=0 governor=0 condition=2           PASS
+  [31] VARIABLE empty admission pool=0 governor=0 condition=3           PASS
+  [32] VARIABLE empty admission pool=0 governor=0 condition=4           PASS
+  [33] VARIABLE empty admission pool=0 governor=0 condition=5           PASS
+  [34] VARIABLE empty admission pool=0 governor=1 condition=0           PASS
+  [35] VARIABLE empty admission pool=0 governor=1 condition=1           PASS
+  [36] VARIABLE empty admission pool=0 governor=1 condition=2           PASS
+  [37] VARIABLE empty admission pool=0 governor=1 condition=3           PASS
+  [38] VARIABLE empty admission pool=0 governor=1 condition=4           PASS
+  [39] VARIABLE empty admission pool=0 governor=1 condition=5           PASS
+  [40] VARIABLE empty admission pool=0 governor=2 condition=0           PASS
+  [41] VARIABLE empty admission pool=0 governor=2 condition=1           PASS
+  [42] VARIABLE empty admission pool=0 governor=2 condition=2           PASS
+  [43] VARIABLE empty admission pool=0 governor=2 condition=3           PASS
+  [44] VARIABLE empty admission pool=0 governor=2 condition=4           PASS
+  [45] VARIABLE empty admission pool=0 governor=2 condition=5           PASS
+  [46] VARIABLE empty admission pool=1 governor=0 condition=0           PASS
+  [47] VARIABLE empty admission pool=1 governor=0 condition=1           PASS
+  [48] VARIABLE empty admission pool=1 governor=0 condition=2           PASS
+  [49] VARIABLE empty admission pool=1 governor=0 condition=3           PASS
+  [50] VARIABLE empty admission pool=1 governor=0 condition=4           PASS
+  [51] VARIABLE empty admission pool=1 governor=0 condition=5           PASS
+  [52] VARIABLE empty admission pool=1 governor=1 condition=0           PASS
+  [53] VARIABLE empty admission pool=1 governor=1 condition=1           PASS
+  [54] VARIABLE empty admission pool=1 governor=1 condition=2           PASS
+  [55] VARIABLE empty admission pool=1 governor=1 condition=3           PASS
+  [56] VARIABLE empty admission pool=1 governor=1 condition=4           PASS
+  [57] VARIABLE empty admission pool=1 governor=1 condition=5           PASS
+  [58] VARIABLE empty admission pool=1 governor=2 condition=0           PASS
+  [59] VARIABLE empty admission pool=1 governor=2 condition=1           PASS
+  [60] VARIABLE empty admission pool=1 governor=2 condition=2           PASS
+  [61] VARIABLE empty admission pool=1 governor=2 condition=3           PASS
+  [62] VARIABLE empty admission pool=1 governor=2 condition=4           PASS
+  [63] VARIABLE empty admission pool=1 governor=2 condition=5           PASS
+  [64] heap CONCAT admission preserves staged inputs                    PASS
+  [65] heap CONCAT admission preserves staged inputs                    PASS
+  [66] pooled CONCAT admission preserves staged inputs                  PASS
+  [67] pooled CONCAT admission preserves staged inputs                  PASS
+  [68] timestamp JOIN batch projects one row but admits physical capacity PASS
+  [69] cross join succeeds at the exact output+scratch peak             PASS
+  [70] cross join denied one byte below output+scratch peak             PASS
+  [71] missing-right JOIN preserves metadata denial and exact overlap   PASS
+  [72] denied growth preserves capacity, rows and the committed token   PASS
+  [73] worker JOIN above ledger threshold keeps all governed rows       PASS
+  [74] a session falls back to one governed owner and serves a smaller join PASS
+  [75] materialized+projected output follows output admission           PASS
+  [76] JOIN output growth denial is ENOSPC and releases its output      PASS
+  [77] SEMI hash denial restores admitted scratch                       PASS
+  [78] ANTI hash denial destroys output and restores scratch            PASS
+  [79] source-only JOIN key scratch denial is typed and balanced        PASS
+  [80] key scratch allocation failure releases its admitted source bytes PASS
+  [81] output admission prefers session over source governors           PASS
+  [82] source output admission prefers left over right governor         PASS
+  [83] source output admission falls back to right governor             PASS
+  [84] source-only governor admits ANTI and SEMI JOIN outputs           PASS
+  [85] cache adoption re-parents the ledger without a second charge     PASS
+  [86] parallel cross-join output is governed after substitution        PASS
+  [87] parallel cross JOIN admits source-governed worker contexts       PASS
+  [88] parallel SEMI JOIN admits source-governed worker scratch         PASS
+  [89] parallel cross-join bulk reserve denies deterministically        PASS
+  [90] cross join inside COL_REL_INIT_CAP is still admitted             PASS
+  [91] parallel keyed diff output is governed after bulk reserve        PASS
+  [92] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [93] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [94] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [95] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [96] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [97] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [98] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [99] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [100] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [101] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [102] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [103] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [104] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [105] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [106] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [107] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [108] borrowed CONS admits copy and workspace, preserves input and retries PASS
+  [109] governed CONS retains a cleanup-refused copy as the retry owner  PASS
+  [110] governed CONS retains a cleanup-refused copy as the retry owner  PASS
+  [111] differential CONS copy obeys admission and can retry             PASS
+  [112] parallel keyed diff copy OOM publishes one accounted result      PASS
+  [113] parallel keyed diff admission denial rolls back transaction state PASS
+  [114] parallel diff partial count submission drains and retries        PASS
+  [115] parallel diff partial fill submission drains and retries         PASS
+  [116] parallel keyed diff dispatches W8 and preserves exact output     PASS
+  [117] parallel keyed diff uses and releases the source-only governor   PASS
+  [118] parallel pair-vector growth denial restores old reservation      PASS
+  [119] parallel pair-vector realloc failure restores old reservation    PASS
+  [120] parallel pair-vector commit failure restores reservation         PASS
+  [121] parallel pair-cache cap falls back without losing JOIN rows      PASS
+  [122] post-push diff commit refusal rolls back cache, twin and reservation PASS
+  [123] post-push disposal refusal retains complete JOIN result at stack limit PASS
+  [124] differential cache pin protects cached result during governed copy PASS
+  [125] materialized join stack copy keeps the transient twin contract   PASS
+  [126] materialized cache copy prefers session then source governor     PASS
+  [127] post-admission twin allocation failure publishes one accounted owner PASS
+  [128] full pinned cache falls back to one accounted JOIN owner         PASS
+  [129] governed materialized JOIN survives FILTER/MAP and CONCAT/CONSOLIDATE PASS
+
+  129 run, 129 passed, 0 failed
+==============================================================================
+
+
+Ok:                7   
+Fail:              0   

@@ -1,0 +1,32 @@
+{
+  "cspa.perf.data.old": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/cspa.perf.data.old",
+    "size_bytes": 34240,
+    "sha256": "b27540a835da7de8c8d2af6d6c6297eea867a9446a71c9c57b3da588c3e2395b"
+  },
+  "cspa.perf.data": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/cspa.perf.data",
+    "size_bytes": 6421312,
+    "sha256": "d48de2d2d8d9519f61a862ce1054fadd193d8c6938756ee427594ae5e01eab59"
+  },
+  "cspa-events.txt": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/cspa-events.txt",
+    "size_bytes": 1259902,
+    "sha256": "78342bcb4caecf3670060e40de69803c0bb7c567ee369cd76a73246484facd9b"
+  },
+  "crdt.perf.data.old": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/crdt.perf.data.old",
+    "size_bytes": 34240,
+    "sha256": "38512cd61bd5c036e8dafd5e2fbcbc8318d39eb68207f5ee8008e20a22732855"
+  },
+  "crdt.perf.data": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/crdt.perf.data",
+    "size_bytes": 57745496,
+    "sha256": "d185cbab348bc671d64f2ae18b99f7736a194a20efc211063765409aec5dcad2"
+  },
+  "crdt-events.txt": {
+    "local_path": "/home/joykim/.cache/wirelog-1913-current-69111650/evidence/crdt-events.txt",
+    "size_bytes": 10229869,
+    "sha256": "9012519eddcc6c01ab1276819a2d8d20d7abc22a5e20b31bca3545f65a80fdf3"
+  }
+}

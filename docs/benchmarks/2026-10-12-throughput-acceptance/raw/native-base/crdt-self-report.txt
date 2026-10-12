@@ -1,0 +1,145 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 6K of event 'cpu_core/cycles/u'
+# Event count (approx.): 88053560867
+#
+# Overhead  Symbol                                                          IPC   [IPC Coverage]
+# ........  ..............................................................  ....................
+#
+    23.25%  [.] wl_columnar_join_diff_op                                    -      -            
+    15.97%  [.] 0x0000000000176e53                                          -      -            
+    11.08%  [.] col_rel_row_copy_in_raw.isra.0                              -      -            
+    10.74%  [.] wl_columnar_hash_value.lto_priv.2                           -      -            
+     6.04%  [.] col_rel_row_copy_out.lto_priv.2                             -      -            
+     5.96%  [.] col_rel_row_cmp.lto_priv.1                                  -      -            
+     5.87%  [.] col_rel_compact_runs_prepared.lto_priv.0                    -      -            
+     4.93%  [.] col_rel_row_cmp_raw                                         -      -            
+     3.41%  [.] col_join_keys_match_rel                                     -      -            
+     3.05%  [.] wl_columnar_value_key.lto_priv.0                            -      -            
+     2.87%  [.] col_diff_arrangement_deep_copy_with_memory_governor_status  -      -            
+     1.04%  [.] wl_columnar_value_equal                                     -      -            
+     0.44%  [.] col_rel_append_row_impl.constprop.0                         -      -            
+     0.34%  [.] col_rel_mutation_lease_validate_binding.lto_priv.0          -      -            
+     0.34%  [.] wl_columnar_antijoin_op                                     -      -            
+     0.28%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0         -      -            
+     0.24%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0         -      -            
+     0.23%  [.] wl_columnar_memory_reservation_init.part.0                  -      -            
+     0.20%  [.] wl_columnar_source_access_writer_release.lto_priv.4         -      -            
+     0.19%  [.] wl_columnar_radix_rows_prepared.isra.0                      -      -            
+     0.18%  [.] col_arrangement_find_first_typed                            -      -            
+     0.16%  [.] wl_columnar_merge_consolidate_checked.lto_priv.0            -      -            
+     0.13%  [.] cfree                                                       -      -            
+     0.13%  [.] malloc                                                      -      -            
+     0.12%  [.] wl_columnar_expr_eval_compiled.constprop.0                  -      -            
+     0.10%  [.] col_rel_mutation_set_unwind.lto_priv.0                      -      -            
+     0.09%  [.] claim_reservation_state                                     -      -            
+     0.09%  [.] col_rel_mutation_set_finish                                 -      -            
+     0.08%  [.] col_rel_append_row                                          -      -            
+     0.06%  [.] wl_columnar_arrangement_diff_reset_state                    -      -            
+     0.06%  [.] ArrowSchemaSetFormat                                        -      -            
+     0.06%  [.] 0x00000000000a4fbe                                          -      -            
+     0.06%  [.] col_rel_set_column_types                                    -      -            
+     0.06%  [.] col_rel_append_all_impl.constprop.0                         -      -            
+     0.06%  [.] col_join_append_pair                                        -      -            
+     0.06%  [.] col_rel_timestamp_shape_valid.lto_priv.0                    -      -            
+     0.06%  [.] wl_columnar_source_access_writer_validate                   -      -            
+     0.05%  [.] wl_columnar_join_op                                         -      -            
+     0.05%  [k] 0xffffffffaf401280                                          -      -            
+     0.05%  [.] expr_push                                                   -      -            
+     0.04%  [.] credit_reservation                                          -      -            
+     0.04%  [.] wl_columnar_memory_reservation_move                         -      -            
+     0.04%  [.] 0x00000000000a4ee9                                          -      -            
+     0.04%  [k] 0xffffffffaf4015f0                                          -      -            
+     0.04%  [.] 0x00000000000a4efd                                          -      -            
+     0.04%  [.] thrd_equal@plt                                              -      -            
+     0.04%  [.] arr_index_rows.constprop.0                                  -      -            
+     0.04%  [.] col_op_consolidate_incremental_delta                        -      -            
+     0.04%  [.] wl_columnar_source_access_writer_thread_equal.lto_priv.1    -      -            
+     0.04%  [.] wl_columnar_value_equal.lto_priv.1                          -      -            
+     0.03%  [.] session_rel_hash_string.lto_priv.0                          -      -            
+     0.03%  [.] malloc@plt                                                  -      -            
+     0.03%  [.] col_rel_new_identity.lto_priv.0                             -      -            
+     0.03%  [.] wl_strdup.lto_priv.3                                        -      -            
+     0.03%  [.] col_rel_payload_shape_bytes.lto_priv.0                      -      -            
+     0.03%  [.] wl_columnar_relation_generation_advance.isra.0              -      -            
+     0.03%  [.] col_rel_set_schema_impl_capacity.lto_priv.0                 -      -            
+     0.03%  [.] thrd_current@plt                                            -      -            
+     0.03%  [.] col_rel_enable_timestamps                                   -      -            
+     0.03%  [.] wl_columnar_source_access_gate_reader_acquire.lto_priv.1    -      -            
+     0.03%  [.] wl_columnar_eval_serial_framed_relation                     -      -            
+     0.03%  [.] col_join_output_limit_reached                               -      -            
+     0.03%  [.] __libc_calloc                                               -      -            
+     0.03%  [.] col_rel_mutation_lease_validate                             -      -            
+     0.03%  [.] 0x0000000000178987                                          -      -            
+     0.03%  [.] wl_columnar_relation_radix_workspace_prepare.constprop.0    -      -            
+     0.03%  [.] 0x000000000017898b                                          -      -            
+     0.03%  [.] col_rel_prepare_resize.constprop.0                          -      -            
+     0.02%  [.] strtoll@plt                                                 -      -            
+     0.02%  [.] csv_parse_line_via_ctx.constprop.0                          -      -            
+     0.01%  [.] col_rel_owned_ledger_bytes                                  -      -            
+     0.01%  [.] col_rel_append_batch_begin                                  -      -            
+     0.01%  [.] 0x0000000000179121                                          -      -            
+     0.01%  [.] col_rel_grow_owned_transition_publish_impl.lto_priv.0       -      -            
+     0.01%  [.] ArrowSchemaInit@plt                                         -      -            
+     0.01%  [.] 0x00000000000a74d4                                          -      -            
+     0.01%  [.] wl_columnar_memory_reserve_checked                          -      -            
+     0.01%  [.] clock_gettime                                               -      -            
+     0.01%  [.] wl_columnar_relation_init_arrow_schema.lto_priv.0           -      -            
+     0.01%  [.] 0x00000000000a7590                                          -      -            
+     0.01%  [.] 0x00000000000a4ef3                                          -      -            
+     0.01%  [.] strchrnul@plt                                               -      -            
+     0.01%  [.] 0x00000000000a73a8                                          -      -            
+     0.01%  [.] wl_mem_ledger_set_gauge.part.0                              -      -            
+     0.01%  [.] wl_columnar_join_key_scratch_alloc                          -      -            
+     0.01%  [.] 0x00000000000a79e8                                          -      -            
+     0.01%  [.] ArrowSchemaSetName@plt                                      -      -            
+     0.01%  [.] 0x000000000017911d                                          -      -            
+     0.01%  [.] col_rel_retained_live_bytes                                 -      -            
+     0.01%  [.] col_rel_payload_grid_bytes.lto_priv.0                       -      -            
+     0.01%  [.] 0x0000000000178c90                                          -      -            
+     0.01%  [.] 0x00000000000a7704                                          -      -            
+     0.01%  [.] getenv                                                      -      -            
+     0.01%  [.] __vdso_clock_gettime                                        -      -            
+     0.01%  [.] wl_columnar_relation_pool_new_like_governed_checked         -      -            
+     0.01%  [.] 0x0000000000178cb4                                          -      -            
+     0.01%  [.] wl_columnar_memory_reservation_init                         -      -            
+     0.01%  [.] standard_rotate_eval_arena.lto_priv.0                       -      -            
+     0.01%  [.] wl_columnar_eval_stack_cleanup_free                         -      -            
+     0.01%  [.] 0x00000000000a7594                                          -      -            
+     0.01%  [.] ArrowSchemaSetTypeStruct                                    -      -            
+     0.01%  [.] 0x00000000000a77f1                                          -      -            
+     0.01%  [.] 0x00000000000a4ed0                                          -      -            
+     0.01%  [.] 0x000000000005a9a7                                          -      -            
+     0.01%  [.] wl_columnar_eval_stack_cleanup_continuations                -      -            
+     0.01%  [.] session_rel_hash_lookup                                     -      -            
+     0.01%  [.] col_rel_payload_live_shape.lto_priv.0                       -      -            
+     0.01%  [.] col_rel_prepare_column_types.constprop.0                    -      -            
+     0.01%  [.] 0x00000000000a4fe3                                          -      -            
+     0.01%  [.] 0x0000000000176687                                          -      -            
+     0.01%  [.] col_rel_append_batch_row                                    -      -            
+     0.01%  [.] wl_columnar_source_access_gate_reader_release.lto_priv.2    -      -            
+     0.01%  [.] 0x00000000000a73c7                                          -      -            
+     0.01%  [.] strlen@plt                                                  -      -            
+     0.01%  [.] col_join_pair_value                                         -      -            
+     0.01%  [.] ArrowMalloc@plt                                             -      -            
+     0.01%  [.] 0x0000000000178787                                          -      -            
+     0.01%  [.] col_rel_storage_owner_ensure_initialized                    -      -            
+     0.01%  [.] col_rel_storage_owner_resolve                               -      -            
+     0.01%  [.] col_rel_row.lto_priv.0                                      -      -            
+     0.01%  [.] col_op_map.part.0                                           -      -            
+     0.01%  [.] reserve_internal.lto_priv.0                                 -      -            
+     0.01%  [.] wl_columnar_filter_append_selected                          -      -            
+     0.01%  [.] col_rel_append_rows_atomic                                  -      -            
+     0.01%  [.] 0x000000000005018c                                          -      -            
+     0.01%  [.] 0x00000000001759b9                                          -      -            
+     0.00%  [.] scan_identifier                                             -      -            
+     0.00%  [.] __ctype_b_loc@plt                                           -      -            
+     0.00%  [.] csv_finish_line                                             -      -            
+
+
+#
+# (Tip: To analyze particular parallelism levels, try: perf report --latency --parallelism=32-64)
+#

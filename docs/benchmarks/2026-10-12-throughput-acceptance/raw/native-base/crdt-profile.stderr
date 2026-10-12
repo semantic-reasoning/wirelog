@@ -1,0 +1,2 @@
+[ perf record: Woken up 221 times to write data ]
+[ perf record: Captured and wrote 55.045 MB /home/joykim/.cache/wirelog-1913-current-69111650/evidence/crdt.perf.data (6841 samples) ]

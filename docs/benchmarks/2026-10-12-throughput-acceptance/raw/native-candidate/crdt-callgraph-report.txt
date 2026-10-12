@@ -1,0 +1,1246 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 6K of event 'cpu_core/cycles/u'
+# Event count (approx.): 88297690829
+#
+# Children      Self  Symbol                                                                 IPC   [IPC Coverage]
+# ........  ........  .....................................................................  ....................
+#
+    99.75%     0.00%  [.] _start                                                             -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               |          
+                --99.74%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          |          
+                           --99.68%--col_eval_stratum
+                                     col_eval_stratum
+                                     |          
+                                     |--49.12%--wl_columnar_eval_serial_framed_relation
+                                     |          |          
+                                     |           --48.87%--wl_columnar_eval_plan_body
+                                     |                     |          
+                                     |                     |--44.55%--wl_columnar_join_diff_op
+                                     |                     |          |          
+                                     |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                                     |                     |          |          |          
+                                     |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                                     |                     |          |                     |          
+                                     |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                                     |                     |          |          
+                                     |                     |          |--4.17%--col_join_keys_match_rel
+                                     |                     |          |          |          
+                                     |                     |          |           --0.73%--wl_columnar_value_equal
+                                     |                     |          |          
+                                     |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                                     |                     |          
+                                     |                     |--1.65%--col_op_map.part.0
+                                     |                     |          |          
+                                     |                     |           --1.18%--col_rel_append_row
+                                     |                     |          
+                                     |                      --1.17%--wl_columnar_antijoin_op
+                                     |          
+                                     |--34.25%--col_op_consolidate_incremental_delta
+                                     |          |          
+                                     |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                                     |                     |          
+                                     |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                     |                                |          
+                                     |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                     |                                |          |          
+                                     |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                     |                                |          
+                                     |                                |--5.56%--col_rel_row_copy_out (inlined)
+                                     |                                |          
+                                     |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                                     |                                |          
+                                     |                                 --5.13%--col_rel_row_cmp_raw
+                                     |          
+                                      --15.88%--col_rel_enable_timestamps
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                |          
+                                                 --15.83%--0x7f4302d76e53
+
+    99.75%     0.00%  [.] __libc_start_main                                                  -      -            
+            |
+            ---0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               |          
+                --99.74%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          |          
+                           --99.68%--col_eval_stratum
+                                     col_eval_stratum
+                                     |          
+                                     |--49.12%--wl_columnar_eval_serial_framed_relation
+                                     |          |          
+                                     |           --48.87%--wl_columnar_eval_plan_body
+                                     |                     |          
+                                     |                     |--44.55%--wl_columnar_join_diff_op
+                                     |                     |          |          
+                                     |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                                     |                     |          |          |          
+                                     |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                                     |                     |          |                     |          
+                                     |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                                     |                     |          |          
+                                     |                     |          |--4.17%--col_join_keys_match_rel
+                                     |                     |          |          |          
+                                     |                     |          |           --0.73%--wl_columnar_value_equal
+                                     |                     |          |          
+                                     |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                                     |                     |          
+                                     |                     |--1.65%--col_op_map.part.0
+                                     |                     |          |          
+                                     |                     |           --1.18%--col_rel_append_row
+                                     |                     |          
+                                     |                      --1.17%--wl_columnar_antijoin_op
+                                     |          
+                                     |--34.25%--col_op_consolidate_incremental_delta
+                                     |          |          
+                                     |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                                     |                     |          
+                                     |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                     |                                |          
+                                     |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                     |                                |          |          
+                                     |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                     |                                |          
+                                     |                                |--5.56%--col_rel_row_copy_out (inlined)
+                                     |                                |          
+                                     |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                                     |                                |          
+                                     |                                 --5.13%--col_rel_row_cmp_raw
+                                     |          
+                                      --15.88%--col_rel_enable_timestamps
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                |          
+                                                 --15.83%--0x7f4302d76e53
+
+    99.75%     0.00%  [.] 0x00007f4302c27780                                                 -      -            
+            |
+            ---main
+               run_crdt_once_ (inlined)
+               |          
+                --99.74%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          |          
+                           --99.68%--col_eval_stratum
+                                     col_eval_stratum
+                                     |          
+                                     |--49.12%--wl_columnar_eval_serial_framed_relation
+                                     |          |          
+                                     |           --48.87%--wl_columnar_eval_plan_body
+                                     |                     |          
+                                     |                     |--44.55%--wl_columnar_join_diff_op
+                                     |                     |          |          
+                                     |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                                     |                     |          |          |          
+                                     |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                                     |                     |          |                     |          
+                                     |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                                     |                     |          |          
+                                     |                     |          |--4.17%--col_join_keys_match_rel
+                                     |                     |          |          |          
+                                     |                     |          |           --0.73%--wl_columnar_value_equal
+                                     |                     |          |          
+                                     |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                                     |                     |          
+                                     |                     |--1.65%--col_op_map.part.0
+                                     |                     |          |          
+                                     |                     |           --1.18%--col_rel_append_row
+                                     |                     |          
+                                     |                      --1.17%--wl_columnar_antijoin_op
+                                     |          
+                                     |--34.25%--col_op_consolidate_incremental_delta
+                                     |          |          
+                                     |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                                     |                     |          
+                                     |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                     |                                |          
+                                     |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                     |                                |          |          
+                                     |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                     |                                |          
+                                     |                                |--5.56%--col_rel_row_copy_out (inlined)
+                                     |                                |          
+                                     |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                                     |                                |          
+                                     |                                 --5.13%--col_rel_row_cmp_raw
+                                     |          
+                                      --15.88%--col_rel_enable_timestamps
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                |          
+                                                 --15.83%--0x7f4302d76e53
+
+    99.75%     0.00%  [.] main                                                               -      -            
+            |
+            ---run_crdt_once_ (inlined)
+               |          
+                --99.74%--wl_session_snapshot (inlined)
+                          col_session_snapshot.lto_priv.0
+                          col_session_snapshot_impl (inlined)
+                          |          
+                           --99.68%--col_eval_stratum
+                                     col_eval_stratum
+                                     |          
+                                     |--49.12%--wl_columnar_eval_serial_framed_relation
+                                     |          |          
+                                     |           --48.87%--wl_columnar_eval_plan_body
+                                     |                     |          
+                                     |                     |--44.55%--wl_columnar_join_diff_op
+                                     |                     |          |          
+                                     |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                                     |                     |          |          |          
+                                     |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                                     |                     |          |                     |          
+                                     |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                                     |                     |          |          
+                                     |                     |          |--4.17%--col_join_keys_match_rel
+                                     |                     |          |          |          
+                                     |                     |          |           --0.73%--wl_columnar_value_equal
+                                     |                     |          |          
+                                     |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     wl_columnar_arrangement_diff_txn_begin
+                                     |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                                     |                     |          
+                                     |                     |--1.65%--col_op_map.part.0
+                                     |                     |          |          
+                                     |                     |           --1.18%--col_rel_append_row
+                                     |                     |          
+                                     |                      --1.17%--wl_columnar_antijoin_op
+                                     |          
+                                     |--34.25%--col_op_consolidate_incremental_delta
+                                     |          |          
+                                     |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                                     |                     |          
+                                     |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                     |                                |          
+                                     |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                     |                                |          |          
+                                     |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                     |                                |          
+                                     |                                |--5.56%--col_rel_row_copy_out (inlined)
+                                     |                                |          
+                                     |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                                     |                                |          
+                                     |                                 --5.13%--col_rel_row_cmp_raw
+                                     |          
+                                      --15.88%--col_rel_enable_timestamps
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                col_rel_enable_timestamps_locked (inlined)
+                                                |          
+                                                 --15.83%--0x7f4302d76e53
+
+    99.75%     0.00%  [.] run_crdt_once_ (inlined)                                           -      -            
+            |          
+             --99.74%--wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       |          
+                        --99.68%--col_eval_stratum
+                                  col_eval_stratum
+                                  |          
+                                  |--49.12%--wl_columnar_eval_serial_framed_relation
+                                  |          |          
+                                  |           --48.87%--wl_columnar_eval_plan_body
+                                  |                     |          
+                                  |                     |--44.55%--wl_columnar_join_diff_op
+                                  |                     |          |          
+                                  |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                                  |                     |          |          |          
+                                  |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                                  |                     |          |                     |          
+                                  |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                                  |                     |          |          
+                                  |                     |          |--4.17%--col_join_keys_match_rel
+                                  |                     |          |          |          
+                                  |                     |          |           --0.73%--wl_columnar_value_equal
+                                  |                     |          |          
+                                  |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                  |                     |                     wl_columnar_arrangement_diff_txn_begin
+                                  |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                                  |                     |          
+                                  |                     |--1.65%--col_op_map.part.0
+                                  |                     |          |          
+                                  |                     |           --1.18%--col_rel_append_row
+                                  |                     |          
+                                  |                      --1.17%--wl_columnar_antijoin_op
+                                  |          
+                                  |--34.25%--col_op_consolidate_incremental_delta
+                                  |          |          
+                                  |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                                  |                     |          
+                                  |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                  |                                |          
+                                  |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                  |                                |          |          
+                                  |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                  |                                |          
+                                  |                                |--5.56%--col_rel_row_copy_out (inlined)
+                                  |                                |          
+                                  |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                                  |                                |          
+                                  |                                 --5.13%--col_rel_row_cmp_raw
+                                  |          
+                                   --15.88%--col_rel_enable_timestamps
+                                             col_rel_enable_timestamps_locked (inlined)
+                                             col_rel_enable_timestamps_locked (inlined)
+                                             |          
+                                              --15.83%--0x7f4302d76e53
+
+    99.74%     0.00%  [.] wl_session_snapshot (inlined)                                      -      -            
+            |
+            ---col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               |          
+                --99.68%--col_eval_stratum
+                          col_eval_stratum
+                          |          
+                          |--49.12%--wl_columnar_eval_serial_framed_relation
+                          |          |          
+                          |           --48.87%--wl_columnar_eval_plan_body
+                          |                     |          
+                          |                     |--44.55%--wl_columnar_join_diff_op
+                          |                     |          |          
+                          |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                          |                     |          |          |          
+                          |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                          |                     |          |                     |          
+                          |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                          |                     |          |          
+                          |                     |          |--4.17%--col_join_keys_match_rel
+                          |                     |          |          |          
+                          |                     |          |           --0.73%--wl_columnar_value_equal
+                          |                     |          |          
+                          |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                          |                     |                     wl_columnar_arrangement_diff_txn_begin
+                          |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                          |                     |          
+                          |                     |--1.65%--col_op_map.part.0
+                          |                     |          |          
+                          |                     |           --1.18%--col_rel_append_row
+                          |                     |          
+                          |                      --1.17%--wl_columnar_antijoin_op
+                          |          
+                          |--34.25%--col_op_consolidate_incremental_delta
+                          |          |          
+                          |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                          |                     |          
+                          |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                          |                                |          
+                          |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                          |                                |          |          
+                          |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                          |                                |          
+                          |                                |--5.56%--col_rel_row_copy_out (inlined)
+                          |                                |          
+                          |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                          |                                |          
+                          |                                 --5.13%--col_rel_row_cmp_raw
+                          |          
+                           --15.88%--col_rel_enable_timestamps
+                                     col_rel_enable_timestamps_locked (inlined)
+                                     col_rel_enable_timestamps_locked (inlined)
+                                     |          
+                                      --15.83%--0x7f4302d76e53
+
+    99.74%     0.00%  [.] col_session_snapshot.lto_priv.0                                    -      -            
+            |
+            ---col_session_snapshot_impl (inlined)
+               |          
+                --99.68%--col_eval_stratum
+                          col_eval_stratum
+                          |          
+                          |--49.12%--wl_columnar_eval_serial_framed_relation
+                          |          |          
+                          |           --48.87%--wl_columnar_eval_plan_body
+                          |                     |          
+                          |                     |--44.55%--wl_columnar_join_diff_op
+                          |                     |          |          
+                          |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                          |                     |          |          |          
+                          |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                          |                     |          |                     |          
+                          |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                          |                     |          |          
+                          |                     |          |--4.17%--col_join_keys_match_rel
+                          |                     |          |          |          
+                          |                     |          |           --0.73%--wl_columnar_value_equal
+                          |                     |          |          
+                          |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                          |                     |                     wl_columnar_arrangement_diff_txn_begin
+                          |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                          |                     |          
+                          |                     |--1.65%--col_op_map.part.0
+                          |                     |          |          
+                          |                     |           --1.18%--col_rel_append_row
+                          |                     |          
+                          |                      --1.17%--wl_columnar_antijoin_op
+                          |          
+                          |--34.25%--col_op_consolidate_incremental_delta
+                          |          |          
+                          |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                          |                     |          
+                          |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                          |                                |          
+                          |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                          |                                |          |          
+                          |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                          |                                |          
+                          |                                |--5.56%--col_rel_row_copy_out (inlined)
+                          |                                |          
+                          |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                          |                                |          
+                          |                                 --5.13%--col_rel_row_cmp_raw
+                          |          
+                           --15.88%--col_rel_enable_timestamps
+                                     col_rel_enable_timestamps_locked (inlined)
+                                     col_rel_enable_timestamps_locked (inlined)
+                                     |          
+                                      --15.83%--0x7f4302d76e53
+
+    99.74%     0.00%  [.] col_session_snapshot_impl (inlined)                                -      -            
+            |          
+             --99.68%--col_eval_stratum
+                       col_eval_stratum
+                       |          
+                       |--49.12%--wl_columnar_eval_serial_framed_relation
+                       |          |          
+                       |           --48.87%--wl_columnar_eval_plan_body
+                       |                     |          
+                       |                     |--44.55%--wl_columnar_join_diff_op
+                       |                     |          |          
+                       |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                       |                     |          |          |          
+                       |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                       |                     |          |                     |          
+                       |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                       |                     |          |          
+                       |                     |          |--4.17%--col_join_keys_match_rel
+                       |                     |          |          |          
+                       |                     |          |           --0.73%--wl_columnar_value_equal
+                       |                     |          |          
+                       |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                       |                     |                     wl_columnar_arrangement_diff_txn_begin
+                       |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                       |                     |          
+                       |                     |--1.65%--col_op_map.part.0
+                       |                     |          |          
+                       |                     |           --1.18%--col_rel_append_row
+                       |                     |          
+                       |                      --1.17%--wl_columnar_antijoin_op
+                       |          
+                       |--34.25%--col_op_consolidate_incremental_delta
+                       |          |          
+                       |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                       |                     |          
+                       |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                       |                                |          
+                       |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                       |                                |          |          
+                       |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                       |                                |          
+                       |                                |--5.56%--col_rel_row_copy_out (inlined)
+                       |                                |          
+                       |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                       |                                |          
+                       |                                 --5.13%--col_rel_row_cmp_raw
+                       |          
+                        --15.88%--col_rel_enable_timestamps
+                                  col_rel_enable_timestamps_locked (inlined)
+                                  col_rel_enable_timestamps_locked (inlined)
+                                  |          
+                                   --15.83%--0x7f4302d76e53
+
+    99.72%     0.03%  [.] col_eval_stratum                                                   -      -            
+            |          
+             --99.69%--col_eval_stratum
+                       col_eval_stratum
+                       |          
+                       |--49.16%--wl_columnar_eval_serial_framed_relation
+                       |          |          
+                       |           --48.91%--wl_columnar_eval_plan_body
+                       |                     |          
+                       |                     |--44.55%--wl_columnar_join_diff_op
+                       |                     |          |          
+                       |                     |          |--22.95%--col_join_hash_rel_keys (inlined)
+                       |                     |          |          |          
+                       |                     |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                       |                     |          |                     |          
+                       |                     |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                       |                     |          |          
+                       |                     |          |--4.17%--col_join_keys_match_rel
+                       |                     |          |          |          
+                       |                     |          |           --0.73%--wl_columnar_value_equal
+                       |                     |          |          
+                       |                     |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                       |                     |                     wl_columnar_arrangement_diff_txn_begin
+                       |                     |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                       |                     |          
+                       |                     |--1.65%--col_op_map.part.0
+                       |                     |          |          
+                       |                     |           --1.18%--col_rel_append_row
+                       |                     |          
+                       |                     |--1.17%--wl_columnar_antijoin_op
+                       |                     |          
+                       |                      --0.51%--wl_columnar_join_op
+                       |          
+                       |--34.25%--col_op_consolidate_incremental_delta
+                       |          |          
+                       |           --34.21%--col_op_consolidate_incremental_delta_impl (inlined)
+                       |                     |          
+                       |                      --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                       |                                |          
+                       |                                |--11.76%--col_rel_row_copy_in_raw.isra.0
+                       |                                |          |          
+                       |                                |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                       |                                |          
+                       |                                |--5.56%--col_rel_row_copy_out (inlined)
+                       |                                |          
+                       |                                |--5.43%--col_rel_row_cmp.lto_priv.1
+                       |                                |          
+                       |                                 --5.13%--col_rel_row_cmp_raw
+                       |          
+                        --15.88%--col_rel_enable_timestamps
+                                  col_rel_enable_timestamps_locked (inlined)
+                                  col_rel_enable_timestamps_locked (inlined)
+                                  |          
+                                   --15.83%--0x7f4302d76e53
+
+    49.16%     0.00%  [.] wl_columnar_eval_serial_framed_relation                            -      -            
+            |          
+             --48.91%--wl_columnar_eval_plan_body
+                       |          
+                       |--44.55%--wl_columnar_join_diff_op
+                       |          |          
+                       |          |--22.95%--col_join_hash_rel_keys (inlined)
+                       |          |          |          
+                       |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                       |          |                     |          
+                       |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                       |          |          
+                       |          |--4.17%--col_join_keys_match_rel
+                       |          |          |          
+                       |          |           --0.73%--wl_columnar_value_equal
+                       |          |          
+                       |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                       |                     wl_columnar_arrangement_diff_txn_begin
+                       |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                       |          
+                       |--1.65%--col_op_map.part.0
+                       |          |          
+                       |           --1.18%--col_rel_append_row
+                       |          
+                       |--1.17%--wl_columnar_antijoin_op
+                       |          
+                        --0.51%--wl_columnar_join_op
+
+    48.91%     0.03%  [.] wl_columnar_eval_plan_body                                         -      -            
+            |          
+             --48.88%--wl_columnar_eval_plan_body
+                       |          
+                       |--44.55%--wl_columnar_join_diff_op
+                       |          |          
+                       |          |--22.95%--col_join_hash_rel_keys (inlined)
+                       |          |          |          
+                       |          |           --13.04%--wl_columnar_hash_value.lto_priv.2
+                       |          |                     |          
+                       |          |                      --3.01%--wl_columnar_value_key.lto_priv.0
+                       |          |          
+                       |          |--4.17%--col_join_keys_match_rel
+                       |          |          |          
+                       |          |           --0.73%--wl_columnar_value_equal
+                       |          |          
+                       |           --3.07%--wl_columnar_arrangement_diff_txn_begin
+                       |                     wl_columnar_arrangement_diff_txn_begin
+                       |                     col_diff_arrangement_deep_copy_with_memory_governor_status
+                       |          
+                       |--1.65%--col_op_map.part.0
+                       |          |          
+                       |           --1.18%--col_rel_append_row
+                       |          
+                       |--1.17%--wl_columnar_antijoin_op
+                       |          
+                        --0.51%--wl_columnar_join_op
+
+    44.67%    23.79%  [.] wl_columnar_join_diff_op                                           -      -            
+            |          
+            |--23.79%--_start
+            |          __libc_start_main
+            |          0x7f4302c27780
+            |          main
+            |          run_crdt_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum
+            |          col_eval_stratum
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          wl_columnar_join_diff_op
+            |          |          
+            |           --9.91%--col_join_hash_rel_keys (inlined)
+            |          
+             --20.88%--wl_columnar_join_diff_op
+                       |          
+                       |--13.04%--col_join_hash_rel_keys (inlined)
+                       |          wl_columnar_hash_value.lto_priv.2
+                       |          |          
+                       |           --3.01%--wl_columnar_value_key.lto_priv.0
+                       |          
+                       |--4.29%--col_join_keys_match_rel
+                       |          |          
+                       |           --0.73%--wl_columnar_value_equal
+                       |          
+                        --3.07%--wl_columnar_arrangement_diff_txn_begin
+                                  wl_columnar_arrangement_diff_txn_begin
+                                  col_diff_arrangement_deep_copy_with_memory_governor_status
+
+    34.25%     0.15%  [.] col_op_consolidate_incremental_delta                               -      -            
+            |          
+             --34.11%--col_op_consolidate_incremental_delta
+                       |          
+                        --34.08%--col_op_consolidate_incremental_delta_impl (inlined)
+                                  |          
+                                   --33.68%--col_rel_compact_runs_prepared.lto_priv.0
+                                             |          
+                                             |--11.76%--col_rel_row_copy_in_raw.isra.0
+                                             |          |          
+                                             |           --7.28%--col_rel_row_copy_in_raw (inlined)
+                                             |          
+                                             |--5.56%--col_rel_row_copy_out (inlined)
+                                             |          
+                                             |--5.43%--col_rel_row_cmp.lto_priv.1
+                                             |          
+                                              --5.13%--col_rel_row_cmp_raw
+
+    33.68%     5.80%  [.] col_rel_compact_runs_prepared.lto_priv.0                           -      -            
+            |          
+            |--27.88%--col_rel_compact_runs_prepared.lto_priv.0
+            |          |          
+            |          |--11.76%--col_rel_row_copy_in_raw.isra.0
+            |          |          |          
+            |          |           --7.28%--col_rel_row_copy_in_raw (inlined)
+            |          |          
+            |          |--5.56%--col_rel_row_copy_out (inlined)
+            |          |          
+            |          |--5.43%--col_rel_row_cmp.lto_priv.1
+            |          |          
+            |           --5.13%--col_rel_row_cmp_raw
+            |          
+             --5.80%--_start
+                       __libc_start_main
+                       0x7f4302c27780
+                       main
+                       run_crdt_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum
+                       col_eval_stratum
+                       col_op_consolidate_incremental_delta
+                       col_op_consolidate_incremental_delta_impl (inlined)
+                       col_rel_compact_runs_prepared.lto_priv.0
+
+    22.94%     0.00%  [.] col_join_hash_rel_keys (inlined)                                   -      -            
+            |          
+             --13.04%--wl_columnar_hash_value.lto_priv.2
+                       |          
+                        --3.01%--wl_columnar_value_key.lto_priv.0
+
+    17.50%     0.00%  [.] col_op_consolidate_incremental_delta_impl (inlined)                -      -            
+            |          
+             --17.03%--col_rel_compact_runs_prepared.lto_priv.0
+                       |          
+                       |--6.27%--col_rel_row_copy_in_raw.isra.0
+                       |          |          
+                       |           --4.15%--col_rel_row_copy_in_raw (inlined)
+                       |          
+                       |--2.76%--col_rel_row_copy_out (inlined)
+                       |          
+                       |--2.64%--col_rel_row_cmp_raw
+                       |          
+                        --2.39%--col_rel_row_cmp.lto_priv.1
+
+    16.71%     0.00%  [.] col_op_consolidate_incremental_delta_impl (inlined)                -      -            
+            |          
+             --16.65%--col_rel_compact_runs_prepared.lto_priv.0
+                       |          
+                       |--5.49%--col_rel_row_copy_in_raw.isra.0
+                       |          |          
+                       |           --3.13%--col_rel_row_copy_in_raw (inlined)
+                       |          
+                       |--3.04%--col_rel_row_cmp.lto_priv.1
+                       |          
+                       |--2.80%--col_rel_row_copy_out (inlined)
+                       |          
+                        --2.49%--col_rel_row_cmp_raw
+
+    15.88%     0.01%  [.] col_rel_enable_timestamps                                          -      -            
+            |          
+             --15.87%--col_rel_enable_timestamps
+                       col_rel_enable_timestamps_locked (inlined)
+                       col_rel_enable_timestamps_locked (inlined)
+                       |          
+                        --15.83%--0x7f4302d76e53
+
+    15.83%    15.83%  [.] 0x0000000000176e53                                                 -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               col_rel_enable_timestamps
+               col_rel_enable_timestamps_locked (inlined)
+               col_rel_enable_timestamps_locked (inlined)
+               0x7f4302d76e53
+
+    15.83%     0.00%  [.] 0x00007f4302d76e53                                                 -      -            
+    13.34%    10.21%  [.] wl_columnar_hash_value.lto_priv.2                                  -      -            
+            |          
+            |--10.21%--_start
+            |          __libc_start_main
+            |          0x7f4302c27780
+            |          main
+            |          run_crdt_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum
+            |          col_eval_stratum
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          |          
+            |           --10.03%--wl_columnar_join_diff_op
+            |                     col_join_hash_rel_keys (inlined)
+            |                     wl_columnar_hash_value.lto_priv.2
+            |          
+             --3.13%--wl_columnar_hash_value.lto_priv.2
+                       wl_columnar_value_key.lto_priv.0
+
+    11.78%    11.78%  [.] col_rel_row_copy_in_raw.isra.0                                     -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               |          
+                --11.76%--col_op_consolidate_incremental_delta
+                          col_op_consolidate_incremental_delta_impl (inlined)
+                          col_rel_compact_runs_prepared.lto_priv.0
+                          col_rel_row_copy_in_raw.isra.0
+                          |          
+                           --7.28%--col_rel_row_copy_in_raw (inlined)
+
+     9.02%     0.00%  [.] col_rel_enable_timestamps_locked (inlined)                         -      -            
+            |
+            ---col_rel_enable_timestamps_locked (inlined)
+               |          
+                --9.01%--0x7f4302d76e53
+
+     7.31%     0.00%  [.] col_rel_row_copy_in_raw (inlined)                                  -      -            
+     6.86%     0.00%  [.] col_rel_enable_timestamps_locked (inlined)                         -      -            
+            |
+            ---col_rel_enable_timestamps_locked (inlined)
+               |          
+                --6.82%--0x7f4302d76e53
+
+     5.67%     0.00%  [.] col_rel_row_copy_out (inlined)                                     -      -            
+     5.66%     5.66%  [.] col_rel_row_copy_out.lto_priv.2                                    -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               |          
+                --5.56%--col_op_consolidate_incremental_delta
+                          col_op_consolidate_incremental_delta_impl (inlined)
+                          col_rel_compact_runs_prepared.lto_priv.0
+                          col_rel_row_copy_out (inlined)
+
+     5.65%     5.65%  [.] col_rel_row_cmp.lto_priv.1                                         -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               |          
+                --5.58%--col_op_consolidate_incremental_delta
+                          col_op_consolidate_incremental_delta_impl (inlined)
+                          |          
+                           --5.43%--col_rel_compact_runs_prepared.lto_priv.0
+                                     col_rel_row_cmp.lto_priv.1
+
+     5.13%     5.13%  [.] col_rel_row_cmp_raw                                                -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               col_op_consolidate_incremental_delta
+               col_op_consolidate_incremental_delta_impl (inlined)
+               col_rel_compact_runs_prepared.lto_priv.0
+               col_rel_row_cmp_raw
+
+     4.40%     3.64%  [.] col_join_keys_match_rel                                            -      -            
+            |          
+            |--3.52%--_start
+            |          __libc_start_main
+            |          0x7f4302c27780
+            |          main
+            |          run_crdt_once_ (inlined)
+            |          wl_session_snapshot (inlined)
+            |          col_session_snapshot.lto_priv.0
+            |          col_session_snapshot_impl (inlined)
+            |          col_eval_stratum
+            |          col_eval_stratum
+            |          wl_columnar_eval_serial_framed_relation
+            |          wl_columnar_eval_plan_body
+            |          |          
+            |           --3.44%--wl_columnar_join_diff_op
+            |                     col_join_keys_match_rel
+            |          
+             --0.76%--col_join_keys_match_rel
+                       wl_columnar_value_equal
+
+     3.13%     3.13%  [.] wl_columnar_value_key.lto_priv.0                                   -      -            
+            |
+            ---__libc_start_main
+               0x7f4302c27780
+               main
+               run_crdt_once_ (inlined)
+               wl_session_snapshot (inlined)
+               col_session_snapshot.lto_priv.0
+               col_session_snapshot_impl (inlined)
+               col_eval_stratum
+               col_eval_stratum
+               wl_columnar_eval_serial_framed_relation
+               wl_columnar_eval_plan_body
+               |          
+                --3.01%--wl_columnar_join_diff_op
+                          col_join_hash_rel_keys (inlined)
+                          wl_columnar_hash_value.lto_priv.2
+                          wl_columnar_value_key.lto_priv.0
+
+     3.07%     3.06%  [.] col_diff_arrangement_deep_copy_with_memory_governor_status         -      -            
+            |          
+             --3.06%--_start
+                       __libc_start_main
+                       0x7f4302c27780
+                       main
+                       run_crdt_once_ (inlined)
+                       wl_session_snapshot (inlined)
+                       col_session_snapshot.lto_priv.0
+                       col_session_snapshot_impl (inlined)
+                       col_eval_stratum
+                       col_eval_stratum
+                       wl_columnar_eval_serial_framed_relation
+                       wl_columnar_eval_plan_body
+                       wl_columnar_join_diff_op
+                       wl_columnar_arrangement_diff_txn_begin
+                       wl_columnar_arrangement_diff_txn_begin
+                       col_diff_arrangement_deep_copy_with_memory_governor_status
+
+     3.07%     0.00%  [.] wl_columnar_arrangement_diff_txn_begin                             -      -            
+            |
+            ---wl_columnar_arrangement_diff_txn_begin
+               col_diff_arrangement_deep_copy_with_memory_governor_status
+
+     1.65%     0.04%  [.] col_op_map.part.0                                                  -      -            
+            |          
+             --1.61%--col_op_map.part.0
+                       |          
+                        --1.18%--col_rel_append_row
+
+     1.54%     0.13%  [.] col_rel_append_row                                                 -      -            
+            |          
+             --1.41%--col_rel_append_row
+                       |          
+                       |--0.59%--col_rel_mutation_single_acquire.lto_priv.0
+                       |          |          
+                       |           --0.58%--col_rel_mutation_set_acquire_impl (inlined)
+                       |                     col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+                       |          
+                        --0.53%--col_rel_mutation_set_finish
+
+     1.17%     0.33%  [.] wl_columnar_antijoin_op                                            -      -            
+            |          
+             --0.84%--wl_columnar_antijoin_op
+
+     0.67%     0.44%  [.] col_rel_append_row_impl.part.0.constprop.0                         -      -            
+     0.59%     0.32%  [.] col_rel_mutation_set_acquire_impl.part.0.lto_priv.0                -      -            
+     0.59%     0.01%  [.] col_rel_mutation_single_acquire.lto_priv.0                         -      -            
+            |          
+             --0.58%--col_rel_mutation_single_acquire.lto_priv.0
+                       col_rel_mutation_set_acquire_impl (inlined)
+                       col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+
+     0.58%     0.00%  [.] col_rel_set_schema_impl_capacity.lto_priv.0                        -      -            
+     0.58%     0.00%  [.] col_rel_mutation_set_acquire_impl (inlined)                        -      -            
+            |
+            ---col_rel_mutation_set_acquire_impl.part.0.lto_priv.0
+
+     0.56%     0.09%  [.] col_rel_mutation_set_finish                                        -      -            
+     0.51%     0.01%  [.] wl_columnar_join_op                                                -      -            
+     0.45%     0.00%  [.] col_join_hash_rel_keys (inlined)                                   -      -            
+     0.45%     0.11%  [.] wl_columnar_merge_consolidate_checked.lto_priv.0                   -      -            
+     0.41%     0.41%  [.] wl_columnar_value_equal                                            -      -            
+     0.37%     0.01%  [.] wl_columnar_relation_init_arrow_schema.lto_priv.0                  -      -            
+     0.36%     0.00%  [.] col_op_consolidate                                                 -      -            
+     0.36%     0.00%  [.] wl_columnar_merge_consolidate_entry                                -      -            
+     0.36%     0.14%  [.] col_rel_mutation_set_unwind.lto_priv.0                             -      -            
+     0.35%     0.00%  [.] col_op_consolidate_kway_merge_impl (inlined)                       -      -            
+     0.35%     0.00%  [.] wl_columnar_relation_pool_new_like_governed_checked                -      -            
+     0.35%     0.35%  [.] wl_columnar_value_equal                                            -      -            
+     0.32%     0.00%  [.] col_rel_set_schema                                                 -      -            
+     0.32%     0.00%  [.] col_rel_set_schema_impl (inlined)                                  -      -            
+     0.32%     0.01%  [.] col_rel_destroy_checked                                            -      -            
+     0.31%     0.00%  [.] wl_columnar_relation_new_auto_governed                             -      -            
+     0.28%     0.00%  [.] eval_entry_dispose                                                 -      -            
+     0.26%     0.03%  [.] col_rel_free_contents_impl                                         -      -            
+     0.25%     0.00%  [.] col_rel_binary_search_row (inlined)                                -      -            
+     0.23%     0.23%  [.] wl_columnar_source_access_writer_acquire.lto_priv.0                -      -            
+     0.22%     0.03%  [.] col_rel_mutation_lease_validate                                    -      -            
+     0.22%     0.00%  [.] 0x00007f4302ca7a4e                                                 -      -            
+     0.22%     0.01%  [.] eval_stack_dispose_entry                                           -      -            
+     0.21%     0.20%  [.] col_rel_mutation_lease_validate_binding.lto_priv.0                 -      -            
+     0.20%     0.20%  [.] col_arrangement_find_first_typed                                   -      -            
+     0.19%     0.00%  [.] wl_columnar_relation_new_like_checked_impl.lto_priv.0              -      -            
+     0.19%     0.00%  [.] col_rel_set_column_types                                           -      -            
+     0.19%     0.19%  [.] wl_columnar_source_access_writer_release.lto_priv.4                -      -            
+     0.18%     0.18%  [.] wl_columnar_radix_rows_prepared.isra.0                             -      -            
+     0.18%     0.04%  [.] ArrowSchemaSetName                                                 -      -            
+     0.17%     0.00%  [.] col_op_concat (inlined)                                            -      -            
+     0.17%     0.10%  [.] wl_columnar_source_access_writer_validate                          -      -            
+     0.16%     0.10%  [.] wl_columnar_expr_eval_compiled.constprop.0                         -      -            
+     0.16%     0.00%  [.] col_rel_set_column_types_impl (inlined)                            -      -            
+     0.16%     0.00%  [.] col_rel_row_copy_in_raw (inlined)                                  -      -            
+     0.16%     0.00%  [.] wl_columnar_source_access_writer_acquire (inlined)                 -      -            
+     0.15%     0.15%  [.] malloc                                                             -      -            
+     0.15%     0.15%  [.] wl_columnar_memory_reservation_init.part.0                         -      -            
+     0.14%     0.00%  [.] col_op_consolidate_hash_dedup (inlined)                            -      -            
+     0.14%     0.00%  [.] col_op_consolidate_incremental_delta_append_with_lease (inlined)   -      -            
+     0.13%     0.00%  [.] col_rel_prepare_column_types.constprop.0                           -      -            
+     0.13%     0.01%  [.] ArrowSchemaSetType                                                 -      -            
+     0.13%     0.00%  [.] col_op_concat (inlined)                                            -      -            
+     0.13%     0.00%  [.] col_op_concat_cleanup.lto_priv.0                                   -      -            
+     0.13%     0.00%  [.] wl_columnar_join_new_output.constprop.0                            -      -            
+     0.12%     0.00%  [.] wl_columnar_filter_op                                              -      -            
+     0.12%     0.01%  [.] ArrowSchemaReleaseInternal                                         -      -            
+     0.12%     0.00%  [.] wl_columnar_relation_new_like_governed_checked (inlined)           -      -            
+     0.12%     0.03%  [.] ArrowSchemaSetFormat                                               -      -            
+     0.12%     0.00%  [.] ArrowSchemaInitFromType                                            -      -            
+     0.11%     0.00%  [.] wl_columnar_source_access_writer_release (inlined)                 -      -            
+     0.11%     0.00%  [.] radix_uniform_count_fused_k16_avx2 (inlined)                       -      -            
+     0.10%     0.00%  [.] snprintf                                                           -      -            
+     0.10%     0.00%  [.] 0x00007f4302c8c12a                                                 -      -            
+     0.10%     0.00%  [.] 0x00007f4302ca61fd                                                 -      -            
+     0.10%     0.00%  [.] tcache_get (inlined)                                               -      -            
+     0.10%     0.00%  [.] tcache_get_n (inlined)                                             -      -            
+     0.10%     0.00%  [.] wl_columnar_source_access_writer_release (inlined)                 -      -            
+     0.10%     0.00%  [.] col_join_set_output_types                                          -      -            
+     0.09%     0.00%  [.] col_rel_pool_new_like                                              -      -            
+     0.09%     0.00%  [.] wl_columnar_relation_pool_new_like_governed (inlined)              -      -            
+     0.09%     0.00%  [.] col_columns_alloc.lto_priv.0                                       -      -            
+     0.09%     0.00%  [.] wl_columnar_filter_dispose_input.lto_priv.0                        -      -            
+     0.09%     0.03%  [.] finish_reservation                                                 -      -            
+     0.09%     0.01%  [.] col_rel_append_all_impl.constprop.0                                -      -            
+     0.08%     0.00%  [.] wl_columnar_source_access_writer_acquire (inlined)                 -      -            
+     0.08%     0.00%  [.] col_rel_mutation_set_nonce_allocate (inlined)                      -      -            
+     0.08%     0.00%  [.] wl_columnar_relation_radix_sequence_execute_with_lease (inlined)   -      -            
+     0.08%     0.00%  [.] wl_columnar_radix_k16_prepared (inlined)                           -      -            
+     0.08%     0.00%  [.] wl_csv_adapter_stream_read.constprop.0                             -      -            
+     0.08%     0.00%  [.] wl_csv_read_file_via_ctx_stream_admitted (inlined)                 -      -            
+     0.07%     0.07%  [.] 0x0000000000179121                                                 -      -            
+     0.07%     0.00%  [.] 0x00007f4302d79121                                                 -      -            
+     0.07%     0.00%  [.] wl_columnar_relation_new_like_governed_checked_mode (inlined)      -      -            
+     0.07%     0.00%  [.] col_rel_prospective_metadata_bytes.lto_priv.0                      -      -            
+     0.07%     0.00%  [.] session_remove_rel                                                 -      -            
+     0.07%     0.07%  [.] claim_reservation_state                                            -      -            
+     0.07%     0.07%  [.] cfree                                                              -      -            
+     0.07%     0.00%  [.] col_op_consolidate_diff (inlined)                                  -      -            
+     0.07%     0.00%  [.] col_op_consolidate_kway_merge (inlined)                            -      -            
+     0.07%     0.00%  [.] wl_columnar_expr_compile_governed (inlined)                        -      -            
+     0.07%     0.00%  [.] wl_columnar_relation_radix_sequence_prepare_with_lease (inlined)   -      -            
+     0.07%     0.00%  [.] col_op_consolidate_kway_merge_impl (inlined)                       -      -            
+     0.07%     0.07%  [k] 0xffffffffaf401280                                                 -      -            
+     0.07%     0.07%  [.] expr_push                                                          -      -            
+     0.07%     0.00%  [.] col_session_emit_snapshot (inlined)                                -      -            
+     0.06%     0.00%  [.] ArrowSchemaSetTypeStruct                                           -      -            
+     0.06%     0.00%  [.] ArrowSchemaRelease (inlined)                                       -      -            
+     0.06%     0.00%  [.] wl_columnar_relation_alloc_governed                                -      -            
+     0.06%     0.03%  [.] reserve_internal.lto_priv.0                                        -      -            
+     0.06%     0.00%  [.] reserve_internal (inlined)                                         -      -            
+     0.06%     0.00%  [.] session_find_rel                                                   -      -            
+     0.06%     0.01%  [.] col_session_mem_sample                                             -      -            
+     0.06%     0.06%  [.] thrd_equal@plt                                                     -      -            
+     0.06%     0.02%  [.] csv_parse_line_via_ctx.constprop.0                                 -      -            
+     0.06%     0.00%  [.] col_op_consolidate_hash_row (inlined)                              -      -            
+     0.06%     0.06%  [.] col_join_append_pair                                               -      -            
+     0.06%     0.00%  [.] radix_uniform_count_fused_avx2 (inlined)                           -      -            
+     0.06%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease_impl.part.0.lto_priv.0  -      -            
+     0.06%     0.00%  [.] col_rel_prepare_resize.constprop.0                                 -      -            
+     0.06%     0.00%  [.] col_rel_prepare_resize (inlined)                                   -      -            
+     0.05%     0.00%  [.] col_rel_append_row_with_lease                                      -      -            
+     0.05%     0.00%  [.] wl_columnar_source_access_writer_thread_equal (inlined)            -      -            
+     0.04%     0.03%  [.] col_rel_payload_txn_begin                                          -      -            
+     0.04%     0.00%  [.] col_session_invalidate_arrangements                                -      -            
+     0.04%     0.00%  [.] col_rel_source_reader_acquire                                      -      -            
+     0.04%     0.00%  [.] 0x00007f4302ca7782                                                 -      -            
+     0.04%     0.01%  [.] wl_strdup.lto_priv.3                                               -      -            
+     0.04%     0.00%  [.] session_add_rel                                                    -      -            
+     0.04%     0.04%  [.] col_rel_payload_live_shape.lto_priv.0                              -      -            
+     0.04%     0.04%  [.] 0x00000000000a5002                                                 -      -            
+     0.04%     0.00%  [.] 0x00007f4302ca5002                                                 -      -            
+     0.04%     0.03%  [.] session_rel_hash_lookup                                            -      -            
+     0.04%     0.04%  [.] 0x000000000017911d                                                 -      -            
+     0.04%     0.00%  [.] 0x00007f4302d7911d                                                 -      -            
+     0.04%     0.00%  [.] col_rel_transport_bytes                                            -      -            
+     0.04%     0.00%  [.] col_rel_retained_live_bytes                                        -      -            
+     0.04%     0.01%  [.] wl_columnar_expr_compile_governed.constprop.0                      -      -            
+     0.04%     0.04%  [.] arr_index_rows.constprop.0                                         -      -            
+     0.04%     0.00%  [.] col_arrangement_probe_bundle_acquire_primary (inlined)             -      -            
+     0.04%     0.00%  [.] col_session_acquire_primary_arrangement_probe (inlined)            -      -            
+     0.04%     0.00%  [.] col_session_get_arrangement_for_source.constprop.0                 -      -            
+     0.04%     0.00%  [.] col_session_get_arrangement_for_source (inlined)                   -      -            
+     0.04%     0.00%  [.] arr_build_full.lto_priv.0                                          -      -            
+     0.04%     0.00%  [.] arr_build_full_impl (inlined)                                      -      -            
+     0.04%     0.04%  [.] credit_reservation                                                 -      -            
+     0.04%     0.00%  [.] col_rel_publish_retained_reservation                               -      -            
+     0.04%     0.00%  [.] arr_hash_key_typed (inlined)                                       -      -            
+     0.04%     0.00%  [.] wl_columnar_source_access_writer_thread_equal (inlined)            -      -            
+     0.04%     0.00%  [.] wl_columnar_relation_radix_sort_consolidation_with_lease (inlined)  -      -            
+     0.04%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease_impl (inlined)          -      -            
+     0.04%     0.04%  [.] 0x000000000017898b                                                 -      -            
+     0.04%     0.00%  [.] 0x00007f4302d7898b                                                 -      -            
+     0.04%     0.00%  [.] wl_columnar_relation_radix_sequence_execute_with_lease (inlined)   -      -            
+     0.04%     0.00%  [.] wl_columnar_radix_k16_prepared (inlined)                           -      -            
+     0.04%     0.00%  [.] count_cb                                                           -      -            
+     0.04%     0.04%  [.] wl_columnar_source_access_writer_thread_equal.lto_priv.1           -      -            
+     0.03%     0.03%  [.] __libc_calloc                                                      -      -            
+     0.03%     0.00%  [.] ArrowSchemaAllocateChildren                                        -      -            
+     0.03%     0.03%  [.] wl_columnar_arrangement_diff_reset_state                           -      -            
+     0.03%     0.00%  [.] diff_entry_reset.lto_priv.0                                        -      -            
+     0.03%     0.03%  [.] wl_columnar_source_access_gate_reader_acquire.lto_priv.1           -      -            
+     0.03%     0.00%  [.] wl_columnar_source_access_gate_reader_acquire (inlined)            -      -            
+     0.03%     0.01%  [.] wl_columnar_expr_compile_governed.constprop.0                      -      -            
+     0.03%     0.03%  [.] 0x00000000000a7754                                                 -      -            
+     0.03%     0.00%  [.] 0x00007f4302ca7754                                                 -      -            
+     0.03%     0.00%  [.] wl_columnar_join_key_scratch_alloc                                 -      -            
+     0.03%     0.03%  [.] 0x00000000000a4ee9                                                 -      -            
+     0.03%     0.00%  [.] 0x00007f4302ca4ee9                                                 -      -            
+     0.03%     0.03%  [.] wl_columnar_relation_terminal_sequence_finish                      -      -            
+     0.03%     0.00%  [.] col_rel_reserve_metadata.lto_priv.0                                -      -            
+     0.03%     0.01%  [.] col_op_resolve_key                                                 -      -            
+     0.03%     0.01%  [.] col_rel_attach_memory_governor                                     -      -            
+     0.03%     0.01%  [.] col_rel_publish_payload_txn.lto_priv.0                             -      -            
+     0.03%     0.01%  [.] wl_columnar_memory_commit                                          -      -            
+     0.03%     0.00%  [.] 0x00007f4302ca5027                                                 -      -            
+     0.03%     0.00%  [.] 0x00007f4302ca7c0f                                                 -      -            
+     0.03%     0.03%  [.] session_rel_build_hash                                             -      -            
+     0.03%     0.00%  [.] wl_columnar_eval_stack_cleanup_finish                              -      -            
+     0.03%     0.00%  [.] wl_columnar_eval_stack_cleanup_dispose                             -      -            
+     0.03%     0.00%  [.] arr_hash_rows_batch (inlined)                                      -      -            
+     0.03%     0.00%  [.] col_op_consolidate_hash_rows_equal (inlined)                       -      -            
+     0.03%     0.01%  [.] col_rel_source_writer_acquire                                      -      -            
+     0.03%     0.00%  [.] col_rel_published_writer_acquire.lto_priv.0                        -      -            
+     0.03%     0.03%  [.] free@plt                                                           -      -            
+     0.03%     0.00%  [.] _mm256_extract_epi64 (inlined)                                     -      -            
+     0.03%     0.00%  [.] _mm256_extractf128_si256 (inlined)                                 -      -            
+     0.03%     0.03%  [.] col_rel_row.lto_priv.0                                             -      -            
+     0.03%     0.00%  [.] col_rel_row (inlined)                                              -      -            
+     0.03%     0.00%  [.] _mm256_i32gather_epi64 (inlined)                                   -      -            
+     0.02%     0.00%  [.] csv_next_line.lto_priv.0                                           -      -            
+     0.01%     0.01%  [.] 0x00000000000a73a8                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca73a8                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000658b0                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c658b0                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a7566                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca7566                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a789d                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca789d                                                 -      -            
+     0.01%     0.00%  [.] clear_memory (inlined)                                             -      -            
+     0.01%     0.00%  [.] tcache_get (inlined)                                               -      -            
+     0.01%     0.00%  [.] tcache_get_n (inlined)                                             -      -            
+     0.01%     0.01%  [.] 0x00000000000a616a                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca616a                                                 -      -            
+     0.01%     0.01%  [.] col_rel_new_identity.lto_priv.0                                    -      -            
+     0.01%     0.01%  [.] 0x00000000000a70c7                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca70c7                                                 -      -            
+     0.01%     0.00%  [.] col_rel_mutation_set_acquire (inlined)                             -      -            
+     0.01%     0.00%  [.] col_rel_mutation_set_acquire_impl (inlined)                        -      -            
+     0.01%     0.00%  [.] wl_columnar_join_publish_after_left                                -      -            
+     0.01%     0.01%  [.] 0x00000000000651be                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c651be                                                 -      -            
+     0.01%     0.01%  [k] 0xffffffffaf4015f0                                                 -      -            
+     0.01%     0.00%  [.] session_pool_rel_promote (inlined)                                 -      -            
+     0.01%     0.01%  [.] 0x0000000000178959                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302d78959                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a4efd                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4efd                                                 -      -            
+     0.01%     0.01%  [.] ArrowSchemaRelease.lto_priv.0                                      -      -            
+     0.01%     0.01%  [.] 0x00000000000a4fc0                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4fc0                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a4f17                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4f17                                                 -      -            
+     0.01%     0.00%  [.] col_rel_payload_private_bytes.lto_priv.0                           -      -            
+     0.01%     0.01%  [.] 0x000000000017896f                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302d7896f                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca7047                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a61c1                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca61c1                                                 -      -            
+     0.01%     0.01%  [.] 0x0000000000178760                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c64ee4                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302d78760                                                 -      -            
+     0.01%     0.00%  [.] col_rel_free_heap_after_contents.lto_priv.0                        -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+     0.01%     0.01%  [.] ArrowSchemaInit                                                    -      -            
+     0.01%     0.01%  [.] 0x00000000000a4faa                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4faa                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000651c8                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c651c8                                                 -      -            
+     0.01%     0.00%  [.] col_columns_free.lto_priv.1                                        -      -            
+     0.01%     0.00%  [.] col_columns_free (inlined)                                         -      -            
+     0.01%     0.00%  [.] wl_columnar_join_select_right                                      -      -            
+     0.01%     0.01%  [.] 0x0000000000178cc2                                                 -      -            
+     0.01%     0.00%  [.] col_rel_col_idx                                                    -      -            
+     0.01%     0.00%  [.] 0x00007f4302d78cc2                                                 -      -            
+     0.01%     0.01%  [.] delta_pool_alloc_slot                                              -      -            
+     0.01%     0.01%  [.] 0x00000000000a4edc                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4edc                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a78a4                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca78a4                                                 -      -            
+     0.01%     0.01%  [.] col_rel_storage_owner_ensure_initialized                           -      -            
+     0.01%     0.01%  [.] 0x000000000005c2df                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c66655                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c5c2df                                                 -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+     0.01%     0.01%  [.] reservation_identity_valid                                         -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_move                                -      -            
+     0.01%     0.01%  [.] 0x00000000000a7298                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca7298                                                 -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+     0.01%     0.00%  [.] col_join_hash_rel_keys (inlined)                                   -      -            
+     0.01%     0.00%  [.] col_rel_publish_payload_txn (inlined)                              -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_commit_growth                                   -      -            
+     0.01%     0.01%  [.] 0x00000000000a7580                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca7580                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a77b7                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca77b7                                                 -      -            
+     0.01%     0.00%  [.] arr_hash_key_typed (inlined)                                       -      -            
+     0.01%     0.01%  [.] 0x0000000000064ec5                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c64ec5                                                 -      -            
+     0.01%     0.00%  [.] col_rel_binary_search_row (inlined)                                -      -            
+     0.01%     0.00%  [.] tcache_put (inlined)                                               -      -            
+     0.01%     0.00%  [.] tcache_put_n (inlined)                                             -      -            
+     0.01%     0.00%  [.] session_rel_free_hash                                              -      -            
+     0.01%     0.00%  [.] session_reservation_release (inlined)                              -      -            
+     0.01%     0.00%  [.] session_rels_release (inlined)                                     -      -            
+     0.01%     0.00%  [.] wl_columnar_eval_stack_cleanup_begin                               -      -            
+     0.01%     0.01%  [.] 0x00000000000a70dd                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca70dd                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000a6fa3                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca6fa3                                                 -      -            
+     0.01%     0.01%  [.] session_rel_hash_string.lto_priv.0                                 -      -            
+     0.01%     0.00%  [.] session_rel_hash_string (inlined)                                  -      -            
+     0.01%     0.01%  [.] 0x0000000000065038                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c65038                                                 -      -            
+     0.01%     0.01%  [.] col_rel_timestamp_shape_valid.lto_priv.0                           -      -            
+     0.01%     0.01%  [.] 0x00000000000a4f12                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca4f12                                                 -      -            
+     0.01%     0.01%  [.] col_rel_reserve_retained_shape.constprop.0                         -      -            
+     0.01%     0.01%  [.] wl_columnar_value_equal.lto_priv.1                                 -      -            
+     0.01%     0.01%  [.] col_join_output_limit_reached                                      -      -            
+     0.01%     0.01%  [.] 0x00000000000a7428                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302ca7428                                                 -      -            
+     0.01%     0.00%  [.] wl_columnar_relation_radix_sort_consolidation_with_lease (inlined)  -      -            
+     0.01%     0.00%  [.] wl_columnar_relation_radix_sort_with_lease_impl (inlined)          -      -            
+     0.01%     0.01%  [.] thrd_current@plt                                                   -      -            
+     0.01%     0.00%  [.] col_op_consolidate_diff (inlined)                                  -      -            
+     0.01%     0.00%  [.] col_op_consolidate_kway_merge (inlined)                            -      -            
+     0.01%     0.00%  [.] wl_columnar_memory_reservation_init (inlined)                      -      -            
+     0.01%     0.01%  [.] col_rel_storage_owner_resolve                                      -      -            
+     0.01%     0.01%  [.] wl_columnar_source_access_gate_reader_release.lto_priv.2           -      -            
+     0.01%     0.00%  [.] col_rel_append_all (inlined)                                       -      -            
+     0.01%     0.00%  [.] wl_columnar_source_access_reader_release.lto_priv.0                -      -            
+     0.01%     0.00%  [.] wl_columnar_source_access_gate_reader_release (inlined)            -      -            
+     0.01%     0.00%  [.] col_op_consolidate_hash_dedup (inlined)                            -      -            
+     0.01%     0.00%  [.] col_op_consolidate_hash_row (inlined)                              -      -            
+     0.01%     0.01%  [.] 0x000000000017896b                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302d7896b                                                 -      -            
+     0.01%     0.01%  [.] col_rel_append_row_impl.constprop.0                                -      -            
+     0.01%     0.01%  [.] 0x0000000000050219                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c50219                                                 -      -            
+     0.01%     0.01%  [.] csv_finish_line                                                    -      -            
+     0.01%     0.01%  [.] 0x00000000001759b9                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302d759b9                                                 -      -            
+     0.01%     0.01%  [.] 0x0000000000050165                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c50165                                                 -      -            
+     0.01%     0.01%  [.] 0x00000000000500e7                                                 -      -            
+     0.01%     0.00%  [.] 0x00007f4302c500e7                                                 -      -            
+     0.01%     0.01%  [.] __ctype_b_loc                                                      -      -            
+     0.00%     0.00%  [.] 0x00000000000500a0                                                 -      -            
+     0.00%     0.00%  [.] 0x00007f4302c500a0                                                 -      -            
+     0.00%     0.00%  [.] scan_identifier                                                    -      -            
+     0.00%     0.00%  [.] wirelog_parse_string (inlined)                                     -      -            
+     0.00%     0.00%  [.] wl_ir_parse_string_err.constprop.0                                 -      -            
+     0.00%     0.00%  [.] wl_parser_parse_string (inlined)                                   -      -            
+     0.00%     0.00%  [.] parse_program (inlined)                                            -      -            
+     0.00%     0.00%  [.] parse_declaration (inlined)                                        -      -            
+     0.00%     0.00%  [.] parser_consume                                                     -      -            
+     0.00%     0.00%  [.] parser_advance                                                     -      -            
+     0.00%     0.00%  [.] wl_parser_lexer_next_token (inlined)                               -      -            
+     0.00%     0.00%  [.] scan_token.lto_priv.0                                              -      -            
+     0.00%     0.00%  [.] scan_token (inlined)                                               -      -            
+     0.00%     0.00%  [.] identifier_type (inlined)                                          -      -            
+
+
+#
+# (Tip: For memory address profiling, try: perf mem record / perf mem report)
+#

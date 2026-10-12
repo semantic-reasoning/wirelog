@@ -1,0 +1,1 @@
+{"schema_version":1,"measurement":"crdt_perf_gate_single_run","workload":"crdt","fixture":"full","workers":1,"elapsed_ms":17206.201988000,"result":104851,"expected":104851,"aggregate":2152328,"iterations":14148,"status":"OK"}

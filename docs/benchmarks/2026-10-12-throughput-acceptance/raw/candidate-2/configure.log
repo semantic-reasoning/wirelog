@@ -1,0 +1,106 @@
+The Meson build system
+Version: 1.12.0
+Source dir: /workspace
+Build dir: /workspace/build-perf-nightly
+Build type: native build
+Project name: wirelog
+Project version: 0.70.0
+C compiler for the host machine: /usr/bin/ccache cc (gcc 15.2.0 "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0")
+C linker for the host machine: cc ld.bfd 2.46
+Host machine cpu family: x86_64
+Host machine cpu: x86_64
+meson.build:66: WARNING: Consider using the built-in option for language standard version instead of using "-std=c11".
+meson.build:78: WARNING: Consider using the built-in warning_level option instead of using "-Wall".
+meson.build:78: WARNING: Consider using the built-in warning_level option instead of using "-Wextra".
+Message: wirelog 0.70.0
+Message:   Platform: linux
+Message:   Embedded: false
+Message:   IPC support: disabled
+Message:   Threading: native
+Message:   CRC-32 variant: ethernet
+Message:   Plugin loader (dlopen): disabled
+Message:   iOS: false
+Run-time dependency threads found: YES
+
+Executing subproject nanoarrow for machine: host 
+
+nanoarrow| Project name: nanoarrow
+nanoarrow| Project version: 0.10.0-SNAPSHOT
+nanoarrow| C compiler for the host machine: /usr/bin/ccache cc (gcc 15.2.0 "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0")
+nanoarrow| C linker for the host machine: cc ld.bfd 2.46
+nanoarrow| C++ compiler for the host machine: /usr/bin/ccache c++ (gcc 15.2.0 "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0")
+nanoarrow| C++ linker for the host machine: c++ ld.bfd 2.46
+nanoarrow| Compiler for C supports arguments -Wno-misleading-indentation: YES
+nanoarrow| Compiler for C++ supports arguments -Wno-misleading-indentation: YES
+nanoarrow| Configuring nanoarrow_config.h using configuration
+nanoarrow| Found pkg-config: YES (/usr/bin/pkg-config) 2.5.1
+nanoarrow| Build targets in project: 1
+nanoarrow| Subproject nanoarrow finished.
+
+
+Executing subproject xxhash for machine: host 
+
+xxhash| Project name: xxHash
+xxhash| Project version: 0.8.4
+xxhash| C compiler for the host machine: /usr/bin/ccache cc (gcc 15.2.0 "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0")
+xxhash| C linker for the host machine: cc ld.bfd 2.46
+xxhash| Build targets in project: 3
+xxhash| Subproject xxhash finished.
+
+Library m found: YES
+Configuring wirelog-config.h using configuration
+Checking if "C11 <threads.h> support" links: YES 
+Message:   Threading backend: C11 <threads.h>
+Configuring wirelog-version.h using configuration
+Program bash found: YES (/usr/bin/bash)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program /workspace/scripts/ci/check-log-erasure.sh found: YES (/workspace/scripts/ci/check-log-erasure.sh)
+Program /workspace/scripts/ci/test-check-log-erasure.sh found: YES (/workspace/scripts/ci/test-check-log-erasure.sh)
+Program /workspace/scripts/ci/test-log-abi-source-root.sh found: YES (/workspace/scripts/ci/test-log-abi-source-root.sh)
+Program /workspace/scripts/ci/test-gate-skip-exit-codes.sh found: YES (/workspace/scripts/ci/test-gate-skip-exit-codes.sh)
+Program /workspace/scripts/check_log_header_not_public.sh found: YES (/workspace/scripts/check_log_header_not_public.sh)
+Program /workspace/scripts/ci/check-no-testhook-in-libwirelog.sh found: YES (/workspace/scripts/ci/check-no-testhook-in-libwirelog.sh)
+Program /workspace/scripts/ci/check-no-testhook-in-libwirelog.sh found: YES (/workspace/scripts/ci/check-no-testhook-in-libwirelog.sh)
+Program /workspace/scripts/ci/test-check-no-testhook.sh found: YES (/workspace/scripts/ci/test-check-no-testhook.sh)
+Program /workspace/scripts/ci/check-wl-easy-opts-symbol.sh found: YES (/workspace/scripts/ci/check-wl-easy-opts-symbol.sh)
+Program /workspace/scripts/ci/check-advanced-header.sh found: YES (/workspace/scripts/ci/check-advanced-header.sh)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program bash found: YES (/usr/bin/bash)
+Program pwsh powershell found: NO
+Compiler for C supports arguments -Wno-deprecated-declarations: YES 
+Compiler for C supports arguments /wd4996: NO 
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Program python3 found: YES (/home/perf/tmp/meson-venv/bin/python3)
+Message: 
+Message: wirelog 0.70.0 Configuration:
+Message:   Library: lib/x86_64-linux-gnu
+Message:   Headers: include/wirelog
+Message:   Embedded mode: false
+Message:   IPC support: disabled
+Message:   Threading: native
+Message:   Tests: true
+Message: 
+Message: Git Hooks: optional transactional Uncrustify hook setup attempted
+Build targets in project: 321
+
+wirelog 0.70.0
+
+  Subprojects (for host machine)
+    nanoarrow            : YES
+    xxhash               : YES
+
+  User defined options
+    buildtype            : release
+    mbedTLS              : disabled
+    tests                : true
+    wirelog_log_max_level: error
+
+Found ninja-cap.py-1.13.2.git.kitware.jobserver-pipe-1 at /workspace/.github/actions/setup-meson/ninja-cap.py

@@ -1,0 +1,4 @@
+taskset: invalid option -- '0'
+Try 'taskset --help' for more information.
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.007 MB /home/joykim/.cache/wirelog-1913-current-69111650/evidence/crdt.perf.data ]

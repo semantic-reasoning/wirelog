@@ -1,0 +1,7 @@
+1/2 perf - wirelog:crdt_perf_gate OK             228.80s
+2/2 perf - wirelog:cspa_w1_gate   OK              19.48s
+
+Ok:                2   
+Fail:              0   
+
+Full log written to /workspace/build-perf-nightly/meson-logs/testlog.txt
