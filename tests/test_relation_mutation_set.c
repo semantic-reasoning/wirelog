@@ -1640,6 +1640,174 @@ join_denial_tests(void)
     assert(join_denial_run(32, hi, true) == ENOSPC);
 }
 
+/* #2072: antijoin and the serial semijoin probe append their output under
+ * one batch lease.  left(k, v) has 4096 rows over 128 keys and right(k)
+ * holds the even keys, so each operator keeps half the left rows. */
+enum { SEMI_KEYS = 128, SEMI_ROWS = 4096 };
+
+static col_rel_t *
+semi_left(void)
+{
+    col_rel_t *left = join_rel("left", 2);
+    for (uint32_t i = 0; i < SEMI_ROWS; i++) {
+        int64_t row[2] = { (int64_t)(i % SEMI_KEYS), (int64_t)i };
+        assert(col_rel_append_row(left, row) == 0);
+    }
+    return left;
+}
+
+static void
+semi_right(wl_col_session_t *sess, uint32_t right_rows)
+{
+    col_rel_t *right = join_rel("right", 1);
+    for (uint32_t i = 0; i < right_rows; i++) {
+        int64_t row[1] = { (int64_t)(2u * i) };
+        assert(col_rel_append_row(right, row) == 0);
+    }
+    assert(session_add_rel(sess, right) == 0);
+}
+
+static void
+semi_op(wl_plan_op_t *op, bool anti, const uint32_t *project,
+    uint32_t project_count)
+{
+    static const char *const keys[] = { "k" };
+    memset(op, 0, sizeof(*op));
+    op->op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+    op->right_relation = "right";
+    op->key_count = 1;
+    op->left_keys = keys;
+    op->right_keys = keys;
+    op->delta_mode = WL_DELTA_FORCE_FULL;
+    op->project_indices = (uint32_t *)project;
+    op->project_count = project_count;
+}
+
+static int
+semi_run(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
+{
+    return op->op == WL_PLAN_OP_ANTIJOIN
+           ? wl_columnar_antijoin_op(op, stack, sess)
+           : wl_columnar_semijoin_op(op, stack, sess);
+}
+
+static void
+semi_batch_case(bool anti, bool project)
+{
+    static const uint32_t swap[] = { 1, 0 };
+    wl_col_session_t *sess = join_session();
+    semi_right(sess, SEMI_KEYS / 2u);
+    wl_plan_op_t op;
+    semi_op(&op, anti, project ? swap : NULL, project ? 2u : 0u);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, semi_left(), true) == 0);
+    wl_columnar_relation_test_set_mutation_nonce(1000);
+    uint64_t before = wl_columnar_relation_test_mutation_nonce_peek();
+    int rc = semi_run(&op, &stack, sess);
+    uint64_t acquisitions
+        = wl_columnar_relation_test_mutation_nonce_peek() - before;
+    assert(rc == 0 && stack.top == 1);
+    eval_entry_t result = eval_stack_pop(&stack);
+    col_rel_t *out = result.rel;
+    /* Rows keep left order: semijoin keeps the even keys, antijoin the odd
+     * ones, and a projection swaps the columns. */
+    assert(out && out->nrows == SEMI_ROWS / 2u && out->ncols == 2);
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < SEMI_ROWS; i++) {
+        int64_t k = (int64_t)(i % SEMI_KEYS);
+        if ((k % 2 == 0) == anti)
+            continue;
+        assert(out->columns[project ? 1 : 0][r] == k);
+        assert(out->columns[project ? 0 : 1][r] == (int64_t)i);
+        r++;
+    }
+    assert(r == out->nrows);
+    /* A lease per row needs at least 2048 sets; growing 64 -> 2048 takes six
+     * storage epochs. */
+    assert(acquisitions >= 1 && acquisitions <= 16);
+    if (result.owned)
+        assert(col_rel_destroy_checked(out) == 0);
+    join_session_destroy(sess);
+}
+
+static void
+semi_batch_tests(void)
+{
+    semi_batch_case(true, false);
+    semi_batch_case(false, false);
+    semi_batch_case(false, true);
+}
+
+/* Antijoin and semijoin under a governor that refuses their output's second
+ * growth: ENOSPC with the denial flag, the input disposed, and every byte
+ * the attempt reserved returned, which needs the output destroyed and so
+ * the batch ended first.  The first @kept left rows are the ones the
+ * operator keeps. */
+static int
+semi_denial_run(bool anti, uint32_t kept, uint64_t budget,
+    bool check_cleanup)
+{
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
+    sess->memory_governor = ref;
+    /* right(k) holds 0..7; left rows with k < 8 match. */
+    semi_right(sess, 0);
+    col_rel_t *right = sess->rels[sess->nrels - 1];
+    for (uint32_t i = 0; i < 8u; i++) {
+        int64_t row[1] = { (int64_t)i };
+        assert(col_rel_append_row(right, row) == 0);
+    }
+    col_rel_t *left = join_rel("left", 2);
+    for (uint32_t i = 0; i < 512u; i++) {
+        /* Kept rows first, then rows the operator drops. */
+        bool keep = i < kept;
+        int64_t k = (keep != anti) ? (int64_t)(i % 8u) : 100 + (int64_t)i;
+        int64_t row[2] = { k, (int64_t)i };
+        assert(col_rel_append_row(left, row) == 0);
+    }
+    wl_plan_op_t op;
+    semi_op(&op, anti, NULL, 0);
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, left, true) == 0);
+    uint64_t baseline = governor_reserved(ref);
+    int rc = semi_run(&op, &stack, sess);
+    if (rc == 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        assert(result.rel->nrows == kept);
+        if (result.owned)
+            assert(col_rel_destroy_checked(result.rel) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied
+            && stack.top == 0);
+        assert(governor_reserved(ref) == baseline);
+    }
+    sess->memory_governor = NULL;
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+semi_denial_tests(void)
+{
+    for (int anti = 0; anti < 2; anti++) {
+        /* Smallest budget at which 128 kept rows (one growth past the 64-row
+         * floor) succeed; 256 kept rows need a second growth. */
+        uint64_t lo = 0, hi = 1u << 24;
+        assert(semi_denial_run(anti, 128, hi, false) == 0);
+        while (hi - lo > 1) {
+            uint64_t mid = lo + (hi - lo) / 2u;
+            if (semi_denial_run(anti, 128, mid, false) == 0)
+                hi = mid;
+            else
+                lo = mid;
+        }
+        assert(semi_denial_run(anti, 256, hi, true) == ENOSPC);
+    }
+}
+
 /* The map operator appends its output rows under the batch appender (#2122):
  * a map over 4096 rows acquires a handful of mutation sets, not one per row,
  * with or without a governor, and produces exactly the per-row result. */
@@ -1840,6 +2008,8 @@ main(void)
     batch_shared_view_tests();
     batch_shared_view_retry_tests();
     batch_renewal_wrong_thread_tests();
+    semi_batch_tests();
+    semi_denial_tests();
     filter_denial_tests();
     join_denial_tests();
     map_op_batch_tests();
