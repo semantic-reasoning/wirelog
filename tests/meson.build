@@ -6311,3 +6311,14 @@ test('required_correctness_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-required-correctness.py',
             test_crdt_perf_gate_exe],
      suite: 'abi', timeout: 60)
+
+# #1821 controlled materialization, internal test hooks only.
+test_evaluation_work_exe = executable(
+  'test_evaluation_work', files('test_evaluation_work.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_work', test_evaluation_work_exe,
+     suite: ['unit'], timeout: 60)
