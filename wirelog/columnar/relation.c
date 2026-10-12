@@ -844,6 +844,9 @@ col_rel_mutation_lease_validate_impl(
     if (rc)
         return rc;
     const wl_columnar_relation_mutation_set_t *set = lease->set;
+    /* The binding check refuses a NULL set; restated for the analyzer. */
+    if (!set)
+        return EINVAL;
     if (wl_columnar_source_access_writer_validate(
             &set->descriptors[lease->descriptor_slot].writer,
             &expected_relation->descriptor_access))
@@ -7761,6 +7764,32 @@ wl_columnar_relation_new_like_governed_checked_mode(const char *name,
 {
     return wl_columnar_relation_new_like_checked_impl(out, name, src,
                governor, preserve_timestamps);
+}
+
+int
+wl_columnar_relation_copy_rows(const char *name, const col_rel_t *src,
+    uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out)
+{
+    col_rel_t *copy = NULL;
+    int rc = wl_columnar_relation_new_like_governed_checked_mode(name, src,
+            governor, false, &copy);
+    if (rc != 0)
+        return rc;
+    col_rel_append_batch_t batch = { 0 };
+    rc = col_rel_append_batch_begin(&batch, copy);
+    for (uint32_t r = begin; rc == 0 && r < end; r++)
+        rc = col_rel_append_batch_row(&batch, col_rel_row(src, r));
+    if (rc == 0)
+        rc = col_rel_append_batch_end(&batch, true);
+    else
+        (void)col_rel_append_batch_end(&batch, false);
+    if (rc != 0) {
+        col_rel_destroy(copy);
+        return rc;
+    }
+    *out = copy;
+    return 0;
 }
 
 /* Pool-aware col_rel constructor wrappers.

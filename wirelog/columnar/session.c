@@ -2636,15 +2636,10 @@ session_snapshot_insert(wl_session_t *session, const wl_plan_t *plan)
         rc = ENOMEM;
         goto done;
     }
-    rc = wl_columnar_relation_new_like_governed_checked_mode("$inserted",
-            rel, sess->memory_governor, false, &deltas[0]);
+    rc = wl_columnar_relation_copy_rows("$inserted", rel, rel->base_nrows,
+            rel->nrows, sess->memory_governor, &deltas[0]);
     if (rc != 0)
         goto done;
-    for (uint32_t row = rel->base_nrows; row < rel->nrows; row++) {
-        rc = col_rel_append_row(deltas[0], col_rel_row(rel, row));
-        if (rc != 0)
-            goto done;
-    }
     names[0] = inserted;
     nchanged = 1;
 
@@ -2691,6 +2686,15 @@ done:
     free((void *)deltas);
     return rc;
 }
+
+#ifdef WL_TEST_MUTATION_SET_HOOK
+int
+wl_columnar_session_test_snapshot_insert(wl_session_t *session,
+    const wl_plan_t *plan)
+{
+    return session_snapshot_insert(session, plan);
+}
+#endif
 
 /*
  * col_detect_physical_memory: Detect total physical RAM in bytes (Issue #221).
