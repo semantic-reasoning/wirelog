@@ -1354,6 +1354,8 @@ filter_denial_tests(void)
     } cases[] = {
         { DENY_FILTER_OP, true, false },
         { DENY_FILTER_OP, true, true },
+        { DENY_FILTER_OP, false, false },
+        { DENY_FILTER_OP, false, true },
         { DENY_RIGHT_FILTER, true, false },
         { DENY_RIGHT_FILTER, false, true },
     };
