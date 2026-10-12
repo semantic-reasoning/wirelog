@@ -687,6 +687,7 @@ int wl_columnar_relation_terminal_sequence_finish(
 #ifdef WL_TEST_MUTATION_SET_HOOK
 void wl_columnar_relation_test_set_mutation_nonce(uint64_t next_nonce);
 uint64_t wl_columnar_relation_test_mutation_nonce_peek(void);
+uint64_t wl_columnar_relation_test_lease_validations_peek(void);
 bool wl_columnar_relation_test_terminal_sequence_validate(
     const wl_columnar_relation_terminal_sequence_t *sequence);
 #endif
@@ -2839,10 +2840,14 @@ wl_columnar_relation_privatize_shared_view_with_lease(col_rel_t *r,
  * The struct holds address- and thread-bound tokens: keep it in the frame
  * that runs the loop, pass it by pointer, never copy it.  A failed row leaves
  * the relation as that append's own contract says and the batch active; a
- * failed lease renewal leaves it inactive. */
+ * lease renewal that cannot finish the old lease leaves the batch active,
+ * and one that cannot acquire the new lease leaves it inactive. */
 typedef struct {
     wl_columnar_relation_mutation_single_t single;
     col_rel_t *relation;
+    /* Relation generation at which the lease was last fully validated, or 0;
+     * rows at that generation take a cheaper check (#2072). */
+    uint64_t verified_generation;
     bool active;
 } col_rel_append_batch_t;
 

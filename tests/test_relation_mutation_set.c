@@ -694,6 +694,8 @@ append_batch_tests(void)
     assert(col_rel_append_batch_row(&batch, row) == EINVAL);
     assert(col_rel_append_batch_end(&batch, true) == 0);
     uint64_t nonce_before = wl_columnar_relation_test_mutation_nonce_peek();
+    uint64_t validations_before
+        = wl_columnar_relation_test_lease_validations_peek();
     assert(col_rel_append_batch_begin(&batch, out) == 0);
     assert(col_rel_append_batch_begin(&batch, out) == EINVAL);
     for (uint32_t i = 0; i < ROWS; i++) {
@@ -708,6 +710,8 @@ append_batch_tests(void)
     assert(col_rel_append_batch_end(&batch, true) == 0);
     uint64_t acquisitions
         = wl_columnar_relation_test_mutation_nonce_peek() - nonce_before;
+    uint64_t validations = wl_columnar_relation_test_lease_validations_peek()
+        - validations_before;
     assert(col_rel_append_batch_end(&batch, true) == 0);
     assert(col_rel_append_batch_row(&batch, row) == EINVAL);
 
@@ -725,6 +729,11 @@ append_batch_tests(void)
     /* One set per storage epoch: at least one, never more than the
      * transitions plus the first, and far below one per row. */
     assert(acquisitions >= 1 && acquisitions <= transitions + 1);
+    /* Issue #2072: the held lease is fully validated when an epoch starts
+     * and a bounded number of times around each storage transition (the
+     * renewal, the transition's own publication steps, the first row after
+     * it), not on every row. */
+    assert(validations <= 4u * transitions + 2u && validations < ROWS / 10u);
 
     wl_columnar_source_access_reader_t reader = {0};
     assert(col_rel_source_reader_acquire(out, &reader) == 0);
@@ -1215,6 +1224,194 @@ batch_denial_tests(void)
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+typedef struct {
+    col_rel_append_batch_t *batch;
+    const int64_t *row;
+    int rc;
+} batch_thread_arg_t;
+
+static void *
+batch_row_other_thread(void *arg)
+{
+    batch_thread_arg_t *a = arg;
+    a->rc = col_rel_append_batch_row(a->batch, a->row);
+    return NULL;
+}
+
+/* Issue #2072: rows after the first in an epoch take a cheaper lease check.
+ * It must still refuse a row from another thread, through a copy of the
+ * batch, after the set was finished behind the batch, and after the
+ * relation's identity or a storage generation changed behind it. */
+static void
+batch_lease_check_tests(void)
+{
+    col_rel_t *r = col_rel_new_auto("batch_check", 2);
+    assert(r);
+    col_rel_append_batch_t batch = { 0 };
+    int64_t row[2] = { 0, 0 };
+    assert(col_rel_append_batch_begin(&batch, r) == 0);
+    for (int i = 0; i < 8; i++) {
+        row[0]++;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    /* An append through the held lease validates it once, not twice. */
+    uint64_t validations_before
+        = wl_columnar_relation_test_lease_validations_peek();
+    row[0]++;
+    assert(col_rel_append_row_with_lease(r, row, &batch.single.lease) == 0);
+    assert(wl_columnar_relation_test_lease_validations_peek()
+        - validations_before == 1u);
+    uint32_t nrows = r->nrows;
+
+    batch_thread_arg_t arg = { &batch, row, 0 };
+    wl_thread_t thread;
+    assert(wl_thread_create(&thread, batch_row_other_thread, &arg) == 0);
+    assert(wl_thread_join(&thread) == 0);
+    assert(arg.rc == EINVAL && batch.active && r->nrows == nrows);
+
+    col_rel_append_batch_t copy;
+    memcpy(&copy, &batch, sizeof(copy));
+    assert(col_rel_append_batch_row(&copy, row) == EINVAL);
+    assert(r->nrows == nrows);
+
+    r->relation_identity++;
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+    r->relation_identity--;
+    r->storage_generation++;
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+    r->storage_generation--;
+    r->storage_owner_generation++;
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+    r->storage_owner_generation--;
+    assert(r->nrows == nrows && batch.active);
+    row[0]++;
+    assert(col_rel_append_batch_row(&batch, row) == 0);
+    nrows = r->nrows;
+
+    assert(col_rel_mutation_set_finish(&batch.single.set, true) == 0);
+    assert(col_rel_append_batch_row(&batch, row) == EINVAL);
+    assert(r->nrows == nrows);
+    assert(col_rel_append_batch_end(&batch, true) == EINVAL);
+    assert(!batch.active);
+    assert_open(r);
+    assert(col_rel_destroy_checked(r) == 0);
+}
+
+/* A batch on a shared view is checked in full until its first append copies
+ * the view, then cheaply; the rows equal a per-row reference and the source
+ * is left untouched. */
+static void
+batch_shared_view_tests(void)
+{
+    enum { BASE = 100, ROWS = 300 };
+    col_rel_t *src = col_rel_new_auto("batch_view_src", 2);
+    col_rel_t *ref = col_rel_new_auto("batch_view_ref", 2);
+    col_rel_t *view = col_rel_new_auto("batch_view", 2);
+    assert(src && ref && view);
+    int64_t row[2];
+    for (uint32_t i = 0; i < BASE; i++) {
+        row[0] = i;
+        row[1] = -(int64_t)i;
+        assert(col_rel_append_row(src, row) == 0);
+        assert(col_rel_append_row(ref, row) == 0);
+    }
+    for (uint32_t i = BASE; i < ROWS; i++) {
+        row[0] = i;
+        row[1] = -(int64_t)i;
+        assert(col_rel_append_row(ref, row) == 0);
+    }
+    assert(col_rel_install_shared_view(view, src) == 0);
+    assert(view->col_shared);
+    col_rel_append_batch_t batch = { 0 };
+    uint64_t validations_before
+        = wl_columnar_relation_test_lease_validations_peek();
+    assert(col_rel_append_batch_begin(&batch, view) == 0);
+    for (uint32_t i = BASE; i < ROWS; i++) {
+        row[0] = i;
+        row[1] = -(int64_t)i;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(wl_columnar_relation_test_lease_validations_peek()
+        - validations_before < (ROWS - BASE) / 10u);
+    assert(!view->col_shared && view->nrows == ROWS && src->nrows == BASE);
+    for (uint32_t c = 0; c < 2; c++) {
+        assert(memcmp(view->columns[c], ref->columns[c],
+            ROWS * sizeof(int64_t)) == 0);
+        assert(memcmp(src->columns[c], ref->columns[c],
+            BASE * sizeof(int64_t)) == 0);
+    }
+    assert(col_rel_destroy_checked(view) == 0);
+    assert(col_rel_destroy_checked(ref) == 0);
+    assert(col_rel_destroy_checked(src) == 0);
+}
+
+/* A first row on a shared view that fails before copying the view leaves
+ * the batch on its alias lease; the retried row must still take the full
+ * check, and succeeds. */
+static void
+batch_shared_view_retry_tests(void)
+{
+    col_rel_t *src = col_rel_new_auto("batch_retry_src", 2);
+    col_rel_t *view = col_rel_new_auto("batch_retry_view", 2);
+    assert(src && view);
+    int64_t row[2] = { 1, 2 };
+    assert(col_rel_append_row(src, row) == 0);
+    assert(col_rel_install_shared_view(view, src) == 0);
+    col_rel_append_batch_t batch = { 0 };
+    assert(col_rel_append_batch_begin(&batch, view) == 0);
+    uint64_t view_generation = view->view_generation;
+    view->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+    row[0] = 3;
+    assert(col_rel_append_batch_row(&batch, row) == EOVERFLOW);
+    view->view_generation = view_generation;
+    assert(view->col_shared && view->nrows == 1 && batch.active);
+    assert(col_rel_append_batch_row(&batch, row) == 0);
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert(!view->col_shared && view->nrows == 2 && src->nrows == 1);
+    assert(view->columns[0][0] == 1 && view->columns[1][0] == 2
+        && view->columns[0][1] == 3 && view->columns[1][1] == 2);
+    assert(col_rel_destroy_checked(view) == 0);
+    assert(col_rel_destroy_checked(src) == 0);
+}
+
+/* A lease renewal attempted from another thread cannot finish the held set,
+ * so the batch stays active with its gates held, and the owning thread can
+ * still end it. */
+static void
+batch_renewal_wrong_thread_tests(void)
+{
+    col_rel_t *r = col_rel_new_auto("batch_renewal_thread", 2);
+    assert(r);
+    col_rel_append_batch_t batch = { 0 };
+    int64_t row[2] = { 0, 0 };
+    assert(col_rel_append_batch_begin(&batch, r) == 0);
+    while (!(batch.single.lease.storage_transitioned
+        && r->nrows == r->capacity)) {
+        row[0]++;
+        assert(col_rel_append_batch_row(&batch, row) == 0);
+    }
+    uint32_t nrows = r->nrows;
+    batch_thread_arg_t arg = { &batch, row, 0 };
+    wl_thread_t thread;
+    assert(wl_thread_create(&thread, batch_row_other_thread, &arg) == 0);
+    assert(wl_thread_join(&thread) == 0);
+    assert(arg.rc == EINVAL && batch.active && r->nrows == nrows);
+    wl_columnar_source_access_reader_t reader = {0};
+    assert(col_rel_source_reader_acquire(r, &reader) == EBUSY);
+    /* The renewal's new lease is fully validated once before its row; the
+     * row's growth publishes without validating it again. */
+    uint64_t validations_before
+        = wl_columnar_relation_test_lease_validations_peek();
+    row[0]++;
+    assert(col_rel_append_batch_row(&batch, row) == 0);
+    assert(wl_columnar_relation_test_lease_validations_peek()
+        - validations_before == 1u);
+    assert(col_rel_append_batch_end(&batch, true) == 0);
+    assert_open(r);
+    assert(col_rel_destroy_checked(r) == 0);
+}
+
 /* A lease renewal that cannot acquire leaves the batch inactive with the
  * relation unchanged and its gates released. */
 static void
@@ -1639,6 +1836,10 @@ main(void)
     join_batch_tests();
     batch_denial_tests();
     batch_renewal_failure_tests();
+    batch_lease_check_tests();
+    batch_shared_view_tests();
+    batch_shared_view_retry_tests();
+    batch_renewal_wrong_thread_tests();
     filter_denial_tests();
     join_denial_tests();
     map_op_batch_tests();

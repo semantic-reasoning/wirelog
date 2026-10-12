@@ -43,6 +43,16 @@ wl_columnar_relation_test_mutation_nonce_peek(void)
     return atomic_load_explicit(&wl_next_mutation_set_nonce,
                memory_order_relaxed);
 }
+
+/* Calls of col_rel_mutation_lease_validate: a delta across a
+ * single-threaded window counts the full lease validations in it. */
+static wl_atomic_u64 wl_lease_validations = 0u;
+
+uint64_t
+wl_columnar_relation_test_lease_validations_peek(void)
+{
+    return atomic_load_explicit(&wl_lease_validations, memory_order_relaxed);
+}
 #endif
 
 static int
@@ -825,8 +835,8 @@ col_rel_mutation_lease_validate_binding(
     return 0;
 }
 
-int
-col_rel_mutation_lease_validate(
+static int
+col_rel_mutation_lease_validate_impl(
     const wl_columnar_relation_mutation_lease_t *lease,
     const col_rel_t *expected_relation)
 {
@@ -852,6 +862,18 @@ col_rel_mutation_lease_validate(
     return wl_columnar_source_access_writer_validate(
         &set->owners[lease->owner_slot].writer,
         &lease->owner->source_access);
+}
+
+int
+col_rel_mutation_lease_validate(
+    const wl_columnar_relation_mutation_lease_t *lease,
+    const col_rel_t *expected_relation)
+{
+#ifdef WL_TEST_MUTATION_SET_HOOK
+    atomic_fetch_add_explicit(&wl_lease_validations, 1u,
+        memory_order_relaxed);
+#endif
+    return col_rel_mutation_lease_validate_impl(lease, expected_relation);
 }
 
 /* A leased publisher may advance this lease only for the exact storage
@@ -4602,10 +4624,14 @@ col_rel_append_replaces_storage(const col_rel_t *r)
            || (r->timestamps && r->nrows >= r->timestamp_capacity);
 }
 
+/* @lease_checked: the caller checked @lease for @r on this thread, with
+ * col_rel_mutation_lease_validate or the batch check below, and between that
+ * check and this call wrote none of the lease, its set, or @r's identity,
+ * generations or gates, so the lease is not validated again here. */
 static int
 col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
     wl_columnar_source_access_writer_t *writer, bool writer_held,
-    wl_columnar_relation_mutation_lease_t *lease)
+    wl_columnar_relation_mutation_lease_t *lease, bool lease_checked)
 {
     bool alias_release_pending = false;
     int64_t inline_row[16];
@@ -4636,7 +4662,7 @@ col_rel_append_row_impl(col_rel_t *r, const int64_t *row,
         r->memory_budget_denial_pending = false;
     }
     if (lease && (lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
-        || col_rel_mutation_lease_validate(lease, r)))
+        || (!lease_checked && col_rel_mutation_lease_validate(lease, r))))
         return EINVAL;
     prior_storage_generation = lease ? lease->relation_generation
         : r->storage_generation;
@@ -4893,7 +4919,7 @@ col_rel_append_row(col_rel_t *r, const int64_t *row)
     r->memory_budget_denial_pending = false;
     rc = col_rel_append_row_impl(r, row,
             &single.owners[single.lease.owner_slot].writer, true,
-            &single.lease);
+            &single.lease, false);
     int finish_rc = col_rel_mutation_set_finish(&single.set, rc == 0);
     return rc ? rc : finish_rc;
 }
@@ -4907,7 +4933,8 @@ col_rel_append_row_with_lease(col_rel_t *r, const int64_t *row,
         || col_rel_mutation_lease_validate(lease, r))
         return EINVAL;
     return col_rel_append_row_impl(r, row,
-               &lease->set->owners[lease->owner_slot].writer, true, lease);
+               &lease->set->owners[lease->owner_slot].writer, true, lease,
+               true);
 }
 
 int
@@ -4926,6 +4953,59 @@ col_rel_append_batch_begin(col_rel_append_batch_t *batch, col_rel_t *r)
     return 0;
 }
 
+/* Checks the batch's lease before a row.  A full validation runs when the
+ * lease is new to the batch, after its relation generation moved, and while
+ * it is not the canonical self-owned lease of the relation.  Otherwise the
+ * lease was fully validated at this relation generation, and the set and
+ * slot bookkeeping that the full check reads is written only when the set
+ * is acquired or unwound, or when relation_generation moves with it; so it
+ * is enough to recheck the lease and set identities and nonce, the
+ * relation's identity and generations against the lease snapshot, and both
+ * writer tokens, which carry the thread and gate-state checks. */
+static int
+col_rel_append_batch_lease_check(col_rel_append_batch_t *batch)
+{
+    col_rel_t *r = batch->relation;
+    wl_columnar_relation_mutation_single_t *single = &batch->single;
+    const wl_columnar_relation_mutation_lease_t *lease = &single->lease;
+    bool canonical = lease->owner == r && !lease->detached
+        && lease->owner_slot == lease->self_owner_slot;
+    if (!canonical || !batch->verified_generation
+        || lease->relation_generation != batch->verified_generation) {
+        if (col_rel_mutation_lease_validate(lease, r))
+            return EINVAL;
+        batch->verified_generation = canonical ? lease->relation_generation
+            : 0;
+        return 0;
+    }
+    const wl_columnar_relation_mutation_set_t *set = &single->set;
+    int rc = 0;
+    if (lease->identity != (uintptr_t)lease || lease->set != set
+        || set->identity != (uintptr_t)set || !set->acquisition_nonce
+        || lease->acquisition_nonce != set->acquisition_nonce
+        || lease->relation != r
+        || lease->role_flags != WL_COLUMNAR_RELATION_PAYLOAD_MUTATION
+        || lease->descriptor_slot >= set->descriptor_count
+        || lease->self_owner_slot >= set->owner_count
+        || r->relation_identity != lease->relation_identity
+        || r->storage_generation != lease->relation_generation
+        || r->storage_owner != r
+        || r->storage_owner_identity != lease->owner_identity
+        || r->storage_owner_generation != lease->owner_generation
+        || wl_columnar_source_access_writer_validate(
+            &set->descriptors[lease->descriptor_slot].writer,
+            &r->descriptor_access)
+        || wl_columnar_source_access_writer_validate(
+            &set->owners[lease->self_owner_slot].writer, &r->source_access))
+        rc = EINVAL;
+#ifdef WL_TEST_MUTATION_SET_HOOK
+    /* Test builds hold the cheap check to the full one. */
+    if ((rc != 0) != (col_rel_mutation_lease_validate_impl(lease, r) != 0))
+        abort();
+#endif
+    return rc;
+}
+
 int
 col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
 {
@@ -4933,24 +5013,30 @@ col_rel_append_batch_row(col_rel_append_batch_t *batch, const int64_t *row)
         return EINVAL;
     col_rel_t *r = batch->relation;
     /* A lease publishes at most one storage transition.  Once it has, a row
-     * that would replace storage again starts the next epoch's lease. */
+     * that would replace storage again starts the next epoch's lease.  A
+     * finish that fails released nothing, so the batch stays active with
+     * the old lease. */
     if (batch->single.lease.storage_transitioned
         && col_rel_append_replaces_storage(r)) {
         int rc = col_rel_mutation_set_finish(&batch->single.set, true);
-        if (rc == 0) {
-            memset(&batch->single, 0, sizeof(batch->single));
-            rc = col_rel_mutation_single_acquire(r, &batch->single);
-        }
+        if (rc)
+            return rc;
+        memset(&batch->single, 0, sizeof(batch->single));
+        batch->verified_generation = 0;
+        rc = col_rel_mutation_single_acquire(r, &batch->single);
         if (rc) {
             batch->active = false;
             return rc;
         }
     }
+    int rc = col_rel_append_batch_lease_check(batch);
+    if (rc)
+        return rc;
     /* Each row's denial evidence starts clean, as for col_rel_append_row. */
     r->memory_budget_denial_pending = false;
     return col_rel_append_row_impl(r, row,
                &batch->single.owners[batch->single.lease.owner_slot].writer,
-               true, &batch->single.lease);
+               true, &batch->single.lease, true);
 }
 
 int
