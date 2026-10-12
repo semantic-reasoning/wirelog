@@ -6070,6 +6070,217 @@ col_rel_append_all(col_rel_t *dst, const col_rel_t *src, wl_arena_t *arena)
     return col_rel_append_all_impl(dst, src, arena, false);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_work_checkpoint)(
+    wl_evaluation_control_t *control, uint64_t work);
+#endif
+
+/* Observe cancellation after each real bounded region, including its tail. */
+static int
+wl_columnar_relation_work_tail(wl_evaluation_control_t *control, uint64_t work)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control, work);
+#else
+    (void)work;
+#endif
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_relation_append_all_controlled(col_rel_t *dst,
+    const col_rel_t *src, wl_arena_t *arena, wl_evaluation_control_t *control)
+{
+    col_rel_t *src_owner = NULL, *dst_owner = NULL;
+    wl_columnar_source_access_reader_t reader = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool read_held = false, write_held = false;
+    uint32_t base, count;
+    int rc;
+    if (!control)
+        return col_rel_append_all(dst, src, arena);
+    if (!dst || !src || dst->ncols != src->ncols)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        return rc;
+    /* NONE is a plain representation, not a compound shape to defer. */
+    if ((dst->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+        && (dst->compound_count || dst->inline_physical_offset))
+        || (src->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+        && (src->compound_count || src->inline_physical_offset)))
+        return EINVAL;
+    /* Reject compound metadata before any potentially long map validation. */
+    if (dst->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || dst->compound_arity_map || src->compound_arity_map
+        || dst->compound_arity_len || src->compound_arity_len
+        || dst->col_shared || src->col_shared || dst->arena_owned
+        || src->arena_owned || arena)
+        return ENOTSUP;
+    rc = col_rel_storage_owner_resolve(src, &src_owner);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_storage_owner_resolve(dst, &dst_owner);
+    if (rc != 0)
+        return rc;
+    if (src_owner != src || dst_owner != dst)
+        return ENOTSUP;
+    if (src_owner != dst_owner) {
+        rc = wl_columnar_source_access_reader_acquire(
+            &src_owner->source_access, &reader);
+        if (rc != 0)
+            return rc;
+        read_held = true;
+    }
+    rc = wl_columnar_source_access_writer_acquire(
+        &dst_owner->source_access, &writer);
+    if (rc != 0)
+        goto done;
+    write_held = true;
+    if (col_rel_storage_alias_borrow_count(dst_owner) != 0) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    if (src->nrows > UINT32_MAX - dst->nrows) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    if (!col_rel_timestamp_shape_valid(dst)
+        || !col_rel_timestamp_shape_valid(src)
+        || src->nrows > src->capacity || dst->nrows > dst->capacity) {
+        rc = EINVAL;
+        goto done;
+    }
+    base = dst->nrows;
+    count = src->nrows;
+    if (base + count > dst->capacity
+        || (dst->timestamps && base + count > dst->timestamp_capacity)
+        || (!dst->column_types && src->column_types)) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    if (!wl_columnar_relation_generation_valid(dst->view_generation)
+        || dst->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+        || (src->ncols && (!src->columns || !dst->columns))) {
+        rc = EINVAL;
+        goto done;
+    }
+    for (uint32_t c = 0; c < dst->ncols; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        wirelog_column_type_t dt = dst->column_types
+            ? dst->column_types[c] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t st = src->column_types
+            ? src->column_types[c] : WIRELOG_TYPE_INT64;
+        if (!src->columns[c] || !dst->columns[c]
+            || ((dt == WIRELOG_TYPE_FLOAT || st == WIRELOG_TYPE_FLOAT)
+            && dt != st)) {
+            rc = EINVAL;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    /* Empty inputs still poll, but need no second uncharged width walk. */
+    if (count == 0) {
+        rc = wl_evaluation_control_charge(control, 0);
+        goto done;
+    }
+    /* Legacy typed validation visits every scalar, even integer lanes. */
+    if (src->column_types) {
+        for (uint32_t row = 0; row < count; row++) {
+            for (uint32_t c = 0; c < src->ncols; c++) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc != 0)
+                    goto done;
+                if (src->column_types[c] == WIRELOG_TYPE_FLOAT
+                    && !wl_columnar_float_bits_valid(src->columns[c][row])) {
+                    rc = EINVAL;
+                    goto done;
+                }
+                rc = wl_columnar_relation_work_tail(control, 1);
+                if (rc != 0)
+                    goto done;
+            }
+        }
+    }
+    for (uint32_t c = 0; c < dst->ncols; c++) {
+        for (uint32_t row = 0; row < count;) {
+            uint32_t n = count - row;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM)
+                n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+            rc = wl_evaluation_control_charge(control, n);
+            if (rc != 0)
+                goto done;
+            memcpy(dst->columns[c] + base + row, src->columns[c] + row,
+                (size_t)n * sizeof(int64_t));
+            rc = wl_columnar_relation_work_tail(control, n);
+            if (rc != 0)
+                goto done;
+            if (dst->column_types
+                && dst->column_types[c] == WIRELOG_TYPE_FLOAT) {
+                rc = wl_evaluation_control_charge(control, n);
+                if (rc != 0)
+                    goto done;
+                for (uint32_t i = 0; i < n; i++) {
+                    int64_t *cell = &dst->columns[c][base + row + i];
+                    if (wl_columnar_float_bits_zero(*cell))
+                        *cell = 0;
+                }
+                rc = wl_columnar_relation_work_tail(control, n);
+                if (rc != 0)
+                    goto done;
+            }
+            row += n;
+        }
+    }
+    if (src->timestamps && dst->timestamps) {
+        for (uint32_t row = 0; row < count;) {
+            uint32_t n = count - row;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM / 5u)
+                n = (uint32_t)(WL_EVALUATION_CONTROL_QUANTUM / 5u);
+            rc = wl_evaluation_control_charge(control, (uint64_t)n * 5u);
+            if (rc != 0)
+                goto done;
+            for (uint32_t i = 0; i < n; i++) {
+                const col_delta_timestamp_t *from = &src->timestamps[row + i];
+                col_delta_timestamp_t *to = &dst->timestamps[base + row + i];
+                to->iteration = from->iteration;
+                to->stratum = from->stratum;
+                to->worker = from->worker;
+                to->_reserved = from->_reserved;
+                to->multiplicity = from->multiplicity;
+            }
+            rc = wl_columnar_relation_work_tail(control, (uint64_t)n * 5u);
+            if (rc != 0)
+                goto done;
+            row += n;
+        }
+    }
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc == 0 && count != 0) {
+        dst->nrows = base + count;
+        wl_columnar_relation_touch_view(dst);
+    }
+done:
+    /* A genuine cleanup failure has precedence over a control disposition. */
+    if (write_held) {
+        int cleanup = wl_columnar_source_access_writer_release(&writer);
+        if (cleanup != 0 && rc <= 0)
+            rc = cleanup;
+    }
+    if (read_held) {
+        int cleanup = wl_columnar_source_access_reader_release(&reader);
+        if (cleanup != 0 && rc <= 0)
+            rc = cleanup;
+    }
+    return rc;
+}
+
 int
 wl_columnar_relation_append_all_if_empty(col_rel_t *dst,
     const col_rel_t *src)
