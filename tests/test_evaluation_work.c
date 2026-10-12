@@ -1217,6 +1217,560 @@ test_growth_ungoverned_and_raw_twins(void)
     release(c); destroy(dst); destroy(raw); destroy(src);
 }
 
+/* Independent region oracle from the source contract: I75, nonce1+1,
+ * descriptor1, owner-presence1, optional journal18, resolver12, binding32,
+ * owner1 (alias adds1), borrow/identity4, full validation128. */
+static size_t
+single_regions(unsigned mode, uint64_t regions[12])
+{
+    size_t n = 0;
+    regions[n++] = 75; regions[n++] = 1; regions[n++] = 1;
+    regions[n++] = 1; regions[n++] = 1;
+    if (mode == 1) regions[n++] = 18;
+    regions[n++] = 12; regions[n++] = 32; regions[n++] = 1;
+    if (mode >= 2) regions[n++] = 1;
+    regions[n++] = 4; regions[n++] = 128;
+    return n;
+}
+
+static col_rel_t *
+single_fixture(unsigned mode, col_rel_t **root)
+{
+    *root = NULL;
+    if (mode < 2) {
+        col_rel_t *r = relation(1, 4, 1, false, NULL);
+        if (mode == 1) {
+            r->storage_owner = NULL;
+            r->storage_owner_identity = 73;
+            r->storage_owner_generation = 91;
+        }
+        return r;
+    }
+    col_rel_t *a = col_rel_new_auto("single-a", 1);
+    col_rel_t *b = col_rel_new_auto("single-b", 1);
+    CHECK(a && b);
+    bool a_first = (uintptr_t)&a->source_access < (uintptr_t)&b->source_access;
+    *root = (a_first == (mode == 2)) ? a : b;
+    col_rel_t *alias = *root == a ? b : a;
+    int64_t row = 42;
+    CHECK(col_rel_append_row(*root, &row) == 0);
+    CHECK(col_rel_install_shared_view(alias, *root) == 0);
+    CHECK(alias->storage_owner == *root);
+    return alias;
+}
+
+static void
+single_dispose(col_rel_t *r, col_rel_t *root)
+{
+    if (!r->storage_owner) {
+        r->storage_owner = r;
+        r->storage_owner_identity = r->relation_identity;
+        r->storage_owner_generation = r->storage_generation;
+    }
+    destroy(r);
+    if (root) destroy(root);
+}
+
+static void
+single_open(col_rel_t *r, col_rel_t *root)
+{
+    CHECK(!wl_columnar_source_access_gate_busy(&r->descriptor_access));
+    CHECK(!wl_columnar_source_access_gate_busy(&r->source_access));
+    if (root) {
+        CHECK(!wl_columnar_source_access_gate_busy(&root->source_access));
+        CHECK(col_rel_storage_alias_borrow_count(root) == 1);
+    }
+}
+
+static void
+single_writer_thread_equal(const wl_columnar_source_access_writer_t *a,
+    const wl_columnar_source_access_writer_t *b)
+{
+    if (!a->thread_valid || !a->owner) return;
+#if defined(WL_HAVE_C11_THREADS)
+    CHECK(thrd_equal(a->owner_thread, b->owner_thread));
+#elif defined(_WIN32) || defined(_WIN64)
+    CHECK(a->owner_thread == b->owner_thread);
+#else
+    CHECK(pthread_equal(a->owner_thread, b->owner_thread));
+#endif
+}
+
+static void
+single_state_equal(const wl_columnar_relation_mutation_single_t *a,
+    const wl_columnar_relation_mutation_single_t *b)
+{
+    CHECK(a->set.identity == b->set.identity);
+    CHECK(a->set.acquisition_nonce == b->set.acquisition_nonce);
+    CHECK(a->set.roles == b->set.roles);
+    CHECK(a->set.descriptors == b->set.descriptors);
+    CHECK(a->set.owners == b->set.owners);
+    CHECK(a->set.leases == b->set.leases);
+    CHECK(a->set.initializations == b->set.initializations);
+    CHECK(a->set.descriptor_count == b->set.descriptor_count);
+    CHECK(a->set.owner_count == b->set.owner_count);
+    CHECK(a->set.lease_count == b->set.lease_count);
+    CHECK(a->set.initialization_count == b->set.initialization_count);
+    CHECK(a->set.descriptors_acquired == b->set.descriptors_acquired);
+    CHECK(a->set.owners_acquired == b->set.owners_acquired);
+    CHECK(a->set.terminal_sequence == b->set.terminal_sequence);
+    CHECK(a->set.terminal_expected_events == b->set.terminal_expected_events);
+    CHECK(a->set.terminal_observed_events == b->set.terminal_observed_events);
+    CHECK(a->set.terminal_sequence_consumed ==
+        b->set.terminal_sequence_consumed);
+    CHECK(a->set.published == b->set.published);
+    CHECK(a->role.relation == b->role.relation);
+    CHECK(a->role.role_flags == b->role.role_flags);
+    CHECK(a->descriptor.relation == b->descriptor.relation);
+    CHECK(a->lease.identity == b->lease.identity);
+    CHECK(a->lease.acquisition_nonce == b->lease.acquisition_nonce);
+    CHECK(a->lease.set == b->lease.set);
+    CHECK(a->lease.relation == b->lease.relation);
+    CHECK(a->lease.owner == b->lease.owner);
+    CHECK(a->lease.descriptor_slot == b->lease.descriptor_slot);
+    CHECK(a->lease.owner_slot == b->lease.owner_slot);
+    CHECK(a->lease.self_owner_slot == b->lease.self_owner_slot);
+    CHECK(a->lease.relation_identity == b->lease.relation_identity);
+    CHECK(a->lease.relation_generation == b->lease.relation_generation);
+    CHECK(a->lease.owner_identity == b->lease.owner_identity);
+    CHECK(a->lease.owner_generation == b->lease.owner_generation);
+    CHECK(a->lease.role_flags == b->lease.role_flags);
+    CHECK(a->lease.detached == b->lease.detached);
+    CHECK(a->lease.storage_transitioned == b->lease.storage_transitioned);
+    CHECK(a->initialization.relation == b->initialization.relation);
+    CHECK(a->initialization.owner_identity == b->initialization.owner_identity);
+    CHECK(a->initialization.owner_generation ==
+        b->initialization.owner_generation);
+    CHECK(a->initialization.borrows == b->initialization.borrows);
+    CHECK(a->descriptor.writer.owner == b->descriptor.writer.owner);
+    CHECK(a->descriptor.writer.secondary_owner ==
+        b->descriptor.writer.secondary_owner);
+    CHECK(a->descriptor.writer.identity == b->descriptor.writer.identity);
+    CHECK(a->descriptor.writer.thread_valid ==
+        b->descriptor.writer.thread_valid);
+    CHECK(a->owners[0].owner == b->owners[0].owner);
+    CHECK(a->owners[0].writer.owner == b->owners[0].writer.owner);
+    CHECK(a->owners[0].writer.secondary_owner ==
+        b->owners[0].writer.secondary_owner);
+    CHECK(a->owners[0].writer.identity == b->owners[0].writer.identity);
+    CHECK(a->owners[0].writer.thread_valid == b->owners[0].writer.thread_valid);
+    CHECK(a->owners[1].owner == b->owners[1].owner);
+    CHECK(a->owners[1].writer.owner == b->owners[1].writer.owner);
+    CHECK(a->owners[1].writer.secondary_owner ==
+        b->owners[1].writer.secondary_owner);
+    CHECK(a->owners[1].writer.identity == b->owners[1].writer.identity);
+    CHECK(a->owners[1].writer.thread_valid == b->owners[1].writer.thread_valid);
+    single_writer_thread_equal(&a->descriptor.writer, &b->descriptor.writer);
+    single_writer_thread_equal(&a->owners[0].writer, &b->owners[0].writer);
+    single_writer_thread_equal(&a->owners[1].writer, &b->owners[1].writer);
+}
+
+static void
+test_single_regions(void)
+{
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        uint64_t regions[12], total = 0;
+        size_t count = single_regions(mode, regions);
+        for (size_t i = 0; i < count; ++i) total += regions[i];
+        CHECK(total == (mode == 0 ? 256u : mode == 1 ? 274u : 257u));
+        for (unsigned tail = 0; tail < 2; ++tail) {
+            uint64_t prefix = 0;
+            for (size_t i = 0; i < count; ++i) {
+                col_rel_t *root, *r = single_fixture(mode, &root);
+                wl_columnar_relation_mutation_single_t single = {0}, zero = {0};
+                int64_t **columns = r->columns;
+                uint32_t capacity = r->capacity;
+                uint64_t generation = r->storage_generation;
+                uint64_t held =
+                    r->memory_governor ? wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(r->memory_governor)) :
+                    0;
+                uint64_t prior = prefix;
+                prefix += regions[i];
+                wl_evaluation_control_t *c = control(tail ? 0 : prefix - 1);
+                if (tail) cancel_at = prefix;
+                int expected =
+                    tail ? WL_EVALUATION_CONTROL_CANCELLED :
+                    WL_EVALUATION_CONTROL_WORK_LIMIT;
+                CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+                    &single, c) == expected);
+                CHECK(finish(c, expected) == (tail ? prefix : prior));
+                single_state_equal(&single, &zero);
+                single_open(r, root);
+                CHECK(r->columns == columns && r->capacity == capacity
+                    && r->storage_generation == generation);
+                if (r->memory_governor)
+                    CHECK(wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(
+                                r->memory_governor)) == held);
+                CHECK(r->nrows == 1 && r->columns[0][0] == (root ? 42 : 0));
+                if (mode == 1) CHECK(!r->storage_owner &&
+                        r->storage_owner_identity == 73 &&
+                        r->storage_owner_generation == 91);
+                release(c); single_dispose(r, root);
+            }
+        }
+        for (unsigned raw = 0; raw < 2; ++raw) {
+            col_rel_t *root, *r = single_fixture(mode, &root);
+            wl_columnar_relation_mutation_single_t single = {0}, zero = {0};
+            wl_evaluation_control_t *c = raw ? NULL : control(total);
+            CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+                &single, c) == 0);
+            CHECK(col_rel_mutation_lease_validate(&single.lease, r) == 0);
+            CHECK(single.set.owner_count == (root ? 2u : 1u));
+            if (root) CHECK((uintptr_t)&single.owners[0].owner->source_access <
+                    (uintptr_t)&single.owners[1].owner->source_access);
+            CHECK(wl_columnar_relation_mutation_single_finish_controlled(
+                    &single, 0, c) == 0);
+            single_state_equal(&single, &zero); single_open(r, root);
+            if (c) {
+                CHECK(finish(c, 0) == total); release(c);
+            }
+            CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+                &single, NULL) == 0);
+            CHECK(wl_columnar_relation_mutation_single_finish_controlled(
+                    &single, 0, NULL) == 0);
+            single_dispose(r, root);
+        }
+    }
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_mutation_single_t single = {0}, zero = {0};
+    wl_evaluation_control_t *c = control(0);
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 0);
+    single_state_equal(&single, &zero); single_open(r, NULL);
+    release(c); destroy(r);
+}
+
+static void
+test_single_dirty(void)
+{
+    col_rel_t *a = relation(1, 4, 1, false, NULL);
+    col_rel_t *b = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_mutation_single_t live = {0};
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(a, &live,
+        NULL) == 0);
+    wl_columnar_relation_mutation_single_t before = live, copy = live;
+    for (unsigned controlled = 0; controlled < 2; ++controlled) {
+        wl_evaluation_control_t *c = controlled ? control(0) : NULL;
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(b, &live,
+            c) == EINVAL);
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(b, &copy,
+            c) == EINVAL);
+        single_state_equal(&live, &before); single_state_equal(&copy, &before);
+        CHECK(col_rel_mutation_lease_validate(&live.lease, a) == 0);
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&copy, 0,
+            c) == EINVAL);
+        CHECK(!wl_columnar_source_access_gate_busy(&b->descriptor_access));
+        if (c) {
+            CHECK(finish(c, EINVAL) == 150); release(c);
+        }
+    }
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&live, 0,
+        NULL) == 0);
+    for (unsigned mode = 0; mode < 8; ++mode) {
+        wl_columnar_relation_mutation_single_t dirty = {0};
+        switch (mode) {
+        case 0: dirty.role.relation = a; break;
+        case 1: dirty.set.terminal_sequence_consumed = true; break;
+        case 2: dirty.set.published = true; break;
+        case 3: dirty.owners[0].writer.identity = 7; break;
+        case 4: dirty.owners[1].writer.thread_valid = true; break;
+        case 5: dirty.lease.storage_transitioned = true; break;
+        case 6: dirty.initialization.borrows = 1; break;
+        default: dirty.lease.detached = true; break;
+        }
+        before = dirty;
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(b, &dirty,
+            NULL) == EINVAL);
+        single_state_equal(&dirty, &before);
+    }
+    /* Raw failed admission retains descriptive role residue, despite retiring
+     * this ordinary busy failure's authority. Verify retirement before reset. */
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(wl_columnar_source_access_reader_acquire(&b->descriptor_access,
+        &reader) == 0);
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(b, &live,
+        NULL) == EBUSY);
+    CHECK(live.role.relation == b
+        && live.role.role_flags == WL_COLUMNAR_RELATION_PAYLOAD_MUTATION);
+    CHECK(!live.set.identity && !live.set.descriptors_acquired
+        && !live.set.owners_acquired && !live.descriptor.writer.owner
+        && !live.owners[0].writer.owner && !live.owners[1].writer.owner);
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0);
+    single_open(b, NULL);
+    live = (wl_columnar_relation_mutation_single_t){0};
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(b, &live,
+        NULL) == 0);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&live, 0,
+        NULL) == 0);
+    destroy(a); destroy(b);
+}
+
+static col_rel_t *single_peer;
+static unsigned single_nonce_retries;
+static void
+single_nonce_interfere(wl_evaluation_control_t *c, uint64_t observed)
+{
+    (void)c; (void)observed;
+    if (!single_nonce_retries) return;
+    --single_nonce_retries;
+    wl_columnar_relation_mutation_single_t peer = {0};
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(single_peer,
+        &peer, NULL) == 0);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&peer, 0,
+        NULL) == 0);
+}
+
+static void
+test_single_nonce(void)
+{
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    single_peer = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_test_before_nonce_cas = single_nonce_interfere;
+    single_nonce_retries = 3;
+    wl_columnar_relation_mutation_single_t single = {0};
+    wl_evaluation_control_t *c = control(259);
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        c) == 0);
+    CHECK(single_nonce_retries == 0);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+        c) == 0);
+    CHECK(finish(c, 0) == 259); release(c);
+    wl_columnar_relation_test_before_nonce_cas = NULL;
+    for (unsigned zero = 0; zero < 2; ++zero) {
+        uint64_t terminal = zero ? 0 : UINT64_MAX;
+        uint64_t saved =
+            wl_columnar_relation_test_single_nonce_replace(terminal);
+        c = control(0);
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, c) == EOVERFLOW);
+        CHECK(finish(c, EOVERFLOW) == 77);
+        CHECK(wl_columnar_relation_test_single_nonce_replace(saved) ==
+            terminal);
+        release(c); single_open(r, NULL);
+    }
+    destroy(single_peer); single_peer = NULL; destroy(r);
+}
+
+static unsigned single_fail_slot, single_release_calls[3];
+static int
+single_release_failure(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    (void)single;
+    CHECK(slot < 3); ++single_release_calls[slot];
+    return slot == single_fail_slot ? EIO : 0;
+}
+
+static void *
+single_wrong_thread(void *arg)
+{
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(arg, 0,
+        NULL) == EINVAL);
+    return NULL;
+}
+
+static void
+test_single_cleanup(void)
+{
+    for (unsigned slot = 0; slot < 3; ++slot) {
+        col_rel_t *root, *r = single_fixture(2, &root);
+        wl_columnar_relation_mutation_single_t single = {0};
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, NULL) == 0);
+        wl_columnar_relation_mutation_single_t before = single;
+        wl_thread_t thread;
+        CHECK(wl_thread_create(&thread, single_wrong_thread, &single) == 0);
+        CHECK(wl_thread_join(&thread) == 0);
+        single_state_equal(&single, &before);
+        single_fail_slot = slot;
+        memset(single_release_calls, 0, sizeof(single_release_calls));
+        wl_columnar_relation_test_single_release = single_release_failure;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+            NULL) == EIO);
+        CHECK(single.set.published && single.set.descriptors_acquired == 1);
+        CHECK(single.set.owners_acquired == slot);
+        CHECK(wl_columnar_source_access_gate_busy(&r->descriptor_access));
+        CHECK(single_release_calls[2] == 1);
+        CHECK(single_release_calls[1] == (slot <= 1 ? 1u : 0u));
+        CHECK(single_release_calls[0] == (slot == 0 ? 1u : 0u));
+        single_fail_slot = 99;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+            NULL) == 0);
+        CHECK(single_release_calls[2] == (slot == 2 ? 2u : 1u));
+        CHECK(single_release_calls[1] == (slot == 1 ? 2u : 1u));
+        CHECK(single_release_calls[0] == (slot == 0 ? 2u : 1u));
+        wl_columnar_relation_test_single_release = NULL;
+        single_open(r, root); single_dispose(r, root);
+    }
+    for (unsigned committed = 0; committed < 2; ++committed) {
+        col_rel_t *root, *r = single_fixture(1, &root);
+        wl_columnar_relation_mutation_single_t single = {0};
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, NULL) == 0);
+        CHECK(r->storage_owner == r);
+        int execution = committed ? 0 : WL_EVALUATION_CONTROL_CANCELLED;
+        single_fail_slot = 1;
+        wl_columnar_relation_test_single_release = single_release_failure;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+            execution, NULL) == EIO);
+        CHECK(single.set.initialization_count == 1 && r->storage_owner == r);
+        single_fail_slot = 0;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+            execution, NULL) == EIO);
+        CHECK(!single.set.initialization_count && !single.set.owners_acquired);
+        CHECK((r->storage_owner == r) == (committed != 0));
+        if (!committed) CHECK(r->storage_owner_identity == 73 &&
+                r->storage_owner_generation == 91);
+        wl_columnar_relation_test_single_release = NULL;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+            execution, NULL) == execution);
+        single_open(r, NULL); single_dispose(r, root);
+    }
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_mutation_single_t single = {0};
+    wl_evaluation_control_t *c = control(256);
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        c) == 0);
+    int64_t value = 987;
+    CHECK(col_rel_append_row_with_lease(r, &value, &single.lease) == 0);
+    wl_evaluation_control_request_cancel(c);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+        c) == 0);
+    CHECK(r->nrows == 2 && r->columns[0][1] == 987);
+    /* No post-publication poll converts the pending flag into an observed
+     * stop; both mandatory cleanup and the completed attempt remain success. */
+    CHECK(finish(c, 0) == 256);
+    release(c); single_open(r, NULL); destroy(r);
+}
+
+static void
+test_single_refusals(void)
+{
+    col_rel_t *root, *r = single_fixture(2, &root);
+    wl_columnar_source_access_gate_t *gates[] = {&r->descriptor_access,
+                                                 &r->source_access,
+                                                 &root->source_access};
+    for (size_t i = 0; i < 3; ++i) {
+        wl_columnar_source_access_reader_t reader = {0};
+        CHECK(wl_columnar_source_access_reader_acquire(gates[i], &reader) == 0);
+        wl_columnar_relation_mutation_single_t single = {0};
+        wl_evaluation_control_t *c = control(0);
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, c) == EBUSY);
+        CHECK(wl_columnar_source_access_reader_release(&reader) == 0);
+        (void)finish(c, EBUSY); release(c); single_open(r, root);
+    }
+    uint64_t identity = r->storage_owner_identity,
+        generation = r->storage_owner_generation;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        wl_columnar_relation_mutation_single_t single = {0};
+        wl_evaluation_control_t *c = control(0);
+        if (mode == 0) ++r->storage_owner_identity;
+        if (mode == 1) ++r->storage_owner_generation;
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(mode ==
+            2 ? root : r, &single, c) == (mode == 2 ? EBUSY : EINVAL));
+        r->storage_owner_identity = identity;
+        r->storage_owner_generation = generation;
+        (void)finish(c, mode == 2 ? EBUSY : EINVAL); release(c);
+        single_open(r, root);
+    }
+    single_dispose(r, root);
+}
+
+static void
+test_single_partial_acquisition_cleanup(void)
+{
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        col_rel_t *root, *r = single_fixture(1, &root);
+        wl_columnar_relation_mutation_single_t single = {0};
+        wl_evaluation_control_t *c = control(0);
+        /* Legacy admission after Q: 75+1+1+1+1+18+12+32+1+4. */
+        cancel_at = 146;
+        single_fail_slot = slot;
+        wl_columnar_relation_test_single_release = single_release_failure;
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r,
+            &single, c) == EIO);
+        CHECK(single.set.descriptors_acquired == 1 && !single.set.published);
+        CHECK(single.set.owners_acquired == slot);
+        CHECK(single.set.initialization_count == slot);
+        CHECK((r->storage_owner == r) == (slot == 1));
+        wl_columnar_relation_test_single_release = NULL;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+            WL_EVALUATION_CONTROL_CANCELLED,
+            c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!r->storage_owner && r->storage_owner_identity == 73 &&
+            r->storage_owner_generation == 91);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 146);
+        release(c); single_open(r, NULL); single_dispose(r, root);
+    }
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_mutation_single_t single = {0};
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        NULL) == 0);
+    wl_columnar_relation_terminal_sequence_t terminal = {0};
+    single.set.terminal_sequence = &terminal;
+    wl_columnar_relation_mutation_single_t before = single;
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+        NULL) == EINVAL);
+    single_state_equal(&single, &before);
+    single.set.terminal_sequence = NULL;
+    single_fail_slot = 1;
+    wl_columnar_relation_test_single_release = single_release_failure;
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+        ENOMEM, NULL) == ENOMEM);
+    CHECK(single.set.owners_acquired == 1 && !single.set.published);
+    wl_columnar_relation_test_single_release = NULL;
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+        ENOMEM, NULL) == ENOMEM);
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        NULL) == 0);
+    int64_t row = 88;
+    /* The raw leased storage transition, unlike an in-capacity row write,
+     * records set.published itself. Exercise that real publisher. */
+    for (unsigned i = 0; i < 4; ++i)
+        CHECK(col_rel_append_row_with_lease(r, &row, &single.lease) == 0);
+    CHECK(single.set.published);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single,
+        WL_EVALUATION_CONTROL_CANCELLED, NULL) == 0);
+    CHECK(r->nrows == 5 && r->columns[0][1] == 88 && r->columns[0][4] == 88);
+    single_open(r, NULL); destroy(r);
+}
+
+static uint64_t single_seen_nonce;
+static void
+single_nonce_observe(wl_evaluation_control_t *c, uint64_t observed)
+{
+    (void)c;
+    single_seen_nonce = observed;
+}
+
+static void
+test_single_nonce_stopped_publication(void)
+{
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    wl_columnar_relation_mutation_single_t single = {0};
+    wl_evaluation_control_t *c = control(0);
+    cancel_at = 77; /* Successful nonce CAS tail, before inline publication. */
+    wl_columnar_relation_test_before_nonce_cas = single_nonce_observe;
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(single_seen_nonce != 0);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 77);
+    release(c);
+    uint64_t consumed = single_seen_nonce;
+    wl_columnar_relation_test_before_nonce_cas = NULL;
+    CHECK(wl_columnar_relation_mutation_single_acquire_controlled(r, &single,
+        NULL) == 0);
+    CHECK(single.set.acquisition_nonce == consumed + 1);
+    CHECK(wl_columnar_relation_mutation_single_finish_controlled(&single, 0,
+        NULL) == 0);
+    single_open(r, NULL); destroy(r);
+}
+
 int
 main(void)
 {
@@ -1250,6 +1804,13 @@ main(void)
     test_growth_partial_faults_and_overlap();
     test_growth_scope_and_gate_stops();
     test_growth_ungoverned_and_raw_twins();
+    test_single_regions();
+    test_single_dirty();
+    test_single_nonce();
+    test_single_cleanup();
+    test_single_refusals();
+    test_single_partial_acquisition_cleanup();
+    test_single_nonce_stopped_publication();
     puts("evaluation_work: OK");
     return 0;
 }
