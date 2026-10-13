@@ -1898,3 +1898,60 @@ before old release and includes both original-ID guards, reinitialization and
 refused-child return continuations. The maximum conservative forward envelope
 is248; the complete post-CAS publication through outer return is225, including
 both wrappers' ordinary return work. Mandatory cleanup bodies remain excluded.
+
+
+### Caller-attempt-bound empty scalar schema clone
+
+The internal `wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled`
+entrypoint creates a private, empty scalar relation under the supplied original
+active attempt ID. NULL control delegates the exact raw mode API. This is a
+new-like constructor prerequisite for logical row copy; it does not activate
+an evaluator operator or clone delta weights.
+
+The caller owns a writable, exclusive, nonoverlapping output slot containing
+no live owned result. Exactly one fixed bootstrap exception normalizes that
+slot to NULL before ID validation or the first charge. Thus inactive, stale or
+initially refused calls may perform that store with consumed0. No source scan,
+resource claim, callback or bulk context initialization is part of this
+exception. All later resource work is admitted against the immutable caller ID.
+
+Original descriptor and canonical owner reader tokens protect borrowed schema,
+names and types through the constructor's last read. Real alias borrowing and
+external source lifetimes remain necessary; arena/pool reset is prohibited
+while those descriptors are used. The private builder acquires no additional
+source readers. It receives an already pinned recipe and returns an owned local
+relation. Only after mandatory source drain and another original-ID guard does
+the wrapper admit the final external output store.
+
+D covers the descriptor and owned relation name. M covers actual names, types,
+Arrow schema objects, tables and format/name bytes. P covers the column grid,
+optional zero timestamp storage and eager governed row scratch. The explicit
+output governor is retained before its first D admission and any following
+constructor checkpoint. Its retained reference and the three original credit
+tokens remain reachable throughout partial allocation and Arrow initialization.
+Successful publication transfers original credits and that one retained
+reference into the complete local relation in a single prepaid cutoff.
+Failure frees partial physical images before returning only their own credits,
+then releases the retained governor reference. Impossible original token or
+reader retirement fails stop while authority remains reachable.
+
+The clone owns its source-compatible names, scalar types, graph/index/declared
+width and requested optional zero timestamp image. It uses the explicit output
+governor without inheriting source governor authority. Constructor D/M/P denial
+retains the existing ENOSPC category. The later logical physical-row copy has a
+separate contract and deliberately projects away signed timestamp weights.
+Allocator internals, instrumentation and mandatory original retirement remain
+outside logical forward-work accounting; no elapsed latency guarantee follows.
+
+The constructor's conservative interprocedural source envelope is248, using
+inherited governor168 plus the complete reserve caller80. The post-commit
+caller is separated by the governor's actual final cutoff: final4 plus its
+continuation41, with failed continuation at most60. Byte chunks use a224 paid
+region for a211 conservative full caller/refusal envelope. Identity observation
+uses80 for56 including a refused first claim. Pointer192 covers160. Complete
+installation costs140 for moves/stores,160 through source-drain bookkeeping,
+and176 including refused external publication; its paid region is220. All
+24 named regions and portable compile-time bounds are adjacent to the source.
+These are source-derived envelopes under the stated exclusions, not observed
+instruction counts. Reached-tail telemetry may omit already admitted work when
+a nested governor phase stops; charged reports remain the accounting authority.

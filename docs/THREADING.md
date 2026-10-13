@@ -1620,3 +1620,34 @@ that reference through physical free and original S refund. The shared
 reference counter protects governor lifetime and does not confer token
 ownership. Batch publication retains the original inline single address;
 reader/writer thread checks and mandatory DRAINING cleanup remain required.
+
+
+### Caller-attempt-bound scalar new-like construction
+
+The new opt-in constructor holds original descriptor and canonical source
+readers until its last borrowed metadata read. A source alias must retain its
+real borrow and both descriptors must remain alive; arena and pool reset are
+excluded for the call. Gate admission does not pin allocation lifetime.
+
+Every initial reader/identity observation and actual strong CAS retry is
+admitted under the caller's original attempt ID. Successful reader ownership
+is initialized before the post-CAS seam. Stops drain only that original reader;
+identity claims remain consumed. MSVC's weak-named Interlocked shim has no
+spurious failures. A neutral active-ID observation is correlation, while the
+caller's serialized control lifecycle and original token thread/address checks
+supply the ownership contract.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Paid original-attempt initial observation, never a source allocation lifetime pin |
+| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; owner marker precedes callback and stale cleanup uses the same original token |
+| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt |
+| `relation.c:wl_columnar_relation_constructor_attempt_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | relaxed | Original-attempt paid observation; uniqueness alone publishes no payload |
+| `relation.c:wl_columnar_relation_constructor_attempt_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | MSVC strong identity reservation; no counter rewind after cancellation or stale return |
+| `relation.c:wl_columnar_relation_constructor_attempt_identity#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | relaxed/relaxed | Non-MSVC separately admitted strong identity retry, with original-ID guard after the before-CAS seam |
+
+These six sites extend the complete current inventory from312 to318. Existing
+original reservation initialization and move helpers are reused; their source
+sites are already in the audit. Constructor cleanup frees physical images
+before original credit refunds and releases its early retained governor
+reference last. It does not recharge a successor during mandatory cleanup.

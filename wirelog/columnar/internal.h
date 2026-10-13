@@ -3409,6 +3409,23 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out,
     wl_evaluation_control_t *control);
+
+/* Caller-attempt-bound empty scalar schema clone. NULL control delegates the
+ * exact raw mode API and ignores attempt_id. A controlled caller supplies its
+ * active nonzero ID and keeps source/canonical storage alive and immutable
+ * under admitted readers, including an external no-reset arena/pool lifetime.
+ * The exclusive writable, nonoverlapping out slot must own no live result.
+ * One fixed bootstrap exception clears *out before ID/first-charge checks;
+ * stale/inactive/first refusal may therefore write NULL with consumed0.
+ * All other forward resource work is admitted; cleanup drains original tokens.
+ * Source names/types/graph and optional zero timestamps are owned by the clone.
+ * Output uses the explicit governor, without inheriting the source governor.
+ */
+int
+wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor, bool preserve_timestamps,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t attempt_id);
 int
 wl_columnar_relation_new_like_governed_checked_controlled(col_rel_t **out,
     const char *name, const col_rel_t *src,
