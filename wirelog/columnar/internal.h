@@ -2660,6 +2660,37 @@ wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess);
 int
 wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out);
+/* Opt-in original-attempt admission, not operator activation. NULL control
+ * delegates raw begin. Otherwise require a live matching nonzero ID, empty
+ * exclusive out, serialized session and stable governor binding. Storage is
+ * disjoint and stays live through the call; peer governor credits may change.
+ * Failures preserve lists/counters/out; actual DENIED may set budget_denied.
+ * Success transfers ownership to the session, independent of control lifetime.
+ * Private frames have no supported ownership escape through test callbacks.
+ * Both external-cutoff hooks share one funded region; mandatory physical-freed
+ * hook receives NULL control and never polls or debits another attempt. */
+int
+wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+enum {
+    WL_COLUMNAR_EVAL_STACK_ENTRY_PHASE = 1,
+    WL_COLUMNAR_EVAL_STACK_RESERVE_PHASE = 2,
+    WL_COLUMNAR_EVAL_STACK_ALLOCATION_PHASE = 3,
+    WL_COLUMNAR_EVAL_STACK_ZERO_PHASE = 4,
+    WL_COLUMNAR_EVAL_STACK_TOKEN_PHASE = 5,
+    WL_COLUMNAR_EVAL_STACK_MOVED_PHASE = 6,
+    WL_COLUMNAR_EVAL_STACK_COMMITTED_PHASE = 7,
+    WL_COLUMNAR_EVAL_STACK_EXTERNAL_PHASE = 8,
+    WL_COLUMNAR_EVAL_STACK_PHYSICAL_FREED_PHASE = 9,
+};
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_stack_test_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+extern int wl_columnar_eval_stack_test_fail_allocation;
+/* Physical layout only, never an observed work total. */
+size_t wl_columnar_eval_stack_test_frame_size(void);
+#endif
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame);

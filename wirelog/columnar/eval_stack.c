@@ -320,6 +320,315 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     return 0;
 }
 
+/* Original-attempt frame admission: logical source accounting, not latency.
+ * G9/C13/T29 expand original-ID guard/charge/tail; token init10/move40,
+ * size-add7, retain6/get3, verdict R10 and returned status19. Ordinary failure
+ * F56 rounded64 includes all marker/pointer/retirement-selection/abort/return
+ * decisions and full move40; only allocator, original physical-credit-ref
+ * retirement internals, control internals and instrumentation are excluded.
+ * ENTRY103<=112, SETUP135<=144, RESERVE156<=192, ALLOC128<=144,
+ * ZERO202<=208, TOKEN122<=128, MOVE161<=176, COMMIT104<=128,
+ * EXTERNAL133<=144 including BOTH T29 tails on one debit. Six terminal
+ * publication slots include active_count arithmetic/store2, no later hook.
+ * ZERO counts16*(address+store+increment arithmetic/store+test)=80 plus
+ * setup/transitions, tail and NEXT refused debit through full F64.
+ * Nested reserve last-poll return84+status19+T29+R10+C13+refusal3+F64=222;
+ * nested commit final4+rc3+check6+C13+refusal3+F64=93. Conservative240.
+ * Read-only invalid/first-refused bootstrap<=28 may run at consumed0.
+ * Ungoverned928+224*N; governed1726+224*N, one failed total CAS adds84;
+ * N=ceil(actual frame bytes/16). No unfinished frame field is inspected. */
+enum {
+    WL_COLUMNAR_EVAL_STACK_ENTRY_WORK = 128,
+    WL_COLUMNAR_EVAL_STACK_SETUP_WORK = 160,
+    WL_COLUMNAR_EVAL_STACK_RESERVE_WORK = 240,
+    WL_COLUMNAR_EVAL_STACK_ALLOC_WORK = 160,
+    WL_COLUMNAR_EVAL_STACK_ZERO_WORK = 224,
+    WL_COLUMNAR_EVAL_STACK_TOKEN_WORK = 128,
+    WL_COLUMNAR_EVAL_STACK_MOVE_WORK = 192,
+    WL_COLUMNAR_EVAL_STACK_COMMIT_WORK = 160,
+    WL_COLUMNAR_EVAL_STACK_EXTERNAL_WORK = 160,
+};
+
+typedef char wl_columnar_eval_stack_attempt_fees_fit_t[
+        (WL_COLUMNAR_EVAL_STACK_ENTRY_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_SETUP_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_RESERVE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_ALLOC_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_ZERO_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_TOKEN_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_MOVE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_COMMIT_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_EXTERNAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+typedef char wl_columnar_eval_stack_attempt_envelopes_fit_t[
+        (UINT64_C(112) <= WL_COLUMNAR_EVAL_STACK_ENTRY_WORK
+        && UINT64_C(144) <= WL_COLUMNAR_EVAL_STACK_SETUP_WORK
+        && UINT64_C(192) <= WL_COLUMNAR_EVAL_STACK_RESERVE_WORK
+        && UINT64_C(144) <= WL_COLUMNAR_EVAL_STACK_ALLOC_WORK
+        && UINT64_C(208) <= WL_COLUMNAR_EVAL_STACK_ZERO_WORK
+        && UINT64_C(128) <= WL_COLUMNAR_EVAL_STACK_TOKEN_WORK
+        && UINT64_C(176) <= WL_COLUMNAR_EVAL_STACK_MOVE_WORK
+        && UINT64_C(128) <= WL_COLUMNAR_EVAL_STACK_COMMIT_WORK
+        && UINT64_C(144) <= WL_COLUMNAR_EVAL_STACK_EXTERNAL_WORK) ? 1 : -1];
+typedef char wl_columnar_eval_stack_attempt_contiguous_fits_t[
+        (UINT64_C(240) <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+int wl_columnar_eval_stack_test_fail_allocation = -1;
+
+size_t
+wl_columnar_eval_stack_test_frame_size(void)
+{
+    return sizeof(wl_columnar_eval_stack_cleanup_frame_t);
+}
+#endif
+
+static void
+wl_columnar_eval_stack_attempt_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_checkpoint)
+        wl_columnar_eval_stack_test_checkpoint(control, phase, progress);
+#else
+    (void)control;
+    (void)phase;
+    (void)progress;
+#endif
+}
+
+static void *
+wl_columnar_eval_stack_attempt_allocate(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_fail_allocation >= 0) {
+        if (wl_columnar_eval_stack_test_fail_allocation == 0)
+            return NULL;
+        wl_columnar_eval_stack_test_fail_allocation--;
+    }
+#endif
+    return malloc(bytes);
+}
+
+static int
+wl_columnar_eval_stack_attempt_guard(wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    return !control || !id
+           || wl_evaluation_control_active_attempt_id(control) != id
+        ? EINVAL : 0;
+}
+
+static int
+wl_columnar_eval_stack_attempt_charge(wl_evaluation_control_t *control,
+    uint64_t id, uint64_t work)
+{
+    int rc = wl_columnar_eval_stack_attempt_guard(control, id);
+    return rc ? rc : wl_evaluation_control_charge(control, work);
+}
+
+static int
+wl_columnar_eval_stack_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_eval_stack_attempt_guard(control, id);
+    if (rc)
+        return rc;
+    wl_columnar_eval_stack_attempt_checkpoint(control, phase, progress);
+    return wl_columnar_eval_stack_attempt_charge(control, id, 0);
+}
+
+int
+wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
+    wl_columnar_eval_stack_cleanup_frame_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control)
+        return wl_columnar_eval_stack_cleanup_begin(sess, out);
+    if (!sess || !out || *out)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_ENTRY_WORK);
+    if (rc)
+        return rc;
+    uint64_t bytes = 0;
+    int verdict = sess->cleanup_pending ? EBUSY
+        : sess->cleanup_active_count >=
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
+        || sess->cleanup_pending_count >=
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES
+        - sess->cleanup_active_count ? ENOBUFS
+        : !wl_columnar_memory_size_add(sess->cleanup_reserved_bytes,
+            sizeof(wl_columnar_eval_stack_cleanup_frame_t),
+            &bytes) ? EOVERFLOW : 0;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_ENTRY_PHASE, bytes);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            return rc;
+    }
+    if (verdict)
+        return verdict;
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_SETUP_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_memory_reservation_t admission;
+    wl_columnar_memory_reservation_init(&admission);
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    wl_columnar_memory_governor_ref_t *retained_ref = sess->memory_governor;
+    bool local_held = false, frame_held = false, committed = false;
+    if (retained_ref)
+        wl_columnar_memory_governor_ref_retain(retained_ref);
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_TOKEN_PHASE, 0);
+    if (rc)
+        goto fail;
+    if (retained_ref) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EVAL_STACK_RESERVE_WORK);
+        if (rc)
+            goto fail;
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(retained_ref), sizeof(*frame),
+            &admission, &status, control, attempt_id);
+        if (rc)
+            goto fail;
+        local_held = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+        verdict = local_held ? 0
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            sess->memory_budget_denied = true;
+        rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_EVAL_STACK_RESERVE_PHASE, sizeof(*frame));
+        if (rc > 0 || !verdict) {
+            if (rc)
+                goto fail;
+        }
+        if (verdict) {
+            rc = verdict;
+            goto fail;
+        }
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_ALLOC_WORK);
+    if (rc)
+        goto fail;
+    frame = wl_columnar_eval_stack_attempt_allocate(sizeof(*frame));
+    verdict = frame ? 0 : ENOMEM;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_ALLOCATION_PHASE, sizeof(*frame));
+    if (rc > 0 || !verdict) {
+        if (rc)
+            goto fail;
+    }
+    if (verdict) {
+        rc = verdict;
+        goto fail;
+    }
+    for (size_t offset = 0; offset < sizeof(*frame); ) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EVAL_STACK_ZERO_WORK);
+        if (rc)
+            goto fail;
+        size_t count = sizeof(*frame) - offset;
+        if (count > 16)
+            count = 16;
+        for (size_t i = 0; i < count; i++)
+            ((unsigned char *)frame)[offset + i] = 0;
+        offset += count;
+        rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_EVAL_STACK_ZERO_PHASE, offset);
+        if (rc)
+            goto fail;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_TOKEN_WORK);
+    if (rc)
+        goto fail;
+    wl_columnar_memory_reservation_init(&frame->reservation);
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_TOKEN_PHASE, sizeof(*frame));
+    if (rc)
+        goto fail;
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_MOVE_WORK);
+    if (rc)
+        goto fail;
+    if (local_held) {
+        if (!wl_columnar_memory_reservation_move(&frame->reservation,
+            &admission))
+            abort();
+        frame_held = true;
+        local_held = false;
+        frame->governor = retained_ref;
+    }
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_MOVED_PHASE, sizeof(*frame));
+    if (rc)
+        goto fail;
+    if (frame_held) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EVAL_STACK_COMMIT_WORK);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &frame->reservation, frame, &committed, control, attempt_id);
+        if (rc)
+            goto fail;
+        if (!committed) {
+            rc = EINVAL;
+            goto fail;
+        }
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_EXTERNAL_WORK);
+    if (rc)
+        goto fail;
+    frame->session = sess;
+    frame->next = sess->cleanup_active;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_COMMITTED_PHASE, sizeof(*frame));
+    if (rc)
+        goto fail;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_EXTERNAL_PHASE, bytes);
+    if (rc)
+        goto fail;
+    sess->cleanup_active = frame;
+    sess->cleanup_active_count++;
+    sess->cleanup_reserved_bytes = bytes;
+    *out = frame;
+    return 0;
+fail:
+    if (frame_held) {
+        if (!wl_columnar_memory_reservation_move(&admission,
+            &frame->reservation))
+            abort();
+        local_held = true;
+    }
+    if (frame) {
+        free(frame);
+        wl_columnar_eval_stack_attempt_checkpoint(NULL,
+            WL_COLUMNAR_EVAL_STACK_PHYSICAL_FREED_PHASE, 0);
+    }
+    if (local_held) {
+        bool released = committed ? wl_columnar_memory_release(&admission)
+            : wl_columnar_memory_rollback(&admission);
+        if (!released)
+            abort();
+    }
+    if (retained_ref)
+        wl_columnar_memory_governor_ref_release(retained_ref);
+    return rc;
+}
+
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame)

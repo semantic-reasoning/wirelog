@@ -2092,3 +2092,36 @@ Distinct controls and output slots may read one immutable owner concurrently;
 exclude destruction until all borrowed readers join. The registered numeric
 fixture uses real synchronized threads and owner-only governor pinning. This
 atom supplies numeric execution without activating default FILTER/MAP dispatch.
+# Attempt-bound persistent cleanup frame admission
+
+`wl_columnar_eval_stack_cleanup_begin_attempt_controlled` admits the existing
+cleanup frame under the caller's original nonzero execution-attempt ID. A NULL
+control delegates the existing raw entry point. The session and empty output
+handle must be exclusively accessed; its governor binding remains stable.
+Failure preserves the active/pending lists, counters and output. A returned
+typed governor DENIED status may set `memory_budget_denied`; stale/accounting
+errors before that authoritative status do not fabricate this flag.
+
+The frame is privately allocated and zeroed in admitted chunks of at most
+16 bytes. Partial initialization cleanup reads only initialized local ownership
+markers. Original token moves and the committed outcome select rollback versus
+release. Physical memory is freed before original credit and the retained
+governor reference are released. A published frame belongs to the session and
+uses the existing finish/pending/retry protocol after control destruction.
+Private test observation grants no supported ownership or reader escape.
+
+The nine logical fees are ENTRY128, SETUP160, RESERVE240, ALLOC160, ZERO224,
+TOKEN128, MOVE192, COMMIT160 and EXTERNAL160. Both external-cutoff hooks share
+the last fee. With `N = ceil(actual frame bytes / 16)`, independent totals are
+`928 + 224*N` without a governor and `1726 + 224*N` with a governor; a real
+failed governor total CAS adds84. Ordinary failure decisions and checked token
+moves, zero-loop transitions, nested helper returns and refused next debits
+are included. The conservative contiguous source bound is240, below256.
+The read-only invalid/first-refused bootstrap may execute at consumed0 and is
+bounded by28. Control/instrumentation/allocator internals and mandatory original
+physical/credit/reference retirement internals remain explicit exclusions;
+this is a logical-work bound, not a latency bound. The physical-freed hook is
+mandatory, receives NULL control and cannot debit a successor attempt.
+
+This internal primitive leaves the frame layout and raw behavior unchanged.
+It does not activate FILTER/MAP, unary transactions or default evaluation routes.
