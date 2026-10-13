@@ -2060,3 +2060,35 @@ not machine instructions or elapsed time. Allocator/control internals,
 instrumentation and original mandatory physical/credit/ref retirement are
 explicit exclusions; new ordinary cleanup branches are included. Test phase8
 is mandatory disposal with NULL control, distinct from subsequent forward hooks.
+
+
+### Caller-attempt numeric execution
+
+`wl_columnar_expr_eval_attempt_controlled` borrows the genuine immutable
+program produced by the preceding compiler. The caller supplies the active
+control and original attempt ID; NULL, inactive or stale control returns
+EINVAL. Both output slots remain unchanged on every nonzero return. Numeric
+semantic failure publishes value0/failedtrue only after the final original-ID
+check, while control errors take precedence. No raw interpreter fallback,
+allocation, reservation or governor-reference operation runs during evaluation.
+
+The fixed local stack initializes only its top; each admitted numeric push
+writes its value and sidefields. Raw underflow0, ignored saturated pushes,
+aggregate no-ops, checked integer boundaries, finite FLOAT and negative-zero
+semantics remain. Each in-range VAR lane is admitted before reading it. Phase21
+observes that read before finite validation (failedfalse); phase20 and phase22
+carry detected semantic failure. A stopped/stale call publishes neither slot.
+
+Five tariffs are96/64/224/160/96 for entry/fetch/step/row/final. Full source
+regions64/32/192/144/48 include expanded portable arithmetic/stack helpers and
+all outward/next-refusal continuations; row includes both row and step tails.
+Conservative224 bounds logical forward work, with control internals and
+instrumentation excluded, not machine instructions or elapsed time. Independent
+success/semantic-prefix work is192+288 per executed instruction+160 per actual
+in-range VAR read, including final96 after semantic failure.
+
+Programs may outlive compilation attempts and the caller's governor reference.
+Distinct controls and output slots may read one immutable owner concurrently;
+exclude destruction until all borrowed readers join. The registered numeric
+fixture uses real synchronized threads and owner-only governor pinning. This
+atom supplies numeric execution without activating default FILTER/MAP dispatch.
