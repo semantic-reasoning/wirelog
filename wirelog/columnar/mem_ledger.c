@@ -106,7 +106,12 @@ wl_columnar_mem_ledger_writer_acquire(wl_mem_ledger_t *ledger)
 static void
 wl_columnar_mem_ledger_writer_release(wl_mem_ledger_t *ledger)
 {
+#ifdef _MSC_VER
+    (void)atomic_exchange_explicit(&ledger->writer_gate, 0,
+        memory_order_release);
+#else
     atomic_store_explicit(&ledger->writer_gate, 0, memory_order_release);
+#endif
 }
 
 /* Protected arithmetic preserves saturating/clamped raw accounting. Counter
@@ -162,25 +167,37 @@ wl_mem_ledger_init(wl_mem_ledger_t *ledger, uint64_t budget_bytes)
 }
 
 void
+wl_columnar_mem_ledger_event_locked(wl_mem_ledger_t *ledger, int subsys,
+    uint64_t bytes, bool allocate)
+{
+    if (bytes == 0)
+        return;
+    if (allocate) {
+        uint64_t subsys_new = wl_columnar_mem_ledger_saturating_add(
+            &ledger->subsys_bytes[subsys], bytes);
+        wl_columnar_mem_ledger_update_peak(&ledger->subsys_peak[subsys],
+            subsys_new);
+        uint64_t total_new = wl_columnar_mem_ledger_saturating_add(
+            &ledger->current_bytes, bytes);
+        wl_columnar_mem_ledger_update_peak(&ledger->peak_bytes, total_new);
+    } else {
+        wl_columnar_mem_ledger_counter_sub_clamped(
+            &ledger->subsys_bytes[subsys],
+            bytes);
+        wl_columnar_mem_ledger_counter_sub_clamped(&ledger->current_bytes,
+            bytes);
+    }
+}
+
+void
 wl_mem_ledger_alloc(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
 {
     if (!ledger || bytes == 0)
         return;
     if (subsys < 0 || subsys >= WL_MEM_SUBSYS_COUNT)
         return;
-
     wl_columnar_mem_ledger_writer_acquire(ledger);
-    /* Update subsystem counter */
-    uint64_t subsys_new =
-        wl_columnar_mem_ledger_saturating_add(&ledger->subsys_bytes[subsys],
-            bytes);
-    wl_columnar_mem_ledger_update_peak(&ledger->subsys_peak[subsys],
-        subsys_new);
-
-    /* Update total counter */
-    uint64_t total_new =
-        wl_columnar_mem_ledger_saturating_add(&ledger->current_bytes, bytes);
-    wl_columnar_mem_ledger_update_peak(&ledger->peak_bytes, total_new);
+    wl_columnar_mem_ledger_event_locked(ledger, subsys, bytes, true);
     wl_columnar_mem_ledger_writer_release(ledger);
 }
 
@@ -193,9 +210,7 @@ wl_mem_ledger_free(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
         return;
 
     wl_columnar_mem_ledger_writer_acquire(ledger);
-    wl_columnar_mem_ledger_counter_sub_clamped(&ledger->subsys_bytes[subsys],
-        bytes);
-    wl_columnar_mem_ledger_counter_sub_clamped(&ledger->current_bytes, bytes);
+    wl_columnar_mem_ledger_event_locked(ledger, subsys, bytes, false);
     wl_columnar_mem_ledger_writer_release(ledger);
 }
 

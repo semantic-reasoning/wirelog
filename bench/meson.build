@@ -62,6 +62,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/diff_join_batch.c',
   subdir_wirelog / 'columnar/lftj.c',
   subdir_wirelog / 'columnar/mem_ledger.c',
+  subdir_wirelog / 'columnar/mem_ledger_publication.c',
   subdir_wirelog / 'columnar/memory_governor.c',
   subdir_wirelog / 'columnar/diff_trace.c',
   subdir_wirelog / 'columnar/diff_arrangement.c',

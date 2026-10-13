@@ -140,6 +140,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/kfusion_adaptive.c',
     '../wirelog/columnar/lftj.c',
     '../wirelog/columnar/mem_ledger.c',
+    '../wirelog/columnar/mem_ledger_publication.c',
     '../wirelog/columnar/memory_governor.c',
     '../wirelog/columnar/merge.c',
     '../wirelog/columnar/mobius.c',
@@ -2052,6 +2053,7 @@ backend_src = files(
   '../wirelog/columnar/diff_join_batch.c',
   '../wirelog/columnar/lftj.c',
   '../wirelog/columnar/mem_ledger.c',
+  '../wirelog/columnar/mem_ledger_publication.c',
   '../wirelog/columnar/memory_governor.c',
   '../wirelog/evaluation_control.c',
   '../wirelog/columnar/diff_trace.c',
@@ -6359,3 +6361,22 @@ test_evaluation_relation_creation_exe = executable(
 )
 test('evaluation_relation_creation', test_evaluation_relation_creation_exe,
      suite: ['unit'], timeout: 60)
+
+
+# Controlled ledger publication with real governor/peer composition.
+test_evaluation_output_materialization_exe = executable(
+  'test_evaluation_output_materialization',
+  files('test_evaluation_output_materialization.c',
+        '../wirelog/columnar/mem_ledger_publication.c',
+        '../wirelog/columnar/mem_ledger.c',
+        '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c'),
+  thread_src,
+  c_args: ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+  install: false,
+)
+test('evaluation_output_materialization', test_evaluation_output_materialization_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
