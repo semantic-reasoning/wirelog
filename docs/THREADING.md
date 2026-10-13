@@ -238,7 +238,8 @@ Format: `file:function[#N]` | field | operation | order | justification.
 |---|---|---|---|---|
 | `mem_ledger.c:wl_columnar_mem_ledger_writer_acquire` | `ledger->writer_gate` | `atomic_compare_exchange_weak_explicit` | `acquire/relaxed` | Acquire exclusive accounting writer authority; failed attempts retry |
 | `mem_ledger.c:wl_columnar_mem_ledger_writer_acquire#2` | `ledger->writer_gate` | `atomic_load_explicit` | `relaxed` | Read-only waiting while a peer owns writer authority; no counter access until acquire succeeds |
-| `mem_ledger.c:wl_columnar_mem_ledger_writer_release` | `ledger->writer_gate` | `atomic_store_explicit` | `release` | Publish protected accounting writes before the next writer acquires |
+| `mem_ledger.c:wl_columnar_mem_ledger_writer_release` | `ledger->writer_gate` | `atomic_exchange_explicit` | `release` | MSVC Interlocked release publishes protected accounting writes |
+| `mem_ledger.c:wl_columnar_mem_ledger_writer_release#2` | `ledger->writer_gate` | `atomic_store_explicit` | `release` | C11 release publishes protected accounting writes before the next writer acquires |
 | `mem_ledger.c:wl_columnar_mem_ledger_saturating_add` | `*counter` | `atomic_load_explicit` | `relaxed` | Protected counter read; ledger writer authority prevents competing writes |
 | `mem_ledger.c:wl_columnar_mem_ledger_saturating_add#2` | `*counter` | `atomic_store_explicit` | `relaxed` | Publish saturated increment under writer authority; no retry loop |
 | `mem_ledger.c:wl_columnar_mem_ledger_update_peak` | `*counter` | `atomic_load_explicit` | `relaxed` | Protected counter read; ledger writer authority prevents competing writes |
@@ -1511,3 +1512,33 @@ reused; four new conditional read/publication sites extend the inventory.
 | `memory_governor.c:wl_columnar_memory_governor_growth_commit_read#2` | token state/owner | `atomic_load_explicit` | acquire | C11 observation validates saved scalar authority before terminal stores |
 | `memory_governor.c:wl_columnar_memory_governor_growth_commit_cancel` | token state | `atomic_exchange_explicit` | release | Restore only REPLACING after validating original owning cleanup |
 | `memory_governor.c:wl_columnar_memory_governor_growth_commit_finish` | token state | `atomic_exchange_explicit` | release | Publish finite COMMITTED state after saved bytes/kind updates |
+
+### Controlled ledger publication
+
+The private `mem_ledger_publication` translation unit shares finite protected
+arithmetic with raw accounting; the raw ledger remains independently linkable.
+Prepare binds the original zero-initialized record, acquiring thread and saved
+active attempt, copies at most two ordered requests, and prepays initial
+validation, apply and release. Count zero still requires apply and release.
+The record and its live ledger/control references remain exclusive through
+consumption. Atomic attempt observation does not pin host lifecycle.
+
+Every strong gate CAS has a separate admitted retry round. Its failure pays
+loopback and the next saved-attempt guard before another positive charge.
+A stopped acquisition is cancel-only, and a repeated call cannot reuse its
+prepaid initial validation. Every callback checks the saved identity before
+polling; none runs after successful CAS. Apply validates both requests before
+its first write and reads current protected counters, never a saved snapshot.
+Release/cancel use original address and thread authority; cleanup is legal
+following attempt end. APPLIED records require release and never roll counters
+or peaks back. A consumed or copied record cannot release a subsequent writer.
+MSVC uses Interlocked observation/release; C11 retains acquire-load/release-store.
+
+| Site anchor | Object | Operation | Ordering | Purpose |
+|---|---|---|---|---|
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_read` | ledger writer gate | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked observation under original authority |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_gate_read#2` | ledger writer gate | `atomic_load_explicit` | acquire | C11 observation under original authority |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong` | ledger writer gate | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC shim is a nonspurious single Interlocked CAS |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong#2` | ledger writer gate | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One admitted nonspurious C11 acquisition attempt |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming original record |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming original record |

@@ -76,6 +76,7 @@ wirelog/columnar/join_pipeline.c
 wirelog/columnar/kfusion_adaptive.c
 wirelog/columnar/lftj.c
 wirelog/columnar/mem_ledger.c
+wirelog/columnar/mem_ledger_publication.c
 wirelog/columnar/memory_governor.c
 wirelog/columnar/merge.c
 wirelog/columnar/mobius.c

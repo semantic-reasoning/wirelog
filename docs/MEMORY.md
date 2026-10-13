@@ -1612,3 +1612,41 @@ EINVAL, and a genuine admitted stop propagates its negative disposition.
 `test_memory_governor` uses real old/incoming buffers and an independent peer
 reservation for exact admission, every checkpoint stop/error/stale edge,
 original/copy/thread authority, and physical-free-before-refund checks.
+
+### Private controlled ledger publication
+
+`mem_ledger_publication` prepares at most two ordered alloc/free events before
+claiming the ledger's writer gate. Preparation admits109 logical slots, then
+166 for initial validation26, finite apply117 and release23. Each gate CAS
+attempt admits28, including failure loopback and the next attempt-identity
+check. Denied admissions consume no work; successful preparation totals275,
+and acquisition totals275+28*n for n CAS attempts. These conservative source
+ceilings include expanded helpers and error paths, not exact executed counts.
+Each individual admission fits the256-slot quantum. Caller initialization and
+actual relation/lease publication require separate accounting.
+
+The source-adjacent inventory counts assignments, predicates, dispatches,
+atomic/thread primitives and returns. Apply117 combines the worst FREE
+validation with the more expensive ALLOC arithmetic; APPLIED release23 covers
+both phase predicates. After callbacks, saved identity is checked before a
+zero poll or further positive admission. No successor attempt is debited.
+Acquisition can be invoked once; stopped/stale acquisition is cancel-only.
+
+A successful CAS establishes the final cutoff. Finite apply uses current
+protected saturating/clamped counters in request order, preserving peak
+semantics of raw accounting. No callback, poll, charge, allocation, retry or
+mutex occurs during apply/release. The real governor/storage composition test
+counts the complete held sequence207 slots after CAS (208 including CAS), with
+four explicit fixture publication stores. It proves composition of the helper
+protocols; actual row/batch/lease publication remains separately required.
+The fixture's FREE-old/ALLOC-new events do not prescribe actual relation
+accounting deltas when saturation or gauge drift is involved.
+
+Before the cutoff, cancellation consumes only original prepared authority,
+never restores a numeric ledger snapshot or another reservation's credit.
+After APPLIED, cancellation refuses and original release remains mandatory.
+Governor cancellation restores its token phase; incoming physical storage is
+freed before rollback refunds credit. Successful physical retirement likewise
+precedes downsizing original credit. The independent17-byte peer reservation
+remains untouched throughout composition tests. This private foundation does
+not activate operators or expose enforceable public configuration.

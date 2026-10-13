@@ -357,6 +357,14 @@ wl_mem_ledger_alloc(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes);
 void
 wl_mem_ledger_free(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes);
 
+/* Internal unchecked primitive: original caller owns this ledger's writer
+ * gate and supplies a valid subsystem. No gate acquisition, callback, control
+ * or retry. Preserve raw saturating/clamped arithmetic and monotone peaks.
+ */
+void
+wl_columnar_mem_ledger_event_locked(wl_mem_ledger_t *ledger, int subsys,
+    uint64_t bytes, bool allocate);
+
 /* Register/unregister a callback used by a quiescent owner to release
  * reclaimable capacity.  Unregister before destroying @owner.  A stale
  * handle cannot unregister a later callback that reused the slot. */
