@@ -6363,6 +6363,17 @@ test_evaluation_relation_creation_exe = executable(
 test('evaluation_relation_creation', test_evaluation_relation_creation_exe,
      suite: ['unit'], timeout: 60)
 
+# #1821 physical-row projection with original attempt and resource authority.
+test_evaluation_copy_exe = executable(
+  'test_evaluation_copy', files('test_evaluation_copy.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_copy', test_evaluation_copy_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 
 # Controlled ledger publication with real governor/peer composition.
 test_evaluation_output_materialization_exe = executable(

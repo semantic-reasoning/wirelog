@@ -3439,6 +3439,23 @@ WL_MUST_CHECK int
 wl_columnar_relation_copy_rows(const char *name, const col_rel_t *src,
     uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
     col_rel_t **out);
+/* Controlled scalar physical-row projection with one captured caller attempt.
+ * NULL control delegates raw before output normalization. Controlled mode
+ * clears the exclusive, writable, nonoverlapping output slot before the first
+ * admission; it must contain no live owned result. This single fixed bootstrap
+ * store is retrospective. Source/owner lifetime and pool/arena no-reset are
+ * caller obligations; original readers protect metadata and row lanes.
+ * Order/duplicates are preserved; timestamps and signed multiplicities are
+ * deliberately omitted, matching raw physical-row projection. Source scratch
+ * is untouched. Wide rows use a reusable gather S plus independent batch
+ * capture S, so their peak budget can exceed raw copy. Constructor denial is
+ * ENOSPC; gather/row denial is ENOMEM. Every failed controlled call leaves
+ * output NULL and retires its private destination and original authority. */
+WL_MUST_CHECK int
+wl_columnar_relation_copy_rows_controlled(const char *name,
+    const col_rel_t *src,
+    uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control);
 #ifdef WL_TEST_BDX_SEED
 int
 wl_columnar_eval_test_bdx_seed(col_rel_t *cidb,

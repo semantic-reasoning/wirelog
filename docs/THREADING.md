@@ -1639,7 +1639,7 @@ supply the ownership contract.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
-| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Paid original-attempt initial observation, never a source allocation lifetime pin |
+| `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled` | `gate->state` | `atomic_load_explicit` | acquire | Paid original-attempt schema-clone/copy observation; copy retains its original source pair through last gather, never an allocation lifetime pin |
 | `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | MSVC strong reader claim; owner marker precedes callback and stale cleanup uses the same original token |
 | `relation.c:wl_columnar_relation_reader_acquire_attempt_controlled#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Non-MSVC reader retry charged separately and guarded against a successor attempt |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | relaxed | Original-attempt paid observation; uniqueness alone publishes no payload |
