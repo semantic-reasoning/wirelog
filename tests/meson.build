@@ -6336,3 +6336,14 @@ test_evaluation_work_exe = executable(
 )
 test('evaluation_work', test_evaluation_work_exe,
      suite: ['unit'], timeout: 60)
+
+# #1821: numeric expression preparation, execution and governed disposal.
+test_evaluation_numeric_exe = executable(
+  'test_evaluation_numeric',
+  files('test_evaluation_numeric.c'),
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_numeric', test_evaluation_numeric_exe, timeout: 60)
