@@ -1653,6 +1653,110 @@ join_denial_tests(void)
     assert(join_denial_run(32, hi, true) == ENOSPC);
 }
 
+/* The keyed, unary and diff probe loops refuse a second output growth the
+ * same way (#2154).  The right side is governed and the session is not, so
+ * the output and the operator's scratch are charged while arrangements and
+ * diff transactions are not, and nothing charged outlives a failed
+ * operator.  The inputs are built under a large budget, then the operator
+ * gets @headroom bytes above the reservation it starts from.  Each of the
+ * first @matches of 512 left rows pairs with one of eight right rows; the
+ * rest match none. */
+static int
+join_case_denial_run(join_case_t which, uint32_t matches, uint64_t headroom,
+    bool check_cleanup)
+{
+    static const char *const names[] = { "k", "v" };
+    static const char *const keys[] = { "k" };
+    bool unary = which == JOIN_UNARY;
+    uint32_t right_cols = unary ? 1u : 2u;
+    wl_col_session_t *sess = join_session();
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(1u << 24);
+    /* The ephemeral diff probe runs when the right delta is selected. */
+    const char *right_names[] = { "right", "$d$right" };
+    uint32_t nright = which == JOIN_DIFF_EPHEMERAL ? 2u : 1u;
+    for (uint32_t n = 0; n < nright; n++) {
+        col_rel_t *right = NULL;
+        assert(wl_columnar_relation_new_auto_governed(right_names[n],
+            right_cols, COL_REL_INIT_CAP, false, ref, &right) == 0);
+        assert(col_rel_set_schema(right, right_cols, names) == 0);
+        for (uint32_t i = 0; i < 8u; i++) {
+            int64_t row[2] = { (int64_t)i, 1000 + (int64_t)i };
+            assert(col_rel_append_row(right, row) == 0);
+        }
+        assert(session_add_rel(sess, right) == 0);
+    }
+    col_rel_t *left = join_rel("left", 2);
+    for (uint32_t i = 0; i < 512u; i++) {
+        int64_t row[2] = { i < matches ? (int64_t)(i % 8u)
+                           : 100 + (int64_t)i, (int64_t)i };
+        assert(col_rel_append_row(left, row) == 0);
+    }
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = keys;
+    op.right_keys = keys;
+    op.delta_mode = which == JOIN_DIFF_EPHEMERAL
+        ? WL_DELTA_FORCE_DELTA : WL_DELTA_FORCE_FULL;
+    eval_stack_t stack;
+    eval_stack_init(&stack);
+    assert(eval_stack_push(&stack, left, true) == 0);
+    uint64_t baseline = governor_reserved(ref);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            ref)->usable_bytes, baseline + headroom, memory_order_release);
+    bool diff = which == JOIN_DIFF_PERSISTENT || which == JOIN_DIFF_EPHEMERAL;
+    int rc = diff ? wl_columnar_join_diff_op(&op, &stack, sess)
+        : wl_columnar_join_op(&op, &stack, sess);
+    if (rc == 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        assert(result.rel->nrows == matches && !sess->memory_budget_denied);
+        /* The loop this case exists for is the one that ran. */
+        if (which == JOIN_ARRANGEMENT)
+            assert(sess->arr_count > 0);
+        if (which == JOIN_UNARY)
+            assert(sess->arr_count == 0);
+        if (which == JOIN_DIFF_PERSISTENT)
+            assert(sess->diff_arr_count > 0);
+        if (which == JOIN_DIFF_EPHEMERAL)
+            assert(sess->diff_arr_count == 0);
+        if (result.owned)
+            assert(col_rel_destroy_checked(result.rel) == 0);
+    } else if (check_cleanup) {
+        assert(rc == ENOSPC && sess->memory_budget_denied
+            && stack.top == 0);
+        assert(governor_reserved(ref) == baseline);
+    }
+    join_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(ref);
+    return rc;
+}
+
+static void
+join_case_denial_tests(void)
+{
+    static const join_case_t cases[] = {
+        JOIN_UNARY, JOIN_ARRANGEMENT, JOIN_DIFF_PERSISTENT,
+        JOIN_DIFF_EPHEMERAL
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        /* Smallest headroom at which 128 output rows (one growth past the
+         * 64-row floor) fit; 256 rows need a second growth. */
+        uint64_t lo = 0, hi = 1u << 22;
+        assert(join_case_denial_run(cases[k], 128, hi, false) == 0);
+        while (hi - lo > 1) {
+            uint64_t mid = lo + (hi - lo) / 2u;
+            if (budget_fits(join_case_denial_run(cases[k], 128, mid, false),
+                ENOSPC))
+                hi = mid;
+            else
+                lo = mid;
+        }
+        assert(join_case_denial_run(cases[k], 256, hi, true) == ENOSPC);
+    }
+}
+
 /* #2072: antijoin and the serial semijoin probe append their output under
  * batch leases, one per storage epoch.  left(k, v) has 4096 rows over 128
  * keys and right(k) holds the even keys, so each operator keeps half the
@@ -2870,6 +2974,7 @@ main(void)
     semi_batch_tests();
     semi_denial_tests();
     filter_denial_tests();
+    join_case_denial_tests();
     join_denial_tests();
     map_op_batch_tests();
     map_error_tests();
