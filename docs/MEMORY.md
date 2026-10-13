@@ -1650,3 +1650,56 @@ freed before rollback refunds credit. Successful physical retirement likewise
 precedes downsizing original credit. The independent17-byte peer reservation
 remains untouched throughout composition tests. This private foundation does
 not activate operators or expose enforceable public configuration.
+
+### Caller-attempt-bound governor admission
+
+The private `wl_columnar_memory_governor_*_attempt_controlled` reserve, growth
+and commit APIs require a live control and the caller's original nonzero
+attempt ID. NULL control returns EINVAL; legacy APIs retain their raw delegation
+and tariffs. The host serializes control lifecycle. The original token and
+nonoverlapping output remain exclusively caller-owned. Token, control and
+governor storage remain live through cleanup, with stable governor configuration.
+Independent peer tokens may share the governor and concurrently change its
+aggregate reserved total; exclusive governor ownership is not required. A hook
+may change the attempt or independent peer resources; it cannot free or forge
+the original token or allocate its incoming physical storage.
+
+Entry correlation is an explicit bounded read-only exception: valid entry
+executes12 logical slots included retrospectively in the first admission;
+invalid/stale entry executes at most13, with consumed0. First-admission refusal
+can also execute this observation without debit. No mutation, allocation or
+pointer walk precedes admission; this is not prior prepayment.
+
+| Region | Conservative admitted slots | Source obligations |
+|---|---:|---|
+| Entry | 74 | Bootstrap, typed shape checks, complete original snapshot, phase and work checkpoints |
+| Claim | 54 | Original strong state CAS, claimed marker, preparation; includes six-slot caller continuation when first round admission refuses |
+| Aggregate round | 84 | Current total/limit reads, strong CAS, credited marker, guards, work checkpoint, caller ADMITTED checkpoint; failed round pays next guard/loopback and refused-next-admission continuation |
+| Publish | 29 | Reversible reserve/growth publication or finite four-slot commit terminal |
+
+Successful reserve/growth admits157+84*n slots for n aggregate CAS attempts
+(first success241); commit admits157. Limits73/127/211/240 retain respectively
+0/74/128/212; commit156 retains128. Refused charges debit nothing. These are
+source ceilings, not executed instruction counts. Hook work arguments label
+regions and must not be added as consumed work. Expanded source equations live
+beside the constants. The conservative adjacent-region no-poll ceiling168 is
+below quantum256, including bootstrap from function entry. Host callbacks,
+synchronous runtime/admission internals and mandatory cleanup are excluded;
+this does not bound return time or cleanup retries.
+
+Every individual callback validates saved ID before another callback, poll,
+claim or positive admission. Staleness stops immediately without charging the
+successor. Cancellation/accounting injected at aggregate before/after-CAS hooks
+can proceed to the paid work checkpoint; unchanged ID alone does not poll them.
+Completed typed INVALID/DENIED/OVERFLOW outcomes beat negative stops; positive
+accounting or stale errors take precedence, and outputs are authoritative only
+with rc0. Actual commit has no callback or negative poll after COMMITTED.
+
+Snapshots precede the token claim; owned-credit markers precede after-CAS hooks.
+Mandatory unwind restores only the original token and subtracts only its own
+credit from current totals. Independent peer changes survive, and impossible
+refund aborts. Incoming physical allocation follows successful return, and
+physical free always precedes later rollback/release. Tests cover literal
+boundaries, genuine RELEASED reuse, raw parity including NULL owners, all seams,
+typed verdicts, real independent peer allocations and actual aggregate CAS
+failures. This opt-in foundation does not activate engine operators.

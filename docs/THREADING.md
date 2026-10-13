@@ -408,7 +408,7 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_governor_ref_is_sole` | `references` | `atomic_load_explicit` | `acquire` | Observe that only the intern table still holds the governor before rebinding it |
 | `memory_governor.c:wl_columnar_memory_governor_strong` | `state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
 | `memory_governor.c:wl_columnar_memory_governor_strong#2` | `state` | `atomic_compare_exchange_strong_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
-| `memory_governor.c:wl_columnar_memory_governor_snapshot` | `token->owner_bits` | `atomic_load_explicit` | `relaxed` | Exclusive claimed token snapshots owner bits; no new cross-thread publication is acquired. |
+| `memory_governor.c:wl_columnar_memory_governor_snapshot` | `token->owner_bits` | `atomic_load_explicit` | `relaxed` | Exclusively caller-owned original token snapshots owner bits, including before a claim; no new cross-thread publication is acquired. |
 | `memory_governor.c:wl_columnar_memory_governor_restore` | `token->owner_bits` | `atomic_store_explicit` | `relaxed` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
 | `memory_governor.c:wl_columnar_memory_governor_restore#2` | `token->state` | `atomic_store_explicit` | `release` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
 | `memory_governor.c:wl_columnar_memory_governor_admit` | `governor->reserved_bytes` | `atomic_load_explicit` | `relaxed` | Read current aggregate admission and usable limit; actual strong CAS, not these relaxed observations, arbitrates reservation. |
@@ -1508,8 +1508,8 @@ reused; four new conditional read/publication sites extend the inventory.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read` | token state/owner | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked observation under original exclusive token authority |
-| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read#2` | token state/owner | `atomic_load_explicit` | acquire | C11 observation validates saved scalar authority before terminal stores |
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read` | token state/owner or shared governor reserved/usable counters | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked observation of original token authority or current shared admission values; separate reads do not form a coherent multi-counter snapshot |
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read#2` | token state/owner or shared governor reserved/usable counters | `atomic_load_explicit` | acquire | C11 observation validates saved token authority or reads current shared admission values; the later CAS linearizes aggregate admission, not these separate reads |
 | `memory_governor.c:wl_columnar_memory_governor_growth_commit_cancel` | token state | `atomic_exchange_explicit` | release | Restore only REPLACING after validating original owning cleanup |
 | `memory_governor.c:wl_columnar_memory_governor_growth_commit_finish` | token state | `atomic_exchange_explicit` | release | Publish finite COMMITTED state after saved bytes/kind updates |
 
@@ -1542,3 +1542,32 @@ MSVC uses Interlocked observation/release; C11 retains acquire-load/release-stor
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_strong#2` | ledger writer gate | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | One admitted nonspurious C11 acquisition attempt |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release` | ledger writer gate | `atomic_exchange_explicit` | release | MSVC publishes finite current-counter updates before consuming original record |
 | `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_release#2` | ledger writer gate | `atomic_store_explicit` | release | C11 publishes finite current-counter updates before consuming original record |
+
+### Caller-attempt-bound governor admission
+
+The additive private admission APIs correlate the caller ID before the first
+charge and individually after each hook. Atomic observation is not a lifecycle
+pin: the host serializes control lifecycle and retains all storage through
+cleanup. The original token and output are exclusively caller-owned; the live
+governor permits independent peer reservations and concurrent aggregate updates,
+with its configuration stable. Snapshots precede claims; own-credit markers
+precede after-CAS callbacks.
+Original-only restoration uses release exchanges on C11 and MSVC, never a saved
+aggregate total. Cleanup has no callback, successor poll or positive admission;
+its mandatory own-credit CAS may retry. Legacy paths and tariffs are unchanged.
+The bounded read-only bootstrap is retrospective accounting, with at most13
+uncharged slots on invalid/stale entry. See MEMORY.md for admitted region costs
+and the conservative168-slot forward no-poll ceiling.
+
+| Site anchor | Object | Operation | Ordering | Purpose |
+|---|---|---|---|---|
+| `memory_governor.c:wl_columnar_memory_governor_attempt_restore` | original owner | `atomic_exchange_explicit` | release | Restore original ownership during mandatory cleanup on both compilers |
+| `memory_governor.c:wl_columnar_memory_governor_attempt_restore#2` | original token state | `atomic_exchange_explicit` | release | Publish complete restored payload after refunding only owned credit |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Clear owner under original claim before reversible reservation publication |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish completed typed refusal without incoming credit |
+| `memory_governor.c:wl_columnar_memory_governor_reserve_checked_attempt_controlled#3` | token state | `atomic_exchange_explicit` | release | Publish reversible RESERVED state before final guarded checkpoint |
+| `memory_governor.c:wl_columnar_memory_governor_begin_growth_attempt_controlled` | token state | `atomic_exchange_explicit` | release | Publish reversible REPLACING after recording added credit and growth kind |
+| `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
+| `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
+
+The complete current atomic-source inventory contains302 call sites.
