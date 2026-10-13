@@ -2947,9 +2947,65 @@ snapshot_insert_copy_tests(void)
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+static void *
+attempt_single_wrong_thread_finish(void *arg)
+{
+    assert(wl_columnar_relation_mutation_single_finish_controlled(arg, 0,
+        NULL) == EINVAL);
+    return NULL;
+}
+
+static void
+attempt_single_authority_tests(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = NULL;
+    assert(wl_evaluation_control_create(0, &control) == 0);
+    assert(wl_evaluation_control_attach(control, &owner) == 0);
+    assert(wl_evaluation_control_begin(control, &owner) == 0);
+    col_rel_t relation;
+    root_init(&relation, 991);
+    wl_columnar_relation_mutation_single_t single = {0};
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    assert(wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+            &relation, &single, control, id) == 0);
+    assert(single.set.descriptors_acquired == 1
+        && single.set.owners_acquired == 1 && single.set.owner_count == 1);
+    assert(col_rel_mutation_lease_validate(&single.lease, &relation) == 0);
+    wl_columnar_relation_mutation_single_t copy = single;
+    assert(wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+            &relation, &single, control, id) == EINVAL);
+    assert(wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+            &relation, &copy, control, id) == EINVAL);
+    assert(col_rel_mutation_lease_validate(&single.lease, &relation) == 0);
+    assert(wl_columnar_relation_mutation_single_finish_controlled(&copy, 0,
+        control) == EINVAL);
+    wl_thread_t thread;
+    assert(wl_thread_create(&thread, attempt_single_wrong_thread_finish,
+        &single) == 0);
+    assert(wl_thread_join(&thread) == 0);
+    assert(col_rel_mutation_lease_validate(&single.lease, &relation) == 0);
+    /* Cleanup remains valid after the original attempt ends and a new one
+     * starts; it must not observe or debit that successor. */
+    assert(wl_evaluation_control_finish(control, &owner, 0, 0) == 0);
+    assert(wl_evaluation_control_reset(control) == 0);
+    assert(wl_evaluation_control_begin(control, &owner) == 0);
+    assert(wl_evaluation_control_active_attempt_id(control) != id);
+    assert(wl_columnar_relation_mutation_single_finish_controlled(&single,
+        0, control) == 0);
+    assert_open(&relation);
+    assert(wl_evaluation_control_finish(control, &owner, 0, 0) == 0);
+    wl_evaluation_control_report_t report;
+    assert(wl_evaluation_control_report(control, &report) == 0);
+    assert(report.consumed == 0);
+    assert(wl_evaluation_control_detach(control, &owner) == 0);
+    wl_evaluation_control_release(control);
+}
+
 int
 main(void)
 {
+    attempt_single_authority_tests();
     lease_tests();
     writer_token_liveness_tests();
     overlapping_storage_tests();
