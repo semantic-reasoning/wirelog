@@ -1750,6 +1750,481 @@ fail:
     return rc;
 }
 
+/* Caller-attempt numeric owners deliberately have a separate representation. */
+struct wl_columnar_expr_attempt_numeric {
+    expr_instr_t *instrs;
+    uint32_t ninstr;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    bool credit_held;
+    bool committed;
+    wl_columnar_memory_reservation_t token;
+};
+
+/* Logical source funding, including ordinary outward refusal paths.
+ * G9 saved-ID guard; C13 guarded debit prefix; T26 tail/T29 with caller.
+ * Reservation init10; original move40; fixed ref retain4/get3.
+ * New free69 rounded72: snapshots, held/ref decisions, init/move and returns;
+ * original physical/credit/ref retirement and instrumentation are excluded,
+ * not the new destructor as a whole. F96 includes free72, local admission/ref
+ * decisions, unsupported branch and its guarded zero-poll/return. F100 adds
+ * compiler result/branch/goto; F104 adds decoder leaf result/branch/return.
+ * B24 byte entry includes bounds/subtraction/loop init and next C13 prefix.
+ * S32 bounds decoder last-byte length/prefix/constant/dispatch continuation;
+ * mutually exclusive fixed memcpy2/8 alternatives, no hidden traversal.
+ * Complete funding envelopes (source slots, not instructions or time):
+ * ENTRY86; DECODE3+S32+B24+C13+F104=176;
+ * BYTE3+T29+loop3+S32+B24+F104=195;
+ * DIGIT9+T29+invalid3+loop3+C13+F104=161;
+ * PASS T29+C13+child4+F104=150;
+ * SETUP locals5+init10+math23+pin7+T29+route8+C13+F96=191;
+ * RESERVE T29+child12+get3+route3+status4+marker1+verdict8+T29+
+ * route8+C13+F100=210; ALLOC2+branch2+fields5+init10+verdict3+
+ * T29+route8+nextsetup5+C13+F100=177;
+ * STORE3+T29+loop3+C13+F100=148;
+ * MOVE branch2+move40+failure2+markers4+T29+held2+C13+F100=192;
+ * COMMIT T29+child12+route3+check6+C13+F100=163;
+ * EXTERNAL T29+F100+outputs2+return1=132 (alternative outcomes).
+ * Ancestor funding pays a child-return suffix once, never each child loop or
+ * a refused debit. Children retain their own admitted loop work. AB-G internal
+ * 168 is separated by real control polls from returned-stage84; reserve
+ * continuation84+status16+tail-prefix12+F100=212. Commit final4+route6+C13+
+ * F100=123; other returned errors84+4+F100=188. Conservative224 dominates all
+ * these actual forward intervals; no blanket168+whole-caller sum. Root output
+ * initialization/initial guard/refused-first-debit are bounded bootstrap
+ * exceptions and may run with consumed0. Mandatory disposal has no control
+ * poll and is not a promised latency bound. */
+enum {
+    WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK = 128,
+    WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_BYTE_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_DIGIT_WORK = 192,
+    WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK = 192,
+    WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_RESERVE_CALL_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK = 192,
+    WL_COLUMNAR_EXPR_ATTEMPT_MOVE_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_COMMIT_CALL_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_EXTERNAL_WORK = 160,
+};
+
+typedef char wl_columnar_expr_attempt_all_tariffs_fit_t[
+        (WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_BYTE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_DIGIT_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_RESERVE_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_MOVE_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_COMMIT_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_EXTERNAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+typedef char wl_columnar_expr_attempt_full_regions_funded_t[
+        (UINT64_C(86) <= WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK
+        && UINT64_C(176) <= WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK
+        && UINT64_C(195) <= WL_COLUMNAR_EXPR_ATTEMPT_BYTE_WORK
+        && UINT64_C(161) <= WL_COLUMNAR_EXPR_ATTEMPT_DIGIT_WORK
+        && UINT64_C(150) <= WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK
+        && UINT64_C(191) <= WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK
+        && UINT64_C(210) <= WL_COLUMNAR_EXPR_ATTEMPT_RESERVE_CALL_WORK
+        && UINT64_C(177) <= WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK
+        && UINT64_C(148) <= WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK
+        && UINT64_C(192) <= WL_COLUMNAR_EXPR_ATTEMPT_MOVE_WORK
+        && UINT64_C(163) <= WL_COLUMNAR_EXPR_ATTEMPT_COMMIT_CALL_WORK
+        && UINT64_C(132) <= WL_COLUMNAR_EXPR_ATTEMPT_EXTERNAL_WORK) ? 1 : -1];
+
+typedef char wl_columnar_expr_attempt_contiguous_fits_t[
+        (UINT64_C(224) <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+static int
+wl_columnar_expr_attempt_guard(wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    return !control || !attempt_id
+           || wl_evaluation_control_active_attempt_id(control) != attempt_id
+        ? EINVAL : 0;
+}
+
+static int
+wl_columnar_expr_attempt_charge(wl_evaluation_control_t *control,
+    uint64_t attempt_id, uint64_t work)
+{
+    int rc = wl_columnar_expr_attempt_guard(control, attempt_id);
+    return rc ? rc : wl_evaluation_control_charge(control, work);
+}
+
+static int
+wl_columnar_expr_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t attempt_id, unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_expr_attempt_guard(control, attempt_id);
+    if (rc)
+        return rc;
+    wl_columnar_expr_checkpoint(control, phase, progress, false);
+    return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
+}
+
+static int
+wl_columnar_expr_attempt_bytes(const uint8_t *buf, uint32_t size,
+    uint32_t *pos, uint8_t *out, uint32_t count, unsigned pass,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (*pos > size || count > size - *pos)
+        return ENOTSUP;
+    for (uint32_t i = 0; i < count; i++) {
+        int rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_BYTE_WORK);
+        if (rc)
+            return rc;
+        out[i] = buf[(*pos)++];
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, pass, *pos);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
+    uint32_t *pos,
+    expr_instr_t *out, unsigned pass, wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    int rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK);
+    if (rc)
+        return rc;
+    out->op = 0; out->iarg = 0; out->larg = 0;
+    rc = wl_columnar_expr_attempt_bytes(buf, size, pos, &out->op, 1, pass,
+            control, attempt_id);
+    if (rc)
+        return rc;
+    switch ((wl_plan_expr_tag_t)out->op) {
+    case WL_PLAN_EXPR_VAR:
+    case WL_PLAN_EXPR_VAR_FLOAT: {
+        uint8_t encoded[2], name[12];
+        uint16_t length;
+        rc = wl_columnar_expr_attempt_bytes(buf, size, pos, encoded, 2, pass,
+                control, attempt_id);
+        if (rc)
+            return rc;
+        memcpy(&length, encoded, sizeof(length));
+        if (length < 4 || length > sizeof(name))
+            return ENOTSUP;
+        rc = wl_columnar_expr_attempt_bytes(buf, size, pos, name, length, pass,
+                control, attempt_id);
+        if (rc)
+            return rc;
+        if (name[0] != 'c' || name[1] != 'o' || name[2] != 'l')
+            return ENOTSUP;
+        /* Exactly1..9 digits, matching the checked raw VAR parser. */
+        for (uint32_t d = 3; d < length; d++) {
+            rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_EXPR_ATTEMPT_DIGIT_WORK);
+            if (rc)
+                return rc;
+            bool digit = name[d] >= '0' && name[d] <= '9';
+            if (digit)
+                out->iarg = out->iarg * 10u + (uint32_t)(name[d] - '0');
+            rc = wl_columnar_expr_attempt_tail(control, attempt_id, 19, d);
+            if (rc)
+                return rc;
+            if (!digit)
+                return ENOTSUP;
+        }
+        break;
+    }
+    case WL_PLAN_EXPR_CONST_INT:
+    case WL_PLAN_EXPR_CONST_FLOAT: {
+        uint8_t encoded[8];
+        rc = wl_columnar_expr_attempt_bytes(buf, size, pos, encoded, 8, pass,
+                control, attempt_id);
+        if (rc)
+            return rc;
+        memcpy(&out->larg, encoded, sizeof(out->larg));
+        break;
+    }
+    case WL_PLAN_EXPR_BOOL: {
+        uint8_t value;
+        rc = wl_columnar_expr_attempt_bytes(buf, size, pos, &value, 1, pass,
+                control, attempt_id);
+        if (rc)
+            return rc;
+        out->larg = value ? 1 : 0;
+        break;
+    }
+    case WL_PLAN_EXPR_ARITH_ADD: case WL_PLAN_EXPR_ARITH_SUB:
+    case WL_PLAN_EXPR_ARITH_MUL: case WL_PLAN_EXPR_ARITH_DIV:
+    case WL_PLAN_EXPR_ARITH_MOD: case WL_PLAN_EXPR_ARITH_SHL:
+    case WL_PLAN_EXPR_ARITH_SHR: case WL_PLAN_EXPR_ARITH_BAND:
+    case WL_PLAN_EXPR_ARITH_BOR: case WL_PLAN_EXPR_ARITH_BXOR:
+    case WL_PLAN_EXPR_ARITH_BNOT:
+    case WL_PLAN_EXPR_CMP_EQ: case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT: case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GT: case WL_PLAN_EXPR_CMP_GTE:
+    case WL_PLAN_EXPR_ARITH_FLOAT_ADD: case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+    case WL_PLAN_EXPR_ARITH_FLOAT_MUL: case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+    case WL_PLAN_EXPR_CMP_FLOAT_EQ: case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_LT: case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_GT: case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+    case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
+    case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
+        break;
+    default:
+        return ENOTSUP;
+    }
+    return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
+}
+
+void
+wl_columnar_expr_attempt_numeric_free(wl_columnar_expr_attempt_numeric_t *owner)
+{
+    if (!owner)
+        return;
+    bool held = owner->credit_held;
+    bool committed = owner->committed;
+    wl_columnar_memory_governor_ref_t *saved_ref = owner->governor_ref;
+    expr_instr_t *instructions = owner->instrs;
+    wl_columnar_memory_reservation_t retirement;
+    if (held) {
+        wl_columnar_memory_reservation_init(&retirement);
+        if (!wl_columnar_memory_reservation_move(&retirement, &owner->token))
+            abort();
+    }
+    free(instructions);
+    free(owner);
+    wl_columnar_expr_checkpoint(NULL, 8, 0, false);
+    if (held) {
+        bool retired = committed ? wl_columnar_memory_release(&retirement)
+            : wl_columnar_memory_rollback(&retirement);
+        if (!retired)
+            abort();
+    }
+    if (saved_ref)
+        wl_columnar_memory_governor_ref_release(saved_ref);
+}
+
+int
+wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_attempt_numeric_t **out, bool *supported,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!out || !supported)
+        return EINVAL;
+    *out = NULL;
+    *supported = false;
+    int rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    int verdict = !buf && size ? EINVAL : 0;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 10, size);
+    if (rc > 0)
+        return rc;
+    if (verdict || rc || !size)
+        return verdict ? verdict : rc;
+
+    uint32_t count = 0, pos = 0;
+    expr_instr_t instruction;
+    while (pos < size) {
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK);
+        if (rc)
+            return rc;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 11, count);
+        if (rc)
+            return rc;
+        rc = wl_columnar_expr_attempt_decode(buf, size, &pos, &instruction,
+                1, control, attempt_id);
+        if (rc) {
+            if (rc != ENOTSUP)
+                return rc;
+            rc = wl_columnar_expr_attempt_charge(control, attempt_id, 0);
+            return rc;
+        }
+        count++;
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK);
+    if (rc)
+        return rc;
+    uint64_t instr_bytes = 0, total = 0;
+    wl_columnar_memory_reservation_t admission;
+    wl_columnar_memory_reservation_init(&admission);
+    wl_columnar_expr_attempt_numeric_t *owner = NULL;
+    wl_columnar_memory_governor_ref_t *retained_ref = NULL;
+    bool admitted = false;
+    verdict = !wl_columnar_memory_size_mul(count, sizeof(expr_instr_t),
+            &instr_bytes)
+        || !wl_columnar_memory_size_add(
+        sizeof(wl_columnar_expr_attempt_numeric_t), instr_bytes,
+        &total) || total > SIZE_MAX ? EOVERFLOW : 0;
+    if (governor) {
+        wl_columnar_memory_governor_ref_retain(governor);
+        retained_ref = governor;
+    }
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 12, count);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            goto fail;
+    }
+    if (verdict) {
+        rc = verdict;
+        goto fail;
+    }
+    if (governor) {
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_RESERVE_CALL_WORK);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 13, count);
+        if (rc)
+            goto fail;
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(retained_ref), total,
+            &admission, &status, control, attempt_id);
+        if (rc)
+            goto fail;
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            admitted = true;
+        verdict = admitted ? 0
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+            ? EOVERFLOW : EINVAL;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 4, count);
+        if (rc > 0 || !verdict) {
+            if (rc)
+                goto fail;
+        }
+        if (verdict) {
+            rc = verdict;
+            goto fail;
+        }
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK);
+    if (rc)
+        goto fail;
+    owner = wl_columnar_expr_allocate(sizeof(*owner));
+    if (owner) {
+        owner->instrs = NULL;
+        owner->ninstr = count;
+        owner->governor_ref = NULL;
+        owner->credit_held = false;
+        owner->committed = false;
+        wl_columnar_memory_reservation_init(&owner->token);
+    }
+    verdict = owner ? 0 : ENOMEM;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 14, count);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            goto fail;
+    }
+    if (verdict) {
+        rc = verdict;
+        goto fail;
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK);
+    if (rc)
+        goto fail;
+    owner->instrs = wl_columnar_expr_allocate((size_t)instr_bytes);
+    verdict = owner->instrs ? 0 : ENOMEM;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 15, count);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            goto fail;
+    }
+    if (verdict) {
+        rc = verdict;
+        goto fail;
+    }
+    pos = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 16, i);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_attempt_decode(buf, size, &pos, &instruction,
+                2, control, attempt_id);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK);
+        if (rc)
+            goto fail;
+        owner->instrs[i].op = instruction.op;
+        owner->instrs[i].iarg = instruction.iarg;
+        owner->instrs[i].larg = instruction.larg;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 17, i);
+        if (rc)
+            goto fail;
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_MOVE_WORK);
+    if (rc)
+        goto fail;
+    if (admitted) {
+        if (!wl_columnar_memory_reservation_move(&owner->token, &admission))
+            abort();
+        owner->credit_held = true;
+        admitted = false;
+        owner->governor_ref = retained_ref;
+        retained_ref = NULL;
+    }
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 5, count);
+    if (rc)
+        goto fail;
+    if (owner->credit_held) {
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_COMMIT_CALL_WORK);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_attempt_tail(control, attempt_id, 18, count);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &owner->token, owner, &owner->committed, control, attempt_id);
+        if (rc)
+            goto fail;
+        if (!owner->committed) {
+            rc = EINVAL;
+            goto fail;
+        }
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_EXTERNAL_WORK);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 6, count);
+    if (rc)
+        goto fail;
+    *supported = true;
+    *out = owner;
+    return 0;
+fail:
+    wl_columnar_expr_attempt_numeric_free(owner);
+    if (admitted && !wl_columnar_memory_rollback(&admission))
+        abort();
+    if (retained_ref)
+        wl_columnar_memory_governor_ref_release(retained_ref);
+    if (rc == ENOTSUP)
+        return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
+    return rc;
+}
+
 static int
 wl_columnar_expr_numeric_step(expr_stack_t *stack,
     const expr_instr_t *in, const int64_t *row, uint32_t ncols,

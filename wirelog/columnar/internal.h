@@ -4074,10 +4074,37 @@ int wl_columnar_expr_compile_controlled(const uint8_t *, uint32_t,
 int wl_columnar_expr_eval_controlled(const wl_columnar_expr_controlled_t *,
     const int64_t *, uint32_t, int64_t *, bool *, wl_evaluation_control_t *);
 void wl_columnar_expr_controlled_free(wl_columnar_expr_controlled_t *);
+
+/* Caller-attempt numeric owner: distinct from legacy representations. The
+ * immutable bytecode and output slots remain live/nonoverlapping through the
+ * call; an output slot must not hold a live owned result (free it first).
+ * Caller serializes control lifecycle and keeps the shared governor alive
+ * with stable configuration through admission; owner pins its own reference
+ * thereafter. Original token/owner use is exclusive; immutable evaluation
+ * may borrow only while destruction is externally excluded.
+ * NonNULL control and a nonzero current supplied ID are required;
+ * missing/inactive/stale IDs return EINVAL without successor callbacks/debit.
+ * Compile initializes out=NULL/supported=false as fixed bootstrap, then
+ * returns supported=false for nonnumeric/malformed programs without fallback.
+ * Genuine NULL governor is supported; a governed owner pins its own reference.
+ * Owner and its embedded token are noncopyable, externally synchronized for
+ * destruction, and may survive attempt finish/reset. Free is mandatory and
+ * retires physical storage before its own credit and saved reference.
+ * This compiler-only unit declares no new evaluator until its separate atom. */
+typedef struct wl_columnar_expr_attempt_numeric
+    wl_columnar_expr_attempt_numeric_t;
+int wl_columnar_expr_compile_attempt_controlled(const uint8_t *, uint32_t,
+    wl_columnar_memory_governor_ref_t *, wl_columnar_expr_attempt_numeric_t **,
+    bool *, wl_evaluation_control_t *, uint64_t);
+void wl_columnar_expr_attempt_numeric_free(
+    wl_columnar_expr_attempt_numeric_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 /* phases:1/2 consumed byte in first/second pass;3 evaluated instruction;
  * 4 reserved;5 moved;6 committed before publication;7 evaluation publication;
  * 8 physical storage freed but credit still held (mandatory cleanup, NULL ctl).
+ * Attempt compiler additionally uses10 entry,11 first-pass caller,12 setup,
+ * 13 reserve caller,14/15 allocations,16 second-pass caller,17 store,
+ * 18 commit caller,19 digit. Legacy phase numbers remain unchanged.
  * Progress is byte offset/instruction count; failed is pending semantic result. */
 extern void (*wl_columnar_expr_test_checkpoint)(wl_evaluation_control_t *,
     unsigned, uint64_t, bool);
