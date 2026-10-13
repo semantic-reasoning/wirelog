@@ -133,6 +133,75 @@ limits_and_errors(void)
     wl_evaluation_control_release(c);
 }
 
+static void
+active_identity(void)
+{
+    int owner, other;
+    wl_evaluation_control_t *c;
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_active_attempt_id(NULL) == 0);
+    CHECK(wl_evaluation_control_create(7, &c) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 0);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, NULL, 10) == EINVAL);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &owner, 10) == EINVAL);
+    CHECK(wl_evaluation_control_attach(c, &owner) == 0);
+    CHECK(wl_evaluation_control_begin(c, &other) == EINVAL);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 1);
+    CHECK(wl_evaluation_control_report(c, &report) == ENOENT);
+    CHECK(wl_evaluation_control_begin(c, &owner) == EBUSY);
+    CHECK(wl_evaluation_control_reset(c) == EBUSY);
+    CHECK(wl_evaluation_control_configure(c, 10) == EBUSY);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &owner, 10) == EBUSY);
+    CHECK(wl_evaluation_control_finish(c, &other, 0, 0) == EINVAL);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 1);
+    CHECK(wl_evaluation_control_finish(c, &owner, EIO, 0) == EIO);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 2);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == 1 && report.result == EIO);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &other,
+        UINT64_MAX) == EINVAL);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &owner, 1) == EINVAL);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 3);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &owner,
+        (uint64_t)INT64_MAX - 1) == 0);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == 3 && report.limit == 7 && report.consumed == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == (uint64_t)INT64_MAX);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c)
+        == (uint64_t)INT64_MAX + 1);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_test_seed_attempt_id(c, &owner,
+        UINT64_MAX - 1) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == UINT64_MAX);
+    CHECK(wl_evaluation_control_begin(c, &owner) == EBUSY);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == UINT64_MAX);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 0);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == UINT64_MAX && report.limit == 7);
+    CHECK(wl_evaluation_control_begin(c, &owner) == EOVERFLOW);
+    CHECK(wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_evaluation_control_configure(c, 20) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == EOVERFLOW);
+    CHECK(wl_evaluation_control_active_attempt_id(c) == 0);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == UINT64_MAX && report.limit == 7);
+    CHECK(wl_evaluation_control_detach(c, &owner) == 0);
+    wl_evaluation_control_release(c);
+}
+
 typedef struct {
     wl_mutex_t mutex;
     wl_cond_t changed;
@@ -151,6 +220,7 @@ cancel_thread(void *opaque)
     while (!ctx->go)
         wl_cond_wait(&ctx->changed, &ctx->mutex);
     wl_mutex_unlock(&ctx->mutex);
+    CHECK(wl_evaluation_control_active_attempt_id(ctx->control) == 1);
     wl_evaluation_control_request_cancel(ctx->control);
     wl_evaluation_control_release(ctx->control);
     return NULL;
@@ -237,6 +307,7 @@ main(void)
 {
     boundaries();
     limits_and_errors();
+    active_identity();
     cross_thread_cancel();
     shared_allowance();
     puts("evaluation_control: OK");

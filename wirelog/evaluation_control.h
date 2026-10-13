@@ -73,6 +73,19 @@ void wl_evaluation_control_request_cancel(wl_evaluation_control_t *control);
 int wl_evaluation_control_begin(wl_evaluation_control_t *control,
     const void *owner);
 /*
+ * NULL/inactive returns 0; every nonzero uint64_t, including UINT64_MAX, is
+ * a valid active attempt ID. One atomic observation, no mutex or work charge.
+ * Caller holds a live reference. This does not pin an attempt: host lifecycle
+ * still requires external serialization and finish requires workers drained.
+ */
+uint64_t wl_evaluation_control_active_attempt_id(
+    const wl_evaluation_control_t *control);
+#ifdef WL_SESSION_TEST_HOOKS
+/* Inactive attached owner only; advance the generator without changing report. */
+int wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
+    const void *owner, uint64_t value);
+#endif
+/*
  * Charge before work; charge(0) is a poll. Denial does not consume work.
  * Cancellation precedes a new budget denial; a latched disposition persists.
  * Unlimited accounting overflow is a sticky EOVERFLOW execution error.

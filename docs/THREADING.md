@@ -1456,17 +1456,25 @@ pointer. Reset is quiescent relative to evaluation; a request racing reset is
 ordered by the atomic exchange, and hosts must coordinate reset if that request
 must not be cleared.
 
-The nine sites below extend the existing exact inventory. RMW reads use the
+The fourteen sites below extend the existing exact inventory. RMW reads use the
 existing MSVC Interlocked shim instead of assuming volatile loads publish state.
 Cancellation carries no payload, so relaxed ordering suffices. References use
 release decrement plus acquire RMW at last release before destruction. The
 reference count is capped at `UINT32_MAX` so the shim's signed arithmetic cannot
 overflow. Ownership/charge state publication is through the mutex, not the flag.
 
+The active attempt ID is separately release-published after successful begin
+and cleared at finish. Its acquire observation uses a C11 load or a neutral
+MSVC Interlocked RMW; the latter logically const read preserves all unsigned
+64-bit IDs. Zero alone means inactive. This observation neither pins the
+attempt nor changes the host serialization and worker-drain requirements.
+The test-only inactive generator seed does not publish an active ID.
+
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `evaluation_control.c:wl_evaluation_control_create` | references | `atomic_init` | initialization | Initialize before publication |
 | `evaluation_control.c:wl_evaluation_control_create#2` | cancelled | `atomic_init` | initialization | Initialize before publication |
+| `evaluation_control.c:wl_evaluation_control_create#3` | active_attempt_id | `atomic_init` | initialization | Initialize inactive identity before publication |
 | `evaluation_control.c:wl_evaluation_control_retain` | references | `atomic_fetch_add_explicit` | relaxed | Atomic read through RMW shim; caller already holds a live reference |
 | `evaluation_control.c:wl_evaluation_control_retain#2` | references | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Increment without wrapping or reviving freed storage |
 | `evaluation_control.c:wl_evaluation_control_release` | references | `atomic_fetch_sub_explicit` | release | Publish prior accesses before releasing the reference |
@@ -1474,6 +1482,10 @@ overflow. Ownership/charge state publication is through the mutex, not the flag.
 | `evaluation_control.c:wl_evaluation_control_reset` | cancelled | `atomic_exchange_explicit` | relaxed | Quiescent reset serialized with requests by atomic modification order |
 | `evaluation_control.c:wl_evaluation_control_request_cancel` | cancelled | `atomic_exchange_explicit` | relaxed | Sticky request, no payload or session lock dependency |
 | `evaluation_control.c:wl_evaluation_control_charge` | cancelled | `atomic_fetch_add_explicit` | relaxed | Poll using Interlocked-compatible atomic read; mutex protects resulting stop state |
+| `evaluation_control.c:wl_evaluation_control_begin` | active_attempt_id | `atomic_exchange_explicit` | release | Publish identity after complete active initialization |
+| `evaluation_control.c:wl_evaluation_control_active_attempt_id` | active_attempt_id | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked read preserves full unsigned identity |
+| `evaluation_control.c:wl_evaluation_control_active_attempt_id#2` | active_attempt_id | `atomic_load_explicit` | acquire | C11 observation of active identity without mutex or attempt pin |
+| `evaluation_control.c:wl_evaluation_control_finish` | active_attempt_id | `atomic_exchange_explicit` | release | Clear identity after completion and before unlocking |
 
 See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation-1819-engine-integration-pending)
 for prospective checkpoint coverage and the publication cutoff. The future
