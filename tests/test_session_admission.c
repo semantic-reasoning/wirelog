@@ -1,5 +1,9 @@
 /* Internal session operation admission and teardown concurrency regressions. */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "wirelog/session.h"
 #include "wirelog/thread.h"
 
@@ -7,6 +11,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 typedef enum {
     TEST_OP_INSERT,
@@ -25,6 +34,7 @@ typedef struct {
     test_operation_t blocked_operation;
     bool operation_entered;
     bool release_operation;
+    bool release_destroy;
     bool backend_destroy_entered;
     bool destroy_returned;
     unsigned calls[TEST_OP_COUNT];
@@ -200,6 +210,10 @@ destroy_thread(void *opaque)
 {
     thread_context_t *ctx = (thread_context_t *)opaque;
 
+    wl_mutex_lock(&ctx->sync->mutex);
+    while (!ctx->sync->release_destroy)
+        wl_cond_wait(&ctx->sync->changed, &ctx->sync->mutex);
+    wl_mutex_unlock(&ctx->sync->mutex);
     wl_session_destroy(ctx->session);
     wl_mutex_lock(&ctx->sync->mutex);
     ctx->sync->destroy_returned = true;
@@ -228,7 +242,54 @@ expect(bool condition, const char *message)
 }
 
 static int
-run_destroy_race(test_operation_t blocked_operation, bool controlled)
+admission_now_ms(uint64_t *now)
+{
+#if defined(_WIN32)
+    *now = (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return errno;
+    *now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+    return 0;
+}
+
+static int
+wait_for_admission_close(wl_session_t *session,
+    test_operation_t blocked_operation, bool controlled, uint64_t timeout_ms)
+{
+    uint64_t start, now;
+    int rc = admission_now_ms(&start);
+    if (rc != 0)
+        return rc;
+    for (;;) {
+        /* Only probe an operation that cannot enter the blocked backend call.
+         * Controlled step/snapshot can fail before checking admission. */
+        rc = controlled ? wl_session_remove(session, "r", NULL, 0, 0)
+            : blocked_operation == TEST_OP_SNAPSHOT
+            ? wl_session_step(session)
+            : wl_session_snapshot(session, NULL, NULL);
+        if (rc != 0)
+            return rc;
+        rc = admission_now_ms(&now);
+        if (rc != 0)
+            return rc;
+        if (now - start >= timeout_ms)
+            return ETIMEDOUT;
+#if defined(_WIN32)
+        Sleep(1);
+#else
+        const struct timespec pause = { 0, 1000000 };
+        if (nanosleep(&pause, NULL) != 0 && errno != EINTR)
+            return errno;
+#endif
+    }
+}
+
+static int
+run_destroy_race(test_operation_t blocked_operation, bool controlled,
+    bool force_timeout)
 {
     test_sync_t sync = { 0 };
     thread_context_t operation_ctx = { 0 };
@@ -255,14 +316,19 @@ run_destroy_race(test_operation_t blocked_operation, bool controlled)
         return 1;
     }
     sync.blocked_operation = blocked_operation;
+    sync.release_destroy = !force_timeout;
     creation_sync = &sync;
     wl_session_options_init(&options);
-    if (controlled && wl_evaluation_control_create(0, &control) != 0)
+    if (controlled && wl_evaluation_control_create(0, &control) != 0) {
+        wl_cond_destroy(&sync.changed);
+        wl_mutex_destroy(&sync.mutex);
         return 1;
+    }
     options.evaluation_control = control;
     if (wl_session_create_with_options(&fake_backend, NULL, 1, &options,
         &session) != 0
         || !session) {
+        wl_evaluation_control_release(control);
         wl_cond_destroy(&sync.changed);
         wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: fake session creation\n");
@@ -275,6 +341,7 @@ run_destroy_race(test_operation_t blocked_operation, bool controlled)
     if (wl_thread_create(&operation_tid, operation_thread,
         &operation_ctx) != 0) {
         wl_session_destroy(session);
+        wl_evaluation_control_release(control);
         wl_cond_destroy(&sync.changed);
         wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: operation thread creation\n");
@@ -295,24 +362,27 @@ run_destroy_race(test_operation_t blocked_operation, bool controlled)
         wl_mutex_unlock(&sync.mutex);
         wl_thread_join(&operation_tid);
         wl_session_destroy(session);
+        wl_evaluation_control_release(control);
         wl_cond_destroy(&sync.changed);
         wl_mutex_destroy(&sync.mutex);
         fprintf(stderr, "FAIL: destroy thread creation\n");
         return 1;
     }
 
-    /* The active backend call proves destroy cannot complete.  Probe the
-     * other quick operation until destroy has closed admission. */
-    for (unsigned attempt = 0; attempt < 1000000; attempt++) {
-        denied_rc = controlled ? wl_session_remove(session, "r", NULL, 0, 0)
-            : blocked_operation == TEST_OP_SNAPSHOT
-            ? wl_session_step(session)
-            : wl_session_snapshot(session, NULL, NULL);
-        if (denied_rc == EBUSY || denied_rc != 0)
-            break;
+    /* The active backend call keeps the session alive throughout the wait.
+     * Holding destroy behind its gate deterministically exercises timeout. */
+    denied_rc = wait_for_admission_close(session, blocked_operation, controlled,
+            force_timeout ? 10 : 5000);
+    failures += expect(denied_rc == (force_timeout ? ETIMEDOUT : EBUSY),
+            force_timeout ? "held destroy thread causes admission wait timeout"
+            : "new operation denied while destroy waits");
+    if (denied_rc != EBUSY) {
+        if (!force_timeout || denied_rc != ETIMEDOUT)
+            fprintf(stderr,
+                "admission wait failed: rc=%d, operation=%d, controlled=%d\n",
+                denied_rc, (int)blocked_operation, (int)controlled);
+        goto release_threads;
     }
-    failures += expect(denied_rc == EBUSY,
-            "new operation denied while destroy waits");
 
     wl_mutex_lock(&sync.mutex);
     for (unsigned i = 0; i < TEST_OP_COUNT; i++)
@@ -336,16 +406,20 @@ run_destroy_race(test_operation_t blocked_operation, bool controlled)
     failures += expect(wl_session_memory_governor(session) == NULL,
             "memory governor access denied after admission closes");
 
-    /* The admitted insert is still blocked and destroy is waiting. The
-     * independent control request must complete without waiting for either. */
-    if (control)
-        wl_evaluation_control_request_cancel(control);
-
     wl_mutex_lock(&sync.mutex);
     for (unsigned i = 0; i < TEST_OP_COUNT; i++)
         failures += expect(sync.calls[i] == before[i],
                 "denied operation did not enter backend");
+    wl_mutex_unlock(&sync.mutex);
+
+release_threads:
+    /* Cancel before releasing the admitted call, including on wait failure.
+     * Never access session after release: destroy may immediately free it. */
+    if (control)
+        wl_evaluation_control_request_cancel(control);
+    wl_mutex_lock(&sync.mutex);
     sync.release_operation = true;
+    sync.release_destroy = true;
     wl_cond_broadcast(&sync.changed);
     wl_mutex_unlock(&sync.mutex);
 
@@ -383,9 +457,12 @@ main(void)
 {
     int failures = 0;
 
-    failures += run_destroy_race(TEST_OP_SNAPSHOT, false);
-    failures += run_destroy_race(TEST_OP_STEP, false);
-    failures += run_destroy_race(TEST_OP_INSERT, true);
+    failures += run_destroy_race(TEST_OP_SNAPSHOT, false, false);
+    failures += run_destroy_race(TEST_OP_STEP, false, false);
+    failures += run_destroy_race(TEST_OP_INSERT, true, false);
+    failures += run_destroy_race(TEST_OP_SNAPSHOT, false, true);
+    failures += run_destroy_race(TEST_OP_STEP, false, true);
+    failures += run_destroy_race(TEST_OP_INSERT, true, true);
     if (failures)
         fprintf(stderr, "session_admission: %d failure(s)\n", failures);
     return failures != 0;
