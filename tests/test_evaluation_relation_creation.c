@@ -1235,6 +1235,557 @@ new_like_release_fail_stop(void)
 }
 #endif
 
+static int
+attempt_new_like(col_rel_t **out, col_rel_t *src, bool governed, bool ts,
+    wl_evaluation_control_t *c)
+{
+    return
+        wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+        "attempt clone", src, governed ? watched : NULL, ts, out, c,
+        wl_evaluation_control_active_attempt_id(c));
+}
+
+static void
+attempt_new_like_success(col_rel_t *src, bool governed, bool ts)
+{
+    watched = governor();
+    uint64_t baseline = src->memory_governor
+        ? wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(src->memory_governor)) : 0;
+    uint64_t d, m, p;
+    new_like_credits("attempt clone", src, ts && src->timestamps, &d, &m, &p);
+    wl_evaluation_control_t *c = control(0);
+    col_rel_t *out = NULL, *raw = NULL;
+    external_out = &out;
+    CHECK(attempt_new_like(&out, src, governed, ts, c) == 0);
+    external_out = NULL;
+    CHECK(finish(c, 0) > 0 && max_chunk <= WL_EVALUATION_CONTROL_QUANTUM);
+    CHECK(out->memory_governor == (governed ? watched : NULL));
+    CHECK(reserved() == (governed ? d + m + p : 0));
+    CHECK(wl_columnar_memory_governor_ref_is_sole(watched) == !governed);
+    CHECK(wl_columnar_relation_new_like_governed_checked_mode("attempt clone",
+        src, NULL, ts, &raw) == 0);
+    new_like_equal(out, raw, src);
+    new_like_released(src);
+    if (src->memory_governor)
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(src->memory_governor)) ==
+            baseline);
+    CHECK(col_rel_destroy_checked(raw) == 0);
+    CHECK(col_rel_destroy_checked(out) == 0 && reserved() == 0);
+    CHECK(wl_columnar_memory_governor_ref_is_sole(watched));
+    release(c); wl_columnar_memory_governor_ref_release(watched);
+    watched = NULL;
+}
+
+static void
+attempt_new_like_domains_and_prefixes(void)
+{
+    col_rel_t *src = new_like_source(1, false, false, 0);
+    watched = governor();
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    col_rel_t *out = src;
+    /* out holds a borrowed test sentinel, never an owned result. */
+    CHECK(
+        wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+            "x", src, watched, false, &out, c, id + 1u) == EINVAL && !out);
+    CHECK(finish(c, EINVAL) == 0); release(c);
+    const uint64_t prefixes[] = {128, 256, 352, 496, 624, 720, 864, 1024, 1216};
+    for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        for (unsigned below = 0; below < 2; below++) {
+            c = control(prefixes[i] - below);
+            out = src;
+            CHECK(attempt_new_like(&out, src, true, false, c)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !out);
+            uint64_t expected = below ? (i ? prefixes[i - 1] : 0) : prefixes[i];
+            CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == expected);
+            CHECK(reserved() == 0 &&
+                wl_columnar_memory_governor_ref_is_sole(watched));
+            new_like_released(src); release(c);
+        }
+    }
+    c = control(0); out = src;
+    CHECK(
+        wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+            NULL, src, watched, false, &out, c,
+            wl_evaluation_control_active_attempt_id(c)) == EINVAL && !out);
+    CHECK(finish(c, EINVAL) == 128); release(c);
+    /* NULL control ignores ID and retains exact raw delegation. */
+    CHECK(
+        wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+            "raw", src, NULL, false, &out, NULL, UINT64_MAX) == 0);
+    CHECK(col_rel_destroy_checked(out) == 0);
+    CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+attempt_new_like_allocations(void)
+{
+    col_rel_t *src = new_like_source(17, true, true, 1);
+    watched = governor();
+    bool completed = false;
+    for (long ordinal = 1; ordinal < 128; ordinal++) {
+        wl_evaluation_control_t *c = control(0);
+        col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = ordinal;
+        int rc = attempt_new_like(&out, src, true, true, c);
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        if (rc == 0) {
+            CHECK(out && ordinal > 20);
+            CHECK(finish(c, 0) > 0);
+            CHECK(col_rel_destroy_checked(out) == 0);
+            completed = true;
+        } else {
+            CHECK(rc == ENOMEM && !out && retired == 1);
+            CHECK(finish(c, ENOMEM) > 0);
+        }
+        CHECK(reserved() == 0 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        new_like_released(src); release(c);
+        if (completed) break;
+    }
+    CHECK(completed);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    CHECK(col_rel_destroy_checked(src) == 0);
+}
+
+static void
+attempt_new_like_fixtures(void)
+{
+    const uint32_t widths[] = {0, 1, 17};
+    for (unsigned typed = 0; typed < 2; typed++)
+        for (unsigned ts = 0; ts < 2; ts++)
+            for (unsigned i = 0; i < 3; i++) {
+                col_rel_t *src = new_like_source(widths[i], typed != 0,
+                        ts != 0, i);
+                attempt_new_like_success(src, false, false);
+                attempt_new_like_success(src, true, ts != 0);
+                CHECK(col_rel_destroy_checked(src) == 0);
+            }
+    col_rel_t *src = new_like_source(17, true, true, 1);
+    col_rel_t *alias = col_rel_new_like("attempt alias", src);
+    CHECK(alias && col_rel_install_shared_view(alias, src) == 0);
+    attempt_new_like_success(alias, true, true);
+    CHECK(col_rel_destroy_checked(alias) == 0);
+    delta_pool_t *pool = delta_pool_create(2, sizeof(col_rel_t), 65536);
+    CHECK(pool);
+    col_rel_t *pooled = col_rel_pool_new_like(pool, "attempt pool", src);
+    CHECK(pooled && pooled->pool_owned);
+    attempt_new_like_success(pooled, true, true);
+    CHECK(col_rel_destroy_checked(pooled) == 0); delta_pool_destroy(pool);
+    wl_arena_t *arena = wl_arena_create(65536);
+    pool = delta_pool_create(1, sizeof(col_rel_t), 32);
+    CHECK(pool && arena);
+    pooled = col_rel_pool_new_auto(pool, arena, "attempt arena", 1);
+    CHECK(pooled && pooled->pool_owned && pooled->arena_owned);
+    attempt_new_like_success(pooled, true, false);
+    CHECK(col_rel_destroy_checked(pooled) == 0); delta_pool_destroy(pool);
+    wl_arena_free(arena); CHECK(col_rel_destroy_checked(src) == 0);
+    attempt_new_like_domains_and_prefixes(); attempt_new_like_allocations();
+}
+
+static void
+attempt_constructor_pin(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)c; (void)token; (void)phase;
+    CHECK(watched && !wl_columnar_memory_governor_ref_is_sole(watched));
+}
+
+static void
+attempt_new_like_credit_and_peers(void)
+{
+    col_rel_t *src = new_like_source(17, true, true, 1);
+    watched = governor();
+    uint64_t d, m, p;
+    new_like_credits("attempt clone", src, true, &d, &m, &p);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(watched);
+    const uint64_t limits[] = {d - 1, d + m - 1, d + m + p - 1};
+    wl_columnar_memory_governor_test_checkpoint = attempt_constructor_pin;
+    for (unsigned i = 0; i < 3; i++) {
+        atomic_store_explicit(&g->usable_bytes, limits[i],
+            memory_order_release);
+        wl_evaluation_control_t *c = control(0);
+        col_rel_t *out = NULL;
+        CHECK(attempt_new_like(&out, src, true, true, c) == ENOSPC && !out);
+        CHECK(finish(c, ENOSPC) > 0);
+        CHECK(reserved() == 0 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        new_like_released(src); release(c);
+    }
+    atomic_store_explicit(&g->usable_bytes, WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        memory_order_release);
+    wl_columnar_memory_reservation_init(&peer); peer_changed = false;
+    wl_columnar_memory_governor_test_before_total_cas = peer_race;
+    wl_evaluation_control_t *c = control(0);
+    col_rel_t *out = NULL;
+    CHECK(attempt_new_like(&out, src, true, true, c) == 0 && out);
+    CHECK(finish(c, 0) > 0 && peer_changed && reserved() == d + m + p + 17);
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    CHECK(col_rel_destroy_checked(out) == 0 && reserved() == 17);
+    CHECK(wl_columnar_memory_release(&peer) && reserved() == 0);
+    release(c); CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static unsigned attempt_busy_round, attempt_busy_stop;
+
+static void
+attempt_busy_checkpoint(wl_evaluation_control_t *c, uint64_t work)
+{
+    checkpoint(c, work);
+    if (work == 144 && ++attempt_busy_round == attempt_busy_stop)
+        wl_evaluation_control_request_cancel(c);
+}
+
+static wl_evaluation_control_report_t attempt_old_report;
+static bool attempt_restarted;
+static unsigned attempt_successor_callbacks;
+
+static void
+attempt_restart(wl_evaluation_control_t *c)
+{
+    CHECK(!attempt_restarted);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_report(c, &attempt_old_report) == 0);
+    CHECK(wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(c) !=
+        attempt_old_report.attempt_id);
+    attempt_restarted = true;
+}
+
+static void
+attempt_restart_before_reader(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, uint64_t observed)
+{
+    (void)gate; (void)observed;
+    if (attempt_restarted) attempt_successor_callbacks++;
+    else attempt_restart(c);
+}
+
+static void
+attempt_restart_after_reader(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    (void)gate;
+    CHECK(acquired);
+    if (attempt_restarted) attempt_successor_callbacks++;
+    else attempt_restart(c);
+}
+
+static void
+attempt_restart_after_commit(wl_evaluation_control_t *c, unsigned stage)
+{
+    (void)stage;
+    if (attempt_restarted) attempt_successor_callbacks++;
+    else attempt_restart(c);
+}
+
+static void
+attempt_new_like_authority(void)
+{
+    col_rel_t *src = new_like_source(1, false, false, 0);
+    watched = governor();
+    for (unsigned gate = 0; gate < 2; gate++) {
+        wl_columnar_source_access_writer_t writer = {0};
+        CHECK(wl_columnar_source_access_writer_acquire(gate
+            ? &src->source_access : &src->descriptor_access, &writer) == 0);
+        wl_evaluation_control_t *c = control(0);
+        attempt_busy_round = 0; attempt_busy_stop = gate ? 2 : 1;
+        wl_columnar_relation_test_work_checkpoint = attempt_busy_checkpoint;
+        col_rel_t *out = NULL;
+        CHECK(attempt_new_like(&out, src, true, false, c) == EBUSY && !out);
+        CHECK(finish(c, EBUSY) > 0 && attempt_busy_round == attempt_busy_stop);
+        wl_columnar_relation_test_work_checkpoint = checkpoint;
+        CHECK(wl_columnar_source_access_writer_release(&writer) == 0);
+        new_like_released(src); CHECK(reserved() == 0); release(c);
+    }
+    for (unsigned seam = 0; seam < 3; seam++) {
+        wl_evaluation_control_t *c = control(0);
+        attempt_restarted = false; attempt_successor_callbacks = 0;
+        if (seam == 0)
+            wl_columnar_relation_test_before_reader_cas =
+                attempt_restart_before_reader;
+        else if (seam == 1)
+            wl_columnar_relation_test_after_reader_cas =
+                attempt_restart_after_reader;
+        else
+            wl_columnar_relation_test_constructor_committed =
+                attempt_restart_after_commit;
+        col_rel_t *out = NULL;
+        CHECK(attempt_new_like(&out, src, true, false, c) == EINVAL && !out);
+        CHECK(attempt_restarted && attempt_old_report.result == 0
+            && attempt_old_report.consumed > 0 && !attempt_successor_callbacks);
+        wl_columnar_relation_test_before_reader_cas = NULL;
+        wl_columnar_relation_test_after_reader_cas = NULL;
+        wl_columnar_relation_test_constructor_committed = committed;
+        CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+        wl_evaluation_control_report_t successor;
+        CHECK(wl_evaluation_control_report(c, &successor) == 0
+            && successor.consumed == 0 && successor.result == 0);
+        CHECK(reserved() == 0 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        new_like_released(src); release(c);
+    }
+    CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+attempt_phase_finish(wl_evaluation_control_t *c, int expected)
+{
+    CHECK(wl_evaluation_control_finish(c, &owner,
+        expected > 0 ? expected : 0, 0) == expected);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0
+        && report.result == expected && report.consumed >= seen);
+}
+
+static unsigned attempt_domain_round, attempt_domain_mode;
+
+static void
+attempt_domain_checkpoint(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (attempt_restarted) {
+        attempt_successor_callbacks++;
+        return;
+    }
+    checkpoint(c, work);
+    if (work != 128 || ++attempt_domain_round != 3)
+        return;
+    if (attempt_domain_mode == 0)
+        wl_evaluation_control_request_cancel(c);
+    else if (attempt_domain_mode == 1)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else
+        attempt_restart(c);
+}
+
+static void
+attempt_new_like_domain_precedence(void)
+{
+    col_rel_t *src = new_like_source(2, false, false, 0);
+    col_rel_t *saved_owner = src->storage_owner;
+    uint32_t live_map = 2;
+    const struct {
+        bool lazy;
+        wirelog_compound_kind_t kind;
+        uint32_t count;
+        bool map;
+        uint32_t length, offset;
+        int expected;
+    } cases[] = {
+        {true, (wirelog_compound_kind_t)99, 1, true, 0, 2, ENOTSUP},
+        {false, WIRELOG_COMPOUND_KIND_INLINE, 1, false, 1, 2, EINVAL},
+        {false, WIRELOG_COMPOUND_KIND_SIDE, 1, true, 0, 2, EINVAL},
+        {false, (wirelog_compound_kind_t)99, 0, false, 0, 0, EINVAL},
+        {false, WIRELOG_COMPOUND_KIND_INLINE, 1, true, 1, 2, ENOTSUP},
+        {false, WIRELOG_COMPOUND_KIND_SIDE, 1, true, 1, 2, ENOTSUP},
+        {false, WIRELOG_COMPOUND_KIND_NONE, 1, false, 0, 0, EINVAL},
+        {false, WIRELOG_COMPOUND_KIND_NONE, 0, true, 1, 0, EINVAL},
+        {false, WIRELOG_COMPOUND_KIND_NONE, 0, false, 0, 1, EINVAL},
+    };
+    watched = governor();
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (unsigned mode = 0; mode < 4; mode++) {
+            src->storage_owner = cases[i].lazy ? NULL : saved_owner;
+            src->compound_kind = cases[i].kind;
+            src->compound_count = cases[i].count;
+            src->compound_arity_map = cases[i].map ? &live_map : NULL;
+            src->compound_arity_len = cases[i].length;
+            src->inline_physical_offset = cases[i].offset;
+            wl_evaluation_control_t *c = control(0);
+            attempt_domain_round = 0;
+            attempt_domain_mode = mode;
+            attempt_restarted = false;
+            attempt_successor_callbacks = 0;
+            if (mode < 3)
+                wl_columnar_relation_test_work_checkpoint =
+                    attempt_domain_checkpoint;
+            col_rel_t *out = NULL;
+            int expected = mode == 1 ? EOVERFLOW
+                : mode == 2 ? EINVAL : cases[i].expected;
+            CHECK(attempt_new_like(&out, src, true, false, c) == expected
+                && !out);
+            wl_columnar_relation_test_work_checkpoint = checkpoint;
+            if (mode == 2) {
+                CHECK(attempt_restarted && !attempt_successor_callbacks
+                    && attempt_old_report.consumed == 624
+                    && attempt_old_report.result == 0);
+                CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+                wl_evaluation_control_report_t successor;
+                CHECK(wl_evaluation_control_report(c, &successor) == 0
+                    && successor.result == 0 && successor.consumed == 0);
+            } else {
+                CHECK(finish(c, expected) == 624);
+            }
+            CHECK(reserved() == 0
+                && wl_columnar_memory_governor_ref_is_sole(watched));
+            /* The bounded map is borrowed test storage. Restore the genuine
+             * scalar metadata before resolver checks or owned destruction. */
+            src->storage_owner = saved_owner;
+            src->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+            src->compound_count = 0;
+            src->compound_arity_map = NULL;
+            src->compound_arity_len = 0;
+            src->inline_physical_offset = 0;
+            new_like_released(src);
+            release(c);
+        }
+    }
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    attempt_new_like_success(src, true, false);
+    /* Refuse a genuine supported compound producer before construction. */
+    src->nrows = 0;
+    col_rel_logical_col_t logical = {WIRELOG_COMPOUND_KIND_INLINE, 2u, 1u};
+    CHECK(col_rel_apply_compound_schema(src, &logical, 1) == 0);
+    watched = governor();
+    wl_evaluation_control_t *c = control(0);
+    col_rel_t *out = NULL;
+    CHECK(attempt_new_like(&out, src, true, false, c) == ENOTSUP && !out);
+    CHECK(finish(c, ENOTSUP) == 624 && reserved() == 0
+        && wl_columnar_memory_governor_ref_is_sole(watched));
+    new_like_released(src); release(c);
+    CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+attempt_restart_governor(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)token;
+    if (attempt_restarted) {
+        attempt_successor_callbacks++;
+        return;
+    }
+    if (phase == fault_phase) {
+        fault_hits++;
+        attempt_restart(c);
+    }
+}
+
+static void
+attempt_new_like_governor_seams(void)
+{
+    const unsigned phases[] = {
+        WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT,
+        WL_COLUMNAR_MEMORY_GOVERNOR_PREPARED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING,
+        WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF
+    };
+    col_rel_t *src = new_like_source(17, true, true, 1);
+    watched = governor();
+    for (unsigned mode = 0; mode < 3; mode++) {
+        for (unsigned i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+            wl_evaluation_control_t *c = control(0);
+            fault_phase = phases[i]; fault_hits = 0;
+            attempt_restarted = false; attempt_successor_callbacks = 0;
+            positive_error = mode == 1;
+            wl_columnar_memory_governor_test_checkpoint = mode == 2
+                ? attempt_restart_governor : governor_fault;
+            col_rel_t *out = NULL;
+            int expected = mode == 2 ? EINVAL : mode == 1 ? EOVERFLOW
+                : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(attempt_new_like(&out, src, true, true,
+                c) == expected && !out);
+            CHECK(fault_hits == 1 && reserved() == 0
+                && wl_columnar_memory_governor_ref_is_sole(watched));
+            wl_columnar_memory_governor_test_checkpoint = NULL;
+            if (mode == 2) {
+                CHECK(attempt_restarted && !attempt_successor_callbacks);
+                CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+                wl_evaluation_control_report_t successor;
+                CHECK(wl_evaluation_control_report(c, &successor) == 0
+                    && successor.result == 0 && successor.consumed == 0);
+            } else
+                attempt_phase_finish(c, expected);
+            new_like_released(src); release(c);
+        }
+    }
+    positive_error = false; fault_phase = 0;
+    CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+/* Independent literal admission oracle for the complete empty-name/nullary,
+* ungoverned/no-types/no-TS path. Source descriptor byte size is ABI dependent;
+* its actual physical zero image takes separately counted16byte chunks.
+* Includes identity observation/CAS, all three skipped commit iterations,
+* irreversible installation and the final external store, not only entry. */
+static void
+attempt_new_like_complete_literal(void)
+{
+    uint64_t prefixes[2048];
+    size_t count = 0;
+    uint64_t total = 0;
+#define ATTEMPT_LITERAL_ADD(work) do { \
+            CHECK(count < sizeof(prefixes) / sizeof(prefixes[0])); \
+            total += (work); prefixes[count++] = total; \
+} while (0)
+    const uint64_t entry_and_preflight[] = {
+        128, 128, 96, 144, 128, 96, 144, 160, 192,
+        96, /* empty relation name includes itsNUL */
+        96, 96, 96, 96, 96, 96, /* checked D/table/names/lane/scratch/TS */
+        96, /* type-presence/no-typebytes setup */
+        96, 96, 96, /* owned-grid/table/TS payload checked arithmetic */
+        128, 96, 160, 112 /* fits, credits, skipped D reserve, descriptor malloc */
+    };
+    for (size_t i = 0;
+        i < sizeof(entry_and_preflight) / sizeof(entry_and_preflight[0]); i++)
+        ATTEMPT_LITERAL_ADD(entry_and_preflight[i]);
+    for (size_t pos = 0; pos < sizeof(col_rel_t); pos += 16)
+        ATTEMPT_LITERAL_ADD(224);
+    for (unsigned i = 0; i < 5; i++)
+        ATTEMPT_LITERAL_ADD(96); /* five original embedded inert credit tokens */
+    const uint64_t completion[] = {
+        112, 224, 80, 112, 96, /* name malloc/copy, identity read/claim, owner init */
+        160, 160, /* no-governor M/P reserve wrappers */
+        96, 112, 224, /* Arrow root, root format malloc and3bytes */
+        128, 128, 128, /* all three ungoverned skipped commit iterations */
+        220, 64 /* complete local installation, source drain, external store */
+    };
+    for (size_t i = 0; i < sizeof(completion) / sizeof(completion[0]); i++)
+        ATTEMPT_LITERAL_ADD(completion[i]);
+#undef ATTEMPT_LITERAL_ADD
+    col_rel_t *src = new_like_source(0, false, false, 2);
+    watched = governor();
+    for (size_t i = 0; i < count; i++) {
+        for (unsigned below = 0; below < 2; below++) {
+            wl_evaluation_control_t *c = control(prefixes[i] - below);
+            col_rel_t *out = NULL;
+            int rc =
+                wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled
+                (
+                "", src, NULL, false, &out, c,
+                wl_evaluation_control_active_attempt_id(c));
+            if (!below && i + 1 == count) {
+                CHECK(rc == 0 && out && !out->ncols && !out->nrows);
+                CHECK(finish(c, 0) == total);
+                CHECK(col_rel_destroy_checked(out) == 0);
+            } else {
+                CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !out);
+                CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT)
+                    == (below ? (i ? prefixes[i - 1] : 0) : prefixes[i]));
+            }
+            CHECK(reserved() == 0 &&
+                wl_columnar_memory_governor_ref_is_sole(watched));
+            new_like_released(src); release(c);
+        }
+    }
+    CHECK(col_rel_destroy_checked(src) == 0);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
 int
 main(void)
 {
@@ -1270,6 +1821,12 @@ main(void)
     new_like_reader_races();
     new_like_ledger_and_governor();
     new_like_budget();
+    attempt_new_like_fixtures();
+    attempt_new_like_credit_and_peers();
+    attempt_new_like_authority();
+    attempt_new_like_domain_precedence();
+    attempt_new_like_governor_seams();
+    attempt_new_like_complete_literal();
 #ifndef _WIN32
     new_like_release_fail_stop();
 #endif
