@@ -6660,6 +6660,347 @@ fail:
                control);
 }
 
+/* Caller-attempt-bound initialized single admission. The finite read-only
+ * entry check is an explicit exception: valid bootstrap12 is included in the
+ * first debit retrospectively; rejected bootstrap (at most13) may consume0.
+ * No callback, traversal or mutation occurs before that first admission.
+ *
+ * Count assignment/predicate/dispatch/selection/atomic/query/return/goto/
+ * increment/loopback as one, expanding pure helpers. Immediate admission/poll
+ * scheduling and test hooks are excluded. G/H=9, guarded caller=12.
+ * Inert=local1+45 outer terms+3*(writer predicates4+return1)+not1+return1=63.
+ * Writer init=stores5+thread query1+return1=7; generation=2; borrow getter=4.
+ * Thread equality=5; writer validator=15; canonical self-owner resolver=17.
+ *
+ * ENTRY94: bootstrap12+relation1+inert63+not1+dispatch1+Hcaller12=90;
+ *   tail error91; refused nested NONCE_READ adds outer caller4 =>94.
+ * READ19: atomic/local2+H/local/if12=14; error return1+outer caller4 =>19.
+ * ROUND39: exhaustion3+Gcaller12+increment/CAS/local3+acquired/store3+
+ *   H/local10+result predicates/dispatch3+return1=35; outer caller3 and
+ *   refused FRAME return1 =>39. Failed round34+next refusal caller4=38.
+ *   Exhaustion including typed result and outer caller=20.
+ * FRAME39: set local1+18 set stores+3 role/descriptor stores+Hcaller12=34;
+ *   tail error36; refused nested WRITER adds caller5 =>39.
+ * WRITER45: Gcaller12+expected1+CAS/local2+if2+init7+count1+H/local10+
+ *   result selections/return5=40; outer caller/error or next refusal5 =>45.
+ *   Busy37 and pre-CAS stale18 include outer continuation.
+ * BIND52: shape10+identity/generation8+owner/count2+lease15+Hcaller12=47;
+ *   tail error49; refused nested WRITER caller5 =>52.
+ * BORROW21: getter4+if2+identity1+Hcaller12=19; error/refused VALIDATE2 =>21.
+ * VALIDATE144: binding79 = guards8+set1+guard11+member1+one-entry loop13+
+ *   guards2+2+resolver/identity32+metadata2+slots6+return1. Loop13 includes
+ *   initialization, both tests/dispatches, member/role checks, increment and
+ *   loopback. Resolver32=resolver17+ten predicates10+generation helpers4+if1.
+ *   Impl124=binding79+rc/if3+set1+nullguard2+writer15/if2+metadata2+
+ *   writer15/if2+self-slot guard2+return1. Wrapper return1 =>125.
+ *   Outer rc1+H/local10+result selections/assignment5+if2+return1 =>144.
+ *   Exactly one original lease, one owner and self slots0/0 make this finite;
+ *   third writer validation is unreachable. Hooks cannot alter this authority.
+ *
+ * First success=498; each failed nonce CAS adds39. Conservative adjacent-region
+ * maximum165 includes bootstrap but excludes callbacks/admission internals.
+ * It is not an executed instruction or whole-return bound. Mandatory original
+ * cleanup body is unmetered; ordinary error goto/outer return are included.
+ */
+enum {
+    WL_COLUMNAR_RELATION_ATTEMPT_ENTRY_WORK = 94,
+    WL_COLUMNAR_RELATION_ATTEMPT_NONCE_READ_WORK = 19,
+    WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK = 39,
+    WL_COLUMNAR_RELATION_ATTEMPT_FRAME_WORK = 39,
+    WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK = 45,
+    WL_COLUMNAR_RELATION_ATTEMPT_BIND_WORK = 52,
+    WL_COLUMNAR_RELATION_ATTEMPT_BORROW_WORK = 21,
+    WL_COLUMNAR_RELATION_ATTEMPT_VALIDATE_WORK = 144
+};
+/* Adjacent regions cover tails and the next admission/refusal continuation. */
+typedef char wl_columnar_relation_attempt_regions_fit_quantum[
+        (WL_COLUMNAR_RELATION_ATTEMPT_ENTRY_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_NONCE_READ_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_NONCE_READ_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_FRAME_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_FRAME_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_BIND_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_BIND_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_BORROW_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_ATTEMPT_BORROW_WORK
+        + WL_COLUMNAR_RELATION_ATTEMPT_VALIDATE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM)
+    ? 1 : -1];
+
+static int
+wl_columnar_relation_attempt_guard(wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_relation_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t attempt_id, uint64_t work)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(control, work);
+#else
+    (void)work;
+#endif
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_relation_nonce_attempt_controlled(uint64_t *nonce,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_NONCE_READ_WORK);
+    if (rc)
+        return rc;
+#ifdef _MSC_VER
+    uint64_t observed = (uint64_t)atomic_fetch_add_explicit(
+        &wl_next_mutation_set_nonce, 0, memory_order_acquire);
+#else
+    uint64_t observed = atomic_load_explicit(&wl_next_mutation_set_nonce,
+            memory_order_acquire);
+#endif
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_NONCE_READ_WORK);
+    if (rc)
+        return rc;
+    for (;;) {
+        rc = wl_evaluation_control_charge(control,
+                WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK);
+        if (rc)
+            return rc;
+        if (!observed || observed == UINT64_MAX) {
+            rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+                    WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK);
+            return rc > 0 ? rc : EOVERFLOW;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_before_nonce_cas)
+            wl_columnar_relation_test_before_nonce_cas(control, observed);
+#endif
+        rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+        if (rc)
+            return rc;
+#ifdef _MSC_VER
+        bool acquired = atomic_compare_exchange_weak_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#else
+        bool acquired = atomic_compare_exchange_strong_explicit(
+            &wl_next_mutation_set_nonce, &observed, observed + 1u,
+            memory_order_relaxed, memory_order_relaxed);
+#endif
+        if (acquired)
+            *nonce = observed;
+        rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_ATTEMPT_NONCE_ROUND_WORK);
+        if (rc || acquired)
+            return rc;
+    }
+}
+
+/* Exact inert original writer and acquired-count slot were established by
+ * this entrypoint. Publish both authority records before the work callback.
+ * Strong-CAS busy is typed: a negative stop cannot erase it; positive errors
+ * still win. Only the outer original-frame cleanup releases owned writers.
+ */
+static int
+wl_columnar_relation_writer_attempt_controlled(
+    wl_columnar_source_access_gate_t *gate,
+    wl_columnar_source_access_writer_t *writer, size_t *acquired_count,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK);
+    if (rc)
+        return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_before_writer_cas)
+        wl_columnar_relation_test_before_writer_cas(control, gate);
+#endif
+    rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+    if (rc)
+        return rc;
+    uint64_t expected = 0;
+#ifdef _MSC_VER
+    bool acquired = atomic_compare_exchange_weak_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#else
+    bool acquired = atomic_compare_exchange_strong_explicit(&gate->state,
+            &expected, WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+            memory_order_relaxed);
+#endif
+    if (acquired) {
+        wl_columnar_source_access_writer_initialize(gate, writer);
+        *acquired_count = 1;
+    }
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_WRITER_WORK);
+    return rc > 0 ? rc : !acquired ? EBUSY : rc;
+}
+
+int
+wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+    col_rel_t *relation, wl_columnar_relation_mutation_single_t *single,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control || !attempt_id || !single)
+        return EINVAL;
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    if (!relation || !wl_columnar_relation_single_inert(single))
+        return EINVAL;
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    uint64_t nonce;
+    rc = wl_columnar_relation_nonce_attempt_controlled(&nonce, control,
+            attempt_id);
+    if (rc)
+        return rc;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_FRAME_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_mutation_set_t *set = &single->set;
+    set->identity = (uintptr_t)set;
+    set->acquisition_nonce = nonce;
+    set->roles = &single->role;
+    set->descriptors = &single->descriptor;
+    set->owners = single->owners;
+    set->leases = &single->lease;
+    set->initializations = &single->initialization;
+    set->descriptor_count = 1;
+    set->owner_count = 0;
+    set->lease_count = 1;
+    set->initialization_count = 0;
+    set->descriptors_acquired = 0;
+    set->owners_acquired = 0;
+    set->terminal_sequence = NULL;
+    set->terminal_expected_events = 0;
+    set->terminal_observed_events = 0;
+    set->terminal_sequence_consumed = false;
+    set->published = false;
+    single->role.relation = relation;
+    single->role.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    single->descriptor.relation = relation;
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_FRAME_WORK);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_relation_writer_attempt_controlled(
+        &relation->descriptor_access, &single->descriptor.writer,
+        &set->descriptors_acquired, control, attempt_id);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_BIND_WORK);
+    if (rc)
+        goto fail;
+    /* Read shape only with descriptor authority; never resolve an alias or
+     * initialize a lazy owner in this bounded private admission. */
+    if (relation->storage_owner != relation || relation->pool_owned
+        || relation->arena_owned || relation->col_shared
+        || relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || relation->compound_count || relation->compound_arity_map
+        || relation->compound_arity_len || relation->inline_physical_offset) {
+        rc = ENOTSUP;
+        goto fail;
+    }
+    if (!relation->relation_identity || !relation->storage_generation
+        || !wl_columnar_relation_generation_valid(relation->storage_generation)
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->storage_owner_generation != relation->storage_generation) {
+        rc = EINVAL;
+        goto fail;
+    }
+    single->owners[0].owner = relation;
+    set->owner_count = 1;
+    single->lease.identity = 0;
+    single->lease.acquisition_nonce = nonce;
+    single->lease.set = set;
+    single->lease.relation = relation;
+    single->lease.owner = relation;
+    single->lease.descriptor_slot = 0;
+    single->lease.owner_slot = 0;
+    single->lease.self_owner_slot = 0;
+    single->lease.relation_identity = relation->relation_identity;
+    single->lease.relation_generation = relation->storage_generation;
+    single->lease.owner_identity = relation->relation_identity;
+    single->lease.owner_generation = relation->storage_generation;
+    single->lease.role_flags = WL_COLUMNAR_RELATION_PAYLOAD_MUTATION;
+    single->lease.detached = false;
+    single->lease.storage_transitioned = false;
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_BIND_WORK);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_relation_writer_attempt_controlled(
+        &relation->source_access, &single->owners[0].writer,
+        &set->owners_acquired, control, attempt_id);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_BORROW_WORK);
+    if (rc)
+        goto fail;
+    if (col_rel_storage_alias_borrow_count(relation)) {
+        rc = EBUSY;
+        goto fail;
+    }
+    single->lease.identity = (uintptr_t)&single->lease;
+    rc = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_BORROW_WORK);
+    if (rc)
+        goto fail;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_RELATION_ATTEMPT_VALIDATE_WORK);
+    if (rc)
+        goto fail;
+    /* Exact inline counts and original addresses were established above;
+     * this generic validator's sole membership iteration is fixed. */
+    rc = col_rel_mutation_lease_validate(&single->lease, relation);
+    int tail = wl_columnar_relation_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_ATTEMPT_VALIDATE_WORK);
+    rc = tail > 0 ? tail : rc ? rc : tail;
+    if (!rc)
+        return 0;
+fail:
+    return wl_columnar_relation_mutation_single_finish_controlled(single, rc,
+               control);
+}
+
 /* Allocation ordinals cover cache, types, root format, child table and each
  * child object/format/name. The formats are fixed-size admitted regions. */
 static bool

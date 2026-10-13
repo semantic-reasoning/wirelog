@@ -3314,6 +3314,369 @@ test_metadata_wide_table_and_advisory(void)
     }
 }
 
+/* Literal source-region oracle, independent of production constants. */
+static const uint64_t attempt_single_regions[] =
+{94, 19, 39, 39, 45, 52, 45, 21, 144};
+static const uint64_t attempt_single_prefix[] =
+{94, 113, 152, 152, 191, 236, 236, 288, 333, 333, 354, 498};
+static unsigned attempt_single_seams, attempt_single_at, attempt_single_fault;
+static uint64_t attempt_single_old_consumed;
+static wl_columnar_relation_mutation_single_t *attempt_single_frame;
+static col_rel_t *attempt_single_relation;
+
+static void
+attempt_single_inject(wl_evaluation_control_t *c)
+{
+    ++attempt_single_seams;
+    if (attempt_single_seams != attempt_single_at) return;
+    if (attempt_single_fault == 1) wl_evaluation_control_request_cancel(c);
+    else if (attempt_single_fault == 2)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else if (attempt_single_fault == 3) {
+        attempt_single_old_consumed = finish(c, 0);
+        retry(c, 0);
+    }
+}
+
+static void
+attempt_single_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    CHECK(work <= WL_EVALUATION_CONTROL_QUANTUM);
+    if (attempt_single_frame) {
+        /* At every callback, live gates already have original tokens/counts. */
+        if (wl_columnar_source_access_gate_busy(
+                &attempt_single_relation->descriptor_access)) {
+            CHECK(attempt_single_frame->set.descriptors_acquired == 1);
+            CHECK(wl_columnar_source_access_writer_validate(
+                    &attempt_single_frame->descriptor.writer,
+                    &attempt_single_relation->descriptor_access) == 0);
+        }
+        if (wl_columnar_source_access_gate_busy(
+                &attempt_single_relation->source_access)) {
+            CHECK(attempt_single_frame->set.owners_acquired == 1);
+            CHECK(wl_columnar_source_access_writer_validate(
+                    &attempt_single_frame->owners[0].writer,
+                    &attempt_single_relation->source_access) == 0);
+        }
+    }
+    attempt_single_inject(c);
+}
+
+static void
+attempt_single_nonce(wl_evaluation_control_t *c, uint64_t observed)
+{
+    CHECK(observed && observed != UINT64_MAX);
+    attempt_single_inject(c);
+}
+
+static void
+attempt_single_writer(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate)
+{
+    (void)gate;
+    attempt_single_inject(c);
+}
+
+static void
+attempt_single_hooks(unsigned at, unsigned fault)
+{
+    attempt_single_at = at; attempt_single_fault = fault;
+    attempt_single_seams = 0; attempt_single_old_consumed = 0;
+    wl_columnar_relation_test_work_checkpoint = attempt_single_work;
+    wl_columnar_relation_test_before_nonce_cas = attempt_single_nonce;
+    wl_columnar_relation_test_before_writer_cas = attempt_single_writer;
+}
+
+static void
+attempt_single_hooks_clear(void)
+{
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    wl_columnar_relation_test_before_nonce_cas = NULL;
+    wl_columnar_relation_test_before_writer_cas = NULL;
+    attempt_single_frame = NULL; attempt_single_relation = NULL;
+}
+
+static int
+attempt_single_acquire(col_rel_t *r,
+    wl_columnar_relation_mutation_single_t *s, wl_evaluation_control_t *c)
+{
+    return wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+        r, s, c, wl_evaluation_control_active_attempt_id(c));
+}
+
+static void
+test_attempt_single_boundaries(void)
+{
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        uint64_t prefix = 0;
+        for (size_t i = 0; i < sizeof(attempt_single_regions)
+            / sizeof(attempt_single_regions[0]); ++i) {
+            uint64_t prior = prefix;
+            prefix += attempt_single_regions[i];
+            col_rel_t *r = relation(1, 4, 1, true, NULL);
+            int64_t **columns = r->columns;
+            col_delta_timestamp_t *timestamps = r->timestamps;
+            wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+            wl_evaluation_control_t *c = control(exact ? prefix : prefix - 1);
+            int rc = attempt_single_acquire(r, &s, c);
+            int expected = exact &&
+                i == 8 ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected);
+            if (!rc) {
+                CHECK(col_rel_mutation_lease_validate(&s.lease, r) == 0);
+                CHECK(wl_columnar_relation_mutation_single_finish_controlled(
+                        &s, 0, c) == 0);
+            }
+            CHECK(finish(c, expected) == (exact ? prefix : prior));
+            single_state_equal(&s, &zero); single_open(r, NULL);
+            CHECK(r->columns == columns && r->timestamps == timestamps
+                && r->nrows == 1 && r->columns[0][0] == 0);
+            release(c); destroy(r);
+        }
+        CHECK(prefix == 498);
+    }
+    /* Exact admission produces real authority usable by the existing row API. */
+    for (unsigned width = 0; width < 3; ++width) {
+        col_rel_t *r = relation(width, 4, 1, false, NULL);
+        col_rel_t *raw = relation(width, 4, 1, false, NULL);
+        wl_columnar_relation_mutation_single_t s = {0}, twin = {0};
+        wl_evaluation_control_t *c = control(498);
+        CHECK(attempt_single_acquire(r, &s, c) == 0);
+        CHECK(wl_columnar_relation_mutation_single_acquire_controlled(
+                raw, &twin, NULL) == 0);
+        int64_t row[2] = {7, 11};
+        CHECK(col_rel_append_row_with_lease(r, row, &s.lease) == 0);
+        CHECK(col_rel_append_row_with_lease(raw, row, &twin.lease) == 0);
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&s, 0,
+            c) == 0);
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&twin, 0,
+            NULL) == 0);
+        CHECK(finish(c, 0) == 498 && r->nrows == raw->nrows);
+        for (unsigned lane = 0; lane < width; ++lane)
+            CHECK(r->columns[lane][1] == raw->columns[lane][1]);
+        release(c); destroy(r); destroy(raw);
+    }
+}
+
+static void
+test_attempt_single_seams(void)
+{
+    for (unsigned fault = 1; fault <= 3; ++fault)
+        for (unsigned at = 1; at <= 12; ++at) {
+            col_rel_t *r = relation(1, 4, 1, true, NULL);
+            wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+            wl_evaluation_control_t *c = control(0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            uint64_t held = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(r->memory_governor));
+            uint64_t prior_nonce =
+                wl_columnar_relation_test_single_nonce_replace(60000);
+            single_fail_slot = 99;
+            memset(single_release_calls, 0, sizeof(single_release_calls));
+            wl_columnar_relation_test_single_release = single_release_failure;
+            attempt_single_frame = &s; attempt_single_relation = r;
+            attempt_single_hooks(at, fault);
+            int rc =
+                wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+                r, &s, c, id);
+            int expected = fault == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                : fault == 2 ? EOVERFLOW : EINVAL;
+            CHECK(rc == expected);
+            /* Negative/accounting before-CAS hooks poll at the following work
+            * tail; stale identity prevents the CAS and any following hook. */
+            unsigned last = at + ((fault != 3 &&
+                (at == 3 || at == 6 || at == 9)) ? 1u : 0u);
+            CHECK(attempt_single_seams == last);
+            CHECK(wl_columnar_relation_test_single_nonce_replace(prior_nonce)
+                == (last >= 4 ? 60001u : 60000u));
+            CHECK(single_release_calls[0] == (last >= 7 ? 1u : 0u));
+            CHECK(single_release_calls[1] == (last >= 10 ? 1u : 0u));
+            CHECK(single_release_calls[2] == 0);
+            wl_columnar_relation_test_single_release = NULL;
+            if (fault == 3) {
+                CHECK(attempt_single_old_consumed ==
+                    attempt_single_prefix[at - 1]);
+                CHECK(finish(c, 0) == 0);
+            } else CHECK(finish(c, expected) == attempt_single_prefix[at - 1]);
+            single_state_equal(&s, &zero); single_open(r, NULL);
+            CHECK(r->nrows == 1 && r->columns[0][0] == 0);
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(r->memory_governor)) ==
+                held);
+            attempt_single_hooks_clear(); release(c); destroy(r);
+        }
+}
+
+static void
+test_attempt_single_entry(void)
+{
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        if (mode == 4) {
+            CHECK(finish(c, 0) == 0); retry(c, 0);
+        }
+        CHECK(wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+                r, mode == 3 ? NULL : &s, mode == 0 ? NULL : c,
+                mode == 1 ? 0 : mode == 2 ? id + 1 : id) == EINVAL);
+        CHECK(finish(c, 0) == 0); single_state_equal(&s, &zero);
+        release(c);
+    }
+    for (unsigned mode = 0; mode < 8; ++mode) {
+        wl_columnar_relation_mutation_single_t dirty = {0};
+        switch (mode) {
+        case 0: dirty.role.relation = r; break;
+        case 1: dirty.set.terminal_sequence_consumed = true; break;
+        case 2: dirty.set.published = true; break;
+        case 3: dirty.owners[0].writer.identity = 7; break;
+        case 4: dirty.owners[1].writer.thread_valid = true; break;
+        case 5: dirty.lease.storage_transitioned = true; break;
+        case 6: dirty.initialization.borrows = 1; break;
+        default: dirty.lease.detached = true; break;
+        }
+        wl_columnar_relation_mutation_single_t before = dirty;
+        wl_evaluation_control_t *c = control(0);
+        CHECK(attempt_single_acquire(r, &dirty, c) == EINVAL);
+        CHECK(finish(c, EINVAL) == 94);
+        single_state_equal(&dirty, &before); single_open(r, NULL); release(c);
+    }
+    destroy(r);
+}
+
+static void
+test_attempt_single_domains_and_busy(void)
+{
+    for (unsigned mode = 1; mode < 4; ++mode) {
+        col_rel_t *root, *r = single_fixture(mode, &root);
+        wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+        wl_evaluation_control_t *c = control(0);
+        CHECK(attempt_single_acquire(r, &s, c) == ENOTSUP);
+        CHECK(finish(c, ENOTSUP) == 288);
+        single_state_equal(&s, &zero); single_open(r, root);
+        release(c); single_dispose(r, root);
+    }
+    for (unsigned shape = 0; shape < 5; ++shape) {
+        col_rel_t *r = relation(1, 4, 1, false, NULL);
+        wl_columnar_relation_mutation_single_t frame = {0}, zero = {0};
+        /* Quiescent shape fixture; restore ownership metadata before destroy. */
+        if (shape == 0) r->pool_owned = true;
+        if (shape == 1) r->arena_owned = true;
+        if (shape == 2) r->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+        if (shape == 3) r->storage_owner_identity = 0;
+        if (shape == 4) r->storage_owner_generation = 0;
+        wl_evaluation_control_t *c = control(0);
+        int expected = shape < 3 ? ENOTSUP : EINVAL;
+        CHECK(attempt_single_acquire(r, &frame, c) == expected);
+        CHECK(finish(c, expected) == 288);
+        single_state_equal(&frame, &zero); single_open(r, NULL);
+        r->pool_owned = false; r->arena_owned = false;
+        r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
+        r->storage_owner_identity = r->relation_identity;
+        r->storage_owner_generation = r->storage_generation;
+        release(c); destroy(r);
+    }
+    /* A genuine live shared view makes the canonical owner's payload busy. */
+    {
+        col_rel_t *root, *alias = single_fixture(2, &root);
+        wl_columnar_relation_mutation_single_t frame = {0}, zero = {0};
+        wl_evaluation_control_t *c = control(0);
+        CHECK(attempt_single_acquire(root, &frame, c) == EBUSY);
+        CHECK(finish(c, EBUSY) == 354);
+        single_state_equal(&frame, &zero); single_open(alias, root);
+        release(c); single_dispose(alias, root);
+    }
+    for (unsigned slot = 0; slot < 2; ++slot)
+        for (unsigned fault = 0; fault < 4; ++fault) {
+            col_rel_t *r = relation(1, 4, 1, false, NULL);
+            wl_columnar_source_access_reader_t peer = {0};
+            wl_columnar_source_access_gate_t *gate =
+                slot ? &r->source_access : &r->descriptor_access;
+            CHECK(wl_columnar_source_access_reader_acquire(gate, &peer) == 0);
+            wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+            wl_evaluation_control_t *c = control(0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            attempt_single_hooks(slot ? 9 : 6, fault);
+            int rc =
+                wl_columnar_relation_mutation_single_acquire_attempt_controlled(
+                r, &s, c, id);
+            int expected = fault < 2 ? EBUSY : fault == 2 ? EOVERFLOW : EINVAL;
+            CHECK(rc == expected);
+            single_state_equal(&s, &zero);
+            CHECK(peer.owner == gate && peer.identity == (uintptr_t)&peer
+                && wl_columnar_source_access_reader_thread_equal(&peer));
+            CHECK(wl_columnar_source_access_reader_release(&peer) == 0);
+            if (fault == 3) {
+                CHECK(attempt_single_old_consumed == (slot ? 333u : 236u));
+                CHECK(finish(c, 0) == 0);
+            } else CHECK(finish(c, expected) == (slot ? 333u : 236u));
+            attempt_single_hooks_clear(); single_open(r, NULL); release(c);
+            destroy(r);
+        }
+}
+
+static void
+test_attempt_single_nonce_and_cleanup(void)
+{
+    col_rel_t *r = relation(1, 4, 1, false, NULL);
+    single_peer = relation(1, 4, 1, false, NULL);
+    for (unsigned failures = 1; failures <= 4; ++failures)
+        for (unsigned denied = 0; denied < 2; ++denied) {
+            wl_columnar_relation_mutation_single_t s = {0}, zero = {0};
+            uint64_t limit = denied ? 113 + 39u * failures : 498 + 39u *
+                failures;
+            wl_evaluation_control_t *c = control(limit);
+            single_nonce_retries = failures;
+            wl_columnar_relation_test_before_nonce_cas = single_nonce_interfere;
+            int expected = denied ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+            CHECK(attempt_single_acquire(r, &s, c) == expected);
+            CHECK(!single_nonce_retries);
+            wl_columnar_relation_test_before_nonce_cas = NULL;
+            if (!denied) CHECK(
+                    wl_columnar_relation_mutation_single_finish_controlled(&s,
+                    0, c) == 0);
+            CHECK(finish(c, expected) == limit);
+            single_state_equal(&s, &zero); single_open(r, NULL); release(c);
+        }
+    for (unsigned zero = 0; zero < 2; ++zero) {
+        uint64_t terminal = zero ? 0 : UINT64_MAX;
+        uint64_t saved =
+            wl_columnar_relation_test_single_nonce_replace(terminal);
+        wl_columnar_relation_mutation_single_t s = {0}, empty = {0};
+        wl_evaluation_control_t *c = control(0);
+        CHECK(attempt_single_acquire(r, &s, c) == EOVERFLOW);
+        CHECK(finish(c, EOVERFLOW) == 152);
+        CHECK(wl_columnar_relation_test_single_nonce_replace(saved) ==
+            terminal);
+        single_state_equal(&s, &empty); release(c);
+    }
+    /* Stopping after a successful nonce CAS never rewinds global identity. */
+    uint64_t saved = wl_columnar_relation_test_single_nonce_replace(50000);
+    wl_columnar_relation_mutation_single_t s = {0};
+    wl_evaluation_control_t *c = control(152);
+    CHECK(attempt_single_acquire(r, &s, c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == 152);
+    CHECK(wl_columnar_relation_test_single_nonce_replace(saved) == 50001);
+    release(c);
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        c = control(0);
+        attempt_single_hooks(12, 1);
+        single_fail_slot = slot;
+        wl_columnar_relation_test_single_release = single_release_failure;
+        CHECK(attempt_single_acquire(r, &s, c) == EIO);
+        CHECK(s.set.descriptors_acquired == 1 && s.set.owners_acquired == slot);
+        CHECK(s.descriptor.writer.owner == &r->descriptor_access);
+        CHECK(finish(c, EIO) == 498);
+        wl_columnar_relation_test_single_release = NULL;
+        CHECK(wl_columnar_relation_mutation_single_finish_controlled(&s,
+            WL_EVALUATION_CONTROL_CANCELLED,
+            c) == WL_EVALUATION_CONTROL_CANCELLED);
+        attempt_single_hooks_clear(); single_open(r, NULL); release(c);
+    }
+    destroy(single_peer); single_peer = NULL; destroy(r);
+}
+
 int
 main(void)
 {
@@ -3362,6 +3725,11 @@ main(void)
     test_single_refusals();
     test_single_partial_acquisition_cleanup();
     test_single_nonce_stopped_publication();
+    test_attempt_single_boundaries();
+    test_attempt_single_seams();
+    test_attempt_single_entry();
+    test_attempt_single_domains_and_busy();
+    test_attempt_single_nonce_and_cleanup();
     test_exact_capacity_success(1, 0, true);
     test_exact_capacity_success(1, 300, true);
     test_exact_capacity_success(300, 2, false);

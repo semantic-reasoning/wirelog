@@ -1570,4 +1570,26 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains302 call sites.
+The complete current atomic-source inventory contains308 call sites.
+
+### Caller-attempt-bound single mutation admission
+
+The opt-in single admission keeps the caller's original attempt ID across all
+nonce, writer and work callbacks. The caller owns the inert original frame,
+keeps relation/control storage live and serializes the control lifecycle.
+Descriptor authority precedes private/self-owner shape reads. A successful
+writer CAS records both original token and acquired count before a callback;
+cleanup can therefore retire an interrupted acquisition without losing it.
+The global nonce may advance on a later-stopped call and is never rolled back.
+Mandatory original-frame release remains noncancellable and may retain its
+remaining authority on error for caller drain. These changes do not activate
+an evaluation operator or alter existing raw admission.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `relation.c:wl_columnar_relation_nonce_attempt_controlled` | global mutation nonce | `atomic_fetch_add_explicit` | MSVC neutral Interlocked read | Observe the shared nonce without a plain wide read |
+| `relation.c:wl_columnar_relation_nonce_attempt_controlled#2` | global mutation nonce | `atomic_load_explicit` | acquire | Observe the starting nonce for independently charged strong CAS rounds |
+| `relation.c:wl_columnar_relation_nonce_attempt_controlled#3` | global mutation nonce | `atomic_compare_exchange_weak_explicit` | relaxed (MSVC strong shim) | Claim one unique nonce after checking the saved attempt ID |
+| `relation.c:wl_columnar_relation_nonce_attempt_controlled#4` | global mutation nonce | `atomic_compare_exchange_strong_explicit` | relaxed | Claim one unique nonce; failed attempts update the expected value for the next charged round |
+| `relation.c:wl_columnar_relation_writer_attempt_controlled` | descriptor or self-owner source gate | `atomic_compare_exchange_weak_explicit` | acquire success / relaxed failure (MSVC strong shim) | One nonwaiting writer claim; original token/count published before work callback |
+| `relation.c:wl_columnar_relation_writer_attempt_controlled#2` | descriptor or self-owner source gate | `atomic_compare_exchange_strong_explicit` | acquire success / relaxed failure | One nonwaiting writer claim; busy preserves independent reader/writer authority |

@@ -1703,3 +1703,47 @@ physical free always precedes later rollback/release. Tests cover literal
 boundaries, genuine RELEASED reuse, raw parity including NULL owners, all seams,
 typed verdicts, real independent peer allocations and actual aggregate CAS
 failures. This opt-in foundation does not activate engine operators.
+
+### Caller-attempt-bound single mutation admission
+
+`wl_columnar_relation_mutation_single_acquire_attempt_controlled` acquires
+one initialized private scalar relation's descriptor and self-owner writer
+under the caller's immutable evaluation attempt ID. The caller keeps the
+relation and control alive, exclusively owns the original inert frame, and
+externally serializes the control lifecycle. The attempt ID detects a changed
+attempt; it does not pin any object's lifetime. Existing raw and controlled
+single-admission entrypoints retain their behavior and work tariffs.
+
+Each nonce, writer and work callback is followed by an ID check before another
+callback, claim, poll or positive debit. Successful claims record the original
+writer and acquired count before exposing a work callback. Failed nonce CAS
+rounds are charged separately; a consumed global nonce is never rewound when a
+later stage stops. Unsupported alias, lazy-owner, pool, arena, shared-column
+and compound shapes are inspected only after descriptor authority is held.
+No allocation or variable role expansion occurs in this entrypoint.
+
+Success supplies the ordinary single-frame lease. Failure uses the existing
+noncancellable single finish to release only this original frame's authority.
+A release failure retains the remaining tokens and counts: the caller must
+retry cleanup while that frame remains live or fail-stop. Copied frames and
+wrong-thread finish cannot retire the original writer. Cleanup after an ended
+attempt does not poll or charge a successor. An established busy verdict wins
+over a negative stop; a positive stale or accounting error wins over busy.
+
+Before the first charge, the entry performs only a bounded read-only argument
+and identity check: 12 logical slots on valid entry, at most 13 on rejection.
+This is an explicit uncharged exception, included retrospectively in the first
+admitted region. Rejected or first-admission-denied calls can execute it with
+zero consumed work. Work-region ceilings describe logical source operations,
+not elapsed time or exact machine instruction counts; mandatory cleanup is
+outside the forward work metric.
+
+The admitted regions are entry 94, nonce observation 19, each nonce CAS round 39,
+frame 39, each writer 45, self binding 52, borrow check 21 and final validation 144.
+A first-round success consumes 498; each genuine failed nonce CAS adds 39.
+The conservative adjacent-region ceiling is 165, below the 256-work quantum.
+Frame storage must not overlap relation/control storage. Forward callbacks
+cannot forge/free original authority or change protected descriptor shape.
+Mandatory release hooks are exempt from forward ID checks. An initiating
+positive error may mask a later release error; inspect and drain retained
+original authority regardless of the returned error value.

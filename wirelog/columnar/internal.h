@@ -674,6 +674,24 @@ typedef struct {
  * residue only after independently verifying all authority has retired. */
 int wl_columnar_relation_mutation_single_acquire_controlled(col_rel_t *,
     wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *);
+/* Caller-attempt-bound admission for initialized private scalar self-owners.
+ * Requires live relation/control and exclusive inert original frame; control
+ * lifecycle is externally serialized. Frame, relation and control storage
+ * must not overlap. Callbacks may not free or forge original frame/tokens,
+ * or mutate protected descriptor shape. NULL control or zero/stale ID returns
+ * EINVAL without debit or frame mutation. No alias, pool, arena, compound or
+ * lazy-owner expansion. Every forward admission hook validates the original ID
+ * before another
+ * hook, claim or debit. Success uses the dedicated noncancellable finish below.
+ * Failure retires only original authority; a failed release retains the frame
+ * for caller drain/fail-stop, even if an initiating positive error masks the
+ * release error. Never discard a frame with retained authority. Mandatory
+ * cleanup release hooks are exempt from forward ID checks and polling.
+ * The finite read-only bootstrap is an explicit uncharged exception, included
+ * retrospectively in the first admitted region. */
+int wl_columnar_relation_mutation_single_acquire_attempt_controlled(col_rel_t *,
+    wl_columnar_relation_mutation_single_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_relation_mutation_single_finish_controlled(
     wl_columnar_relation_mutation_single_t *, int, wl_evaluation_control_t *);
 #ifdef WL_SESSION_TEST_HOOKS
