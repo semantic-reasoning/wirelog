@@ -11451,6 +11451,252 @@ cleanup:
 #undef IDB_CHECK
 }
 
+/* #2161: wl_columnar_eval_delta_consolidate builds a private $consol
+ * candidate from the head and publishes it with prepare_replacement.  A
+ * governor refusal at each stage these tests reach must report ENOSPC with
+ * the session's denial flag.  The consolidation boundary hook names the
+ * stage reached: 0 after the candidate exists (before the append), 1 after
+ * the append, 2 after normalization, 3 after prepare_replacement. */
+enum {
+    CONSOL_ARM_BUDGET = 0,
+    CONSOL_ARM_FAULT, /* fail the next malloc (Linux allocation wrap) */
+    CONSOL_ARM_RESIZE, /* fail the next relation resize (every platform) */
+};
+#define CONSOL_ROWS 128u /* above COL_REL_INIT_CAP: the append must grow */
+static unsigned consol_arm_at, consol_arm_kind;
+static uint64_t consol_headroom;
+static int consol_stage;
+static bool consol_timestamped, consol_stale, consol_armed;
+static bool consol_ts_applied;
+
+static void
+consol_arm(wl_col_session_t *sess)
+{
+    consol_armed = true;
+    if (consol_arm_kind == CONSOL_ARM_RESIZE) {
+        wl_columnar_relation_test_fail_next_prepare_resize();
+        return;
+    }
+    if (consol_arm_kind == CONSOL_ARM_FAULT) {
+#ifdef WL_TEST_ALLOC_WRAP
+        fail_next_alloc = true;
+#endif
+        return;
+    }
+    idb_set_budget(sess);
+    wl_columnar_memory_governor_t *budget =
+        wl_columnar_memory_governor_ref_get(sess->memory_governor);
+    atomic_store_explicit(&budget->usable_bytes,
+        wl_columnar_memory_reserved(budget) + consol_headroom,
+        memory_order_relaxed);
+}
+
+static void
+consol_after_eval(wl_col_session_t *sess)
+{
+    col_rel_t *target = session_find_rel(sess, "output");
+    if (!target || target->nrows != CONSOL_ROWS)
+        return;
+    if (consol_timestamped && col_rel_enable_timestamps(target) == 0
+        && target->timestamps) {
+        for (uint32_t row = 0; row < target->nrows; row++)
+            target->timestamps[row] = idb_timestamp(row);
+        consol_ts_applied = true;
+    }
+    /* Evidence of an earlier refusal that this step must not reuse. */
+    if (consol_stale)
+        target->memory_budget_denial_pending = true;
+}
+
+static void
+consol_boundary(wl_col_session_t *sess, col_rel_t *target,
+    col_rel_t *candidate, unsigned boundary)
+{
+    (void)candidate;
+    if (strcmp(target->name, "output") != 0)
+        return;
+    if ((int)boundary > consol_stage)
+        consol_stage = (int)boundary;
+    if (boundary == consol_arm_at && !consol_armed)
+        consol_arm(sess);
+}
+
+/* One step of a fresh serial session.  With @check, every postcondition of
+ * the expected outcome is asserted: a budget refusal (ENOSPC, the session
+ * flag, WIRELOG_ERR_MEMORY_BUDGET, an untouched head and an exact retry) or
+ * an allocator fault (ENOMEM, no flag, WIRELOG_ERR_MEMORY). */
+static const char *
+consol_run(unsigned arm_at, unsigned kind, uint64_t headroom, bool check,
+    int *stage)
+{
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t output = { .name = "output", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    delta_collector_t deltas = { 0 };
+    int64_t values[CONSOL_ROWS];
+    const char *failure = NULL;
+#define CONSOL_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                            goto consol_cleanup; } } while (0)
+    /* One duplicate, so publication has work to do. */
+    for (uint32_t row = 0; row < CONSOL_ROWS; row++)
+        values[row] = 5000 - (int64_t)(row % (CONSOL_ROWS - 1));
+    consol_arm_at = arm_at;
+    consol_arm_kind = kind;
+    consol_headroom = headroom;
+    consol_stage = -1;
+    consol_armed = false;
+    consol_ts_applied = false;
+    idb_budget_changed = false;
+    CONSOL_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "consol session");
+    wl_col_session_t *sess = COL_SESSION(session);
+    governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    CONSOL_CHECK(wl_session_insert(session, "input", values, CONSOL_ROWS,
+        1) == 0, "consol insert");
+    wl_columnar_eval_delta_test_after_eval = consol_after_eval;
+    wl_columnar_eval_delta_test_consolidation_boundary = consol_boundary;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    wl_columnar_eval_delta_test_consolidation_boundary = NULL;
+    idb_restore_budget(sess);
+    *stage = consol_stage;
+    if (!check)
+        goto consol_cleanup;
+    CONSOL_CHECK(consol_armed && consol_stage == (int)arm_at,
+        "consol refusal outside the armed stage");
+    CONSOL_CHECK(consol_ts_applied == consol_timestamped,
+        "consol head timestamps not as requested");
+    col_rel_t *target = session_find_rel(sess, "output");
+    bool denied = wl_columnar_session_budget_denied(sess);
+    int code = wl_facade_session_error_code_with_budget(rc,
+            sess->extension_expr_status, denied);
+    CONSOL_CHECK(target && target->nrows == CONSOL_ROWS && deltas.count == 0,
+        "consol refusal changed the head");
+    if (kind != CONSOL_ARM_BUDGET) {
+#ifdef WL_TEST_ALLOC_WRAP
+        CONSOL_CHECK(!fail_next_alloc, "consol fault never consumed");
+#endif
+        CONSOL_CHECK(!wl_columnar_relation_test_fail_prepare_resize,
+            "consol resize fault never consumed");
+        CONSOL_CHECK(rc == ENOMEM, "consol fault is not ENOMEM");
+        CONSOL_CHECK(!sess->memory_budget_denied,
+            "consol fault set the denial flag");
+        CONSOL_CHECK(code == WIRELOG_ERR_MEMORY, "consol fault public code");
+        CONSOL_CHECK(target->memory_budget_denial_pending == consol_stale,
+            "consol fault changed the head's evidence");
+        goto consol_cleanup;
+    }
+    CONSOL_CHECK(rc == ENOSPC, "consol refusal is not ENOSPC");
+    CONSOL_CHECK(sess->memory_budget_denied && denied,
+        "consol refusal lost the denial flag");
+    CONSOL_CHECK(code == WIRELOG_ERR_MEMORY_BUDGET,
+        "consol refusal public code");
+    /* A refused prepare_replacement leaves its evidence on the head. */
+    CONSOL_CHECK(arm_at != 2 || target->memory_budget_denial_pending,
+        "consol refusal dropped the head's evidence");
+    CONSOL_CHECK(!sess->cleanup_pending && sess->cleanup_reserved_bytes == 0,
+        "consol refusal ownership");
+    wl_columnar_session_budget_denial_clear(sess);
+    CONSOL_CHECK(wl_session_step(session) == 0
+        && target == session_find_rel(sess, "output")
+        && target->nrows == CONSOL_ROWS - 1
+        && !sess->memory_budget_denied, "consol retry");
+consol_cleanup:
+    wl_columnar_eval_delta_test_after_eval = NULL;
+    wl_columnar_eval_delta_test_consolidation_boundary = NULL;
+#ifdef WL_TEST_ALLOC_WRAP
+    fail_next_alloc = false;
+#endif
+    wl_columnar_relation_test_fail_prepare_resize = false;
+    if (session)
+        idb_restore_budget(COL_SESSION(session));
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "consol reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    return failure;
+#undef CONSOL_CHECK
+}
+
+/* Arms a zero-headroom budget at @arm_at, which must stop the step before
+ * the next boundary, then bisects for a headroom that still stops there
+ * while one byte more passes it, and checks both runs.  The bracket is
+ * searched, never assumed. */
+static const char *
+consol_budget_case(unsigned arm_at)
+{
+    const char *failure;
+    int stage = -1;
+    uint64_t lo = 0, hi = 64;
+    if ((failure = consol_run(arm_at, CONSOL_ARM_BUDGET, lo, true, &stage)))
+        return failure;
+    for (;;) {
+        if ((failure = consol_run(arm_at, CONSOL_ARM_BUDGET, hi, false,
+            &stage)))
+            return failure;
+        if (stage > (int)arm_at)
+            break;
+        if (hi >= (UINT64_C(1) << 30))
+            return "consol stage never passed";
+        hi *= 2;
+    }
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if ((failure = consol_run(arm_at, CONSOL_ARM_BUDGET, mid, false,
+            &stage)))
+            return failure;
+        if (stage > (int)arm_at)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return consol_run(arm_at, CONSOL_ARM_BUDGET, lo, true, &stage);
+}
+
+static void
+test_consolidate_budget_denial(unsigned arm_at, bool timestamped)
+{
+    TEST("IDB consolidation: refused stage reports a budget denial (#2161)");
+    consol_timestamped = timestamped;
+    consol_stale = false;
+    const char *failure = consol_budget_case(arm_at);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
+
+/* An allocator fault with the candidate alive stays ENOMEM without the
+ * flag; these cases guard against mapping a non-budget failure.  @kind
+ * picks the fault: a failed relation resize reaches the append on every
+ * platform; the allocation wrap, Linux only, also reaches
+ * prepare_replacement.  With @stale, earlier evidence on the head must
+ * neither turn the fault into a budget denial nor be lost. */
+static void
+test_consolidate_allocation_fault(unsigned arm_at, unsigned kind,
+    bool timestamped, bool stale)
+{
+    TEST("IDB consolidation: allocator fault is not a budget denial (#2161)");
+    int stage = -1;
+    consol_timestamped = timestamped;
+    consol_stale = stale;
+    const char *failure = consol_run(arm_at, kind, 0, true, &stage);
+    consol_stale = false;
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
+
 static bool idb_small_invalid;
 static int idb_small_hook_rc;
 static void
@@ -16116,6 +16362,19 @@ main(void)
     test_idb_consolidation(4, true);
     test_idb_consolidation(5, false);
     test_idb_consolidation(6, false);
+#endif
+    for (unsigned at = 0; at <= 2; at++) {
+        test_consolidate_budget_denial(at, false);
+        test_consolidate_budget_denial(at, true);
+    }
+    test_consolidate_allocation_fault(0, CONSOL_ARM_RESIZE, false, false);
+    test_consolidate_allocation_fault(0, CONSOL_ARM_RESIZE, true, false);
+#ifdef WL_TEST_ALLOC_WRAP
+    test_consolidate_allocation_fault(0, CONSOL_ARM_FAULT, false, false);
+    test_consolidate_allocation_fault(0, CONSOL_ARM_FAULT, true, false);
+    test_consolidate_allocation_fault(2, CONSOL_ARM_FAULT, false, false);
+    test_consolidate_allocation_fault(2, CONSOL_ARM_FAULT, true, false);
+    test_consolidate_allocation_fault(2, CONSOL_ARM_FAULT, true, true);
 #endif
     test_observer_completion_retry(0, false);
     test_observer_completion_retry(0, true);
