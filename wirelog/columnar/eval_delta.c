@@ -1673,6 +1673,9 @@ fail:
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+/* Boundaries in wl_columnar_eval_delta_consolidate: 0 once the candidate
+ * exists, before the head is appended to it; 1 after the append; 2 after
+ * normalization or consolidation; 3 after prepare_replacement. */
 void (*wl_columnar_eval_delta_test_consolidation_boundary)(
     wl_col_session_t *sess, col_rel_t *target, col_rel_t *candidate,
     unsigned boundary);
@@ -1796,6 +1799,21 @@ wl_columnar_eval_delta_timestamp_normalize(wl_col_session_t *sess,
     return rc != 0 ? rc : release_rc;
 }
 
+/* Maps the result of the candidate's growth or of prepare_replacement's
+ * reservations on the head below.  A refusal there returns ENOMEM with the
+ * denial recorded on @rel, or ENOSPC directly; either is reported as ENOSPC
+ * with the session's denial flag (#2161).  Other failures pass through. */
+static int
+wl_columnar_eval_delta_budget_status(wl_col_session_t *sess,
+    const col_rel_t *rel, int rc)
+{
+    if (rc == ENOMEM && rel && rel->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC)
+        sess->memory_budget_denied = true;
+    return rc;
+}
+
 int
 wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess)
 {
@@ -1831,7 +1849,13 @@ wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess)
     }
     result->rel = candidate;
     result->owned = true;
-    rc = col_rel_append_all(candidate, target, NULL);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_delta_test_consolidation_boundary)
+        wl_columnar_eval_delta_test_consolidation_boundary(sess, target,
+            candidate, 0);
+#endif
+    rc = wl_columnar_eval_delta_budget_status(sess, candidate,
+            col_rel_append_all(candidate, target, NULL));
     if (rc != 0)
         goto done;
     rc = col_rel_source_reader_release(&source_reader);
@@ -1864,7 +1888,15 @@ wl_columnar_eval_delta_consolidate(col_rel_t *target, wl_col_session_t *sess)
     rc = col_rel_source_reader_acquire(candidate, &candidate_reader);
     if (rc != 0)
         goto done;
-    rc = col_rel_prepare_replacement(target, candidate, &replacement);
+    /* A step does not clear the head's denial evidence, so an earlier
+     * refusal may still be recorded; read only what prepare_replacement
+     * records, then keep both.  Consolidation runs on the thread that owns
+     * the session, which no other thread reads the flag from meanwhile. */
+    bool prior_denial = target->memory_budget_denial_pending;
+    target->memory_budget_denial_pending = false;
+    rc = wl_columnar_eval_delta_budget_status(sess, target,
+            col_rel_prepare_replacement(target, candidate, &replacement));
+    target->memory_budget_denial_pending |= prior_denial;
     if (rc != 0)
         goto done;
     if (target->relation_identity != identity || target->view_generation != view
