@@ -6281,6 +6281,7 @@ test_evaluation_control_exe = executable(
   'test_evaluation_control',
   files('test_evaluation_control.c', '../wirelog/evaluation_control.c'),
   thread_src,
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],
   install: false,

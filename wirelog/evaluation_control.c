@@ -15,6 +15,7 @@ struct wl_evaluation_control {
     wl_mutex_t mutex;
     wl_atomic_u64 references;
     wl_atomic_u64 cancelled;
+    wl_atomic_u64 active_attempt_id;
     const void *owner;
     uint64_t configured_limit;
     uint64_t attempt_id;
@@ -41,6 +42,7 @@ wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out)
     }
     atomic_init(&control->references, 1);
     atomic_init(&control->cancelled, 0);
+    atomic_init(&control->active_attempt_id, 0);
     control->configured_limit = limit;
     *out = control;
     return 0;
@@ -172,10 +174,45 @@ wl_evaluation_control_begin(wl_evaluation_control_t *control,
         control->consumed = 0;
         control->stop = WL_EVALUATION_CONTROL_NONE;
         control->accounting_error = 0;
+        (void)atomic_exchange_explicit(&control->active_attempt_id,
+            control->attempt_id, memory_order_release);
     }
     wl_mutex_unlock(&control->mutex);
     return rc;
 }
+
+uint64_t
+wl_evaluation_control_active_attempt_id(const wl_evaluation_control_t *control)
+{
+    if (!control)
+        return 0;
+#ifdef _MSC_VER
+    /* Logical const: neutral Interlocked read of privately mutable storage. */
+    return (uint64_t)atomic_fetch_add_explicit(
+        (wl_atomic_u64 *)&control->active_attempt_id, UINT64_C(0),
+        memory_order_acquire);
+#else
+    return atomic_load_explicit(&control->active_attempt_id,
+               memory_order_acquire);
+#endif
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
+    const void *owner, uint64_t value)
+{
+    if (!control || !owner)
+        return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = control->owner != owner ? EINVAL : control->active ? EBUSY
+        : value < control->attempt_id ? EINVAL : 0;
+    if (rc == 0)
+        control->attempt_id = value;
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+#endif
 
 int
 wl_evaluation_control_charge(wl_evaluation_control_t *control,
@@ -246,6 +283,8 @@ wl_evaluation_control_finish(wl_evaluation_control_t *control,
         .result = result,
     };
     control->active = false;
+    (void)atomic_exchange_explicit(&control->active_attempt_id, 0,
+        memory_order_release);
     wl_mutex_unlock(&control->mutex);
     return result;
 }
