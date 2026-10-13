@@ -2024,3 +2024,47 @@ failure through the copy return. It uses actual no-ledger batch terminals and
 actual last-poll boundaries, rather than adding whole caller tariffs to old
 internal248/168 maxima. Charged reports remain authoritative; reached-tail
 labels can repeat at multiple sites financed by one earlier admission.
+
+
+### Caller-attempt numeric compiler ownership
+
+The internal `wl_columnar_expr_compile_attempt_controlled()` produces a
+separate opaque `wl_columnar_expr_attempt_numeric_t`. It requires a live
+control and the caller's nonzero current attempt ID; missing, inactive or stale
+IDs return `EINVAL`. It does not delegate to the legacy owner representation.
+The output slot must be exclusively writable and contain no live owned result.
+Its fixed NULL/false initialization and initial getter/refused debit are bounded
+bootstrap exceptions that can execute with consumed work zero.
+
+The immutable encoded input remains live through both passes. Each byte and
+column digit is admitted before access; unsupported or malformed numeric input
+returns success with supported false before an owner is published. No raw
+string, intern, crypto or extension fallback is called. This compiler unit does
+not introduce a new evaluator or activate default operators.
+
+A governed program retains its own governor reference. Before the admitted
+stack token moves, the pin belongs to the compiler, while the partial owner has
+no pin or credit. The successful checked move and the held/admitted/ref marker
+updates occur without a callback between them. Genuine ungoverned programs
+leave the embedded token EMPTY and skip reserve, move, commit and retirement.
+Mandatory destruction snapshots the held/committed/reference fields before
+freeing instructions and owner, then retires only its own moved credit and
+finally releases the saved reference. It remains valid after attempt finish or
+reset. Original tokens and destruction are exclusive; immutable program reads
+require external exclusion of destruction. Callers serialize control lifecycle
+and preserve stable shared-governor configuration throughout admission.
+
+Source-adjacent accounting expands the guard9, debit-prefix13, tail26 (29 with
+caller), initializer10 and move40. New ordinary destruction69 is rounded to72;
+complete outward failure chains are96,100,104. The fixed bytes-helper prefix24
+and decoder continuation32 include last-byte-to-next-debit refusal. The twelve
+tariffs are128/224/224/192/192/224/224/224/192/224/224/160 for entry, decode,
+byte, digit, pass, setup, reserve caller, allocation, store, move, commit caller
+and external publication. Their full envelopes are86/176/195/161/150/191/210/
+177/148/192/163/132, checked by portable typedef bounds. Nested governor return
+is212; its internal168 interval is separated by actual polls and is not added
+to the whole caller tariff. Conservative224 bounds logical forward intervals,
+not machine instructions or elapsed time. Allocator/control internals,
+instrumentation and original mandatory physical/credit/ref retirement are
+explicit exclusions; new ordinary cleanup branches are included. Test phase8
+is mandatory disposal with NULL control, distinct from subsequent forward hooks.
