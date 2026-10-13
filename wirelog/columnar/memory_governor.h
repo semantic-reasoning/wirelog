@@ -12,6 +12,7 @@
 
 #include "columnar/mem_ledger.h"
 #include "evaluation_control.h"
+#include "thread.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -193,6 +194,80 @@ int wl_columnar_memory_governor_commit_controlled(
     wl_evaluation_control_t *);
 int wl_columnar_memory_governor_commit_growth_controlled(
     wl_columnar_memory_reservation_t *, bool *, wl_evaluation_control_t *);
+
+typedef enum {
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT = 0,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED,
+} wl_columnar_memory_governor_growth_commit_phase_t;
+
+/* Caller-owned original address, zero-initialized before first preparation.
+ * Noncopyable; caller retains exclusive token and live control/governor until
+ * consumed. Explicit reinitialization is legal only with no remaining claim.
+ * Outputs/record/token must not overlap. This is a controlled growth-only
+ * protocol; existing raw and controlled commit entry points remain available.
+ */
+typedef struct {
+    const void *identity;
+    wl_columnar_memory_reservation_t *token;
+    wl_columnar_memory_governor_t *governor;
+    uint64_t owner_bits;
+    wl_evaluation_control_t *control;
+    uint64_t active_attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    uint64_t prior_bytes;
+    uint64_t additional_bytes;
+    uint64_t final_bytes;
+    uint64_t prepaid_work;
+    wl_columnar_memory_governor_growth_commit_phase_t phase;
+} wl_columnar_memory_governor_growth_commit_prepared_t;
+
+/* rc0 makes ready authoritative; shape/claim refusal yields false. Invalid
+ * pointers/record/attempt yield EINVAL. Stops preserve original reservations.
+ * Preparation admits a conservative228 units once (including finish44), then
+ * claims COMMITTING reversibly. Early refusal/stop does not refund admission.
+ * Invalid original record may consume228 without mutation. Work is admitted,
+ * not exact executed operations; successful checkpoint instrumentation ceilings total180 and
+ * exclude trailing READY4 + finish44. Largest interval63; trailing48 requires
+ * caller's cutoff/composition proof for any additional work before finish.
+ * Preclaim unclaimed error return is bounded15 (its final consume/return2
+ * use the snapshot dispatch reserve); interval13 labels the success bucket.
+ */
+int wl_columnar_memory_governor_growth_commit_prepare_controlled(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
+    wl_evaluation_control_t *control);
+/* Mandatory cleanup, also legal after attempt end. Restores REPLACING only:
+ * free incoming physical storage before the existing rollback_growth refund.
+ */
+int wl_columnar_memory_governor_growth_commit_cancel(
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared);
+/* Caller establishes final cutoff before finish. Stale/invalid finish leaves
+ * READY reachable for original cancellation. Successful finish is finite and
+ * performs no charge, callback, mutex, allocation, CAS or governor refund.
+ */
+int wl_columnar_memory_governor_growth_commit_finish(
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared);
+
+/* Private protocol phase IDs also compile when instrumentation is disabled. */
+enum {
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_ARGUMENTS = 10,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_SNAPSHOT,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_PRECLAIM,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_CLAIMED,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_READY_CUTOFF,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_REFUSED,
+};
 
 #if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
 enum {

@@ -617,6 +617,246 @@ wl_columnar_memory_governor_strong(wl_atomic_u64 *state, uint64_t *expected,
 #endif
 }
 
+/* One platform atomic observation and its return; MSVC must use Interlocked. */
+static uint64_t
+wl_columnar_memory_governor_growth_commit_read(wl_atomic_u64 *value)
+{
+#ifdef _MSC_VER
+    return (uint64_t)atomic_fetch_add_explicit(value, UINT64_C(0),
+               memory_order_acquire);
+#else
+    return atomic_load_explicit(value, memory_order_acquire);
+#endif
+}
+
+/* Valid25: five initial predicates + dispatch6; current thread/equality/
+ * negation/dispatch4; ten final predicates10; read2 twice4; final return1.
+ * The portable maximum includes the cheaper Windows thread comparison.
+ */
+static bool
+wl_columnar_memory_governor_growth_commit_valid(
+    const wl_columnar_memory_governor_growth_commit_prepared_t *prepared,
+    uint64_t state)
+{
+    if (!prepared || prepared->identity != prepared || !prepared->thread_valid
+        || !prepared->token || !prepared->governor)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(prepared->owner_thread, thrd_current()))
+        return false;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (prepared->owner_thread != GetCurrentThreadId())
+        return false;
+#else
+    if (!pthread_equal(prepared->owner_thread, pthread_self()))
+        return false;
+#endif
+    return prepared->token->identity == prepared->token
+           && prepared->token->governor == prepared->governor
+           && wl_columnar_memory_governor_growth_commit_read(
+        &prepared->token->owner_bits) == prepared->owner_bits
+           && wl_columnar_memory_governor_growth_commit_read(
+        &prepared->token->state) == state
+           && prepared->token->bytes == prepared->prior_bytes
+           && prepared->token->replacement_bytes == prepared->additional_bytes
+           && prepared->token->transition_kind
+           == WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+           && prepared->additional_bytes != 0
+           && prepared->additional_bytes <= UINT64_MAX - prepared->prior_bytes
+           && prepared->final_bytes
+           == prepared->prior_bytes + prepared->additional_bytes;
+}
+
+enum {
+    /* Finish44 = valid25 + four predicates/dispatch5 + getter4/local1
+     * + two active predicates/dispatch3 + token stores4 + consume1 + return1.
+     * Preparation184 = arguments28 + snapshots50 + claim37 + five checkpoint
+     * ceilings13 each + READY stores/return4. These include explicit error
+     * alternatives, not an assertion that all admitted operations execute.
+     * Helper: getter4, read2, strong2; charge/poll scaffolding and test hooks
+     * excluded. No engine-owned loop is excluded or hidden in a helper.
+     */
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_FINISH_WORK = 44,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_PREPARE_WORK = 184,
+    WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_TOTAL_WORK = 228,
+};
+
+typedef char wl_columnar_memory_governor_growth_commit_quantum_bound[
+        (WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_TOTAL_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+/* H9: getter4/local1, two id predicates/dispatch3, return1. Caller rc
+ * assignment/predicate/dispatch/error alternative adds4, yielding ceiling13.
+ * Callback first, original-id validation BEFORE poll; never debit a successor.
+ */
+static int
+wl_columnar_memory_governor_growth_commit_checkpoint(
+    wl_evaluation_control_t *control,
+    wl_columnar_memory_reservation_t *token, uint64_t saved_id,
+    unsigned phase, uint64_t interval)
+{
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(control, token, phase);
+    if (wl_columnar_memory_governor_test_work_checkpoint)
+        wl_columnar_memory_governor_test_work_checkpoint(control, interval);
+#else
+    (void)token;
+    (void)phase;
+    (void)interval;
+#endif
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != saved_id)
+        return EINVAL;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+int
+wl_columnar_memory_governor_growth_commit_cancel(
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared)
+{
+    if (!wl_columnar_memory_governor_growth_commit_valid(prepared,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING)
+        || (prepared->phase != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED
+        && prepared->phase != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY))
+        return EINVAL;
+    (void)atomic_exchange_explicit(&prepared->token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING, memory_order_release);
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+    return 0;
+}
+
+int
+wl_columnar_memory_governor_growth_commit_finish(
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared)
+{
+    if (!wl_columnar_memory_governor_growth_commit_valid(prepared,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING)
+        || prepared->phase != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY
+        || !prepared->control
+        || prepared->prepaid_work
+        != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_FINISH_WORK)
+        return EINVAL;
+    uint64_t active =
+        wl_evaluation_control_active_attempt_id(prepared->control);
+    if (!active || active != prepared->active_attempt_id)
+        return EINVAL;
+    prepared->token->bytes = prepared->final_bytes;
+    prepared->token->replacement_bytes = 0;
+    prepared->token->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    (void)atomic_exchange_explicit(&prepared->token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+    return 0;
+}
+
+int
+wl_columnar_memory_governor_growth_commit_prepare_controlled(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_TOTAL_WORK);
+    if (rc)
+        return rc;
+    if (!token || !expected_governor || !expected_owner || !prepared || !ready
+        || prepared->identity || prepared->token || prepared->governor
+        || prepared->control || prepared->thread_valid || prepared->owner_bits
+        || prepared->active_attempt_id || prepared->prior_bytes
+        || prepared->additional_bytes || prepared->final_bytes
+        || prepared->prepaid_work
+        || prepared->phase != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT)
+        return EINVAL;
+    *ready = false;
+    uint64_t saved_id = wl_evaluation_control_active_attempt_id(control);
+    if (!saved_id)
+        return EINVAL;
+    rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
+            saved_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_ARGUMENTS, 41);
+    if (rc)
+        return rc;
+    prepared->identity = prepared;
+    prepared->token = token;
+    prepared->governor = expected_governor;
+    prepared->owner_bits = (uint64_t)(uintptr_t)expected_owner;
+    prepared->control = control;
+    prepared->active_attempt_id = saved_id;
+#if defined(WL_HAVE_C11_THREADS)
+    prepared->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    prepared->owner_thread = GetCurrentThreadId();
+#else
+    prepared->owner_thread = pthread_self();
+#endif
+    prepared->thread_valid = true;
+    prepared->prior_bytes = token->bytes;
+    prepared->additional_bytes = token->replacement_bytes;
+    prepared->final_bytes = token->bytes + token->replacement_bytes;
+    prepared->prepaid_work = 0;
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT;
+    bool valid = wl_columnar_memory_governor_growth_commit_valid(prepared,
+            WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+    rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
+            saved_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_SNAPSHOT, 63);
+    if (!valid) {
+        prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+        return rc > 0 ? rc : 0;
+    }
+    if (rc)
+        goto unclaimed;
+    rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
+            saved_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_PRECLAIM, 13);
+    if (rc)
+        goto unclaimed;
+    if (!wl_columnar_memory_governor_growth_commit_valid(prepared,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)) {
+        rc = wl_columnar_memory_governor_growth_commit_checkpoint(control,
+                token,
+                saved_id,
+                WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_REFUSED, 50);
+        prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+        return rc > 0 ? rc : 0;
+    }
+    uint64_t expected = WL_COLUMNAR_MEMORY_RESERVATION_REPLACING;
+    if (!wl_columnar_memory_governor_strong(&token->state, &expected,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING)) {
+        rc = wl_columnar_memory_governor_growth_commit_checkpoint(control,
+                token,
+                saved_id,
+                WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_REFUSED, 50);
+        prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+        return rc > 0 ? rc : 0;
+    }
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED;
+    rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
+            saved_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_CLAIMED, 50);
+    if (rc)
+        goto claimed;
+    rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
+            saved_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_READY_CUTOFF, 13);
+    if (rc)
+        goto claimed;
+    prepared->prepaid_work =
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_FINISH_WORK;
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY;
+    *ready = true;
+    return 0;
+claimed:
+    if (wl_columnar_memory_governor_growth_commit_cancel(prepared) != 0)
+        abort();
+    return rc;
+unclaimed:
+    prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
+    return rc;
+}
+
 typedef struct {
     wl_columnar_memory_governor_t *governor;
     uint64_t bytes;

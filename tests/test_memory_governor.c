@@ -921,11 +921,19 @@ static int controlled_owner;
 static uint64_t controlled_work, controlled_cancel_at;
 static unsigned controlled_phase, controlled_hits;
 static int controlled_fault;
+static bool prepared_trace_enabled;
+static uint64_t prepared_trace[5];
+static unsigned prepared_trace_count;
+static wl_columnar_memory_governor_growth_commit_prepared_t *prepared_witness;
 static void
 controlled_work_point(wl_evaluation_control_t *c, uint64_t work)
 {
     (void)c;
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(work <= WL_EVALUATION_CONTROL_QUANTUM);
+    if (prepared_trace_enabled) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_trace_count < 5);
+        prepared_trace[prepared_trace_count++] = work;
+    }
     controlled_work += work;
     if (controlled_cancel_at && controlled_work >= controlled_cancel_at)
         wl_evaluation_control_request_cancel(c);
@@ -934,7 +942,16 @@ static void
 controlled_point(wl_evaluation_control_t *c,
     wl_columnar_memory_reservation_t *token, unsigned phase)
 {
-    (void)token;
+    if (prepared_witness &&
+        phase == WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_CLAIMED) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_witness->phase
+            == WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_witness->token == token
+            && prepared_witness->prior_bytes == 8
+            && prepared_witness->additional_bytes == 16
+            && prepared_witness->final_bytes == 24
+            && prepared_witness->thread_valid);
+    }
     if (phase != controlled_phase)
         return;
     controlled_hits++;
@@ -943,6 +960,16 @@ controlled_point(wl_evaluation_control_t *c,
     else if (controlled_fault == 2)
         WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_charge(c,
             UINT64_MAX) == EOVERFLOW);
+    else if (controlled_fault == 3) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(c,
+            &controlled_owner, 0, 0) == 0);
+        wl_evaluation_control_report_t report;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_report(c,
+            &report) == 0 && report.consumed == 228);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(c) == 0);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(c,
+            &controlled_owner) == 0);
+    }
 }
 static wl_evaluation_control_t *
 controlled_begin(uint64_t limit)
@@ -1644,6 +1671,368 @@ test_controlled_copied_authority(void)
     PASS();
 }
 
+typedef struct {
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_t peer;
+    void *old_buffer;
+    void *incoming_buffer;
+} prepared_growth_fixture_t;
+
+static void
+prepared_growth_init(prepared_growth_fixture_t *fixture)
+{
+    controlled_governor(&fixture->governor, 1024);
+    wl_columnar_memory_reservation_init(&fixture->token);
+    wl_columnar_memory_reservation_init(&fixture->peer);
+    fixture->old_buffer = malloc(8);
+    fixture->incoming_buffer = NULL;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->old_buffer);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+            &fixture->governor, 8, &fixture->token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+            &fixture->token, fixture->old_buffer));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+            &fixture->governor, 17, &fixture->peer));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_begin_growth(
+            &fixture->token, 16) == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+    fixture->incoming_buffer = malloc(16);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->incoming_buffer);
+    memset(fixture->old_buffer, 0x17, 8);
+    memset(fixture->incoming_buffer, 0x29, 16);
+}
+
+static void
+prepared_growth_check(prepared_growth_fixture_t *fixture, uint64_t state)
+{
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+            &fixture->governor) == 41);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.bytes == 8);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.replacement_bytes == 16);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.transition_kind
+        == WL_COLUMNAR_MEMORY_TRANSITION_GROWTH);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(
+            &fixture->token.state, memory_order_acquire) == state);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->peer.bytes == 17);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(((unsigned char *)fixture->old_buffer)[7]
+        == 0x17);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        ((unsigned char *)fixture->incoming_buffer)[15] == 0x29);
+}
+
+static void
+prepared_growth_dispose(prepared_growth_fixture_t *fixture, bool committed)
+{
+    free(fixture->incoming_buffer);
+    fixture->incoming_buffer = NULL;
+    if (!committed) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback_growth(
+                &fixture->token));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                &fixture->governor) == 25);
+    }
+    free(fixture->old_buffer);
+    fixture->old_buffer = NULL;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+            &fixture->token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+            &fixture->governor) == 17);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+            &fixture->peer));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+            &fixture->governor) == 0);
+}
+
+static uint64_t
+prepared_growth_success(uint64_t limit)
+{
+    prepared_growth_fixture_t fixture;
+    prepared_growth_init(&fixture);
+    wl_columnar_memory_governor_growth_commit_prepared_t prepared = { 0 };
+    wl_evaluation_control_t *control = controlled_begin(limit);
+    bool ready = false;
+    controlled_phase = 0;
+    controlled_fault = 0;
+    prepared_trace_enabled = true;
+    prepared_trace_count = 0;
+    prepared_witness = &prepared;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_prepare_controlled(
+            &fixture.token,
+            &fixture.governor, fixture.old_buffer, &prepared, &ready,
+            control) == 0
+        && ready);
+    prepared_trace_enabled = false;
+    prepared_witness = NULL;
+    uint64_t intervals[] = { 41, 63, 13, 50, 13 };
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_trace_count == 5);
+    for (unsigned i = 0; i < 5; i++)
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_trace[i] == intervals[i]);
+    prepared_growth_check(&fixture, WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING);
+    /* Independent source inventory: valid25, outer guards5, getter/local5,
+     * id guards3, token stores4, consume1, return1; not a production macro.
+     */
+    unsigned finish_slots[] = { 25, 5, 5, 3, 4, 1, 1 };
+    unsigned finish_work = 0;
+    for (unsigned i = 0; i < sizeof(finish_slots) / sizeof(finish_slots[0]);
+        i++)
+        finish_work += finish_slots[i];
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(finish_work == 44
+        && prepared.prepaid_work == finish_work);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_charge(control,
+        0) == 0);
+    /* Cancellation after genuine final cutoff remains for the next attempt. */
+    wl_evaluation_control_request_cancel(control);
+    uint64_t work = controlled_work;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_finish(&prepared) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_work == work);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.token.bytes == 24
+        && fixture.token.replacement_bytes == 0
+        && fixture.token.transition_kind == WL_COLUMNAR_MEMORY_TRANSITION_NONE);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(&fixture.token.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_finish(&prepared) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_cancel(&prepared) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(work == 180);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 228);
+    prepared_growth_dispose(&fixture, true);
+    return work;
+}
+
+static void
+test_prepared_growth_prefixes(void)
+{
+    TEST(
+        "prepared growth preserves real storage and peer credit at every stop");
+    uint64_t observed = prepared_growth_success(0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_growth_success(228) == observed);
+    /* Admitted228 differs from conservative checkpoint ceilings180. */
+    unsigned preparation_slots[] = { 28, 50, 37, 65, 4 };
+    uint64_t total = 44;
+    for (unsigned i = 0;
+        i < sizeof(preparation_slots) / sizeof(preparation_slots[0]); i++)
+        total += preparation_slots[i];
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(total == 228 && observed == 180);
+    for (unsigned mode = 0; mode < 2; mode++) {
+        for (uint64_t at = 1; at <= (mode == 0 ? total : observed); at++) {
+            prepared_growth_fixture_t fixture;
+            prepared_growth_init(&fixture);
+            wl_columnar_memory_governor_growth_commit_prepared_t prepared =
+            { 0 };
+            wl_evaluation_control_t *control = controlled_begin(
+                mode == 0 ? at - 1 : 0);
+            if (mode == 0 && at == 1) {
+                /* Limit zero means unlimited; exercise initial refusal with1. */
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    wl_evaluation_control_finish(control, &controlled_owner,
+                    0, 0) == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    wl_evaluation_control_configure(control, 1) == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    wl_evaluation_control_begin(control,
+                    &controlled_owner) == 0);
+            }
+            controlled_cancel_at = mode == 1 ? at : 0;
+            bool ready = false;
+            prepared_witness = &prepared;
+            int rc =
+                wl_columnar_memory_governor_growth_commit_prepare_controlled(
+                &fixture.token, &fixture.governor, fixture.old_buffer,
+                &prepared, &ready, control);
+            prepared_witness = NULL;
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (mode == 0
+                ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                : WL_EVALUATION_CONTROL_CANCELLED));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!ready);
+            prepared_growth_check(&fixture,
+                WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, rc)
+                == (mode == 0 ? 0 : total));
+            prepared_growth_dispose(&fixture, false);
+        }
+    }
+    unsigned phases[] = {
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_ARGUMENTS,
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_SNAPSHOT,
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_PRECLAIM,
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_CLAIMED,
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_READY_CUTOFF,
+    };
+    for (unsigned p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
+        for (int fault = 1; fault <= 3; fault++) {
+            prepared_growth_fixture_t fixture;
+            prepared_growth_init(&fixture);
+            wl_columnar_memory_governor_growth_commit_prepared_t prepared =
+            { 0 };
+            wl_evaluation_control_t *control = controlled_begin(0);
+            controlled_phase = phases[p];
+            controlled_fault = fault;
+            bool ready = false;
+            prepared_witness = &prepared;
+            int rc =
+                wl_columnar_memory_governor_growth_commit_prepare_controlled(
+                &fixture.token, &fixture.governor, fixture.old_buffer,
+                &prepared, &ready, control);
+            prepared_witness = NULL;
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (fault == 1
+                ? WL_EVALUATION_CONTROL_CANCELLED : fault ==
+                2 ? EOVERFLOW : EINVAL));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!ready && controlled_hits == 1);
+            prepared_growth_check(&fixture,
+                WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, rc)
+                == (fault == 3 ? 0 : total));
+            prepared_growth_dispose(&fixture, false);
+        }
+    }
+    controlled_phase = 0;
+    controlled_fault = 0;
+    PASS();
+}
+
+typedef struct {
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared;
+    int finish_status;
+    int cancel_status;
+} prepared_growth_thread_t;
+
+static void *
+prepared_growth_wrong_thread(void *opaque)
+{
+    prepared_growth_thread_t *context = opaque;
+    context->finish_status =
+        wl_columnar_memory_governor_growth_commit_finish(context->prepared);
+    context->cancel_status =
+        wl_columnar_memory_governor_growth_commit_cancel(context->prepared);
+    return NULL;
+}
+
+static void
+test_prepared_growth_authority(void)
+{
+    TEST("prepared growth rejects copies, wrong threads and stale attempts");
+    prepared_growth_fixture_t fixture;
+    prepared_growth_init(&fixture);
+    wl_columnar_memory_governor_growth_commit_prepared_t prepared = { 0 };
+    wl_evaluation_control_t *control = controlled_begin(0);
+    bool ready = false;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_prepare_controlled(
+            &fixture.token,
+            &fixture.governor, fixture.old_buffer, &prepared, &ready,
+            control) == 0
+        && ready);
+    wl_columnar_memory_governor_growth_commit_prepared_t copy = prepared;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_finish(&copy) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_cancel(&copy) == EINVAL);
+    prepared_growth_thread_t context = { .prepared = &prepared };
+    wl_thread_t worker;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_thread_create(&worker,
+        prepared_growth_wrong_thread, &context) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_thread_join(&worker) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(context.finish_status == EINVAL
+        && context.cancel_status == EINVAL);
+    prepared_growth_check(&fixture, WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(control,
+        &controlled_owner, 0, 0) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_finish(&prepared) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(control) ==
+        0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(control,
+        &controlled_owner) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_finish(&prepared) == EINVAL);
+    prepared_growth_check(&fixture, WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_cancel(&prepared) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_cancel(&prepared) == EINVAL);
+    prepared_growth_check(&fixture, WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 0);
+    prepared_growth_dispose(&fixture, false);
+    PASS();
+}
+
+static void
+test_prepared_growth_refusals(void)
+{
+    TEST(
+        "prepared growth distinguishes typed shape refusal and execution stops");
+    for (unsigned shape = 0; shape < 3; shape++) {
+        for (int fault = 0; fault <= 3; fault++) {
+            prepared_growth_fixture_t fixture;
+            prepared_growth_init(&fixture);
+            wl_columnar_memory_governor_t other;
+            controlled_governor(&other, 1024);
+            wl_columnar_memory_reservation_t copy = fixture.token;
+            wl_columnar_memory_governor_growth_commit_prepared_t prepared =
+            { 0 };
+            wl_evaluation_control_t *control = controlled_begin(0);
+            controlled_phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_SNAPSHOT;
+            controlled_fault = fault;
+            bool ready = true;
+            prepared_witness = &prepared;
+            int rc =
+                wl_columnar_memory_governor_growth_commit_prepare_controlled(
+                shape == 2 ? &copy : &fixture.token,
+                shape == 0 ? &other : &fixture.governor,
+                shape == 1 ? &other : fixture.old_buffer,
+                &prepared, &ready, control);
+            prepared_witness = NULL;
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (fault <= 1 ? 0
+                : fault == 2 ? EOVERFLOW : EINVAL));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!ready);
+            prepared_growth_check(&fixture,
+                WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_governor_growth_commit_cancel(&prepared) ==
+                EINVAL);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                wl_columnar_memory_governor_growth_commit_finish(&prepared) ==
+                EINVAL);
+            /* Typed refusal beats latched negative stop in execution rc, but
+             * the control report independently retains that disposition. */
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control,
+                fault == 1 ? WL_EVALUATION_CONTROL_CANCELLED : rc)
+                == (fault == 3 ? 0 : 228));
+            prepared_growth_dispose(&fixture, false);
+        }
+    }
+    controlled_phase = 0;
+    controlled_fault = 0;
+    prepared_growth_fixture_t fixture;
+    prepared_growth_init(&fixture);
+    wl_columnar_memory_governor_growth_commit_prepared_t prepared = { 0 };
+    wl_evaluation_control_t *control = controlled_begin(0);
+    bool ready = false;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_prepare_controlled(
+            &fixture.token,
+            &fixture.governor, fixture.old_buffer, &prepared, &ready,
+            control) == 0
+        && ready);
+    /* A live original is never overwritten, despite conservative admission. */
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_prepare_controlled(
+            &fixture.token,
+            &fixture.governor, fixture.old_buffer, &prepared, &ready,
+            control) == EINVAL
+        && ready &&
+        prepared.phase == WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY);
+    prepared_growth_check(&fixture, WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_governor_growth_commit_cancel(&prepared) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 456);
+    prepared_growth_dispose(&fixture, false);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -1671,6 +2060,9 @@ main(void)
     test_controlled_all_region_boundaries();
     test_controlled_raw_admission_twins();
     test_controlled_copied_authority();
+    test_prepared_growth_prefixes();
+    test_prepared_growth_authority();
+    test_prepared_growth_refusals();
     wl_columnar_memory_governor_test_work_checkpoint = NULL;
     wl_columnar_memory_governor_test_checkpoint = NULL;
     wl_columnar_memory_governor_test_before_total_cas = NULL;

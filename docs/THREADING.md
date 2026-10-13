@@ -1491,3 +1491,23 @@ See the [evaluation-control contract](SEMANTICS.md#evaluation-control-foundation
 for prospective checkpoint coverage and the publication cutoff. The future
 256-unit quantum excludes host callbacks, synchronous runtime calls and mandatory
 cleanup/drain; it is not a return-time guarantee or existing engine enforcement.
+
+
+## Prepared governor growth authority (#1821 foundation)
+
+Prepared records belong to their original address and acquiring thread. The
+caller exclusively owns the original token and retains governor/control until
+the record is consumed. Preparation checks the saved active ID after each
+callback before a zero poll; lifecycle observation does not permit concurrent
+host finish. All snapshots precede the claim CAS. Cancel restores only token
+state without refund and is legal after the attempt ends. Finish checks the
+saved active identity before its finite stores. It does not acquire the ledger
+writer gate or call control admission. Existing strong state claim sites are
+reused; four new conditional read/publication sites extend the inventory.
+
+| Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read` | token state/owner | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked observation under original exclusive token authority |
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_read#2` | token state/owner | `atomic_load_explicit` | acquire | C11 observation validates saved scalar authority before terminal stores |
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_cancel` | token state | `atomic_exchange_explicit` | release | Restore only REPLACING after validating original owning cleanup |
+| `memory_governor.c:wl_columnar_memory_governor_growth_commit_finish` | token state | `atomic_exchange_explicit` | release | Publish finite COMMITTED state after saved bytes/kind updates |

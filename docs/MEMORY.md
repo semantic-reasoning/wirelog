@@ -1533,3 +1533,82 @@ allocation, preserves earlier evidence belonging to its enclosing operation.
 Rejected growth preserves storage, row/timestamp contents, generations and
 reservation credit; a retry starts a new operation. This status contract does
 not change worker publication or coordinator rollback transactions (#1964/#1965).
+
+
+### Prepared controlled growth commit (#1821 foundation)
+
+The private `wl_columnar_memory_governor_growth_commit_prepared_t` protocol separates
+reversible preparation from a finite terminal commit. It supports an original
+committed token after `begin_growth`, with an exclusive caller, the expected
+governor and physical owner, and a live active evaluation control. It does not
+activate relation or operator paths. Existing raw and controlled commit APIs,
+including their 4/9-unit costs and NULL-control delegation, are unchanged.
+
+Preparation admits **228 conservative logical units once**, before token or
+record mutation. This includes preparation184 and future finish44; an early
+stop or cancellation of READY does not refund admitted work. Limit227 refuses
+at that admission; limit228 can prepare successfully. Invalid original-record
+arguments can consume228 without changing that record. `consumed` measures
+admitted work, not exactly executed primitive operations.
+
+The source convention counts scalar assignments, individual predicates,
+executed if dispatches, returns/gotos and platform atomic/thread operations.
+Arithmetic operand reads belong to their assignment/predicate. Helpers are
+expanded: atomic read2, active-ID getter4, strong CAS2 and token validator25.
+Control admission/poll scheduling, test callbacks and mandatory error cleanup
+are excluded. No engine-owned loop is hidden behind a cleanup exclusion.
+
+| Preparation region | Conservative slots |
+|---|---:|
+| Seventeen pointer/inert predicates, dispatch/error alternative, ready store, saved getter/local and inactive-id verdict | 28 |
+| Thirteen record stores, thread query, validator25, classification local and result/consume/return alternatives | 50 |
+| Final validator25, predicate/dispatch, expected local, strong CAS2, verdict/dispatch, immediate CLAIMED and refusal alternatives | 37 |
+| At most five checkpoints, each getter/local5, identity predicates/dispatch3, return1 and caller result/dispatch/error alternative4 | 65 |
+| Prepaid marker, READY, ready output and return | 4 |
+| Preparation total | 184 |
+
+Finish44 expands validator25, outer predicates/dispatch5, active getter/local5,
+identity predicates/dispatch3, four token stores4, CONSUMED1 and return1. The
+compile-time typedef guard enforces total228 <= quantum256 on every compiler.
+The logical ceilings cover error alternatives; they are not CPU instructions
+or a runtime latency guarantee.
+
+The five successful checkpoint instrumentation ceilings are41/63/13/50/13, total180.
+They represent conservative source intervals, not exact execution. The final
+READY stores4 plus finish44 account for the remaining48 without a finish
+callback. A stopped preclaim checkpoint plus its unclaimed consume/return costs at
+most15; the extra2 already belongs to the snapshot dispatch reserve. Thus
+the success label13 does not claim to count that complete error-return path.
+The largest forward interval remains63; the trailing helper region is48. Caller
+work between READY and finish needs its own admitted cutoff/composition proof.
+A typed preclaim/claim refusal checkpoint replaces later success checkpoints;
+there is never a sixth checkpoint on one path. Each checkpoint invokes the
+test seam, checks the originally saved active ID, then polls zero work. It
+never charges positive work to a successor attempt after a callback.
+
+All restoration snapshots and thread/attempt/original-address bindings exist
+before the one REPLACING-to-COMMITTING CAS. CLAIMED is recorded immediately
+before its first callback or poll. A copied record or another thread cannot
+finish or cancel it. Finish checks the same active ID before any token store;
+a stale finish leaves READY reachable for original cancellation. Observation
+does not pin the attempt: externally serialized host lifecycle, borrowed live
+references and the existing worker-drain requirements still apply.
+
+Cancel is mandatory cleanup and remains legal after attempt end/reset/rebegin.
+It validates original authority, restores only REPLACING and consumes the
+record; it neither changes the shared governor total nor refunds incoming
+credit. The caller frees incoming physical storage before existing
+`rollback_growth` refunds its own credit. Owning cleanup corruption aborts
+instead of inventing restoration. Successful finish updates bytes to the saved
+sum, clears replacement/kind, release-publishes COMMITTED and consumes the
+record. It has no poll, charge, mutex, callback, allocation, CAS or retry.
+No ledger gate may be held across callback-capable preparation.
+
+`ready` is authoritative only with execution rc0. Shape/claim refusal returns
+rc0/false, including a later latched negative stop after refusal was established;
+the control report independently keeps that disposition. Positive accounting
+or stale-attempt errors take precedence. Invalid pointers/dirty record return
+EINVAL, and a genuine admitted stop propagates its negative disposition.
+`test_memory_governor` uses real old/incoming buffers and an independent peer
+reservation for exact admission, every checkpoint stop/error/stale edge,
+original/copy/thread authority, and physical-free-before-refund checks.
