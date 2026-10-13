@@ -924,6 +924,8 @@ static int controlled_fault;
 static bool prepared_trace_enabled;
 static uint64_t prepared_trace[5];
 static unsigned prepared_trace_count;
+static unsigned prepared_phase_count, prepared_phase_at_fault;
+static unsigned prepared_work_at_fault;
 static wl_columnar_memory_governor_growth_commit_prepared_t *prepared_witness;
 static void
 controlled_work_point(wl_evaluation_control_t *c, uint64_t work)
@@ -942,6 +944,8 @@ static void
 controlled_point(wl_evaluation_control_t *c,
     wl_columnar_memory_reservation_t *token, unsigned phase)
 {
+    if (prepared_trace_enabled)
+        ++prepared_phase_count;
     if (prepared_witness &&
         phase == WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_CLAIMED) {
         WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_witness->phase
@@ -955,20 +959,27 @@ controlled_point(wl_evaluation_control_t *c,
     if (phase != controlled_phase)
         return;
     controlled_hits++;
+    if (prepared_trace_enabled) {
+        prepared_phase_at_fault = prepared_phase_count;
+        prepared_work_at_fault = prepared_trace_count;
+    }
     if (controlled_fault == 1)
         wl_evaluation_control_request_cancel(c);
     else if (controlled_fault == 2)
         WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_charge(c,
             UINT64_MAX) == EOVERFLOW);
-    else if (controlled_fault == 3) {
+    else if (controlled_fault == 3 || controlled_fault == 4) {
         WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(c,
             &controlled_owner, 0, 0) == 0);
         wl_evaluation_control_report_t report;
         WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_report(c,
             &report) == 0 && report.consumed == 228);
-        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(c) == 0);
-        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(c,
-            &controlled_owner) == 0);
+        if (controlled_fault == 3) {
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(c) ==
+                0);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(c,
+                &controlled_owner) == 0);
+        }
     }
 }
 static wl_evaluation_control_t *
@@ -982,6 +993,8 @@ controlled_begin(uint64_t limit)
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(c,
         &controlled_owner) == 0);
     controlled_work = 0; controlled_hits = 0; controlled_cancel_at = 0;
+    prepared_phase_count = 0; prepared_phase_at_fault = 0;
+    prepared_work_at_fault = 0;
     return c;
 }
 static uint64_t
@@ -1708,6 +1721,10 @@ prepared_growth_check(prepared_growth_fixture_t *fixture, uint64_t state)
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
             &fixture->governor) == 41);
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.bytes == 8);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.identity == &fixture->token
+        && fixture->token.governor == &fixture->governor
+        && atomic_load_explicit(&fixture->token.owner_bits,
+        memory_order_relaxed) == (uintptr_t)fixture->old_buffer);
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.replacement_bytes == 16);
     WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->token.transition_kind
         == WL_COLUMNAR_MEMORY_TRANSITION_GROWTH);
@@ -1862,7 +1879,7 @@ test_prepared_growth_prefixes(void)
         WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_READY_CUTOFF,
     };
     for (unsigned p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
-        for (int fault = 1; fault <= 3; fault++) {
+        for (int fault = 1; fault <= 4; fault++) {
             prepared_growth_fixture_t fixture;
             prepared_growth_init(&fixture);
             wl_columnar_memory_governor_growth_commit_prepared_t prepared =
@@ -1872,19 +1889,39 @@ test_prepared_growth_prefixes(void)
             controlled_fault = fault;
             bool ready = false;
             prepared_witness = &prepared;
+            prepared_trace_enabled = true;
+            prepared_trace_count = 0;
             int rc =
                 wl_columnar_memory_governor_growth_commit_prepare_controlled(
                 &fixture.token, &fixture.governor, fixture.old_buffer,
                 &prepared, &ready, control);
             prepared_witness = NULL;
+            prepared_trace_enabled = false;
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_phase_at_fault == p + 1
+                && prepared_work_at_fault == p);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared_phase_count == p + 1
+                && prepared_trace_count == p + (fault >= 3 ? 0u : 1u));
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(prepared.phase == (p == 0
+                ? WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT
+                : WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED));
             WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (fault == 1
                 ? WL_EVALUATION_CONTROL_CANCELLED : fault ==
                 2 ? EOVERFLOW : EINVAL));
             WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!ready && controlled_hits == 1);
             prepared_growth_check(&fixture,
                 WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
-            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, rc)
-                == (fault == 3 ? 0 : total));
+            if (fault == 4) {
+                wl_evaluation_control_report_t report;
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    wl_evaluation_control_active_attempt_id(control) == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_report(
+                        control, &report) == 0 && report.consumed == total
+                    && report.result == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_detach(
+                        control, &controlled_owner) == 0);
+                wl_evaluation_control_release(control);
+            } else WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, rc)
+                    == (fault == 3 ? 0 : total));
             prepared_growth_dispose(&fixture, false);
         }
     }

@@ -3133,6 +3133,33 @@ wl_col_rel_inline_project_column(col_rel_t *dst, uint32_t dst_row,
  * distinction between quota denial, allocator ENOMEM, EOVERFLOW and EINVAL. */
 int
 col_rel_append_row(col_rel_t *r, const int64_t *row);
+
+/* Controlled private single-row append; NULL control delegates directly to raw.
+ * Initialized canonical scalar self-owner only: no destination alias/COW,
+ * arena/pool/compound/lazy-owner expansion. Positive width needs allocated
+ * positive capacity; timestamps must genuinely occupy aligned capacity.
+ * Valid deferred ledger timestamp tracking is supported. Nullary non-TS
+ * capacity0 grows to64 without zero-byte allocation or governor growth.
+ * Caller keeps relation/control/input storage live, serializes control
+ * lifecycle and keeps input values stable during capture. Input may alias
+ * protected destination columns/row_scratch. Input must not overlap control
+ * or mutate protected descriptors, original stack frames/tokens in callbacks.
+ * Saves one original attempt ID before callbacks; stale continuation returns
+ * EINVAL without debiting a successor. Every admitted forward region fits the
+ * source quantum; allocator runtimes/callbacks/mandatory cleanup are excluded.
+ * Always captures input: inline16 or governed heap scratch for width>16.
+ * This may require additional credit versus raw disjoint wide input. Scratch
+ * credit is committed before malloc, and physical free precedes its release.
+ * Authoritative S/P budget denial returns ENOMEM with pending=true; allocator
+ * ENOMEM has no new denial. Positive execution errors precede typed status;
+ * typed denial precedes negative cancellation. Prior pending is cleared only
+ * after successful single acquisition. Stops preserve old rows/storage;
+ * unpublished spare cells may change. Ledger CAS is the final publication
+ * cutoff; no negative return follows it. Original authority/resource cleanup
+ * is mandatory; impossible retirement failure aborts rather than discarding
+ * stack-local authority. This private API does not activate operators. */
+int wl_columnar_relation_append_row_controlled(col_rel_t *r,
+    const int64_t *row, wl_evaluation_control_t *control);
 /* Append a complete input batch under one relation writer.  All row/type
  * validation and governor admission complete before the first row publishes.
  * On ENOMEM, *@denied distinguishes governor refusal from allocator failure. */

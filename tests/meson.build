@@ -183,6 +183,7 @@ testlib_prod_src = files(
     '../wirelog/wirelog_advanced.c',
   ) + thread_src
 testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+                       '-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1',
                        '-DWL_TEST_JOIN_CACHE_HOOK=1',
                        '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1',
                        '-DWL_TEST_LFTJ_ADMISSION_HOOKS=1']

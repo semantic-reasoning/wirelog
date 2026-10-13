@@ -1,7 +1,15 @@
 /* #1821: bounded real scalar materialization, before engine integration. */
 #define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "../wirelog/columnar/internal.h"
+#define WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS 1
+#include "../wirelog/columnar/mem_ledger_publication.h"
 #include <stdio.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -3677,6 +3685,621 @@ test_attempt_single_nonce_and_cleanup(void)
     destroy(single_peer); single_peer = NULL; destroy(r);
 }
 
+/* B1 exercises the actual append operation, including original single,
+ * governor, ledger, row staging and retirement in one call. */
+static void
+row_attach_ledger(col_rel_t *r, wl_mem_ledger_t *ledger)
+{
+    wl_mem_ledger_init(ledger, 0);
+    wl_mem_ledger_alloc(ledger, WL_MEM_SUBSYS_ARENA, 37);
+    r->mem_ledger = ledger;
+    col_rel_ledger_reconcile(r, 0);
+}
+
+static void
+row_ledger_equal(wl_mem_ledger_t *a, wl_mem_ledger_t *b)
+{
+    wl_mem_ledger_snapshot_t x, y;
+    wl_mem_ledger_snapshot(a, &x);
+    wl_mem_ledger_snapshot(b, &y);
+    CHECK(x.current_bytes == y.current_bytes);
+    CHECK(x.peak_bytes == y.peak_bytes);
+    for (unsigned i = 0; i < WL_MEM_SUBSYS_COUNT; ++i)
+        CHECK(x.subsys_bytes[i] == y.subsys_bytes[i]);
+}
+
+static void
+row_twins_equal(col_rel_t *r, col_rel_t *raw)
+{
+    CHECK(r->nrows == raw->nrows && r->capacity == raw->capacity);
+    CHECK(r->timestamp_capacity == raw->timestamp_capacity);
+    CHECK(r->view_generation == raw->view_generation);
+    CHECK(r->storage_generation == raw->storage_generation);
+    CHECK(r->storage_owner_generation == r->storage_generation);
+    CHECK(r->ledger_ts_bytes == raw->ledger_ts_bytes);
+    payload_equal(r, raw, 0);
+    if (r->timestamps)
+        CHECK(memcmp(r->timestamps, raw->timestamps,
+            (size_t)r->nrows * sizeof(*r->timestamps)) == 0);
+    released(r);
+}
+
+static void
+test_row_twins(void)
+{
+    const uint32_t widths[] = { 0, 1, 16, 17 };
+    for (unsigned w = 0; w < 4; ++w)
+        for (unsigned ts = 0; ts < 2; ++ts)
+            for (unsigned tracked = 0; tracked < 2; ++tracked) {
+                col_rel_t *r = relation(widths[w], 2, 1, ts != 0, NULL);
+                col_rel_t *raw = relation(widths[w], 2, 1, ts != 0, NULL);
+                wl_mem_ledger_t a, b;
+                if (tracked) {
+                    row_attach_ledger(r, &a); row_attach_ledger(raw, &b);
+                }
+                int64_t values[17];
+                for (unsigned c = 0; c < 17; ++c) values[c] = c + 90;
+                wl_evaluation_control_t *c = control(0);
+                for (unsigned i = 0; i < 9; ++i) {
+                    CHECK(wl_columnar_relation_append_row_controlled(r,
+                        values, c) == 0);
+                    CHECK(col_rel_append_row(raw, values) == 0);
+                    row_twins_equal(r, raw);
+                    if (tracked) row_ledger_equal(&a, &b);
+                }
+                CHECK(finish(c, 0) > 0); release(c);
+                if (tracked) {
+                    uint64_t current = atomic_load_explicit(&a.current_bytes,
+                            memory_order_relaxed);
+                    col_rel_ledger_reconcile(r, col_rel_owned_ledger_bytes(r));
+                    CHECK(atomic_load_explicit(&a.current_bytes,
+                        memory_order_relaxed) == current);
+                }
+                destroy(r); destroy(raw);
+                if (tracked) {
+                    CHECK(atomic_load_explicit(&a.current_bytes,
+                        memory_order_relaxed) == 37);
+                    row_ledger_equal(&a, &b);
+                }
+            }
+    /* Actual ungoverned enable_timestamps leaves deferred ledger tracking.
+     * Exercise nongrowth then two genuine capacity transitions and destroy. */
+    col_rel_t *r = col_rel_new_auto("drift", 1);
+    col_rel_t *raw = col_rel_new_auto("drift", 1);
+    CHECK(r && raw);
+    wl_mem_ledger_t a, b;
+    row_attach_ledger(r, &a); row_attach_ledger(raw, &b);
+    CHECK(col_rel_enable_timestamps(r) == 0);
+    CHECK(col_rel_enable_timestamps(raw) == 0);
+    CHECK(r->timestamps && r->ledger_ts_bytes == 0);
+    uint32_t original_capacity = r->capacity;
+    int64_t value = 18;
+    wl_evaluation_control_t *c = control(0);
+    for (uint32_t i = 0; i <= original_capacity * 2u; ++i) {
+        CHECK(wl_columnar_relation_append_row_controlled(r, &value, c) == 0);
+        CHECK(col_rel_append_row(raw, &value) == 0);
+        row_twins_equal(r, raw); row_ledger_equal(&a, &b);
+        if (i < original_capacity) CHECK(r->ledger_ts_bytes == 0);
+    }
+    uint64_t current = atomic_load_explicit(&a.current_bytes,
+            memory_order_relaxed);
+    col_rel_ledger_reconcile(r, col_rel_owned_ledger_bytes(r));
+    CHECK(atomic_load_explicit(&a.current_bytes,
+        memory_order_relaxed) == current);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r); destroy(raw);
+    CHECK(atomic_load_explicit(&a.current_bytes, memory_order_relaxed) == 37);
+    row_ledger_equal(&a, &b);
+}
+
+static unsigned row_seams, row_fault_at, row_fault_kind;
+static wl_mem_ledger_t *row_watched_ledger;
+static uint64_t row_old_consumed;
+static void
+row_inject(wl_evaluation_control_t *c)
+{
+    ++row_seams;
+    if (row_seams != row_fault_at) return;
+    if (row_fault_kind == 1) wl_evaluation_control_request_cancel(c);
+    if (row_fault_kind == 2)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    if (row_fault_kind == 3) {
+        row_old_consumed = finish(c, 0);
+        retry(c, 0);
+    }
+}
+
+static void
+row_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (row_watched_ledger)
+        CHECK(atomic_load_explicit(&row_watched_ledger->writer_gate,
+            memory_order_relaxed) == 0);
+    checkpoint(c, work);
+    row_inject(c);
+}
+
+static void
+row_governor(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)token; (void)phase;
+    row_inject(c);
+}
+
+static void
+row_ledger(wl_evaluation_control_t *c,
+    wl_columnar_mem_ledger_publication_prepared_t *prepared, unsigned phase)
+{
+    (void)phase;
+    if (prepared->ledger) row_watched_ledger = prepared->ledger;
+    if (row_watched_ledger)
+        CHECK(atomic_load_explicit(&row_watched_ledger->writer_gate,
+            memory_order_relaxed) == 0);
+    row_inject(c);
+}
+
+static void
+row_nonce(wl_evaluation_control_t *c, uint64_t observed)
+{
+    CHECK(observed != 0); row_inject(c);
+}
+
+static void
+row_writer(wl_evaluation_control_t *c, wl_columnar_source_access_gate_t *gate)
+{
+    CHECK(gate != NULL); row_inject(c);
+}
+
+static void
+row_total_before(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *governor, uint64_t old, bool overflow)
+{
+    (void)old; (void)overflow;
+    CHECK(governor != NULL);
+    row_inject(c);
+}
+
+static void
+row_total_after(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *governor, bool admitted, bool overflow)
+{
+    (void)admitted; (void)overflow;
+    CHECK(governor != NULL);
+    row_inject(c);
+}
+
+static void
+row_hooks(unsigned at, unsigned kind)
+{
+    row_seams = 0; row_fault_at = at; row_fault_kind = kind;
+    row_old_consumed = 0;
+    row_watched_ledger = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = row_total_before;
+    wl_columnar_memory_governor_test_after_total_cas = row_total_after;
+    wl_columnar_relation_test_work_checkpoint = row_work;
+    wl_columnar_memory_governor_test_work_checkpoint = row_work;
+    wl_columnar_memory_governor_test_checkpoint = row_governor;
+    wl_columnar_mem_ledger_publication_test_checkpoint = row_ledger;
+    wl_columnar_relation_test_before_nonce_cas = row_nonce;
+    wl_columnar_relation_test_before_writer_cas = row_writer;
+}
+
+static void
+row_hooks_clear(void)
+{
+    row_watched_ledger = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_mem_ledger_publication_test_checkpoint = NULL;
+    wl_columnar_relation_test_before_nonce_cas = NULL;
+    wl_columnar_relation_test_before_writer_cas = NULL;
+}
+
+static void
+test_row_stops(void)
+{
+    int64_t values[17];
+    for (unsigned i = 0; i < 17; ++i) values[i] = 90 + i;
+    col_rel_t *r = relation(17, 2, 2, true, NULL);
+    wl_mem_ledger_t ledger;
+    row_attach_ledger(r, &ledger);
+    wl_evaluation_control_t *c = control(0);
+    row_hooks(0, 0);
+    CHECK(wl_columnar_relation_append_row_controlled(r, values, c) == 0);
+    unsigned seams = row_seams;
+    uint64_t cost = finish(c, 0);
+    CHECK(seams > 50 && cost > 498);
+    row_hooks_clear(); release(c); destroy(r);
+    /* Every actual nested seam is exercised independently. A restarted
+     * successor must retain zero consumed work despite original cleanup. */
+    for (unsigned kind = 1; kind <= 3; ++kind)
+        for (unsigned seam = 1; seam <= seams; ++seam) {
+            r = relation(17, 2, 2, true, NULL);
+            row_attach_ledger(r, &ledger);
+            growth_snapshot_t before = snapshot(r);
+            uint64_t ledger_before = atomic_load_explicit(&ledger.current_bytes,
+                    memory_order_relaxed);
+            c = control(0); row_hooks(seam, kind);
+            int expected = kind == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                : kind == 2 ? EOVERFLOW : EINVAL;
+            CHECK(wl_columnar_relation_append_row_controlled(r, values, c)
+                == expected);
+            CHECK(row_seams >= seam &&
+                row_seams <= seam + (kind == 3 ? 0u : 2u));
+            row_hooks_clear();
+            unchanged(r, before); released(r);
+            CHECK(atomic_load_explicit(&ledger.current_bytes,
+                memory_order_relaxed) == ledger_before);
+            if (kind == 3) {
+                CHECK(row_old_consumed > 0);
+                CHECK(finish(c, 0) == 0);
+            } else CHECK(finish(c, expected) > 0);
+            release(c); destroy(r);
+        }
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        r = relation(17, 2, 2, true, NULL);
+        row_attach_ledger(r, &ledger);
+        growth_snapshot_t before = snapshot(r);
+        c = control(cost - (exact ? 0 : 1));
+        int expected = exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+        CHECK(wl_columnar_relation_append_row_controlled(r, values,
+            c) == expected);
+        uint64_t used = finish(c, expected);
+        if (exact) CHECK(used == cost);
+        else {
+            CHECK(used < cost); unchanged(r, before);
+        }
+        release(c); destroy(r);
+    }
+}
+
+static void
+test_row_resources(void)
+{
+    int64_t values[17];
+    for (unsigned i = 0; i < 17; ++i) values[i] = 80 + i;
+    /* Wide S, table, each of seventeen lanes, and timestamp allocation. */
+    for (unsigned allocation = 1; allocation <= 20; ++allocation) {
+        col_rel_t *r = relation(17, 2, 2, true, NULL);
+        growth_snapshot_t before = snapshot(r);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_test_growth_fail_allocation = allocation;
+        CHECK(wl_columnar_relation_append_row_controlled(r, values,
+            c) == ENOMEM);
+        CHECK(wl_columnar_relation_test_growth_fail_allocation == 0);
+        CHECK(!r->memory_budget_denial_pending);
+        CHECK(finish(c, ENOMEM) > 0); unchanged(r, before); released(r);
+        release(c); destroy(r);
+    }
+    for (unsigned wide = 0; wide < 2; ++wide) {
+        col_rel_t *r = relation(wide ? 17 : 1, 2, 2, false, NULL);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        growth_snapshot_t before = snapshot(r);
+        atomic_store_explicit(&g->usable_bytes, before.reserved,
+            memory_order_relaxed);
+        wl_evaluation_control_t *c = control(0);
+        CHECK(wl_columnar_relation_append_row_controlled(r, values,
+            c) == ENOMEM);
+        CHECK(r->memory_budget_denial_pending);
+        CHECK(finish(c, ENOMEM) > 0); unchanged(r, before);
+        retry(c, 1);
+        CHECK(wl_columnar_relation_append_row_controlled(r, values, c)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(r->memory_budget_denial_pending);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == 0);
+        retry(c, 0);
+        atomic_store_explicit(&g->usable_bytes, WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            memory_order_relaxed);
+        wl_columnar_relation_test_growth_fail_allocation = 1;
+        CHECK(wl_columnar_relation_append_row_controlled(r, values,
+            c) == ENOMEM);
+        CHECK(!r->memory_budget_denial_pending);
+        CHECK(finish(c, ENOMEM) > 0); unchanged(r, before);
+        retry(c, 0);
+        growth_watch = r; growth_peak = 0;
+        CHECK(wl_columnar_relation_append_row_controlled(r, values, c) == 0);
+        uint64_t incoming = (uint64_t)r->ncols * (4 * sizeof(int64_t)
+            + sizeof(int64_t *));
+        CHECK(growth_peak == before.reserved + incoming
+            + (wide ? 17 * sizeof(int64_t) : 0));
+        growth_watch = NULL;
+        CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    }
+}
+
+static void
+test_row_alias_and_nullary(void)
+{
+    for (unsigned wide = 0; wide < 2; ++wide) {
+        uint32_t width = wide ? 17 : 2;
+        col_rel_t *r = relation(width, 32, 32, false, NULL);
+        col_rel_t *raw = relation(width, 32, 32, false, NULL);
+        wl_evaluation_control_t *c = control(0);
+        CHECK(wl_columnar_relation_append_row_controlled(r,
+            r->columns[0] + 1, c) == 0);
+        CHECK(col_rel_append_row(raw, raw->columns[0] + 1) == 0);
+        row_twins_equal(r, raw);
+        for (uint32_t i = 0; i < width; ++i)
+            CHECK(r->columns[i][32] == (int64_t)i + 1);
+        CHECK(r->row_scratch && raw->row_scratch);
+        for (uint32_t i = 0; i < width; ++i)
+            r->row_scratch[i] = raw->row_scratch[i] = 71 + i;
+        CHECK(wl_columnar_relation_append_row_controlled(r, r->row_scratch,
+            c) == 0);
+        CHECK(col_rel_append_row(raw, raw->row_scratch) == 0);
+        row_twins_equal(r, raw);
+        CHECK(finish(c, 0) > 0); release(c); destroy(r); destroy(raw);
+    }
+    col_rel_t *r = relation(0, 0, 0, false, NULL);
+    col_rel_t *raw = relation(0, 0, 0, false, NULL);
+    int64_t dummy = 0;
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_relation_append_row_controlled(r, &dummy, c) == 0);
+    CHECK(col_rel_append_row(raw, &dummy) == 0);
+    CHECK(r->capacity == 64); row_twins_equal(r, raw);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r); destroy(raw);
+    r = relation(1, 2, 1, false, NULL); raw = relation(1, 2, 1, false, NULL);
+    CHECK(wl_columnar_relation_append_row_controlled(r, &dummy, NULL) == 0);
+    CHECK(col_rel_append_row(raw, &dummy) == 0); row_twins_equal(r, raw);
+    destroy(r); destroy(raw);
+}
+
+static void
+test_row_float_and_refusal(void)
+{
+    col_rel_t *r = relation(1, 2, 0, false, NULL);
+    col_rel_t *raw = relation(1, 2, 0, false, NULL);
+    wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+    CHECK(col_rel_set_column_types(r, &type, 1) == 0);
+    CHECK(col_rel_set_column_types(raw, &type, 1) == 0);
+    int64_t values[] = { INT64_MIN, 0, INT64_C(0x3ff8000000000000),
+                         INT64_C(0x7ff0000000000000),
+                         INT64_C(0x7ff8000000000001) };
+    wl_evaluation_control_t *c = control(0);
+    for (unsigned i = 0; i < 5; ++i) {
+        int expected = i < 3 ? 0 : EINVAL;
+        CHECK(wl_columnar_relation_append_row_controlled(r, &values[i],
+            c) == expected);
+        CHECK(col_rel_append_row(raw, &values[i]) == expected);
+        row_twins_equal(r, raw);
+    }
+    CHECK(r->columns[0][0] == 0 && r->columns[0][1] == 0);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r); destroy(raw);
+    for (unsigned bad = 0; bad < 4; ++bad) {
+        r = relation(bad == 0 ? 1 : 0, bad == 0 ? 0 : 2, 0, false, NULL);
+        growth_snapshot_t before = snapshot(r);
+        uint64_t original_view = r->view_generation;
+        uint64_t original_storage = r->storage_generation;
+        uint32_t original_rows = r->nrows, original_capacity = r->capacity;
+        if (bad ==
+            1) r->view_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+        if (bad == 2) {
+            r->capacity = UINT32_MAX; r->nrows = UINT32_MAX;
+        }
+        if (bad == 3) {
+            r->nrows = r->capacity;
+            r->storage_generation = WL_COLUMNAR_REL_GENERATION_INVALID - 1u;
+            r->storage_owner_generation = r->storage_generation;
+        }
+        int expected = bad ? EOVERFLOW : ENOTSUP;
+        c = control(0);
+        CHECK(wl_columnar_relation_append_row_controlled(r, values,
+            c) == expected);
+        CHECK(finish(c, expected) > 0); release(c);
+        r->view_generation = original_view;
+        r->storage_generation = r->storage_owner_generation = original_storage;
+        r->nrows = original_rows; r->capacity = original_capacity;
+        unchanged(r, before); released(r); destroy(r);
+    }
+    /* Quiescent ungoverned shape fixture with a genuinely allocated longer
+     * timestamp image; no retained token or ledger tracking is fabricated. */
+    r = col_rel_new_auto("long-ts", 1);
+    CHECK(r && col_rel_enable_timestamps(r) == 0);
+    uint32_t longer = r->capacity + 1u;
+    col_delta_timestamp_t *timestamps = realloc(r->timestamps,
+            (size_t)longer * sizeof(*timestamps));
+    CHECK(timestamps != NULL);
+    r->timestamps = timestamps;
+    r->timestamp_capacity = longer;
+    growth_snapshot_t before = snapshot(r);
+    c = control(0);
+    CHECK(wl_columnar_relation_append_row_controlled(r, values, c) == ENOTSUP);
+    CHECK(finish(c, ENOTSUP) > 0); release(c); unchanged(r, before);
+    destroy(r);
+}
+
+static void
+test_row_auxiliary_peer(void)
+{
+    col_rel_t *r = relation(17, 2, 2, true, NULL);
+    col_rel_t *peer = relation(1, 3, 1, false, r->memory_governor);
+    CHECK(col_rel_reserve_merge_grid(r, 3) == 0);
+    int64_t **merge = r->merge_columns;
+    merge[0][0] = 993;
+    int64_t *scratch = r->row_scratch;
+    growth_snapshot_t before = snapshot(r);
+    int64_t values[17];
+    for (unsigned i = 0; i < 17; ++i) values[i] = 45 + i;
+    wl_evaluation_control_t *c = control(0);
+    growth_watch = r; growth_peak = 0;
+    CHECK(wl_columnar_relation_append_row_controlled(r, values, c) == 0);
+    uint64_t incoming = 17 * (4 * sizeof(int64_t) + sizeof(int64_t *))
+        + 4 * sizeof(col_delta_timestamp_t);
+    uint64_t old_image = 17 * (2 * sizeof(int64_t) + sizeof(int64_t *))
+        + 2 * sizeof(col_delta_timestamp_t);
+    CHECK(growth_peak == before.reserved + incoming + 17 * sizeof(int64_t));
+    CHECK(r->retained_reserved_bytes == before.credit + incoming - old_image);
+    CHECK(r->merge_columns == merge && merge[0][0] == 993);
+    CHECK(r->row_scratch == scratch);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(peer->memory_governor);
+    CHECK(atomic_load_explicit(&g->reserved_bytes, memory_order_relaxed)
+        == before.reserved + incoming - old_image);
+    growth_watch = NULL;
+    CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    CHECK(peer->columns[0][0] == 0); released(peer); destroy(peer);
+}
+
+#ifndef _WIN32
+static int
+row_release_refused(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    (void)single;
+    return slot == single_fail_slot ? EIO : 0;
+}
+
+static void
+test_row_release_fail_stop(void)
+{
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            struct rlimit core_limit = {0, 0};
+            (void)setrlimit(RLIMIT_CORE, &core_limit);
+            fclose(stderr);
+            col_rel_t *r = relation(mode == 2 ? 17 : 1, 2, 1,
+                    false, NULL);
+            int64_t values[17] = {0};
+            wl_evaluation_control_t *c = control(0);
+            if (mode < 2) {
+                single_fail_slot = mode;
+                wl_columnar_relation_test_single_release = row_release_refused;
+            } else wl_columnar_memory_governor_test_refuse_next_release();
+            (void)wl_columnar_relation_append_row_controlled(r, values, c);
+            _exit(0);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status)
+            && WTERMSIG(status) == SIGABRT);
+    }
+}
+#endif
+
+static void
+test_row_real_ledger_peer(void)
+{
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_init(&ledger, 0);
+    col_rel_t *r = relation(2, 2, 1, true, NULL);
+    col_rel_t *peer = col_rel_new_auto("ledger-peer", 1);
+    CHECK(peer != NULL);
+    r->mem_ledger = peer->mem_ledger = &ledger;
+    col_rel_ledger_reconcile(r, 0);
+    col_rel_ledger_reconcile(peer, 0);
+    const uint64_t peer_bytes = col_rel_owned_ledger_bytes(peer);
+    int64_t values[2] = {71, 91};
+    wl_evaluation_control_t *c = control(0);
+    for (unsigned i = 0; i < 9; ++i) {
+        CHECK(wl_columnar_relation_append_row_controlled(r, values, c) == 0);
+        uint64_t owned = col_rel_owned_ledger_bytes(r);
+        uint64_t ts = (uint64_t)r->timestamp_capacity * sizeof(*r->timestamps);
+        CHECK(r->ledger_ts_bytes == ts);
+        CHECK(atomic_load_explicit(&ledger.current_bytes, memory_order_relaxed)
+            == peer_bytes + owned + ts);
+        col_rel_ledger_reconcile(r, owned);
+        CHECK(atomic_load_explicit(&ledger.current_bytes, memory_order_relaxed)
+            == peer_bytes + owned + ts);
+    }
+    CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    CHECK(atomic_load_explicit(&ledger.current_bytes, memory_order_relaxed)
+        == peer_bytes);
+    released(peer); destroy(peer);
+    CHECK(atomic_load_explicit(&ledger.current_bytes,
+        memory_order_relaxed) == 0);
+}
+
+/* Literal operation-region oracle for one real governed one-lane growth,
+ * no ledger/TS: B1 source table + AB-S and AB-G source tables. This is
+ * independent of checkpoint observations and the whole-call measured cost. */
+static void
+test_row_region_boundaries(void)
+{
+    static const uint64_t regions[] = {
+        80, 56,
+        94, 19, 39, 39, 45, 52, 45, 21, 144,
+        96, 31, 31,
+        81, 81, 81, 81, 81, 74,
+        74, 54, 84, 29,
+        30, 30, 181, 31,
+        66, 149, 24, 228, 46
+    };
+    uint64_t prefix = 0;
+    const size_t count = sizeof(regions) / sizeof(regions[0]);
+    for (size_t region = 0; region < count; ++region) {
+        uint64_t previous = prefix;
+        prefix += regions[region];
+        for (unsigned exact = 0; exact < 2; ++exact) {
+            col_rel_t *r = relation(1, 1, 1, false, NULL);
+            growth_snapshot_t before = snapshot(r);
+            int64_t value = 81;
+            wl_evaluation_control_t *c = control(prefix - (exact ? 0 : 1));
+            int expected = exact && region + 1 == count
+                ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(wl_columnar_relation_append_row_controlled(r, &value,
+                c) == expected);
+            CHECK(finish(c, expected) == (exact ? prefix : previous));
+            if (expected) unchanged(r, before);
+            else CHECK(r->nrows == 2 && r->columns[0][1] == value);
+            released(r); release(c); destroy(r);
+        }
+    }
+}
+
+static unsigned row_denial_fault, row_denial_hits;
+static void
+row_denial_verdict(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)token;
+    if (phase != WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT) return;
+    ++row_denial_hits;
+    if (row_denial_fault == 1) wl_evaluation_control_request_cancel(c);
+    if (row_denial_fault == 2)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    if (row_denial_fault == 3) {
+        row_old_consumed = finish(c, 0);
+        retry(c, 0);
+    }
+}
+
+static void
+test_row_denial_precedence(void)
+{
+    for (unsigned wide = 0; wide < 2; ++wide)
+        for (unsigned fault = 1; fault <= 3; ++fault) {
+            col_rel_t *r = relation(wide ? 17 : 1, 2, 2, false, NULL);
+            growth_snapshot_t before = snapshot(r);
+            wl_columnar_memory_governor_t *g =
+                wl_columnar_memory_governor_ref_get(r->memory_governor);
+            atomic_store_explicit(&g->usable_bytes, before.reserved,
+                memory_order_relaxed);
+            int64_t values[17] = {0};
+            wl_evaluation_control_t *c = control(0);
+            row_denial_fault = fault; row_denial_hits = 0;
+            row_old_consumed = 0;
+            wl_columnar_memory_governor_test_checkpoint = row_denial_verdict;
+            int expected = fault == 1 ? ENOMEM : fault ==
+                2 ? EOVERFLOW : EINVAL;
+            CHECK(wl_columnar_relation_append_row_controlled(r, values,
+                c) == expected);
+            wl_columnar_memory_governor_test_checkpoint = NULL;
+            CHECK(row_denial_hits == 1);
+            CHECK(r->memory_budget_denial_pending == (fault == 1));
+            unchanged(r, before); released(r);
+            if (fault == 3) {
+                CHECK(row_old_consumed > 0);
+                CHECK(finish(c, 0) == 0);
+            } else CHECK(finish(c, expected) > 0);
+            release(c); destroy(r);
+        }
+}
+
 int
 main(void)
 {
@@ -3725,6 +4348,18 @@ main(void)
     test_single_refusals();
     test_single_partial_acquisition_cleanup();
     test_single_nonce_stopped_publication();
+#ifndef _WIN32
+    test_row_release_fail_stop();
+#endif
+    test_row_float_and_refusal();
+    test_row_auxiliary_peer();
+    test_row_region_boundaries();
+    test_row_real_ledger_peer();
+    test_row_twins();
+    test_row_stops();
+    test_row_denial_precedence();
+    test_row_resources();
+    test_row_alias_and_nullary();
     test_attempt_single_boundaries();
     test_attempt_single_seams();
     test_attempt_single_entry();

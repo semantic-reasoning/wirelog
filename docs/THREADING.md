@@ -1570,7 +1570,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains308 call sites.
+The complete current atomic-source inventory contains312 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1593,3 +1593,21 @@ an evaluation operator or alter existing raw admission.
 | `relation.c:wl_columnar_relation_nonce_attempt_controlled#4` | global mutation nonce | `atomic_compare_exchange_strong_explicit` | relaxed | Claim one unique nonce; failed attempts update the expected value for the next charged round |
 | `relation.c:wl_columnar_relation_writer_attempt_controlled` | descriptor or self-owner source gate | `atomic_compare_exchange_weak_explicit` | acquire success / relaxed failure (MSVC strong shim) | One nonwaiting writer claim; original token/count published before work callback |
 | `relation.c:wl_columnar_relation_writer_attempt_controlled#2` | descriptor or self-owner source gate | `atomic_compare_exchange_strong_explicit` | acquire success / relaxed failure | One nonwaiting writer claim; busy preserves independent reader/writer authority |
+
+### Controlled private single-row publication
+
+The row operation keeps original descriptor and self-owner writers throughout
+capture, staging, publication and retirement. Governor peers may retain or
+change unrelated credit; the operation refunds only its original S/P credit.
+The ledger gate is acquired only after fallible preparation. Successful CAS
+begins one finite terminal with ceiling223, including all caller operations;
+no hook, poll, allocator, generic epoch helper or raw reconciliation runs before
+release. The timestamp tracking mirror is stored after apply and before release.
+Physical retirement and original credit downsizing follow gate release.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `relation.c:wl_columnar_relation_row_scratch_init` | original scratch owner bits | `atomic_init` | original inert initialization | Initialize unshared stack token before acquisition without bulk zeroing |
+| `relation.c:wl_columnar_relation_row_scratch_init#2` | original scratch state | `atomic_init` | original inert initialization | Establish EMPTY before original scratch reservation |
+| `relation.c:wl_columnar_relation_append_row_controlled` | original retained owner bits | `atomic_load_explicit` | acquire | Validate relation-owned retained authority while original writers and token exclusivity hold |
+| `relation.c:wl_columnar_relation_append_row_controlled#2` | original retained state | `atomic_load_explicit` | acquire | Require COMMITTED before beginning original growth; shared governor totals remain independent |

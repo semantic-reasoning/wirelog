@@ -1747,3 +1747,90 @@ cannot forge/free original authority or change protected descriptor shape.
 Mandatory release hooks are exempt from forward ID checks. An initiating
 positive error may mask a later release error; inspect and drain retained
 original authority regardless of the returned error value.
+
+### Controlled private row append
+
+`wl_columnar_relation_append_row_controlled` materializes one scalar row under
+an original descriptor/source mutation single. A NULL control delegates to raw
+append. The controlled destination is an initialized private canonical heap
+owner; positive width needs allocated positive capacity, and an existing
+timestamp image must occupy the same capacity. Nullary non-timestamp capacity0
+advances to64 without a zero-byte allocation or governor growth transaction.
+Deferred timestamp ledger tracking remains valid.
+
+The original active attempt ID is captured before callbacks and remains fixed
+through single admission, scratch/payload admission, staging and publication.
+A callback that finishes and restarts the control causes EINVAL before another
+forward callback, claim, poll or debit of that successor. The caller retains
+live storage and serializes control lifecycle. Input values remain stable during
+capture; input may be a readable slice of destination columns or row_scratch.
+Callbacks cannot free or alter the protected descriptor or original authority.
+
+The complete input is captured before writes or retirement: inline through
+width16, heap scratch above16. Governed scratch is reserved and committed at
+its original address before malloc. This deliberate scratch requirement can
+consume more memory than raw append with disjoint wide input. The incoming
+payload includes a full new pointer table, lanes and timestamps beside the old
+image. Auxiliary merge, backup and scratch payload remains resident and keeps
+its coverage; descriptor/metadata credit is untouched. No aggregate governor
+or ledger counter supplies ownership of a token.
+
+S or P authoritative DENIED returns ENOMEM and sets
+memory_budget_denial_pending. An allocator failure returns ENOMEM without
+inventing that provenance. Nonzero execution rc is inspected before a typed
+status; an established typed denial wins over negative cancellation, while a
+positive stale/accounting error wins over both. Prior denial provenance clears
+only after successful original single acquisition. Failed bootstrap/admission
+preserves it.
+
+The source-operation tariff table expands predicates, stores, arithmetic,
+branches, loops, helper returns and refused-child caller continuations. It is
+admitted work, not exact executed-work telemetry. Sixteen-byte copy chunks
+preserve timestamp padding. Fixed scalar initialization avoids an unmetered
+structure-sized zero.
+
+| Row region | Admitted ceiling |
+| --- | ---: |
+| Initial single frame | 80 |
+| Other original records | 56 |
+| Shape and next epochs | 96 |
+| Each size component | 81 |
+| Each scalar lane/value | 31 |
+| Each at-most16-byte copy/zero chunk | 181 |
+| Each allocation/ownership marker | 30 |
+| Credit validation/caller continuation | 74 |
+| Original lexical publication recipe | 66 |
+| Exact-one lease validation | 149 |
+| Prepared-helper caller continuation | 24 |
+| Publication caller glue | 46 |
+
+AB-S admits498 on the first nonce round; AB-G reserve/begin admits241 on its
+first aggregate round and commit157. Prepared governor admission228 includes
+finish44. Ledger preparation109+166 includes initial26, apply117 and release23;
+each gate attempt admits28. Those nested tariffs remain separate from row
+caller glue. The bounded read-only root bootstrap is included retrospectively
+in the first80 admission; invalid bootstrap can consume0. Maximum conservative
+interprocedural polling work is242, below quantum256; byte chunks have their
+own guarded polls.
+
+Before publication the operation validates the original exact-one frame and
+precomputes new pointers, capacities, epochs and ordered ledger deltas.
+Successful ledger CAS is the final cutoff. The complete contiguous governed
+ledger sequence, including CAS and caller/return glue, has ceiling223;
+ungoverned ledger175, governed/no-ledger74, ungoverned/no-ledger26 and
+nongrowth10. It executes no callback, new admission, allocation, generic lease
+advance or raw ledger reconciliation. Governor finish precedes direct stores;
+ledger events apply RELATION then TIMESTAMP against current counters, followed
+by the timestamp tracking mirror and gate release. TIMESTAMP uses final
+physical bytes minus the prior tracked mirror, supporting actual deferred
+tracking from ungoverned enable_timestamps. Nongrowth and no-ledger append
+preserve the mirror.
+
+After releasing the ledger gate, old physical lanes/table/timestamps retire
+before original P credit downsizes to the final retained footprint. Scratch
+physical storage likewise retires before its credit releases. Failed staging
+cancels original prepared records, frees incoming storage, refunds only owned
+credit and drains the original single. Mandatory cleanup is noncancellable;
+impossible retirement failure aborts with original authority reachable. Stopped
+nongrowth can change unpublished spare cells, but rows/view/storage remain
+unchanged. This API alone does not enable evaluation operators.

@@ -697,6 +697,11 @@ wl_columnar_memory_governor_growth_commit_checkpoint(
 {
 #if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
     WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(control, token, phase);
+    /* The two artificial callbacks are separate attempt boundaries. This
+     * observation is test instrumentation; production retains H9 below. */
+    uint64_t hook_active = wl_evaluation_control_active_attempt_id(control);
+    if (!hook_active || hook_active != saved_id)
+        return EINVAL;
     if (wl_columnar_memory_governor_test_work_checkpoint)
         wl_columnar_memory_governor_test_work_checkpoint(control, interval);
 #else
