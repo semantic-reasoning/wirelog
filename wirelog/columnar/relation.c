@@ -12877,6 +12877,450 @@ wl_columnar_relation_copy_rows(const char *name, const col_rel_t *src,
     return 0;
 }
 
+/* Controlled physical range projection: logical source funding.
+ * G9, guarded charge prefix12, guarded tail/caller24. Original physical,
+ * credit/ref, frame and reader retirement bodies are mandatory exclusions;
+ * this does NOT exclude the new copy drain's ordinary state and dispatch.
+ * D32 drain: original batch/address/remaining-authority checks, end result,
+ * allocation/admission/ref/source decisions and markers, DRAINED and return.
+ * W44 adds public result assignment, three !rc decisions, local-destroy
+ * dispatch and return. C48 adds the child result/branch/goto. Complete child
+ * chains: builder direct53, leaf57, scanner60; source55 and reader/source63.
+ * SOURCE_CALL128 and BUILD_CALL128 prepay their added caller suffix once:
+ * success/postchild work and failure/unwind are mutually exclusive. Existing
+ * child admissions still fund each child loop; refused children pay nothing.
+ * Complete new-region funding envelopes (including failure alternatives):
+ * ENTRY76, INIT168 (ctx10+scratch8+batch10+single55+marker1, then24+12+C48),
+ * SOURCE_CALL124, SHAPE118, LANE97, BUILD_CALL126, GATHER_PIN93,
+ * RESERVE_CALL145, COMMIT_CALL131, ALLOC99, BEGIN_CALL218 (includes86 inert
+ * reads BEFORE refused child170), ROW_BEGIN87, CELL152 for8 indexed cells,
+ * ROW_CALL153 (includes25 BEFORE refused CHECK220), EXTERNAL68.
+ * Inherited bytes161+edge31-shared3+new scanner60 give conservative249;
+ * their incremental caller suffix is prepaid by BUILD_CALL, not BYTES224.
+ * Fresh private construction installs no ledger and disables timestamps;
+ * source ledger is not inherited and local output is not exposed. Reachable
+ * batch terminals are therefore no-ledger76/28, not generic ledger225.
+ * Actual returned-poll intervals: CHECK225, row bytes231, validation199,
+ * renewal/AB-S209, constructor AB-G return202. Internal248/168 are separated
+ * by real polls and are never summed blindly with entire copy tariffs.
+ * Overall249 is a conservative source envelope, not measured instructions,
+ * a sum of tariff values, an elapsed bound or a mandatory-cleanup bound. */
+enum {
+    WL_COLUMNAR_RELATION_COPY_ROWS_ENTRY_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_INIT_WORK = 192,
+    WL_COLUMNAR_RELATION_COPY_ROWS_SOURCE_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_SHAPE_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_LANE_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_BUILD_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_GATHER_PIN_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_RESERVE_CALL_WORK = 160,
+    WL_COLUMNAR_RELATION_COPY_ROWS_COMMIT_CALL_WORK = 160,
+    WL_COLUMNAR_RELATION_COPY_ROWS_ALLOC_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK = 224,
+    WL_COLUMNAR_RELATION_COPY_ROWS_ROW_BEGIN_WORK = 128,
+    WL_COLUMNAR_RELATION_COPY_ROWS_CELL_WORK = 224,
+    WL_COLUMNAR_RELATION_COPY_ROWS_ROW_CALL_WORK = 192,
+    WL_COLUMNAR_RELATION_COPY_ROWS_EXTERNAL_WORK = 96,
+};
+
+typedef char wl_columnar_relation_copy_rows_init_bound[
+        (UINT64_C(168) <= WL_COLUMNAR_RELATION_COPY_ROWS_INIT_WORK) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_commit_bound[
+        (UINT64_C(131) <=
+        WL_COLUMNAR_RELATION_COPY_ROWS_COMMIT_CALL_WORK) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_begin_bound[
+        (UINT64_C(218) <=
+        WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_row_call_bound[
+        (UINT64_C(153) <=
+        WL_COLUMNAR_RELATION_COPY_ROWS_ROW_CALL_WORK) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_cell_bound[
+        (UINT64_C(152) <= WL_COLUMNAR_RELATION_COPY_ROWS_CELL_WORK) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_source_bound[
+        (UINT64_C(249) <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+typedef char wl_columnar_relation_copy_rows_tariffs_bound[
+        (WL_COLUMNAR_RELATION_COPY_ROWS_ENTRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_INIT_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_SOURCE_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_SHAPE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_LANE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_BUILD_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_GATHER_PIN_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_RESERVE_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_COMMIT_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_ALLOC_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_ROW_BEGIN_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_CELL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_ROW_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_COPY_ROWS_EXTERNAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+typedef struct {
+    wl_columnar_relation_constructor_attempt_source_t source;
+    wl_columnar_relation_append_batch_t batch;
+    col_rel_t *local;
+    int64_t inline_values[16];
+    int64_t *gather;
+    uint64_t gather_bytes;
+    wl_columnar_memory_governor_ref_t *gather_ref;
+    wl_columnar_memory_reservation_t gather_credit;
+    bool source_held;
+    bool batch_initialized;
+    bool gather_allocated;
+    bool gather_admitted;
+    bool gather_committed;
+    bool ref_held;
+} wl_columnar_relation_copy_rows_context_t;
+
+static int
+wl_columnar_relation_copy_rows_drain(
+    wl_columnar_relation_copy_rows_context_t *ctx, int result)
+{
+    if (ctx->batch_initialized && ctx->batch.identity) {
+        if (ctx->batch.identity != &ctx->batch)
+            abort();
+        result = wl_columnar_relation_append_batch_end_controlled(&ctx->batch,
+                result);
+        /* A negative initiating result can accompany a successful drain.
+         * Remaining authority, rather than the sign, decides safe retirement. */
+        if (ctx->batch.phase != WL_COLUMNAR_RELATION_BATCH_ENDED
+            || ctx->batch.raw.active || ctx->batch.raw.single.set.identity
+            || ctx->batch.raw.single.set.descriptors_acquired
+            || ctx->batch.raw.single.set.owners_acquired)
+            abort();
+    }
+    if (ctx->gather_allocated) {
+        free(ctx->gather);
+        ctx->gather_allocated = false;
+    }
+    if (ctx->gather_admitted) {
+        bool released = ctx->gather_committed
+            ? wl_columnar_memory_release(&ctx->gather_credit)
+            : wl_columnar_memory_rollback(&ctx->gather_credit);
+        if (!released)
+            abort();
+        ctx->gather_admitted = false;
+    }
+    if (ctx->ref_held) {
+        wl_columnar_memory_governor_ref_release(ctx->gather_ref);
+        ctx->ref_held = false;
+    }
+    if (ctx->source_held) {
+        wl_columnar_relation_constructor_attempt_source_drain(&ctx->source);
+        ctx->source_held = false;
+    }
+    return result;
+}
+
+int
+wl_columnar_relation_copy_rows_controlled(const char *name,
+    const col_rel_t *src,
+    uint32_t begin, uint32_t end, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_relation_copy_rows(name, src, begin, end, governor,
+                   out);
+    if (out)
+        *out = NULL;
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_ENTRY_WORK);
+    if (rc)
+        return rc;
+    bool valid = out && name && src;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_ENTRY_WORK);
+    if (rc > 0 || valid) {
+        if (rc)
+            return rc;
+    } else
+        return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_INIT_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_copy_rows_context_t ctx;
+    ctx.local = NULL;
+    ctx.gather = ctx.inline_values;
+    ctx.gather_bytes = 0;
+    ctx.gather_ref = NULL;
+    ctx.source_held = false;
+    ctx.batch_initialized = false;
+    ctx.gather_allocated = false;
+    ctx.gather_admitted = false;
+    ctx.gather_committed = false;
+    ctx.ref_held = false;
+    wl_columnar_relation_row_scratch_init(&ctx.gather_credit);
+    ctx.batch.identity = NULL;
+    ctx.batch.control = NULL;
+    ctx.batch.attempt_id = 0;
+    ctx.batch.phase = WL_COLUMNAR_RELATION_BATCH_EMPTY;
+    ctx.batch.raw_mode = false;
+    ctx.batch.result_saved = false;
+    ctx.batch.saved_result = 0;
+    ctx.batch.raw.relation = NULL;
+    ctx.batch.raw.active = false;
+    ctx.batch.raw.verified_generation = 0;
+    wl_columnar_relation_row_single_init(&ctx.batch.raw.single);
+    ctx.batch_initialized = true;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_INIT_WORK);
+    if (rc)
+        goto done;
+    /* Prepay the copy caller, including inherited child refusal returns. */
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_SOURCE_CALL_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_SOURCE_CALL_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_source_acquire(src, false,
+            &ctx.source, control, attempt_id);
+    if (rc)
+        goto done;
+    ctx.source_held = true;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id, 0);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_SHAPE_WORK);
+    if (rc)
+        goto done;
+    valid = begin <= end && end <= ctx.source.snapshot_nrows
+        && ctx.source.snapshot_nrows <= ctx.source.snapshot_capacity;
+    bool size_ok = wl_columnar_memory_size_mul(ctx.source.width,
+            sizeof(int64_t), &ctx.gather_bytes)
+        && ctx.gather_bytes <= SIZE_MAX;
+    if (valid && begin != end && ctx.source.width && !src->columns)
+        valid = false;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_SHAPE_WORK);
+    if (rc > 0 || (valid && size_ok)) {
+        if (rc)
+            goto done;
+    } else {
+        rc = !valid ? EINVAL : EOVERFLOW;
+        goto done;
+    }
+    if (begin != end) {
+        for (uint32_t column = 0; column < ctx.source.width; column++) {
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_LANE_WORK);
+            if (rc)
+                goto done;
+            valid = src->columns[column] != NULL;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_LANE_WORK);
+            if (rc > 0 || valid) {
+                if (rc)
+                    goto done;
+            } else {
+                rc = EINVAL;
+                goto done;
+            }
+        }
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_BUILD_CALL_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_BUILD_CALL_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_build(name, ctx.source.width,
+            COL_REL_INIT_CAP, false, governor, &ctx.source.recipe, &ctx.local,
+            control, attempt_id);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id, 0);
+    if (rc)
+        goto done;
+    if (ctx.source.width > 16 && begin != end) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_GATHER_PIN_WORK);
+        if (rc)
+            goto done;
+        ctx.gather_ref = governor;
+        wl_columnar_memory_governor_ref_retain(ctx.gather_ref);
+        ctx.ref_held = ctx.gather_ref != NULL;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_COPY_ROWS_GATHER_PIN_WORK);
+        if (rc)
+            goto done;
+        if (ctx.gather_ref) {
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_COPY_ROWS_RESERVE_CALL_WORK);
+            if (rc)
+                goto done;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_COPY_ROWS_RESERVE_CALL_WORK);
+            if (rc)
+                goto done;
+            wl_columnar_memory_admission_status_t status;
+            rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+                wl_columnar_memory_governor_ref_get(ctx.gather_ref),
+                ctx.gather_bytes, &ctx.gather_credit, &status, control,
+                attempt_id);
+            if (rc)
+                goto done;
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+                || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+                ctx.gather_admitted = true;
+            rc = wl_columnar_relation_row_admission(ctx.local, status);
+            int tail = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id, 0);
+            if (tail > 0 || !rc)
+                rc = tail;
+            if (rc)
+                goto done;
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_COPY_ROWS_COMMIT_CALL_WORK);
+            if (rc)
+                goto done;
+            bool committed = false;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id,
+                    WL_COLUMNAR_RELATION_COPY_ROWS_COMMIT_CALL_WORK);
+            if (rc)
+                goto done;
+            rc = wl_columnar_memory_governor_commit_attempt_controlled(
+                &ctx.gather_credit, &ctx.gather_credit, &committed, control,
+                attempt_id);
+            ctx.gather_committed = committed;
+            if (rc)
+                goto done;
+            if (!committed) {
+                rc = EINVAL;
+                goto done;
+            }
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id, 0);
+            if (rc)
+                goto done;
+        }
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_ALLOC_WORK);
+        if (rc)
+            goto done;
+        ctx.gather = wl_columnar_relation_row_malloc((size_t)ctx.gather_bytes);
+        ctx.gather_allocated = ctx.gather != NULL;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_COPY_ROWS_ALLOC_WORK);
+        if (rc > 0 || ctx.gather_allocated) {
+            if (rc)
+                goto done;
+        } else {
+            rc = ENOMEM;
+            goto done;
+        }
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_COPY_ROWS_BEGIN_CALL_WORK);
+    if (rc)
+        goto done;
+    /* Adjacent guard prevents begin's capture-on-entry from charging a new ID. */
+    rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx.batch,
+            ctx.local, control);
+    if (rc)
+        goto done;
+    if (ctx.batch.identity != &ctx.batch ||
+        ctx.batch.attempt_id != attempt_id) {
+        rc = EINVAL;
+        goto done;
+    }
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id, 0);
+    if (rc)
+        goto done;
+    for (uint32_t row = begin; row < end; row++) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_ROW_BEGIN_WORK);
+        if (rc)
+            goto done;
+        uint32_t column = 0;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_COPY_ROWS_ROW_BEGIN_WORK);
+        if (rc)
+            goto done;
+        while (column < ctx.source.width) {
+            rc = wl_columnar_relation_constructor_attempt_charge(control,
+                    attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_CELL_WORK);
+            if (rc)
+                goto done;
+            uint32_t count = ctx.source.width - column;
+            if (count > 8)
+                count = 8;
+            for (uint32_t i = 0; i < count; i++)
+                ctx.gather[column + i] = src->columns[column + i][row];
+            column += count;
+            rc = wl_columnar_relation_constructor_attempt_tail(control,
+                    attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_CELL_WORK);
+            if (rc)
+                goto done;
+        }
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_ROW_CALL_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_COPY_ROWS_ROW_CALL_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_append_batch_row_controlled(&ctx.batch,
+                ctx.gather);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                0);
+        if (rc)
+            goto done;
+    }
+done:
+    rc = wl_columnar_relation_copy_rows_drain(&ctx, rc);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_COPY_ROWS_EXTERNAL_WORK);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_RELATION_COPY_ROWS_EXTERNAL_WORK);
+    if (!rc)
+        *out = ctx.local;
+    else if (ctx.local && col_rel_destroy_checked(ctx.local) != 0)
+        abort();
+    return rc;
+}
+
 /* Pool-aware col_rel constructor wrappers.
  *
  * The struct slot is allocated from the pool slab (O(1), no free needed).

@@ -1955,3 +1955,64 @@ and176 including refused external publication; its paid region is220. All
 These are source-derived envelopes under the stated exclusions, not observed
 instruction counts. Reached-tail telemetry may omit already admitted work when
 a nested governor phase stops; charged reports remain the accounting authority.
+
+### Caller-attempt-bound physical row-range projection
+
+`wl_columnar_relation_copy_rows_controlled` creates a private scalar heap
+relation containing physical rows `[begin, end)` in source order, preserving
+duplicates and source-compatible schema/type/graph metadata. It deliberately
+omits timestamps and signed multiplicities, matching the existing raw range
+copy. A negative or magnitude-greater-than-one source weight does not change
+the number of copied physical rows. This is not a weighted recovery snapshot.
+NULL control delegates the exact raw API before output normalization. Controlled
+calls use the same exclusive/nonoverlapping/no-live-result output slot contract
+and fixed initial NULL-store exception as the caller-bound schema constructor.
+
+One original descriptor/owner reader pair protects the source recipe and lanes
+through the last gather. Source and owner lifetimes, including alias borrowing
+and arena/pool no-reset, remain caller obligations. Range/capacity and nonempty
+lane validation happen under that pair. Empty ranges and nullary rows require
+no fictitious lane reads. Gather reads never call `col_rel_row` or modify source
+row scratch, metadata, timestamps or governor authority.
+
+The pinned private constructor creates the destination without reacquiring
+source readers, with timestamps disabled and the explicit output governor.
+The private destination has no session ledger during copying. The copy owns
+its original held batch, checks its saved attempt ID immediately before the
+batch's capture-on-entry begin, and retains that ID across all rows and storage
+epochs. Complete inert batch initialization includes its nested original
+single/set/lease/writer records and is separately prepaid; partial records are
+never inspected or drained after a refused initialization.
+
+Widths up to16 use an inline gather. A nonempty wider copy allocates one reusable
+width-sized gather under its own original S token and retained explicit governor
+reference. The held batch independently captures each row under its own S token.
+The peak therefore includes both gather S and batch capture S, alongside the
+destination D/M, old and incoming P and eager scratch. This can deny a controlled
+copy at a budget where raw copy succeeds. Constructor D/M/P denial remains
+ENOSPC; gather and row denial use ENOMEM. Allocator failure does not invent a
+budget-denial flag, and no failed private destination is returned.
+
+Mandatory batch end preserves the initiating result. A negative result with
+ENDED and no original owners is a successful drain; retained DRAINING authority
+fails stop before the lexical frame can disappear or the destination can be
+destroyed under its writers. Gather physical storage is freed before its own
+original credit/ref is returned. Owner then descriptor readers drain before
+the original-ID guard and separately funded final external store. Cleanup never
+charges a successor attempt. Forward caller branches, markers and complete
+refused-child return chains are included in the copy's source-cost inventory;
+allocator/instrumentation and mandatory original retirement internals retain
+the explicit exclusions. No wall-clock latency bound follows.
+
+The copy caller prepays its added success-or-failure continuation before
+entering the existing constructor/source helpers; that allowance is not spent
+again on each child loop iteration. Complete ordinary drain/public/child
+suffixes are conservatively32/44/48 source slots. The separately funded begin
+caller includes the86-slot inert read before the child's170 admission; the row
+caller includes25 slots before the child's220 CHECK admission. Its15 named
+regions and portable bounds are adjacent to the implementation. The composed
+conservative source envelope is249, including the deepest inherited byte
+failure through the copy return. It uses actual no-ledger batch terminals and
+actual last-poll boundaries, rather than adding whole caller tariffs to old
+internal248/168 maxima. Charged reports remain authoritative; reached-tail
+labels can repeat at multiple sites financed by one earlier admission.
