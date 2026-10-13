@@ -1419,6 +1419,330 @@ struct wl_columnar_expr_compiled {
     wl_columnar_memory_reservation_t *reservation;
 };
 
+/* Controlled numeric programs have distinct ownership from raw compiled
+ * expressions. No raw destructor or evaluator accepts this representation. */
+struct wl_columnar_expr_controlled {
+    expr_instr_t *instrs;
+    uint32_t ninstr;
+    bool committed;
+    wl_columnar_memory_reservation_t token;
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_expr_test_checkpoint)(wl_evaluation_control_t *, unsigned,
+    uint64_t, bool);
+int wl_columnar_expr_test_fail_allocation = -1;
+#endif
+
+static void
+wl_columnar_expr_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_test_checkpoint)
+        wl_columnar_expr_test_checkpoint(control, phase, progress, failed);
+#else
+    (void)control;
+    (void)phase;
+    (void)progress;
+    (void)failed;
+#endif
+}
+
+static int
+wl_columnar_expr_charge(wl_evaluation_control_t *control, uint64_t work)
+{
+    return control ? wl_evaluation_control_charge(control, work) : 0;
+}
+
+static void *
+wl_columnar_expr_allocate(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_expr_test_fail_allocation >= 0
+        && wl_columnar_expr_test_fail_allocation-- == 0) {
+        wl_columnar_expr_test_fail_allocation = -1;
+        return NULL;
+    }
+#endif
+    return malloc(bytes);
+}
+
+/* Work denotes admitted logical source regions, not CPU instructions/time.
+ * All variable traversals are separately admitted; charge/tail plumbing and
+ * mandatory physical disposal/credit retirement are excluded. Fixed bounds:
+ *
+ * decode64: descriptor fields3, tag/length dispatch8, bounded length copy2,
+ *   prefix/length checks8, constant copy8 or BOOL normalization2, loop/return
+ *   bookkeeping8 = at most45. Each byte transfer (read/write/cursor) costs1;
+ *   each col digit validation+decimal accumulation costs1 separately. Neither
+ *   allowance hides a variable traversal. Both passes pay the same tariff.
+ * scaffold64: count/cursor/local initialization8, checked mul/add/size paths12,
+ *   original token initialization10, owner fields3+embedded token init10,
+ *   admission verdict/authority bookkeeping8, second-pass setup2 =53.
+ *   Token init counts seven zeroed fields, identity and state stores, guard;
+ *   it has fixed sizeof and no input-dependent traversal. Alloc attempts1
+ *   each and second-pass instruction field stores3 are additional.
+ * move64: move helper identity checks6, state checks6, payload/atomic loads
+ *   and stores16, authority/commit dispatch6, final capability/output stores2
+ *   =36. Governor reserve15 (plus CAS retries) and commit4 are additional.
+ * Each finite region <=256; every region and byte/digit iteration tails.
+ */
+static int
+wl_columnar_expr_bytes(const uint8_t *buf, uint32_t size, uint32_t *pos,
+    uint8_t *out, uint32_t count, unsigned pass,
+    wl_evaluation_control_t *control)
+{
+    if (*pos > size || count > size - *pos)
+        return ENOTSUP;
+    for (uint32_t i = 0; i < count; i++) {
+        int rc = wl_columnar_expr_charge(control, 1);
+        if (rc)
+            return rc;
+        out[i] = buf[(*pos)++];
+        wl_columnar_expr_checkpoint(control, pass, *pos, false);
+        rc = wl_columnar_expr_charge(control, 0);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_expr_decode(const uint8_t *buf, uint32_t size, uint32_t *pos,
+    expr_instr_t *out, unsigned pass, wl_evaluation_control_t *control)
+{
+    int rc = wl_columnar_expr_charge(control, 64);
+    if (rc)
+        return rc;
+    *out = (expr_instr_t){0};
+    rc = wl_columnar_expr_bytes(buf, size, pos, &out->op, 1, pass, control);
+    if (rc)
+        return rc;
+    switch ((wl_plan_expr_tag_t)out->op) {
+    case WL_PLAN_EXPR_VAR:
+    case WL_PLAN_EXPR_VAR_FLOAT: {
+        uint8_t encoded[2], name[12];
+        uint16_t length;
+        rc = wl_columnar_expr_bytes(buf, size, pos, encoded, 2, pass, control);
+        if (rc)
+            return rc;
+        memcpy(&length, encoded, sizeof(length));
+        if (length < 4 || length > sizeof(name))
+            return ENOTSUP;
+        rc = wl_columnar_expr_bytes(buf, size, pos, name, length, pass,
+                control);
+        if (rc)
+            return rc;
+        if (name[0] != 'c' || name[1] != 'o' || name[2] != 'l')
+            return ENOTSUP;
+        /* Exactly1..9 digits, matching the checked raw VAR parser. */
+        for (uint32_t d = 3; d < length; d++) {
+            rc = wl_columnar_expr_charge(control, 1);
+            if (rc)
+                return rc;
+            bool digit = name[d] >= '0' && name[d] <= '9';
+            if (digit)
+                out->iarg = out->iarg * 10u + (uint32_t)(name[d] - '0');
+            rc = wl_columnar_expr_charge(control, 0);
+            if (rc)
+                return rc;
+            if (!digit)
+                return ENOTSUP;
+        }
+        break;
+    }
+    case WL_PLAN_EXPR_CONST_INT:
+    case WL_PLAN_EXPR_CONST_FLOAT: {
+        uint8_t encoded[8];
+        rc = wl_columnar_expr_bytes(buf, size, pos, encoded, 8, pass, control);
+        if (rc)
+            return rc;
+        memcpy(&out->larg, encoded, sizeof(out->larg));
+        break;
+    }
+    case WL_PLAN_EXPR_BOOL: {
+        uint8_t value;
+        rc = wl_columnar_expr_bytes(buf, size, pos, &value, 1, pass, control);
+        if (rc)
+            return rc;
+        out->larg = value ? 1 : 0;
+        break;
+    }
+    case WL_PLAN_EXPR_ARITH_ADD: case WL_PLAN_EXPR_ARITH_SUB:
+    case WL_PLAN_EXPR_ARITH_MUL: case WL_PLAN_EXPR_ARITH_DIV:
+    case WL_PLAN_EXPR_ARITH_MOD: case WL_PLAN_EXPR_ARITH_SHL:
+    case WL_PLAN_EXPR_ARITH_SHR: case WL_PLAN_EXPR_ARITH_BAND:
+    case WL_PLAN_EXPR_ARITH_BOR: case WL_PLAN_EXPR_ARITH_BXOR:
+    case WL_PLAN_EXPR_ARITH_BNOT:
+    case WL_PLAN_EXPR_CMP_EQ: case WL_PLAN_EXPR_CMP_NEQ:
+    case WL_PLAN_EXPR_CMP_LT: case WL_PLAN_EXPR_CMP_LTE:
+    case WL_PLAN_EXPR_CMP_GT: case WL_PLAN_EXPR_CMP_GTE:
+    case WL_PLAN_EXPR_ARITH_FLOAT_ADD: case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+    case WL_PLAN_EXPR_ARITH_FLOAT_MUL: case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+    case WL_PLAN_EXPR_CMP_FLOAT_EQ: case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+    case WL_PLAN_EXPR_CMP_FLOAT_LT: case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+    case WL_PLAN_EXPR_CMP_FLOAT_GT: case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+    case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
+    case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
+        break;
+    default:
+        return ENOTSUP;
+    }
+    return wl_columnar_expr_charge(control, 0);
+}
+
+void
+wl_columnar_expr_controlled_free(wl_columnar_expr_controlled_t *owner)
+{
+    if (!owner)
+        return;
+    wl_columnar_memory_reservation_t retirement;
+    wl_columnar_memory_reservation_init(&retirement);
+    bool held = owner->token.bytes != 0;
+    bool committed = owner->committed;
+    if (held && !wl_columnar_memory_reservation_move(&retirement,
+        &owner->token))
+        abort();
+    free(owner->instrs);
+    free(owner);
+    /* Mandatory cleanup: physical storage dies before its own credit. */
+    wl_columnar_expr_checkpoint(NULL, 8, 0, false);
+    if (held) {
+        bool retired = committed ? wl_columnar_memory_release(&retirement)
+            : wl_columnar_memory_rollback(&retirement);
+        if (!retired)
+            abort();
+    }
+}
+
+int
+wl_columnar_expr_compile_controlled(const uint8_t *buf, uint32_t size,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_controlled_t **out, bool *supported,
+    wl_evaluation_control_t *control)
+{
+    if (!out || !supported)
+        return EINVAL;
+    *out = NULL;
+    *supported = false;
+    if (!buf && size)
+        return EINVAL;
+    int rc = wl_columnar_expr_charge(control, 0);
+    if (rc || !size)
+        return rc;
+    rc = wl_columnar_expr_charge(control, 64);
+    if (rc)
+        return rc;
+    uint32_t count = 0, pos = 0;
+    expr_instr_t instruction;
+    while (pos < size) {
+        rc = wl_columnar_expr_decode(buf, size, &pos, &instruction, 1, control);
+        if (rc)
+            return rc == ENOTSUP ? 0 : rc;
+        count++;
+    }
+    uint64_t instr_bytes, total;
+    if (!wl_columnar_memory_size_mul(count, sizeof(expr_instr_t), &instr_bytes)
+        || !wl_columnar_memory_size_add(sizeof(wl_columnar_expr_controlled_t),
+        instr_bytes, &total) || total > SIZE_MAX)
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_t admission;
+    wl_columnar_memory_reservation_init(&admission);
+    wl_columnar_expr_controlled_t *owner = NULL;
+    bool admitted = false;
+    if (governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_controlled(
+            wl_columnar_memory_governor_ref_get(governor), total,
+            &admission, &status, control);
+        if (rc)
+            return rc;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        admitted = true;
+    }
+    wl_columnar_expr_checkpoint(control, 4, count, false);
+    rc = wl_columnar_expr_charge(control, 0);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_expr_charge(control, 1);
+    if (rc)
+        goto fail;
+    owner = wl_columnar_expr_allocate(sizeof(*owner));
+    if (!owner) {
+        rc = ENOMEM;
+        goto fail;
+    }
+    owner->instrs = NULL;
+    owner->ninstr = count;
+    owner->committed = false;
+    wl_columnar_memory_reservation_init(&owner->token);
+    rc = wl_columnar_expr_charge(control, 1);
+    if (rc)
+        goto fail;
+    owner->instrs = wl_columnar_expr_allocate((size_t)instr_bytes);
+    if (!owner->instrs) {
+        rc = ENOMEM;
+        goto fail;
+    }
+    rc = wl_columnar_expr_charge(control, 0);
+    if (rc)
+        goto fail;
+    pos = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        rc = wl_columnar_expr_decode(buf, size, &pos, &instruction, 2, control);
+        if (rc)
+            goto fail;
+        rc = wl_columnar_expr_charge(control, 3);
+        if (rc)
+            goto fail;
+        owner->instrs[i].op = instruction.op;
+        owner->instrs[i].iarg = instruction.iarg;
+        owner->instrs[i].larg = instruction.larg;
+        rc = wl_columnar_expr_charge(control, 0);
+        if (rc)
+            goto fail;
+    }
+    rc = wl_columnar_expr_charge(control, 64);
+    if (rc)
+        goto fail;
+    if (admitted) {
+        if (!wl_columnar_memory_reservation_move(&owner->token, &admission))
+            abort();
+        admitted = false;
+    }
+    wl_columnar_expr_checkpoint(control, 5, count, false);
+    rc = wl_columnar_expr_charge(control, 0);
+    if (rc)
+        goto fail;
+    if (governor) {
+        rc = wl_columnar_memory_governor_commit_controlled(&owner->token,
+                owner, &owner->committed, control);
+        if (rc)
+            goto fail;
+        if (!owner->committed) {
+            rc = EINVAL;
+            goto fail;
+        }
+    }
+    wl_columnar_expr_checkpoint(control, 6, count, false);
+    rc = wl_columnar_expr_charge(control, 0);
+    if (rc)
+        goto fail;
+    *supported = true;
+    *out = owner;
+    return 0;
+fail:
+    wl_columnar_expr_controlled_free(owner);
+    if (admitted && !wl_columnar_memory_rollback(&admission))
+        abort();
+    return rc;
+}
+
 void
 wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c)
 {

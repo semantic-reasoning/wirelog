@@ -3843,6 +3843,32 @@ typedef enum {
     WL_COLUMNAR_EXPR_CALLBACK_REENTRANT
 } wl_columnar_expr_status_t;
 
+/* #1821 numeric preparation/disposal foundation; no engine activation.
+ * Bytecode is immutable through both passes. Governor is borrowed until free;
+ * NULL control
+ * uses the same owner representation and destructor without metering.
+ * Compile initializes out=NULL/supported=false. Empty, malformed or unsupported
+ * bytecode returns0 unsupported; NULL buf with nonzero size returns EINVAL.
+ * Numeric VAR/VAR_FLOAT accepts col plus1..9 digits; FLOAT variables are an
+ * additional capability relative to today's raw compiler. Allocation ENOMEM,
+ * admission ENOSPC/EOVERFLOW/EINVAL and negative control stops stay distinct.
+ * Free consumes a live owner once, accepts NULL, and is noncancellable.
+ * No string/intern/crypto/extension fallback. Tariff table lives in expr.c. */
+typedef struct wl_columnar_expr_controlled wl_columnar_expr_controlled_t;
+int wl_columnar_expr_compile_controlled(const uint8_t *, uint32_t,
+    wl_columnar_memory_governor_ref_t *, wl_columnar_expr_controlled_t **,
+    bool *, wl_evaluation_control_t *);
+void wl_columnar_expr_controlled_free(wl_columnar_expr_controlled_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+/* phases:1/2 consumed byte in first/second pass;
+ * 4 reserved;5 moved;6 committed before publication;
+ * 8 physical storage freed but credit still held (mandatory cleanup, NULL ctl).
+ * Progress is byte offset/instruction count; failed is reserved (false). */
+extern void (*wl_columnar_expr_test_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t, bool);
+extern int wl_columnar_expr_test_fail_allocation;
+#endif
+
 wl_columnar_expr_compiled_t *
 wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
     const wl_intern_t *intern);
