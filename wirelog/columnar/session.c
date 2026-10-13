@@ -5224,7 +5224,20 @@ col_session_publication_cutoff(wl_col_session_t *sess)
 }
 
 static int
-col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess);
+col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess,
+    uint32_t strata_end);
+
+/* Issue #2092: records that strata [0, si] completed in an evaluation that
+ * has not committed yet.  The snapshot runs every stratum in order from 0.
+ * A plain step does too, or resumes just after the prefix an earlier attempt
+ * completed, so the completed strata form a prefix. */
+static void
+col_session_note_stratum_done(wl_col_session_t *sess, uint32_t si)
+{
+    uint32_t done = si < UINT16_MAX ? si + 1 : UINT16_MAX;
+    if (done > sess->uncommitted_strata_done)
+        sess->uncommitted_strata_done = (uint16_t)done;
+}
 
 static int
 col_session_step_impl(wl_session_t *session)
@@ -5338,11 +5351,25 @@ col_session_step_impl(wl_session_t *session)
              * partial, so whatever evaluates next must clear and evaluate in
              * full; only the commit below resets this. */
             sess->pending_full_input_eval = true;
-            int clear_rc = col_session_clear_idb_rows(plan, sess);
+            int clear_rc = col_session_clear_idb_rows(plan, sess,
+                    plan->stratum_count);
             if (clear_rc != 0)
                 return clear_rc;
             for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA;
                 si++)
+                sess->frontier_ops->reset_stratum_frontier(sess, si,
+                    sess->outer_epoch);
+        } else if (sess->uncommitted_strata_done > 0) {
+            /* Issue #2092: a first evaluation failed after these strata
+             * completed.  Discard what they derived, keeping host input, so
+             * re-deriving them does not append a second copy.  The stratum
+             * that failed is re-run over its own rows, as before. */
+            uint32_t done = sess->uncommitted_strata_done;
+            int clear_rc = col_session_clear_idb_rows(plan, sess, done);
+            if (clear_rc != 0)
+                return clear_rc;
+            for (uint32_t si = 0; si < plan->stratum_count && si < MAX_STRATA
+                && si < done; si++)
                 sess->frontier_ops->reset_stratum_frontier(sess, si,
                     sess->outer_epoch);
         }
@@ -5435,6 +5462,7 @@ col_session_step_impl(wl_session_t *session)
             return rc;
         }
         if (sess->plain_step_completion_step_context) {
+            col_session_note_stratum_done(sess, si);
             /* The stratum, including checked cleanup/finalization, committed.
              * Preserve that prefix if a later W1 stratum returns an ordinary
              * error before the final compaction continuation is armed. */
@@ -5530,6 +5558,7 @@ compact_staged_deltas:
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
+    sess->uncommitted_strata_done = 0;
     sess->plain_step_completion_pending = false;
     sess->plain_step_completion_active = false;
     sess->plain_step_completion_phase =
@@ -5695,7 +5724,8 @@ col_session_emit_snapshot(const wl_plan_t *plan, wl_col_session_t *sess,
 }
 
 static int
-col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
+col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess,
+    uint32_t strata_end)
 {
     col_rel_t **targets = NULL;
     col_rel_t **owners = NULL;
@@ -5720,7 +5750,7 @@ col_session_clear_idb_rows(const wl_plan_t *plan, wl_col_session_t *sess)
     }
 
     /* Collect each relation once and resolve all owners before mutation. */
-    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+    for (uint32_t si = 0; si < plan->stratum_count && si < strata_end; si++) {
         const wl_plan_stratum_t *sp = &plan->strata[si];
         for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
             col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
@@ -6030,7 +6060,15 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         && (sess->pending_full_input_eval
         || (sess->pending_input_change
         && sess->last_inserted_relation == NULL))) {
-        int clear_rc = col_session_clear_idb_rows(plan, sess);
+        int clear_rc = col_session_clear_idb_rows(plan, sess,
+                plan->stratum_count);
+        if (clear_rc != 0)
+            return clear_rc;
+    } else if (!sess->has_evaluated && sess->uncommitted_strata_done > 0) {
+        /* Issue #2092: as in the plain step, a failed first evaluation left
+         * these strata derived; every frontier is reset below. */
+        int clear_rc = col_session_clear_idb_rows(plan, sess,
+                sess->uncommitted_strata_done);
         if (clear_rc != 0)
             return clear_rc;
     }
@@ -6291,6 +6329,7 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
+        col_session_note_stratum_done(sess, si);
     }
     sess->tdd_decision_tracking_active = false;
 
@@ -6373,6 +6412,7 @@ evaluated:;
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
+    sess->uncommitted_strata_done = 0;
     sess->snapshot_stable_valid = true;
 
     /* Issue #83: Update base_nrows for all relations after convergence.

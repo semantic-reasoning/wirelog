@@ -2006,6 +2006,13 @@ typedef struct wl_col_session_t {
     uint32_t plain_step_completion_phase;
     uint32_t plain_step_completion_relation;
     bool plain_step_completion_workers_retired;
+    /* Issue #2092: how many leading strata completed in a plain step or a
+     * snapshot that has not committed (saturating).  Their heads hold rows
+     * no commit accounts for, so the next plain step or snapshot that does
+     * not resume clears them before re-deriving, even before has_evaluated
+     * is set.  Zero at commit.
+     */
+    uint16_t uncommitted_strata_done;
     /* Issue #176: Per-iteration cache eviction for recursive strata.
      * cache_evict_threshold: target cache size (bytes) for LRU eviction
      * in recursive stratum iteration loop. When cache exceeds this threshold,

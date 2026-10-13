@@ -21,12 +21,14 @@
  * docs/SEMANTICS.md.  If you change the engine on purpose, update these
  * numbers and re-read that section to check it still holds.
  *
- * Every case drives the session with wirelog_easy_step(), and all but two
- * of them, named below, do so with a delta callback installed throughout.
- * test_plain_step_rederives_every_rule drives the same rule with no
- * callback (Issue #1994): there a step with pending input re-derives every
- * rule in full and an idle step does nothing.  The second-to-last case
- * removes its callback before a step that fails.
+ * Every case before the Issue #2092 group drives the session with
+ * wirelog_easy_step(), and all but two of them, named below, do so with a
+ * delta callback installed throughout.  test_plain_step_rederives_every_rule
+ * drives the same rule with no callback (Issue #1994): there a step with
+ * pending input re-derives every rule in full and an idle step does nothing.
+ * test_failed_plain_step_leaves_a_full_evaluation_pending removes its
+ * callback before a step that fails.  The Issue #2092 group installs no
+ * callback and fails the session's first evaluation, by step or snapshot.
  */
 
 #include "wirelog/wirelog-easy.h"
@@ -255,8 +257,8 @@ typedef struct {
 static char message[256];
 
 static const char *
-fixture_open_plain(fixture_t *fx, const char *program, uint32_t policy,
-    wirelog_extension_scalar_fn fn)
+fixture_open_workers(fixture_t *fx, const char *program, uint32_t policy,
+    wirelog_extension_scalar_fn fn, uint32_t num_workers)
 {
     uint32_t types[] = { WIRELOG_EXTENSION_VALUE_INT64 };
     wirelog_extension_descriptor_t descriptor = {
@@ -288,7 +290,7 @@ fixture_open_plain(fixture_t *fx, const char *program, uint32_t policy,
 
     wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
     opts.eager_build = true;
-    opts.num_workers = 1;
+    opts.num_workers = num_workers;
     opts.extension_snapshot = fx->snapshot;
     wirelog_error_t rc =
         wirelog_easy_open_opts(program, &opts, &fx->session);
@@ -297,6 +299,13 @@ fixture_open_plain(fixture_t *fx, const char *program, uint32_t policy,
         return message;
     }
     return NULL;
+}
+
+static const char *
+fixture_open_plain(fixture_t *fx, const char *program, uint32_t policy,
+    wirelog_extension_scalar_fn fn)
+{
+    return fixture_open_workers(fx, program, policy, fn, 1);
 }
 
 static const char *
@@ -1060,6 +1069,296 @@ test_input_only_removal_leaves_other_rules_alone(void)
         PASS();
 }
 
+/* Issue #2092: the programs below put a stratum that completes ahead of the
+ * failing call site, so a failed first evaluation leaves derived rows behind
+ * in a relation no commit accounts for. */
+static const char *const CHAIN_PROGRAM =
+    ".decl other(k: int64)\n"
+    ".decl echo(k: int64)\n"
+    ".decl started(id: int64, ticket: int64)\n"
+    "echo(k) :- other(k).\n"
+    "started(id, @call(\"replay.action\", id)) :- echo(id).\n";
+
+/* CHAIN_PROGRAM with a host fact in the completed stratum's head. */
+static const char *const CHAIN_SEED_PROGRAM =
+    ".decl other(k: int64)\n"
+    ".decl echo(k: int64)\n"
+    ".decl started(id: int64, ticket: int64)\n"
+    "echo(100).\n"
+    "echo(k) :- other(k).\n"
+    "started(id, @call(\"replay.action\", id)) :- echo(id).\n";
+
+/* A recursive completed stratum whose only input is host facts in its own
+ * head (Issue #372). */
+static const char *const RECURSIVE_SEED_PROGRAM =
+    ".decl r(x: int64, y: int64)\n"
+    ".decl started(id: int64, ticket: int64)\n"
+    "r(1, 2).\n"
+    "r(2, 3).\n"
+    "r(3, 4).\n"
+    "r(x, z) :- r(x, y), r(y, z).\n"
+    "started(x, @call(\"replay.action\", x)) :- r(x, y).\n";
+
+typedef struct {
+    int64_t col[MAX_ROWS][2];
+    unsigned count;
+    int malformed;
+} rows_t;
+
+/* Collects every row a snapshot emits, a repeated row once per copy.  A
+ * `started` row must carry the stable addon's value for its id. */
+static void
+on_collect_row(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    rows_t *rows = (rows_t *)user_data;
+    if (ncols < 1 || ncols > 2 || rows->count >= MAX_ROWS
+        || (strcmp(relation, "started") == 0 && row[1] != row[0] * 10)) {
+        rows->malformed = 1;
+        return;
+    }
+    rows->col[rows->count][0] = row[0];
+    rows->col[rows->count][1] = ncols > 1 ? row[1] : 0;
+    rows->count++;
+}
+
+/* Compares a relation's rows with `want` as a multiset of (col0, col1)
+ * pairs; a one-column relation lists 0 as its second column. */
+static const char *
+expect_rows(fixture_t *fx, const char *relation, const int64_t (*want)[2],
+    unsigned nwant, const char *what)
+{
+    rows_t rows;
+    memset(&rows, 0, sizeof(rows));
+    if (wirelog_easy_snapshot(fx->session, relation, on_collect_row, &rows)
+        != WIRELOG_OK) {
+        snprintf(message, sizeof(message), "%s: snapshot of %s failed", what,
+            relation);
+        return message;
+    }
+    if (rows.malformed) {
+        snprintf(message, sizeof(message), "%s: malformed %s row", what,
+            relation);
+        return message;
+    }
+    if (rows.count != nwant) {
+        snprintf(message, sizeof(message), "%s: %s has %u rows, want %u",
+            what, relation, rows.count, nwant);
+        return message;
+    }
+    for (unsigned i = 0; i < nwant; i++) {
+        unsigned j = 0;
+        while (j < rows.count && (rows.col[j][0] != want[i][0]
+            || rows.col[j][1] != want[i][1]))
+            j++;
+        if (j == rows.count) {
+            snprintf(message, sizeof(message),
+                "%s: %s lacks (%" PRId64 ",%" PRId64 ")", what, relation,
+                want[i][0], want[i][1]);
+            return message;
+        }
+        rows.col[j][0] = rows.col[rows.count - 1][0];
+        rows.col[j][1] = rows.col[rows.count - 1][1];
+        rows.count--;
+    }
+    return NULL;
+}
+
+/* Counts the rows a snapshot of `relation` emits, so a call that only has to
+ * evaluate can be told apart from one that also checks. */
+static void
+on_any_row(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (*(unsigned *)user_data)++;
+}
+
+typedef struct {
+    const char *program;
+    const char *head;           /* the completed stratum's head */
+    const int64_t (*head_rows)[2];
+    unsigned nhead;
+    const int64_t (*started_rows)[2];
+    unsigned nstarted;
+    int insert_other;           /* load other(1..3) before the first call */
+    int remove_other_2;         /* remove other(2) after the failed call */
+} first_eval_case_t;
+
+/* One failed first evaluation and its retry, with no delta callback.  The
+ * failing call is a step or a snapshot, and so is the retry; after it the
+ * model is checked, and checked again after an idle step. */
+static const char *
+first_eval_retry_run(const first_eval_case_t *c, uint32_t workers,
+    int fail_by_snapshot, int retry_by_snapshot)
+{
+    fixture_t fx;
+    const char *why;
+    unsigned n = 0;
+    int64_t value;
+    char what[96];
+
+    snprintf(what, sizeof(what), "W=%u %s->%s%s", (unsigned)workers,
+        fail_by_snapshot ? "snapshot" : "step",
+        retry_by_snapshot ? "snapshot" : "step",
+        c->remove_other_2 ? " after removing other(2)" : "");
+    flaky_fail = 0;
+    why = fixture_open_workers(&fx, c->program,
+            WIRELOG_EXTENSION_CALLBACK_THREAD_SAFE, flaky_action, workers);
+    for (unsigned i = 0; !why && c->insert_other && i < 3; i++) {
+        value = (int64_t)(i + 1);
+        if (wirelog_easy_insert(fx.session, "other", &value, 1)
+            != WIRELOG_OK)
+            why = "insert other";
+    }
+    if (!why) {
+        wirelog_error_t rc;
+        flaky_fail = 1;
+        rc = fail_by_snapshot
+            ? wirelog_easy_snapshot(fx.session, "started", on_any_row, &n)
+            : wirelog_easy_step(fx.session);
+        flaky_fail = 0;
+        if (rc == WIRELOG_OK) {
+            snprintf(message, sizeof(message),
+                "%s: the failing call reported success", what);
+            why = message;
+        }
+    }
+    value = 2;
+    if (!why && c->remove_other_2
+        && wirelog_easy_remove(fx.session, "other", &value, 1)
+        != WIRELOG_OK) {
+        snprintf(message, sizeof(message), "%s: remove other(2)", what);
+        why = message;
+    }
+    if (!why) {
+        wirelog_error_t rc = retry_by_snapshot
+            ? wirelog_easy_snapshot(fx.session, "started", on_any_row, &n)
+            : wirelog_easy_step(fx.session);
+        if (rc != WIRELOG_OK) {
+            snprintf(message, sizeof(message), "%s: retry returned %d", what,
+                (int)rc);
+            why = message;
+        }
+    }
+    if (!why)
+        why = expect_rows(&fx, c->head, c->head_rows, c->nhead, what);
+    if (!why)
+        why = expect_rows(&fx, "started", c->started_rows, c->nstarted, what);
+    if (!why && wirelog_easy_step(fx.session) != WIRELOG_OK)
+        why = "idle step";
+    if (!why)
+        why = expect_rows(&fx, c->head, c->head_rows, c->nhead, what);
+    {
+        const char *teardown = fixture_close(&fx);
+        if (!why)
+            why = teardown;
+    }
+    return why;
+}
+
+/* Every worker count and every combination of failing call and retry. */
+static const char *
+first_eval_retry_matrix(const first_eval_case_t *c)
+{
+    static const uint32_t workers[] = { 1, 2, 4 };
+    for (unsigned w = 0; w < sizeof(workers) / sizeof(workers[0]); w++)
+        for (int fail_snap = 0; fail_snap < 2; fail_snap++)
+            for (int retry_snap = 0; retry_snap < 2; retry_snap++) {
+                const char *why = first_eval_retry_run(c, workers[w],
+                        fail_snap, retry_snap);
+                if (why)
+                    return why;
+            }
+    return NULL;
+}
+
+/* Issue #2092: when the first evaluation fails in `started`, `echo` has
+ * already been derived.  The retry must derive it once, not append a second
+ * copy.  `started` is deduplicated either way, so only `echo` tells the two
+ * apart.  One worker resuming a failed step (#2080) never re-ran `echo`;
+ * every other combination did. */
+static void
+test_failed_first_evaluation_is_not_duplicated(void)
+{
+    static const int64_t echo_rows[][2] = { { 1, 0 }, { 2, 0 }, { 3, 0 } };
+    static const int64_t started_rows[][2] =
+    { { 1, 10 }, { 2, 20 }, { 3, 30 } };
+    const first_eval_case_t c = {
+        CHAIN_PROGRAM, "echo", echo_rows, 3, started_rows, 3, 1, 0
+    };
+    const char *why;
+
+    TEST("a retry after a failed first evaluation derives each row once");
+    why = first_eval_retry_matrix(&c);
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
+/* Issue #2092: the retry re-derives the completed stratum from the input as
+ * it is now.  Before the fix both `echo(2)` and `started(2)` outlived the
+ * removal.  One worker cannot remove under a failed step's pending
+ * completion, so the step-first sequences skip it. */
+static void
+test_failed_first_evaluation_retry_sees_later_input(void)
+{
+    static const int64_t echo_rows[][2] = { { 1, 0 }, { 3, 0 } };
+    static const int64_t started_rows[][2] = { { 1, 10 }, { 3, 30 } };
+    static const uint32_t workers[] = { 1, 2, 4 };
+    const first_eval_case_t c = {
+        CHAIN_PROGRAM, "echo", echo_rows, 2, started_rows, 2, 1, 1
+    };
+    const char *why = NULL;
+
+    TEST("a retry after a failed first evaluation reads the current input");
+    for (unsigned w = 0; !why && w < sizeof(workers) / sizeof(workers[0]);
+        w++)
+        for (int fail_snap = 0; !why && fail_snap < 2; fail_snap++)
+            for (int retry_snap = 0; !why && retry_snap < 2; retry_snap++)
+                if (workers[w] > 1 || fail_snap)
+                    why = first_eval_retry_run(&c, workers[w], fail_snap,
+                            retry_snap);
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
+/* Issue #2092: the retry discards what the failed attempt derived, but not
+ * the host facts in that stratum's head, flat or recursive (#372). */
+static void
+test_failed_first_evaluation_keeps_host_facts(void)
+{
+    static const int64_t echo_rows[][2] =
+    { { 1, 0 }, { 2, 0 }, { 3, 0 }, { 100, 0 } };
+    static const int64_t echo_started[][2] =
+    { { 1, 10 }, { 2, 20 }, { 3, 30 }, { 100, 1000 } };
+    static const int64_t r_rows[][2] =
+    { { 1, 2 }, { 2, 3 }, { 3, 4 }, { 1, 3 }, { 2, 4 }, { 1, 4 } };
+    static const int64_t r_started[][2] =
+    { { 1, 10 }, { 2, 20 }, { 3, 30 } };
+    const first_eval_case_t flat = {
+        CHAIN_SEED_PROGRAM, "echo", echo_rows, 4, echo_started, 4, 1, 0
+    };
+    const first_eval_case_t recursive = {
+        RECURSIVE_SEED_PROGRAM, "r", r_rows, 6, r_started, 3, 0, 0
+    };
+    const char *why;
+
+    TEST("a retry after a failed first evaluation keeps host facts");
+    why = first_eval_retry_matrix(&flat);
+    if (!why)
+        why = first_eval_retry_matrix(&recursive);
+    if (why)
+        FAIL(why);
+    else
+        PASS();
+}
+
 int
 main(void)
 {
@@ -1073,6 +1372,9 @@ main(void)
     test_plain_step_rederives_every_rule();
     test_failed_plain_step_leaves_a_full_evaluation_pending();
     test_input_only_removal_leaves_other_rules_alone();
+    test_failed_first_evaluation_is_not_duplicated();
+    test_failed_first_evaluation_retry_sees_later_input();
+    test_failed_first_evaluation_keeps_host_facts();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);
