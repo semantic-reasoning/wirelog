@@ -10856,6 +10856,275 @@ cleanup:
 #undef SPECIAL_CHECK
 }
 
+/* #2160: the multiworker nonrecursive path merges the head's rows and each
+ * worker part into a fresh final->rel after phase boundary 3.  A governor
+ * refusal of any of those growths must report ENOSPC with the session's
+ * denial flag.  The test-only phase 6 observes final->rel after a failed
+ * merge while it is still alive; its row count and timestamp column name
+ * the call that failed. */
+enum {
+    MERGE_STAGE_CREATE = 0, /* final->rel never existed (mapped already) */
+    MERGE_STAGE_ENABLE_TIMESTAMPS,
+    MERGE_STAGE_TARGET,
+    MERGE_STAGE_PART0,
+    MERGE_STAGE_PART1,
+    MERGE_STAGE_PASSED,
+    MERGE_STAGE_UNKNOWN
+};
+static uint64_t merge_denial_headroom;
+static uint32_t merge_denial_target_rows, merge_denial_part_rows;
+static bool merge_denial_armed;
+static unsigned merge_denial_stage;
+static bool merge_denial_pending;
+static bool merge_denial_fault;
+static bool merge_denial_flag_after;
+
+static int
+merge_denial_boundary(wl_col_session_t *coord, unsigned phase,
+    uint32_t worker, col_rel_t *candidate)
+{
+    (void)worker;
+    if (phase == 3 && !merge_denial_armed) {
+        merge_denial_armed = true;
+        /* In fault mode the next governed timestamp calloc on this thread
+         * fails: an allocator failure in the merge, not a budget refusal. */
+        if (merge_denial_fault) {
+            wl_columnar_relation_test_fail_next_governed_timestamp_alloc();
+            return 0;
+        }
+        idb_set_budget(coord);
+        wl_columnar_memory_governor_t *budget =
+            wl_columnar_memory_governor_ref_get(coord->memory_governor);
+        atomic_store_explicit(&budget->usable_bytes,
+            wl_columnar_memory_reserved(budget) + merge_denial_headroom,
+            memory_order_relaxed);
+    } else if (phase == 4 && merge_denial_armed) {
+        merge_denial_stage = MERGE_STAGE_PASSED;
+        idb_restore_budget(coord);
+    } else if (phase == 6 && merge_denial_armed) {
+        uint32_t t = merge_denial_target_rows, p = merge_denial_part_rows;
+        merge_denial_pending = candidate->memory_budget_denial_pending;
+        merge_denial_stage = !candidate->timestamps
+            ? MERGE_STAGE_ENABLE_TIMESTAMPS
+            : t && candidate->nrows == 0 ? MERGE_STAGE_TARGET
+            : candidate->nrows == t ? MERGE_STAGE_PART0
+            : candidate->nrows == t + p ? MERGE_STAGE_PART1
+            : MERGE_STAGE_UNKNOWN;
+    }
+    return 0;
+}
+
+/* One step of a fresh two-worker session whose merge runs with @headroom
+ * bytes above the reservation at phase 3.  @target_rows head rows are
+ * registered first, with timestamps unless @target_plain.  On a refusal
+ * with @check set, every postcondition of a budget denial is asserted and
+ * a retry with the budget restored must publish the complete union. */
+static const char *
+merge_denial_run(uint32_t target_rows, bool target_plain, uint64_t headroom,
+    bool check, unsigned *stage, int *step_rc)
+{
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_relation_t output = { .name = "output", .delta_name = "$d$output",
+                                  .ops = ops, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &output, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    const uint32_t workers = 2, part_rows = 64, count = workers * part_rows;
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *seed_rel = NULL;
+    int64_t values[2 * 64];
+    const char *failure = NULL;
+#define MERGE_CHECK(c, m) do { if (!(c)) { failure = (m); \
+                                           goto merge_cleanup; } } while (0)
+    merge_denial_headroom = headroom;
+    merge_denial_target_rows = target_rows;
+    merge_denial_part_rows = part_rows;
+    merge_denial_armed = false;
+    merge_denial_stage = MERGE_STAGE_CREATE;
+    merge_denial_pending = false;
+    MERGE_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "merge session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    for (uint32_t row = 0; row < count; row++) values[row] = 1000 + row;
+    MERGE_CHECK(wl_session_insert(session, "input", values, count, 1) == 0,
+        "merge input");
+    col_rel_t *input = session_find_rel(coord, "input");
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    MERGE_CHECK(input && col_rel_set_column_types(input, &type, 1) == 0
+        && col_rel_enable_timestamps(input) == 0, "merge input metadata");
+    for (uint32_t row = 0; row < count; row++)
+        input->timestamps[row] = idb_timestamp(row);
+    seed_rel = col_rel_new_like("output", input);
+    MERGE_CHECK(seed_rel, "merge target");
+    for (uint32_t row = 0; row < target_rows; row++) {
+        int64_t seed = 7 + (int64_t)row;
+        MERGE_CHECK(col_rel_append_row(seed_rel, &seed) == 0, "merge seed");
+    }
+    /* col_rel_new_like does not copy the timestamp column. */
+    MERGE_CHECK(!seed_rel->timestamps, "merge target copied timestamps");
+    if (!target_plain) {
+        MERGE_CHECK(col_rel_enable_timestamps(seed_rel) == 0
+            && seed_rel->timestamps, "merge target timestamps");
+        for (uint32_t row = 0; row < target_rows; row++)
+            seed_rel->timestamps[row] = idb_timestamp(0);
+    }
+    MERGE_CHECK(session_add_rel(coord, seed_rel) == 0, "merge register");
+    col_rel_t *target = seed_rel;
+    seed_rel = NULL;
+    uint64_t view = target->view_generation;
+    uint64_t storage = target->storage_generation;
+    wl_columnar_eval_test_nonrec_boundary = merge_denial_boundary;
+    int rc = wl_session_step(session);
+    wl_columnar_eval_test_nonrec_boundary = NULL;
+    idb_restore_budget(coord);
+    *stage = merge_denial_stage;
+    *step_rc = rc;
+    merge_denial_flag_after = wl_columnar_session_budget_denied(coord);
+    if (!check || merge_denial_stage == MERGE_STAGE_PASSED)
+        goto merge_cleanup;
+    bool denied = wl_columnar_session_budget_denied(coord);
+    MERGE_CHECK(rc == ENOSPC, "merge refusal is not ENOSPC");
+    MERGE_CHECK(merge_denial_pending, "merge refusal was not the governor's");
+    MERGE_CHECK(coord->memory_budget_denied && denied,
+        "merge refusal lost the denial flag");
+    MERGE_CHECK(wl_facade_session_error_code_with_budget(rc,
+        coord->extension_expr_status, denied) == WIRELOG_ERR_MEMORY_BUDGET,
+        "merge refusal public code");
+    MERGE_CHECK(target == session_find_rel(coord, "output")
+        && target->nrows == target_rows
+        && target->view_generation == view
+        && target->storage_generation == storage,
+        "merge refusal changed the head");
+    MERGE_CHECK(coord->tdd_workers_count == 0 && !coord->cleanup_pending
+        && coord->cleanup_reserved_bytes == 0, "merge refusal ownership");
+    wl_columnar_session_budget_denial_clear(coord);
+    MERGE_CHECK(wl_session_step(session) == 0, "merge retry");
+    target = session_find_rel(coord, "output");
+    MERGE_CHECK(target && target->nrows == target_rows + count
+        && !coord->memory_budget_denied, "merge retry result");
+merge_cleanup:
+    wl_columnar_eval_test_nonrec_boundary = NULL;
+    if (session) idb_restore_budget(COL_SESSION(session));
+    col_rel_destroy(seed_rel);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "merge reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    return failure;
+#undef MERGE_CHECK
+}
+
+/* Bisects for a headroom at which the merge stops at @stage or earlier
+ * while one byte more takes it further, and checks that run, which must
+ * stop exactly at @stage.  The bracket is searched, never assumed:
+ * headroom 0 refuses the creation of final->rel, and doubling finds one
+ * at which the merge completes. */
+static const char *
+merge_denial_case(uint32_t target_rows, bool target_plain, unsigned stage)
+{
+    unsigned got = 0;
+    int rc = 0;
+    const char *failure = NULL;
+    uint64_t lo = 0, hi = 4096;
+    if ((failure = merge_denial_run(target_rows, target_plain, lo, false,
+        &got, &rc)))
+        return failure;
+    if (got != MERGE_STAGE_CREATE || rc != ENOSPC)
+        return "headroom 0 did not refuse final->rel";
+    for (;;) {
+        if ((failure = merge_denial_run(target_rows, target_plain, hi, false,
+            &got, &rc)))
+            return failure;
+        if (got == MERGE_STAGE_PASSED)
+            break;
+        if (hi >= (UINT64_C(1) << 30))
+            return "merge never completed";
+        hi *= 2;
+    }
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if ((failure = merge_denial_run(target_rows, target_plain, mid, false,
+            &got, &rc)))
+            return failure;
+        if (got == MERGE_STAGE_UNKNOWN)
+            return "merge refusal stage not recognised";
+        if (got > stage)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    if ((failure = merge_denial_run(target_rows, target_plain, lo, true,
+        &got, &rc)))
+        return failure;
+    return got == stage ? NULL : "merge stage never refused alone";
+}
+
+static void
+test_nonrec_merge_budget_denial(void)
+{
+    TEST("nonrec TDD merge: refused growth reports a budget denial (#2160)");
+    const char *old_env = getenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
+    char *saved_env = old_env ? malloc(strlen(old_env) + 1) : NULL;
+    if (saved_env) memcpy(saved_env, old_env, strlen(old_env) + 1);
+    specialized_set_threshold("64");
+    const char *failure =
+        merge_denial_case(1, true, MERGE_STAGE_ENABLE_TIMESTAMPS);
+    if (!failure)
+        failure = merge_denial_case(200, false, MERGE_STAGE_TARGET);
+    if (!failure)
+        failure = merge_denial_case(1, false, MERGE_STAGE_PART0);
+    if (!failure)
+        failure = merge_denial_case(1, false, MERGE_STAGE_PART1);
+    if (saved_env) {
+        specialized_set_threshold(saved_env); free(saved_env);
+    } else specialized_set_threshold(NULL);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
+
+static void
+test_nonrec_merge_allocation_failure(void)
+{
+    TEST("nonrec TDD merge: allocation failure is not a budget denial");
+    const char *old_env = getenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
+    char *saved_env = old_env ? malloc(strlen(old_env) + 1) : NULL;
+    if (saved_env) memcpy(saved_env, old_env, strlen(old_env) + 1);
+    specialized_set_threshold("64");
+    unsigned got = 0;
+    int rc = 0;
+    /* A plain head makes the merge enable timestamps on final->rel; that
+     * calloc fails with no budget set, leaving final->rel alive. */
+    merge_denial_fault = true;
+    const char *failure = merge_denial_run(1, true, 0, false, &got, &rc);
+    merge_denial_fault = false;
+    bool fault_left =
+        wl_columnar_relation_test_governed_timestamp_alloc_pending();
+    if (!failure && fault_left)
+        failure = "merge allocation fault was never consumed";
+    if (!failure && (got != MERGE_STAGE_ENABLE_TIMESTAMPS || rc != ENOMEM
+        || merge_denial_pending || merge_denial_flag_after
+        || wl_facade_session_error_code_with_budget(rc, 0, false)
+        != WIRELOG_ERR_MEMORY))
+        failure = "merge allocation failure reported as a denial";
+    if (saved_env) {
+        specialized_set_threshold(saved_env); free(saved_env);
+    } else specialized_set_threshold(NULL);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+}
+
 static void
 test_final_normalization(uint32_t workers, unsigned route, unsigned mode)
 {
@@ -15752,6 +16021,8 @@ main(void)
         }
         test_specialized_publication(workers, 0, 20, false);
     }
+    test_nonrec_merge_budget_denial();
+    test_nonrec_merge_allocation_failure();
     test_tdd_recursive_frame_retention(2, 0, 0, true);
     test_tdd_recursive_frame_retention(8, 3, 1, true);
     for (unsigned mode = 0; mode < 7; mode++) {
