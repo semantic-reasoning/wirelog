@@ -1607,7 +1607,16 @@ Physical retirement and original credit downsizing follow gate release.
 
 | Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
 | --- | --- | --- | --- | --- |
-| `relation.c:wl_columnar_relation_row_scratch_init` | original scratch owner bits | `atomic_init` | original inert initialization | Initialize unshared stack token before acquisition without bulk zeroing |
+| `relation.c:wl_columnar_relation_row_scratch_init` | original scratch owner bits | `atomic_init` | original inert initialization | Initialize original standalone or held-batch capture token before acquisition without bulk zeroing |
 | `relation.c:wl_columnar_relation_row_scratch_init#2` | original scratch state | `atomic_init` | original inert initialization | Establish EMPTY before original scratch reservation |
-| `relation.c:wl_columnar_relation_append_row_controlled` | original retained owner bits | `atomic_load_explicit` | acquire | Validate relation-owned retained authority while original writers and token exclusivity hold |
-| `relation.c:wl_columnar_relation_append_row_controlled#2` | original retained state | `atomic_load_explicit` | acquire | Require COMMITTED before beginning original growth; shared governor totals remain independent |
+| `relation.c:wl_columnar_relation_row_body` | original retained owner bits | `atomic_load_explicit` | acquire | Validate relation-owned retained authority while original writers and token exclusivity hold |
+| `relation.c:wl_columnar_relation_row_body#2` | original retained state | `atomic_load_explicit` | acquire | Require COMMITTED before beginning original growth; shared governor totals remain independent |
+
+Controlled held batches reuse the original scratch initializer and retained
+owner/state checks in `wl_columnar_relation_row_body`; no additional lexical
+atomic site is introduced. Wide pre-renewal capture calls the existing
+governor reference retain under the old descriptor/source writers, then keeps
+that reference through physical free and original S refund. The shared
+reference counter protects governor lifetime and does not confer token
+ownership. Batch publication retains the original inline single address;
+reader/writer thread checks and mandatory DRAINING cleanup remain required.

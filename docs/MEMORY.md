@@ -1791,34 +1791,34 @@ structure-sized zero.
 
 | Row region | Admitted ceiling |
 | --- | ---: |
-| Initial single frame | 80 |
-| Other original records | 56 |
-| Shape and next epochs | 96 |
-| Each size component | 81 |
-| Each scalar lane/value | 31 |
-| Each at-most16-byte copy/zero chunk | 181 |
-| Each allocation/ownership marker | 30 |
-| Credit validation/caller continuation | 74 |
-| Original lexical publication recipe | 66 |
-| Exact-one lease validation | 149 |
-| Prepared-helper caller continuation | 24 |
-| Publication caller glue | 46 |
+| Initial single frame | 83 |
+| Other original records | 63 |
+| Shape and next epochs | 103 |
+| Each size component | 83 |
+| Each scalar lane/value | 36 |
+| Each at-most16-byte copy/zero chunk | 183 |
+| Each allocation/ownership marker | 32 |
+| Credit validation/caller continuation | 76 |
+| Original lexical publication recipe | 69 |
+| Exact-one lease validation | 151 |
+| Prepared-helper caller continuation | 26 |
+| Publication caller glue | 48 |
 
 AB-S admits498 on the first nonce round; AB-G reserve/begin admits241 on its
 first aggregate round and commit157. Prepared governor admission228 includes
 finish44. Ledger preparation109+166 includes initial26, apply117 and release23;
 each gate attempt admits28. Those nested tariffs remain separate from row
 caller glue. The bounded read-only root bootstrap is included retrospectively
-in the first80 admission; invalid bootstrap can consume0. Maximum conservative
-interprocedural polling work is242, below quantum256; byte chunks have their
+in the first83 admission; invalid bootstrap can consume0. Maximum conservative
+interprocedural polling work is248, below quantum256; byte chunks have their
 own guarded polls.
 
 Before publication the operation validates the original exact-one frame and
 precomputes new pointers, capacities, epochs and ordered ledger deltas.
 Successful ledger CAS is the final cutoff. The complete contiguous governed
-ledger sequence, including CAS and caller/return glue, has ceiling223;
-ungoverned ledger175, governed/no-ledger74, ungoverned/no-ledger26 and
-nongrowth10. It executes no callback, new admission, allocation, generic lease
+ledger sequence, including CAS and caller/return glue, has ceiling225;
+ungoverned ledger177, governed/no-ledger76, ungoverned/no-ledger28 and
+nongrowth12. It executes no callback, new admission, allocation, generic lease
 advance or raw ledger reconciliation. Governor finish precedes direct stores;
 ledger events apply RELATION then TIMESTAMP against current counters, followed
 by the timestamp tracking mirror and gate release. TIMESTAMP uses final
@@ -1834,3 +1834,67 @@ credit and drains the original single. Mandatory cleanup is noncancellable;
 impossible retirement failure aborts with original authority reachable. Stopped
 nongrowth can change unpublished spare cells, but rows/view/storage remain
 unchanged. This API alone does not enable evaluation operators.
+
+### Controlled private held batches
+
+`wl_columnar_relation_append_batch_t` is a distinct internal wrapper around
+one original `raw.single`. Begin binds either the current evaluation attempt
+or NULL/raw delegation. Row, set and end take that original wrapper by pointer;
+copying it does not transfer authority. Start with a zero-initialized wrapper,
+keep relation/control alive, serialize their lifecycle, and end every exit
+that retains authority. Reset only a fully ended wrapper for reuse. Legacy
+`col_rel_append_batch_t` and its cached raw lease validation remain unchanged.
+
+Controlled rows retain the private scalar domain of controlled row append.
+Earlier published rows survive a later stop; end is not whole-batch rollback.
+A new storage transition renews the lease only after its predecessor already
+published one. Before releasing the old lease, the row captures every raw
+input lane under its original descriptor/source writers. Input may alias old
+columns or row_scratch. No old input pointer or type array is used after
+release. Reacquisition keeps the original single address and saved attempt ID,
+but obtains a fresh nonce and validates current destination shape. A changed
+width returns ENOTSUP before any captured-lane access. FLOAT validity and
+signed-zero normalization use the reacquired schema, including when a valid
+peer replacement changes the type during the unlocked gap.
+
+Wide capture has exactly one original scratch reservation and allocation.
+It retains the original governor wrapper while its binding is protected,
+commits scratch credit before allocation, and keeps that reference across the
+unlocked renewal gap. Row-body staging borrows the completed capture instead
+of allocating it again. On every exit, incoming row preparation is retired,
+then physical capture is freed, original scratch credit is released, and the
+original governor reference is released last. Current destination binding is
+never used to refund old scratch. If capture was ungoverned and a peer legally
+attaches a governor during the gap, that attachment does not retroactively
+admit already-live capture; new payload admission uses the reacquired binding.
+An already governed relation rejects attachment to a different governor.
+
+A cancelled, exhausted or stale pre-release admission leaves the old held
+single intact. Mandatory old release may fail with residual original authority:
+the wrapper remains DRAINING and must be ended again. Once old authority has
+fully drained, the saved attempt is checked before any forward callback,
+poll, nonce claim or debit; reacquisition failures leave ENDED or DRAINING
+according to actual retained authority. No descriptor payload is read during
+the unlocked interval. Callers must separately retain relation lifetime.
+
+Cell set validates an existing row/column and current FLOAT representation,
+prechecks view epoch overflow, and publishes the cell/view under a final
+funded cutoff. It changes neither storage epoch nor timestamp payload. End
+validates original remaining thread-bound authority and performs mandatory
+cleanup without polling or charging any current or successor attempt. It
+remembers the first initiating result across cleanup retries. A positive
+cleanup error takes precedence over a negative initiating stop while authority
+remains; an initiating positive error retains precedence. After successful
+drain, end returns the remembered initiating result, including a negative stop
+following earlier published rows. Inspect DRAINING authority even when an
+initiating positive error masks a cleanup error.
+
+The held-batch region ceilings are begin170, original validation220, each
+capture initialization/pin phase80, renewal128 and set70. Full valid begin
+read-only bootstrap86 includes the inert-single helper63; rejected inert paths
+are bounded by78. This is an explicit retrospective bootstrap exception: dirty,
+inactive and first-refused admissions may report consumed0. Renewal is funded
+before old release and includes both original-ID guards, reinitialization and
+refused-child return continuations. The maximum conservative forward envelope
+is248; the complete post-CAS publication through outer return is225, including
+both wrappers' ordinary return work. Mandatory cleanup bodies remain excluded.
