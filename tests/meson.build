@@ -6347,3 +6347,14 @@ test_evaluation_numeric_exe = executable(
   link_with: [testlib_prod],
 )
 test('evaluation_numeric', test_evaluation_numeric_exe, timeout: 60)
+
+# #1821 fresh controlled scalar relation creation.
+test_evaluation_relation_creation_exe = executable(
+  'test_evaluation_relation_creation', files('test_evaluation_relation_creation.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_relation_creation', test_evaluation_relation_creation_exe,
+     suite: ['unit'], timeout: 60)

@@ -277,7 +277,7 @@ The 64-byte padding between `tail` and `head`
 cache-line ping-pong between producer and consumer collapses
 throughput by 2-10x.
 
-### 5.3 Init and relation identity/nonce allocators (9 rows)
+### 5.3 Init and relation identity/nonce allocators (12 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -285,6 +285,9 @@ throughput by 2-10x.
 | `io_adapter.c:ensure_builtins` | `s_mutex_init_ok` | `atomic_load` | `seq_cst` (default) | Pairs with the init publish; gates all later mutex operations |
 | `relation.c:col_rel_new_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Read the candidate identity before the non-wrapping CAS reservation loop; the counter only has to hand out distinct values, no other memory is published through it |
 | `relation.c:col_rel_new_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Reserve a unique relation identity and retry with the observed value after a lost race; uniqueness comes from the RMW, not from ordering |
+| `relation.c:wl_columnar_relation_constructor_identity` | `wl_next_relation_identity` | `atomic_load_explicit` | `relaxed` | Charged initial observation for fresh controlled construction; identity uniqueness does not publish payload |
+| `relation.c:wl_columnar_relation_constructor_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | MSVC Interlocked-backed strong reservation, charged per attempt; successful identities remain consumed on cancellation |
+| `relation.c:wl_columnar_relation_constructor_identity#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | `relaxed`/`relaxed` | Non-MSVC charged strong reservation; retry with observed counter on contention, never wrap or roll back |
 | `relation.c:col_rel_test_set_next_identity` | `wl_next_relation_identity` | `atomic_store_explicit` | `relaxed` | Test-only seam for selecting the terminal allocator state; production allocation is not concurrent with this reset |
 | `relation.c:wl_columnar_relation_test_single_nonce_replace` | `wl_next_mutation_set_nonce` | `atomic_load_explicit` | `relaxed` | Test-only quiescent snapshot before temporarily exercising nonce exhaustion; never used by production callers |
 | `relation.c:wl_columnar_relation_test_single_nonce_replace#2` | `wl_next_mutation_set_nonce` | `atomic_store_explicit` | `relaxed` | Test-only quiescent nonce boundary installation and restoration; no concurrent nonce allocator may run |

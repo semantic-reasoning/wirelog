@@ -3179,6 +3179,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
 #ifdef WL_SESSION_TEST_HOOKS
 extern uint32_t wl_columnar_relation_test_metadata_fail_allocation;
 extern bool wl_columnar_relation_test_metadata_fail_commit;
+extern uint32_t wl_columnar_relation_test_constructor_fail_allocation;
+extern void (*wl_columnar_relation_test_before_identity_cas)(
+    wl_evaluation_control_t *, uint64_t);
+extern void (*wl_columnar_relation_test_constructor_committed)(
+    wl_evaluation_control_t *, unsigned);
+extern void (*wl_columnar_relation_test_constructor_retired)(void);
 extern void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 extern void (*wl_columnar_relation_test_after_reader_cas)(
@@ -3232,6 +3238,21 @@ int
 wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Fresh private scalar construction. Same strict non-NULL name/governor/out
+* domain as raw; NULL control delegates raw. The name remains immutable for
+* this call. Logical work counts byte scans/copies/zeroing, generated digits,
+* table slots, allocation attempts, fixed header/token initialization, real
+* identity CAS rounds and controlled governor primitives. Fixed entry/size
+* arithmetic and mandatory retirement are excluded, as are allocator internals.
+* Three original local credit tokens survive all unpublished failure paths;
+* physical retirement precedes own-credit refunds. A final prepaid cutoff
+* installs canonical tokens and output without subsequent callbacks. Identity
+* gaps after cancellation are intentional; identities are never refunded. */
+int
+wl_columnar_relation_new_auto_governed_controlled(const char *name,
+    uint32_t ncols, uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control);
 /* Allocate a heap descriptor and optional name under a known governor. */
 int
 wl_columnar_relation_alloc_governed(col_rel_t **out, const char *name,
