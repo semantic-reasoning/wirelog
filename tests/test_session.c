@@ -1066,6 +1066,12 @@ test_worker_registry_pointer_admission(void)
     coordinator.memory_governor = ref;
     coordinator.num_workers = 1;
     const char *failure = NULL;
+    if (col_worker_session_create(&coordinator, 0, NULL, 0,
+        &coordinator) != EINVAL
+        || coordinator.memory_governor != ref
+        || wl_columnar_memory_reserved(governor) != 0)
+        failure = "self worker clone did not reject before mutation";
+
     atomic_store_explicit(&governor->usable_bytes,
         sizeof(col_rel_t *) - 1u, memory_order_release);
     int rc = col_worker_session_create(&coordinator, 0, parts, 1, &worker);
@@ -14069,6 +14075,84 @@ kfusion_retained_cleanup:
 #undef KRETAIN_CHECK
 }
 
+/* A real peer owns the parent ledger gate while the actual K-Fusion
+ * construction seam copies the numeric snapshot into a distinct branch. */
+static wl_atomic_u64 wl_columnar_session_clone_peer_ready;
+static wl_atomic_u64 wl_columnar_session_clone_peer_release;
+static wl_thread_t wl_columnar_session_clone_peer;
+static bool wl_columnar_session_clone_peer_started;
+static bool wl_columnar_session_clone_failed;
+static unsigned wl_columnar_session_clone_count;
+static wl_mem_ledger_snapshot_t wl_columnar_session_clone_parent_before;
+
+static void *
+wl_columnar_session_clone_hold_parent(void *arg)
+{
+    wl_mem_ledger_t *ledger = arg;
+    uint64_t expected = 0;
+    while (!atomic_compare_exchange_weak_explicit(&ledger->writer_gate,
+        &expected, 1, memory_order_acquire, memory_order_relaxed))
+        expected = 0;
+    atomic_store_explicit(&wl_columnar_session_clone_peer_ready, 1,
+        memory_order_release);
+    while (!atomic_load_explicit(&wl_columnar_session_clone_peer_release,
+        memory_order_acquire)) {
+    }
+    atomic_store_explicit(&ledger->writer_gate, 0, memory_order_release);
+    return NULL;
+}
+
+static void
+wl_columnar_session_clone_witness(wl_col_session_t *parent,
+    wl_col_session_t *child, bool before)
+{
+    if (before) {
+        atomic_store_explicit(&wl_columnar_session_clone_peer_ready, 0,
+            memory_order_relaxed);
+        atomic_store_explicit(&wl_columnar_session_clone_peer_release, 0,
+            memory_order_relaxed);
+        wl_columnar_session_clone_peer_started = wl_thread_create(
+            &wl_columnar_session_clone_peer,
+            wl_columnar_session_clone_hold_parent, &parent->mem_ledger) == 0;
+        if (!wl_columnar_session_clone_peer_started) {
+            wl_columnar_session_clone_failed = true;
+            return;
+        }
+        while (!atomic_load_explicit(&wl_columnar_session_clone_peer_ready,
+            memory_order_acquire)) {
+        }
+        wl_mem_ledger_snapshot(&parent->mem_ledger,
+            &wl_columnar_session_clone_parent_before);
+        return;
+    }
+    if (!wl_columnar_session_clone_peer_started)
+        return;
+    wl_mem_ledger_snapshot_t copy, parent_after;
+    wl_mem_ledger_snapshot(&child->mem_ledger, &copy);
+    if (memcmp(&copy, &wl_columnar_session_clone_parent_before, sizeof(copy))
+        || atomic_load_explicit(&child->mem_ledger.writer_gate,
+        memory_order_acquire) || child->mem_ledger.next_reclaimer_handle)
+        wl_columnar_session_clone_failed = true;
+    for (unsigned i = 0; i < WL_MEM_LEDGER_MAX_RECLAIMERS; i++)
+        if (child->mem_ledger.reclaimers[i].active)
+            wl_columnar_session_clone_failed = true;
+    /* Child accounting completes while the original peer still owns parent. */
+    wl_mem_ledger_alloc(&child->mem_ledger, WL_MEM_SUBSYS_CACHE, 17);
+    wl_mem_ledger_free(&child->mem_ledger, WL_MEM_SUBSYS_CACHE, 17);
+    wl_mem_ledger_snapshot(&parent->mem_ledger, &parent_after);
+    if (memcmp(&parent_after, &wl_columnar_session_clone_parent_before,
+        sizeof(parent_after))
+        || atomic_load_explicit(&parent->mem_ledger.writer_gate,
+        memory_order_acquire) != 1)
+        wl_columnar_session_clone_failed = true;
+    atomic_store_explicit(&wl_columnar_session_clone_peer_release, 1,
+        memory_order_release);
+    if (wl_thread_join(&wl_columnar_session_clone_peer))
+        wl_columnar_session_clone_failed = true;
+    wl_columnar_session_clone_peer_started = false;
+    wl_columnar_session_clone_count++;
+}
+
 static void
 test_kfusion_parallel_cohort_refusal_retry(void)
 {
@@ -14145,11 +14229,18 @@ test_kfusion_parallel_cohort_refusal_retry(void)
     kfusion_parent_session = &sess;
     kfusion_registered_during_submit = false;
     wl_columnar_kfusion_test_submit = kfusion_fail_second_submit;
+    wl_columnar_session_clone_failed = false;
+    wl_columnar_session_clone_count = 0;
+    wl_columnar_kfusion_test_clone = wl_columnar_session_clone_witness;
     int rc = col_op_k_fusion(&op, &stack, &sess);
+    wl_columnar_kfusion_test_clone = NULL;
     wl_columnar_kfusion_test_before_cleanup = NULL;
     wl_columnar_kfusion_test_submit = NULL;
     kfusion_parent_session = NULL;
     kfusion_refusal_source = NULL;
+    KCOHORT_CHECK(!wl_columnar_session_clone_failed
+        && wl_columnar_session_clone_count == 2,
+        "actual branch clone inherited peer writer authority");
     KCOHORT_CHECK(rc == EBUSY, "busy worker cleanup was not retained");
     KCOHORT_CHECK(sess.kfusion_pending_cohort != NULL,
         "pending cohort ownership was not retained");
@@ -14253,6 +14344,7 @@ test_kfusion_parallel_cohort_refusal_retry(void)
         "fresh merged result cleanup failed");
 
 kfusion_cohort_cleanup:
+    wl_columnar_kfusion_test_clone = NULL;
     wl_columnar_kfusion_test_before_cleanup = NULL;
     wl_columnar_kfusion_test_submit = NULL;
     kfusion_parent_session = NULL;

@@ -232,18 +232,27 @@ match the script's count (currently **170**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
-### 5.1 `wirelog/columnar/mem_ledger.c` — accounting (21 rows)
+### 5.1 `wirelog/columnar/mem_ledger.c` — accounting (30 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `mem_ledger.c:update_peak` | `*peak_atom` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current for monotone peak-update CAS loop; no happens-before edge required |
-| `mem_ledger.c:update_peak#2` | `*peak_atom` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Monotone high-water bump; if another thread won, retry; observed values are non-decreasing |
-| `mem_ledger.c:counter_sub_clamped` | `*counter` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current for the clamp-to-zero subtract path |
-| `mem_ledger.c:counter_sub_clamped#2` | `*counter` | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Clamp-to-zero CAS loop shared by free and set_gauge; loss-of-race retries |
-| `mem_ledger.c:wl_mem_ledger_init` | `ledger->total_budget` | `atomic_store_explicit` | `relaxed` | Set-once at init; readers see the value eventually via per-counter relaxed loads |
-| `mem_ledger.c:saturating_add` | `*counter` (subsys or global) | `atomic_load_explicit` | `relaxed` | Read-current before overflow-safe saturating increment |
-| `mem_ledger.c:saturating_add#2` | `*counter` (subsys or global) | `atomic_compare_exchange_weak_explicit` | `relaxed`/`relaxed` | Atomic saturating increment; retry with the observed value and never wrap |
-| `mem_ledger.c:wl_mem_ledger_set_gauge` | `ledger->subsys_bytes[subsys]` | `atomic_exchange_explicit` | `relaxed` | Gauge replace (Issue #1380); returns the previous value so the total can move by the difference |
+| `mem_ledger.c:wl_columnar_mem_ledger_writer_acquire` | `ledger->writer_gate` | `atomic_compare_exchange_weak_explicit` | `acquire/relaxed` | Acquire exclusive accounting writer authority; failed attempts retry |
+| `mem_ledger.c:wl_columnar_mem_ledger_writer_acquire#2` | `ledger->writer_gate` | `atomic_load_explicit` | `relaxed` | Read-only waiting while a peer owns writer authority; no counter access until acquire succeeds |
+| `mem_ledger.c:wl_columnar_mem_ledger_writer_release` | `ledger->writer_gate` | `atomic_store_explicit` | `release` | Publish protected accounting writes before the next writer acquires |
+| `mem_ledger.c:wl_columnar_mem_ledger_saturating_add` | `*counter` | `atomic_load_explicit` | `relaxed` | Protected counter read; ledger writer authority prevents competing writes |
+| `mem_ledger.c:wl_columnar_mem_ledger_saturating_add#2` | `*counter` | `atomic_store_explicit` | `relaxed` | Publish saturated increment under writer authority; no retry loop |
+| `mem_ledger.c:wl_columnar_mem_ledger_update_peak` | `*counter` | `atomic_load_explicit` | `relaxed` | Protected counter read; ledger writer authority prevents competing writes |
+| `mem_ledger.c:wl_columnar_mem_ledger_update_peak#2` | `*counter` | `atomic_store_explicit` | `relaxed` | Publish monotone peak under writer authority; readers remain atomic |
+| `mem_ledger.c:wl_columnar_mem_ledger_counter_sub_clamped` | `*counter` | `atomic_load_explicit` | `relaxed` | Protected counter read; ledger writer authority prevents competing writes |
+| `mem_ledger.c:wl_columnar_mem_ledger_counter_sub_clamped#2` | `*counter` | `atomic_store_explicit` | `relaxed` | Publish clamped subtraction under writer authority; no retry loop |
+| `mem_ledger.c:wl_mem_ledger_init` | `ledger->writer_gate` | `atomic_store_explicit` | `relaxed` | Quiescent initialization before publication; reset must not race readers or writers |
+| `mem_ledger.c:wl_mem_ledger_init#2` | `ledger->total_budget` | `atomic_store_explicit` | `relaxed` | Quiescent initialization before publication; reset must not race readers or writers |
+| `mem_ledger.c:wl_mem_ledger_set_gauge` | `ledger->subsys_bytes[subsys]` | `atomic_load_explicit` | `relaxed` | Read prior gauge under writer authority for signed total delta |
+| `mem_ledger.c:wl_mem_ledger_set_gauge#2` | `ledger->subsys_bytes[subsys]` | `atomic_store_explicit` | `relaxed` | Publish absolute gauge under writer authority; atomic readers may observe intermediate accounting skew |
+| `mem_ledger.c:wl_columnar_mem_ledger_clone_unpublished` | `destination->current_bytes` | `atomic_store_explicit` | `relaxed` | Initialize independent unpublished numeric snapshot; parent writer authority and reclaimers are excluded |
+| `mem_ledger.c:wl_columnar_mem_ledger_clone_unpublished#2` | `destination->peak_bytes` | `atomic_store_explicit` | `relaxed` | Initialize independent unpublished numeric snapshot; parent writer authority and reclaimers are excluded |
+| `mem_ledger.c:wl_columnar_mem_ledger_clone_unpublished#3` | `destination->subsys_bytes[i]` | `atomic_store_explicit` | `relaxed` | Initialize independent unpublished numeric snapshot; parent writer authority and reclaimers are excluded |
+| `mem_ledger.c:wl_columnar_mem_ledger_clone_unpublished#4` | `destination->subsys_peak[i]` | `atomic_store_explicit` | `relaxed` | Initialize independent unpublished numeric snapshot; parent writer authority and reclaimers are excluded |
 | `mem_ledger.c:wl_mem_ledger_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path; no edge required |
 | `mem_ledger.c:wl_mem_ledger_over_budget#2` | `ledger->current_bytes` | `atomic_load_explicit` | `relaxed` | Query path |
 | `mem_ledger.c:wl_mem_ledger_subsys_over_budget` | `ledger->total_budget` | `atomic_load_explicit` | `relaxed` | Query path |
@@ -258,10 +267,25 @@ Format: `file:function[#N]` | field | operation | order | justification.
 | `mem_ledger.c:wl_mem_ledger_snapshot#4` | `ledger->subsys_bytes[i]` | `atomic_load_explicit` | `relaxed` | Snapshot per-subsys path |
 | `mem_ledger.c:wl_mem_ledger_snapshot#5` | `ledger->subsys_peak[i]` | `atomic_load_explicit` | `relaxed` | Snapshot per-subsys path |
 
-The ledger's design accepts **accounting skew** between
-`current_bytes` and the sum of `subsys_bytes[]`; this is documented in
-`mem_ledger.h:217` and is the reason every counter operation uses
-`memory_order_relaxed` instead of any stronger order.
+All accounting writers (`alloc`, `free`, `set_gauge`) acquire the ledger-local
+writer gate before changing current or peak counters. Their protected helpers
+perform finite atomic loads/stores and saturating/clamped arithmetic, without
+callbacks, allocation, reclaimers, nested ledger APIs or other lock acquisition.
+Raw gate admission may wait and has no fairness or cancellation guarantee;
+read-only waiting reduces write contention. Controlled gate admission and
+publication are a subsequent dependency, not implemented by this raw foundation.
+
+Snapshots retain relaxed atomic reads and may observe intermediate accounting
+skew between subsystem and total counters. Independent saturation/clamping can
+also lose magnitude, so totals need not equal the sum of subsystem counters.
+Initialization/reset and reclaimer registry mutation remain quiescent operations.
+K-Fusion and TDD session copies exclude the entire embedded ledger from byte
+copying. K-Fusion initializes independent authority and copies atomic numeric
+snapshots; TDD initializes its attribution-only ledger before any cleanup/use
+and applies its existing worker budget later. Neither path reads or inherits the
+parent writer gate or reclaimer ownership. Non-ledger shallow fields retain the
+existing immutable-source lifetime contract.
+
 
 ### 5.2 `wirelog/util/lockfree_queue.c` — SPSC ring buffer (4 rows)
 

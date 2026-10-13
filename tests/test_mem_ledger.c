@@ -25,6 +25,7 @@
 
 #include "../wirelog/columnar/mem_ledger.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1018,6 +1019,228 @@ test_atomic_single_evaluation(void)
         PASS();
 }
 
+/* #1821: mixed concurrent writers must preserve a serial accounting order,
+ * including saturated counters, peaks, gauge deltas and clamp-to-zero frees. */
+typedef struct {
+    wl_mem_ledger_t *ledger;
+    unsigned operation;
+    int subsystem;
+    uint64_t bytes;
+} wl_columnar_mem_ledger_test_request_t;
+
+static void *
+wl_columnar_mem_ledger_test_writer(void *arg)
+{
+    wl_columnar_mem_ledger_test_request_t *r = arg;
+    if (r->operation == 0)
+        wl_mem_ledger_alloc(r->ledger, r->subsystem, r->bytes);
+    else if (r->operation == 1)
+        wl_mem_ledger_free(r->ledger, r->subsystem, r->bytes);
+    else
+        wl_mem_ledger_set_gauge(r->ledger, r->subsystem, r->bytes);
+    return NULL;
+}
+
+static int
+wl_columnar_mem_ledger_test_pair(wl_mem_ledger_t *ledger,
+    unsigned op0, int subsystem0, uint64_t bytes0,
+    unsigned op1, int subsystem1, uint64_t bytes1)
+{
+    wl_columnar_mem_ledger_test_request_t requests[2] = {
+        { ledger, op0, subsystem0, bytes0 },
+        { ledger, op1, subsystem1, bytes1 }
+    };
+    wl_thread_t threads[2];
+    if (wl_thread_create(&threads[0], wl_columnar_mem_ledger_test_writer,
+        &requests[0]) != 0)
+        return 1;
+    if (wl_thread_create(&threads[1], wl_columnar_mem_ledger_test_writer,
+        &requests[1]) != 0) {
+        (void)wl_thread_join(&threads[0]);
+        return 1;
+    }
+    int first = wl_thread_join(&threads[0]);
+    int second = wl_thread_join(&threads[1]);
+    return first || second;
+}
+
+static void
+wl_columnar_mem_ledger_test_mixed_writers(void)
+{
+    TEST("concurrent alloc/free/gauge preserve peers and saturated peaks");
+    for (unsigned repeat = 0; repeat < 64; repeat++) {
+        wl_mem_ledger_t ledger;
+        wl_mem_ledger_snapshot_t snapshot;
+        wl_mem_ledger_init(&ledger, 0);
+        /* Either serial order has the same positive total and high water. */
+        if (wl_columnar_mem_ledger_test_pair(&ledger,
+            0, WL_MEM_SUBSYS_RELATION, 64,
+            2, WL_MEM_SUBSYS_STORED, 128)) {
+            FAIL("thread lifecycle failed"); return;
+        }
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        if (snapshot.current_bytes != 192 || snapshot.peak_bytes != 192
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION] != 64
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_STORED] != 128) {
+            FAIL("mixed positive writers lost peer contribution"); return;
+        }
+        if (wl_columnar_mem_ledger_test_pair(&ledger,
+            1, WL_MEM_SUBSYS_RELATION, 64,
+            2, WL_MEM_SUBSYS_STORED, 0)) {
+            FAIL("thread lifecycle failed"); return;
+        }
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        if (snapshot.current_bytes || snapshot.peak_bytes != 192
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_STORED]
+            || snapshot.subsys_peak[WL_MEM_SUBSYS_STORED] != 128) {
+            FAIL("mixed retirement erased peaks or retained peer bytes");
+            return;
+        }
+        if (wl_columnar_mem_ledger_test_pair(&ledger,
+            0, WL_MEM_SUBSYS_RELATION, UINT64_MAX,
+            0, WL_MEM_SUBSYS_RELATION, 17)) {
+            FAIL("thread lifecycle failed"); return;
+        }
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        if (snapshot.current_bytes != UINT64_MAX
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION] != UINT64_MAX
+            || snapshot.peak_bytes != UINT64_MAX
+            || snapshot.subsys_peak[WL_MEM_SUBSYS_RELATION] != UINT64_MAX) {
+            FAIL("contended increment did not saturate"); return;
+        }
+        if (wl_columnar_mem_ledger_test_pair(&ledger,
+            1, WL_MEM_SUBSYS_RELATION, UINT64_MAX,
+            1, WL_MEM_SUBSYS_RELATION, 17)) {
+            FAIL("thread lifecycle failed"); return;
+        }
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        if (snapshot.current_bytes
+            || snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION]
+            || snapshot.peak_bytes != UINT64_MAX) {
+            FAIL("contended free did not clamp independently"); return;
+        }
+        if (atomic_load_explicit(&ledger.writer_gate, memory_order_acquire)) {
+            FAIL("writer authority remained held"); return;
+        }
+    }
+    PASS();
+}
+
+static void
+wl_columnar_mem_ledger_test_gauge_saturation(void)
+{
+    TEST("gauge saturation retains documented independent counter arithmetic");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION, UINT64_MAX - 10);
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_STORED, 20);
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_STORED, 5);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    /* Saturation loses 10, then the raw gauge delta removes 15. This is not
+     * a promise that independent saturated subsystem sums equal the total. */
+    if (snapshot.current_bytes != UINT64_MAX - 15
+        || snapshot.subsys_bytes[WL_MEM_SUBSYS_RELATION] != UINT64_MAX - 10
+        || snapshot.subsys_bytes[WL_MEM_SUBSYS_STORED] != 5
+        || snapshot.subsys_peak[WL_MEM_SUBSYS_STORED] != 20
+        || snapshot.peak_bytes != UINT64_MAX) {
+        FAIL("gauge delta changed raw saturated semantics"); return;
+    }
+    wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_RELATION, UINT64_MAX);
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_STORED, 0);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    if (snapshot.current_bytes || snapshot.subsys_bytes[WL_MEM_SUBSYS_STORED]
+        || snapshot.peak_bytes != UINT64_MAX) {
+        FAIL("clamped retirement changed saturated peak"); return;
+    }
+    PASS();
+}
+
+static void
+wl_columnar_mem_ledger_test_inert_requests(void)
+{
+    TEST("invalid/zero accounting returns before writer admission");
+    wl_mem_ledger_t ledger;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_init(&ledger, 0);
+    /* Quiescent deliberate gate setup: inert requests must not wait on it. */
+    atomic_store_explicit(&ledger.writer_gate, 1, memory_order_release);
+    wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION, 0);
+    wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_RELATION, 0);
+    wl_mem_ledger_alloc(&ledger, -1, 17);
+    wl_mem_ledger_free(&ledger, WL_MEM_SUBSYS_COUNT, 17);
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_COUNT, 17);
+    wl_mem_ledger_alloc(NULL, WL_MEM_SUBSYS_RELATION, 17);
+    wl_mem_ledger_free(NULL, WL_MEM_SUBSYS_RELATION, 17);
+    wl_mem_ledger_set_gauge(NULL, WL_MEM_SUBSYS_STORED, 17);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    if (snapshot.current_bytes || snapshot.peak_bytes
+        || atomic_load_explicit(&ledger.writer_gate,
+        memory_order_acquire) != 1) {
+        FAIL("inert request changed counters or peer gate"); return;
+    }
+    atomic_store_explicit(&ledger.writer_gate, 0, memory_order_release);
+    /* A valid zero gauge must execute: it can retire an existing charge. */
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_STORED, 9);
+    wl_mem_ledger_set_gauge(&ledger, WL_MEM_SUBSYS_STORED, 0);
+    wl_mem_ledger_snapshot(&ledger, &snapshot);
+    if (snapshot.current_bytes || snapshot.peak_bytes != 9) {
+        FAIL("zero gauge was mistaken for an inert request"); return;
+    }
+    PASS();
+}
+
+static wl_mem_reclaim_result_t
+wl_columnar_mem_ledger_test_clone_reclaimer(void *owner)
+{
+    (void)owner;
+    return (wl_mem_reclaim_result_t){ 0, 0 };
+}
+
+static void
+wl_columnar_mem_ledger_test_clone(void)
+{
+    TEST("unpublished ledger clone never inherits held writer authority");
+    wl_mem_ledger_t source, child;
+    wl_mem_ledger_snapshot_t before, copied, after;
+    wl_mem_ledger_init(&source, 4096);
+    wl_mem_ledger_alloc(&source, WL_MEM_SUBSYS_RELATION, 51);
+    wl_mem_ledger_alloc(&source, WL_MEM_SUBSYS_TIMESTAMP, 27);
+    wl_mem_ledger_free(&source, WL_MEM_SUBSYS_RELATION, 11);
+    wl_mem_reclaimer_handle_t handle = 0;
+    if (wl_mem_ledger_register_reclaimer(&source,
+        wl_columnar_mem_ledger_test_clone_reclaimer, &source, &handle)
+        || !handle) {
+        FAIL("source reclaimer setup failed"); return;
+    }
+    wl_mem_ledger_snapshot(&source, &before);
+    atomic_store_explicit(&source.writer_gate, 1, memory_order_release);
+    int result = wl_columnar_mem_ledger_clone_unpublished(&child, &source);
+    wl_mem_ledger_snapshot(&child, &copied);
+    if (result || copied.total_budget != 4096 || copied.current_bytes != 67
+        || copied.peak_bytes != 78 || memcmp(&before, &copied, sizeof(before))
+        || atomic_load_explicit(&child.writer_gate, memory_order_acquire)
+        || child.next_reclaimer_handle) {
+        FAIL("clone lost numeric state or copied authority"); return;
+    }
+    for (unsigned i = 0; i < WL_MEM_LEDGER_MAX_RECLAIMERS; i++)
+        if (child.reclaimers[i].active) {
+            FAIL("clone inherited source reclaimer ownership"); return;
+        }
+    wl_mem_ledger_alloc(&child, WL_MEM_SUBSYS_RELATION, 17);
+    wl_mem_ledger_free(&child, WL_MEM_SUBSYS_RELATION, 17);
+    wl_mem_ledger_snapshot(&source, &after);
+    if (memcmp(&before, &after, sizeof(before))
+        || atomic_load_explicit(&source.writer_gate, memory_order_acquire) != 1
+        || wl_columnar_mem_ledger_clone_unpublished(&source, &source) != EINVAL
+        || wl_columnar_mem_ledger_clone_unpublished(NULL, &source) != EINVAL) {
+        FAIL("clone mutated parent or accepted live self-clone"); return;
+    }
+    atomic_store_explicit(&source.writer_gate, 0, memory_order_release);
+    PASS();
+}
+
 /* ======================================================================== */
 /* Main                                                                     */
 /* ======================================================================== */
@@ -1046,6 +1269,10 @@ main(void)
     test_atomic_unsigned_bits();
     test_atomic_unique_prior_values();
     test_atomic_single_evaluation();
+    wl_columnar_mem_ledger_test_mixed_writers();
+    wl_columnar_mem_ledger_test_gauge_saturation();
+    wl_columnar_mem_ledger_test_inert_requests();
+    wl_columnar_mem_ledger_test_clone();
 
     printf("\n");
     printf("Passed: %d/%d\n", tests_passed, tests_run);

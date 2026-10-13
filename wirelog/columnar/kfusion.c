@@ -296,6 +296,8 @@ struct wl_columnar_kfusion_cohort {
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_kfusion_test_clone)(wl_col_session_t *,
+    wl_col_session_t *, bool);
 void (*wl_columnar_kfusion_test_before_cleanup)(wl_col_session_t *sess,
     eval_stack_t *stack, col_rel_t **results, uint32_t result_count);
 int (*wl_columnar_kfusion_test_submit)(wl_work_queue_t *wq,
@@ -981,7 +983,18 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
          * mat_cache is zeroed below (Issue #196): workers start fresh.
          * arrangement caches are zeroed below, so workers rebuild private
          * entries on demand instead of cloning coordinator state. */
-        worker_sess[d] = *sess;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_kfusion_test_clone)
+            wl_columnar_kfusion_test_clone(sess, &worker_sess[d], true);
+#endif
+        wl_columnar_session_copy_without_ledger(&worker_sess[d], sess);
+        if (wl_columnar_mem_ledger_clone_unpublished(
+                &worker_sess[d].mem_ledger, &sess->mem_ledger))
+            abort(); /* distinct unpublished destination is structural */
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_kfusion_test_clone)
+            wl_columnar_kfusion_test_clone(sess, &worker_sess[d], false);
+#endif
         worker_sess[d].base.owns_evaluation_control = false;
         worker_sess[d].wq = NULL; /* prevent nested K-fusion from workers */
         worker_sess[d].wq_workers = 0;
