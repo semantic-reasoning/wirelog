@@ -2440,6 +2440,20 @@ typedef struct wl_col_session_t {
     uint64_t seed_none_identity[16];
 } wl_col_session_t;
 
+/* Distinct unpublished destination, immutable non-ledger source fields.
+ * Never byte-copy live accounting atomics or original writer authority.
+ * Caller initializes the excluded ledger before any use or publication. */
+static inline void
+wl_columnar_session_copy_without_ledger(wl_col_session_t *destination,
+    const wl_col_session_t *source)
+{
+    const size_t begin = offsetof(wl_col_session_t, mem_ledger);
+    const size_t end = begin + sizeof(source->mem_ledger);
+    memcpy(destination, source, begin);
+    memcpy((unsigned char *)destination + end,
+        (const unsigned char *)source + end, sizeof(*source) - end);
+}
+
 bool
 wl_columnar_session_budget_denied(const void *session);
 void
@@ -4489,6 +4503,8 @@ extern int (*wl_columnar_eval_delta_test_retraction_eval)(
     const wl_plan_stratum_t *, wl_col_session_t *, uint32_t);
 int wl_columnar_eval_delta_test_retraction_step(const wl_plan_stratum_t *,
     wl_col_session_t *, uint32_t);
+extern void (*wl_columnar_kfusion_test_clone)(wl_col_session_t *parent,
+    wl_col_session_t *child, bool before);
 extern void (*wl_columnar_kfusion_test_before_cleanup)(
     wl_col_session_t *sess, eval_stack_t *stack, col_rel_t **results,
     uint32_t result_count);
@@ -4608,6 +4624,7 @@ col_rel_exchange_partition(const col_rel_t *src,
  * Borrowed fields (plan, frontier_ops) are shared read-only.
  *
  * out_worker must be caller-allocated (e.g., from calloc'd array).
+ * It must be distinct from coordinator; self-cloning returns EINVAL.
  * partitions[] ownership transfers to the worker on success;
  * on failure, partitions[] are NOT consumed (caller must free).
  * Precondition (#1661): no non-NULL partition may itself be pool_owned or

@@ -83,69 +83,67 @@ percent_of(uint64_t value, uint32_t percentage)
            + (remainder * (uint64_t)percentage) / 100;
 }
 
-/* The accounting API has no failure return.  Saturating increments preserve
- * the invariant that a counter never wraps into a deceptively small value;
- * admission and allocation failure remain responsibilities of the governor
- * and allocator layers described in docs/MEMORY.md. */
-static uint64_t
-saturating_add(wl_atomic_u64 *counter, uint64_t bytes)
+/* All accounting writers serialize on this ledger-local gate. Raw callers
+ * wait without cancellation; controlled publication will admit each attempt
+ * before acquiring the same gate. No callback, allocation, reclaimer or other
+ * lock acquisition is permitted inside the finite accounting section. */
+static void
+wl_columnar_mem_ledger_writer_acquire(wl_mem_ledger_t *ledger)
 {
-    uint64_t old = atomic_load_explicit(counter, memory_order_relaxed);
     for (;;) {
-        uint64_t next = (UINT64_MAX - old < bytes) ? UINT64_MAX : old + bytes;
-        if (atomic_compare_exchange_weak_explicit(counter, &old, next,
-            memory_order_relaxed,
-            memory_order_relaxed))
-            return next;
-    }
-}
-
-/*
- * update_peak: atomically update @peak_atom to max(*peak_atom, new_val).
- * Uses compare-exchange loop.
- */
-static void
-update_peak(wl_atomic_u64 *peak_atom, uint64_t new_val)
-{
-    uint64_t old = atomic_load_explicit(peak_atom, memory_order_relaxed);
-    while (old < new_val) {
-        if (atomic_compare_exchange_weak_explicit(peak_atom, &old, new_val,
-            memory_order_relaxed,
-            memory_order_relaxed)) {
-            break;
+        uint64_t expected = 0;
+        if (atomic_compare_exchange_weak_explicit(&ledger->writer_gate,
+            &expected, 1, memory_order_acquire, memory_order_relaxed))
+            return;
+        /* Read-only waiting avoids repeated write ownership transfers while
+         * a peer is performing the finite protected operation. */
+        while (atomic_load_explicit(&ledger->writer_gate,
+            memory_order_relaxed) != 0) {
         }
-        /* old updated by CAS on failure; retry */
     }
 }
 
-/*
- * total_add: add @bytes to current_bytes and bump peak_bytes.
- */
 static void
-total_add(wl_mem_ledger_t *ledger, uint64_t bytes)
+wl_columnar_mem_ledger_writer_release(wl_mem_ledger_t *ledger)
 {
-    uint64_t total_new = saturating_add(&ledger->current_bytes, bytes);
-    update_peak(&ledger->peak_bytes, total_new);
+    atomic_store_explicit(&ledger->writer_gate, 0, memory_order_release);
 }
 
-/*
- * counter_sub_clamped: subtract @bytes from @counter, clamping at zero.
- *
- * CAS loop rather than fetch_sub: avoids the TOCTOU race between load and
- * subtract under concurrent worker teardown.  Without CAS, two concurrent
- * frees could both read the same old value, both decide to subtract the
- * full amount, and underflow the counter.
- */
-static void
-counter_sub_clamped(wl_atomic_u64 *counter, uint64_t bytes)
+/* Protected arithmetic preserves saturating/clamped raw accounting. Counter
+ * loads/stores remain atomic for lock-free readers; these helpers never retry.
+ * Saturation can lose magnitude, so subsystem sums need not equal total. */
+static uint64_t
+wl_columnar_mem_ledger_saturating_add(wl_atomic_u64 *counter, uint64_t bytes)
 {
     uint64_t old = atomic_load_explicit(counter, memory_order_relaxed);
-    uint64_t updated;
-    do {
-        updated = (bytes > old) ? 0 : old - bytes;
-    } while (!atomic_compare_exchange_weak_explicit(
-            counter, &old, updated, memory_order_relaxed,
-            memory_order_relaxed));
+    uint64_t next = UINT64_MAX - old < bytes ? UINT64_MAX : old + bytes;
+    atomic_store_explicit(counter, next, memory_order_relaxed);
+    return next;
+}
+
+static void
+wl_columnar_mem_ledger_update_peak(wl_atomic_u64 *counter, uint64_t value)
+{
+    uint64_t old = atomic_load_explicit(counter, memory_order_relaxed);
+    if (old < value)
+        atomic_store_explicit(counter, value, memory_order_relaxed);
+}
+
+static void
+wl_columnar_mem_ledger_counter_sub_clamped(wl_atomic_u64 *counter,
+    uint64_t bytes)
+{
+    uint64_t old = atomic_load_explicit(counter, memory_order_relaxed);
+    atomic_store_explicit(counter, bytes > old ? 0 : old - bytes,
+        memory_order_relaxed);
+}
+
+static void
+wl_columnar_mem_ledger_total_add(wl_mem_ledger_t *ledger, uint64_t bytes)
+{
+    uint64_t next = wl_columnar_mem_ledger_saturating_add(
+        &ledger->current_bytes, bytes);
+    wl_columnar_mem_ledger_update_peak(&ledger->peak_bytes, next);
 }
 
 /* ======================================================================== */
@@ -158,6 +156,7 @@ wl_mem_ledger_init(wl_mem_ledger_t *ledger, uint64_t budget_bytes)
     if (!ledger)
         return;
     memset(ledger, 0, sizeof(*ledger));
+    atomic_store_explicit(&ledger->writer_gate, 0, memory_order_relaxed);
     atomic_store_explicit(&ledger->total_budget, budget_bytes,
         memory_order_relaxed);
 }
@@ -170,13 +169,19 @@ wl_mem_ledger_alloc(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
     if (subsys < 0 || subsys >= WL_MEM_SUBSYS_COUNT)
         return;
 
+    wl_columnar_mem_ledger_writer_acquire(ledger);
     /* Update subsystem counter */
-    uint64_t subsys_new = saturating_add(&ledger->subsys_bytes[subsys], bytes);
-    update_peak(&ledger->subsys_peak[subsys], subsys_new);
+    uint64_t subsys_new =
+        wl_columnar_mem_ledger_saturating_add(&ledger->subsys_bytes[subsys],
+            bytes);
+    wl_columnar_mem_ledger_update_peak(&ledger->subsys_peak[subsys],
+        subsys_new);
 
     /* Update total counter */
-    uint64_t total_new = saturating_add(&ledger->current_bytes, bytes);
-    update_peak(&ledger->peak_bytes, total_new);
+    uint64_t total_new =
+        wl_columnar_mem_ledger_saturating_add(&ledger->current_bytes, bytes);
+    wl_columnar_mem_ledger_update_peak(&ledger->peak_bytes, total_new);
+    wl_columnar_mem_ledger_writer_release(ledger);
 }
 
 void
@@ -187,8 +192,33 @@ wl_mem_ledger_free(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
     if (subsys < 0 || subsys >= WL_MEM_SUBSYS_COUNT)
         return;
 
-    counter_sub_clamped(&ledger->subsys_bytes[subsys], bytes);
-    counter_sub_clamped(&ledger->current_bytes, bytes);
+    wl_columnar_mem_ledger_writer_acquire(ledger);
+    wl_columnar_mem_ledger_counter_sub_clamped(&ledger->subsys_bytes[subsys],
+        bytes);
+    wl_columnar_mem_ledger_counter_sub_clamped(&ledger->current_bytes, bytes);
+    wl_columnar_mem_ledger_writer_release(ledger);
+}
+
+int
+wl_columnar_mem_ledger_clone_unpublished(wl_mem_ledger_t *destination,
+    const wl_mem_ledger_t *source)
+{
+    if (!destination || !source || destination == source)
+        return EINVAL;
+    wl_mem_ledger_snapshot_t snapshot;
+    wl_mem_ledger_snapshot(source, &snapshot);
+    wl_mem_ledger_init(destination, snapshot.total_budget);
+    atomic_store_explicit(&destination->current_bytes, snapshot.current_bytes,
+        memory_order_relaxed);
+    atomic_store_explicit(&destination->peak_bytes, snapshot.peak_bytes,
+        memory_order_relaxed);
+    for (unsigned i = 0; i < WL_MEM_SUBSYS_COUNT; i++) {
+        atomic_store_explicit(&destination->subsys_bytes[i],
+            snapshot.subsys_bytes[i], memory_order_relaxed);
+        atomic_store_explicit(&destination->subsys_peak[i],
+            snapshot.subsys_peak[i], memory_order_relaxed);
+    }
+    return 0;
 }
 
 int
@@ -274,16 +304,21 @@ wl_mem_ledger_set_gauge(wl_mem_ledger_t *ledger, int subsys, uint64_t bytes)
     if (subsys < 0 || subsys >= WL_MEM_SUBSYS_COUNT)
         return;
 
-    uint64_t old = atomic_exchange_explicit(&ledger->subsys_bytes[subsys],
-            bytes, memory_order_relaxed);
-    update_peak(&ledger->subsys_peak[subsys], bytes);
+    wl_columnar_mem_ledger_writer_acquire(ledger);
+    uint64_t old = atomic_load_explicit(&ledger->subsys_bytes[subsys],
+            memory_order_relaxed);
+    atomic_store_explicit(&ledger->subsys_bytes[subsys], bytes,
+        memory_order_relaxed);
+    wl_columnar_mem_ledger_update_peak(&ledger->subsys_peak[subsys], bytes);
 
     /* Move the total by the difference so current_bytes stays the sum of
      * the subsystem counters (modulo the documented relaxed skew). */
     if (bytes > old)
-        total_add(ledger, bytes - old);
+        wl_columnar_mem_ledger_total_add(ledger, bytes - old);
     else if (old > bytes)
-        counter_sub_clamped(&ledger->current_bytes, old - bytes);
+        wl_columnar_mem_ledger_counter_sub_clamped(&ledger->current_bytes,
+            old - bytes);
+    wl_columnar_mem_ledger_writer_release(ledger);
 }
 
 bool

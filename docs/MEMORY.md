@@ -388,8 +388,13 @@ is incremental; the sections below describe which paths participate.
 
 Each `wl_col_session_t` embeds one `wl_mem_ledger_t`
 (`wirelog/columnar/mem_ledger.h`).  It holds a total, a total peak and one
-current/peak pair per subsystem, all updated with relaxed atomics so that
-K-fusion branch threads and TDD workers can charge concurrently.  Two update
+current/peak pair per subsystem. Every accounting writer acquires a ledger-local
+writer gate; protected saturating/clamped arithmetic uses finite atomic
+loads/stores. K-fusion branch threads and TDD workers can share a ledger, while
+raw writer admission may wait and does not guarantee fairness or cancellation.
+Snapshots retain relaxed atomic reads and may observe intermediate counter
+updates. Initialization/reset is quiescent; no callbacks, reclaimers, allocations
+or other lock acquisition run inside an accounting critical section. Two update
 styles exist:
 
 - **Event accounting** (`wl_mem_ledger_alloc`/`wl_mem_ledger_free`): the

@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* C11 atomics for lock-free thread safety */
+/* C11 atomic storage and accounting writer admission */
 #ifdef _MSC_VER
 /* MSVC: Use intrinsic functions instead of <stdatomic.h> */
 #include <windows.h>
@@ -270,7 +270,8 @@ extern const uint32_t wl_mem_subsys_pct[WL_MEM_SUBSYS_COUNT];
 /*
  * wl_mem_ledger_t: session-level memory accounting ledger.
  *
- * All fields updated via atomic operations; safe to read/write from
+ * Accounting fields use atomic operations; writers serialize per ledger,
+ * while snapshots may observe intermediate counter updates. Safe to use from
  * multiple threads (K-fusion worker threads and session thread).
  *
  * @total_budget:  Maximum allowed bytes (0 = unlimited).
@@ -287,6 +288,9 @@ typedef struct wl_mem_ledger {
     wl_atomic_u64 subsys_peak[WL_MEM_SUBSYS_COUNT];
     wl_mem_reclaimer_slot_t reclaimers[WL_MEM_LEDGER_MAX_RECLAIMERS];
     wl_mem_reclaimer_handle_t next_reclaimer_handle;
+    /* Serializes every accounting writer. Init/reset is quiescent; snapshots
+     * remain atomic but nontransactional. Raw acquisition may wait. */
+    wl_atomic_u64 writer_gate;
 } wl_mem_ledger_t;
 
 /*
@@ -316,6 +320,13 @@ typedef struct {
  */
 void
 wl_mem_ledger_init(wl_mem_ledger_t *ledger, uint64_t budget_bytes);
+
+/* Copy only atomic numeric snapshots into distinct unpublished storage.
+* Destination writer authority and reclaimer registry start empty. Source
+* snapshots are nontransactional; no source gate is read or acquired. */
+int
+wl_columnar_mem_ledger_clone_unpublished(wl_mem_ledger_t *destination,
+    const wl_mem_ledger_t *source);
 
 /*
  * wl_mem_ledger_alloc:

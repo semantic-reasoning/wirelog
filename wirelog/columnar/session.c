@@ -3817,7 +3817,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     uint32_t num_partitions, wl_col_session_t *out_worker)
 {
     int failure_rc = ENOMEM;
-    if (!coordinator || !out_worker || (!partitions && num_partitions > 0))
+    if (!coordinator || !out_worker || coordinator == out_worker
+        || (!partitions && num_partitions > 0))
         return EINVAL;
     /* Worker storage is reusable only after a complete destroy. A refused
      * teardown leaves ownership in place and permanently closes this worker. */
@@ -3854,7 +3855,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
 
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
-    *out_worker = *coordinator;
+    wl_columnar_session_copy_without_ledger(out_worker, coordinator);
+    /* Independent authority exists before any failure cleanup. The worker
+     * attribution budget is initialized below after its policy is resolved. */
+    wl_mem_ledger_init(&out_worker->mem_ledger, 0);
 
     /* Step 2: Set identity fields */
     out_worker->worker_id = worker_id;
