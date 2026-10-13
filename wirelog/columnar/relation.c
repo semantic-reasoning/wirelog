@@ -9111,6 +9111,12 @@ wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     return 0;
 }
 
+/* File-scope array bounds enforce this on default MSVC C mode as well as
+ * C11 compilers, without emitting a runtime assertion call. */
+typedef char wl_columnar_relation_constructor_token_quantum_bound[
+        (sizeof(wl_columnar_memory_reservation_t) + 2u
+        <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
 /* Fresh construction keeps all credit at its original stack addresses until
  * the final publication cutoff. Cleanup uses these external prefixes even
  * when descriptor zeroing has not completed. Allocator internals and mandatory
@@ -9439,9 +9445,6 @@ wl_columnar_relation_new_private_controlled(const char *name,
     };
     /* Token init performs sizeof(token) zero bytes, identity and state stores.
      * Each call is finite and prepaid; these tokens do not own credit yet. */
-    _Static_assert(sizeof(wl_columnar_memory_reservation_t) + 2u
-        <= WL_EVALUATION_CONTROL_QUANTUM,
-        "fresh constructor token initialization must fit one quantum");
     for (unsigned i = 0; i < 5; i++) {
         uint64_t work = sizeof(wl_columnar_memory_reservation_t) + 2u;
         rc = wl_evaluation_control_charge(control, work);
