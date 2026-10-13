@@ -10315,6 +10315,126 @@ cleanup:
 #undef GLOBAL_CHECK
 }
 
+/* Issue #2092: a nonrecursive stratum `pre` completes ahead of the
+ * global-read stratum, which then reads it and fails.  The retry clears
+ * `pre` before re-deriving it, so it holds exactly one copy of `input`. */
+static void
+test_global_read_prefix_retry(uint32_t workers, unsigned mode)
+{
+    TEST("global-read failure after a completed stratum: exact prefix retry");
+    uint32_t key = 0, projection[] = { 0, 1 };
+    const char *keys[] = { "col1" };
+    uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t pre_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" }
+    };
+    wl_plan_op_t output_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "pre", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = 2 },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "pre" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_op_t relay_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "pre" },
+        { .op = WL_PLAN_OP_FILTER, .filter_expr = { predicate, 2 } },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t pre_relation[] = {
+        { .name = "pre", .delta_name = "$d$pre", .ops = pre_ops,
+          .op_count = 1 }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "output", .delta_name = "$d$output", .ops = output_ops,
+          .op_count = 5 },
+        { .name = "relay", .delta_name = "$d$relay", .ops = relay_ops,
+          .op_count = 3 }
+    };
+    wl_plan_stratum_t strata[] = {
+        { .relations = pre_relation, .relation_count = 1,
+          .is_recursive = false },
+        { .relations = relations, .relation_count = 2, .is_recursive = true }
+    };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = strata, .stratum_count = 2,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    global_publication_mode = mode;
+    global_publication_relation = 0;
+    global_publication_hit = false;
+    global_publication_held = global_publication_alias = NULL;
+    memset(&global_publication_reader, 0, sizeof(global_publication_reader));
+    atomic_store_explicit(&global_publication_workers, 0, memory_order_relaxed);
+#define PREFIX_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    PREFIX_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "prefix session");
+    wl_col_session_t *coord = COL_SESSION(session);
+    governor = coord->memory_governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    uint32_t input_rows = workers * 4096;
+    values = malloc((size_t)input_rows * 2 * sizeof(*values));
+    PREFIX_CHECK(values, "prefix input allocation");
+    for (uint32_t i = 0; i < input_rows * 2; i++) values[i] = 42;
+    PREFIX_CHECK(wl_session_insert(session, "input", values, input_rows,
+        2) == 0, "prefix input");
+    wl_columnar_eval_test_global_publication = global_publication_boundary;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    PREFIX_CHECK(global_publication_hit && global_publication_hook_rc == 0,
+        "prefix global-read boundary");
+    PREFIX_CHECK(rc == (mode <= 3 ? EBUSY : ENOMEM) && tuples.count == 0,
+        "prefix failure status or callbacks");
+    /* `pre` completed; mode 3 also leaves the failed stratum's workers
+     * retained across the retry's clear. */
+    PREFIX_CHECK(coord->uncommitted_strata_done == 1
+        && coord->tdd_workers_count == (mode == 3 ? workers : 0),
+        "prefix completed stratum or retained workers");
+    if (mode <= 3) {
+        PREFIX_CHECK(col_rel_source_reader_release(
+                &global_publication_reader) == 0, "prefix reader release");
+        col_rel_destroy(global_publication_alias);
+        global_publication_alias = NULL;
+    }
+    wl_columnar_eval_test_global_publication = NULL;
+    PREFIX_CHECK(wl_session_snapshot(session, collect_tuple, &tuples) == 0,
+        "prefix public retry");
+    col_rel_t *pre = session_find_rel(coord, "pre");
+    PREFIX_CHECK(pre && pre->nrows == input_rows, "prefix exact rows");
+    for (uint32_t ri = 0; ri < 2; ri++) {
+        col_rel_t *r = session_find_rel(coord, relations[ri].name);
+        PREFIX_CHECK(r && r->nrows == 1 && col_rel_get(r, 0, 0) == 42
+            && col_rel_get(r, 0, 1) == 42, "prefix exact global rows");
+    }
+    PREFIX_CHECK(coord->tdd_workers_count == 0, "prefix teardown");
+cleanup:
+    wl_columnar_eval_test_global_publication = NULL;
+    if (global_publication_reader.owner)
+        (void)col_rel_source_reader_release(&global_publication_reader);
+    col_rel_destroy(global_publication_alias);
+    global_publication_alias = NULL;
+    free(values);
+    wl_session_destroy(session);
+    if (governor) {
+        if (reserved_on(governor) != 0 && !failure)
+            failure = "prefix retained reservation leak";
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef PREFIX_CHECK
+}
+
 extern void (*wl_columnar_eval_test_nonrec_worker)(wl_col_session_t *,
     eval_stack_t *, eval_entry_t *, int *);
 extern int (*wl_columnar_eval_test_nonrec_boundary)(wl_col_session_t *,
@@ -16346,6 +16466,10 @@ main(void)
         test_global_read_publication(workers, 1, 0, 1, true);
         test_global_read_publication(workers, 1, 1, 1, true);
         test_global_read_publication(workers, 1, 3, 1, true);
+        test_global_read_prefix_retry(workers, 1);
+        test_global_read_prefix_retry(workers, 2);
+        test_global_read_prefix_retry(workers, 3);
+        test_global_read_prefix_retry(workers, 6);
     }
     for (uint32_t workers = 2; workers <= 8; workers *= 4) {
         for (unsigned initial = 0; initial < 3; initial++)
