@@ -1486,6 +1486,13 @@ wl_columnar_expr_allocate(size_t bytes)
  * move64: move helper identity checks6, state checks6, payload/atomic loads
  *   and stores16, authority/commit dispatch6, final capability/output stores2
  *   =36. Governor reserve15 (plus CAS retries) and commit4 are additional.
+ * eval64: instruction dispatch8, two pops6, result locals4, maximum arithmetic
+ *   branch30, push sidefields10, outcome bookkeeping4 =62. The arithmetic
+ *   maximum covers two FLOAT loads (8-byte copies+finite checks each), one
+ *   operation and FLOAT store (finite/zero checks+8-byte copy): <=30; portable
+ *   checked integer multiply incl abs/range guards is <=24. Row reads1 and
+ *   instruction fetch1 are additional. No string/library traversal admitted.
+ * final8: stack/result selection3, pending failure1, output stores2 =6.
  * Each finite region <=256; every region and byte/digit iteration tails.
  */
 static int
@@ -1741,6 +1748,149 @@ fail:
     if (admitted && !wl_columnar_memory_rollback(&admission))
         abort();
     return rc;
+}
+
+static int
+wl_columnar_expr_numeric_step(expr_stack_t *stack,
+    const expr_instr_t *in, const int64_t *row, uint32_t ncols,
+    bool *failed,
+    wl_evaluation_control_t *control)
+{
+    int rc;
+    *failed = false;
+    if (in->op == WL_PLAN_EXPR_VAR || in->op == WL_PLAN_EXPR_VAR_FLOAT) {
+        if (in->iarg < ncols) {
+            rc = wl_columnar_expr_charge(control, 1);
+            if (rc) return rc;
+            int64_t value = row[in->iarg];
+            double decoded;
+            if (in->op == WL_PLAN_EXPR_VAR_FLOAT && !expr_float_load(value,
+                &decoded))
+                *failed = true;
+            else expr_push(stack, value);
+        } else if (in->op == WL_PLAN_EXPR_VAR_FLOAT) *failed = true;
+        else expr_push(stack, 0);
+    } else if (in->op == WL_PLAN_EXPR_CONST_FLOAT) {
+        double decoded;
+        if (!expr_float_load(in->larg, &decoded)) *failed = true;
+        else expr_push(stack, in->larg);
+    } else if (in->op == WL_PLAN_EXPR_CONST_INT ||
+        in->op == WL_PLAN_EXPR_BOOL) {
+        expr_push(stack, in->larg);
+    } else if (in->op == WL_PLAN_EXPR_ARITH_BNOT) {
+        int64_t a = expr_pop(stack); expr_push(stack, ~a);
+    } else if (in->op == WL_PLAN_EXPR_AGG_COUNT ||
+        in->op == WL_PLAN_EXPR_AGG_SUM
+        || in->op == WL_PLAN_EXPR_AGG_MIN ||
+        in->op == WL_PLAN_EXPR_AGG_MAX) {
+        /* Actual compiled aggregates are no-ops. */
+    } else {
+        int64_t b = expr_pop(stack), a = expr_pop(stack), result = 0;
+        int semantic = 0;
+        switch ((wl_plan_expr_tag_t)in->op) {
+        case WL_PLAN_EXPR_ARITH_ADD: semantic =
+                wl_columnar_arithmetic_checked_add_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SUB: semantic =
+                wl_columnar_arithmetic_checked_sub_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_MUL: semantic =
+                wl_columnar_arithmetic_checked_mul_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_DIV: semantic =
+                wl_columnar_arithmetic_checked_div_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_MOD: semantic =
+                wl_columnar_arithmetic_checked_mod_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SHL: semantic =
+                wl_columnar_arithmetic_checked_shl_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SHR: semantic =
+                wl_columnar_arithmetic_checked_shr_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_BAND: result = a & b; break;
+        case WL_PLAN_EXPR_ARITH_BOR: result = a | b; break;
+        case WL_PLAN_EXPR_ARITH_BXOR: result = a ^ b; break;
+        case WL_PLAN_EXPR_CMP_EQ: result = a == b; break;
+        case WL_PLAN_EXPR_CMP_NEQ: result = a != b; break;
+        case WL_PLAN_EXPR_CMP_LT: result = a < b; break;
+        case WL_PLAN_EXPR_CMP_LTE: result = a <= b; break;
+        case WL_PLAN_EXPR_CMP_GT: result = a > b; break;
+        case WL_PLAN_EXPR_CMP_GTE: result = a >= b; break;
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD: case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL: case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ: case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT: case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE: case WL_PLAN_EXPR_CMP_FLOAT_GTE: {
+            double da, db, dv = 0;
+            if (!expr_float_load(a, &da) || !expr_float_load(b, &db)) {
+                semantic = 1; break;
+            }
+            switch ((wl_plan_expr_tag_t)in->op) {
+            case WL_PLAN_EXPR_ARITH_FLOAT_ADD: dv = da + db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_SUB: dv = da - db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_MUL: dv = da * db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_DIV: dv = da / db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_EQ: result = da == db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_NEQ: result = da != db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LT: result = da < db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_GT: result = da > db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LTE: result = da <= db; break;
+            default: result = da >= db; break;
+            }
+            if (in->op <= WL_PLAN_EXPR_ARITH_FLOAT_DIV && !expr_float_store(dv,
+                &result)) semantic = 1;
+            break;
+        }
+        default: semantic = 1; break;
+        }
+        *failed = semantic != 0;
+        if (!*failed) expr_push(stack, result);
+    }
+    return 0;
+}
+int
+wl_columnar_expr_eval_controlled(const wl_columnar_expr_controlled_t *c,
+    const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control)
+{
+    if (!c || !value || !failed || (ncols && !row))
+        return EINVAL;
+    expr_stack_t stack;
+    stack.top = 0;
+    bool pending_failed = false;
+    for (uint32_t k = 0; k < c->ninstr; k++) {
+        int rc = wl_columnar_expr_charge(control, 1);
+        if (rc)
+            return rc;
+        const expr_instr_t *in = &c->instrs[k];
+        rc = wl_columnar_expr_charge(control, 64);
+        if (rc)
+            return rc;
+        rc = wl_columnar_expr_numeric_step(&stack, in, row, ncols,
+                &pending_failed, control);
+        if (rc)
+            return rc;
+        wl_columnar_expr_checkpoint(control, 3, k + 1u, pending_failed);
+        rc = wl_columnar_expr_charge(control, 0);
+        if (rc)
+            return rc;
+        if (pending_failed)
+            break;
+    }
+    int rc = wl_columnar_expr_charge(control, 8);
+    if (rc)
+        return rc;
+    int64_t pending = !pending_failed && stack.top
+        ? stack.vals[stack.top - 1] : 0;
+    wl_columnar_expr_checkpoint(control, 7, c->ninstr, pending_failed);
+    rc = wl_columnar_expr_charge(control, 0);
+    if (rc)
+        return rc;
+    *value = pending;
+    *failed = pending_failed;
+    return 0;
 }
 
 void

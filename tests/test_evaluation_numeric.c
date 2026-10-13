@@ -16,6 +16,7 @@ typedef struct {
 static int owner_key;
 static unsigned cancel_phase;
 static uint64_t cancel_progress;
+static bool cancel_failure;
 static wl_columnar_memory_governor_t *watch;
 static wl_columnar_memory_reservation_t peer;
 static bool add_peer, peer_added, saw_physical;
@@ -25,7 +26,6 @@ static void
 checkpoint(wl_evaluation_control_t *c, unsigned phase, uint64_t progress,
     bool failed)
 {
-    (void)failed;
     if (phase == 8 && watch) {
         saw_physical = true;
         physical_credit = wl_columnar_memory_reserved(watch);
@@ -35,7 +35,7 @@ checkpoint(wl_evaluation_control_t *c, unsigned phase, uint64_t progress,
         peer_added = true;
     }
     if (phase == cancel_phase && progress >= cancel_progress
-        )
+        && (!cancel_failure || failed))
         wl_evaluation_control_request_cancel(c);
 }
 
@@ -125,6 +125,138 @@ compile(const program_t *p, wl_columnar_memory_governor_ref_t *g,
 }
 
 static void
+parity(const program_t *p, const int64_t *row, uint32_t ncols,
+    bool float_variable, uint32_t executed, uint32_t reads)
+{
+    uint8_t original[20000];
+    memcpy(original, p->bytes, p->size);
+    int64_t expected = 123;
+    wl_columnar_expr_compiled_t *raw = wl_columnar_expr_compile(p->bytes,
+            p->size, NULL);
+    int semantic;
+    if (float_variable) {
+        CHECK(raw == NULL); /* Real existing producer refuses VAR_FLOAT. */
+        semantic = wl_columnar_expr_eval_run(p->bytes, p->size, row, ncols,
+                &expected, NULL);
+    } else {
+        CHECK(raw != NULL);
+        semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
+        wl_columnar_expr_compiled_free(raw);
+    }
+    if (semantic)
+        expected = 0;
+    uint64_t cost = compile_cost(p, false);
+    wl_evaluation_control_t *c = control(cost);
+    wl_columnar_expr_controlled_t *numeric = compile(p, NULL, c);
+    CHECK(finish(c, 0) == cost);
+    uint64_t eval_cost = (uint64_t)executed * 65 + reads + 8;
+    for (unsigned repeat = 0; repeat < 3; repeat++) {
+        c = control(repeat == 0 ? eval_cost - 1 : eval_cost);
+        int64_t value = 12345;
+        bool failed = !semantic;
+        int rc = wl_columnar_expr_eval_controlled(numeric, row, ncols,
+                &value, &failed, c);
+        if (repeat == 0) {
+            CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(value == 12345 && failed == !semantic);
+            CHECK(finish(c, rc) == eval_cost - 8);
+        } else {
+            CHECK(rc == 0 && value == expected && failed == (semantic != 0));
+            CHECK(finish(c, 0) == eval_cost);
+        }
+    }
+    int64_t value = 0;
+    bool failed = false;
+    CHECK(wl_columnar_expr_eval_controlled(numeric, row, ncols,
+        &value, &failed, NULL) == 0);
+    CHECK(value == expected && failed == (semantic != 0));
+    wl_columnar_expr_controlled_free(numeric);
+    CHECK(memcmp(original, p->bytes, p->size) == 0);
+}
+
+static void
+numeric_semantics(void)
+{
+    static const uint8_t binary[] = {
+        WL_PLAN_EXPR_ARITH_ADD, WL_PLAN_EXPR_ARITH_SUB,
+        WL_PLAN_EXPR_ARITH_MUL, WL_PLAN_EXPR_ARITH_DIV,
+        WL_PLAN_EXPR_ARITH_MOD, WL_PLAN_EXPR_ARITH_SHL,
+        WL_PLAN_EXPR_ARITH_SHR, WL_PLAN_EXPR_ARITH_BAND,
+        WL_PLAN_EXPR_ARITH_BOR, WL_PLAN_EXPR_ARITH_BXOR,
+        WL_PLAN_EXPR_CMP_EQ, WL_PLAN_EXPR_CMP_NEQ,
+        WL_PLAN_EXPR_CMP_LT, WL_PLAN_EXPR_CMP_LTE,
+        WL_PLAN_EXPR_CMP_GT, WL_PLAN_EXPR_CMP_GTE,
+    };
+    static const int64_t pairs[][2] = {
+        {7, 2}, {-7, 2}, {0, 0}, {INT64_MIN, -1}, {INT64_MAX, 1},
+        {INT64_MIN, 1}, {INT64_MAX, 2}, {1, 64}, {1, -1}, {-1, 63}
+    };
+    for (size_t i = 0; i < sizeof(binary); i++) {
+        for (size_t j = 0; j < sizeof(pairs) / sizeof(pairs[0]); j++) {
+            program_t p = {0};
+            constant(&p, WL_PLAN_EXPR_CONST_INT, pairs[j][0]);
+            constant(&p, WL_PLAN_EXPR_CONST_INT, pairs[j][1]);
+            op(&p, binary[i]);
+            parity(&p, NULL, 0, false, 3, 0);
+        }
+    }
+    static const uint8_t floats[] = {
+        WL_PLAN_EXPR_ARITH_FLOAT_ADD, WL_PLAN_EXPR_ARITH_FLOAT_SUB,
+        WL_PLAN_EXPR_ARITH_FLOAT_MUL, WL_PLAN_EXPR_ARITH_FLOAT_DIV,
+        WL_PLAN_EXPR_CMP_FLOAT_EQ, WL_PLAN_EXPR_CMP_FLOAT_NEQ,
+        WL_PLAN_EXPR_CMP_FLOAT_LT, WL_PLAN_EXPR_CMP_FLOAT_LTE,
+        WL_PLAN_EXPR_CMP_FLOAT_GT, WL_PLAN_EXPR_CMP_FLOAT_GTE,
+    };
+    static const double fpairs[][2] = {
+        {1.25, 2.5}, {-0.0, 0.0}, {DBL_MAX, 2.0}, {INFINITY, 1.0},
+        {1.0, NAN}, {1.0, 0.0}, {-1.0, 2.0}
+    };
+    for (size_t i = 0; i < sizeof(floats); i++) {
+        for (size_t j = 0; j < sizeof(fpairs) / sizeof(fpairs[0]); j++) {
+            program_t p = {0};
+            constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(fpairs[j][0]));
+            constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(fpairs[j][1]));
+            op(&p, floats[i]);
+            uint32_t executed = !isfinite(fpairs[j][0]) ? 1
+                : !isfinite(fpairs[j][1]) ? 2 : 3;
+            parity(&p, NULL, 0, false, executed, 0);
+        }
+    }
+    static const uint8_t unary[] = { WL_PLAN_EXPR_ARITH_BNOT,
+                                     WL_PLAN_EXPR_AGG_COUNT,
+                                     WL_PLAN_EXPR_AGG_SUM,
+                                     WL_PLAN_EXPR_AGG_MIN,
+                                     WL_PLAN_EXPR_AGG_MAX };
+    for (size_t i = 0; i < sizeof(unary); i++) {
+        program_t p = {0};
+        op(&p, unary[i]);
+        parity(&p, NULL, 0, false, 1, 0); /* empty stack semantics */
+    }
+    program_t p = {0};
+    for (unsigned i = 0; i < COL_FILTER_STACK + 17; i++)
+        constant(&p, WL_PLAN_EXPR_CONST_INT, i);
+    parity(&p, NULL, 0, false, p.instructions, 0); /* full-stack push ignored */
+    p = (program_t){0};
+    op(&p, WL_PLAN_EXPR_BOOL);
+    p.bytes[p.size++] = 200;
+    parity(&p, NULL, 0, false, 1, 0);
+    p = (program_t){0};
+    variable(&p, WL_PLAN_EXPR_VAR, "col000000000");
+    int64_t row[] = {73};
+    parity(&p, row, 1, false, 1, 1);
+    variable(&p, WL_PLAN_EXPR_VAR, "col999999999");
+    parity(&p, row, 1, false, 2, 1);
+    p = (program_t){0};
+    variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col0");
+    const double values[] = {1.5, -0.0, NAN, INFINITY};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        row[0] = bits(values[i]);
+        parity(&p, row, 1, true, 1, 1);
+    }
+    parity(&p, NULL, 0, true, 1, 0);
+}
+
+static void
 refuse(const program_t *p)
 {
     wl_columnar_expr_controlled_t *out = NULL;
@@ -142,7 +274,7 @@ malformed(void)
     program_t p = {0};
     refuse(&p);
     constant(&p, WL_PLAN_EXPR_CONST_INT, INT64_C(0x7071727374757677));
-    wl_columnar_expr_controlled_free(compile(&p, NULL, NULL)); /* payload is not opcodes */
+    parity(&p, NULL, 0, false, 1, 0); /* payload bytes are not opcodes */
     for (uint32_t size = 1; size < 9; size++) {
         p.size = size;
         refuse(&p);
@@ -170,12 +302,15 @@ malformed(void)
         refuse(&p);
     }
     wl_columnar_expr_controlled_t *out = NULL;
-    bool supported = true;
+    bool supported = true, failed = true;
+    int64_t value = 41;
     CHECK(wl_columnar_expr_compile_controlled(NULL, 1, NULL, &out,
         &supported, NULL) == EINVAL);
     CHECK(!out && !supported);
     CHECK(wl_columnar_expr_compile_controlled(NULL, 0, NULL, NULL,
         &supported, NULL) == EINVAL);
+    CHECK(wl_columnar_expr_eval_controlled(NULL, NULL, 0, &value,
+        &failed, NULL) == EINVAL && value == 41 && failed);
     wl_columnar_expr_controlled_free(NULL);
 }
 
@@ -290,7 +425,7 @@ lifetime(void)
 }
 
 static void
-compile_budgets(void)
+budgets_and_stops(void)
 {
     program_t p = {0};
     constant(&p, WL_PLAN_EXPR_CONST_INT, 1);
@@ -312,6 +447,44 @@ compile_budgets(void)
             wl_columnar_expr_controlled_free(x);
         }
     }
+    wl_columnar_expr_controlled_t *x = compile(&p, NULL, NULL);
+    for (unsigned phase = 3; phase <= 7; phase += 4) {
+        cancel_phase = phase;
+        cancel_progress = phase == 3 ? 100 : p.instructions;
+        wl_evaluation_control_t *c = control(0);
+        int64_t value = 9123;
+        bool failed = true;
+        CHECK(wl_columnar_expr_eval_controlled(x, NULL, 0, &value, &failed,
+            c) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(value == 9123 && failed);
+        uint64_t expected = phase == 3 ? 100 * 65 : p.instructions * 65 + 8;
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == expected);
+        cancel_phase = 0;
+    }
+    wl_evaluation_control_t *c = control(1);
+    int64_t value = 12;
+    bool failed = true;
+    CHECK(wl_columnar_expr_eval_controlled(x, NULL, 0, &value, &failed,
+        c) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(value == 12 && failed);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == 1);
+    wl_columnar_expr_controlled_free(x);
+    p = (program_t){0};
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 1);
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 0);
+    op(&p, WL_PLAN_EXPR_ARITH_DIV);
+    x = compile(&p, NULL, NULL);
+    cancel_phase = 3;
+    cancel_progress = 3;
+    cancel_failure = true;
+    c = control(0);
+    CHECK(wl_columnar_expr_eval_controlled(x, NULL, 0, &value, &failed,
+        c) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(value == 12 && failed);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == 3 * 65);
+    cancel_phase = 0;
+    cancel_failure = false;
+    wl_columnar_expr_controlled_free(x);
 }
 
 static unsigned governor_cancel_phase;
@@ -402,51 +575,16 @@ admission_boundaries(void)
     wl_columnar_memory_governor_ref_release(g);
 }
 
-static void
-compiler_acceptance(void)
-{
-    const uint8_t tags[] = {
-        WL_PLAN_EXPR_ARITH_ADD, WL_PLAN_EXPR_ARITH_SUB,
-        WL_PLAN_EXPR_ARITH_MUL, WL_PLAN_EXPR_ARITH_DIV,
-        WL_PLAN_EXPR_ARITH_MOD, WL_PLAN_EXPR_ARITH_SHL,
-        WL_PLAN_EXPR_ARITH_SHR, WL_PLAN_EXPR_ARITH_BAND,
-        WL_PLAN_EXPR_ARITH_BOR, WL_PLAN_EXPR_ARITH_BXOR,
-        WL_PLAN_EXPR_ARITH_BNOT, WL_PLAN_EXPR_CMP_EQ,
-        WL_PLAN_EXPR_CMP_NEQ, WL_PLAN_EXPR_CMP_LT,
-        WL_PLAN_EXPR_CMP_LTE, WL_PLAN_EXPR_CMP_GT, WL_PLAN_EXPR_CMP_GTE,
-        WL_PLAN_EXPR_ARITH_FLOAT_ADD, WL_PLAN_EXPR_ARITH_FLOAT_SUB,
-        WL_PLAN_EXPR_ARITH_FLOAT_MUL, WL_PLAN_EXPR_ARITH_FLOAT_DIV,
-        WL_PLAN_EXPR_CMP_FLOAT_EQ, WL_PLAN_EXPR_CMP_FLOAT_NEQ,
-        WL_PLAN_EXPR_CMP_FLOAT_LT, WL_PLAN_EXPR_CMP_FLOAT_LTE,
-        WL_PLAN_EXPR_CMP_FLOAT_GT, WL_PLAN_EXPR_CMP_FLOAT_GTE,
-        WL_PLAN_EXPR_AGG_COUNT, WL_PLAN_EXPR_AGG_SUM,
-        WL_PLAN_EXPR_AGG_MIN, WL_PLAN_EXPR_AGG_MAX,
-    };
-    program_t p = {0};
-    constant(&p, WL_PLAN_EXPR_CONST_INT, INT64_MAX);
-    constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(1.25));
-    op(&p, WL_PLAN_EXPR_BOOL);
-    p.bytes[p.size++] = 200;
-    for (size_t i = 0; i < sizeof(tags); i++)
-        op(&p, tags[i]);
-    variable(&p, WL_PLAN_EXPR_VAR, "col000000000");
-    variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col999999999");
-    wl_evaluation_control_t *c = control(compile_cost(&p, false));
-    wl_columnar_expr_controlled_t *x = compile(&p, NULL, c);
-    CHECK(finish(c, 0) == compile_cost(&p, false));
-    wl_columnar_expr_controlled_free(x);
-}
-
 int
 main(void)
 {
     wl_columnar_expr_test_checkpoint = checkpoint;
-    compiler_acceptance();
+    numeric_semantics();
     malformed();
     lifetime();
-    compile_budgets();
+    budgets_and_stops();
     admission_boundaries();
     wl_columnar_expr_test_checkpoint = NULL;
-    puts("numeric preparation/lifetime: PASS");
+    puts("numeric lifecycle: PASS");
     return 0;
 }
