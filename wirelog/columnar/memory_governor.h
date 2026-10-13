@@ -195,6 +195,36 @@ int wl_columnar_memory_governor_commit_controlled(
 int wl_columnar_memory_governor_commit_growth_controlled(
     wl_columnar_memory_reservation_t *, bool *, wl_evaluation_control_t *);
 
+/* Opt-in caller-attempt binding. Requires live control, nonzero matching ID
+ * and output; NULL control is EINVAL, with no raw delegation. The original
+ * token and output remain exclusively caller-owned. Control lifecycle is
+ * externally serialized; token, control and shared governor storage remain
+ * live through cleanup, with stable governor configuration. Independent peer
+ * reservations may concurrently change the governor's reserved total.
+ * Output, token and control storage must not overlap. Each hook
+ * checks the caller ID before another hook, poll, claim or admission.
+ * Entry correlation is a bounded read-only exception: valid12 slots belong
+ * to the first admission retrospectively; invalid/stale (at most13 slots)
+ * or first admission refusal can execute with consumed0. No mutation,
+ * allocation or pointer traversal precedes admission. It is not prepayment.
+ * Outputs are authoritative only with rc0; positive errors beat typed/negative
+ * outcomes. Commit has no callback or negative poll after COMMITTED.
+ * Physical allocation follows successful admission, never occurs in a hook
+ * borrowing the exclusive token. These APIs do not enable engine operators.
+ */
+int wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+    wl_columnar_memory_governor_t *, uint64_t,
+    wl_columnar_memory_reservation_t *,
+    wl_columnar_memory_admission_status_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_memory_governor_commit_attempt_controlled(
+    wl_columnar_memory_reservation_t *, const void *, bool *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_memory_governor_begin_growth_attempt_controlled(
+    wl_columnar_memory_reservation_t *, uint64_t,
+    wl_columnar_memory_admission_status_t *, wl_evaluation_control_t *,
+    uint64_t);
+
 typedef enum {
     WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT = 0,
     WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED,
@@ -269,7 +299,7 @@ enum {
     WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_REFUSED,
 };
 
-#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+/* Private phase IDs also compile without instrumentation. */
 enum {
     WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED = 1,
     WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
@@ -281,6 +311,7 @@ enum {
     WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF,
     WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT
 };
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
 extern void (*wl_columnar_memory_governor_test_work_checkpoint)(
     wl_evaluation_control_t *, uint64_t);
 extern void (*wl_columnar_memory_governor_test_checkpoint)(

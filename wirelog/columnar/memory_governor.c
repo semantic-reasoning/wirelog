@@ -1367,6 +1367,535 @@ wl_columnar_memory_governor_commit_growth_controlled(
                control);
 }
 
+/* Attempt-bound conservative source-region ceilings (logical slots).
+ * Assignments, evaluated predicates, dispatches, primitives, returns and
+ * loopbacks count one; helpers expand, hooks/admission scaffolding do not.
+ * Getter4; identity3; read/strong2; snapshot7; G/H9; guarded H caller12;
+ * verdict25; typed verdict caller30. Mandatory original-only restoration
+ * below is cleanup, including its own-credit retry; forward retries are not.
+ *
+ * ENTRY: reserve12+7+3+3+7+36=68; begin12+6+3+7+2+7+36=73;
+ * commit12+5+3+2+7+36=65. Last-H error adds1: common ceiling74.
+ * Bootstrap valid12 is included retrospectively, not prepaid; invalid13
+ * or first admission refusal can execute with consumed0, without mutation.
+ * CLAIM: prefix6; reserve6+12+5+12+12+1=48, plus zero-round
+ * refusal continuation6=54. Begin31+6=37; commit30+1=31;
+ * original claim failure6+typed verdict caller30=36.
+ * ROUND: successful body66 plus caller result/ADMITTED/error18=84;
+ * overflow including caller84; denial49; failed round72 includes next G
+ * and loopback, plus next admission refusal continuation6=78.
+ * PUBLISH: reserve1+12+12+1+1=27; begin3+12+12+1+1=29;
+ * commit12+12+terminal4=28. Commit terminal is owner/state/out/return,
+ * without a callback or negative poll after COMMITTED.
+ *
+ * Every callback independently checks saved ID before another hook, poll,
+ * CAS or charge. Conservative adjacent-region no-poll bound168 covers
+ * ROUND+ROUND; ENTRY includes work from function entry. It is not an
+ * executed count or return-time guarantee. Legacy tariffs remain unchanged.
+ */
+enum {
+    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK = 74,
+    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK = 54,
+    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK = 84,
+    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK = 29,
+};
+typedef char wl_columnar_memory_governor_attempt_quantum_bound[
+        (WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM
+        && UINT64_C(2) * WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+static int
+wl_columnar_memory_governor_attempt_guard(wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    return 0;
+}
+
+/* Mandatory original-only restoration; retain legacy restore unchanged.
+ * Exchange supplies release publication on MSVC as well as C11. No hook,
+ * positive admission or successor poll occurs in this cleanup.
+ */
+static int
+wl_columnar_memory_governor_attempt_restore(
+    wl_columnar_memory_reservation_t *token,
+    const wl_columnar_memory_governor_snapshot_t *snapshot, uint64_t state,
+    wl_columnar_memory_governor_t *credited_governor, uint64_t credited, int rc)
+{
+    if (credited && !credit_reservation(credited_governor, credited))
+        abort();
+    token->governor = snapshot->governor;
+    token->bytes = snapshot->bytes;
+    token->replacement_bytes = snapshot->replacement_bytes;
+    token->transition_kind = snapshot->kind;
+    (void)atomic_exchange_explicit(&token->owner_bits, snapshot->owner,
+        memory_order_release);
+    (void)atomic_exchange_explicit(&token->state, state, memory_order_release);
+    return rc;
+}
+
+static int
+wl_columnar_memory_governor_attempt_phase(wl_evaluation_control_t *control,
+    uint64_t attempt_id, wl_columnar_memory_reservation_t *token,
+    unsigned phase)
+{
+    WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(control, token, phase);
+#if !defined(WL_SESSION_TEST_HOOKS) && !defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    (void)token;
+    (void)phase;
+#endif
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+static int
+wl_columnar_memory_governor_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t attempt_id, uint64_t work)
+{
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    if (wl_columnar_memory_governor_test_work_checkpoint)
+        wl_columnar_memory_governor_test_work_checkpoint(control, work);
+#else
+    (void)work;
+#endif
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    return wl_evaluation_control_charge(control, 0);
+}
+
+/* A completed typed refusal beats a negative stop; each individual seam
+ * still rejects stale/accounting positive errors before any later seam.
+ */
+static int
+wl_columnar_memory_governor_attempt_verdict(wl_evaluation_control_t *control,
+    uint64_t attempt_id, wl_columnar_memory_reservation_t *token,
+    uint64_t work)
+{
+    int rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT);
+    if (rc > 0)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id, work);
+    return rc > 0 ? rc : 0;
+}
+
+/* Caller has just completed a saved-ID checkpoint and owns the original
+ * token claim. Initial credited=false belongs to the caller's claim region.
+ * Every failed round funds loopback and the next guard before new admission.
+ */
+static int
+wl_columnar_memory_governor_attempt_admit(
+    wl_columnar_memory_governor_t *governor, uint64_t bytes,
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_admission_status_t *status, bool *credited,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control,
+                WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
+        if (rc)
+            return rc;
+        uint64_t old = wl_columnar_memory_governor_growth_commit_read(
+            &governor->reserved_bytes);
+        uint64_t limit = wl_columnar_memory_governor_growth_commit_read(
+            &governor->usable_bytes);
+        bool overflow = bytes > UINT64_MAX - old;
+        if (!overflow && old + bytes > limit) {
+            rc = wl_columnar_memory_governor_attempt_verdict(control,
+                    attempt_id, token,
+                    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
+            if (rc)
+                return rc;
+            *status = WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
+            return 0;
+        }
+        uint64_t desired = overflow ? old : old + bytes;
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+        if (wl_columnar_memory_governor_test_before_total_cas)
+            wl_columnar_memory_governor_test_before_total_cas(control,
+                governor, old, overflow);
+#endif
+        rc = wl_columnar_memory_governor_attempt_guard(control, attempt_id);
+        if (rc)
+            return rc;
+        bool admitted = wl_columnar_memory_governor_strong(
+            &governor->reserved_bytes, &old, desired);
+        if (admitted && !overflow)
+            *credited = true;
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+        if (wl_columnar_memory_governor_test_after_total_cas)
+            wl_columnar_memory_governor_test_after_total_cas(control,
+                governor, admitted, overflow);
+#endif
+        rc = wl_columnar_memory_governor_attempt_guard(control, attempt_id);
+        if (rc)
+            return rc;
+        if (admitted && overflow) {
+            rc = wl_columnar_memory_governor_attempt_verdict(control,
+                    attempt_id, token,
+                    WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
+            if (rc)
+                return rc;
+            *status = WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
+            return 0;
+        }
+        rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+                WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ROUND_WORK);
+        if (rc)
+            return rc;
+        if (admitted) {
+            *status = governor->mode == WL_COLUMNAR_MEMORY_MODE_ADVISORY
+                ? WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY
+                : WL_COLUMNAR_MEMORY_ADMISSION_OK;
+            return 0;
+        }
+        rc = wl_columnar_memory_governor_attempt_guard(control, attempt_id);
+        if (rc)
+            return rc;
+    }
+}
+
+int
+wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+    wl_columnar_memory_governor_t *governor, uint64_t bytes,
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_admission_status_t *out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Bounded read-only bootstrap exception, maximum13, valid12. */
+    if (!control || !attempt_id || !out)
+        return EINVAL;
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    if (!governor || !reservation_identity_valid(token) || !bytes) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return rc;
+    }
+    uint64_t from =
+        wl_columnar_memory_governor_growth_commit_read(&token->state);
+    if (from != WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+        && from != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return rc;
+    }
+    wl_columnar_memory_governor_snapshot_t prior;
+    wl_columnar_memory_governor_snapshot(token, &prior);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return rc;
+    uint64_t expected = from;
+    bool claimed = wl_columnar_memory_governor_strong(&token->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_CLAIMED);
+    if (!claimed) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+        if (!rc)
+            *out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return rc;
+    }
+    /* claimed records original authority before the first after-claim seam. */
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    token->governor = governor;
+    token->bytes = bytes;
+    token->replacement_bytes = 0;
+    token->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    (void)atomic_exchange_explicit(&token->owner_bits, 0, memory_order_release);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_PREPARED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    bool credited = false;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_attempt_admit(governor, bytes, token,
+            &status, &credited, control, attempt_id);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   governor, credited ? bytes : 0, rc);
+    if (!credited) {
+        (void)atomic_exchange_explicit(&token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_RELEASED, memory_order_release);
+        *out = status;
+        return 0;
+    }
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   governor, bytes, rc);
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   governor, bytes, rc);
+    (void)atomic_exchange_explicit(&token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RESERVED, memory_order_release);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   governor, bytes, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   governor, bytes, rc);
+    *out = status;
+    return 0;
+}
+
+int
+wl_columnar_memory_governor_begin_growth_attempt_controlled(
+    wl_columnar_memory_reservation_t *token, uint64_t additional,
+    wl_columnar_memory_admission_status_t *out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control || !attempt_id || !out)
+        return EINVAL;
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    if (!reservation_identity_valid(token) || !additional) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return rc;
+    }
+    uint64_t from =
+        wl_columnar_memory_governor_growth_commit_read(&token->state);
+    wl_columnar_memory_admission_status_t invalid =
+        from != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED || !token->governor
+        || token->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        ? WL_COLUMNAR_MEMORY_ADMISSION_INVALID
+        : additional > UINT64_MAX - token->bytes
+        ? WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW :
+        WL_COLUMNAR_MEMORY_ADMISSION_OK;
+    if (invalid != WL_COLUMNAR_MEMORY_ADMISSION_OK) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = invalid;
+        return rc;
+    }
+    wl_columnar_memory_governor_snapshot_t prior;
+    wl_columnar_memory_governor_snapshot(token, &prior);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return rc;
+    uint64_t expected = from;
+    bool claimed = wl_columnar_memory_governor_strong(&token->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING);
+    if (!claimed) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+        if (!rc)
+            *out = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        return rc;
+    }
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    bool credited = false;
+    wl_columnar_memory_admission_status_t status;
+    rc = wl_columnar_memory_governor_attempt_admit(prior.governor,
+            additional, token, &status, &credited, control, attempt_id);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   prior.governor, credited ? additional : 0, rc);
+    if (!credited) {
+        (void)wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+            NULL, 0, 0);
+        *out = status;
+        return 0;
+    }
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   prior.governor, additional, rc);
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   prior.governor, additional, rc);
+    token->replacement_bytes = additional;
+    token->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_GROWTH;
+    (void)atomic_exchange_explicit(&token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_REPLACING, memory_order_release);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   prior.governor, additional, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   prior.governor, additional, rc);
+    *out = status;
+    return 0;
+}
+
+int
+wl_columnar_memory_governor_commit_attempt_controlled(
+    wl_columnar_memory_reservation_t *token, const void *owner, bool *out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control || !attempt_id || !out)
+        return EINVAL;
+    uint64_t active = wl_evaluation_control_active_attempt_id(control);
+    if (!active || active != attempt_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    if (!reservation_identity_valid(token)) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = false;
+        return rc;
+    }
+    uint64_t from =
+        wl_columnar_memory_governor_growth_commit_read(&token->state);
+    if (from != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+        if (!rc)
+            *out = false;
+        return rc;
+    }
+    wl_columnar_memory_governor_snapshot_t prior;
+    wl_columnar_memory_governor_snapshot(token, &prior);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED);
+    if (rc)
+        return rc;
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return rc;
+    uint64_t expected = from;
+    bool claimed = wl_columnar_memory_governor_strong(&token->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING);
+    if (!claimed) {
+        rc = wl_columnar_memory_governor_attempt_verdict(control, attempt_id,
+                token, WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+        if (!rc)
+            *out = false;
+        return rc;
+    }
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_CLAIM_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_evaluation_control_charge(control,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_columnar_memory_governor_attempt_phase(control, attempt_id,
+            token, WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    rc = wl_columnar_memory_governor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_MEMORY_GOVERNOR_ATTEMPT_PUBLISH_WORK);
+    if (rc)
+        return wl_columnar_memory_governor_attempt_restore(token, &prior, from,
+                   NULL, 0, rc);
+    /* Four finite slots after final cutoff; no after-COMMITTED hook. */
+    (void)atomic_exchange_explicit(&token->owner_bits,
+        (uint64_t)(uintptr_t)owner, memory_order_release);
+    (void)atomic_exchange_explicit(&token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+    *out = true;
+    return 0;
+}
+
 static wl_columnar_memory_admission_status_t
 reserve_internal(wl_columnar_memory_governor_t *governor,
     uint64_t bytes, wl_columnar_memory_reservation_t *reservation)

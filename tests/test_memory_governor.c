@@ -2033,6 +2033,665 @@ test_prepared_growth_refusals(void)
     PASS();
 }
 
+/* Attempt-bound admission fixtures. Physical storage follows successful
+ * admission; a failing API has not allocated incoming storage. Independent
+ * peer credit advances at a hook and must survive original-only restoration.
+ */
+typedef struct {
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token, peer, extra;
+    void *old_buffer, *peer_buffer, *extra_buffer;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id, old_consumed;
+    unsigned kind, seams, fault_at, fault_kind, hits;
+    unsigned contention_remaining, failed_cas;
+    unsigned phase[32], seam_kind[32];
+    uint64_t work[32];
+    bool running, skip_peer_update;
+} attempt_admission_fixture_t;
+
+static attempt_admission_fixture_t *attempt_fixture;
+
+static void
+attempt_seam(unsigned kind, unsigned phase, uint64_t work)
+{
+    attempt_admission_fixture_t *fixture = attempt_fixture;
+    if (!fixture || !fixture->running)
+        return;
+    unsigned index = fixture->seams++;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(index < 32);
+    fixture->phase[index] = phase;
+    fixture->seam_kind[index] = kind;
+    fixture->work[index] = work;
+    if (fixture->seams != fixture->fault_at || !fixture->fault_kind)
+        return;
+    fixture->hits++;
+    if (!fixture->skip_peer_update) {
+        /* A genuine independent peer update; no original token mutation. */
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+                &fixture->governor, 3, &fixture->extra));
+        fixture->extra_buffer = malloc(3);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->extra_buffer);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+                &fixture->extra, fixture->extra_buffer));
+        memset(fixture->extra_buffer, 0x33, 3);
+    }
+    if (fixture->fault_kind == 1)
+        wl_evaluation_control_request_cancel(fixture->control);
+    else if (fixture->fault_kind == 2)
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_charge(
+                fixture->control, UINT64_MAX) == EOVERFLOW);
+    else {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(
+                fixture->control, &controlled_owner, 0, 0) == 0);
+        wl_evaluation_control_report_t report;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_report(
+                fixture->control, &report) == 0);
+        fixture->old_consumed = report.consumed;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(
+                fixture->control) == 0);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(
+                fixture->control, &controlled_owner) == 0);
+    }
+}
+
+static void
+attempt_phase(wl_evaluation_control_t *control,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (!attempt_fixture || !attempt_fixture->running)
+        return;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(control == attempt_fixture->control
+        && (token == &attempt_fixture->token
+        || phase == WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT));
+    if (phase == WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED
+        || phase == WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING) {
+        uint64_t expected = attempt_fixture->kind == 0
+            ? WL_COLUMNAR_MEMORY_RESERVATION_CLAIMED
+            : attempt_fixture->kind == 1
+            ? WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING
+            : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(atomic_load_explicit(&token->state,
+            memory_order_acquire) == expected);
+    }
+    attempt_seam(0, phase, 0);
+}
+
+static void
+attempt_work(wl_evaluation_control_t *control, uint64_t work)
+{
+    if (!attempt_fixture || !attempt_fixture->running)
+        return;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(control == attempt_fixture->control);
+    attempt_seam(1, 0, work);
+}
+
+static void
+attempt_before_total(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, uint64_t old, bool overflow)
+{
+    (void)old;
+    (void)overflow;
+    if (!attempt_fixture || !attempt_fixture->running)
+        return;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(control == attempt_fixture->control
+        && governor == &attempt_fixture->governor);
+    attempt_seam(2, 0, 0);
+    if (attempt_fixture->contention_remaining) {
+        attempt_admission_fixture_t *fixture = attempt_fixture;
+        fixture->contention_remaining--;
+        if (fixture->extra_buffer) {
+            free(fixture->extra_buffer);
+            fixture->extra_buffer = NULL;
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+                    &fixture->extra));
+        } else {
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+                    &fixture->governor, 3, &fixture->extra));
+            fixture->extra_buffer = malloc(3);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->extra_buffer);
+            memset(fixture->extra_buffer, 0x33, 3);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+                    &fixture->extra, fixture->extra_buffer));
+        }
+    }
+}
+
+static void
+attempt_after_total(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, bool admitted, bool overflow)
+{
+    if (!attempt_fixture || !attempt_fixture->running)
+        return;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(control == attempt_fixture->control
+        && governor == &attempt_fixture->governor);
+    if (!admitted)
+        attempt_fixture->failed_cas++;
+    if (admitted && !overflow) {
+        uint64_t before = (attempt_fixture->kind == 0 ? 17 : 25)
+            + (attempt_fixture->extra_buffer ? 3 : 0);
+        uint64_t added = attempt_fixture->kind == 0 ? 8 : 16;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(governor)
+            == before + added);
+    }
+    attempt_seam(3, 0, 0);
+}
+
+static void
+attempt_init(attempt_admission_fixture_t *fixture, unsigned kind,
+    uint64_t limit)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->kind = kind;
+    controlled_governor(&fixture->governor, 1024);
+    wl_columnar_memory_reservation_init(&fixture->token);
+    wl_columnar_memory_reservation_init(&fixture->peer);
+    wl_columnar_memory_reservation_init(&fixture->extra);
+    if (kind) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+                &fixture->governor, 8, &fixture->token));
+        fixture->old_buffer = malloc(8);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->old_buffer);
+        memset(fixture->old_buffer, 0x22, 8);
+        if (kind == 1)
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+                    &fixture->token, fixture->old_buffer));
+    }
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(
+            &fixture->governor, 17, &fixture->peer));
+    fixture->peer_buffer = malloc(17);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture->peer_buffer);
+    memset(fixture->peer_buffer, 0x17, 17);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_commit(
+            &fixture->peer, fixture->peer_buffer));
+    fixture->control = controlled_begin(limit);
+    fixture->attempt_id = wl_evaluation_control_active_attempt_id(
+        fixture->control);
+    fixture->running = true;
+    attempt_fixture = fixture;
+}
+
+static int
+attempt_call(attempt_admission_fixture_t *fixture,
+    wl_columnar_memory_admission_status_t *status, bool *committed)
+{
+    if (fixture->kind == 0)
+        return wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            &fixture->governor, 8, &fixture->token, status, fixture->control,
+            fixture->attempt_id);
+    if (fixture->kind == 1)
+        return wl_columnar_memory_governor_begin_growth_attempt_controlled(
+            &fixture->token, 16, status, fixture->control, fixture->attempt_id);
+    return wl_columnar_memory_governor_commit_attempt_controlled(
+        &fixture->token, fixture->old_buffer, committed, fixture->control,
+        fixture->attempt_id);
+}
+
+static void
+attempt_dispose(attempt_admission_fixture_t *fixture, bool success)
+{
+    fixture->running = false;
+    attempt_fixture = NULL;
+    if (success && fixture->kind == 0) {
+        void *incoming = malloc(8);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(incoming);
+        free(incoming);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(
+                &fixture->token));
+    } else if (success && fixture->kind == 1) {
+        void *incoming = malloc(16);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(incoming);
+        free(incoming);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback_growth(
+                &fixture->token));
+    }
+    if (fixture->old_buffer) {
+        free(fixture->old_buffer);
+        if (fixture->kind == 2 && !success)
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(
+                    &fixture->token));
+        else
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+                    &fixture->token));
+    }
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+            &fixture->governor) == (fixture->extra_buffer ? 20 : 17));
+    if (fixture->extra_buffer) {
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+            ((unsigned char *)fixture->extra_buffer)[2] == 0x33);
+        free(fixture->extra_buffer);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+                &fixture->extra));
+    }
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        ((unsigned char *)fixture->peer_buffer)[16] == 0x17);
+    free(fixture->peer_buffer);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_release(
+            &fixture->peer));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+            &fixture->governor) == 0);
+}
+
+static void
+test_attempt_admission_typed_verdicts(void)
+{
+    TEST(
+        "attempt-bound typed invalid/denied/overflow beat negative but not positive errors");
+    wl_columnar_memory_governor_test_checkpoint = attempt_phase;
+    wl_columnar_memory_governor_test_work_checkpoint = attempt_work;
+    wl_columnar_memory_governor_test_before_total_cas = attempt_before_total;
+    wl_columnar_memory_governor_test_after_total_cas = attempt_after_total;
+    for (unsigned kind = 0; kind < 3; kind++)
+        for (unsigned scenario = 0; scenario < (kind == 2 ? 1u : 3u);
+            scenario++)
+            for (unsigned tail = 0; tail < 2; tail++)
+                for (unsigned fault = 1; fault <= 3; fault++) {
+                    attempt_admission_fixture_t fixture;
+                    attempt_init(&fixture, kind, 0);
+                    fixture.skip_peer_update = true;
+                    fixture.fault_kind = fault;
+                    unsigned phase_at = scenario == 0 ||
+                        (kind == 1 && scenario == 2)
+                        ? 1 : scenario == 1 ? (kind == 0 ? 7 : 6) : 9;
+                    fixture.fault_at = phase_at + tail;
+                    if (scenario == 1)
+                        atomic_store_explicit(&fixture.governor.usable_bytes,
+                            kind == 0 ? 17 : 25, memory_order_relaxed);
+                    wl_columnar_memory_reservation_t prior = fixture.token;
+                    wl_columnar_memory_admission_status_t status =
+                        WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+                    bool committed = true;
+                    uint64_t bytes = scenario == 0 ? 0 : scenario == 1
+                        ? (kind == 0 ? 8 : 16) : UINT64_MAX;
+                    int rc = kind == 0
+                        ?
+                        wl_columnar_memory_governor_reserve_checked_attempt_controlled
+                        (
+                        &fixture.governor, bytes, &fixture.token, &status,
+                        fixture.control, fixture.attempt_id)
+                        : kind == 1
+                        ?
+                        wl_columnar_memory_governor_begin_growth_attempt_controlled
+                        (
+                        &fixture.token, bytes, &status, fixture.control,
+                        fixture.attempt_id)
+                        : wl_columnar_memory_governor_commit_attempt_controlled(
+                        NULL, NULL, &committed, fixture.control,
+                        fixture.attempt_id);
+                    int expected_rc = fault == 1 ? 0 : fault ==
+                        2 ? EOVERFLOW : EINVAL;
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == expected_rc &&
+                        fixture.hits == 1);
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.seams ==
+                        (fault == 1 ? phase_at + 1 : phase_at + tail));
+                    uint64_t prefix = scenario == 0 ||
+                        (kind == 1 && scenario == 2) ? 74 : 212;
+                    if (fault == 1) {
+                        if (kind == 2)
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!committed);
+                        else
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+                                (scenario == 0
+                                ? WL_COLUMNAR_MEMORY_ADMISSION_INVALID :
+                                scenario == 1
+                                ? WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                                : WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW));
+                    } else
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+                            WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY
+                            && committed);
+                    if (fault != 1 || kind != 0 || scenario == 0)
+                        controlled_token_equal(&fixture.token, &prior);
+                    else
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.token.bytes ==
+                            bytes
+                            && atomic_load_explicit(&fixture.token.state,
+                            memory_order_acquire)
+                            == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        wl_columnar_memory_reserved(
+                            &fixture.governor) == (kind ? 25 : 17));
+                    if (fault == 3) {
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            fixture.old_consumed == prefix);
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                                fixture.control, 0) == 0);
+                    } else
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                                fixture.control,
+                                fault ==
+                                1 ? WL_EVALUATION_CONTROL_CANCELLED : rc) ==
+                            prefix);
+                    attempt_dispose(&fixture, false);
+                }
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_memory_governor_test_work_checkpoint = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    PASS();
+}
+
+static void
+test_attempt_admission_boundaries(void)
+{
+    TEST(
+        "attempt-bound literal exact/minus-one admissions and genuine CAS retries");
+    wl_columnar_memory_governor_test_checkpoint = attempt_phase;
+    wl_columnar_memory_governor_test_work_checkpoint = attempt_work;
+    wl_columnar_memory_governor_test_before_total_cas = attempt_before_total;
+    wl_columnar_memory_governor_test_after_total_cas = attempt_after_total;
+    for (unsigned kind = 0; kind < 3; kind++) {
+        const uint64_t limits[2][8] = {
+            { 73, 74, 127, 128, 211, 212, 240, 241 },
+            { 73, 74, 127, 128, 156, 157 },
+        };
+        const uint64_t consumed[2][8] = {
+            { 0, 74, 74, 128, 128, 212, 212, 241 },
+            { 0, 74, 74, 128, 128, 157 },
+        };
+        unsigned row = kind == 2;
+        for (unsigned i = 0; i < (row ? 6u : 8u); i++) {
+            attempt_admission_fixture_t fixture;
+            attempt_init(&fixture, kind, limits[row][i]);
+            wl_columnar_memory_reservation_t prior = fixture.token;
+            wl_columnar_memory_admission_status_t status =
+                WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+            bool committed = false;
+            bool success = i == (row ? 5u : 7u);
+            int rc = attempt_call(&fixture, &status, &committed);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (success ? 0
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            if (!success)
+                controlled_token_equal(&fixture.token, &prior);
+            else
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(kind == 2 ? committed
+                    : status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(fixture.control,
+                rc)
+                == consumed[row][i]);
+            attempt_dispose(&fixture, success);
+        }
+    }
+    /* Independent peer physical allocate/free changes the aggregate between
+     * the actual read and strong CAS. No fabricated CAS result is injected. */
+    for (unsigned kind = 0; kind < 2; kind++)
+        for (unsigned failed = 1; failed <= 4; failed++)
+            for (unsigned boundary = 0; boundary < 3; boundary++) {
+                const uint64_t totals[] = { 325, 409, 493, 577 };
+                const uint64_t round_denied[] = { 212, 296, 380, 464 };
+                const uint64_t publication_denied[] = { 296, 380, 464, 548 };
+                uint64_t limit = boundary == 0 ? totals[failed - 1]
+                    : boundary == 1 ? totals[failed - 1] - 1
+                    : publication_denied[failed - 1] - 1;
+                attempt_admission_fixture_t fixture;
+                attempt_init(&fixture, kind, limit);
+                fixture.contention_remaining = failed;
+                wl_columnar_memory_reservation_t prior = fixture.token;
+                wl_columnar_memory_admission_status_t status =
+                    WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+                bool committed = false;
+                int rc = attempt_call(&fixture, &status, &committed);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (boundary == 0 ? 0
+                    : WL_EVALUATION_CONTROL_WORK_LIMIT));
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                    fixture.contention_remaining == 0
+                    && fixture.failed_cas == failed);
+                if (boundary)
+                    controlled_token_equal(&fixture.token, &prior);
+                uint64_t expected = boundary == 0 ? totals[failed - 1]
+                    : boundary == 1 ? publication_denied[failed - 1]
+                    : round_denied[failed - 1];
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                        fixture.control, rc)
+                    == expected);
+                attempt_dispose(&fixture, boundary == 0);
+            }
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_memory_governor_test_work_checkpoint = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    PASS();
+}
+
+static void
+test_attempt_admission_raw_twins(void)
+{
+    TEST(
+        "attempt-bound raw parity for original lifecycles, modes and null owners");
+    for (unsigned kind = 0; kind < 3; kind++)
+        for (unsigned enforcing = 0; enforcing < 2; enforcing++)
+            for (unsigned released = 0; released < 2; released++)
+                for (unsigned request = 0; request < 4; request++) {
+                    wl_columnar_memory_governor_t governor[2];
+                    wl_columnar_memory_reservation_t token[2];
+                    const uint64_t bytes[] = { 0, 8, 64, 65 };
+                    for (unsigned i = 0; i < 2; i++) {
+                        controlled_governor(&governor[i], 64);
+                        if (enforcing)
+                            governor[i].mode =
+                                WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+                        wl_columnar_memory_reservation_init(&token[i]);
+                        if (released) {
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_reserve(
+                                    &governor[i], 7, &token[i]));
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_rollback(
+                                    &token[i]));
+                        }
+                        if (kind) {
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_reserve(
+                                    &governor[i], 8, &token[i]));
+                            if (kind == 1)
+                                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                    wl_columnar_memory_commit(
+                                        &token[i], NULL));
+                        }
+                    }
+                    wl_evaluation_control_t *control = controlled_begin(0);
+                    uint64_t id =
+                        wl_evaluation_control_active_attempt_id(control);
+                    wl_columnar_memory_admission_status_t raw =
+                        WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+                    wl_columnar_memory_admission_status_t actual = raw;
+                    bool raw_committed = false, actual_committed = false;
+                    int rc;
+                    if (kind == 0) {
+                        raw = wl_columnar_memory_reserve_checked(&governor[0],
+                                bytes[request], &token[0]);
+                        rc =
+                            wl_columnar_memory_governor_reserve_checked_attempt_controlled
+                            (
+                            &governor[1], bytes[request], &token[1], &actual,
+                            control, id);
+                    } else if (kind == 1) {
+                        raw = wl_columnar_memory_begin_growth(&token[0],
+                                bytes[request]);
+                        rc =
+                            wl_columnar_memory_governor_begin_growth_attempt_controlled
+                            (
+                            &token[1], bytes[request], &actual, control, id);
+                    } else {
+                        const void *owner = request &
+                            1 ? &controlled_owner : NULL;
+                        raw_committed = wl_columnar_memory_commit(&token[0],
+                                owner);
+                        rc =
+                            wl_columnar_memory_governor_commit_attempt_controlled
+                            (
+                            &token[1], owner, &actual_committed, control, id);
+                    }
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == 0 && (kind == 2
+                        ? raw_committed == actual_committed : raw == actual));
+                    uint64_t state = atomic_load_explicit(&token[0].state,
+                            memory_order_acquire);
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(state ==
+                        atomic_load_explicit(
+                            &token[1].state, memory_order_acquire)
+                        && token[0].bytes == token[1].bytes
+                        && token[0].replacement_bytes ==
+                        token[1].replacement_bytes
+                        && token[0].transition_kind == token[1].transition_kind
+                        && atomic_load_explicit(&token[0].owner_bits,
+                        memory_order_relaxed)
+                        == atomic_load_explicit(&token[1].owner_bits,
+                        memory_order_relaxed)
+                        && wl_columnar_memory_reserved(&governor[0])
+                        == wl_columnar_memory_reserved(&governor[1]));
+                    (void)controlled_end(control, 0);
+                    for (unsigned i = 0; i < 2; i++) {
+                        if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_rollback_growth(&token[i]));
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_release(&token[i]));
+                        } else if (state ==
+                            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_release(&token[i]));
+                        else if (state ==
+                            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+                            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                                wl_columnar_memory_rollback(&token[i]));
+                        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                            wl_columnar_memory_reserved(&governor[i]) == 0);
+                    }
+                }
+    PASS();
+}
+
+static void
+test_attempt_admission_bootstrap(void)
+{
+    TEST(
+        "attempt-bound bootstrap rejects missing and old authority without debit");
+    for (unsigned kind = 0; kind < 3; kind++) {
+        for (unsigned invalid = 0; invalid < 5; invalid++) {
+            attempt_admission_fixture_t fixture;
+            attempt_init(&fixture, kind, 0);
+            wl_columnar_memory_reservation_t prior = fixture.token;
+            wl_evaluation_control_t *control = invalid ==
+                0 ? NULL : fixture.control;
+            uint64_t id = invalid == 1 ? 0 : invalid == 2
+                ? fixture.attempt_id + 1 : fixture.attempt_id;
+            wl_columnar_memory_admission_status_t status =
+                WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW;
+            bool committed = true;
+            if (invalid == 4) {
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_finish(
+                        fixture.control, &controlled_owner, 0, 0) == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_reset(
+                        fixture.control) == 0);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_evaluation_control_begin(
+                        fixture.control, &controlled_owner) == 0);
+            }
+            int rc = kind == 0
+                ? wl_columnar_memory_governor_reserve_checked_attempt_controlled
+                (
+                &fixture.governor, 8, &fixture.token,
+                invalid == 3 ? NULL : &status, control, id)
+                : kind == 1
+                ? wl_columnar_memory_governor_begin_growth_attempt_controlled(
+                &fixture.token, 16, invalid == 3 ? NULL : &status, control, id)
+                : wl_columnar_memory_governor_commit_attempt_controlled(
+                &fixture.token, fixture.old_buffer,
+                invalid == 3 ? NULL : &committed, control, id);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == EINVAL &&
+                fixture.seams == 0);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(status ==
+                WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                && committed);
+            controlled_token_equal(&fixture.token, &prior);
+            WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(fixture.control,
+                0) == 0);
+            attempt_dispose(&fixture, false);
+        }
+    }
+    PASS();
+}
+
+static void
+test_attempt_admission_seams(void)
+{
+    TEST(
+        "attempt-bound governor rejects every stale seam and restores own credit");
+    wl_columnar_memory_governor_test_checkpoint = attempt_phase;
+    wl_columnar_memory_governor_test_work_checkpoint = attempt_work;
+    wl_columnar_memory_governor_test_before_total_cas = attempt_before_total;
+    wl_columnar_memory_governor_test_after_total_cas = attempt_after_total;
+    for (unsigned kind = 0; kind < 3; kind++) {
+        attempt_admission_fixture_t success;
+        attempt_init(&success, kind, 0);
+        wl_columnar_memory_admission_status_t status =
+            WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+        bool committed = false;
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(attempt_call(&success,
+            &status, &committed) == 0);
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(kind == 2 ? committed
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+        unsigned count = success.seams;
+        const uint64_t prefixes[3][12] = {
+            { 74, 74, 74, 128, 128, 128, 212, 212, 212, 212, 241, 241 },
+            { 74, 74, 74, 128, 128, 212, 212, 212, 212, 241, 241 },
+            { 74, 74, 74, 128, 128, 157, 157 },
+        };
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(count ==
+            (kind == 0 ? 12 : kind == 1 ? 11 : 7));
+        WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(success.control, 0)
+            == (kind == 2 ? 157 : 241));
+        attempt_dispose(&success, true);
+        for (unsigned at = 1; at <= count; at++) {
+            for (unsigned fault = 1; fault <= 3; fault++) {
+                attempt_admission_fixture_t fixture;
+                attempt_init(&fixture, kind, 0);
+                wl_columnar_memory_reservation_t prior = fixture.token;
+                fixture.fault_at = at;
+                fixture.fault_kind = fault;
+                status = WL_COLUMNAR_MEMORY_ADMISSION_INVALID;
+                committed = false;
+                int rc = attempt_call(&fixture, &status, &committed);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == (fault == 1
+                    ? WL_EVALUATION_CONTROL_CANCELLED
+                    : fault == 2 ? EOVERFLOW : EINVAL));
+                unsigned seam_kind = success.seam_kind[at - 1];
+                unsigned suffix = fault == 3 ? 0 : seam_kind == 2 ? 2
+                    : seam_kind == 3 ? 1 : 0;
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.hits == 1
+                    && fixture.seams == at + suffix);
+                if (suffix == 2)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.seam_kind[at] ==
+                        3);
+                if (suffix)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        fixture.seam_kind[at + suffix - 1] == 1);
+                controlled_token_equal(&fixture.token, &prior);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(
+                        &fixture.governor) == (kind ? 28 : 20));
+                if (fixture.old_buffer)
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+                        ((unsigned char *)fixture.old_buffer)[7] == 0x22);
+                WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.peer.bytes == 17
+                    && fixture.extra.bytes == 3);
+                if (fault == 3) {
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(fixture.old_consumed ==
+                        prefixes[kind][at - 1]);
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                            fixture.control, 0) == 0);
+                } else
+                    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(
+                            fixture.control, rc) == prefixes[kind][at - 1]);
+                attempt_dispose(&fixture, false);
+            }
+        }
+    }
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_memory_governor_test_work_checkpoint = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    PASS();
+}
+
 int
 main(void)
 {
@@ -2063,6 +2722,11 @@ main(void)
     test_prepared_growth_prefixes();
     test_prepared_growth_authority();
     test_prepared_growth_refusals();
+    test_attempt_admission_raw_twins();
+    test_attempt_admission_bootstrap();
+    test_attempt_admission_seams();
+    test_attempt_admission_boundaries();
+    test_attempt_admission_typed_verdicts();
     wl_columnar_memory_governor_test_work_checkpoint = NULL;
     wl_columnar_memory_governor_test_checkpoint = NULL;
     wl_columnar_memory_governor_test_before_total_cas = NULL;
