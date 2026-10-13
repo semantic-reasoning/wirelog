@@ -3151,7 +3151,18 @@ wl_columnar_relation_writer_acquire_controlled(
 * Established positive-width allocated heap grids may grow transactionally.
 * Timestamped growth requires both sides tracked and destination timestamp
 * capacity equal to its old column capacity. Other growth shapes, aliases,
-* COW, arena, compound data and schema installation remain unsupported.
+* COW, arena and compound data remain unsupported. Preallocated nonempty
+* appends may install integer-family types and matching flat scalar Arrow
+* schema together into an untyped destination; growth installation is unsupported.
+* Existing destination schema must be normal descriptor-owned scalar metadata.
+* For W columns and N name characters including each NUL (unnamed counts1),
+* installation adds6+7W+2N units plus34 for two governed fresh reservations
+* and final commit, plus actual extra total-CAS attempts. This includes name
+* scans/copies and explicit allocation regions, excluding fixed Arrow/token
+* initialization and mandatory publication/destruction. Retained destination
+* names are conservatively covered by both old/new metadata policy credit.
+* Failed installation preserves canonical metadata and original credit; spare
+* cells may be written. Shared ledger totals are never snapshot-restored.
 * Governed growth requires positive committed retained credit. Its bounded
 * reservation preparation/admission/commit adds75 units plus one per extra
 * total-CAS round; interrupted begin restores its own credit, while interrupted
@@ -3166,6 +3177,8 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,
     wl_evaluation_control_t *control);
 #ifdef WL_SESSION_TEST_HOOKS
+extern uint32_t wl_columnar_relation_test_metadata_fail_allocation;
+extern bool wl_columnar_relation_test_metadata_fail_commit;
 extern void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 extern void (*wl_columnar_relation_test_after_reader_cas)(

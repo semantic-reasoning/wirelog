@@ -6155,6 +6155,8 @@ void (*wl_columnar_relation_test_before_writer_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *);
 void (*wl_columnar_relation_test_work_checkpoint)(
     wl_evaluation_control_t *control, uint64_t work);
+uint32_t wl_columnar_relation_test_metadata_fail_allocation;
+bool wl_columnar_relation_test_metadata_fail_commit;
 #endif
 
 /* Observe cancellation after each real bounded region, including its tail. */
@@ -6651,6 +6653,322 @@ fail:
                control);
 }
 
+/* Allocation ordinals cover cache, types, root format, child table and each
+ * child object/format/name. The formats are fixed-size admitted regions. */
+static bool
+wl_columnar_relation_metadata_allocation_fails(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_metadata_fail_allocation
+        && --wl_columnar_relation_test_metadata_fail_allocation == 0)
+        return true;
+#endif
+    return false;
+}
+
+static int
+wl_columnar_relation_reserve_metadata_controlled(col_rel_t *dst,
+    uint64_t bytes, wl_columnar_memory_reservation_t *token,
+    bool *active, wl_evaluation_control_t *control)
+{
+    if (!dst->memory_governor)
+        return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(dst->memory_governor), bytes,
+        token, &status, control);
+    if (rc != 0)
+        return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        *active = true;
+        return 0;
+    }
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        dst->memory_budget_denial_pending = true;
+        return ENOSPC;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+/* Normal flat scalar metadata is owned by the descriptor. Its lifetime and
+ * provenance are serialized by the caller; no external Arrow tree is accepted.
+ * Incremental logical work: cache/types/table attempts3 + root format3,
+ * per-lane account/type/table slots3 and child/format/name work4,
+ * name scan and copy2*Nchars. Two fresh reservations15 each and commit4
+ * add34 for governed calls, plus actual extra total-CAS attempts. Fixed
+ * guards/arithmetic/Arrow initialization/token scaffolding/publication and
+ * mandatory destruction are excluded, as are allocator internals. */
+static int
+wl_columnar_relation_name_length_controlled(const char *name,
+    uint64_t *length, wl_evaluation_control_t *control)
+{
+    uint64_t n = 0;
+    for (;;) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            return rc;
+        if (n == UINT64_MAX || n >= SIZE_MAX || n >= INT64_MAX)
+            return EOVERFLOW;
+        char value = name[n];
+        n++;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            return rc;
+        if (!value) {
+            *length = n;
+            return 0;
+        }
+    }
+}
+
+static int
+wl_columnar_relation_prepare_types_controlled(col_rel_t *dst,
+    const wirelog_column_type_t *types, wirelog_column_type_t **types_out,
+    struct ArrowSchema *schema, uint64_t *metadata_bytes,
+    wl_columnar_memory_reservation_t *pending, bool *pending_active,
+    wl_evaluation_control_t *control)
+{
+    /* Descriptor width is stable under the caller's serialization contract. */
+    const uint32_t width = dst->ncols;
+    uint64_t length_bytes, types_bytes, table_bytes;
+    uint64_t *lengths = NULL;
+    wirelog_column_type_t *copy = NULL;
+    wl_columnar_memory_reservation_t scratch;
+    bool schema_initialized = false, scratch_active = false;
+    uint64_t bytes = 3, old_bytes = dst->schema_ok ? 3u : 0u;
+    int rc;
+    wl_columnar_memory_reservation_init(&scratch);
+    wl_columnar_memory_reservation_init(pending);
+    if (!wl_columnar_memory_size_mul(width, sizeof(*lengths),
+        &length_bytes)
+        || !wl_columnar_memory_size_mul(width, sizeof(*copy), &types_bytes)
+        || !wl_columnar_memory_size_mul(width,
+        sizeof(struct ArrowSchema *), &table_bytes)
+        || length_bytes > SIZE_MAX || types_bytes > SIZE_MAX ||
+        table_bytes > SIZE_MAX || table_bytes > INT64_MAX)
+        return EOVERFLOW;
+    /* Scratch is physically live beside both canonical and incoming metadata.
+     * Admit it independently before allocating the length cache. */
+    if (dst->memory_governor) {
+        const wl_columnar_memory_reservation_t *old =
+            &dst->metadata_reservation;
+        if (old->identity != old || old->replacement_bytes
+            || old->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+            || !col_rel_image_token_valid(old, dst,
+            dst->metadata_reserved_bytes))
+            return EINVAL;
+    }
+    rc = wl_columnar_relation_reserve_metadata_controlled(dst, length_bytes,
+            &scratch, &scratch_active, control);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+#ifdef WL_TEST_RELATION_RESIZE_HOOK
+    if (wl_columnar_relation_test_fail_metadata_alloc) {
+        wl_columnar_relation_test_fail_metadata_alloc = false;
+        rc = ENOMEM;
+        goto done;
+    }
+#endif
+    lengths = wl_columnar_relation_metadata_allocation_fails() ? NULL
+        : (uint64_t *)malloc((size_t)length_bytes);
+    if (!lengths) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    for (uint32_t c = 0; c < width; c++) {
+        const char *name = dst->col_names &&
+            dst->col_names[c] ? dst->col_names[c] : "";
+        uint64_t old_fixed = 0;
+        uint64_t length, fixed = sizeof(struct ArrowSchema *)
+            + sizeof(struct ArrowSchema) + 2u + sizeof(*copy);
+        rc = wl_columnar_relation_name_length_controlled(name, &length,
+                control);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        lengths[c] = length;
+        if (dst->col_names) {
+            if (!wl_columnar_memory_size_add(fixed, sizeof(char *), &fixed)
+                || (dst->col_names[c] && !wl_columnar_memory_size_add(fixed,
+                length, &fixed))) {
+                rc = EOVERFLOW;
+                goto done;
+            }
+        }
+        if (!wl_columnar_memory_size_add(bytes, fixed, &bytes)
+            || !wl_columnar_memory_size_add(bytes, length, &bytes)) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        if (dst->col_names) {
+            old_fixed = sizeof(char *);
+            if (dst->col_names[c] && !wl_columnar_memory_size_add(old_fixed,
+                length, &old_fixed)) {
+                rc = EOVERFLOW;
+                goto done;
+            }
+        }
+        if ((dst->schema_ok
+            && (!wl_columnar_memory_size_add(old_fixed,
+            sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema)
+            + 2u, &old_fixed)
+            || !wl_columnar_memory_size_add(old_fixed, length, &old_fixed)))
+            || !wl_columnar_memory_size_add(old_bytes, old_fixed, &old_bytes)) {
+            rc = EOVERFLOW;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    if (dst->memory_governor && dst->metadata_reserved_bytes < old_bytes) {
+        rc = ENOTSUP;
+        goto done;
+    }
+    rc = wl_columnar_relation_reserve_metadata_controlled(dst, bytes, pending,
+            pending_active, control);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    copy = wl_columnar_relation_metadata_allocation_fails() ? NULL
+        : (wirelog_column_type_t *)malloc((size_t)types_bytes);
+    if (!copy) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    for (uint32_t c = 0; c < width; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        copy[c] = types[c];
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+    }
+    rc = wl_evaluation_control_charge(control, 3);
+    if (rc != 0)
+        goto done;
+    ArrowSchemaInit(schema);
+    schema_initialized = true;
+    rc = wl_columnar_relation_metadata_allocation_fails() ? ENOMEM
+        : ArrowSchemaSetFormat(schema, "+s");
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_work_tail(control, 3);
+    if (rc != 0)
+        goto done;
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    schema->children = wl_columnar_relation_metadata_allocation_fails() ? NULL
+        : (struct ArrowSchema **)ArrowMalloc((int64_t)table_bytes);
+    if (!schema->children) {
+        rc = ENOMEM;
+        goto done;
+    }
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    /* n_children stays zero until every uninitialized pointer has been cleared. */
+    for (uint32_t c = 0; c < width;) {
+        uint32_t n = width - c;
+        if (n > WL_EVALUATION_CONTROL_QUANTUM)
+            n = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+        rc = wl_evaluation_control_charge(control, n);
+        if (rc != 0)
+            goto done;
+        for (uint32_t i = 0; i < n; i++)
+            schema->children[c + i] = NULL;
+        c += n;
+        rc = wl_columnar_relation_work_tail(control, n);
+        if (rc != 0)
+            goto done;
+    }
+    for (uint32_t c = 0; c < width; c++) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        struct ArrowSchema *child =
+            wl_columnar_relation_metadata_allocation_fails() ? NULL
+            : (struct ArrowSchema *)ArrowMalloc(sizeof(*child));
+        if (!child) {
+            rc = ENOMEM;
+            goto done;
+        }
+        ArrowSchemaInit(child);
+        schema->children[c] = child;
+        schema->n_children = (int64_t)c + 1;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 2);
+        if (rc != 0)
+            goto done;
+        rc = wl_columnar_relation_metadata_allocation_fails() ? ENOMEM
+            : ArrowSchemaSetFormat(child, "l");
+        if (rc != 0)
+            goto done;
+        rc = wl_columnar_relation_work_tail(control, 2);
+        if (rc != 0)
+            goto done;
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            goto done;
+        child->name = wl_columnar_relation_metadata_allocation_fails() ? NULL
+            : (const char *)ArrowMalloc((int64_t)lengths[c]);
+        if (!child->name) {
+            rc = ENOMEM;
+            goto done;
+        }
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            goto done;
+        const char *name = dst->col_names &&
+            dst->col_names[c] ? dst->col_names[c] : "";
+        for (uint64_t pos = 0; pos < lengths[c];) {
+            uint64_t n = lengths[c] - pos;
+            if (n > WL_EVALUATION_CONTROL_QUANTUM)
+                n = WL_EVALUATION_CONTROL_QUANTUM;
+            rc = wl_evaluation_control_charge(control, n);
+            if (rc != 0)
+                goto done;
+            memcpy((char *)child->name + pos, name + pos, (size_t)n);
+            pos += n;
+            rc = wl_columnar_relation_work_tail(control, n);
+            if (rc != 0)
+                goto done;
+        }
+    }
+    *metadata_bytes = bytes;
+    *types_out = copy;
+    copy = NULL;
+    schema_initialized = false;
+    rc = 0;
+done:
+    free(lengths);
+    if (scratch_active)
+        col_rel_reservation_rollback(&scratch);
+    free(copy);
+    if (schema_initialized)
+        ArrowSchemaRelease(schema);
+    /* Caller owns pending on success and failure; release it exactly once. */
+    return rc;
+}
+
 static int
 wl_columnar_relation_copy_cells_controlled(int64_t *to,
     const int64_t *from, uint32_t count, bool normalize,
@@ -6901,6 +7219,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     uint32_t base, count, new_capacity = 0;
     uint32_t owned_columns = 0;
     bool growth = false, transaction_active = false;
+    bool install_types = false, metadata_active = false;
+    bool prepared_schema_ok = false;
+    wirelog_column_type_t *prepared_types = NULL;
+    struct ArrowSchema prepared_schema;
+    wl_columnar_memory_reservation_t metadata_pending, old_metadata;
+    uint64_t metadata_bytes = 0;
     int64_t **prepared_columns = NULL;
     col_delta_timestamp_t *prepared_timestamps = NULL;
     int64_t **output_columns;
@@ -6910,6 +7234,8 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     int rc;
     if (!control)
         return col_rel_append_all(dst, src, arena);
+    wl_columnar_memory_reservation_init(&metadata_pending);
+    wl_columnar_memory_reservation_init(&old_metadata);
     if (!dst || !src || dst->ncols != src->ncols)
         return EINVAL;
     rc = wl_evaluation_control_charge(control, 0);
@@ -6965,11 +7291,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     }
     base = dst->nrows;
     count = src->nrows;
-    if (!dst->column_types && src->column_types) {
+    install_types = !dst->column_types && src->column_types;
+    growth = base + count > dst->capacity;
+    if (install_types && (!count || !dst->ncols || !dst->capacity || growth)) {
         rc = ENOTSUP;
         goto done;
     }
-    growth = base + count > dst->capacity;
     if ((growth && (!dst->ncols || !dst->capacity
         || (dst->timestamps && (!src->timestamps
         || dst->timestamp_capacity != dst->capacity))))
@@ -7005,6 +7332,12 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
             rc = EINVAL;
             goto done;
         }
+        if (install_types && st != WIRELOG_TYPE_INT32
+            && st != WIRELOG_TYPE_INT64 && st != WIRELOG_TYPE_UINT32
+            && st != WIRELOG_TYPE_UINT64) {
+            rc = ENOTSUP;
+            goto done;
+        }
         owned_columns++;
         rc = wl_columnar_relation_work_tail(control, 1);
         if (rc != 0)
@@ -7032,6 +7365,15 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
                     goto done;
             }
         }
+    }
+    if (install_types) {
+        dst->memory_budget_denial_pending = false;
+        rc = wl_columnar_relation_prepare_types_controlled(dst,
+                src->column_types, &prepared_types, &prepared_schema,
+                &metadata_bytes, &metadata_pending, &metadata_active, control);
+        if (rc != 0)
+            goto done;
+        prepared_schema_ok = true;
     }
     output_columns = dst->columns;
     output_timestamps = dst->timestamps;
@@ -7160,11 +7502,71 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         wl_columnar_relation_ledger_reconcile_known(dst, ledger_before,
             ledger_after);
     }
+    if (rc == 0 && install_types) {
+        /* The pending token is fresh, local and never transferred. The
+         * controlled primitive validates its RESERVED state/owner at cutoff. */
+        if (metadata_active && (metadata_pending.identity != &metadata_pending
+            || metadata_pending.bytes != metadata_bytes
+            || metadata_pending.governor !=
+            wl_columnar_memory_governor_ref_get(dst->memory_governor)
+            || metadata_pending.replacement_bytes
+            || metadata_pending.transition_kind !=
+            WL_COLUMNAR_MEMORY_TRANSITION_NONE)) {
+            rc = EINVAL;
+            goto done;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_relation_test_metadata_fail_commit) {
+            wl_columnar_relation_test_metadata_fail_commit = false;
+            rc = EFAULT;
+            goto done;
+        }
+#endif
+        if (metadata_active) {
+            bool committed;
+            rc = wl_columnar_memory_governor_commit_controlled(
+                &metadata_pending, dst, &committed, control);
+            if (rc != 0)
+                goto done;
+            if (!committed) {
+                rc = EINVAL;
+                goto done;
+            }
+            /* True commit is irreversible: move original-address authority
+             * and finish publication/physical retirement without callbacks. */
+            if (dst->metadata_reserved_bytes
+                && !wl_columnar_memory_reservation_move(&old_metadata,
+                &dst->metadata_reservation))
+                abort();
+            if (!wl_columnar_memory_reservation_move(&dst->metadata_reservation,
+                &metadata_pending))
+                abort();
+            dst->metadata_reserved_bytes = metadata_bytes;
+            metadata_active = false;
+        }
+        struct ArrowSchema old_schema = dst->schema;
+        bool old_schema_ok = dst->schema_ok;
+        wirelog_column_type_t *old_types = dst->column_types;
+        dst->column_types = prepared_types;
+        prepared_types = NULL;
+        dst->schema = prepared_schema;
+        dst->schema_ok = true;
+        prepared_schema_ok = false;
+        if (old_schema_ok)
+            ArrowSchemaRelease(&old_schema);
+        free(old_types);
+        col_rel_release_reservation_or_abort(&old_metadata);
+    }
     if (rc == 0 && count != 0) {
         dst->nrows = base + count;
         wl_columnar_relation_touch_view(dst);
     }
 done:
+    free(prepared_types);
+    if (prepared_schema_ok)
+        ArrowSchemaRelease(&prepared_schema);
+    if (metadata_active)
+        col_rel_reservation_rollback(&metadata_pending);
     if (prepared_columns)
         col_columns_free(prepared_columns, dst->ncols);
     free(prepared_timestamps);
