@@ -828,6 +828,13 @@ nonrec_copy_relation_slice(wl_col_session_t *coord, const col_rel_t *src,
         int end_rc = col_rel_append_batch_end(&batch, rc == 0);
         if (rc == 0)
             rc = end_rc;
+        /* A refused growth reports ENOSPC with the session's denial flag,
+         * like the other governed operators (#2148); dst holds the evidence
+         * until it is destroyed below.  coord is NULL only through the test
+         * wrapper. */
+        rc = eval_relation_status(dst, rc);
+        if (rc == ENOSPC && coord)
+            coord->memory_budget_denied = true;
     }
 done:
     free(row);

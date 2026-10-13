@@ -2611,26 +2611,27 @@ slice_copy_tests(void)
     }
 }
 
-/* A slice of @rows rows from a 512-row source under @budget.  A refused
- * growth leaves no slice and no reservation behind.  It currently surfaces
- * as ENOMEM, without the session's denial flag, where other operators
- * report ENOSPC (#2148); this pins that until the mapping changes. */
+/* A slice of @rows rows from a 512-row source under @budget, copied for
+ * a session or, with @null_coord, for none.  A refused growth surfaces as
+ * ENOSPC with the session's denial flag set, like the other governed
+ * operators (#2148), and leaves no slice and no reservation behind. */
 static int
-slice_denial_run(uint32_t rows, uint64_t budget, bool check_cleanup)
+slice_denial_run(uint32_t rows, uint64_t budget, bool check_cleanup,
+    bool null_coord)
 {
     wl_col_session_t *coord = join_session();
     wl_columnar_memory_governor_ref_t *ref = enforcing_governor(budget);
     col_rel_t *src = slice_source(512);
     uint64_t baseline = governor_reserved(ref);
     col_rel_t *slice = NULL;
-    int rc = wl_columnar_eval_test_copy_relation_slice(coord, src, "slice",
-            0, rows, ref, &slice);
+    int rc = wl_columnar_eval_test_copy_relation_slice(
+        null_coord ? NULL : coord, src, "slice", 0, rows, ref, &slice);
     if (rc == 0) {
-        assert(slice->nrows == rows);
+        assert(slice->nrows == rows && !coord->memory_budget_denied);
         assert(col_rel_destroy_checked(slice) == 0);
     } else if (check_cleanup) {
-        assert(rc == ENOMEM && slice == NULL
-            && !coord->memory_budget_denied);
+        assert(rc == ENOSPC && slice == NULL);
+        assert(coord->memory_budget_denied == !null_coord);
         assert(governor_reserved(ref) == baseline);
     }
     assert(col_rel_destroy_checked(src) == 0);
@@ -2645,15 +2646,16 @@ slice_denial_tests(void)
     /* Smallest budget at which a 128-row slice (one growth past the 64-row
      * floor) succeeds; 256 rows need a second growth. */
     uint64_t lo = 0, hi = 1u << 24;
-    assert(slice_denial_run(128, hi, false) == 0);
+    assert(slice_denial_run(128, hi, false, false) == 0);
     while (hi - lo > 1) {
         uint64_t mid = lo + (hi - lo) / 2u;
-        if (budget_fits(slice_denial_run(128, mid, false), ENOMEM))
+        if (budget_fits(slice_denial_run(128, mid, false, false), ENOSPC))
             hi = mid;
         else
             lo = mid;
     }
-    assert(slice_denial_run(256, hi, true) == ENOMEM);
+    assert(slice_denial_run(256, hi, true, false) == ENOSPC);
+    assert(slice_denial_run(256, hi, true, true) == ENOSPC);
 }
 
 /* The image holds 1024 rows in its dedup set, then 4096 appended rows of
