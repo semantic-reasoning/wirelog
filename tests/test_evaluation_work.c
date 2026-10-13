@@ -412,7 +412,8 @@ test_rejected_shapes(void)
     wirelog_column_type_t type = WIRELOG_TYPE_INT64;
     src->nrows = 0;
     CHECK(col_rel_set_column_types(src, &type, 1) == 0);
-    src->nrows = 1;
+    /* Empty typed-source installation remains outside the supported route. */
+    src->nrows = 0;
     retry(c, 0);
     CHECK(wl_columnar_relation_append_all_controlled(dst, src, NULL,
         c) == ENOTSUP);
@@ -2785,6 +2786,534 @@ test_exact_capacity_partial_initialization(unsigned mode)
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+/* Real flat owned metadata, completed before governor attachment. Missing
+ * names are physically retired and Arrow names replaced through its API. */
+static col_rel_t *
+metadata_fixture(uint32_t width, bool governed, unsigned names_mode,
+    bool long_names, bool timestamps)
+{
+    char long_name[301];
+    memset(long_name, 'x', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    const char **names = calloc(width, sizeof(*names));
+    CHECK(names != NULL);
+    for (uint32_t c = 0; c < width; c++)
+        names[c] = c % 3 == 0 ? (long_names ? long_name : "x")
+            : c % 3 == 1 ? "" : NULL;
+    col_rel_t *r = col_rel_new_auto("metadata", 0);
+    CHECK(r && col_rel_set_schema(r, width, names) == 0);
+    free(names);
+    CHECK(r->capacity >= 4 && !r->column_types && r->schema_ok);
+    if (names_mode) {
+        for (uint32_t c = 0; c < width; c++) {
+            if (names_mode == 1 && c % 2) continue;
+            free(r->col_names[c]);
+            r->col_names[c] = NULL;
+            CHECK(ArrowSchemaSetName(r->schema.children[c], "") == 0);
+        }
+        if (names_mode == 2) {
+            free(r->col_names);
+            r->col_names = NULL;
+        }
+    }
+    r->nrows = 2;
+    for (uint32_t c = 0; c < width; c++)
+        for (uint32_t row = 0; row < 2; row++)
+            r->columns[c][row] = (int64_t)c * 10000 + row;
+    if (timestamps) {
+        CHECK(!r->timestamps);
+        r->timestamps = calloc(r->capacity, sizeof(*r->timestamps));
+        CHECK(r->timestamps != NULL);
+        r->timestamp_capacity = r->capacity;
+        for (uint32_t row = 0; row < 2; row++) {
+            r->timestamps[row].iteration = row;
+            r->timestamps[row].stratum = row + 1;
+            r->timestamps[row].worker = row + 2;
+            r->timestamps[row].multiplicity = -(int64_t)row;
+        }
+    }
+    if (governed) {
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        };
+        wl_columnar_memory_governor_ref_t *g =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(g && col_rel_attach_memory_governor(r, g) == 0);
+        wl_columnar_memory_governor_ref_release(g);
+    }
+    return r;
+}
+
+static col_rel_t *
+metadata_source(uint32_t width, bool timestamps)
+{
+    col_rel_t *r = relation(width, 4, 2, timestamps, NULL);
+    wirelog_column_type_t *types = malloc(width * sizeof(*types));
+    const wirelog_column_type_t family[] = {
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT64,
+        WIRELOG_TYPE_UINT32, WIRELOG_TYPE_UINT64
+    };
+    CHECK(types != NULL);
+    for (uint32_t c = 0; c < width; c++) types[c] = family[c % 4];
+    CHECK(col_rel_set_column_types(r, types, width) == 0);
+    free(types);
+    return r;
+}
+
+static uint64_t
+metadata_name_length(const col_rel_t *r, uint32_t c)
+{
+    return r->col_names && r->col_names[c] ? strlen(r->col_names[c]) + 1 : 1;
+}
+
+static uint64_t
+metadata_cost(const col_rel_t *r, const col_rel_t *src)
+{
+    uint64_t chars = 0, w = r->ncols, rows = src->nrows;
+    for (uint32_t c = 0; c < r->ncols; c++) chars += metadata_name_length(r, c);
+    return 2 + w + 2 * w * rows
+           + (r->timestamps && src->timestamps ? 5 * rows : 0)
+           + 6 + 7 * w + 2 * chars + (r->memory_governor ? 34 : 0);
+}
+
+/* Explicit protocol inventory; independent of observed checkpoint totals. */
+static size_t
+metadata_regions(const col_rel_t *r, const col_rel_t *src, uint64_t *out,
+    uint64_t *allocation_prefixes, size_t *allocations)
+{
+    size_t n = 0, a = 0;
+    uint64_t total = 0;
+#define MR(v) do { uint64_t amount = (v); out[n++] = amount; total += amount; \
+} while (0)
+#define MA(v) do { MR(v); allocation_prefixes[a++] = total; } while (0)
+#define RESERVE_REGIONS() do { MR(3); MR(1); MR(5); MR(4); MR(1); MR(1); \
+} while (0)
+    MR(1); MR(1);
+    for (uint32_t c = 0; c < r->ncols; c++) MR(1);
+    for (uint32_t row = 0; row < src->nrows; row++)
+        for (uint32_t c = 0; c < r->ncols; c++) MR(1);
+    if (r->memory_governor) RESERVE_REGIONS();
+    MA(1); /* length cache */
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        for (uint64_t j = 0; j < metadata_name_length(r, c); j++) MR(1);
+        MR(1);
+    }
+    if (r->memory_governor) RESERVE_REGIONS();
+    MA(1); /* type array */
+    for (uint32_t c = 0; c < r->ncols; c++) MR(1);
+    MA(3); MA(1); /* root format, child pointer table */
+    for (uint32_t c = 0; c < r->ncols;) {
+        uint32_t count = r->ncols - c;
+        if (count > WL_EVALUATION_CONTROL_QUANTUM)
+            count = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+        MR(count); c += count;
+    }
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        MA(1); MA(2); MA(1); /* child, fixed format, name */
+        for (uint64_t j = 0, length = metadata_name_length(r, c); j < length;) {
+            uint64_t count = length - j;
+            if (count > WL_EVALUATION_CONTROL_QUANTUM)
+                count = WL_EVALUATION_CONTROL_QUANTUM;
+            MR(count); j += count;
+        }
+    }
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        for (uint32_t row = 0; row < src->nrows;) {
+            uint32_t count = src->nrows - row;
+            if (count > WL_EVALUATION_CONTROL_QUANTUM)
+                count = (uint32_t)WL_EVALUATION_CONTROL_QUANTUM;
+            MR(count); row += count;
+        }
+    }
+    if (r->timestamps && src->timestamps) {
+        for (uint32_t row = 0; row < src->nrows;) {
+            uint32_t count = src->nrows - row;
+            if (count > WL_EVALUATION_CONTROL_QUANTUM / 5u)
+                count = (uint32_t)(WL_EVALUATION_CONTROL_QUANTUM / 5u);
+            MR(5u * count); row += count;
+        }
+    }
+    if (r->memory_governor) {
+        MR(1); MR(1); MR(2);
+    }
+#undef RESERVE_REGIONS
+#undef MA
+#undef MR
+    CHECK(total == metadata_cost(r, src));
+    *allocations = a;
+    return n;
+}
+
+static void
+metadata_unchanged(col_rel_t *r, growth_snapshot_t before,
+    const struct ArrowSchema *schema, char **names, uint64_t credit)
+{
+    unchanged(r, before);
+    CHECK(!r->column_types && r->col_names == names && r->schema_ok);
+    CHECK(memcmp(&r->schema, schema, sizeof(*schema)) == 0);
+    CHECK(r->metadata_reserved_bytes == credit);
+    released(r);
+}
+
+static void
+metadata_equal(col_rel_t *r, col_rel_t *raw, const col_rel_t *src)
+{
+    CHECK(r->nrows == 4 && raw->nrows == 4);
+    payload_equal(r, raw, 0);
+    CHECK(strcmp(r->schema.format, "+s") == 0);
+    CHECK(r->schema.n_children == r->ncols);
+    for (uint32_t c = 0; c < r->ncols; c++) {
+        CHECK(r->column_types[c] == src->column_types[c]);
+        CHECK(r->column_types[c] == raw->column_types[c]);
+        CHECK(strcmp(r->schema.children[c]->format, "l") == 0);
+        CHECK(strcmp(r->schema.children[c]->name,
+            raw->schema.children[c]->name) == 0);
+    }
+}
+
+static void
+test_metadata_success(uint32_t width, bool governed, unsigned names_mode,
+    bool long_names, bool timestamps)
+{
+    col_rel_t *r = metadata_fixture(width, governed, names_mode, long_names,
+            timestamps);
+    col_rel_t *raw = metadata_fixture(width, governed, names_mode, long_names,
+            timestamps);
+    col_rel_t *src = metadata_source(width, timestamps);
+    growth_snapshot_t before = snapshot(r);
+    struct ArrowSchema schema = r->schema;
+    char **names = r->col_names;
+    uint64_t old_credit = r->metadata_reserved_bytes;
+    uint64_t cost = metadata_cost(r, src);
+    uint64_t last = governed ? 2 : timestamps ? 10 : 2;
+    wl_evaluation_control_t *c = control(cost - 1);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == cost - last);
+    metadata_unchanged(r, before, &schema, names, old_credit);
+    retry(c, 0); cancel_at = cost;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == cost);
+    metadata_unchanged(r, before, &schema, names, old_credit);
+    retry(c, cost); growth_watch = r; growth_peak = before.reserved;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c) == 0);
+    growth_watch = NULL;
+    CHECK(finish(c, 0) == cost && seen == cost);
+    CHECK(wl_columnar_relation_append_all_controlled(raw, src, NULL,
+        NULL) == 0);
+    metadata_equal(r, raw, src);
+    CHECK(r->col_names == names && r->columns == before.columns);
+    CHECK(r->capacity == before.capacity &&
+        r->storage_generation == before.storage);
+    CHECK(r->view_generation == before.view + 1);
+    if (governed) {
+        uint64_t next = old_credit + width * sizeof(wirelog_column_type_t);
+        CHECK(r->metadata_reserved_bytes == next);
+        CHECK(r->metadata_reservation.bytes == next);
+        CHECK(r->metadata_reservation.identity == &r->metadata_reservation);
+        CHECK(atomic_load_explicit(&r->metadata_reservation.owner_bits,
+            memory_order_relaxed) == (uint64_t)(uintptr_t)r);
+        CHECK(atomic_load_explicit(&r->metadata_reservation.state,
+            memory_order_relaxed) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED);
+        CHECK(growth_peak == before.reserved + width * sizeof(uint64_t) + next);
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(r->memory_governor))
+            == before.reserved + next - old_credit);
+    }
+    wl_columnar_memory_governor_ref_t *ref = r->memory_governor;
+    if (ref) wl_columnar_memory_governor_ref_retain(ref);
+    release(c); destroy(r); destroy(raw); destroy(src);
+    if (ref) {
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                ref)) == 0);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_metadata_boundaries(void)
+{
+    col_rel_t *r = metadata_fixture(2, true, 0, true, true);
+    col_rel_t *src = metadata_source(2, true);
+    growth_snapshot_t before = snapshot(r);
+    struct ArrowSchema schema = r->schema;
+    char **names = r->col_names;
+    uint64_t credit = r->metadata_reserved_bytes;
+    uint64_t regions[2048], allocation_prefixes[32], prefix = 0;
+    size_t allocations;
+    size_t count = metadata_regions(r, src, regions, allocation_prefixes,
+            &allocations);
+    CHECK(allocations == 10);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(finish(c, 0) == 0);
+    for (size_t i = 0; i < count; i++) {
+        retry(c, prefix + regions[i] - 1);
+        if (prefix + regions[i] > 1) {
+            CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(finish(c, WL_EVALUATION_CONTROL_WORK_LIMIT) == prefix);
+            metadata_unchanged(r, before, &schema, names, credit);
+        } else CHECK(finish(c, 0) == 0);
+        prefix += regions[i]; retry(c, 0); cancel_at = prefix;
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == prefix);
+        metadata_unchanged(r, before, &schema, names, credit); released(src);
+    }
+    CHECK(prefix == metadata_cost(r, src));
+    release(c); destroy(r); destroy(src);
+}
+
+static void
+test_metadata_faults(void)
+{
+    col_rel_t *r = metadata_fixture(3, true, 0, false, false);
+    col_rel_t *src = metadata_source(3, false);
+    growth_snapshot_t before = snapshot(r);
+    struct ArrowSchema schema = r->schema;
+    char **names = r->col_names;
+    uint64_t credit = r->metadata_reserved_bytes;
+    uint64_t regions[2048], allocation_prefixes[32];
+    size_t allocations;
+    (void)metadata_regions(r, src, regions, allocation_prefixes, &allocations);
+    CHECK(allocations == 13);
+    wl_evaluation_control_t *c = control(0);
+    for (size_t i = 0; i <= allocations; i++) {
+        if (i) retry(c, 0);
+        wl_columnar_relation_test_metadata_fail_allocation =
+            i < allocations ? (uint32_t)i + 1 : 0;
+        wl_columnar_relation_test_metadata_fail_commit = i == allocations;
+        int expected = i < allocations ? ENOMEM : EFAULT;
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+            c) == expected);
+        uint64_t prefix = i < allocations ? allocation_prefixes[i]
+            : metadata_cost(r, src) - 4;
+        CHECK(finish(c, expected) == prefix);
+        CHECK(!wl_columnar_relation_test_metadata_fail_allocation
+            && !wl_columnar_relation_test_metadata_fail_commit);
+        CHECK(!r->memory_budget_denial_pending);
+        metadata_unchanged(r, before, &schema, names, credit);
+    }
+    retry(c, metadata_cost(r, src));
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == seen);
+    release(c); destroy(r); destroy(src);
+}
+
+static void
+test_metadata_governor(void)
+{
+    col_rel_t *r = metadata_fixture(3, true, 0, false, false);
+    col_rel_t *src = metadata_source(3, false);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(r->memory_governor);
+    wl_columnar_memory_reservation_t held;
+    wl_columnar_memory_reservation_init(&held);
+    CHECK(wl_columnar_memory_reserve(g, 41, &held));
+    CHECK(wl_columnar_memory_commit(&held, &held));
+    growth_snapshot_t before = snapshot(r);
+    struct ArrowSchema schema = r->schema;
+    char **names = r->col_names;
+    uint64_t old = r->metadata_reserved_bytes;
+    uint64_t scratch = 3 * sizeof(uint64_t);
+    uint64_t next = old + 3 * sizeof(wirelog_column_type_t);
+    wl_evaluation_control_t *c = control(0);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        if (mode) retry(c, 0);
+        atomic_store_explicit(&g->usable_bytes,
+            before.reserved + scratch + next - 1, memory_order_relaxed);
+        growth_verdict_phase = WL_COLUMNAR_MEMORY_GOVERNOR_VERDICT;
+        growth_verdict_hits = 0; growth_verdict_positive = mode == 2;
+        wl_columnar_memory_governor_test_checkpoint =
+            mode ? growth_verdict : NULL;
+        int expected = mode == 2 ? EOVERFLOW : ENOSPC;
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+            c) == expected);
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+        CHECK(finish(c, expected) == seen);
+        CHECK(r->memory_budget_denial_pending == (mode != 2));
+        CHECK(growth_verdict_hits == (mode ? 1u : 0u));
+        metadata_unchanged(r, before, &schema, names, old);
+    }
+    retry(c, 0);
+    atomic_store_explicit(&g->usable_bytes, before.reserved + scratch - 1,
+        memory_order_relaxed);
+    wl_columnar_relation_test_metadata_fail_allocation = 1;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+        c) == ENOSPC);
+    CHECK(finish(c, ENOSPC) == 2 + 3 + 6 + 14);
+    CHECK(wl_columnar_relation_test_metadata_fail_allocation == 1);
+    wl_columnar_relation_test_metadata_fail_allocation = 0;
+    metadata_unchanged(r, before, &schema, names, old);
+    atomic_store_explicit(&g->usable_bytes, WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        memory_order_relaxed);
+    const unsigned phases[] = {WL_COLUMNAR_MEMORY_GOVERNOR_VALIDATED,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_SNAPSHOT,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_PREPARED,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_COMMITTING,
+                               WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF};
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        retry(c, 0); growth_verdict_phase = phases[i];
+        growth_verdict_hits = 0; growth_verdict_positive = true;
+        wl_columnar_memory_governor_test_checkpoint = growth_verdict;
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+            c) == EOVERFLOW);
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+        CHECK(finish(c, EOVERFLOW) == seen && growth_verdict_hits == 1);
+        CHECK(!r->memory_budget_denial_pending);
+        metadata_unchanged(r, before, &schema, names, old);
+    }
+    retry(c, metadata_cost(r, src));
+    atomic_store_explicit(&g->usable_bytes, before.reserved + scratch + next,
+        memory_order_relaxed);
+    growth_watch = r; growth_peak = before.reserved;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c) == 0);
+    growth_watch = NULL;
+    CHECK(finish(c,
+        0) == seen && growth_peak == before.reserved + scratch + next);
+    CHECK(wl_columnar_memory_reserved(g) == before.reserved + next - old);
+    CHECK(held.bytes == 41 && held.identity == &held);
+    CHECK(wl_columnar_memory_release(&held));
+    release(c); destroy(r); destroy(src);
+}
+
+static void
+test_metadata_peer_and_ledger(void)
+{
+    col_rel_t *r = metadata_fixture(3, true, 0, false, false);
+    col_rel_t *src = metadata_source(3, false);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(r->memory_governor);
+    uint64_t before = wl_columnar_memory_reserved(g);
+    uint64_t cost = metadata_cost(r, src);
+    wl_columnar_memory_reservation_init(&growth_peer);
+    growth_peer_rounds = 0; growth_peer_base = before;
+    growth_peer_cancel = false;
+    wl_columnar_memory_governor_test_before_total_cas = growth_before_total;
+    wl_columnar_memory_governor_test_after_total_cas = growth_after_total;
+    wl_evaluation_control_t *c = control(cost + 3);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c) == 0);
+    CHECK(finish(c, 0) == cost + 3 && growth_peer_rounds == 3);
+    CHECK(wl_columnar_memory_reserved(g) == before + growth_peer.bytes
+        + 3 * sizeof(wirelog_column_type_t));
+    CHECK(wl_columnar_memory_rollback(&growth_peer));
+    release(c); destroy(r); destroy(src);
+    for (unsigned success = 0; success < 2; success++) {
+        r = metadata_fixture(3, true, 0, false, false);
+        src = metadata_source(3, false);
+        col_rel_t *peer_rel = col_rel_new_auto("peer", 1);
+        CHECK(peer_rel != NULL);
+        wl_mem_ledger_t ledger;
+        wl_mem_ledger_init(&ledger, 0);
+        r->mem_ledger = peer_rel->mem_ledger = &ledger;
+        col_rel_ledger_reconcile(r, 0); col_rel_ledger_reconcile(peer_rel, 0);
+        uint64_t ledger_before = atomic_load_explicit(&ledger.current_bytes,
+                memory_order_relaxed);
+        growth_snapshot_t snap = snapshot(r);
+        struct ArrowSchema schema = r->schema;
+        char **names = r->col_names;
+        uint64_t credit = r->metadata_reserved_bytes;
+        cost = metadata_cost(r, src); c = control(cost);
+        if (!success) cancel_at = cost;
+        exact_ledger_peer = peer_rel; exact_ledger_changed = false;
+        wl_columnar_relation_test_work_checkpoint = exact_shared_checkpoint;
+        wl_columnar_memory_governor_test_work_checkpoint =
+            exact_shared_checkpoint;
+        int result = success ? 0 : WL_EVALUATION_CONTROL_CANCELLED;
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+            c) == result);
+        CHECK(finish(c, result) == cost && exact_ledger_changed);
+        wl_columnar_relation_test_work_checkpoint = checkpoint;
+        wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+        exact_ledger_peer = NULL;
+        CHECK(atomic_load_explicit(&ledger.current_bytes, memory_order_relaxed)
+            == ledger_before + 5 * sizeof(int64_t));
+        if (!success) metadata_unchanged(r, snap, &schema, names, credit);
+        release(c); destroy(r); destroy(peer_rel); destroy(src);
+        CHECK(atomic_load_explicit(&ledger.current_bytes,
+            memory_order_relaxed) == 0);
+    }
+}
+
+static void
+test_metadata_scope(void)
+{
+    col_rel_t *r = metadata_fixture(1, true, 0, false, false);
+    col_rel_t *src = metadata_source(1, false);
+    wl_evaluation_control_t *c = control(0);
+    src->nrows = 0;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+        c) == ENOTSUP);
+    CHECK(finish(c, ENOTSUP) == 2);
+    src->nrows = 2;
+    uint32_t rows = r->nrows;
+    r->nrows = r->capacity;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+        c) == ENOTSUP);
+    CHECK(finish(c, ENOTSUP) == 2);
+    r->nrows = rows;
+    const void *identity = r->metadata_reservation.identity;
+    r->metadata_reservation.identity = &src->metadata_reservation;
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+        c) == EINVAL);
+    CHECK(finish(c, EINVAL) == 2 + 1 + 2);
+    r->metadata_reservation.identity = identity;
+    wirelog_column_type_t type = WIRELOG_TYPE_BOOL;
+    CHECK(col_rel_set_column_types(src, &type, 1) == 0);
+    retry(c, 0);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL,
+        c) == ENOTSUP);
+    CHECK(finish(c, ENOTSUP) == 3);
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, NULL) == 0);
+    CHECK(r->column_types[0] == type && r->nrows == 4);
+    release(c); destroy(r); destroy(src);
+}
+
+static void
+test_metadata_wide_table_and_advisory(void)
+{
+    col_rel_t *r = metadata_fixture(300, true, 0, false, false);
+    col_rel_t *src = metadata_source(300, false);
+    uint64_t regions[16384], allocations[1024];
+    size_t allocation_count;
+    (void)metadata_regions(r, src, regions, allocations, &allocation_count);
+    CHECK(allocation_count == 904);
+    growth_snapshot_t before = snapshot(r);
+    struct ArrowSchema schema = r->schema;
+    char **names = r->col_names;
+    uint64_t credit = r->metadata_reserved_bytes;
+    wl_evaluation_control_t *c = control(0);
+    cancel_at = allocations[3] + WL_EVALUATION_CONTROL_QUANTUM;
+    CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, WL_EVALUATION_CONTROL_CANCELLED) == cancel_at);
+    metadata_unchanged(r, before, &schema, names, credit);
+    release(c); destroy(r); destroy(src);
+    for (unsigned unlimited = 0; unlimited < 2; unlimited++) {
+        r = metadata_fixture(1, true, 2, false, false);
+        src = metadata_source(1, false);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        g->mode = WL_COLUMNAR_MEMORY_MODE_ADVISORY;
+        atomic_store_explicit(&g->usable_bytes,
+            unlimited ? UINT64_MAX : WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            memory_order_relaxed);
+        uint64_t cost = metadata_cost(r, src);
+        c = control(cost);
+        CHECK(wl_columnar_relation_append_all_controlled(r, src, NULL, c) == 0);
+        CHECK(finish(c, 0) == cost && r->nrows == 4);
+        release(c); destroy(r); destroy(src);
+    }
+}
+
 int
 main(void)
 {
@@ -2847,6 +3376,17 @@ main(void)
     test_exact_capacity_no_growth_and_scope();
     for (unsigned mode = 0; mode < 3; mode++)
         test_exact_capacity_partial_initialization(mode);
+    for (unsigned governed = 0; governed < 2; governed++) {
+        for (unsigned names_mode = 0; names_mode < 3; names_mode++)
+            test_metadata_success(4, governed != 0, names_mode, true, true);
+        test_metadata_success(300, governed != 0, 0, false, false);
+    }
+    test_metadata_boundaries();
+    test_metadata_faults();
+    test_metadata_governor();
+    test_metadata_peer_and_ledger();
+    test_metadata_scope();
+    test_metadata_wide_table_and_advisory();
     puts("evaluation_work: OK");
     return 0;
 }
