@@ -671,6 +671,10 @@ void (*wl_columnar_eval_test_nonrec_worker)(wl_col_session_t *, eval_stack_t *,
     eval_entry_t *, int *);
 int (*wl_columnar_eval_test_nonrec_boundary)(wl_col_session_t *, unsigned,
     uint32_t, col_rel_t *);
+/* Phases: 0 before the stage frame, 1 per worker before submission, 2
+ * after the workers finish, 3 before final->rel is built, 4 after the merge
+ * into it, 5 before publication, and 6 after a failed merge while final->rel
+ * is still alive. */
 #define WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, phase, worker, candidate) \
         (wl_columnar_eval_test_nonrec_boundary \
     ? wl_columnar_eval_test_nonrec_boundary(coord, phase, worker, \
@@ -1179,6 +1183,18 @@ wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
                 rc = col_rel_append_all(final->rel, stages->items[w].rel, NULL);
 
 
+        /* A refused growth of final->rel above reports ENOSPC with the
+         * session's denial flag, like a refused creation of it and the
+         * slice copy (#2160).  final->rel is not in coord->rels and on
+         * failure the stage frame destroys it, so its evidence is read
+         * here.  An ENOSPC from the governor attach is flagged too. */
+        rc = eval_relation_status(final->rel, rc);
+        if (rc == ENOSPC)
+            coord->memory_budget_denied = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (rc != 0 && final->rel)
+            (void)WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 6, 0, final->rel);
+#endif
         if (rc == 0)
             rc = WL_COLUMNAR_EVAL_NONREC_BOUNDARY(coord, 4, 0, final->rel);
         if (rc == 0 && nonrec_plan_has_consolidate(rp))
