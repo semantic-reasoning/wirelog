@@ -3160,6 +3160,53 @@ col_rel_append_row(col_rel_t *r, const int64_t *row);
  * stack-local authority. This private API does not activate operators. */
 int wl_columnar_relation_append_row_controlled(col_rel_t *r,
     const int64_t *row, wl_evaluation_control_t *control);
+/* Controlled original held batch, zero-initialized before begin. Never copy or
+ * move a live wrapper. Keep relation/control alive and serialize lifecycle.
+ * The private domain matches controlled single-row append; NULL begin binds
+ * raw delegation with its broader domain. Every exit must call end, including
+ * failed begin that leaves DRAINING authority. End is mandatory after attempt
+ * cancellation/restart; it never polls or debits a successor and preserves the
+ * initiating result across a failed cleanup retry. Published earlier rows are
+ * retained. Reset only a completely ENDED wrapper to zero for reuse.
+ * Every row captures raw input under its old lease before a renewal releases
+ * backing. A new width mismatch is ENOTSUP; types belong to the reacquired
+ * destination. Wide capture pins its original governor until physical free
+ * and S refund. Later ungoverned-to-governed attachment does not retroactively
+ * admit old S; new P uses the current destination governor. */
+typedef enum {
+    WL_COLUMNAR_RELATION_BATCH_EMPTY = 0,
+    WL_COLUMNAR_RELATION_BATCH_HELD,
+    WL_COLUMNAR_RELATION_BATCH_RENEWING,
+    WL_COLUMNAR_RELATION_BATCH_DRAINING,
+    WL_COLUMNAR_RELATION_BATCH_ENDED
+} wl_columnar_relation_batch_phase_t;
+
+typedef struct wl_columnar_relation_append_batch {
+    struct wl_columnar_relation_append_batch *identity;
+    col_rel_append_batch_t raw;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_relation_batch_phase_t phase;
+    bool raw_mode;
+    bool result_saved;
+    int saved_result;
+} wl_columnar_relation_append_batch_t;
+
+int wl_columnar_relation_append_batch_begin_controlled(
+    wl_columnar_relation_append_batch_t *batch, col_rel_t *r,
+    wl_evaluation_control_t *control);
+int wl_columnar_relation_append_batch_row_controlled(
+    wl_columnar_relation_append_batch_t *batch, const int64_t *row);
+int wl_columnar_relation_append_batch_set_controlled(
+    wl_columnar_relation_append_batch_t *batch, uint32_t row, uint32_t col,
+    int64_t value);
+int wl_columnar_relation_append_batch_end_controlled(
+    wl_columnar_relation_append_batch_t *batch, int result);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_batch_renewed)(
+    wl_columnar_relation_append_batch_t *batch);
+#endif
+
 /* Append a complete input batch under one relation writer.  All row/type
  * validation and governor admission complete before the first row publishes.
  * On ENOMEM, *@denied distinguishes governor refusal from allocator failure. */

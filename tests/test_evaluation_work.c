@@ -3956,6 +3956,691 @@ test_row_stops(void)
     }
 }
 
+/* B2: actual held row/set/end and storage renewal, independent raw twins. */
+static void
+test_controlled_batch_twins(void)
+{
+    const uint32_t widths[] = {0, 1, 16, 17};
+    int64_t values[17];
+    for (unsigned k = 0; k < 17; ++k) values[k] = 900 + k;
+    for (unsigned mode = 0; mode < 2; ++mode)
+        for (unsigned w = 0; w < 4; ++w)
+            for (unsigned ts = 0; ts < 2; ++ts) {
+                col_rel_t *r = relation(widths[w], 2, 1, ts != 0, NULL);
+                col_rel_t *raw = relation(widths[w], 2, 1, ts != 0, NULL);
+                wl_mem_ledger_t a, b;
+                row_attach_ledger(r, &a); row_attach_ledger(raw, &b);
+                wl_evaluation_control_t *c = control(0);
+                wl_columnar_relation_append_batch_t batch = {0};
+                col_rel_append_batch_t ref = {0};
+                CHECK(wl_columnar_relation_append_batch_begin_controlled(
+                        &batch, r, mode ? NULL : c) == 0);
+                CHECK(col_rel_append_batch_begin(&ref, raw) == 0);
+                uintptr_t original = (uintptr_t)&batch.raw.single;
+                uint64_t nonce = batch.raw.single.set.acquisition_nonce;
+                unsigned renewals = 0;
+                for (unsigned i = 0; i < 20; ++i) {
+                    CHECK(wl_columnar_relation_append_batch_row_controlled(
+                            &batch, values) == 0);
+                    CHECK(col_rel_append_batch_row(&ref, values) == 0);
+                    CHECK((uintptr_t)&batch.raw.single == original);
+                    if (batch.raw.single.set.acquisition_nonce != nonce) {
+                        ++renewals;
+                        nonce = batch.raw.single.set.acquisition_nonce;
+                    }
+                    if (widths[w]) {
+                        CHECK(wl_columnar_relation_append_batch_set_controlled(
+                                &batch, r->nrows - 1, 0, (int64_t)i) == 0);
+                        CHECK(col_rel_append_batch_set(&ref,
+                            raw->nrows - 1, 0, (int64_t)i) == 0);
+                    }
+                    CHECK(r->nrows == raw->nrows &&
+                        r->capacity == raw->capacity);
+                    CHECK(r->view_generation == raw->view_generation);
+                    CHECK(r->storage_generation == raw->storage_generation);
+                    payload_equal(r, raw, 0);
+                    row_ledger_equal(&a, &b);
+                }
+                CHECK(renewals >= 3);
+                CHECK(wl_columnar_relation_append_batch_end_controlled(
+                        &batch, WL_EVALUATION_CONTROL_CANCELLED)
+                    == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(col_rel_append_batch_end(&ref, true) == 0);
+                row_twins_equal(r, raw);
+                CHECK(wl_columnar_relation_append_batch_end_controlled(
+                        &batch, EIO) == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(wl_columnar_relation_append_batch_row_controlled(
+                        &batch, values) == EINVAL);
+                CHECK(wl_columnar_relation_append_batch_begin_controlled(
+                        &batch, r, c) == EINVAL);
+                uint64_t used = finish(c, 0);
+                CHECK(mode ? used == 0 : used > 0); /* Exact source oracles are separately literal. */
+                release(c); destroy(r); destroy(raw);
+                CHECK(atomic_load_explicit(&a.current_bytes,
+                    memory_order_relaxed) == 37);
+                row_ledger_equal(&a, &b);
+            }
+}
+
+static col_rel_t *batch_gap_candidate;
+static unsigned batch_gap_calls;
+static uintptr_t batch_gap_old_columns, batch_gap_old_scratch;
+static void
+batch_replace_in_gap(wl_columnar_relation_append_batch_t *batch)
+{
+    col_rel_t *r = batch->raw.relation;
+    CHECK(batch->raw.single.set.identity == 0);
+    CHECK(atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed) == 0);
+    CHECK(atomic_load_explicit(&r->source_access.state,
+        memory_order_relaxed) == 0);
+    if (r->ncols > 16)
+        CHECK(!wl_columnar_memory_governor_ref_is_sole(r->memory_governor));
+    col_rel_replacement_t replacement = {0};
+    CHECK(col_rel_prepare_replacement(r, batch_gap_candidate,
+        &replacement) == 0);
+    col_rel_commit_replacement_locked(r, &replacement);
+    col_rel_discard_replacement(&replacement);
+    CHECK((uintptr_t)r->columns != batch_gap_old_columns);
+    CHECK(!batch_gap_old_scratch
+        || (uintptr_t)r->row_scratch != batch_gap_old_scratch);
+    ++batch_gap_calls;
+}
+
+static void
+test_controlled_batch_gap_capture(void)
+{
+    for (unsigned wide = 0; wide < 2; ++wide)
+        for (unsigned shape = 0; shape < 3; ++shape) {
+            uint32_t width = wide ? 17 : 1;
+            col_rel_t *r = relation(width, 2, 2, true, NULL);
+            int64_t values[17], expected[17];
+            for (unsigned k = 0; k < 17; ++k) values[k] = 300 + k;
+            if (wide) CHECK(col_rel_row(r, 0) != NULL);
+            wl_mem_ledger_t ledger; row_attach_ledger(r, &ledger);
+            wl_evaluation_control_t *c = control(0);
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(wl_columnar_relation_append_batch_begin_controlled(
+                    &batch, r, c) == 0);
+            CHECK(wl_columnar_relation_append_batch_row_controlled(
+                    &batch, values) == 0);
+            CHECK(wl_columnar_relation_append_batch_row_controlled(
+                    &batch, values) == 0);
+            CHECK(r->nrows == r->capacity);
+            const int64_t *input = wide ? r->row_scratch : r->columns[0];
+            for (uint32_t k = 0; k < width; ++k) expected[k] = input[k];
+            uint32_t new_width = shape == 0 ? width
+                : shape == 1 ? width + 1 : width - 1;
+            batch_gap_candidate = relation(new_width, 8, 1, true, NULL);
+            batch_gap_old_columns = (uintptr_t)r->columns;
+            batch_gap_old_scratch = (uintptr_t)r->row_scratch;
+            batch_gap_calls = 0;
+            wl_columnar_relation_test_batch_renewed = batch_replace_in_gap;
+            CHECK(wl_columnar_relation_append_batch_row_controlled(
+                    &batch, input) == (shape ? ENOTSUP : 0));
+            wl_columnar_relation_test_batch_renewed = NULL;
+            CHECK(batch_gap_calls == 1);
+            CHECK(wl_columnar_memory_governor_ref_is_sole(r->memory_governor));
+            CHECK(r->ncols == new_width && r->nrows == (shape ? 1u : 2u));
+            if (!shape)
+                for (uint32_t k = 0; k < width; ++k)
+                    CHECK(r->columns[k][1] == expected[k]);
+            CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+                shape ? ENOTSUP : 0) == (shape ? ENOTSUP : 0));
+            CHECK(finish(c, shape ? ENOTSUP : 0) > 0);
+            release(c); destroy(batch_gap_candidate);
+            batch_gap_candidate = NULL;
+            destroy(r);
+            CHECK(atomic_load_explicit(&ledger.current_bytes,
+                memory_order_relaxed) == 37);
+        }
+}
+
+static void
+test_controlled_batch_end_authority(void)
+{
+    col_rel_t *r = relation(1, 2, 1, false, NULL);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+        c) == 0);
+    wl_columnar_relation_append_batch_t copy = batch;
+    int64_t value = 55;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&copy,
+        &value) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_set_controlled(&copy, 0, 0,
+        6) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&copy,
+        EIO) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        &value) == 0);
+    CHECK(finish(c, 0) > 0); retry(c, 0);
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        &value) == EINVAL);
+    single_fail_slot = 0;
+    wl_columnar_relation_test_single_release = single_release_failure;
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+        WL_EVALUATION_CONTROL_CANCELLED) == EIO);
+    CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_DRAINING);
+    CHECK(batch.raw.single.set.descriptors_acquired == 1);
+    CHECK(batch.raw.single.set.owners_acquired == 0);
+    wl_columnar_relation_test_single_release = NULL;
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, EINVAL)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(finish(c, 0) == 0); release(c); released(r); destroy(r);
+}
+
+static void
+batch_gap_fault(wl_columnar_relation_append_batch_t *batch)
+{
+    CHECK(batch->raw.single.set.identity == 0);
+    CHECK(atomic_load_explicit(&batch->raw.relation->descriptor_access.state,
+        memory_order_relaxed) == 0);
+    CHECK(atomic_load_explicit(&batch->raw.relation->source_access.state,
+        memory_order_relaxed) == 0);
+    row_inject(batch->control);
+}
+
+static col_rel_t *
+batch_at_second_growth(wl_columnar_relation_append_batch_t *batch,
+    wl_evaluation_control_t *c, const int64_t *values, wl_mem_ledger_t *ledger)
+{
+    col_rel_t *r = relation(17, 2, 2, true, NULL);
+    row_attach_ledger(r, ledger);
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(batch, r, c) == 0);
+    CHECK(wl_columnar_relation_append_batch_row_controlled(batch, values) == 0);
+    CHECK(wl_columnar_relation_append_batch_row_controlled(batch, values) == 0);
+    CHECK(r->nrows == 4 && r->capacity == 4);
+    CHECK(batch->raw.single.lease.storage_transitioned);
+    return r;
+}
+
+static void
+test_controlled_batch_seams(void)
+{
+    int64_t values[17];
+    for (unsigned k = 0; k < 17; ++k) values[k] = 500 + k;
+    wl_mem_ledger_t ledger;
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    col_rel_t *r = batch_at_second_growth(&batch, c, values, &ledger);
+    row_hooks(0, 0);
+    wl_columnar_relation_test_batch_renewed = batch_gap_fault;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        values) == 0);
+    unsigned seams = row_seams;
+    CHECK(seams > 60);
+    row_hooks_clear(); wl_columnar_relation_test_batch_renewed = NULL;
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, 0) == 0);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    for (unsigned kind = 1; kind <= 3; ++kind)
+        for (unsigned seam = 1; seam <= seams; ++seam) {
+            c = control(0); batch = (wl_columnar_relation_append_batch_t){0};
+            r = batch_at_second_growth(&batch, c, values, &ledger);
+            growth_snapshot_t before = snapshot(r);
+            uint64_t ledger_before = atomic_load_explicit(&ledger.current_bytes,
+                    memory_order_relaxed);
+            int64_t old_values[17][4];
+            col_delta_timestamp_t old_ts[4];
+            for (unsigned k = 0; k < 17; ++k)
+                memcpy(old_values[k], r->columns[k], sizeof(old_values[k]));
+            memcpy(old_ts, r->timestamps, sizeof(old_ts));
+            row_hooks(seam, kind);
+            wl_columnar_relation_test_batch_renewed = batch_gap_fault;
+            int expected = kind == 1 ? WL_EVALUATION_CONTROL_CANCELLED
+                : kind == 2 ? EOVERFLOW : EINVAL;
+            CHECK(wl_columnar_relation_append_batch_row_controlled(
+                    &batch, values) == expected);
+            CHECK(row_seams >= seam &&
+                row_seams <= seam + (kind == 3 ? 0u : 2u));
+            row_hooks_clear(); wl_columnar_relation_test_batch_renewed = NULL;
+            growth_snapshot_t after = snapshot(r);
+            CHECK(after.columns == before.columns &&
+                after.timestamps == before.timestamps);
+            CHECK(after.capacity == before.capacity &&
+                after.rows == before.rows);
+            CHECK(after.view == before.view && after.storage == before.storage);
+            CHECK(after.reserved == before.reserved &&
+                after.credit == before.credit);
+            CHECK(after.token_identity == before.token_identity
+                && after.token_owner == before.token_owner
+                && after.token_state == before.token_state
+                && after.token_bytes == before.token_bytes
+                && after.replacement == before.replacement);
+            for (unsigned k = 0; k < 17; ++k)
+                CHECK(memcmp(old_values[k], r->columns[k],
+                    sizeof(old_values[k])) == 0);
+            CHECK(memcmp(old_ts, r->timestamps, sizeof(old_ts)) == 0);
+            CHECK(atomic_load_explicit(&ledger.current_bytes,
+                memory_order_relaxed) == ledger_before);
+            CHECK(wl_columnar_relation_append_batch_end_controlled(
+                    &batch, expected) == expected);
+            released(r);
+            uint64_t used = finish(c, kind == 3 ? 0 : expected);
+            CHECK(kind == 3 ? used == 0 : used > 0);
+            release(c); destroy(r);
+            CHECK(atomic_load_explicit(&ledger.current_bytes,
+                memory_order_relaxed) == 37);
+        }
+}
+
+static wl_evaluation_control_t *batch_release_control;
+static unsigned batch_release_restart_calls;
+static int
+batch_release_restart(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    (void)single;
+    ++batch_release_restart_calls;
+    if (slot == 1) {
+        CHECK(finish(batch_release_control, 0) > 0);
+        retry(batch_release_control, 0);
+    }
+    return 0;
+}
+
+static void *
+batch_wrong_thread(void *arg)
+{
+    wl_columnar_relation_append_batch_t *batch = arg;
+    int64_t value = 123;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(batch,
+        &value) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_set_controlled(batch, 0, 0,
+        value) == EINVAL);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(batch,
+        EIO) == EINVAL);
+    return NULL;
+}
+
+static void
+test_controlled_batch_renew_authority(void)
+{
+    int64_t values[17];
+    for (unsigned k = 0; k < 17; ++k) values[k] = 600 + k;
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        wl_mem_ledger_t ledger;
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_append_batch_t batch = {0};
+        col_rel_t *r = batch_at_second_growth(&batch, c, values, &ledger);
+        uint64_t nonce = batch.raw.single.set.acquisition_nonce;
+        uint64_t reserved = snapshot(r).reserved;
+        single_fail_slot = slot;
+        wl_columnar_relation_test_single_release = single_release_failure;
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            values) == EIO);
+        CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_DRAINING);
+        CHECK(batch.raw.single.set.acquisition_nonce == nonce);
+        CHECK(batch.raw.single.set.descriptors_acquired == 1);
+        CHECK(batch.raw.single.set.owners_acquired == slot);
+        CHECK(snapshot(r).reserved == reserved);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            WL_EVALUATION_CONTROL_CANCELLED) == EIO);
+        wl_columnar_relation_test_single_release = NULL;
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, ENOTSUP)
+            == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(r->nrows == 4 && r->capacity == 4);
+        CHECK(finish(c, 0) > 0); release(c); released(r); destroy(r);
+        CHECK(atomic_load_explicit(&ledger.current_bytes,
+            memory_order_relaxed) == 37);
+    }
+    wl_mem_ledger_t ledger;
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    col_rel_t *r = batch_at_second_growth(&batch, c, values, &ledger);
+    uint64_t nonce = batch.raw.single.set.acquisition_nonce;
+    uint64_t next = wl_columnar_relation_test_single_nonce_replace(900000);
+    batch_release_control = c; batch_release_restart_calls = 0;
+    wl_columnar_relation_test_single_release = batch_release_restart;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        values) == EINVAL);
+    wl_columnar_relation_test_single_release = NULL;
+    CHECK(batch_release_restart_calls == 2);
+    CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_ENDED);
+    CHECK(batch.raw.single.set.acquisition_nonce == 0);
+    CHECK(nonce != 0);
+    CHECK(wl_columnar_relation_test_single_nonce_replace(next) == 900000);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+        EINVAL) == EINVAL);
+    CHECK(finish(c, 0) == 0); release(c); released(r); destroy(r);
+    batch_release_control = NULL;
+
+    c = control(0); batch = (wl_columnar_relation_append_batch_t){0};
+    r = relation(1, 2, 1, false, NULL);
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+        c) == 0);
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, batch_wrong_thread, &batch) == 0);
+    CHECK(wl_thread_join(&thread) == 0);
+    CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_HELD);
+    CHECK(!batch.result_saved);
+    CHECK(batch.raw.single.set.descriptors_acquired == 1);
+    CHECK(batch.raw.single.set.owners_acquired == 1);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, 0) == 0);
+    CHECK(finish(c, 0) > 0); release(c); released(r); destroy(r);
+}
+
+static void
+test_controlled_batch_new_types(void)
+{
+    for (unsigned old_float = 0; old_float < 2; ++old_float)
+        for (unsigned invalid = 0; invalid < 2; ++invalid) {
+            col_rel_t *r = relation(1, 2, 2, false, NULL);
+            wirelog_column_type_t int_type = WIRELOG_TYPE_INT64;
+            CHECK(col_rel_set_column_types(r, &int_type, 1) == 0);
+            wirelog_column_type_t old_type = old_float
+                ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+            CHECK(col_rel_set_column_types(r, &old_type, 1) == 0);
+            batch_gap_candidate = relation(1, 8, 1, false, NULL);
+            CHECK(col_rel_set_column_types(batch_gap_candidate, &int_type,
+                1) == 0);
+            wirelog_column_type_t new_type = old_float
+                ? WIRELOG_TYPE_INT64 : WIRELOG_TYPE_FLOAT;
+            CHECK(col_rel_set_column_types(batch_gap_candidate, &new_type,
+                1) == 0);
+            wl_evaluation_control_t *c = control(0);
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+                c) == 0);
+            int64_t ordinary = 0;
+            CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+                &ordinary) == 0);
+            CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+                &ordinary) == 0);
+            uint64_t bits = invalid ? UINT64_C(0x7ff8000000000001)
+                : UINT64_C(0x8000000000000000);
+            int64_t input; memcpy(&input, &bits, sizeof(input));
+            batch_gap_old_columns = (uintptr_t)r->columns;
+            batch_gap_old_scratch = (uintptr_t)r->row_scratch;
+            batch_gap_calls = 0;
+            wl_columnar_relation_test_batch_renewed = batch_replace_in_gap;
+            int expected = !old_float && invalid ? EINVAL : 0;
+            CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+                &input) == expected);
+            wl_columnar_relation_test_batch_renewed = NULL;
+            CHECK(batch_gap_calls == 1 && r->column_types[0] == new_type);
+            CHECK(r->nrows == (expected ? 1u : 2u));
+            if (!expected) CHECK(r->columns[0][1] == (old_float ? input : 0));
+            CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+                expected) == expected);
+            CHECK(finish(c, expected) > 0); release(c);
+            destroy(batch_gap_candidate); batch_gap_candidate = NULL;
+            destroy(r);
+        }
+}
+
+static void
+test_controlled_batch_resources(void)
+{
+    int64_t values[17];
+    for (unsigned k = 0; k < 17; ++k) values[k] = 700 + k;
+    for (unsigned allocation = 1; allocation <= 20; ++allocation) {
+        col_rel_t *r = relation(17, 2, 2, true, NULL);
+        growth_snapshot_t before = snapshot(r);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_append_batch_t batch = {0};
+        CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+            c) == 0);
+        wl_columnar_relation_test_growth_fail_allocation = allocation;
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            values) == ENOMEM);
+        CHECK(wl_columnar_relation_test_growth_fail_allocation == 0);
+        CHECK(!r->memory_budget_denial_pending);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            ENOMEM) == ENOMEM);
+        unchanged(r, before); released(r);
+        CHECK(finish(c, ENOMEM) > 0); release(c); destroy(r);
+    }
+    for (unsigned wide = 0; wide < 2; ++wide) {
+        col_rel_t *r = relation(wide ? 17 : 1, 2, 2, false, NULL);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(r->memory_governor);
+        growth_snapshot_t before = snapshot(r);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_append_batch_t batch = {0};
+        CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+            c) == 0);
+        atomic_store_explicit(&g->usable_bytes, before.reserved,
+            memory_order_relaxed);
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            values) == ENOMEM);
+        CHECK(r->memory_budget_denial_pending);
+        atomic_store_explicit(&g->usable_bytes, WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            memory_order_relaxed);
+        wl_columnar_relation_test_growth_fail_allocation = 1;
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            values) == ENOMEM);
+        CHECK(!r->memory_budget_denial_pending);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            ENOMEM) == ENOMEM);
+        unchanged(r, before); released(r);
+        CHECK(finish(c, ENOMEM) > 0); release(c); destroy(r);
+    }
+    col_rel_t *r = relation(17, 2, 2, true, NULL);
+    col_rel_t *peer = relation(1, 3, 1, false, r->memory_governor);
+    CHECK(col_rel_reserve_merge_grid(r, 3) == 0);
+    int64_t **merge = r->merge_columns;
+    merge[0][0] = 991;
+    int64_t *scratch = r->row_scratch;
+    growth_snapshot_t before = snapshot(r);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+        c) == 0);
+    growth_watch = r; growth_peak = 0;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        values) == 0);
+    uint64_t incoming = 17 * (4 * sizeof(int64_t) + sizeof(int64_t *))
+        + 4 * sizeof(col_delta_timestamp_t);
+    uint64_t old_image = 17 * (2 * sizeof(int64_t) + sizeof(int64_t *))
+        + 2 * sizeof(col_delta_timestamp_t);
+    CHECK(growth_peak == before.reserved + incoming + 17 * sizeof(int64_t));
+    CHECK(snapshot(r).reserved == before.reserved + incoming - old_image);
+    CHECK(r->retained_reserved_bytes == before.credit + incoming - old_image);
+    CHECK(r->merge_columns == merge && merge[0][0] == 991 &&
+        r->row_scratch == scratch);
+    growth_watch = NULL;
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, 0) == 0);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    CHECK(peer->columns[0][0] == 0); released(peer); destroy(peer);
+}
+
+static wl_columnar_memory_governor_ref_t *batch_gap_governor;
+static uint64_t batch_gap_attached_bytes;
+static void
+batch_attach_in_gap(wl_columnar_relation_append_batch_t *batch)
+{
+    col_rel_t *r = batch->raw.relation;
+    CHECK(!r->memory_governor && batch->raw.single.set.identity == 0);
+    CHECK(atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed) == 0);
+    CHECK(atomic_load_explicit(&r->source_access.state,
+        memory_order_relaxed) == 0);
+    CHECK(col_rel_attach_memory_governor(r, batch_gap_governor) == 0);
+    batch_gap_attached_bytes = snapshot(r).reserved;
+}
+
+static void
+test_controlled_batch_attach_policy(void)
+{
+    col_rel_t *r = col_rel_new_auto("batch_attach", 17);
+    CHECK(r && !r->memory_governor && r->capacity > 0);
+    r->nrows = r->capacity;
+    for (uint32_t k = 0; k < r->ncols; ++k)
+        for (uint32_t i = 0; i < r->nrows; ++i)
+            r->columns[k][i] = (int64_t)k * 1000 + i;
+    CHECK(col_rel_row(r, 0) != NULL);
+    int64_t expected[17];
+    memcpy(expected, r->row_scratch, sizeof(expected));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+    };
+    batch_gap_governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(batch_gap_governor != NULL);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+        c) == 0);
+    uint32_t old_capacity = r->capacity;
+    for (uint32_t i = 0; i < old_capacity; ++i)
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            expected) == 0);
+    CHECK(r->nrows == r->capacity && r->capacity == old_capacity * 2u);
+    uint64_t old_image = 17 *
+        ((uint64_t)r->capacity * sizeof(int64_t) + sizeof(int64_t *));
+    uint64_t incoming = 17 *
+        ((uint64_t)r->capacity * 2u * sizeof(int64_t) + sizeof(int64_t *));
+    wl_columnar_relation_test_batch_renewed = batch_attach_in_gap;
+    growth_watch = r; growth_peak = 0;
+    CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+        r->row_scratch) == 0);
+    wl_columnar_relation_test_batch_renewed = NULL; growth_watch = NULL;
+    CHECK(batch_gap_attached_bytes > 0);
+    /* Capture was ungoverned: no retroactive external S charge after attach. */
+    CHECK(growth_peak == batch_gap_attached_bytes + incoming);
+    CHECK(snapshot(r).reserved ==
+        batch_gap_attached_bytes + incoming - old_image);
+    for (uint32_t k = 0; k < 17; ++k)
+        CHECK(r->columns[k][r->nrows - 1] == expected[k]);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, 0) == 0);
+    CHECK(finish(c, 0) > 0); release(c); destroy(r);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(batch_gap_governor);
+    CHECK(atomic_load_explicit(&g->reserved_bytes, memory_order_relaxed) == 0);
+    wl_columnar_memory_governor_ref_release(batch_gap_governor);
+    batch_gap_governor = NULL;
+}
+
+/* Independent literal tariffs from the accepted source inventory; no observed
+ * whole-call cost is reused to construct these exact/minus-one thresholds. */
+static void
+test_controlled_batch_literal_boundaries(void)
+{
+    static const uint64_t begin_regions[] = {170, 94, 19, 39, 39, 45, 52, 45,
+                                             21, 144};
+    static const uint64_t row_regions[] = {220, 80, 36, 63, 103, 36, 36, 36,
+                                           48};
+    static const uint64_t set_regions[] = {220, 70};
+    static const uint64_t renew_regions[] = {
+        220, 80, 36, 128,
+        94, 19, 39, 39, 45, 52, 45, 21, 144, 220,
+        63, 103, 36, 36, 83, 83, 83, 83, 83, 76,
+        74, 54, 84, 29, 32, 32, 183, 183, 36, 69, 151, 26, 228, 48
+    };
+    const uint64_t *lists[] = {begin_regions, row_regions, set_regions,
+                               renew_regions};
+    const size_t lengths[] = {
+        sizeof(begin_regions) / sizeof(begin_regions[0]),
+        sizeof(row_regions) / sizeof(row_regions[0]),
+        sizeof(set_regions) / sizeof(set_regions[0]),
+        sizeof(renew_regions) / sizeof(renew_regions[0])
+    };
+    const uint64_t setup[] = {0, 668, 668, 3437};
+    for (unsigned operation = 0; operation < 4; ++operation) {
+        uint64_t prefix = 0;
+        for (size_t region = 0; region < lengths[operation]; ++region) {
+            uint64_t previous = prefix;
+            prefix += lists[operation][region];
+            for (unsigned exact = 0; exact < 2; ++exact) {
+                col_rel_t *r = relation(1, operation == 3 ? 2 : 4,
+                        operation == 3 ? 2 : 1, false, NULL);
+                wl_evaluation_control_t *c = control(setup[operation] + prefix -
+                        (exact ? 0 : 1));
+                wl_columnar_relation_append_batch_t batch = {0};
+                int64_t value = 71;
+                if (operation) {
+                    CHECK(wl_columnar_relation_append_batch_begin_controlled(
+                            &batch, r, c) == 0);
+                    if (operation == 3) {
+                        CHECK(wl_columnar_relation_append_batch_row_controlled(
+                                &batch, &value) == 0);
+                        CHECK(wl_columnar_relation_append_batch_row_controlled(
+                                &batch, &value) == 0);
+                        CHECK(r->nrows == 4 && r->capacity == 4);
+                    }
+                }
+                uint32_t rows = r->nrows, capacity = r->capacity;
+                uint64_t view = r->view_generation,
+                    storage = r->storage_generation;
+                int64_t first = r->columns[0][0];
+                uint64_t reserved = snapshot(r).reserved;
+                int expected = exact && region + 1 == lengths[operation]
+                    ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+                int rc = operation == 0
+                    ? wl_columnar_relation_append_batch_begin_controlled(&batch,
+                        r, c)
+                    : operation == 2
+                        ? wl_columnar_relation_append_batch_set_controlled(
+                    &batch, 0, 0, value)
+                        : wl_columnar_relation_append_batch_row_controlled(
+                    &batch, &value);
+                CHECK(rc == expected);
+                if (expected) {
+                    CHECK(r->nrows == rows && r->capacity == capacity);
+                    CHECK(r->view_generation == view &&
+                        r->storage_generation == storage);
+                    CHECK(r->columns[0][0] == first &&
+                        snapshot(r).reserved == reserved);
+                }
+                if (batch.identity) {
+                    int first_result = expected;
+                    CHECK(wl_columnar_relation_append_batch_end_controlled(
+                            &batch, first_result) == first_result);
+                    CHECK(wl_columnar_relation_append_batch_end_controlled(
+                            &batch, EIO) == first_result);
+                } else CHECK(operation == 0 && !batch.raw.single.set.identity);
+                CHECK(finish(c,
+                    expected) ==
+                    setup[operation] + (exact ? prefix : previous));
+                release(c); released(r); destroy(r);
+            }
+        }
+    }
+}
+
+static wl_columnar_source_access_reader_t batch_gap_reader;
+static void
+batch_busy_in_gap(wl_columnar_relation_append_batch_t *batch)
+{
+    col_rel_t *r = batch->raw.relation;
+    CHECK(batch->raw.single.set.identity == 0);
+    CHECK(wl_columnar_source_access_reader_acquire(&r->source_access,
+        &batch_gap_reader) == 0);
+}
+
+static void
+test_controlled_batch_ended_result(void)
+{
+    const int results[] = {0, WL_EVALUATION_CONTROL_CANCELLED, EIO};
+    for (unsigned k = 0; k < 3; ++k) {
+        col_rel_t *r = relation(1, 2, 2, false, NULL);
+        wl_evaluation_control_t *c = control(0);
+        wl_columnar_relation_append_batch_t batch = {0};
+        CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+            c) == 0);
+        int64_t value = 73;
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            &value) == 0);
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            &value) == 0);
+        wl_columnar_relation_test_batch_renewed = batch_busy_in_gap;
+        CHECK(wl_columnar_relation_append_batch_row_controlled(&batch,
+            &value) == EBUSY);
+        wl_columnar_relation_test_batch_renewed = NULL;
+        CHECK(wl_columnar_source_access_reader_release(&batch_gap_reader) == 0);
+        CHECK(batch.phase == WL_COLUMNAR_RELATION_BATCH_ENDED);
+        CHECK(!batch.result_saved && !batch.raw.single.set.identity);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            results[k]) == results[k]);
+        CHECK(batch.result_saved && batch.saved_result == results[k]);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            ENOTSUP) == results[k]);
+        CHECK(finish(c, EBUSY) > 0); release(c); released(r); destroy(r);
+    }
+}
+
 static void
 test_row_resources(void)
 {
@@ -4221,13 +4906,13 @@ static void
 test_row_region_boundaries(void)
 {
     static const uint64_t regions[] = {
-        80, 56,
+        83, 63,
         94, 19, 39, 39, 45, 52, 45, 21, 144,
-        96, 31, 31,
-        81, 81, 81, 81, 81, 74,
+        103, 36, 36,
+        83, 83, 83, 83, 83, 76,
         74, 54, 84, 29,
-        30, 30, 181, 31,
-        66, 149, 24, 228, 46
+        32, 32, 183, 36,
+        69, 151, 26, 228, 48
     };
     uint64_t prefix = 0;
     const size_t count = sizeof(regions) / sizeof(regions[0]);
@@ -4359,6 +5044,16 @@ main(void)
     test_row_stops();
     test_row_denial_precedence();
     test_row_resources();
+    test_controlled_batch_twins();
+    test_controlled_batch_gap_capture();
+    test_controlled_batch_end_authority();
+    test_controlled_batch_seams();
+    test_controlled_batch_renew_authority();
+    test_controlled_batch_new_types();
+    test_controlled_batch_resources();
+    test_controlled_batch_attach_policy();
+    test_controlled_batch_literal_boundaries();
+    test_controlled_batch_ended_result();
     test_row_alias_and_nullary();
     test_attempt_single_boundaries();
     test_attempt_single_seams();
