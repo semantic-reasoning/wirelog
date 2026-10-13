@@ -508,6 +508,12 @@ Reader and writer tokens are caller-owned and address-bound; ordinary operation 
 are thread-confined, while session-owned source leases are transferable across serialized teardown.
 Relation readers pin the descriptor before resolving and pinning the canonical owner.
 Release drops the owner first, then the optional descriptor pin.
+Controlled scalar schema cloning uses two separate original reader tokens,
+each with no secondary gate. It drains the owner token and then the descriptor
+token before publishing its owned result. Unexpected mandatory release failure
+aborts while the original token remains reachable; it never returns with lost
+stack authority. Name/type reads finish while both pins are held. Source pools
+and arenas remain caller-owned and cannot be reset or reclaimed during the call.
 The prepared cohort exchange first changes the source gate from the exact
 transferable-reader count to WRITER, then changes each descriptor gate from
 its exact cohort count to WRITER. Its release-order rollback and restore keep

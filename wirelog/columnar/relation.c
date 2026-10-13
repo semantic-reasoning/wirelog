@@ -6163,6 +6163,7 @@ void (*wl_columnar_relation_test_before_identity_cas)(
 void (*wl_columnar_relation_test_constructor_committed)(
     wl_evaluation_control_t *, unsigned);
 void (*wl_columnar_relation_test_constructor_retired)(void);
+void (*wl_columnar_relation_test_new_like_before_release)(const col_rel_t *);
 #endif
 
 /* Observe cancellation after each real bounded region, including its tail. */
@@ -9120,6 +9121,7 @@ typedef struct {
     int64_t **columns;
     int64_t *scratch;
     char **names;
+    wirelog_column_type_t *types;
     col_delta_timestamp_t *timestamps;
     uint32_t columns_owned;
     uint32_t names_owned;
@@ -9129,6 +9131,18 @@ typedef struct {
     bool committed[3];
     wl_columnar_memory_reservation_t tokens[3];
 } wl_columnar_relation_constructor_t;
+
+/* Borrowed metadata stays pinned by the new-like wrapper through every read.
+ * No recipe pointer survives publication of the fully owned local output. */
+typedef struct {
+    const char *const *names;
+    const wirelog_column_type_t *types;
+    bool has_graph_column;
+    uint32_t graph_col_idx;
+    uint32_t declared_ncols;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+} wl_columnar_relation_constructor_recipe_t;
 
 /* Each byte copy/zero is an admitted region no larger than the quantum. */
 static int
@@ -9183,6 +9197,31 @@ wl_columnar_relation_constructor_column_name(uint32_t column, char *name,
     name[3u + used] = '\0';
     *length = 4u + used;
     return wl_columnar_relation_work_tail(control, 4u + used);
+}
+
+static int
+wl_columnar_relation_constructor_effective_name(
+    const wl_columnar_relation_constructor_recipe_t *recipe, uint32_t column,
+    char *generated, const char **name, uint64_t *length,
+    wl_evaluation_control_t *control)
+{
+    if (recipe) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc != 0)
+            return rc;
+        const char *selected = recipe->names ? recipe->names[column] : NULL;
+        rc = wl_columnar_relation_work_tail(control, 1);
+        if (rc != 0)
+            return rc;
+        if (selected) {
+            *name = selected;
+            return wl_columnar_relation_name_length_controlled(selected,
+                       length, control);
+        }
+    }
+    *name = generated;
+    return wl_columnar_relation_constructor_column_name(column, generated,
+               length, control);
 }
 
 /* The initial observation and every real counter CAS are admitted. Successful
@@ -9246,7 +9285,7 @@ wl_columnar_relation_constructor_reserve(
     wl_columnar_memory_reservation_t *token, bool *admitted,
     wl_evaluation_control_t *control)
 {
-    if (!bytes)
+    if (!governor || !bytes)
         return 0;
     wl_columnar_memory_admission_status_t status;
     int rc = wl_columnar_memory_governor_reserve_checked_controlled(
@@ -9273,6 +9312,7 @@ wl_columnar_relation_constructor_dispose(
     for (uint32_t c = 0; c < ctx->names_owned; c++)
         free(ctx->names[c]);
     free((void *)ctx->names);
+    free(ctx->types);
     free(ctx->timestamps);
     free(ctx->scratch);
     for (uint32_t c = 0; c < ctx->columns_owned; c++)
@@ -9296,24 +9336,22 @@ wl_columnar_relation_constructor_dispose(
         wl_columnar_memory_governor_ref_release(governor);
 }
 
-int
-wl_columnar_relation_new_auto_governed_controlled(const char *name,
+static int
+wl_columnar_relation_new_private_controlled(const char *name,
     uint32_t ncols, uint32_t initial_capacity, bool timestamps,
-    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_columnar_memory_governor_ref_t *governor,
+    const wl_columnar_relation_constructor_recipe_t *recipe, col_rel_t **out,
     wl_evaluation_control_t *control)
 {
     wl_columnar_relation_constructor_t ctx = { 0 };
     uint64_t name_length, descriptor_bytes, metadata_bytes = 3;
     uint64_t table_bytes, names_bytes, lane_bytes, scratch_bytes, ts_bytes;
-    uint64_t payload_bytes;
+    uint64_t payload_bytes, type_bytes = 0;
     char generated[14];
     int rc;
-    if (!control)
-        return wl_columnar_relation_new_auto_governed(name, ncols,
-                   initial_capacity, timestamps, governor, out);
     if (out)
         *out = NULL;
-    if (!name || !governor || !out)
+    if (!name || !out)
         return EINVAL;
     /* Fixed entry validation/context/checked arithmetic are scaffolding, not
      * variable traversals. Tokens are initialized before any admission. */
@@ -9340,19 +9378,26 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
         || scratch_bytes > SIZE_MAX || ts_bytes > SIZE_MAX
         || table_bytes > INT64_MAX)
         return EOVERFLOW;
+    if (recipe && recipe->types
+        && (!wl_columnar_memory_size_mul(ncols, sizeof(*ctx.types), &type_bytes)
+        || type_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(metadata_bytes, type_bytes,
+        &metadata_bytes)))
+        return EOVERFLOW;
     col_rel_payload_shape_t shape = {
         .ncols = ncols, .owned_columns = ncols,
         .column_capacity = initial_capacity,
         .timestamp_capacity = timestamps ? initial_capacity : 0,
-        .active_table = ncols != 0, .scratch = ncols != 0,
+        .active_table = ncols != 0, .scratch = governor && ncols != 0,
     };
     if (!col_rel_payload_shape_bytes(&shape, &payload_bytes))
         return EOVERFLOW;
     for (uint32_t c = 0; c < ncols; c++) {
         uint64_t length, fixed = sizeof(char *) + sizeof(struct ArrowSchema *)
             + sizeof(struct ArrowSchema) + 2u;
-        rc = wl_columnar_relation_constructor_column_name(c, generated,
-                &length, control);
+        const char *effective;
+        rc = wl_columnar_relation_constructor_effective_name(recipe, c,
+                generated, &effective, &length, control);
         if (rc != 0)
             return rc;
         rc = wl_evaluation_control_charge(control, 1);
@@ -9419,14 +9464,18 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
         goto done;
     /* Nine field/atomic stores: two generations, six owner/gate stores and
      * one governor reference retain RMW. Bookkeeping branches are excluded. */
-    rc = wl_evaluation_control_charge(control, 9);
+    uint64_t owner_work = governor ? 9u : 8u;
+    rc = wl_evaluation_control_charge(control, owner_work);
     if (rc != 0)
         goto done;
-    r->view_generation = 2u; r->storage_generation = 1u;
+    r->view_generation = recipe ? recipe->view_generation : 2u;
+    r->storage_generation = recipe ? recipe->storage_generation : 1u;
     col_rel_storage_owner_init(r);
-    wl_columnar_memory_governor_ref_retain(governor);
-    ctx.governor_retained = true;
-    rc = wl_columnar_relation_work_tail(control, 9);
+    if (governor) {
+        wl_columnar_memory_governor_ref_retain(governor);
+        ctx.governor_retained = true;
+    }
+    rc = wl_columnar_relation_work_tail(control, owner_work);
     if (rc != 0)
         goto done;
     for (unsigned i = 1; i < 3; i++) {
@@ -9468,8 +9517,9 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
             if (rc != 0)
                 goto done;
         }
-        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx.scratch, int64_t *,
-            scratch_bytes, false);
+        if (governor)
+            WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx.scratch, int64_t *,
+                scratch_bytes, false);
         WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx.names, char **, names_bytes,
             false);
         for (uint32_t c = 0; c < ncols;) {
@@ -9488,8 +9538,9 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
         }
         for (uint32_t c = 0; c < ncols; c++) {
             uint64_t length;
-            rc = wl_columnar_relation_constructor_column_name(c, generated,
-                    &length, control);
+            const char *effective;
+            rc = wl_columnar_relation_constructor_effective_name(recipe, c,
+                    generated, &effective, &length, control);
             if (rc != 0)
                 goto done;
             rc = wl_evaluation_control_charge(control, 1);
@@ -9505,9 +9556,20 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
             if (rc != 0)
                 goto done;
             rc = wl_columnar_relation_constructor_bytes(ctx.names[c],
-                    generated, length, control);
+                    effective, length, control);
             if (rc != 0)
                 goto done;
+        }
+    }
+    if (type_bytes) {
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(ctx.types,
+            wirelog_column_type_t *, type_bytes, false);
+        for (uint32_t c = 0; c < ncols; c++) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc != 0) goto done;
+            ctx.types[c] = recipe->types[c];
+            rc = wl_columnar_relation_work_tail(control, 1);
+            if (rc != 0) goto done;
         }
     }
     if (ts_bytes) {
@@ -9569,14 +9631,23 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
                 goto done;
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(child->format, const char *,
                 2, true);
+            const char *format = "l";
+            if (ctx.types) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc != 0) goto done;
+                format = ctx.types[c] == WIRELOG_TYPE_FLOAT ? "g" : "l";
+                rc = wl_columnar_relation_work_tail(control, 1);
+                if (rc != 0) goto done;
+            }
             rc = wl_columnar_relation_constructor_bytes((char *)child->format,
-                    "l", 2, control);
+                    format, 2, control);
             if (rc != 0)
                 goto done;
             /* Measured generated length uses bounded digits, not strlen. */
             uint64_t length;
-            rc = wl_columnar_relation_constructor_column_name(c, generated,
-                    &length, control);
+            const char *effective;
+            rc = wl_columnar_relation_constructor_effective_name(recipe, c,
+                    generated, &effective, &length, control);
             if (rc != 0)
                 goto done;
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC(child->name, const char *,
@@ -9618,16 +9689,17 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
         if (rc != 0)
             goto done;
     }
-    rc = wl_evaluation_control_charge(control, 14);
+    uint64_t install_work = recipe ? 18u : 14u;
+    rc = wl_evaluation_control_charge(control, install_work);
     if (rc != 0)
         goto done;
-    rc = wl_columnar_relation_work_tail(control, 14);
+    rc = wl_columnar_relation_work_tail(control, install_work);
     if (rc != 0)
         goto done;
-    if (!wl_columnar_memory_reservation_move(&r->descriptor_reservation,
-        &ctx.tokens[0])
-        || !wl_columnar_memory_reservation_move(&r->metadata_reservation,
-        &ctx.tokens[1])
+    if ((ctx.admitted[0] && !wl_columnar_memory_reservation_move(
+            &r->descriptor_reservation, &ctx.tokens[0]))
+        || (ctx.admitted[1] && !wl_columnar_memory_reservation_move(
+            &r->metadata_reservation, &ctx.tokens[1]))
         || (ctx.admitted[2] && !wl_columnar_memory_reservation_move(
             &r->retained_reservation, &ctx.tokens[2])))
         abort();
@@ -9636,15 +9708,38 @@ wl_columnar_relation_new_auto_governed_controlled(const char *name,
     r->col_names = ctx.names; r->timestamps = ctx.timestamps;
     r->timestamp_capacity = timestamps ? initial_capacity : 0;
     r->schema_ok = true; r->memory_governor = governor;
-    r->descriptor_reserved_bytes = descriptor_bytes;
-    r->metadata_reserved_bytes = metadata_bytes;
-    r->retained_reserved_bytes = payload_bytes;
+    r->descriptor_reserved_bytes = governor ? descriptor_bytes : 0;
+    r->metadata_reserved_bytes = governor ? metadata_bytes : 0;
+    r->retained_reserved_bytes = governor ? payload_bytes : 0;
+    if (recipe) {
+        r->column_types = ctx.types;
+        r->has_graph_column = recipe->has_graph_column;
+        r->graph_col_idx = recipe->graph_col_idx;
+        r->declared_ncols = recipe->declared_ncols;
+    }
     *out = r;
 #undef WL_COLUMNAR_RELATION_CONSTRUCTOR_ALLOC
     return 0;
 done:
     wl_columnar_relation_constructor_dispose(&ctx, governor);
     return rc;
+}
+
+int
+wl_columnar_relation_new_auto_governed_controlled(const char *name,
+    uint32_t ncols, uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_relation_new_auto_governed(name, ncols,
+                   initial_capacity, timestamps, governor, out);
+    if (out)
+        *out = NULL;
+    if (!name || !governor || !out)
+        return EINVAL;
+    return wl_columnar_relation_new_private_controlled(name, ncols,
+               initial_capacity, timestamps, governor, NULL, out, control);
 }
 
 /* Helper: create owned relation copying col_names from src.
@@ -9765,6 +9860,154 @@ wl_columnar_relation_new_like_governed_checked_mode(const char *name,
 {
     return wl_columnar_relation_new_like_checked_impl(out, name, src,
                governor, preserve_timestamps);
+}
+
+/* Separate original tokens have no secondary gate, so failed validation cannot
+ * follow a successful decrement of a different gate. Mandatory release failure
+ * is an invariant breach: never return with disappearing stack authority. */
+static void
+wl_columnar_relation_new_like_reader_drain(
+    wl_columnar_source_access_reader_t *token)
+{
+    if (token->owner && wl_columnar_source_access_reader_release(token) != 0)
+        abort();
+}
+
+int
+wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    bool preserve_timestamps, col_rel_t **out, wl_evaluation_control_t *control)
+{
+    wl_columnar_source_access_reader_t descriptor = { 0 }, reader = { 0 };
+    wl_columnar_relation_constructor_recipe_t recipe;
+    col_rel_t *storage_owner = NULL, *local = NULL;
+    uint32_t width = 0;
+    bool timestamps = false;
+    int rc, tail;
+    if (!control)
+        return wl_columnar_relation_new_like_governed_checked_mode(name, src,
+                   governor, preserve_timestamps, out);
+    if (out)
+        *out = NULL;
+    if (!out || !name || !src)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_relation_reader_acquire_controlled(
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access,
+        &descriptor, control);
+    if (rc != 0)
+        goto done;
+    /* J1: reject legacy lazy owners before invoking the direct resolver. */
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc != 0)
+        goto done;
+    bool initialized = src->storage_owner != NULL;
+    rc = wl_columnar_relation_work_tail(control, 1);
+    if (rc != 0)
+        goto done;
+    if (!initialized) {
+        rc = ENOTSUP; goto done;
+    }
+    rc = wl_columnar_relation_resolve_controlled(src, &storage_owner, control);
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_reader_acquire_controlled(
+        &storage_owner->source_access, &reader, control);
+    if (rc != 0)
+        goto done;
+    /* S40 fixed inventory (success <=38): map pairing3, enum1 (invalid3
+     * exits), enabled graph2, unsupported compound5, schema1, identities4,
+     * source generation predicates4, owner bindings3, snapshots9, TS/type
+     * decisions3 and result/dispatch3. No width walk or deep map validation.
+     * Alias own storage generation is independent of its saved owner epoch. */
+    rc = wl_evaluation_control_charge(control, 40);
+    if (rc != 0)
+        goto done;
+    if ((src->compound_arity_map == NULL) != (src->compound_arity_len == 0)
+        || (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        && src->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+        && src->compound_kind != WIRELOG_COMPOUND_KIND_SIDE)
+        || (src->has_graph_column && src->graph_col_idx >= src->ncols)) {
+        rc = EINVAL;
+        goto shape_done;
+    }
+    if (src->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || src->compound_count || src->compound_arity_map
+        || src->compound_arity_len || src->inline_physical_offset) {
+        rc = src->compound_kind ==
+            WIRELOG_COMPOUND_KIND_NONE ? EINVAL : ENOTSUP;
+        goto shape_done;
+    }
+    if (!src->schema_ok) {
+        rc = ENOTSUP;
+        goto shape_done;
+    }
+    if (!src->relation_identity || src->relation_identity == UINT64_MAX
+        || !storage_owner->relation_identity
+        || storage_owner->relation_identity == UINT64_MAX
+        || !wl_columnar_relation_generation_valid(src->view_generation)
+        || !wl_columnar_relation_generation_valid(src->storage_generation)
+        || storage_owner->storage_owner_generation
+        != storage_owner->storage_generation
+        || src->storage_owner_identity != storage_owner->relation_identity
+        || src->storage_owner_generation != storage_owner->storage_generation) {
+        rc = EINVAL;
+        goto shape_done;
+    }
+    {
+        width = src->ncols;
+        timestamps = preserve_timestamps && src->timestamps != NULL;
+        recipe.names = (const char *const *)src->col_names;
+        recipe.types = src->column_types;
+        recipe.has_graph_column = src->has_graph_column;
+        recipe.graph_col_idx = src->graph_col_idx;
+        recipe.declared_ncols = src->declared_ncols;
+        recipe.view_generation = 2u + (recipe.types != NULL);
+        recipe.storage_generation = 1u + timestamps;
+        rc = 0;
+    }
+shape_done:
+    tail = wl_columnar_relation_work_tail(control, 40);
+    if (tail > 0 || rc == 0)
+        rc = tail;
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_relation_new_private_controlled(name, width,
+            COL_REL_INIT_CAP, timestamps, governor, &recipe, &local, control);
+done:
+#ifdef WL_SESSION_TEST_HOOKS
+    if (reader.owner && wl_columnar_relation_test_new_like_before_release)
+        wl_columnar_relation_test_new_like_before_release(src);
+#endif
+    wl_columnar_relation_new_like_reader_drain(&reader);
+    wl_columnar_relation_new_like_reader_drain(&descriptor);
+    /* All borrowed recipe reads have finished. Only an owned local image is
+     * reachable; a stop at this final external store retires it completely. */
+    if (rc == 0) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc == 0)
+            rc = wl_columnar_relation_work_tail(control, 1);
+    }
+    if (rc == 0)
+        *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0)
+        abort();
+    return rc;
+}
+
+int
+wl_columnar_relation_new_like_governed_checked_controlled(col_rel_t **out,
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control)
+{
+    if (!control)
+        return wl_columnar_relation_new_like_governed_checked(out, name, src,
+                   governor);
+    return wl_columnar_relation_new_like_governed_checked_mode_controlled(name,
+               src, governor, true, out, control);
 }
 
 int

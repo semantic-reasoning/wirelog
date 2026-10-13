@@ -3185,6 +3185,8 @@ extern void (*wl_columnar_relation_test_before_identity_cas)(
 extern void (*wl_columnar_relation_test_constructor_committed)(
     wl_evaluation_control_t *, unsigned);
 extern void (*wl_columnar_relation_test_constructor_retired)(void);
+extern void (*wl_columnar_relation_test_new_like_before_release)(
+    const col_rel_t *);
 extern void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 extern void (*wl_columnar_relation_test_after_reader_cas)(
@@ -3280,6 +3282,32 @@ int
 wl_columnar_relation_new_like_governed_checked_mode(const char *name,
     const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
     bool preserve_timestamps, col_rel_t **out);
+/* Empty private scalar schema clone, with optional output governor (never
+ * inherited from src). NULL control delegates its exact raw counterpart.
+ * Initialized scalar owners, shared-view aliases and pool/arena metadata
+ * sources are admitted; compound metadata and lazy owners are unsupported.
+ * Caller keeps descriptors, metadata and name live/immutable through the call
+ * and does not reset a source pool. Original descriptor/owner reader tokens
+ * pin source reads, including all three measured name passes, then drain
+ * before the final output store. Unexpected mandatory release failure aborts.
+ * Source admission adds55 uncontended units, recipe selection3W, explicit
+ * names3N scans+2N copies (generated names retain constructor digit work),
+ * type allocation/copyW and format-selectionW when typed, recipe install18,
+ * and final external store1. No length cache; no credit is inherited/restored.
+ * Fixed entry bookkeeping, allocator internals and mandatory cleanup excluded.
+ * FLOAT selects Arrow g; other enum metadata retains the raw l representation.
+ * Names/types/graph/declared width and optional timestamp presence are copied;
+ * rows are empty, capacity is the raw default, timestamp values are zero. */
+int
+wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
+    const col_rel_t *src, wl_columnar_memory_governor_ref_t *governor,
+    bool preserve_timestamps, col_rel_t **out,
+    wl_evaluation_control_t *control);
+int
+wl_columnar_relation_new_like_governed_checked_controlled(col_rel_t **out,
+    const char *name, const col_rel_t *src,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control);
 /* Rows [@begin, @end) of @src as a new private relation named @name with
  * @src's schema and without delta timestamps, appended under one batch
  * lease per storage epoch (#2072).  Requires @begin <= @end <= @src->nrows.
