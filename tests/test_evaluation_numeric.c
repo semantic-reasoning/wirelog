@@ -1,5 +1,6 @@
 /* #1821: real numeric expression lifecycle, budgets and ownership. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/thread.h"
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -1235,6 +1236,434 @@ attempt_compile_lifecycle(void)
     wl_columnar_memory_governor_test_after_total_cas = NULL;
 }
 
+/* Real C1a owners, independent evaluator literals and borrowed-reader tests. */
+static uint64_t
+eval_attempt_cost(uint32_t executed, uint32_t reads)
+{
+    return UINT64_C(192) + UINT64_C(288) * executed
+           + UINT64_C(160) * reads;
+}
+
+static wl_columnar_expr_attempt_numeric_t *
+eval_attempt_prepare(const program_t *p, wl_columnar_memory_governor_ref_t *g)
+{
+    CHECK(!wl_columnar_expr_test_checkpoint);
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_expr_attempt_numeric_t *x = NULL;
+    bool supported = false;
+    CHECK(wl_columnar_expr_compile_attempt_controlled(p->bytes, p->size, g,
+        &x, &supported, c, wl_evaluation_control_active_attempt_id(c)) == 0);
+    CHECK(x && supported && finish(c, 0) == attempt_compile_cost(p, g != NULL));
+    return x;
+}
+
+static void
+eval_attempt_parity(const program_t *p, const int64_t *row, uint32_t ncols,
+    bool float_variable, uint32_t executed, uint32_t reads)
+{
+    uint8_t original[20000]; memcpy(original, p->bytes, p->size);
+    int64_t expected = 123;
+    wl_columnar_expr_compiled_t *raw =
+        wl_columnar_expr_compile(p->bytes, p->size, NULL);
+    int semantic;
+    if (float_variable) {
+        CHECK(!raw);
+        semantic = wl_columnar_expr_eval_run(p->bytes, p->size, row, ncols,
+                &expected, NULL);
+    } else {
+        CHECK(raw);
+        semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
+        wl_columnar_expr_compiled_free(raw);
+    }
+    if (semantic) expected = 0;
+    for (unsigned governed = 0; governed < 2; governed++) {
+        wl_columnar_memory_governor_ref_t *g =
+            governor(WL_COLUMNAR_MEMORY_MIN_BUDGET, false);
+        wl_columnar_memory_governor_t *gov =
+            wl_columnar_memory_governor_ref_get(g);
+        wl_columnar_expr_attempt_numeric_t *x =
+            eval_attempt_prepare(p, governed ? g : NULL);
+        uint64_t baseline = wl_columnar_memory_reserved(gov);
+        for (unsigned repeat = 0; repeat < 3; repeat++) {
+            uint64_t cost = eval_attempt_cost(executed, reads);
+            wl_evaluation_control_t *c = control(repeat == 0 ? cost - 1 :
+                    repeat == 1 ? cost : 0);
+            int64_t value = 98765; bool failed = !semantic;
+            int rc = wl_columnar_expr_eval_attempt_controlled(x, row, ncols,
+                    &value, &failed, c,
+                    wl_evaluation_control_active_attempt_id(c));
+            if (repeat == 0) {
+                CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+                CHECK(value == 98765 && failed == !semantic);
+                CHECK(finish(c, rc) == cost - 96);
+            } else {
+                CHECK(rc == 0 && value == expected &&
+                    failed == (semantic != 0));
+                CHECK(finish(c, 0) == cost);
+            }
+            CHECK(wl_columnar_memory_reserved(gov) == baseline);
+        }
+        CHECK(memcmp(original, p->bytes, p->size) == 0);
+        wl_columnar_expr_attempt_numeric_free(x);
+        CHECK(wl_columnar_memory_reserved(gov) == 0
+            && wl_columnar_memory_governor_ref_is_sole(g));
+        wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
+static void
+eval_attempt_semantics(void)
+{
+    static const uint8_t integers[] = {
+        WL_PLAN_EXPR_ARITH_ADD, WL_PLAN_EXPR_ARITH_SUB,
+        WL_PLAN_EXPR_ARITH_MUL, WL_PLAN_EXPR_ARITH_DIV,
+        WL_PLAN_EXPR_ARITH_MOD, WL_PLAN_EXPR_ARITH_SHL,
+        WL_PLAN_EXPR_ARITH_SHR, WL_PLAN_EXPR_ARITH_BAND,
+        WL_PLAN_EXPR_ARITH_BOR, WL_PLAN_EXPR_ARITH_BXOR,
+        WL_PLAN_EXPR_CMP_EQ, WL_PLAN_EXPR_CMP_NEQ,
+        WL_PLAN_EXPR_CMP_LT, WL_PLAN_EXPR_CMP_LTE,
+        WL_PLAN_EXPR_CMP_GT, WL_PLAN_EXPR_CMP_GTE,
+    };
+    static const int64_t pairs[][2] = {
+        {7, 2}, {-7, 2}, {0, 0}, {INT64_MIN, -1}, {INT64_MAX, 1},
+        {INT64_MIN, 1}, {INT64_MAX, 2}, {1, 64}, {1, -1}, {-1, 63}, {1, 0}
+    };
+    for (size_t i = 0; i < sizeof(integers); i++) {
+        for (size_t j = 0; j < sizeof(pairs)/sizeof(pairs[0]); j++) {
+            program_t p = {0};
+            constant(&p, WL_PLAN_EXPR_CONST_INT, pairs[j][0]);
+            constant(&p, WL_PLAN_EXPR_CONST_INT, pairs[j][1]);
+            op(&p, integers[i]);
+            eval_attempt_parity(&p, NULL, 0, false, 3, 0);
+        }
+        program_t underflow = {0}; op(&underflow, integers[i]);
+        eval_attempt_parity(&underflow, NULL, 0, false, 1, 0);
+    }
+    static const uint8_t floating[] = {
+        WL_PLAN_EXPR_ARITH_FLOAT_ADD, WL_PLAN_EXPR_ARITH_FLOAT_SUB,
+        WL_PLAN_EXPR_ARITH_FLOAT_MUL, WL_PLAN_EXPR_ARITH_FLOAT_DIV,
+        WL_PLAN_EXPR_CMP_FLOAT_EQ, WL_PLAN_EXPR_CMP_FLOAT_NEQ,
+        WL_PLAN_EXPR_CMP_FLOAT_LT, WL_PLAN_EXPR_CMP_FLOAT_LTE,
+        WL_PLAN_EXPR_CMP_FLOAT_GT, WL_PLAN_EXPR_CMP_FLOAT_GTE,
+    };
+    static const double fpairs[][2] = {
+        {1.25, 2.5}, {-0.0, 0.0}, {DBL_MAX, 2.0}, {INFINITY, 1.0},
+        {1.0, NAN}, {1.0, 0.0}, {-1.0, 2.0}
+    };
+    for (size_t i = 0; i < sizeof(floating); i++) {
+        for (size_t j = 0; j < sizeof(fpairs)/sizeof(fpairs[0]); j++) {
+            program_t p = {0};
+            constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(fpairs[j][0]));
+            constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(fpairs[j][1]));
+            op(&p, floating[i]);
+            uint32_t executed = !isfinite(fpairs[j][0]) ? 1
+                : !isfinite(fpairs[j][1]) ? 2 : 3;
+            eval_attempt_parity(&p, NULL, 0, false, executed, 0);
+        }
+    }
+    static const uint8_t unary[] = { WL_PLAN_EXPR_ARITH_BNOT,
+                                     WL_PLAN_EXPR_AGG_COUNT,
+                                     WL_PLAN_EXPR_AGG_SUM,
+                                     WL_PLAN_EXPR_AGG_MIN,
+                                     WL_PLAN_EXPR_AGG_MAX };
+    for (size_t i = 0; i < sizeof(unary); i++) {
+        program_t p = {0}; op(&p, unary[i]);
+        eval_attempt_parity(&p, NULL, 0, false, 1, 0);
+    }
+    for (unsigned extra = 0; extra < 3; extra++) {
+        program_t p = {0};
+        for (unsigned i = 0; i < COL_FILTER_STACK - 1 + extra; i++)
+            constant(&p, WL_PLAN_EXPR_CONST_INT, i);
+        op(&p, WL_PLAN_EXPR_ARITH_ADD); op(&p, WL_PLAN_EXPR_ARITH_BNOT);
+        eval_attempt_parity(&p, NULL, 0, false, p.instructions, 0);
+    }
+    program_t p = {0}; op(&p, WL_PLAN_EXPR_BOOL); p.bytes[p.size++] = 200;
+    eval_attempt_parity(&p, NULL, 0, false, 1, 0);
+    p = (program_t){0}; constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(-0.0));
+    eval_attempt_parity(&p, NULL, 0, false, 1, 0);
+    p = (program_t){0}; constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(NAN));
+    for (unsigned i = 0; i < 8; i++) op(&p, WL_PLAN_EXPR_ARITH_BNOT);
+    eval_attempt_parity(&p, NULL, 0, false, 1, 0);
+    p = (program_t){0}; variable(&p, WL_PLAN_EXPR_VAR, "col0");
+    int64_t row[] = {73, 19}; int64_t original[2];
+    memcpy(original, row, sizeof(row));
+    eval_attempt_parity(&p, row, 2, false, 1, 1);
+    eval_attempt_parity(&p, NULL, 0, false, 1, 0);
+    for (unsigned i = 0; i < 4; i++) {
+        static const double inputs[] = {-0.0, 3.5, NAN, INFINITY};
+        p = (program_t){0}; variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col0");
+        int64_t frow[] = {bits(inputs[i])};
+        eval_attempt_parity(&p, frow, 1, true, 1, 1);
+        constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(2.0));
+        op(&p, WL_PLAN_EXPR_ARITH_FLOAT_MUL);
+        eval_attempt_parity(&p, frow, 1, true,
+            isfinite(inputs[i]) ? 3 : 1, 1);
+        CHECK(frow[0] == bits(inputs[i]));
+    }
+    p = (program_t){0}; variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col0");
+    eval_attempt_parity(&p, NULL, 0, true, 1, 0);
+    CHECK(memcmp(original, row, sizeof(row)) == 0);
+}
+
+static void
+eval_attempt_literal_boundaries(void)
+{
+    program_t p = {0}; variable(&p, WL_PLAN_EXPR_VAR, "col0");
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 7); op(&p, WL_PLAN_EXPR_ARITH_ADD);
+    wl_columnar_expr_attempt_numeric_t *x = eval_attempt_prepare(&p, NULL);
+    const uint64_t fees[] = {96, 64, 224, 160, 64, 224, 64, 224, 96};
+    uint64_t prefix = 0, previous = 0;
+    int64_t row[] = {2};
+    for (unsigned i = 0; i < sizeof(fees)/sizeof(fees[0]); i++) {
+        previous = prefix; prefix += fees[i];
+        for (unsigned exact = 0; exact < 2; exact++) {
+            wl_evaluation_control_t *c = control(exact ? prefix : prefix - 1);
+            int64_t value = 98765; bool failed = true;
+            bool complete = exact && i + 1 == sizeof(fees)/sizeof(fees[0]);
+            int expected = complete ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(wl_columnar_expr_eval_attempt_controlled(x, row, 1,
+                &value, &failed, c,
+                wl_evaluation_control_active_attempt_id(c)) == expected);
+            CHECK(complete ? value == 9 && !failed : value == 98765 && failed);
+            CHECK(finish(c, expected) == (exact ? prefix : previous));
+        }
+    }
+    CHECK(prefix == eval_attempt_cost(3, 1));
+    wl_columnar_expr_attempt_numeric_free(x);
+}
+
+static unsigned eval_event, eval_stop, eval_mode, eval_later;
+static bool eval_restarted, eval_saw_row, eval_saw_failed_step,
+    eval_saw_failed_final;
+static wl_evaluation_control_t *eval_control;
+static wl_evaluation_control_report_t eval_old;
+
+static void
+eval_attempt_checkpoint(wl_evaluation_control_t *c, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    (void)progress;
+    if (phase == 8) {
+        CHECK(!c); return;
+    }
+    CHECK(c == eval_control && (phase == 20 || phase == 21 || phase == 22));
+    if (eval_restarted) {
+        eval_later++; return;
+    }
+    if (phase == 21) {
+        CHECK(!failed); eval_saw_row = true;
+    }
+    if (phase == 20 && failed) eval_saw_failed_step = true;
+    if (phase == 22 && failed) eval_saw_failed_final = true;
+    eval_event++;
+    if (!eval_stop || eval_event != eval_stop) return;
+    if (eval_mode == 0) wl_evaluation_control_request_cancel(c);
+    else if (eval_mode == 1)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else {
+        CHECK(wl_evaluation_control_finish(c, &owner_key, 0, 0) == 0);
+        CHECK(wl_evaluation_control_report(c, &eval_old) == 0);
+        CHECK(wl_evaluation_control_reset(c) == 0);
+        CHECK(wl_evaluation_control_begin(c, &owner_key) == 0);
+        CHECK(wl_evaluation_control_active_attempt_id(c) !=
+            eval_old.attempt_id);
+        eval_restarted = true;
+    }
+}
+
+static uint64_t
+eval_attempt_finish(wl_evaluation_control_t *c, int result)
+{
+    CHECK(!eval_later);
+    uint64_t consumed;
+    if (eval_restarted) {
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        CHECK(id && id != eval_old.attempt_id);
+        CHECK(wl_evaluation_control_finish(c, &owner_key, 0, 0) == 0);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0);
+        CHECK(report.attempt_id == id && report.consumed == 0 &&
+            report.result == 0
+            && report.execution_status == 0 && report.cleanup_status == 0
+            && report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+        CHECK(wl_evaluation_control_detach(c, &owner_key) == 0);
+        wl_evaluation_control_release(c); consumed = eval_old.consumed;
+    } else consumed = finish(c, result);
+    eval_control = NULL; return consumed;
+}
+
+static void
+eval_attempt_faults(void)
+{
+    for (unsigned semantic = 0; semantic < 2; semantic++) {
+        program_t p = {0}; variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col0");
+        for (unsigned i = 0; i < 5; i++) op(&p, WL_PLAN_EXPR_ARITH_BNOT);
+        int64_t row[] = {bits(semantic ? NAN : 3.5)}, original = row[0];
+        wl_columnar_expr_attempt_numeric_t *x = eval_attempt_prepare(&p, NULL);
+        wl_columnar_expr_test_checkpoint = eval_attempt_checkpoint;
+        eval_stop = 0; eval_event = eval_later = 0; eval_restarted = false;
+        eval_control = control(0);
+        int64_t value = 98765; bool failed = false;
+        CHECK(wl_columnar_expr_eval_attempt_controlled(x, row, 1, &value,
+            &failed, eval_control,
+            wl_evaluation_control_active_attempt_id(eval_control)) == 0);
+        unsigned events = eval_event;
+        CHECK(failed == (semantic != 0)
+            && value == (semantic ? 0 : ~row[0]));
+        CHECK(eval_attempt_finish(eval_control, 0)
+            == eval_attempt_cost(semantic ? 1 : 6, 1));
+        CHECK(events == (semantic ? 3 : 8)); /* row + executed steps + final */
+        for (unsigned event = 1; event <= events; event++) {
+            for (unsigned mode = 0; mode < 3; mode++) {
+                eval_stop = event; eval_mode = mode;
+                eval_event = eval_later = 0; eval_restarted = false;
+                eval_control = control(0); value = 98765; failed = !semantic;
+                int expected = mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+                    : mode == 1 ? EOVERFLOW : EINVAL;
+                CHECK(wl_columnar_expr_eval_attempt_controlled(x, row, 1,
+                    &value, &failed, eval_control,
+                    wl_evaluation_control_active_attempt_id(eval_control)) ==
+                    expected);
+                CHECK(value == 98765 && failed == !semantic &&
+                    eval_event == event);
+                CHECK(eval_attempt_finish(eval_control, expected) > 0);
+                CHECK(row[0] == original);
+            }
+        }
+        eval_stop = 0; wl_columnar_expr_test_checkpoint = NULL;
+        wl_columnar_expr_attempt_numeric_free(x);
+    }
+    CHECK(eval_saw_row && eval_saw_failed_step && eval_saw_failed_final);
+}
+
+static void
+eval_attempt_arguments(void)
+{
+    program_t p = {0}; constant(&p, WL_PLAN_EXPR_CONST_INT, 7);
+    wl_columnar_expr_attempt_numeric_t *x = eval_attempt_prepare(&p, NULL);
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    int64_t value = 98765; bool failed = true;
+    CHECK(wl_columnar_expr_eval_attempt_controlled(NULL, NULL, 0, &value,
+        &failed, c, id) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 1, &value,
+        &failed, c, id) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, NULL,
+        &failed, c, id) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, &value,
+        NULL, c, id) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, &value,
+        &failed, NULL, id) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, &value,
+        &failed, c, 0) == EINVAL);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, &value,
+        &failed, c, id + 1) == EINVAL);
+    CHECK(value == 98765 && failed);
+    CHECK(wl_evaluation_control_finish(c, &owner_key, 0, 0) == 0);
+    CHECK(wl_columnar_expr_eval_attempt_controlled(x, NULL, 0, &value,
+        &failed, c, id) == EINVAL && value == 98765 && failed);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c,
+        &report) == 0 && report.consumed == 0);
+    CHECK(wl_evaluation_control_detach(c, &owner_key) == 0);
+    wl_evaluation_control_release(c); wl_columnar_expr_attempt_numeric_free(x);
+}
+
+/* Hook globals are NULL throughout real shared-owner threads. */
+typedef struct {
+    wl_mutex_t mutex;
+    wl_cond_t condition;
+    unsigned ready;
+    bool start;
+    const wl_columnar_expr_attempt_numeric_t *program;
+} eval_attempt_shared_t;
+typedef struct { eval_attempt_shared_t *shared; int64_t row;
+} eval_attempt_worker_t;
+
+static void *
+eval_attempt_reader(void *arg)
+{
+    eval_attempt_worker_t *worker = arg;
+    eval_attempt_shared_t *shared = worker->shared;
+    wl_evaluation_control_t *c = control(eval_attempt_cost(3, 1));
+    CHECK(wl_mutex_lock(&shared->mutex) == 0);
+    shared->ready++; CHECK(wl_cond_broadcast(&shared->condition) == 0);
+    while (!shared->start)
+        CHECK(wl_cond_wait(&shared->condition, &shared->mutex) == 0);
+    CHECK(wl_mutex_unlock(&shared->mutex) == 0);
+    for (unsigned repeat = 0; repeat < 32; repeat++) {
+        int64_t value = 98765; bool failed = true;
+        CHECK(wl_columnar_expr_eval_attempt_controlled(shared->program,
+            &worker->row, 1, &value, &failed, c,
+            wl_evaluation_control_active_attempt_id(c)) == 0);
+        CHECK(value == worker->row + 7 && !failed);
+        CHECK(wl_evaluation_control_finish(c, &owner_key, 0, 0) == 0);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(c, &report) == 0
+            && report.consumed == eval_attempt_cost(3,
+            1) && report.result == 0);
+        if (repeat + 1 < 32) {
+            CHECK(wl_evaluation_control_reset(c) == 0);
+            CHECK(wl_evaluation_control_begin(c, &owner_key) == 0);
+        }
+    }
+    CHECK(wl_evaluation_control_detach(c, &owner_key) == 0);
+    wl_evaluation_control_release(c); return NULL;
+}
+
+static void
+eval_attempt_shared_owner(void)
+{
+    CHECK(!wl_columnar_expr_test_checkpoint
+        && !wl_columnar_memory_governor_test_checkpoint
+        && !wl_columnar_memory_governor_test_work_checkpoint
+        && !wl_columnar_memory_governor_test_before_total_cas
+        && !wl_columnar_memory_governor_test_after_total_cas);
+    program_t p = {0}; variable(&p, WL_PLAN_EXPR_VAR, "col0");
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 7); op(&p, WL_PLAN_EXPR_ARITH_ADD);
+    wl_columnar_memory_governor_ref_t *g =
+        governor(WL_COLUMNAR_MEMORY_MIN_BUDGET, false);
+    wl_columnar_memory_governor_t *gov = wl_columnar_memory_governor_ref_get(g);
+    wl_columnar_expr_attempt_numeric_t *x = eval_attempt_prepare(&p, g);
+    uint64_t own = wl_columnar_memory_reserved(gov);
+    wl_columnar_memory_reservation_t original_peer;
+    wl_columnar_memory_reservation_init(&original_peer);
+    CHECK(wl_columnar_memory_reserve(gov, 17, &original_peer));
+    wl_columnar_memory_governor_ref_release(g); /* Owner alone pins governor. */
+    CHECK(wl_columnar_memory_governor_ref_is_sole(g));
+    eval_attempt_shared_t shared = {.ready = 0, .start = false, .program = x};
+    CHECK(wl_mutex_init(&shared.mutex) == 0);
+    CHECK(wl_cond_init(&shared.condition) == 0);
+    eval_attempt_worker_t workers[4]; wl_thread_t threads[4];
+    for (unsigned i = 0; i < 4; i++) {
+        workers[i].shared = &shared; workers[i].row = (int64_t)i * 11;
+        CHECK(wl_thread_create(&threads[i], eval_attempt_reader,
+            &workers[i]) == 0);
+    }
+    CHECK(wl_mutex_lock(&shared.mutex) == 0);
+    while (shared.ready != 4)
+        CHECK(wl_cond_wait(&shared.condition, &shared.mutex) == 0);
+    shared.start = true; CHECK(wl_cond_broadcast(&shared.condition) == 0);
+    CHECK(wl_mutex_unlock(&shared.mutex) == 0);
+    for (unsigned i = 0; i < 4; i++) CHECK(wl_thread_join(&threads[i]) == 0);
+    CHECK(wl_columnar_memory_reserved(gov) == own + 17
+        && wl_columnar_memory_governor_ref_is_sole(g));
+    CHECK(wl_columnar_memory_rollback(&original_peer)
+        && wl_columnar_memory_reserved(gov) == own);
+    wl_cond_destroy(&shared.condition); wl_mutex_destroy(&shared.mutex);
+    wl_columnar_expr_attempt_numeric_free(x); /* After all borrowed readers join. */
+    /* gov/g became invalid after the final owner reference; never dereference. */
+}
+
+static void
+eval_attempt_lifecycle(void)
+{
+    eval_attempt_semantics(); eval_attempt_literal_boundaries();
+    eval_attempt_faults(); eval_attempt_arguments();
+    eval_attempt_shared_owner();
+    CHECK(!eval_control && !wl_columnar_expr_test_checkpoint);
+}
+
 int
 main(void)
 {
@@ -1246,6 +1675,7 @@ main(void)
     admission_boundaries();
     wl_columnar_expr_test_checkpoint = NULL;
     attempt_compile_lifecycle();
+    eval_attempt_lifecycle();
     puts("numeric lifecycle: PASS");
     return 0;
 }

@@ -4108,7 +4108,7 @@ void wl_columnar_expr_controlled_free(wl_columnar_expr_controlled_t *);
  * Owner and its embedded token are noncopyable, externally synchronized for
  * destruction, and may survive attempt finish/reset. Free is mandatory and
  * retires physical storage before its own credit and saved reference.
- * This compiler-only unit declares no new evaluator until its separate atom. */
+ * The separate evaluator below borrows this prepared owner without mutation. */
 typedef struct wl_columnar_expr_attempt_numeric
     wl_columnar_expr_attempt_numeric_t;
 int wl_columnar_expr_compile_attempt_controlled(const uint8_t *, uint32_t,
@@ -4116,6 +4116,25 @@ int wl_columnar_expr_compile_attempt_controlled(const uint8_t *, uint32_t,
     bool *, wl_evaluation_control_t *, uint64_t);
 void wl_columnar_expr_attempt_numeric_free(
     wl_columnar_expr_attempt_numeric_t *);
+
+/* Caller-attempt evaluator for genuine immutable numeric owners above.
+ * Program and row stay live/immutable; outputs are exclusive, disjoint from
+ * each other, program/instructions, row and control. NULL control, inactive
+ * or stale caller ID return EINVAL without changing either output.
+ * Nonzero return leaves value/failed untouched. Success publishes value and
+ * failed=false, or semantic failure value=0/failed=true after final cutoff.
+ * No allocation, governor debit/ref operation, or ownership transfer occurs.
+ * Immutable readers may use separate controls/outputs concurrently; exclude
+ * destruction until every reader joins. Phases20/21/22: step/row/final;
+ * row21 precedes finite-FLOAT validation and reports failed=false, while
+ * step20/final22 report detected semantic failure. Logical forward bound224
+ * excludes control internals/instrumentation; no allocation/retirement occurs.
+ */
+int
+wl_columnar_expr_eval_attempt_controlled(
+    const wl_columnar_expr_attempt_numeric_t *program,
+    const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
 #ifdef WL_SESSION_TEST_HOOKS
 /* phases:1/2 consumed byte in first/second pass;3 evaluated instruction;
  * 4 reserved;5 moved;6 committed before publication;7 evaluation publication;

@@ -2225,6 +2225,230 @@ fail:
     return rc;
 }
 
+/* Caller-attempt numeric evaluation: conservative logical source accounting.
+ * G9 and C13 are the unchanged original-ID guard/charge prefix. Failed-aware
+ * tail26 + caller dispatch3 = T29; instrumentation is not a polling boundary.
+ * push14 covers value/top/type/string sidefield stores; pop7 includes its
+ * caller store. FLOAT load10/store16 include fixed8-byte copies, finite tests
+ * and zero normalization. Portable add/sub12, mul40 (two abs5 and full signed
+ * guards/unsigned threshold), div/mod12 and shift10 dominate builtin paths.
+ * Routing24 + reset1 + two pop7 + init2 + switch2 + worst FLOAT arm56 +
+ * failed stores2 + push guard2 + push14 + return1 = step118.
+ * Returned rc3 + executed2 + T29 + failed/break2 + loop3 + C13 + refused
+ * next FETCH/FINAL caller3 = suffix55. No refused region funds its return.
+ * Complete regions including return/refusal alternatives:
+ * ENTRY <= pointer12+C13+rc3+init4+loop1+C13+refusal3 =49 <=64,
+ * FETCH <= rc3+instruction address3+C13+refusal3 =22 <=32,
+ * STEP <= postcharge3+step118+suffix55 =176 <=192,
+ * ROW <= rc3+read/store2+rowT29+FLOAT/route/push30+return1+suffix55
+ *       =120 <=144 (BOTH row and later step tails included),
+ * FINAL <= rc3+pending select8+T29+two outputs2+return1 =43 <=48.
+ * STEP pays pre-ROW/refused-ROW caller work; admitted ROW pays its actual
+ * lane and remaining step/eval continuation once. Initial invalid/first
+ * refused read-only bootstrap <=28 can execute at consumed0. Only top and
+ * used stack fields are written; no whole-array copy/initialization.
+ * Conservative224 bounds actual contiguous logical forward intervals, not
+ * nominal fee sums, machine instructions or elapsed time. Control internals
+ * and instrumentation are excluded. This evaluator allocates and retires no
+ * resources; ordinary returns/branches are included without cleanup waiver.
+ */
+enum {
+    WL_COLUMNAR_EXPR_ATTEMPT_EVAL_ENTRY_WORK = 96,
+    WL_COLUMNAR_EXPR_ATTEMPT_FETCH_WORK = 64,
+    WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK = 224,
+    WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK = 160,
+    WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK = 96,
+    WL_COLUMNAR_EXPR_ATTEMPT_STEP_PHASE = 20,
+    WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_PHASE = 21,
+    WL_COLUMNAR_EXPR_ATTEMPT_FINAL_PHASE = 22,
+};
+typedef char wl_columnar_expr_attempt_eval_tariffs_fit_quantum[
+        (WL_COLUMNAR_EXPR_ATTEMPT_EVAL_ENTRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_FETCH_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK <= WL_EVALUATION_CONTROL_QUANTUM)
+    ? 1 : -1];
+typedef char wl_columnar_expr_attempt_eval_regions_fit_tariffs[
+        (UINT64_C(64) <= WL_COLUMNAR_EXPR_ATTEMPT_EVAL_ENTRY_WORK
+        && UINT64_C(32) <= WL_COLUMNAR_EXPR_ATTEMPT_FETCH_WORK
+        && UINT64_C(192) <= WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK
+        && UINT64_C(144) <= WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK
+        && UINT64_C(48) <= WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK) ? 1 : -1];
+typedef char wl_columnar_expr_attempt_eval_forward_bound[
+        UINT64_C(224) <= WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+static int
+wl_columnar_expr_attempt_eval_tail(wl_evaluation_control_t *control,
+    uint64_t attempt_id, unsigned phase, uint64_t progress, bool failed)
+{
+    int rc = wl_columnar_expr_attempt_guard(control, attempt_id);
+    if (rc)
+        return rc;
+    wl_columnar_expr_checkpoint(control, phase, progress, failed);
+    return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
+}
+
+static int
+wl_columnar_expr_attempt_numeric_step(expr_stack_t *stack,
+    const expr_instr_t *in, const int64_t *row, uint32_t ncols,
+    bool *failed,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc;
+    *failed = false;
+    if (in->op == WL_PLAN_EXPR_VAR || in->op == WL_PLAN_EXPR_VAR_FLOAT) {
+        if (in->iarg < ncols) {
+            rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK);
+            if (rc) return rc;
+            int64_t value = row[in->iarg];
+            rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id,
+                    WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_PHASE, in->iarg, false);
+            if (rc) return rc;
+            double decoded;
+            if (in->op == WL_PLAN_EXPR_VAR_FLOAT && !expr_float_load(value,
+                &decoded))
+                *failed = true;
+            else expr_push(stack, value);
+        } else if (in->op == WL_PLAN_EXPR_VAR_FLOAT) *failed = true;
+        else expr_push(stack, 0);
+    } else if (in->op == WL_PLAN_EXPR_CONST_FLOAT) {
+        double decoded;
+        if (!expr_float_load(in->larg, &decoded)) *failed = true;
+        else expr_push(stack, in->larg);
+    } else if (in->op == WL_PLAN_EXPR_CONST_INT ||
+        in->op == WL_PLAN_EXPR_BOOL) {
+        expr_push(stack, in->larg);
+    } else if (in->op == WL_PLAN_EXPR_ARITH_BNOT) {
+        int64_t a = expr_pop(stack); expr_push(stack, ~a);
+    } else if (in->op == WL_PLAN_EXPR_AGG_COUNT ||
+        in->op == WL_PLAN_EXPR_AGG_SUM
+        || in->op == WL_PLAN_EXPR_AGG_MIN ||
+        in->op == WL_PLAN_EXPR_AGG_MAX) {
+        /* Actual compiled aggregates are no-ops. */
+    } else {
+        int64_t b = expr_pop(stack), a = expr_pop(stack), result = 0;
+        int semantic = 0;
+        switch ((wl_plan_expr_tag_t)in->op) {
+        case WL_PLAN_EXPR_ARITH_ADD: semantic =
+                wl_columnar_arithmetic_checked_add_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SUB: semantic =
+                wl_columnar_arithmetic_checked_sub_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_MUL: semantic =
+                wl_columnar_arithmetic_checked_mul_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_DIV: semantic =
+                wl_columnar_arithmetic_checked_div_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_MOD: semantic =
+                wl_columnar_arithmetic_checked_mod_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SHL: semantic =
+                wl_columnar_arithmetic_checked_shl_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_SHR: semantic =
+                wl_columnar_arithmetic_checked_shr_int64(a, b, &result);
+            break;
+        case WL_PLAN_EXPR_ARITH_BAND: result = a & b; break;
+        case WL_PLAN_EXPR_ARITH_BOR: result = a | b; break;
+        case WL_PLAN_EXPR_ARITH_BXOR: result = a ^ b; break;
+        case WL_PLAN_EXPR_CMP_EQ: result = a == b; break;
+        case WL_PLAN_EXPR_CMP_NEQ: result = a != b; break;
+        case WL_PLAN_EXPR_CMP_LT: result = a < b; break;
+        case WL_PLAN_EXPR_CMP_LTE: result = a <= b; break;
+        case WL_PLAN_EXPR_CMP_GT: result = a > b; break;
+        case WL_PLAN_EXPR_CMP_GTE: result = a >= b; break;
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD: case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL: case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ: case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT: case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE: case WL_PLAN_EXPR_CMP_FLOAT_GTE: {
+            double da, db, dv = 0;
+            if (!expr_float_load(a, &da) || !expr_float_load(b, &db)) {
+                semantic = 1; break;
+            }
+            switch ((wl_plan_expr_tag_t)in->op) {
+            case WL_PLAN_EXPR_ARITH_FLOAT_ADD: dv = da + db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_SUB: dv = da - db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_MUL: dv = da * db; break;
+            case WL_PLAN_EXPR_ARITH_FLOAT_DIV: dv = da / db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_EQ: result = da == db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_NEQ: result = da != db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LT: result = da < db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_GT: result = da > db; break;
+            case WL_PLAN_EXPR_CMP_FLOAT_LTE: result = da <= db; break;
+            default: result = da >= db; break;
+            }
+            if (in->op <= WL_PLAN_EXPR_ARITH_FLOAT_DIV && !expr_float_store(dv,
+                &result)) semantic = 1;
+            break;
+        }
+        default: semantic = 1; break;
+        }
+        *failed = semantic != 0;
+        if (!*failed) expr_push(stack, result);
+    }
+    return 0;
+}
+int
+wl_columnar_expr_eval_attempt_controlled(
+    const wl_columnar_expr_attempt_numeric_t *program,
+    const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Fixed read-only invalid/first-refused admission exception. */
+    if (!program || !value || !failed || (ncols && !row))
+        return EINVAL;
+    int rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_EVAL_ENTRY_WORK);
+    if (rc)
+        return rc;
+    expr_stack_t stack;
+    stack.top = 0;
+    bool pending_failed = false;
+    uint32_t executed = 0;
+    for (uint32_t k = 0; k < program->ninstr; k++) {
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_FETCH_WORK);
+        if (rc)
+            return rc;
+        const expr_instr_t *in = &program->instrs[k];
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK);
+        if (rc)
+            return rc;
+        rc = wl_columnar_expr_attempt_numeric_step(&stack, in, row, ncols,
+                &pending_failed, control, attempt_id);
+        if (rc)
+            return rc;
+        executed = k + 1u;
+        rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_STEP_PHASE, executed, pending_failed);
+        if (rc)
+            return rc;
+        if (pending_failed)
+            break;
+    }
+    rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK);
+    if (rc)
+        return rc;
+    int64_t pending = !pending_failed && stack.top
+        ? stack.vals[stack.top - 1] : 0;
+    rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id,
+            WL_COLUMNAR_EXPR_ATTEMPT_FINAL_PHASE, executed, pending_failed);
+    if (rc)
+        return rc;
+    *value = pending;
+    *failed = pending_failed;
+    return 0;
+}
+
 static int
 wl_columnar_expr_numeric_step(expr_stack_t *stack,
     const expr_instr_t *in, const int64_t *row, uint32_t ncols,
