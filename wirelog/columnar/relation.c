@@ -12980,6 +12980,626 @@ wl_columnar_relation_new_auto_attempt_controlled(
                COL_REL_INIT_CAP, NULL, false, out, control, attempt_id);
 }
 
+/* Protected scalar source/provenance: logical predicate-slot work.
+ * Count assignments, evaluated leaf predicates, controlling dispatches,
+ * explicit arithmetic/loop steps, native thread primitives and helper returns.
+ * Short-circuit connectors route predicates; they add no separate slot.
+ * Expand helpers. C12 plus caller assignment/predicate/dispatch is15;
+ * G9 plus the same caller is12. Prior auto validity8 conservatively allows
+ * three more slots than its predicate/store core5; it does not change this
+ * metric. Control scheduling, instrumentation and original physical/token/ref
+ * retirement interiors retain their documented exclusions. Ordinary source
+ * end validation/latch/drain dispatch/clearing is counted, never exempted.
+ * INIT256 prepays initialization86 and ONE live END72, including interrupted
+ * init or declined BEGIN. DRAINED repeat is a bounded readonly bootstrap.
+ * Selected PRE228 and RETURN243 include next refused admissions. ROW_CALL
+ * prepays its caller continuation; child fees still fund their own regions.
+ * Successful B2 return uses immutable locals, then G and a genuine zero poll:
+ * conservative225+capture scaffold8+result3+G/caller12+poll1+refusal4=253.
+ * That real poll separates the later RETURN region. Fees are admission,
+ * not completed-work telemetry or CPU-instruction/time measurements. */
+enum {
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK = 256,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_BEGIN_WORK = 256,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_RESOLVE_WORK = 224,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_VALIDATE_WORK = 224,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SNAPSHOT_WORK = 192,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK = 224,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SHAPE_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_GATHER_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_CELL_WORK = 224,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK = 192,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK = 256,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK = 256,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK = 128,
+};
+
+typedef char wl_columnar_relation_scalar_source_tariffs_bound[
+        (WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_BEGIN_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_RESOLVE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_VALIDATE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_SNAPSHOT_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_SHAPE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_GATHER_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_CELL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_init_bound[
+        (UINT64_C(86) + UINT64_C(72) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_column_bound[
+        (UINT64_C(208) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_cell_bound[
+        (UINT64_C(128) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_CELL_WORK) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_selected_pre_bound[
+        (UINT64_C(228) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_row_return_bound[
+        (UINT64_C(243) <=
+        WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_reader_bound[
+        (UINT64_C(144) + UINT64_C(76) <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_builder_bound[
+        (UINT64_C(168) + UINT64_C(82) <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+typedef char wl_columnar_relation_scalar_source_return_poll_bound[
+        (UINT64_C(225) + UINT64_C(8) + UINT64_C(3) + UINT64_C(12)
+        + UINT64_C(1) + UINT64_C(4) <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+static bool
+wl_columnar_relation_scalar_source_thread_equal(
+    const wl_columnar_relation_scalar_source_t *source)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return source->thread_valid
+           && thrd_equal(source->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return source->thread_valid
+           && source->owner_thread == GetCurrentThreadId();
+#else
+    return source->thread_valid
+           && pthread_equal(source->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static bool
+wl_columnar_relation_scalar_source_reader_empty(
+    const wl_columnar_source_access_reader_t *reader)
+{
+    return !reader->owner && !reader->secondary_owner && !reader->identity
+           && !reader->thread_valid && !reader->transferable;
+}
+
+/* Callback-free original-record bootstrap. No control access on DRAINED. */
+static int
+wl_columnar_relation_scalar_source_check(
+    const wl_columnar_relation_scalar_source_t *source,
+    wl_columnar_relation_scalar_source_phase_t phase)
+{
+    if (!source || source->identity != source || source->phase != phase
+        || !wl_columnar_relation_scalar_source_thread_equal(source)
+        || !source->control || !source->attempt_id)
+        return EINVAL;
+    if (phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD
+        && (!source->descriptor || !source->owner
+        || source->descriptor_reader.owner !=
+        &source->descriptor->descriptor_access
+        || source->owner_reader.owner != &source->owner->source_access
+        || source->descriptor_reader.identity !=
+        (uintptr_t)&source->descriptor_reader
+        || source->owner_reader.identity != (uintptr_t)&source->owner_reader))
+        return EINVAL;
+    return 0;
+}
+
+int
+wl_columnar_relation_scalar_source_end(
+    wl_columnar_relation_scalar_source_t *source, int initiating_result)
+{
+    if (!source || source->identity != source)
+        return EINVAL;
+    if (source->phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+        return source->first_result_saved ? source->first_result : EINVAL;
+    if ((source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT
+        && source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR
+        && source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD)
+        || !wl_columnar_relation_scalar_source_thread_equal(source))
+        return EINVAL;
+    if (!source->first_result_saved) {
+        source->first_result = initiating_result;
+        source->first_result_saved = true;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (source->owner_reader.owner
+        && wl_columnar_relation_test_new_like_before_release)
+        wl_columnar_relation_test_new_like_before_release(source->descriptor);
+#endif
+    /* Actual tokens are authoritative even when a child did not return
+     * success and enclosing phase was never advanced. The child self-drains
+     * its failed current claim; any earlier original token is still ours. */
+    wl_columnar_relation_new_like_reader_drain(&source->owner_reader);
+    wl_columnar_relation_new_like_reader_drain(&source->descriptor_reader);
+    if (!wl_columnar_relation_scalar_source_reader_empty(&source->owner_reader)
+        || !wl_columnar_relation_scalar_source_reader_empty(
+            &source->descriptor_reader))
+        abort();
+    source->descriptor = NULL; source->owner = NULL;
+    source->columns = NULL; source->timestamps = NULL;
+    source->names = NULL; source->types = NULL;
+    source->width = 0; source->nrows = 0; source->capacity = 0;
+    source->timestamp_capacity = 0;
+    source->descriptor_identity = 0; source->descriptor_view_generation = 0;
+    source->descriptor_storage_generation = 0; source->owner_identity = 0;
+    source->owner_storage_generation = 0;
+    source->has_graph_column = false; source->graph_col_idx = 0;
+    source->declared_ncols = 0; source->preserve_timestamps = false;
+    source->control = NULL; source->attempt_id = 0;
+    source->thread_valid = false;
+    source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED;
+    return source->first_result;
+}
+
+int
+wl_columnar_relation_scalar_source_init_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, bool *initialized,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (initialized)
+        *initialized = false;
+    if (!source || !initialized || !control)
+        return EINVAL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK);
+    if (rc)
+        return rc;
+    source->control = control; source->attempt_id = attempt_id;
+    source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT;
+    source->thread_valid = false;
+    wl_columnar_relation_constructor_attempt_reader_inert(
+        &source->descriptor_reader);
+    wl_columnar_relation_constructor_attempt_reader_inert(
+        &source->owner_reader);
+    source->descriptor = NULL; source->owner = NULL;
+    source->columns = NULL; source->timestamps = NULL;
+    source->names = NULL; source->types = NULL;
+    source->width = 0; source->nrows = 0; source->capacity = 0;
+    source->timestamp_capacity = 0;
+    source->descriptor_identity = 0; source->descriptor_view_generation = 0;
+    source->descriptor_storage_generation = 0; source->owner_identity = 0;
+    source->owner_storage_generation = 0;
+    source->has_graph_column = false; source->graph_col_idx = 0;
+    source->declared_ncols = 0; source->preserve_timestamps = false;
+    source->first_result_saved = false; source->first_result = 0;
+#if defined(WL_HAVE_C11_THREADS)
+    source->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    source->owner_thread = GetCurrentThreadId();
+#else
+    source->owner_thread = pthread_self();
+#endif
+    source->thread_valid = true;
+    source->identity = source;
+    *initialized = true;
+    return wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+               WL_COLUMNAR_RELATION_SCALAR_SOURCE_INIT_WORK);
+}
+
+int
+wl_columnar_relation_scalar_source_begin_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool preserve_timestamps)
+{
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT);
+    if (rc)
+        return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BEGIN_WORK);
+    if (rc)
+        goto done;
+    bool valid = relation != NULL;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BEGIN_WORK);
+    rc = tail > 0 || valid ? tail : EINVAL;
+    if (rc)
+        goto done;
+    source->descriptor = relation;
+    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+        (wl_columnar_source_access_gate_t *)&relation->descriptor_access,
+        &source->descriptor_reader, control, id);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RESOLVE_WORK);
+    if (rc)
+        goto done;
+    source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR;
+    bool unsupported = !relation->storage_owner;
+    bool invalid = false;
+    if (!unsupported) {
+        invalid = ((relation->compound_arity_map == NULL)
+            != (relation->compound_arity_len == 0))
+            || (relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            && relation->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+            && relation->compound_kind != WIRELOG_COMPOUND_KIND_SIDE);
+        if (!invalid) {
+            unsupported = relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE;
+            if (!unsupported)
+                invalid = relation->compound_count ||
+                    relation->compound_arity_map
+                    || relation->compound_arity_len ||
+                    relation->inline_physical_offset;
+        }
+    }
+    if (unsupported) rc = ENOTSUP;
+    else if (invalid) rc = EINVAL;
+    else rc = col_rel_storage_owner_resolve(relation, &source->owner);
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RESOLVE_WORK);
+    if (tail > 0 || !rc) rc = tail;
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_reader_acquire_attempt_controlled(
+        &source->owner->source_access, &source->owner_reader, control, id);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_VALIDATE_WORK);
+    if (rc)
+        goto done;
+    source->phase = WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD;
+    const col_rel_t *owner = source->owner;
+    if (!relation->schema_ok) rc = ENOTSUP;
+    else if (!relation->relation_identity ||
+        relation->relation_identity == UINT64_MAX
+        || !owner->relation_identity || owner->relation_identity == UINT64_MAX
+        || !wl_columnar_relation_generation_valid(relation->view_generation)
+        || !wl_columnar_relation_generation_valid(relation->storage_generation)
+        || !wl_columnar_relation_generation_valid(owner->storage_generation)
+        || owner->storage_owner != owner
+        || owner->storage_owner_identity != owner->relation_identity
+        || owner->storage_owner_generation != owner->storage_generation
+        || relation->storage_owner != owner
+        || relation->storage_owner_identity != owner->relation_identity
+        || relation->storage_owner_generation != owner->storage_generation
+        || relation->nrows > relation->capacity
+        || (relation->ncols && !relation->columns)
+        || (relation->timestamps &&
+        relation->timestamp_capacity < relation->nrows)
+        || (relation->has_graph_column &&
+        relation->graph_col_idx >= relation->ncols))
+        rc = EINVAL;
+    else rc = 0;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_VALIDATE_WORK);
+    if (tail > 0 || !rc) rc = tail;
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SNAPSHOT_WORK);
+    if (rc)
+        goto done;
+    source->columns = (const int64_t *const *)relation->columns;
+    source->timestamps = relation->timestamps;
+    source->names = (const char *const *)relation->col_names;
+    source->types = relation->column_types;
+    source->width = relation->ncols; source->nrows = relation->nrows;
+    source->capacity = relation->capacity;
+    source->timestamp_capacity = relation->timestamp_capacity;
+    source->descriptor_identity = relation->relation_identity;
+    source->descriptor_view_generation = relation->view_generation;
+    source->descriptor_storage_generation = relation->storage_generation;
+    source->owner_identity = owner->relation_identity;
+    source->owner_storage_generation = owner->storage_generation;
+    source->has_graph_column = relation->has_graph_column;
+    source->graph_col_idx = relation->graph_col_idx;
+    source->declared_ncols = relation->declared_ncols;
+    source->preserve_timestamps = preserve_timestamps;
+    uint32_t column = 0;
+    tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SNAPSHOT_WORK);
+    if (tail){
+        rc = tail; goto done;
+    }
+    while (column < source->width) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK);
+        if (rc)
+            goto done;
+        uint32_t count = source->width - column;
+        if (count > 8) count = 8;
+        bool accessible = true;
+        for (uint32_t i = 0; i < count; i++)
+            if (!source->columns[column + i]) accessible = false;
+        column += count;
+        tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_COLUMN_WORK);
+        rc = tail > 0 || accessible ? tail : EINVAL;
+        if (rc)
+            goto done;
+    }
+    return 0;
+done:
+    return wl_columnar_relation_scalar_source_end(source, rc);
+}
+
+int
+wl_columnar_relation_scalar_source_shape_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, uint32_t *width,
+    uint32_t *nrows, bool *timestamped)
+{
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc)
+        return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SHAPE_WORK);
+    if (rc) return rc;
+    bool valid = width && nrows && timestamped;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SHAPE_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    *width = source->width; *nrows = source->nrows;
+    *timestamped = source->preserve_timestamps && source->timestamps;
+    return 0;
+}
+
+int
+wl_columnar_relation_scalar_source_gather_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, uint32_t row,
+    int64_t *values, uint32_t width)
+{
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_GATHER_WORK);
+    if (rc) return rc;
+    bool valid = values && width == source->width && row < source->nrows;
+    uint32_t column = 0;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_GATHER_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    while (column < width) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_CELL_WORK);
+        if (rc) return rc;
+        uint32_t count = width - column;
+        if (count > 8) count = 8;
+        for (uint32_t i = 0; i < count; i++)
+            values[column + i] = source->columns[column + i][row];
+        column += count;
+        rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_CELL_WORK);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+int
+wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    if (out) *out = NULL;
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (rc) return rc;
+    bool valid = name && out;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = source->names; recipe.types = source->types;
+    recipe.has_graph_column = source->has_graph_column;
+    recipe.graph_col_idx = source->graph_col_idx;
+    recipe.declared_ncols = source->declared_ncols;
+    recipe.view_generation = 2u + (source->types != NULL);
+    bool ts = source->preserve_timestamps && source->timestamps;
+    recipe.storage_generation = 1u + ts;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_build(name, source->width,
+            COL_REL_INIT_CAP, ts, governor, &recipe, &local, control, id);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0) abort();
+    return rc;
+}
+
+int
+wl_columnar_relation_append_batch_selected_source_row_controlled(
+    wl_columnar_relation_append_batch_t *batch,
+    wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
+    const int64_t *values, uint32_t width)
+{
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    wl_evaluation_control_t *const call_control = source->control;
+    const uint64_t call_id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (rc) return rc;
+    bool valid = batch && batch->identity == batch && !batch->raw_mode
+        && batch->phase == WL_COLUMNAR_RELATION_BATCH_HELD
+        && batch->control == call_control && batch->attempt_id == call_id
+        && batch->raw.relation && values && width == source->width
+        && source_row < source->nrows;
+    int tail = wl_columnar_relation_constructor_attempt_tail(call_control,
+            call_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_batch_validate(batch);
+    col_rel_t *destination = batch->raw.relation;
+    bool timestamped = source->preserve_timestamps && source->timestamps;
+    uint32_t old_nrows = 0, expected_nrows = 0;
+    if (!rc &&
+        (destination == source->descriptor || destination == source->owner
+        || destination->storage_owner != destination ||
+        destination->ncols != width
+        || destination->nrows == UINT32_MAX
+        || (timestamped && (!destination->timestamps
+        || destination->timestamp_capacity < destination->nrows))))
+        rc = EINVAL;
+    if (!rc) {
+        old_nrows = destination->nrows;
+        expected_nrows = old_nrows + 1u;
+    }
+    tail = wl_columnar_relation_constructor_attempt_tail(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_PRE_WORK);
+    if (tail > 0 || !rc) rc = tail;
+    if (rc) return rc;
+    uint32_t iteration = 0, stratum = 0, worker = 0, reserved_field = 0;
+    int64_t multiplicity = 0;
+    if (timestamped) {
+        rc = wl_columnar_relation_constructor_attempt_charge(call_control,
+                call_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK);
+        if (rc) return rc;
+        const col_delta_timestamp_t *ts = &source->timestamps[source_row];
+        iteration = ts->iteration; stratum = ts->stratum;
+        worker = ts->worker; reserved_field = ts->_reserved;
+        multiplicity = ts->multiplicity;
+        rc = wl_columnar_relation_constructor_attempt_tail(call_control,
+                call_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_READ_WORK);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_append_batch_row_controlled(batch, values);
+    if (rc) return rc;
+    /* The very first forward action after child success uses only immutable
+     * locals. Mandatory capture disposal can have restarted the control. */
+    rc = wl_columnar_relation_attempt_guard(call_control, call_id);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge(call_control, 0);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (!rc && (batch->identity != batch || batch->raw_mode
+        || batch->phase != WL_COLUMNAR_RELATION_BATCH_HELD
+        || batch->control != call_control || batch->attempt_id != call_id))
+        rc = EINVAL;
+    if (!rc) rc = wl_columnar_relation_batch_validate(batch);
+    if (!rc) {
+        destination = batch->raw.relation;
+        if (destination == source->descriptor || destination == source->owner
+            || destination->storage_owner != destination ||
+            destination->ncols != width
+            || destination->nrows != expected_nrows
+            || (timestamped && (!destination->timestamps
+            || destination->timestamp_capacity < destination->nrows)))
+            rc = EINVAL;
+    }
+    tail = wl_columnar_relation_constructor_attempt_tail(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_RETURN_WORK);
+    if (tail > 0 || !rc) rc = tail;
+    if (rc) return rc;
+    if (!timestamped) return 0;
+    rc = wl_columnar_relation_constructor_attempt_charge(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK);
+    if (rc) return rc;
+    col_delta_timestamp_t *current =
+        &destination->timestamps[destination->nrows - 1u];
+    rc = wl_columnar_relation_constructor_attempt_tail(call_control, call_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_TS_WRITE_WORK);
+    if (rc) return rc;
+    current->iteration = iteration; current->stratum = stratum;
+    current->worker = worker; current->_reserved = reserved_field;
+    current->multiplicity = multiplicity;
+    return 0;
+}
+
+/* End protected scalar source/provenance draft. */
+
 /* End caller-attempt-bound scalar constructor. */
 
 int

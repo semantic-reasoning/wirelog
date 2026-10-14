@@ -2231,3 +2231,108 @@ slot retains ownership for a serialized retry after the reader is released.
 Privileged test hooks can recover an owner address from a still-live committed
 reservation, but acquiring private readers is an invariant violation. The death
 fixture for that violation is distinct from supported postpublication retention.
+
+### Protected scalar source and selected-row provenance (#1821)
+
+The opt-in internal scalar-source record holds two original readers: the
+input descriptor gate and its canonical storage owner's payload gate. The
+caller keeps both allocations, metadata and any pool/arena alive through End;
+reader gates prevent mutation and do not pin those allocations. The original
+record never moves. Init publishes its disjoint initialized flag only after
+all cleanup-relevant fields and both inert reader tokens are complete. A
+refused Init publishes false and the record must not be inspected or ended.
+Forward calls use the original native thread, control and immutable attempt
+ID; serialize lifecycle changes and exclude reentrant lifecycle calls from
+hooks. End drains actual original tokens independently of the outer phase,
+latches its first result including zero, and never accesses control. An ended
+record returns that first result after the old control/source lifetime ends.
+Wrong live thread and copied records leave original authority intact.
+
+The existing source-slot convention counts assignments, individual evaluated
+leaf predicates, controlling dispatches, explicit arithmetic/loop steps,
+native thread primitives and expanded helper returns. Short-circuit connectors
+route predicates without a separate slot. C12 plus assignment/predicate/if
+costs15; G9 with those caller operations costs12. The prior auto-constructor
+validity allowance8 conservatively exceeds its predicate/store core5; it does
+not establish a different connector metric. These are logical admission
+units, not CPU instructions, elapsed time or completed-work telemetry.
+Control scheduling, instrumentation, allocator internals and original
+mandatory physical/token/reference retirement interiors retain their existing
+exclusions. Ordinary scalar-source validation, first-result bookkeeping,
+drain dispatch,23 field clears and return are included.
+
+| Source region | Admitted fee | Conservative performed envelope |
+| --- | ---: | ---: |
+| Init and one future first live End | 256 | 86+72=158 |
+| Begin | 256 | 160 |
+| Classifier/owner resolution | 224 | 176 |
+| Source validation | 224 | 176 |
+| Snapshot | 192 | 144 |
+| Eight column accessibility checks | 224 | 208 |
+| Shape publication | 128 | 96 |
+| Gather entry | 128 | 96 |
+| Eight gathered cells | 224 | 128 |
+| Pinned-newlike entry | 128 | 96 |
+| Pinned recipe | 128 | 64 |
+| Pinned builder caller | 128 | 64 |
+| Private output publication | 128 | 64 |
+| Selected-row domain | 192 | 112 |
+| Selected-row prevalidation | 256 | 228 |
+| Five timestamp reads | 128 | 64 |
+| Existing B2 row caller | 128 | 112 |
+| Post-row revalidation | 256 | 243 |
+| Five timestamp writes | 128 | 48 |
+
+Init reserves one ordinary first-End envelope even if Init stops or the
+subsequent Begin admission declines. End makes no further control debit.
+The first latch and DRAINED phase permit only one live clearing episode;
+repeated End has a bounded readonly9-slot bootstrap. Invalid original/thread
+bootstrap is bounded18. A reader child may self-release its stopped current
+claim; outer End still drains any earlier token. The conservative performed
+reader interval144 plus outer/End76 is220. Refused child admissions contribute
+no debit; prior caller and Init reservations fund their continuations.
+
+An uncontended source Begin admits1376+224*ceil(width/8), separately from
+Init256. Each genuine additional reader CAS round admits144. Shape admits128;
+Gather admits128+224*ceil(width/8). Nullary Gather still requires nonNULL
+exclusive values but reads no columns. Partial gathered data is private and
+must not be published on failure. Pinned-newlike admits512 plus the existing
+builder's independent actual-input schedule. Held readers protect descriptor
+names/types; the recipe uses fresh output generations and the output stays
+local until final publication. Unpublished failure checked-destroys the local
+or aborts on corrupt ownership; it does not hand ownership to a NULL frame.
+The inherited direct-builder continuation retains reserve250, byte213 and
+commit114 bounds; no whole child tariff is substituted for caller work.
+
+Selected-row append requires an original controlled HELD batch on the same
+attempt, a private self-owned destination distinct from the source descriptor
+and owner, matching width and stable gathered values. It admits832 plus the
+independent B2 row/renewal schedule without provenance, or1088 plus that
+schedule with timestamps. NoTS means no timestamp **element** access by this
+wrapper; presence checks and the existing B2 destination defaults remain.
+With timestamps it preserves iteration, stratum, worker, reserved field and
+signed multiplicity explicitly, including zero and negative values.
+
+The first forward action after successful B2 return guards immutable local
+control/ID, then performs a real zero-charge cancellation/accounting check,
+then admits the post-row region before any source/batch/lease/timestamp read.
+An ID getter is not a poll. The conservative returned-success interval is
+225+8 capture bookkeeping+3 child result+12 local guard/caller+1 poll entry
++4 immediate-error continuation=253. The actual zero poll separates later
+post-row243; old internal child248 is not blindly extended with an outer fee.
+After renewal, current original lease, expected row count and current timestamp
+capacity are checked again. The final pointer is reloaded and five field
+stores follow the final tail without a later hook. Late failure can leave an
+appended private row; drain the batch/source and discard the entire output.
+
+The existing creation/work fixtures are registered for unit and TSan. Work
+also directly compiles unchanged governor/control sources with test-only
+SESSION, MEMORY and RESIZE hooks, so the real capture-credit retirement hook
+can cancel, poison accounting or restart an attempt after successful row
+append. Production flags and sources do not gain these hooks. Qualification
+must inspect the configured source/flags/object/link graph and actual native
+links; an archive-link assumption is not link evidence. Independent literal
+prefixes include nested child admissions and report the original completed
+attempt. A reached-tail sum can omit prepaid caller fees and is not the
+billing oracle. These primitives do not activate FILTER/MAP or complete the
+operator coverage required by #1821.

@@ -147,7 +147,7 @@ typedef struct {
 } wl_columnar_memory_reservation_t;
 
 #ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
-/* Only compiled into the direct-source governor test executable. */
+/* Only compiled into direct-source internal test executables. */
 enum {
     WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM = 1,
     WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CLAIMED,

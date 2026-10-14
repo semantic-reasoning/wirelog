@@ -1651,3 +1651,16 @@ original reservation initialization and move helpers are reused; their source
 sites are already in the audit. Constructor cleanup frees physical images
 before original credit refunds and releases its early retained governor
 reference last. It does not recharge a successor during mandatory cleanup.
+
+The internal protected scalar-source record is native-thread confined while
+live. Its descriptor and canonical-owner readers retain their original
+addresses, and forward methods retain the original control/attempt ID. The
+caller serializes lifecycle changes and keeps descriptor, owner, metadata and
+pool/arena allocations live; reader gates are mutation exclusion, not allocation
+references. A copied record or wrong live thread cannot consume original
+reader authority. End drains actual tokens without accessing control, latches
+the first result including zero, and permits a DRAINED readonly repeat after
+old control/source lifetime ends. Joined-thread fixtures exercise rejection
+before the original thread drains. No new atomic site is introduced: this
+record composes the existing source-access and control primitives. Both
+creation and work fixtures participate in the existing TSan suite.
