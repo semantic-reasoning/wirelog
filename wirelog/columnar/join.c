@@ -1441,15 +1441,19 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         col_join_batch_record_fallback(sess, batch_elig);
     }
-    /* An empty right side has nothing to bound: the ordinary probe yields
-     * zero rows in one pass, so do not dispatch the producer.  This also
-     * keeps the producer's lease from being a second lease on the window
-     * pin's entry: the registry reports a pinned index with indexed_rows == 0
-     * unavailable (arrangement.c deferral clause, tracked in #1500), which
-     * would turn an empty relation into ENOENT.  Decided after the strict
-     * and fallback handling above: it is neither a fallback nor a strict-mode
-     * failure, and the eligibility verdict stands. */
-    if (bounded && right->nrows == 0)
+    /* An empty input on either side has nothing to bound: the ordinary probe
+     * yields zero rows in one pass, so do not dispatch the producer.  For an
+     * empty right this also keeps the producer's lease from being a second
+     * lease on the window pin's entry: the registry reports a pinned index
+     * with indexed_rows == 0 unavailable (arrangement.c deferral clause,
+     * tracked in #1500), which would turn an empty relation into ENOENT.  An
+     * empty left can be a zero-column relation whose keys resolved to column
+     * 0 by fallback, an index the producer rejects with EINVAL (#2170).  The
+     * output is then not held for a producer, so it is not forced onto the
+     * heap.  Decided after the strict and fallback handling above: it is
+     * neither a fallback nor a strict-mode failure, and the eligibility
+     * verdict stands. */
+    if (bounded && (right->nrows == 0 || left->nrows == 0))
         bounded = false;
     /* Governed outputs and materialized results outlive the current
      * delta-pool reset, so both require heap-owned relation descriptors. */

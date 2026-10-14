@@ -3172,6 +3172,134 @@ out:
     destroy_session(sess);
 }
 
+/* Run one keyed JOIN over @left against the registered "right" and report
+ * the rc, the output width and row count, and whether a fallback was
+ * recorded.  The stack does not own @left. */
+static int
+empty_left_join(wl_col_session_t *sess, col_rel_t *left, uint32_t batch_bytes,
+    bool strict, uint32_t *ncols, uint32_t *nrows)
+{
+    const char *lk[1] = { "k" };
+    const char *rk[1] = { "k" };
+    wl_plan_op_t op;
+    eval_stack_t stack;
+    eval_entry_t result;
+    int rc;
+
+    init_join_op(&op, lk, rk);
+    sess->join_batch_bytes = batch_bytes;
+    sess->join_batch_strict = strict;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    rc = col_op_join(&op, &stack, sess);
+    sess->join_batch_strict = false;
+    *ncols = 0;
+    *nrows = 0;
+    if (rc != 0) {
+        (void)eval_stack_drain(&stack);
+        return rc;
+    }
+    result = eval_stack_pop(&stack);
+    *ncols = result.rel ? result.rel->ncols : 0;
+    *nrows = result.rel ? result.rel->nrows : UINT32_MAX;
+    if (result.owned)
+        col_rel_destroy(result.rel);
+    return 0;
+}
+
+static void
+test_operator_empty_left_nothing_to_bound(void)
+{
+    wl_col_session_t *sess = make_session(1u << 24);
+    col_rel_t *right = make_right(2, 3);
+    col_rel_t *zero_col = col_rel_new_auto("left", 0);
+    col_rel_t *two_col = make_left(NULL, 0);
+    col_rel_t *zero_col_rows = col_rel_new_auto("left", 0);
+    const int64_t no_columns[1] = { 0 };
+    const char *lk[1] = { "k" };
+    const char *rk[1] = { "k" };
+    wl_plan_op_t op;
+    uint32_t want_zero_col;
+    uint32_t want_two_col;
+    bool ok = true;
+
+    TEST("empty left input yields zero rows without bounded dispatch");
+    if (!sess || !right || !zero_col || !two_col || !zero_col_rows
+        || col_rel_append_row(zero_col_rows, no_columns) != 0
+        || register_relation(sess, &right, "right") != 0) {
+        FAIL("fixture");
+        goto out;
+    }
+    init_join_op(&op, lk, rk);
+    {
+        const col_rel_t *r = session_find_rel(sess, "right");
+        want_zero_col = col_join_output_width(zero_col, r, &op);
+        want_two_col = col_join_output_width(two_col, r, &op);
+    }
+    /* A zero-column placeholder has no column types to read. */
+    if (zero_col->column_types != NULL || zero_col_rows->nrows != 1u) {
+        FAIL("zero-column fixture shape");
+        goto out;
+    }
+    for (int run = 0; run < 3; run++) {
+        uint32_t bytes = run == 0 ? 0u : 4u * 32u;
+        bool strict = run == 2;
+        uint32_t ncols;
+        uint32_t nrows;
+        uint32_t fallbacks = sess->join_batch_fallback_count;
+        int rc = empty_left_join(sess, zero_col, bytes, strict, &ncols,
+                &nrows);
+        if (rc != 0 || ncols != want_zero_col || nrows != 0u
+            || sess->join_batch_fallback_count != fallbacks) {
+            printf("(zero-column run %d: rc=%d ncols=%u nrows=%u) ", run, rc,
+                ncols, nrows);
+            ok = false;
+        }
+        rc = empty_left_join(sess, two_col, bytes, strict, &ncols, &nrows);
+        if (rc != 0 || ncols != want_two_col || nrows != 0u
+            || sess->join_batch_fallback_count != fallbacks) {
+            printf("(two-column run %d: rc=%d ncols=%u nrows=%u) ", run, rc,
+                ncols, nrows);
+            ok = false;
+        }
+    }
+    {
+        /* A zero-column left that holds a row names no key column; the
+         * producer still refuses it. */
+        uint32_t ncols;
+        uint32_t nrows;
+        int rc = empty_left_join(sess, zero_col_rows, 4u * 32u, false,
+                &ncols, &nrows);
+        if (rc != EINVAL) {
+            printf("(zero-column left with a row: rc=%d) ", rc);
+            ok = false;
+        }
+    }
+    {
+        const col_arr_entry_t *entry = NULL;
+        for (uint32_t i = 0; i < sess->arr_count; i++) {
+            if (sess->arr_entries[i].rel_name
+                && strcmp(sess->arr_entries[i].rel_name, "right") == 0)
+                entry = &sess->arr_entries[i];
+        }
+        if (entry && (entry->pin_count != 0 || entry->rebuild_deferred)) {
+            printf("(right index left pinned or deferred) ");
+            ok = false;
+        }
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("an empty left did not join to the empty result");
+out:
+    col_rel_destroy(zero_col_rows);
+    col_rel_destroy(two_col);
+    col_rel_destroy(zero_col);
+    if (right)
+        col_rel_destroy(right);
+    destroy_session(sess);
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
@@ -3615,6 +3743,7 @@ main(void)
     test_eligibility_ordering();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
+    test_operator_empty_left_nothing_to_bound();
     test_join_batch_eligibility_order();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
