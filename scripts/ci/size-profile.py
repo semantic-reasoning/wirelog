@@ -19,11 +19,61 @@ def run(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, encoding="utf-8")
 
 def replace_root(value, root, placeholder):
-    # Replace a complete path prefix only, so /repo does not alter /repo-old.
-    # Roots have already been resolved; preserve all following option syntax.
+    """Normalize supported Meson argv path operands, not arbitrary option text.
+
+    Meson supplies separate operands as separate array entries. Attached
+    include/search options and explicit path-valued options are recognized
+    below; -Wl comma fields are interpreted only for known path options.
+    Unknown options (notably -D definitions and linker sonames) stay literal.
+    Never split on whitespace or scan a path's suffix for another root.
+    """
     text = str(value)
-    escaped = re.escape(str(root))
-    return re.sub(escaped + r"(?=$|[/\\:=,;])", placeholder, text)
+    root = str(root)
+
+    def path(operand):
+        if operand == root:
+            return placeholder
+        if operand.startswith(root) and operand[len(root):len(root) + 1] in ("/", "\\"):
+            return placeholder + operand[len(root):]
+        return operand
+
+    def attached(operand):
+        for prefix in ("-isystem", "-iquote", "-idirafter", "-isysroot",
+                       "-include", "-imacros", "-I", "-L", "-B",
+                       "--sysroot=", "--ld-path="):
+            if operand.startswith(prefix):
+                return prefix + path(operand[len(prefix):])
+        return path(operand)
+
+    if not text.startswith("-Wl,"):
+        return attached(text)
+
+    # GNU-style linker forms emitted by Meson. Only rpath/rpath-link operands
+    # are colon lists; punctuation in other paths is part of the path itself.
+    path_options = {"-L", "--library-path", "--version-script", "--dynamic-list",
+                    "-T", "--script", "-Map", "--sysroot", "--ld-path"}
+    list_options = {"-rpath", "--rpath", "-rpath-link", "--rpath-link"}
+    fields = text.split(",")
+    index = 1
+    while index < len(fields):
+        option, equals, operand = fields[index].partition("=")
+        if option in path_options | list_options:
+            if not equals:
+                index += 1
+                if index == len(fields):
+                    break
+                operand = fields[index]
+            normalized = (":".join(path(part) for part in operand.split(":"))
+                          if option in list_options else path(operand))
+            fields[index] = option + "=" + normalized if equals else normalized
+        elif fields[index].startswith("-L"):
+            fields[index] = "-L" + path(fields[index][2:])
+        else:
+            # An unknown option may consume the next field as literal text
+            # (e.g. -soname,-L/src). Do not reinterpret its remaining fields.
+            break
+        index += 1
+    return ",".join(fields)
 
 def selected_linker_fingerprint(compiler, parameters):
     if not compiler:
