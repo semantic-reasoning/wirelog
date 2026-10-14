@@ -1228,16 +1228,22 @@ the bytes knob is set) turns a fallback into an `ENOTSUP` failure, which is
 the explicit bounded-mode result for unsupported shapes.  Differential
 keyed joins have the separate producer described below.
 
-A non-differential eligible join followed by `FILTER* -> MAP` is consumed
-batch by batch on the eval stack (#1475), so the full join intermediate is
-not materialized while the pipeline runs: each batch is filtered and mapped
-into one output relation, which is published only after the last batch.  The
-FILTERs may use only numeric variables, numeric and boolean literals, and
-comparisons.  The MAP may project columns or evaluate numeric expressions --
-integer and float arithmetic and comparisons (#1777).  A MAP with a string,
-digest, UUID, aggregate or extension expression is not consumed; those have
-no batch contract yet.  A pipeline whose input goes stale mid-stream, or
-whose arrangement is unavailable, re-runs on the ordinary JOIN with reason
+A non-differential eligible join is consumed batch by batch on the eval
+stack together with its tail (#1475, #1370): the longest prefix of the
+operators after it that are row-local FILTERs, optionally ended by one
+row-local MAP.  A MAP always ends the tail.  The full join intermediate is
+therefore not materialized while the pipeline runs: each batch is filtered
+(and mapped) into one output relation, which is published only after the
+last batch and has the schema the sequential operators would publish -- the
+JOIN output's for a FILTER ending, `col0..` without types for a MAP ending.
+Operators after the tail run as before, and what reads the tail's output
+decides strict mode as described below.  The FILTERs may use only numeric
+variables, numeric and boolean literals, and comparisons.  The MAP may
+project columns or evaluate numeric expressions -- integer and float
+arithmetic and comparisons (#1777).  A MAP with a string, digest, UUID,
+aggregate or extension expression is not consumed; those have no batch
+contract yet.  A pipeline whose input goes stale mid-stream, or whose
+arrangement is unavailable, re-runs on the ordinary JOIN with reason
 `pipeline-not-consumable` (`ENOTSUP` under `WIRELOG_JOIN_BATCH_STRICT=1`).
 A FILTER or MAP failure inside the pipeline returns that operator's errno --
 for MAP, `ERANGE` for a failed expression and `ENOSPC` for a denied

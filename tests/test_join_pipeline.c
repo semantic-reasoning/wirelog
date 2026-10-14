@@ -160,8 +160,8 @@ test_conservative_exclusions(void)
     ops[1].materialized = false;
     plan.op_count = 2;
     CHECK(wl_columnar_join_pipeline_preflight(&plan, 0, &sess, NULL)
-        == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
-        "FILTER without MAP is excluded");
+        == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE,
+        "a FILTER-only tail is eligible");
     ops[1].op = WL_PLAN_OP_MAP;
     ops[1].filter_expr.data = NULL;
     ops[1].filter_expr.size = 0;
@@ -1012,6 +1012,22 @@ test_excluded_map_is_diagnosed(void)
     pl_plan_init(&p, exprs, 1);
     wl_columnar_ops_test_before_map_dispose = pl_map_observer;
 
+    pl_observe_reset();
+    want = pl_run(sess, &p.plan, 0);
+    fallbacks = sess->join_batch_fallback_count;
+    pl_observe_reset();
+    run = pl_run(sess, &p.plan, sess->join_batch_bytes);
+    CHECK(run.rc == 0 && pl_same_rows(&run, &want) && pl_map_calls == 1,
+        "an excluded MAP runs once on the consumed FILTER prefix's output");
+    CHECK(sess->join_batch_fallback_count == fallbacks,
+        "a consumed FILTER prefix ahead of an excluded MAP records nothing");
+    free(run.rows);
+    free(want.rows);
+
+    /* Without the FILTER the MAP is the first operator after the JOIN,
+     * so nothing is consumed and the old diagnosis holds. */
+    p.ops[1] = p.ops[2];
+    p.plan.op_count = 2;
     pl_observe_reset();
     want = pl_run(sess, &p.plan, 0);
     fallbacks = sess->join_batch_fallback_count;
@@ -2388,6 +2404,405 @@ test_consumed_tail_then_materializing_successor(void)
     wl_columnar_ops_test_before_reduce_dispose = NULL;
 }
 
+/* ---- FILTER-only tails and the longest consumable prefix (a2b1) ------- */
+
+static uint32_t a2_filter_calls;
+static uint32_t a2_filter_max_rows;
+
+static void
+a2_filter_observer(eval_stack_t *stack, eval_entry_t *entry)
+{
+    (void)stack;
+    a2_filter_calls++;
+    if (entry && entry->rel && entry->rel->nrows > a2_filter_max_rows)
+        a2_filter_max_rows = entry->rel->nrows;
+}
+
+static void
+a2_observe_reset(void)
+{
+    a2_filter_calls = 0;
+    a2_filter_max_rows = 0;
+    pl_observe_reset();
+}
+
+/* col3 >= 101 over the JOIN output (k, v, k, r). */
+static uint8_t a2_r_ge_101[] = {
+    PL_VAR('3'), PL_INT(101), WL_PLAN_EXPR_CMP_GTE,
+};
+/* col1 >= 101 over MAP[1,3] output (v, r). */
+static uint8_t a2_mapped_r_ge_101[] = {
+    PL_VAR('1'), PL_INT(101), WL_PLAN_EXPR_CMP_GTE,
+};
+
+static void
+test_tail_grammar_preflight(void)
+{
+    enum { F_NUM = 1, F_EXT, F_MAT, M_PROJ, M_STR, R_OP };
+    static const char *const keys[] = { "col0" };
+    static const uint32_t project[] = { 0 };
+    static uint8_t ext[] = {
+        WL_PLAN_EXPR_EXTENSION_CALL, 1, 0, 'f', 0, 0, 0, 0
+    };
+    static uint8_t str[] = { WL_PLAN_EXPR_CONST_STR, 1, 0, 's' };
+    static const struct {
+        int ops[3];
+        uint32_t n;
+        wl_columnar_join_pipeline_eligibility_t want;
+        uint32_t want_end;
+        const char *name;
+    } rows[] = {
+        { { F_NUM }, 1, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1, "FILTER" },
+        { { F_NUM, F_NUM }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 2,
+          "FILTER FILTER" },
+        { { F_NUM, M_PROJ }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 2,
+          "FILTER MAP" },
+        { { M_PROJ, F_NUM }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "MAP FILTER" },
+        { { F_NUM, F_EXT, M_PROJ }, 3, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "FILTER FILTER(ext) MAP" },
+        { { F_NUM, M_STR }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "FILTER MAP(string)" },
+        { { F_NUM, R_OP }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "FILTER REDUCE" },
+        { { F_EXT }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER,
+          UINT32_MAX, "FILTER(ext)" },
+        { { F_MAT }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER,
+          UINT32_MAX, "FILTER(materialized)" },
+        { { M_STR }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP, UINT32_MAX,
+          "MAP(string)" },
+        { { R_OP }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE, UINT32_MAX,
+          "REDUCE" },
+        { { 0 }, 0, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE, UINT32_MAX,
+          "end of plan" },
+    };
+    wl_plan_expr_buffer_t str_exprs[] = { { str, sizeof(str) } };
+    wl_col_session_t sess;
+
+    memset(&sess, 0, sizeof(sess));
+    sess.join_batch_bytes = 4096;
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        wl_plan_op_t ops[4];
+        wl_plan_relation_t plan;
+        uint32_t tail_end = 0;
+        wl_columnar_join_pipeline_eligibility_t got;
+
+        memset(ops, 0, sizeof(ops));
+        memset(&plan, 0, sizeof(plan));
+        ops[0].op = WL_PLAN_OP_JOIN;
+        ops[0].right_relation = "right";
+        ops[0].left_keys = keys;
+        ops[0].right_keys = keys;
+        ops[0].key_count = 1;
+        for (uint32_t i = 0; i < rows[r].n; i++) {
+            wl_plan_op_t *op = &ops[i + 1u];
+            switch (rows[r].ops[i]) {
+            case F_NUM:
+            case F_MAT:
+                op->op = WL_PLAN_OP_FILTER;
+                op->filter_expr = (wl_plan_expr_buffer_t){
+                    a2_r_ge_101, sizeof(a2_r_ge_101)
+                };
+                op->materialized = rows[r].ops[i] == F_MAT;
+                break;
+            case F_EXT:
+                op->op = WL_PLAN_OP_FILTER;
+                op->filter_expr = (wl_plan_expr_buffer_t){ ext, sizeof(ext) };
+                break;
+            case M_PROJ:
+            case M_STR:
+                op->op = WL_PLAN_OP_MAP;
+                op->project_indices = project;
+                op->project_count = 1;
+                if (rows[r].ops[i] == M_STR) {
+                    op->map_exprs = str_exprs;
+                    op->map_expr_count = 1;
+                }
+                break;
+            default:
+                op->op = WL_PLAN_OP_REDUCE;
+                break;
+            }
+        }
+        plan.ops = ops;
+        plan.op_count = rows[r].n + 1u;
+        got = wl_columnar_join_pipeline_preflight(&plan, 0, &sess,
+                &tail_end);
+        if (got != rows[r].want || tail_end != rows[r].want_end)
+            fprintf(stderr, "  JOIN %s: verdict %d end %u, want %d end %u\n",
+                rows[r].name, (int)got, tail_end, (int)rows[r].want,
+                rows[r].want_end);
+        CHECK(got == rows[r].want && tail_end == rows[r].want_end,
+            "the tail is the longest consumable prefix after the JOIN");
+    }
+}
+
+/* JOIN -> FILTER(col3 >= 101) -> CONCAT over an empty 4-column base, or
+ * JOIN -> FILTER(col3 >= 101) at the end of the plan. */
+static void
+a2_filter_plan(wl_plan_op_t ops[3], wl_plan_relation_t *plan, bool concat)
+{
+    memset(ops, 0, 3u * sizeof(ops[0]));
+    memset(plan, 0, sizeof(*plan));
+    a1_join(&ops[0], "right", WL_DELTA_AUTO);
+    ops[1].op = WL_PLAN_OP_FILTER;
+    ops[1].filter_expr = (wl_plan_expr_buffer_t){ a2_r_ge_101,
+                                                  sizeof(a2_r_ge_101) };
+    ops[2].op = WL_PLAN_OP_CONCAT;
+    plan->ops = ops;
+    plan->op_count = concat ? 3u : 2u;
+}
+
+static const int64_t a2_filter_want[] = {
+    0, 10, 0, 101, 1, 20, 1, 200, 1, 20, 1, 201,
+};
+
+static void
+test_filter_only_tail_matches_oracle(void)
+{
+    wl_columnar_filter_test_before_filter_dispose = a2_filter_observer;
+    for (int concat = 0; concat < 2; concat++) {
+        for (int knob = 0; knob < 2; knob++) {
+            for (int strict = 0; strict < 2; strict++) {
+                wl_plan_op_t ops[3];
+                wl_plan_relation_t plan;
+                a1_run_t run;
+                wl_col_session_t *sess = sel_session();
+
+                CHECK(sess != NULL, "FILTER-only tail fixture");
+                if (!sess)
+                    continue;
+                a2_filter_plan(ops, &plan, concat != 0);
+                sess->join_batch_strict = strict != 0;
+                a2_observe_reset();
+                run = a1_eval(sess, &plan, knob ? SEL_BATCH_BYTES : 0,
+                        concat ? a1_empty("base", 4) : NULL, NULL);
+                if (!a1_rows_are(&run, 4, a2_filter_want, 3)
+                    || (knob && (a2_filter_calls != 2
+                    || a2_filter_max_rows > 2))
+                    || sess->join_batch_fallback_count != 0) {
+                    a1_report(concat ? "JOIN FILTER CONCAT" : "JOIN FILTER",
+                        &run);
+                    fprintf(stderr, "  knob=%d strict=%d filters=%u max=%u "
+                        "fallbacks=%u\n", knob, strict, a2_filter_calls,
+                        a2_filter_max_rows, sess->join_batch_fallback_count);
+                }
+                CHECK(a1_rows_are(&run, 4, a2_filter_want, 3),
+                    "a FILTER-only tail returns the filtered join rows");
+                CHECK(!knob || (a2_filter_calls == 2
+                    && a2_filter_max_rows <= 2),
+                    "a FILTER-only tail is filtered batch by batch");
+                CHECK(sess->join_batch_fallback_count == 0,
+                    "a FILTER-only tail feeding a relation sink records "
+                    "nothing");
+                pipeline_session_destroy(sess);
+            }
+        }
+    }
+    wl_columnar_filter_test_before_filter_dispose = NULL;
+    a2_observe_reset();
+}
+
+static void
+test_map_ends_the_tail_before_a_filter(void)
+{
+    static const uint32_t project[] = { 1, 3 };
+    static const int64_t want[] = { 10, 101, 20, 200, 20, 201 };
+
+    wl_columnar_filter_test_before_filter_dispose = a2_filter_observer;
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    for (int strict = 0; strict < 2; strict++) {
+        wl_plan_op_t ops[4];
+        wl_plan_relation_t plan;
+        a1_run_t run;
+        wl_col_session_t *sess = sel_session();
+
+        CHECK(sess != NULL, "MAP-then-FILTER fixture");
+        if (!sess)
+            continue;
+        memset(ops, 0, sizeof(ops));
+        memset(&plan, 0, sizeof(plan));
+        a1_join(&ops[0], "right", WL_DELTA_AUTO);
+        ops[1].op = WL_PLAN_OP_MAP;
+        ops[1].project_indices = project;
+        ops[1].project_count = 2;
+        ops[2].op = WL_PLAN_OP_FILTER;
+        ops[2].filter_expr = (wl_plan_expr_buffer_t){
+            a2_mapped_r_ge_101, sizeof(a2_mapped_r_ge_101)
+        };
+        ops[3].op = WL_PLAN_OP_CONCAT;
+        plan.ops = ops;
+        plan.op_count = 4;
+        sess->join_batch_strict = strict != 0;
+        a2_observe_reset();
+        run = a1_eval(sess, &plan, SEL_BATCH_BYTES, a1_empty("base", 2),
+                NULL);
+        if (!strict) {
+            if (!a1_rows_are(&run, 2, want, 3) || pl_map_calls != 2
+                || a2_filter_calls != 1)
+                fprintf(stderr, "  MAP then FILTER: rc=%d maps=%u "
+                    "filters=%u\n", run.rc, pl_map_calls, a2_filter_calls);
+            CHECK(a1_rows_are(&run, 2, want, 3) && pl_map_calls == 2
+                && a2_filter_calls == 1,
+                "a MAP ends the tail and the FILTER after it runs once");
+        } else {
+            CHECK(run.rc == ENOTSUP && run.left_kept,
+                "strict mode refuses a MAP tail whose output a FILTER reads");
+        }
+        pipeline_session_destroy(sess);
+    }
+    wl_columnar_ops_test_before_map_dispose = NULL;
+    wl_columnar_filter_test_before_filter_dispose = NULL;
+    a2_observe_reset();
+}
+
+#define A2_SCHEMA_COLS 8u
+
+/* The published relation's schema, copied before its session goes. */
+typedef struct {
+    uint32_t ncols;
+    bool timestamps;
+    bool typed;
+    char names[A2_SCHEMA_COLS][16];
+    wirelog_column_type_t types[A2_SCHEMA_COLS];
+} a2_schema_t;
+
+static bool
+a2_same_schema(const a2_schema_t *a, const a2_schema_t *b)
+{
+    if (a->ncols != b->ncols || a->ncols > A2_SCHEMA_COLS
+        || a->timestamps != b->timestamps || a->typed != b->typed)
+        return false;
+    for (uint32_t c = 0; c < a->ncols; c++) {
+        if (strcmp(a->names[c], b->names[c]) != 0)
+            return false;
+        if (a->typed && a->types[c] != b->types[c])
+            return false;
+    }
+    return true;
+}
+
+/* Evaluate JOIN -> FILTER and record the published relation's schema. */
+static int
+a2_filter_output(uint32_t batch_bytes, bool timestamped_left,
+    a2_schema_t *schema)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    wl_plan_op_t ops[3];
+    wl_plan_relation_t plan;
+    eval_stack_t stack;
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *left = pipeline_relation("left", left_names, 2, left_rows, 2);
+    int rc = ENOMEM;
+
+    memset(schema, 0, sizeof(*schema));
+    eval_stack_init(&stack);
+    if (sess && left)
+        rc = timestamped_left ? col_rel_enable_timestamps(left) : 0;
+    if (rc == 0)
+        rc = eval_stack_push_delta(&stack, left, true, false);
+    if (rc != 0) {
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return rc;
+    }
+    a2_filter_plan(ops, &plan, false);
+    sess->join_batch_bytes = batch_bytes;
+    rc = col_eval_relation_plan(&plan, &stack, sess);
+    if (rc == 0 && stack.top == 1 && stack.items[0].rel
+        && stack.items[0].rel->ncols <= A2_SCHEMA_COLS) {
+        const col_rel_t *out = stack.items[0].rel;
+        schema->ncols = out->ncols;
+        schema->timestamps = out->timestamps != NULL;
+        schema->typed = out->column_types != NULL;
+        for (uint32_t c = 0; c < out->ncols; c++) {
+            if (out->col_names && out->col_names[c])
+                snprintf(schema->names[c], sizeof(schema->names[c]), "%s",
+                    out->col_names[c]);
+            if (out->column_types)
+                schema->types[c] = out->column_types[c];
+        }
+    } else if (rc == 0) {
+        rc = EINVAL;
+    }
+    (void)eval_stack_drain(&stack);
+    pipeline_session_destroy(sess);
+    return rc;
+}
+
+static void
+test_filter_tail_output_parity(void)
+{
+    wl_columnar_filter_test_before_filter_dispose = a2_filter_observer;
+    for (int ts = 0; ts < 2; ts++) {
+        a2_schema_t off;
+        a2_schema_t on;
+        int off_rc = a2_filter_output(0, ts != 0, &off);
+        int on_rc;
+
+        a2_observe_reset();
+        on_rc = a2_filter_output(SEL_BATCH_BYTES, ts != 0, &on);
+        if (off_rc != 0 || on_rc != 0 || !a2_same_schema(&off, &on)
+            || a2_filter_calls < 2)
+            fprintf(stderr, "  parity ts=%d: rc %d/%d ncols %u/%u "
+                "filters=%u\n", ts, off_rc, on_rc, off.ncols, on.ncols,
+                a2_filter_calls);
+        CHECK(off_rc == 0 && on_rc == 0 && off.ncols == 4
+            && a2_same_schema(&off, &on),
+            "a FILTER-ending tail publishes the sequential FILTER's schema");
+        /* A timestamped left widens the join row, so 64 bytes hold one
+         * row per batch there; either way the tail ran per batch. */
+        CHECK(a2_filter_calls >= 2,
+            "the parity run consumed the FILTER tail");
+    }
+    wl_columnar_filter_test_before_filter_dispose = NULL;
+    a2_observe_reset();
+}
+
+static void
+test_filter_tail_budget_sweep(void)
+{
+    uint32_t denied = 0;
+    uint32_t completed = 0;
+
+    for (uint64_t budget = 512; budget <= 24u * 1024u; budget += 512) {
+        wl_columnar_memory_governor_ref_t *governor = a1_governor(budget);
+        wl_col_session_t *sess = governor ? sel_session() : NULL;
+        wl_plan_op_t ops[3];
+        wl_plan_relation_t plan;
+        a1_run_t run;
+
+        if (!sess) {
+            CHECK(false, "FILTER tail budget fixture");
+            if (governor)
+                wl_columnar_memory_governor_ref_release(governor);
+            continue;
+        }
+        sess->memory_governor = governor;
+        a2_filter_plan(ops, &plan, false);
+        run = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+        if (run.rc == ENOSPC) {
+            denied++;
+            if (!run.left_kept || a1_reserved(governor) != 0)
+                fprintf(stderr, "  budget %llu: top=%u kept=%d reserved=%llu\n",
+                    (unsigned long long)budget, run.stack_top,
+                    (int)run.left_kept,
+                    (unsigned long long)a1_reserved(governor));
+            CHECK(run.left_kept && a1_reserved(governor) == 0,
+                "a denied FILTER tail keeps the left input and leaks nothing");
+        } else {
+            completed++;
+            CHECK(a1_rows_are(&run, 4, a2_filter_want, 3),
+                "a FILTER tail that fits its budget returns the oracle");
+        }
+        a1_fanout_session_destroy(sess);
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+    CHECK(denied > 0 && completed > 0,
+        "the FILTER tail budget sweep sees both denial and completion");
+}
+
 int
 main(void)
 {
@@ -2412,6 +2827,11 @@ main(void)
     test_bounded_join_growth_denial_before_reduce();
     test_successor_census_programs();
     test_consumed_tail_then_materializing_successor();
+    test_tail_grammar_preflight();
+    test_filter_only_tail_matches_oracle();
+    test_map_ends_the_tail_before_a_filter();
+    test_filter_tail_output_parity();
+    test_filter_tail_budget_sweep();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);

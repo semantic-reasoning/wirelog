@@ -12,9 +12,10 @@
  * committed batch is never replayed.
  *
  * This is the ordinary keyed-join slice of #1446.  Differential joins,
- * pipeline consumption (JOIN -> FILTER* -> MAP on the eval stack), LFTJ,
- * cross joins, ephemeral hash fallback, K-Fusion and multiworker transport
- * are outside this unit; see docs/MEMORY.md "Bounded join sub-batches".
+ * pipeline consumption (a JOIN with a row-local FILTER/MAP tail on the eval
+ * stack), LFTJ, cross joins, ephemeral hash fallback, K-Fusion and
+ * multiworker transport are outside this unit; see docs/MEMORY.md "Bounded
+ * join sub-batches".
  */
 #ifndef WL_COLUMNAR_JOIN_BATCH_H
 #define WL_COLUMNAR_JOIN_BATCH_H

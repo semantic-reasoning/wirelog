@@ -5378,6 +5378,8 @@ extern void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
 extern bool wl_columnar_ops_test_map_fail_output_alloc;
 extern void (*wl_columnar_ops_test_before_reduce_dispose)(eval_stack_t *,
     eval_entry_t *);
+extern void (*wl_columnar_filter_test_before_filter_dispose)(eval_stack_t *,
+    eval_entry_t *);
 /* Probe-set and SEMIJOIN/ANTIJOIN emit observation points; they also count
  * the calls the standalone operators make. */
 extern uint32_t wl_columnar_join_test_probe_set_build_calls;
