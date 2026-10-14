@@ -1,4 +1,6 @@
-/* Internal JOIN -> FILTER* -> MAP pipeline preflight (Issue #1475). */
+/* Internal JOIN pipeline: a JOIN followed by its longest consumable prefix
+ * of row-local FILTERs, optionally ended by one row-local MAP (Issues #1475,
+ * #1370). */
 #ifndef WL_COLUMNAR_JOIN_PIPELINE_H
 #define WL_COLUMNAR_JOIN_PIPELINE_H
 
@@ -18,10 +20,13 @@ typedef enum {
  * and numeric expression MAPs (Issue #1777) are row-local without consulting
  * intern or extension/session state; string, digest, UUID, aggregate and
  * extension expressions remain excluded until their ownership and retry
- * contracts are defined. */
+ * contracts are defined.  Returns ELIGIBLE and *@tail_end (the last consumed
+ * operator) when at least one operator after the JOIN is consumable; a MAP
+ * ends the prefix.  Otherwise it returns why the first operator after the
+ * JOIN is not consumed and sets *@tail_end to UINT32_MAX. */
 wl_columnar_join_pipeline_eligibility_t
 wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
-    uint32_t join_index, const wl_col_session_t *sess, uint32_t *map_index);
+    uint32_t join_index, const wl_col_session_t *sess, uint32_t *tail_end);
 
 const char *
 wl_columnar_join_pipeline_eligibility_name(
@@ -59,17 +64,17 @@ wl_columnar_join_successor_t
 wl_columnar_join_pipeline_successor(const wl_plan_relation_t *plan,
     uint32_t first_unconsumed);
 
-/* Consume an eligible JOIN -> FILTER* -> MAP pipeline directly
- * from a bounded join continuation.  Returns 0 when the shape is not
- * eligible, 1 when the pipeline was evaluated and pushed, or an errno value
- * when an eligible pipeline could not be completed.  The caller may then
- * restore the original stack entry and use the ordinary join path.
- * The JOIN is consumed only when its right-operand selection resolves to
- * the persistent relation and its key columns resolve in range on both
- * sides; otherwise 0 is returned with the stack unchanged.  Incompatible
- * key types return EINVAL before the left input is popped.
- * When 0 is returned and @decline is non-NULL, *@decline says why; it is
- * NONE whenever an errno or 1 is returned. */
+/* Consume an eligible JOIN and the tail wl_columnar_join_pipeline_preflight
+ * accepts, directly from a bounded join continuation.  Returns 0 when the
+ * shape is not eligible, 1 when the pipeline was evaluated and pushed, or an
+ * errno value when an eligible pipeline could not be completed.  The caller
+ * may then restore the original stack entry and use the ordinary join path.
+ * The JOIN is consumed only when its right-operand selection resolves to the
+ * persistent relation and its key columns resolve in range on both sides;
+ * otherwise 0 is returned with the stack unchanged.  Incompatible key types
+ * return EINVAL before the left input is popped.  When 0 is returned and
+ * @decline is non-NULL, *@decline says why; it is NONE whenever an errno or
+ * 1 is returned. */
 int
 wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,

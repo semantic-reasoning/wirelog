@@ -691,6 +691,12 @@ wl_columnar_filter_scratch_add(uint64_t count, uint64_t size,
            && wl_columnar_memory_size_add(*total, bytes, total);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test-only observer, called with each FILTER input after it is popped. */
+void (*wl_columnar_filter_test_before_filter_dispose)(eval_stack_t *,
+    eval_entry_t *);
+#endif
+
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -699,6 +705,10 @@ wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     int pop_rc = eval_stack_pop_relation(stack, &e);
     if (pop_rc != 0)
         return pop_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_filter_test_before_filter_dispose)
+        wl_columnar_filter_test_before_filter_dispose(stack, &e);
+#endif
 
     wl_columnar_memory_governor_ref_t *governor = sess->memory_governor
         ? sess->memory_governor : e.rel->memory_governor;

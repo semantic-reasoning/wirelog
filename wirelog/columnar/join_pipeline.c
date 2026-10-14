@@ -99,16 +99,35 @@ wl_columnar_join_pipeline_expr_is_row_local(
     return depth == 1u;
 }
 
+/* Whether @map is a row-local MAP the pipeline can evaluate per batch. */
+static bool
+wl_columnar_join_pipeline_map_is_consumable(const wl_plan_op_t *map)
+{
+    if (map->project_count == 0 || map->materialized)
+        return false;
+    if (map->map_expr_count == 0)
+        return map->map_exprs == NULL && map->project_indices != NULL;
+    if (!map->map_exprs)
+        return false;
+    /* An empty slot projects its column, as in col_op_map(). */
+    for (uint32_t c = 0; c < map->map_expr_count; c++) {
+        const wl_plan_expr_buffer_t *expr = &map->map_exprs[c];
+        if ((expr->data && expr->size > 0)
+            && !wl_columnar_join_pipeline_expr_is_row_local(expr, true))
+            return false;
+    }
+    return true;
+}
+
 wl_columnar_join_pipeline_eligibility_t
 wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
-    uint32_t join_index, const wl_col_session_t *sess, uint32_t *map_index)
+    uint32_t join_index, const wl_col_session_t *sess, uint32_t *tail_end)
 {
     const wl_plan_op_t *join;
-    const wl_plan_op_t *map;
     uint32_t i;
 
-    if (map_index)
-        *map_index = UINT32_MAX;
+    if (tail_end)
+        *tail_end = UINT32_MAX;
     if (!plan || !sess || join_index >= plan->op_count)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
     if (!plan->ops)
@@ -123,38 +142,34 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
         || join->right_filter_expr.size != 0 || join->materialized)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_JOIN;
 
+    /* The tail is the longest prefix of consumable operators: row-local
+     * FILTERs, optionally ended by one row-local MAP. */
     i = join_index + 1u;
-    while (i < plan->op_count && plan->ops[i].op == WL_PLAN_OP_FILTER) {
-        if (plan->ops[i].materialized)
-            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER;
-        if (!wl_columnar_join_pipeline_expr_is_row_local(
-                &plan->ops[i].filter_expr, false))
-            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER;
-        i++;
-    }
-    if (i >= plan->op_count || plan->ops[i].op != WL_PLAN_OP_MAP)
-        return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
-
-    map = &plan->ops[i];
-    if (map->project_count == 0 || map->materialized)
-        return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
-    if (map->map_expr_count == 0) {
-        if (map->map_exprs != NULL || !map->project_indices)
-            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
-    } else {
-        if (!map->map_exprs)
-            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
-        /* An empty slot projects its column, as in col_op_map(). */
-        for (uint32_t c = 0; c < map->map_expr_count; c++) {
-            const wl_plan_expr_buffer_t *expr = &map->map_exprs[c];
-            if ((expr->data && expr->size > 0)
-                && !wl_columnar_join_pipeline_expr_is_row_local(expr, true))
-                return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+    while (i < plan->op_count) {
+        const wl_plan_op_t *op = &plan->ops[i];
+        if (op->op == WL_PLAN_OP_FILTER) {
+            if (op->materialized
+                || !wl_columnar_join_pipeline_expr_is_row_local(
+                    &op->filter_expr, false))
+                break;
+            i++;
+            continue;
         }
+        if (op->op == WL_PLAN_OP_MAP
+            && wl_columnar_join_pipeline_map_is_consumable(op))
+            i++;
+        break;
     }
-
-    if (map_index)
-        *map_index = i;
+    if (i == join_index + 1u) {
+        /* Empty prefix: report why the first operator is not consumed. */
+        if (i < plan->op_count && plan->ops[i].op == WL_PLAN_OP_FILTER)
+            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_FILTER;
+        if (i < plan->op_count && plan->ops[i].op == WL_PLAN_OP_MAP)
+            return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_MAP;
+        return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
+    }
+    if (tail_end)
+        *tail_end = i - 1u;
     return WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE;
 }
 
@@ -178,8 +193,8 @@ wl_columnar_join_pipeline_eligibility_name(
 typedef struct {
     wl_col_session_t *sess;
     const wl_plan_relation_t *plan;
-    uint32_t first_filter;
-    uint32_t map_index;
+    uint32_t first_tail;
+    uint32_t tail_end;
     col_rel_t *out;
     uint32_t pending_begin;
     int error; /* errno of a failed FILTER/MAP, reported unchanged */
@@ -247,21 +262,16 @@ pipeline_sink_append(void *context,
         sink->error = rc;
         return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
     }
-    for (uint32_t i = sink->first_filter; i < sink->map_index; i++) {
-        rc = wl_columnar_filter_op(&sink->plan->ops[i], &batch_stack,
-                sink->sess);
+    for (uint32_t i = sink->first_tail; i <= sink->tail_end; i++) {
+        const wl_plan_op_t *op = &sink->plan->ops[i];
+        rc = op->op == WL_PLAN_OP_MAP
+            ? col_op_map(op, &batch_stack, sink->sess)
+            : wl_columnar_filter_op(op, &batch_stack, sink->sess);
         if (rc != 0) {
             (void)eval_stack_drain(&batch_stack);
             sink->error = rc;
             return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
         }
-    }
-    rc = col_op_map(&sink->plan->ops[sink->map_index], &batch_stack,
-            sink->sess);
-    if (rc != 0) {
-        (void)eval_stack_drain(&batch_stack);
-        sink->error = rc;
-        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
     }
     rc = eval_stack_pop_relation(&batch_stack, &result);
     if (rc != 0 || !result.rel) {
@@ -392,7 +402,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
 {
     wl_columnar_join_pipeline_eligibility_t eligibility;
     const wl_plan_op_t *join;
-    const wl_plan_op_t *map;
+    const wl_plan_op_t *last;
     eval_entry_t left_entry;
     col_rel_t *right;
     wl_columnar_join_selection_t selection;
@@ -400,7 +410,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     wl_columnar_continuation_t *continuation = NULL;
     wl_join_pipeline_sink_t sink_ctx;
     wl_columnar_continuation_sink_t sink;
-    uint32_t map_index = UINT32_MAX;
+    uint32_t tail_end = UINT32_MAX;
     uint32_t *lk = NULL;
     uint32_t *rk = NULL;
     int rc;
@@ -410,7 +420,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     if (decline)
         *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
     eligibility = wl_columnar_join_pipeline_preflight(plan, join_index,
-            sess, &map_index);
+            sess, &tail_end);
     /* Session- and JOIN-level exclusions decline before the operand is
      * examined; a shape exclusion is decided after it, so that what the
      * JOIN reads takes precedence over what follows it. */
@@ -508,12 +518,12 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
         return 0;
     }
-    map = &plan->ops[map_index];
+    last = &plan->ops[tail_end];
     /* Strict mode refuses a tail whose output another operator reads
      * before any producer exists; eval_plan records
      * pipeline-not-consumable once for the ENOTSUP. */
     if (sess->join_batch_strict
-        && wl_columnar_join_pipeline_successor(plan, map_index + 1u)
+        && wl_columnar_join_pipeline_successor(plan, tail_end + 1u)
         == WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING) {
         free(lk);
         free(rk);
@@ -529,11 +539,24 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     if (rc != 0)
         return rc;
 
-    out = col_rel_new_auto("$join_pipeline", map->project_count);
-    if (!out) {
+    /* The output has the schema the sequential tail would publish: a MAP's
+     * is new_auto(project_count), as in col_op_map(); a FILTER's is its
+     * input's, which is the JOIN output's for a FILTER-only tail. */
+    if (last->op == WL_PLAN_OP_MAP) {
+        out = col_rel_new_auto("$join_pipeline", last->project_count);
+        rc = out ? 0 : ENOMEM;
+    } else {
+        out = col_rel_new_auto("$join_pipeline",
+                col_join_output_width(stack->items[stack->top - 1].rel,
+                right, join));
+        rc = out ? col_join_set_output_types(out,
+                stack->items[stack->top - 1].rel, right, join) : ENOMEM;
+    }
+    if (rc != 0) {
+        col_rel_destroy(out);
         wl_columnar_continuation_cancel(continuation);
         wl_columnar_continuation_destroy(continuation);
-        return ENOMEM;
+        return rc;
     }
     if (sess->memory_governor) {
         rc = col_rel_attach_memory_governor(out, sess->memory_governor);
@@ -551,8 +574,8 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     memset(&sink_ctx, 0, sizeof(sink_ctx));
     sink_ctx.sess = sess;
     sink_ctx.plan = plan;
-    sink_ctx.first_filter = join_index + 1u;
-    sink_ctx.map_index = map_index;
+    sink_ctx.first_tail = join_index + 1u;
+    sink_ctx.tail_end = tail_end;
     sink_ctx.out = out;
     memset(&sink, 0, sizeof(sink));
     sink.context = &sink_ctx;
@@ -609,6 +632,6 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         return rc;
     }
     if (next_index)
-        *next_index = map_index;
+        *next_index = tail_end;
     return 1;
 }
