@@ -2230,6 +2230,105 @@ test_successor_census_programs(void)
         "census: a JOIN -> FILTER* -> MAP tail feeds a relation sink");
 }
 
+/* A consumed tail whose output another operator reads (#1370 unit a1b). */
+static void
+test_consumed_tail_then_materializing_successor(void)
+{
+    static const uint32_t project[] = { 0, 3 };
+    static uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    static const int64_t want[] = { 0, 2, 1, 2 };
+
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    wl_columnar_ops_test_before_reduce_dispose = a1_reduce_observer;
+    for (int strict = 0; strict < 2; strict++) {
+        wl_plan_op_t ops[4];
+        wl_plan_relation_t plan;
+        a1_run_t run;
+        wl_col_session_t *sess = sel_session();
+
+        CHECK(sess != NULL, "consumed-tail fixture");
+        if (!sess)
+            continue;
+        memset(&plan, 0, sizeof(plan));
+        memset(ops, 0, sizeof(ops));
+        a1_join(&ops[0], "right", WL_DELTA_AUTO);
+        ops[1].op = WL_PLAN_OP_FILTER;
+        ops[1].filter_expr = (wl_plan_expr_buffer_t){ predicate,
+                                                      sizeof(predicate) };
+        ops[2].op = WL_PLAN_OP_MAP;
+        ops[2].project_indices = project;
+        ops[2].project_count = 2;
+        a1_count_by_k(&ops[3]);
+        plan.ops = ops;
+        plan.op_count = 4;
+        sess->join_batch_strict = strict != 0;
+        pl_observe_reset();
+        run = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+        if (!strict) {
+            if (!a1_rows_are(&run, 2, want, 2) || pl_map_calls != 2)
+                a1_report("consumed tail -> REDUCE", &run);
+            CHECK(a1_rows_are(&run, 2, want, 2) && pl_map_calls == 2
+                && a1_reduce_calls == 1,
+                "without strict mode a consumed tail feeds the REDUCE");
+            CHECK(sess->join_batch_fallback_count == 0,
+                "without strict mode a consumed tail records nothing");
+        } else {
+            if (run.rc != ENOTSUP || pl_map_calls != 0)
+                fprintf(stderr, "  strict consumed tail: rc=%d maps=%u\n",
+                    run.rc, pl_map_calls);
+            CHECK(run.rc == ENOTSUP && run.left_kept && pl_map_calls == 0
+                && a1_reduce_calls == 0,
+                "strict mode refuses a consumed tail that feeds a REDUCE "
+                "before the JOIN runs");
+            CHECK(sess->join_batch_fallback_count == 1
+                && sess->join_batch_last_reason
+                == COL_JOIN_BATCH_EXCLUDED_PIPELINE,
+                "the strict refusal records pipeline-not-consumable once");
+        }
+        pipeline_session_destroy(sess);
+    }
+
+    /* The same tail at the end of the plan is still consumed under strict
+     * mode: the check follows the tail's output, not its first operator. */
+    {
+        static const int64_t want_rows[] = {
+            0, 100, 0, 101, 1, 200, 1, 201,
+        };
+        wl_plan_op_t ops[3];
+        wl_plan_relation_t plan;
+        a1_run_t run;
+        wl_col_session_t *sess = sel_session();
+
+        CHECK(sess != NULL, "strict consumed-tail sink fixture");
+        if (sess) {
+            memset(&plan, 0, sizeof(plan));
+            memset(ops, 0, sizeof(ops));
+            a1_join(&ops[0], "right", WL_DELTA_AUTO);
+            ops[1].op = WL_PLAN_OP_FILTER;
+            ops[1].filter_expr = (wl_plan_expr_buffer_t){ predicate,
+                                                          sizeof(predicate) };
+            ops[2].op = WL_PLAN_OP_MAP;
+            ops[2].project_indices = project;
+            ops[2].project_count = 2;
+            plan.ops = ops;
+            plan.op_count = 3;
+            sess->join_batch_strict = true;
+            pl_observe_reset();
+            run = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+            if (!a1_rows_are(&run, 2, want_rows, 4) || pl_map_calls != 2)
+                a1_report("strict consumed tail at the end", &run);
+            CHECK(a1_rows_are(&run, 2, want_rows, 4) && pl_map_calls == 2
+                && sess->join_batch_fallback_count == 0,
+                "strict mode still consumes a tail whose output reaches "
+                "the end of the plan");
+            pipeline_session_destroy(sess);
+        }
+    }
+    pl_observe_reset();
+    wl_columnar_ops_test_before_map_dispose = NULL;
+    wl_columnar_ops_test_before_reduce_dispose = NULL;
+}
+
 int
 main(void)
 {
@@ -2252,6 +2351,7 @@ main(void)
     test_delta_right_decline_records_one_reason();
     test_bounded_join_growth_denial_before_reduce();
     test_successor_census_programs();
+    test_consumed_tail_then_materializing_successor();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);

@@ -509,6 +509,16 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         return 0;
     }
     map = &plan->ops[map_index];
+    /* Strict mode refuses a tail whose output another operator reads
+     * before any producer exists; eval_plan records
+     * pipeline-not-consumable once for the ENOTSUP. */
+    if (sess->join_batch_strict
+        && wl_columnar_join_pipeline_successor(plan, map_index + 1u)
+        == WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING) {
+        free(lk);
+        free(rk);
+        return ENOTSUP;
+    }
 
     rc = col_join_batch_producer_create(sess, join,
             stack->items[stack->top - 1].rel,
