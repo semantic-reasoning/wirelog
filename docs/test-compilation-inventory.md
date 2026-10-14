@@ -330,3 +330,22 @@ test_workers_as_cap, test_workqueue
 - test_tdd_single_key_owner, test_wide_relation, test_wirelog_easy_inline_facts, test_worker_arena_borrow, test_worker_borrow_w2_tsan, test_worker_session
 - test_workers_as_cap, test_workqueue
 
+
+## MEMORY-hook fixture variant (#2172)
+
+`evaluation_work` and `evaluation_numeric_operators` link only
+`testlib_prod_memory_hooks`. This test-only archive reuses the common objects
+extracted from `testlib_prod`, excluding `memory_governor.c` and
+`evaluation_control.c`, and compiles those two sources once with the common
+flags plus `WL_COLUMNAR_MEMORY_TEST_HOOKS=1`. The fixture translation units
+retain their SESSION, MEMORY and RESIZE hook flags. Other fixtures continue
+to use their existing libraries.
+
+Neither client directly compiles the replacement sources or links the original
+archive. This preserves one governor/control implementation per executable;
+combining direct hook objects with the original archive caused duplicate
+Clang ASan global registration with LTO enabled. The source archive and variant
+use non-unity objects so subset extraction cannot accidentally include the
+excluded sources. LTO and sanitizer settings remain enabled as configured.
+Common sources are not compiled again for this variant. The original inventory
+counts above describe the #1572 conversion, not this later addition.
