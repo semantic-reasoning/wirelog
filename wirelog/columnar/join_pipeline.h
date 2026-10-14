@@ -31,7 +31,11 @@ wl_columnar_join_pipeline_eligibility_name(
  * from a bounded join continuation.  Returns 0 when the shape is not
  * eligible, 1 when the pipeline was evaluated and pushed, or an errno value
  * when an eligible pipeline could not be completed.  The caller may then
- * restore the original stack entry and use the ordinary join path. */
+ * restore the original stack entry and use the ordinary join path.
+ * The JOIN is consumed only when its right-operand selection resolves to
+ * the persistent relation and its key columns resolve in range on both
+ * sides; otherwise 0 is returned with the stack unchanged.  Incompatible
+ * key types return EINVAL before the left input is popped. */
 int
 wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,

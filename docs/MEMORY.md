@@ -1243,6 +1243,14 @@ join with reason `pipeline-not-consumable` (`ENOTSUP` under
 returns that operator's errno -- for MAP, `ERANGE` for a failed expression
 and `ENOSPC` for a denied admission -- and publishes no rows.
 
+Before it creates a producer, the pipeline applies the JOIN's right-operand
+selection, a key-column range check and the key-type check.  A `$d$` or
+`$r$` right operand, a forced-empty right operand, or a key that resolves
+outside a zero-column input is left to the ordinary JOIN, so under
+`WIRELOG_JOIN_BATCH_STRICT=1` a delta right operand with a consumable tail
+is `ENOTSUP`, as it is for the plain bounded JOIN.  A FLOAT key paired with
+a non-FLOAT key is `EINVAL`, as from the ordinary JOIN.
+
 Ownership and admission:
 
 - The producer holds one arrangement lease for its whole lifetime, one
