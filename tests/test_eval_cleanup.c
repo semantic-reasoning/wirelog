@@ -260,6 +260,7 @@ static wl_columnar_memory_governor_t *frame_governor;
 static wl_columnar_memory_reservation_t frame_peer;
 static unsigned frame_event, frame_stop, frame_mode, frame_later;
 static unsigned frame_kinds[2048], frame_phases[2048];
+static uint64_t frame_progress[2048];
 static unsigned frame_failed_cas, frame_physical;
 static bool frame_restarted, frame_contention, frame_peer_added;
 static bool frame_cleanup_restart;
@@ -359,6 +360,8 @@ frame_checkpoint(wl_evaluation_control_t *c, unsigned phase, uint64_t progress)
         wl_columnar_memory_governor_ref_release(frame_drop_ref);
         frame_drop_ref = NULL;
     }
+    if (!frame_restarted && frame_event < 2048)
+        frame_progress[frame_event] = progress;
     frame_forward(c, FRAME_LOCAL, phase);
 }
 
@@ -721,6 +724,668 @@ test_frame_sole_pin(void)
     free(s);
 }
 
+static col_rel_t *
+unary_relation(wl_col_session_t *s, int64_t value)
+{
+    col_rel_t *r = NULL;
+    if (s->memory_governor)
+        CHECK(wl_columnar_relation_new_auto_governed("unary", 1, 1, false,
+            s->memory_governor, &r) == 0);
+    else
+        r = col_rel_new_auto("unary", 1);
+    CHECK(r && col_rel_append_row(r, &value) == 0);
+    return r;
+}
+
+static void
+unary_row(col_rel_t *r, int64_t value)
+{
+    CHECK(r && r->nrows == 1 && r->ncols == 1 && r->columns[0][0] == value);
+}
+
+static bool
+unary_entry_equal(const eval_entry_t *a, const eval_entry_t *b)
+{
+    return a->rel == b->rel && a->owned == b->owned
+           && a->is_delta == b->is_delta &&
+           a->seg_boundaries == b->seg_boundaries
+           && a->seg_count == b->seg_count && a->kind == b->kind
+           && a->continuation == b->continuation;
+}
+
+static col_rel_t *
+unary_frame(wl_col_session_t *s, wl_columnar_eval_stack_cleanup_frame_t **f,
+    unsigned top, bool top_owned)
+{
+    CHECK(top > 0 && top <= COL_STACK_MAX);
+    CHECK(wl_columnar_eval_stack_cleanup_begin(s, f) == 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(*f);
+    for (unsigned i = 0; i < top; i++)
+        CHECK(eval_stack_push(stack, unary_relation(s, 1000 + i),
+            i + 1 == top ? top_owned : true) == 0);
+    return stack->items[top - 1].rel;
+}
+
+static int
+unary_begin(wl_columnar_eval_stack_cleanup_frame_t *f)
+{
+    return wl_columnar_eval_stack_unary_begin_attempt_controlled(f,
+               frame_control,
+               wl_evaluation_control_active_attempt_id(frame_control));
+}
+
+static col_rel_t **
+unary_output(wl_columnar_eval_stack_cleanup_frame_t *f)
+{
+    col_rel_t **slot = NULL;
+    /* Complete accessor work belongs to its caller, independently of the
+     * begin/commit tariffs. These literal48/56 are accepted caller envelopes. */
+    CHECK(wl_evaluation_control_charge(frame_control, 56) == 0);
+    CHECK(wl_columnar_eval_stack_unary_output(f, &slot) == 0 && slot && !*slot);
+    return slot;
+}
+
+struct unary_thread_context {
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    bool retry;
+    int result, reset_result, input_result, output_result;
+};
+
+static void *
+unary_other_thread(void *arg)
+{
+    struct unary_thread_context *ctx = arg;
+    const col_rel_t *input = (const col_rel_t *)&frame_owner;
+    col_rel_t **output = (col_rel_t **)&frame_owner;
+    if (!ctx->retry) {
+        ctx->input_result = wl_columnar_eval_stack_unary_input(ctx->frame,
+                &input);
+        ctx->output_result = wl_columnar_eval_stack_unary_output(ctx->frame,
+                &output);
+        CHECK(input == (const col_rel_t *)&frame_owner
+            && output == (col_rel_t **)&frame_owner);
+    }
+    ctx->result = wl_columnar_eval_stack_unary_finish(ctx->frame, EIO);
+    ctx->reset_result = wl_columnar_eval_stack_unary_reset(ctx->frame);
+    return NULL;
+}
+
+static void
+test_unary_frame_initialization(void)
+{
+    uint64_t bytes = wl_columnar_eval_stack_test_frame_size();
+    CHECK(bytes > sizeof(eval_stack_t) + sizeof(eval_entry_t)
+        + sizeof(wl_columnar_memory_reservation_t) + 3 * sizeof(void *));
+    for (unsigned type = 0; type < 4; type++) {
+        wl_col_session_t *s = new_session();
+        wl_columnar_memory_governor_ref_t *saved = s->memory_governor;
+        if (type & 1) s->memory_governor = NULL;
+        wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+        if (type & 2) {
+            frame_begin(0);
+            CHECK(frame_admit(s, &f) == 0);
+            CHECK(frame_finish(0) == frame_cost(!(type & 1)));
+        } else CHECK(wl_columnar_eval_stack_cleanup_begin(s, &f) == 0);
+        CHECK(s->cleanup_reserved_bytes == bytes);
+        if (!(type & 1)) CHECK(reserved(s) == bytes);
+        col_rel_t *r = unary_relation(s, 7);
+        CHECK(eval_stack_push(wl_columnar_eval_stack_cleanup_stack(f), r,
+            true) == 0);
+        frame_begin(0);
+        CHECK(unary_begin(f) == 0);
+        const col_rel_t *input = NULL;
+        CHECK(wl_evaluation_control_charge(frame_control, 48) == 0);
+        CHECK(wl_columnar_eval_stack_unary_input(f, &input) == 0 && input == r);
+        CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == 0);
+        CHECK(frame_finish(0) == 544 + 48);
+        CHECK(wl_columnar_eval_stack_unary_reset(f) == 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+        s->memory_governor = saved;
+        destroy_session(s);
+    }
+    wl_col_session_t *s = new_session();
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(s->memory_governor);
+    wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+    atomic_store_explicit(&g->usable_bytes, bytes - 1, memory_order_relaxed);
+    CHECK(wl_columnar_eval_stack_cleanup_begin(s, &f) == ENOSPC && !f);
+    CHECK(!s->cleanup_active && !s->cleanup_reserved_bytes && reserved(s) == 0);
+    atomic_store_explicit(&g->usable_bytes, bytes, memory_order_relaxed);
+    CHECK(wl_columnar_eval_stack_cleanup_begin(s,
+        &f) == 0 && reserved(s) == bytes);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0 && reserved(s) == 0);
+    destroy_session(s);
+}
+
+static void
+test_unary_literal_boundaries(void)
+{
+    const uint64_t begin_fees[] = { 160, 128, 256 };
+    uint64_t prefix = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        uint64_t previous = prefix; prefix += begin_fees[i];
+        for (unsigned exact = 0; exact < 2; exact++) {
+            wl_col_session_t *s = new_session();
+            wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+            col_rel_t *input = unary_frame(s, &f, 1, true);
+            eval_entry_t original =
+                wl_columnar_eval_stack_cleanup_stack(f)->items[0];
+            frame_begin(exact ? prefix : prefix - 1);
+            int rc = unary_begin(f);
+            bool active = exact && i == 2;
+            CHECK(rc == (active ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            CHECK(wl_columnar_eval_stack_unary_finish(f,
+                rc) == (active ? 0 : EINVAL));
+            CHECK(frame_finish(rc) == (exact ? prefix : previous));
+            CHECK(unary_entry_equal(&original,
+                &wl_columnar_eval_stack_cleanup_stack(f)->items[0]));
+            unary_row(input, 1000);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+            destroy_session(s);
+        }
+    }
+    CHECK(prefix == 544);
+    /* Top32 covers every actual per-entry debit and the final cutoff. */
+    uint64_t fees[COL_STACK_MAX + 3];
+    fees[0] = 192; fees[1] = 128;
+    for (unsigned i = 0; i < COL_STACK_MAX; i++) fees[i + 2] = 128;
+    fees[COL_STACK_MAX + 2] = 128;
+    prefix = 0;
+    for (unsigned i = 0; i < COL_STACK_MAX + 3; i++) {
+        uint64_t previous = prefix; prefix += fees[i];
+        for (unsigned exact = 0; exact < 2; exact++) {
+            wl_col_session_t *s = new_session();
+            wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+            (void)unary_frame(s, &f, COL_STACK_MAX, true);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+            eval_entry_t original[COL_STACK_MAX];
+            memcpy(original, stack->items, sizeof(original));
+            frame_begin(544 + 56 + (exact ? prefix : prefix - 1));
+            CHECK(unary_begin(f) == 0);
+            col_rel_t **slot = unary_output(f);
+            col_rel_t *output = unary_relation(s, 9000); *slot = output;
+            bool committed = true;
+            int rc = wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+                    &committed);
+            bool final = exact && i == COL_STACK_MAX + 2;
+            CHECK(rc == (final ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
+            CHECK(committed == final && stack->top == COL_STACK_MAX);
+            for (unsigned j = 0; j < COL_STACK_MAX - 1; j++)
+                CHECK(unary_entry_equal(&original[j], &stack->items[j]));
+            if (final) CHECK(stack->items[COL_STACK_MAX - 1].rel == output);
+            else CHECK(unary_entry_equal(&original[COL_STACK_MAX - 1],
+                    &stack->items[COL_STACK_MAX - 1]));
+            CHECK(wl_columnar_eval_stack_unary_finish(f, rc) == rc);
+            CHECK(frame_finish(rc) == 544 + 56 + (exact ? prefix : previous));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+            destroy_session(s);
+        }
+    }
+    CHECK(prefix == 448 + 128 * COL_STACK_MAX);
+}
+
+static void
+test_unary_aliases(void)
+{
+    for (unsigned owned = 0; owned < 2; owned++)
+        for (unsigned target_owned = 0; target_owned < 2; target_owned++)
+            for (unsigned alias_kind = 0; alias_kind < 3; alias_kind++)
+                for (unsigned commit = 0; commit < 2; commit++)
+                    for (unsigned first_kind = 0; first_kind < 3;
+                        first_kind++) {
+                        wl_col_session_t *s = new_session();
+                        wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+                        /* At31 the original index30 is caught by the fixed head.
+                         * Lower index29 genuinely exercises the scalar remainder. */
+                        unsigned top = alias_kind == 1 ? 31 : 32;
+                        col_rel_t *input = unary_frame(s, &f, top, owned != 0);
+                        eval_stack_t *stack =
+                            wl_columnar_eval_stack_cleanup_stack(f);
+                        eval_entry_t *result =
+                            wl_columnar_eval_stack_cleanup_result(f);
+                        result->rel = unary_relation(s, 7000);
+                        result->owned = true;
+                        eval_entry_t *target = alias_kind == 0
+                        ? &stack->items[top - 1] : alias_kind == 1
+                        ? &stack->items[29] : result;
+                        target->owned = target_owned != 0;
+                        col_rel_t *candidate = target->rel;
+                        bool input_borrowed = !stack->items[top - 1].owned;
+                        bool candidate_borrowed = !target->owned;
+                        bool external_candidate = candidate_borrowed
+                            && candidate != input;
+                        eval_entry_t original[COL_STACK_MAX];
+                        memcpy(original, stack->items, sizeof(original));
+                        eval_entry_t original_result = *result;
+                        uint64_t baseline = reserved(s);
+                        frame_begin(0);
+                        CHECK(unary_begin(f) == 0);
+                        col_rel_t **slot = unary_output(f); *slot = candidate;
+                        uint64_t extra = 0;
+                        if (commit) {
+                            bool published = true;
+                            CHECK(
+                                wl_columnar_eval_stack_unary_commit_attempt_controlled
+                                    (f, &published) == EINVAL && !published);
+                            extra = alias_kind == 1 ? 320 + 128 * 30 : 320;
+                        }
+                        int first = first_kind == 0 ? 0 : first_kind ==
+                            1 ? WL_EVALUATION_CONTROL_CANCELLED : EIO;
+                        if (first_kind == 1) {
+                            wl_evaluation_control_request_cancel(frame_control);
+                            CHECK(wl_evaluation_control_charge(frame_control,
+                                0) == WL_EVALUATION_CONTROL_CANCELLED);
+                        }
+                        int expected = first ? first : EINVAL;
+                        CHECK(wl_columnar_eval_stack_unary_finish(f,
+                            first) == expected);
+                        CHECK(wl_columnar_eval_stack_unary_finish(f,
+                            ENOMEM) == expected);
+                        CHECK(stack->top == top && reserved(s) == baseline);
+                        for (unsigned i = 0; i < top; i++) {
+                            CHECK(unary_entry_equal(&original[i],
+                                &stack->items[i]));
+                            unary_row(stack->items[i].rel, 1000 + i);
+                        }
+                        CHECK(unary_entry_equal(&original_result, result));
+                        unary_row(result->rel, 7000);
+                        CHECK(frame_finish(expected) == 544 + 56 + extra);
+                        CHECK(wl_columnar_eval_stack_unary_reset(f) == 0);
+                        CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+                        if (input_borrowed) {
+                            unary_row(input, 1000 + top - 1);
+                            CHECK(col_rel_destroy_checked(input) == 0);
+                        }
+                        if (external_candidate) {
+                            unary_row(candidate, alias_kind == 1 ? 1029 : 7000);
+                            CHECK(col_rel_destroy_checked(candidate) == 0);
+                        }
+                        CHECK(reserved(s) == 0);
+                        destroy_session(s);
+                    }
+    /* Inactive copied pointers are not live owners and must not collide. */
+    for (unsigned commit = 0; commit < 2; commit++) {
+        wl_col_session_t *s = new_session();
+        wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+        col_rel_t *input = unary_frame(s, &f, 5, true);
+        col_rel_t *candidate = unary_relation(s, 12345);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+        stack->items[5].rel = candidate; stack->items[5].owned = true;
+        frame_begin(0); CHECK(unary_begin(f) == 0);
+        *unary_output(f) = candidate;
+        if (commit) {
+            bool published = false;
+            CHECK(wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+                &published) == 0 && published);
+            CHECK(stack->items[4].rel == candidate);
+        }
+        CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == 0);
+        if (!commit) unary_row(input, 1004);
+        CHECK(frame_finish(0) == 544 + 56 + (commit ? 448 + 128 * 5 : 0));
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+        destroy_session(s);
+    }
+}
+
+static void
+test_unary_retained_and_thread_lifetime(void)
+{
+    for (unsigned commit = 0; commit < 2; commit++)
+        for (unsigned first_kind = 0; first_kind < 3; first_kind++) {
+            wl_col_session_t *s = new_session();
+            wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+            col_rel_t *input = unary_frame(s, &f, 32, true);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+            stack->items[31].is_delta = true;
+            stack->items[31].seg_boundaries = segments();
+            stack->items[31].seg_count = 1;
+            uint32_t *saved_segments = stack->items[31].seg_boundaries;
+            eval_entry_t original = stack->items[31];
+            eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(f);
+            result->rel = unary_relation(s, 7000); result->owned = true;
+            frame_begin(0); CHECK(unary_begin(f) == 0);
+            const col_rel_t *borrowed = NULL;
+            CHECK(wl_evaluation_control_charge(frame_control, 48) == 0);
+            CHECK(wl_columnar_eval_stack_unary_input(f,
+                &borrowed) == 0 && borrowed == input);
+            col_rel_t *output = unary_relation(s, 9000);
+            *unary_output(f) = output;
+            struct unary_thread_context wrong = { .frame = f };
+            wl_thread_t tid;
+            CHECK(wl_thread_create(&tid, unary_other_thread, &wrong) == 0);
+            CHECK(wl_thread_join(&tid) == 0);
+            CHECK(wrong.result == EINVAL && wrong.reset_result == EBUSY
+                && wrong.input_result == EINVAL &&
+                wrong.output_result == EINVAL);
+            CHECK(unary_entry_equal(&original, &stack->items[31]));
+            wl_columnar_eval_stack_cleanup_frame_t *handle = f;
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&handle) == EBUSY &&
+                handle == f);
+            wl_columnar_source_access_reader_t reader = { 0 };
+            CHECK(col_rel_source_reader_acquire(commit ? input : output,
+                &reader) == 0);
+            if (commit) {
+                bool published = false;
+                CHECK(wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+                    &published) == 0 && published);
+                CHECK(stack->top == 32 && stack->items[31].rel == output
+                    && stack->items[31].owned && !stack->items[31].is_delta
+                    && !stack->items[31].seg_boundaries &&
+                    !stack->items[31].seg_count
+                    && stack->items[31].kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+                    && !stack->items[31].continuation);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&handle) == EBUSY &&
+                    handle == f);
+            }
+            int first = first_kind == 0 ? 0 : first_kind ==
+                1 ? WL_EVALUATION_CONTROL_CANCELLED : EIO;
+            if (first_kind == 1) {
+                wl_evaluation_control_request_cancel(frame_control);
+                CHECK(wl_evaluation_control_charge(frame_control,
+                    0) == WL_EVALUATION_CONTROL_CANCELLED);
+            }
+            int expected = first ? first : EBUSY;
+            CHECK(wl_columnar_eval_stack_unary_finish(f, first) == expected);
+            CHECK(wl_columnar_eval_stack_unary_reset(f) == EBUSY);
+            unary_row(input, 1031); unary_row(output, 9000);
+            unary_row(result->rel, 7000);
+            CHECK(saved_segments[0] == 0 && saved_segments[1] == 1);
+            CHECK(frame_finish(expected) ==
+                544 + 48 + 56 + (commit ? 448 + 128 * 32 : 0));
+            /* The old control has been released. Joined later host thread
+             * retires only established authority, never old saved bindings. */
+            CHECK(col_rel_source_reader_release(&reader) == 0);
+            struct unary_thread_context retry = { .frame = f, .retry = true };
+            CHECK(wl_thread_create(&tid, unary_other_thread, &retry) == 0);
+            CHECK(wl_thread_join(&tid) == 0);
+            CHECK(retry.result == first && retry.reset_result == 0);
+            if (!commit) CHECK(unary_entry_equal(&original, &stack->items[31]));
+            else unary_row(stack->items[31].rel, 9000);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+            destroy_session(s);
+        }
+}
+
+static uint64_t
+unary_hook_prefix(unsigned phase, uint64_t progress)
+{
+    if (phase == WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_VALID_PHASE) return 160;
+    if (phase == WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARED_PHASE
+        || phase ==
+        WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE_CUTOFF_PHASE) return 544;
+    if (phase ==
+        WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_VALID_PHASE) return 544 + 56 + 192;
+    if (phase ==
+        WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE) return 544 + 56 + 320 +
+               128 * progress;
+    CHECK(phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE);
+    return 544 + 56 + 448 + 128 * progress;
+}
+
+static void
+test_unary_all_interruptions(void)
+{
+    frame_hooks(true); frame_stop = 0;
+    wl_col_session_t *s = new_session();
+    wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+    (void)unary_frame(s, &f, 32, true);
+    frame_begin(0); CHECK(unary_begin(f) == 0);
+    *unary_output(f) = unary_relation(s, 9000);
+    bool published = false;
+    CHECK(wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+        &published) == 0 && published);
+    unsigned total = frame_event;
+    CHECK(total == 6 + 32);
+    unsigned phases[2048]; uint64_t progress[2048];
+    memcpy(phases, frame_phases, sizeof(phases));
+    memcpy(progress, frame_progress, sizeof(progress));
+    CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == 0);
+    CHECK(frame_finish(0) == 544 + 56 + 448 + 128 * 32);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0); destroy_session(s);
+    for (unsigned mode = 0; mode < 3; mode++)
+        for (unsigned stop = 1; stop <= total; stop++) {
+            s = new_session(); f = NULL;
+            (void)unary_frame(s, &f, 32, true);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+            eval_entry_t original[32];
+            memcpy(original, stack->items, sizeof(original));
+            frame_stop = stop; frame_mode = mode; frame_begin(0);
+            int rc = unary_begin(f); bool active = rc == 0;
+            published = true;
+            if (!rc) {
+                *unary_output(f) = unary_relation(s, 9000);
+                rc = wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+                        &published);
+                CHECK(!published);
+            }
+            int expected = mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED : mode ==
+                1 ? EOVERFLOW : EINVAL;
+            CHECK(rc == expected && frame_event == stop);
+            for (unsigned i = 0; i < 32; i++) {
+                CHECK(unary_entry_equal(&original[i], &stack->items[i]));
+                unary_row(stack->items[i].rel, 1000 + i);
+            }
+            CHECK(wl_columnar_eval_stack_unary_finish(f,
+                rc) == (active ? rc : EINVAL));
+            CHECK(frame_finish(rc) == unary_hook_prefix(phases[stop - 1],
+                progress[stop - 1]));
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+            destroy_session(s);
+        }
+    frame_stop = 0; frame_hooks(false);
+}
+
+static void
+test_unary_interrupted_aliases(void)
+{
+    /* Independent stable ordinals: begin three, commit valid one, head one,
+     * then one event per paid row. Assert both named phase and progress. */
+    const unsigned stops[] = { 4, 5, 12, 35 };
+    const unsigned phases[] = {
+        WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_VALID_PHASE,
+        WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE,
+        WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE,
+        WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE
+    };
+    const uint64_t progresses[] = { 31, 0, 7, 30 };
+    const uint64_t consumed[] = {
+        544 + 56 + 192, 544 + 56 + 320,
+        544 + 56 + 320 + 128 * 7,
+        544 + 56 + 320 + 128 * 30
+    };
+    for (unsigned owned = 0; owned < 2; owned++)
+        for (unsigned mode = 0; mode < 4; mode++)
+            for (unsigned seam = 0; seam < (mode == 3 ? 1u : 4u); seam++) {
+                wl_col_session_t *s = new_session();
+                wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+                (void)unary_frame(s, &f, 31, true);
+                eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+                stack->items[29].owned = owned != 0;
+                col_rel_t *candidate = stack->items[29].rel;
+                eval_entry_t *result =
+                    wl_columnar_eval_stack_cleanup_result(f);
+                result->rel = unary_relation(s, 7000); result->owned = true;
+                eval_entry_t original[COL_STACK_MAX];
+                memcpy(original, stack->items, sizeof(original));
+                eval_entry_t original_result = *result;
+                uint64_t baseline = reserved(s);
+                frame_hooks(true); frame_target = false;
+                frame_stop = mode == 3 ? 0 : stops[seam];
+                frame_mode = mode;
+                frame_begin(mode == 3 ? 544 + 56 + 320 + 8 * 128 - 1 : 0);
+                CHECK(unary_begin(f) == 0);
+                *unary_output(f) = candidate;
+                bool published = true;
+                int rc = wl_columnar_eval_stack_unary_commit_attempt_controlled(
+                    f, &published);
+                int expected = mode == 0 && seam != 3
+                    ? WL_EVALUATION_CONTROL_CANCELLED : mode == 1
+                    ? EOVERFLOW : mode == 3
+                    ? WL_EVALUATION_CONTROL_WORK_LIMIT : EINVAL;
+                CHECK(rc == expected && !published);
+                unsigned events = frame_event;
+                if (mode != 3) {
+                    CHECK(events == stops[seam]);
+                    CHECK(frame_phases[events - 1] == phases[seam]);
+                    CHECK(frame_progress[events - 1] == progresses[seam]);
+                } else {
+                    CHECK(events == 12);
+                    CHECK(frame_phases[events - 1] ==
+                        WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE);
+                    CHECK(frame_progress[events - 1] == 7);
+                }
+                CHECK(wl_columnar_eval_stack_unary_finish(f, rc) == rc);
+                CHECK(wl_columnar_eval_stack_unary_finish(f, ENOMEM) == rc);
+                CHECK(frame_event == events && frame_later == 0);
+                CHECK(stack->top == 31 && reserved(s) == baseline);
+                for (unsigned i = 0; i < 31; i++) {
+                    CHECK(unary_entry_equal(&original[i], &stack->items[i]));
+                    unary_row(stack->items[i].rel, 1000 + i);
+                }
+                CHECK(unary_entry_equal(&original_result, result));
+                unary_row(result->rel, 7000);
+                CHECK(frame_finish(rc) == (mode == 3
+                    ? 544 + 56 + 320 + 7 * 128 : consumed[seam]));
+                CHECK(wl_columnar_eval_stack_unary_reset(f) == 0);
+                frame_stop = 0; frame_hooks(false);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+                if (!owned) {
+                    unary_row(candidate, 1029);
+                    CHECK(col_rel_destroy_checked(candidate) == 0);
+                }
+                CHECK(reserved(s) == 0);
+                destroy_session(s);
+            }
+    frame_stop = 0; frame_hooks(false);
+}
+
+static void
+test_unary_contract_and_generic_cleanup(void)
+{
+    wl_col_session_t *s = new_session();
+    wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+    col_rel_t *input = unary_frame(s, &f, 2, true);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+    frame_begin(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(frame_control);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(f, NULL,
+        id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(f,
+        frame_control, id + 1) == EINVAL);
+    CHECK(frame_finish(EINVAL) == 0);
+    frame_begin(0); CHECK(unary_begin(f) == 0);
+    col_rel_t *output = unary_relation(s, 9000); *unary_output(f) = output;
+    uint32_t saved_top = stack->top;
+    /* Controlled malformed-state injection; restore before legitimate end.
+     * The refusal must neither clamp top nor touch candidate/original owners. */
+    stack->top = COL_STACK_MAX + 1;
+    CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == EINVAL);
+    CHECK(stack->top == COL_STACK_MAX + 1);
+    wl_columnar_eval_stack_cleanup_frame_t *unchanged_handle = f;
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&unchanged_handle) == EINVAL
+        && unchanged_handle == f);
+    stack->top = saved_top;
+    unary_row(input, 1001); unary_row(output, 9000);
+    CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == 0);
+    CHECK(frame_finish(0) == 544 + 56);
+    CHECK(wl_columnar_eval_stack_unary_finish(f, EIO) == 0);
+    const col_rel_t *unchanged = input;
+    CHECK(wl_columnar_eval_stack_unary_input(f,
+        &unchanged) == EINVAL && unchanged == input);
+    CHECK(wl_columnar_eval_stack_unary_reset(f) == 0);
+    /* Pending cleanup must visit retired even when result refuses. */
+    uint64_t frame_bytes = s->cleanup_reserved_bytes;
+    uint64_t relation_bytes = (reserved(s) - frame_bytes) / 2;
+    CHECK(relation_bytes > 0 &&
+        reserved(s) == frame_bytes + 2 * relation_bytes);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(f);
+    result->rel = unary_relation(s, 7000); result->owned = true;
+    wl_columnar_source_access_reader_t result_reader = { 0 },
+        input_reader = { 0 };
+    CHECK(col_rel_source_reader_acquire(result->rel, &result_reader) == 0);
+    CHECK(col_rel_source_reader_acquire(input, &input_reader) == 0);
+    frame_begin(0); CHECK(unary_begin(f) == 0);
+    *unary_output(f) = unary_relation(s, 9001);
+    bool committed = false;
+    CHECK(wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+        &committed) == 0 && committed);
+    CHECK(wl_columnar_eval_stack_unary_finish(f, 0) == EBUSY);
+    CHECK(frame_finish(EBUSY) == 544 + 56 + 448 + 128 * 2);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == EBUSY && !f);
+    CHECK(s->cleanup_pending && s->cleanup_pending_count == 1);
+    CHECK(reserved(s) == frame_bytes + 2 * relation_bytes);
+    CHECK(col_rel_source_reader_release(&input_reader) == 0);
+    CHECK(wl_columnar_eval_stack_cleanup_retry(s) == EBUSY);
+    CHECK(reserved(s) == frame_bytes + relation_bytes);
+    CHECK(col_rel_source_reader_release(&result_reader) == 0);
+    CHECK(wl_columnar_eval_stack_cleanup_retry(s) == 0);
+    destroy_session(s);
+}
+
+static void
+test_unary_snapshot_and_refusals(void)
+{
+    for (unsigned field = 0; field < 7; field++) {
+        wl_col_session_t *s = new_session();
+        wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+        (void)unary_frame(s, &f, 2, true);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f);
+        stack->items[1].is_delta = true;
+        stack->items[1].seg_boundaries = segments();
+        stack->items[1].seg_count = 1;
+        eval_entry_t original = stack->items[1];
+        frame_begin(0); CHECK(unary_begin(f) == 0);
+        col_rel_t *output = unary_relation(s, 9000); *unary_output(f) = output;
+        /* Deliberate validation fault, restored before mandatory ownership
+         * cleanup. No corruption repair or active raw mutation is supported. */
+        if (field == 0) stack->items[1].rel = stack->items[0].rel;
+        else if (field == 1) stack->items[1].owned = false;
+        else if (field == 2) stack->items[1].is_delta = false;
+        else if (field == 3) stack->items[1].seg_boundaries = NULL;
+        else if (field == 4) stack->items[1].seg_count = 2;
+        else if (field ==
+            5) stack->items[1].kind = WL_COLUMNAR_EVAL_ENTRY_CONTINUATION;
+        else stack->items[1].continuation =
+                (wl_columnar_continuation_t *)&frame_owner;
+        bool committed = true;
+        CHECK(wl_columnar_eval_stack_unary_commit_attempt_controlled(f,
+            &committed) == EINVAL && !committed);
+        stack->items[1] = original;
+        unary_row(original.rel, 1001); unary_row(output, 9000);
+        CHECK(wl_columnar_eval_stack_unary_finish(f, EINVAL) == EINVAL);
+        CHECK(frame_finish(EINVAL) == 544 + 56 + 192);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0);
+        destroy_session(s);
+    }
+    /* Genuine continuation input is rejected without popping or destruction,
+     * and an established typed verdict wins later same-ID cancellation. */
+    wl_col_session_t *s = new_session();
+    wl_columnar_eval_stack_cleanup_frame_t *f = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(s, &f) == 0);
+    struct reader_context ctx = { 0 };
+    col_rel_t *r = unary_relation(s, 777);
+    CHECK(col_rel_source_reader_acquire(r, &ctx.reader) == 0);
+    wl_columnar_continuation_producer_t producer = {
+        .context = &ctx, .produce = unused_produce, .destroy = release_reader
+    };
+    wl_columnar_continuation_cursor_t cursor = { 0 };
+    wl_columnar_continuation_t *cont =
+        wl_columnar_continuation_create(&producer, &cursor);
+    CHECK(cont &&
+        eval_stack_push_continuation(wl_columnar_eval_stack_cleanup_stack(f),
+        cont) == 0);
+    frame_hooks(true); frame_target = true; frame_target_kind = FRAME_LOCAL;
+    frame_target_phase = WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_VALID_PHASE;
+    frame_stop = 0; frame_mode = 0; frame_begin(0);
+    CHECK(unary_begin(f) == ENOTSUP);
+    CHECK(ctx.destroyed == 0 &&
+        wl_columnar_eval_stack_cleanup_stack(f)->top == 1);
+    CHECK(frame_finish(ENOTSUP) == 160);
+    frame_target = false; frame_stop = 0; frame_hooks(false);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f) == 0 && ctx.destroyed == 1);
+    col_rel_destroy(r); destroy_session(s);
+}
+
 int
 main(void)
 {
@@ -735,6 +1400,14 @@ main(void)
     test_frame_typed_precedence();
     test_frame_contract_and_retained_cleanup();
     test_frame_sole_pin();
+    test_unary_frame_initialization();
+    test_unary_literal_boundaries();
+    test_unary_aliases();
+    test_unary_retained_and_thread_lifetime();
+    test_unary_all_interruptions();
+    test_unary_interrupted_aliases();
+    test_unary_contract_and_generic_cleanup();
+    test_unary_snapshot_and_refusals();
     puts("eval cleanup: all ownership/admission cases passed");
     return 0;
 }

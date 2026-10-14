@@ -246,6 +246,18 @@ eval_stack_drain_to_session(eval_stack_t *s, wl_col_session_t *sess)
 
 /* Persistent cleanup ownership. Every evaluator caller uses this boundary
  * except K-Fusion, which still drains an unframed stack; see #1648. */
+typedef enum {
+    WL_COLUMNAR_EVAL_STACK_UNARY_IDLE = 0,
+    WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE,
+    WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED,
+    WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED,
+    WL_COLUMNAR_EVAL_STACK_UNARY_DONE,
+} wl_columnar_eval_stack_unary_phase_t;
+
+typedef char wl_columnar_eval_stack_unary_zero_defaults_t[
+        (WL_COLUMNAR_EVAL_STACK_UNARY_IDLE == 0
+        && WL_COLUMNAR_EVAL_ENTRY_RELATION == 0) ? 1 : -1];
+
 struct wl_columnar_eval_stack_cleanup_frame {
     wl_col_session_t *session;
     wl_columnar_eval_stack_cleanup_frame_t *next;
@@ -253,6 +265,28 @@ struct wl_columnar_eval_stack_cleanup_frame {
     eval_entry_t result;
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
+    const void *identity;
+    wl_columnar_eval_stack_unary_phase_t unary_phase;
+    eval_entry_t unary_output;
+    eval_entry_t unary_retired;
+    eval_entry_t unary_snapshot;
+    uint32_t unary_index;
+    uint32_t unary_top;
+    wl_evaluation_control_t *unary_control;
+    uint64_t unary_attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t unary_owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD unary_owner_thread;
+#else
+    pthread_t unary_owner_thread;
+#endif
+    bool unary_thread_valid;
+    bool unary_committed;
+    bool unary_result_saved;
+    int unary_first_result;
+    int unary_cleanup_result;
+    bool unary_alias_rejected;
 };
 
 int
@@ -296,6 +330,8 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
         return ENOMEM;
     }
     wl_columnar_memory_reservation_init(&frame->reservation);
+    frame->identity = frame;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
     if (sess->memory_governor) {
         if (!wl_columnar_memory_reservation_move(&frame->reservation,
             &reservation)) {
@@ -327,7 +363,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
  * decisions and full move40; only allocator, original physical-credit-ref
  * retirement internals, control internals and instrumentation are excluded.
  * ENTRY103<=112, SETUP135<=144, RESERVE156<=192, ALLOC128<=144,
- * ZERO202<=208, TOKEN122<=128, MOVE161<=176, COMMIT104<=128,
+ * ZERO202<=208, TOKEN124<=128 (self/IDLE stores2), MOVE161<=176, COMMIT104<=128,
  * EXTERNAL133<=144 including BOTH T29 tails on one debit. Six terminal
  * publication slots include active_count arithmetic/store2, no later hook.
  * ZERO counts16*(address+store+increment arithmetic/store+test)=80 plus
@@ -553,6 +589,8 @@ wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
     if (rc)
         goto fail;
     wl_columnar_memory_reservation_init(&frame->reservation);
+    frame->identity = frame;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
     rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
             WL_COLUMNAR_EVAL_STACK_TOKEN_PHASE, sizeof(*frame));
     if (rc)
@@ -629,6 +667,463 @@ fail:
     return rc;
 }
 
+/* Unary logical source accounting, not instruction counts or latency.
+ * Clear/copy7, inert14, frame-valid8, native-thread8, forward34,
+ * original-matches23, result5; inherited G9/C13/T29/R10. Disposer14 counts
+ * ordinary routing/stores/return, excluding only original physical internals.
+ * FIRST_FINISH is distinct prepayment for later cleanup, not executed twice
+ * during begin. Finish scaffold82 + grouped sanitizer136 + disposer14=232.
+ * Scan prefix13, each4-scalar group14, each remainder cell5; late remainder
+ * alias135 includes detach8/return. All32 no-match128, at31 no-match129.
+ * No callback/poll or ownership change precedes proof and eight detach stores.
+ * BEGIN_ENTRY133<=144, PREPARE112, COMMIT_ENTRY154<=160, HEAD77<=96,
+ * ROW74<=96 including NEXT refused debit, TERMINAL93<=112 (21 field stores).
+ * Input/output caller envelopes48/56, RETAINED96, DONE24, RESET64.
+ * New generic cleanup guard success14/rejection15, disposer extension36,
+ * continuation extension32 are ordinary work, not blanket excluded scans.
+ * Begin544; commit448+128*n live entries; head alias320, indexj alias
+ * 320+128*(j+1). First-refused begin/commit bootstrap26/58 may consume0.
+ * Retry is bounded per invocation at the mandatory lifetime-cleanup boundary;
+ * one old begin debit never pays arbitrary retries or a whole pending list.
+ * Control/instrumentation/allocator and original physical/token/ref retirement
+ * internals retain narrow exclusions. Future callers compose adjacent work. */
+enum {
+    WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK = 160,
+    WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARE_WORK = 128,
+    WL_COLUMNAR_EVAL_STACK_UNARY_FIRST_FINISH_WORK = 256,
+    WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_ENTRY_WORK = 192,
+    WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_HEAD_WORK = 128,
+    WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_ROW_WORK = 128,
+    WL_COLUMNAR_EVAL_STACK_UNARY_TERMINAL_WORK = 128,
+};
+
+typedef char wl_columnar_eval_stack_unary_fees_fit_t[
+        (WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_FIRST_FINISH_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_ENTRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_HEAD_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_ROW_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EVAL_STACK_UNARY_TERMINAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+typedef char wl_columnar_eval_stack_unary_envelopes_fit_t[
+        (UINT64_C(144) <= WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK
+        && UINT64_C(112) <= WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARE_WORK
+        && UINT64_C(232) <= WL_COLUMNAR_EVAL_STACK_UNARY_FIRST_FINISH_WORK
+        && UINT64_C(160) <= WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_ENTRY_WORK
+        && UINT64_C(96) <= WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_HEAD_WORK
+        && UINT64_C(96) <= WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_ROW_WORK
+        && UINT64_C(112) <=
+        WL_COLUMNAR_EVAL_STACK_UNARY_TERMINAL_WORK) ? 1 : -1];
+typedef char wl_columnar_eval_stack_unary_contiguous_fits_t[
+        (UINT64_C(232) <= WL_EVALUATION_CONTROL_QUANTUM
+        && UINT64_C(136) <= WL_EVALUATION_CONTROL_QUANTUM
+        && UINT64_C(124) <= WL_COLUMNAR_EVAL_STACK_TOKEN_WORK) ? 1 : -1];
+
+static void
+wl_columnar_eval_stack_unary_entry_clear(eval_entry_t *entry)
+{
+    entry->rel = NULL;
+    entry->owned = false;
+    entry->is_delta = false;
+    entry->seg_boundaries = NULL;
+    entry->seg_count = 0;
+    entry->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    entry->continuation = NULL;
+}
+
+static void
+wl_columnar_eval_stack_unary_entry_copy(eval_entry_t *out,
+    const eval_entry_t *in)
+{
+    out->rel = in->rel;
+    out->owned = in->owned;
+    out->is_delta = in->is_delta;
+    out->seg_boundaries = in->seg_boundaries;
+    out->seg_count = in->seg_count;
+    out->kind = in->kind;
+    out->continuation = in->continuation;
+}
+
+static bool
+wl_columnar_eval_stack_unary_entry_inert(const eval_entry_t *entry)
+{
+    return !entry->rel && !entry->owned && !entry->is_delta
+           && !entry->seg_boundaries && !entry->seg_count
+           && entry->kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+           && !entry->continuation;
+}
+
+static bool
+wl_columnar_eval_stack_unary_frame_valid(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame && frame->identity == frame && frame->session
+           && frame->stack.top <= COL_STACK_MAX;
+}
+
+static bool
+wl_columnar_eval_stack_unary_thread_valid(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!frame->unary_thread_valid)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(frame->unary_owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return frame->unary_owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(frame->unary_owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_eval_stack_unary_forward(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        || frame->session->cleanup_active != frame
+        || !wl_columnar_eval_stack_unary_thread_valid(frame))
+        return EINVAL;
+    return wl_columnar_eval_stack_attempt_guard(frame->unary_control,
+               frame->unary_attempt_id);
+}
+
+static void
+wl_columnar_eval_stack_unary_binding_clear(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_eval_stack_unary_entry_clear(&frame->unary_snapshot);
+    frame->unary_control = NULL;
+    frame->unary_attempt_id = 0;
+    frame->unary_thread_valid = false;
+}
+
+int
+wl_columnar_eval_stack_unary_begin_attempt_controlled(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK);
+    if (rc)
+        return rc;
+    int verdict = frame->session->cleanup_active != frame
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        ? EBUSY : !frame->stack.top ? EINVAL : 0;
+    if (!verdict) {
+        const eval_entry_t *entry = &frame->stack.items[frame->stack.top - 1];
+        verdict = entry->kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION
+            ? ENOTSUP : entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || !entry->rel || entry->continuation ? EINVAL : 0;
+    }
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_VALID_PHASE, frame->stack.top);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            return rc;
+    }
+    if (verdict)
+        return verdict;
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARE_WORK);
+    if (rc)
+        return rc;
+    /* Initialization belongs to PREPARE, mandatory first finish to this
+     * separate allowance. Refusal exposes neither ACTIVE nor a slot borrow. */
+    rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_FIRST_FINISH_WORK);
+    if (rc)
+        return rc;
+    frame->unary_top = frame->stack.top;
+    frame->unary_index = frame->unary_top - 1;
+    wl_columnar_eval_stack_unary_entry_copy(&frame->unary_snapshot,
+        &frame->stack.items[frame->unary_index]);
+    frame->unary_control = control;
+    frame->unary_attempt_id = attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    frame->unary_owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    frame->unary_owner_thread = GetCurrentThreadId();
+#else
+    frame->unary_owner_thread = pthread_self();
+#endif
+    frame->unary_thread_valid = true;
+    frame->unary_committed = false;
+    frame->unary_result_saved = false;
+    frame->unary_first_result = 0;
+    frame->unary_cleanup_result = 0;
+    frame->unary_alias_rejected = false;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARED_PHASE,
+            frame->unary_top);
+    if (rc)
+        goto fail;
+    rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE_CUTOFF_PHASE, frame->unary_top);
+    if (rc)
+        goto fail;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE;
+    return 0;
+fail:
+    wl_columnar_eval_stack_unary_binding_clear(frame);
+    frame->unary_index = 0;
+    frame->unary_top = 0;
+    return rc;
+}
+
+int
+wl_columnar_eval_stack_unary_input(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const col_rel_t **out)
+{
+    if (!out)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc)
+        return rc;
+    *out = frame->unary_snapshot.rel;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_unary_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t ***out_slot)
+{
+    if (!out_slot)
+        return EINVAL;
+    int rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc)
+        return rc;
+    if (frame->unary_output.rel)
+        return EINVAL;
+    frame->unary_output.owned = true;
+    frame->unary_output.is_delta = false;
+    frame->unary_output.seg_boundaries = NULL;
+    frame->unary_output.seg_count = 0;
+    frame->unary_output.kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->unary_output.continuation = NULL;
+    *out_slot = &frame->unary_output.rel;
+    return 0;
+}
+
+static bool
+wl_columnar_eval_stack_unary_original_matches(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (frame->stack.top != frame->unary_top || !frame->unary_top
+        || frame->unary_index != frame->unary_top - 1)
+        return false;
+    const eval_entry_t *entry = &frame->stack.items[frame->unary_index];
+    const eval_entry_t *saved = &frame->unary_snapshot;
+    return entry->rel == saved->rel && entry->owned == saved->owned
+           && entry->is_delta == saved->is_delta
+           && entry->seg_boundaries == saved->seg_boundaries
+           && entry->seg_count == saved->seg_count && entry->kind == saved->kind
+           && entry->continuation == saved->continuation;
+}
+
+static void
+wl_columnar_eval_stack_unary_alias_detach(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_eval_stack_unary_entry_clear(&frame->unary_output);
+    frame->unary_alias_rejected = true;
+}
+
+/* Mandatory first-finish sanitation. No callback/poll, candidate dereference,
+ * destructor or credit operation. Only actual live entries are compared. */
+static bool
+wl_columnar_eval_stack_unary_output_sanitize(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    col_rel_t *candidate = frame->unary_output.rel;
+    if (!candidate)
+        return false;
+    if (candidate == frame->unary_snapshot.rel
+        || candidate == frame->result.rel ||
+        candidate == frame->unary_retired.rel)
+        goto alias;
+    uint32_t limit = frame->stack.top - frame->stack.top % 4;
+    uint32_t i = 0;
+    for (; i < limit; i += 4)
+        if (candidate == frame->stack.items[i].rel
+            || candidate == frame->stack.items[i + 1].rel
+            || candidate == frame->stack.items[i + 2].rel
+            || candidate == frame->stack.items[i + 3].rel)
+            goto alias;
+    for (; i < frame->stack.top; i++)
+        if (candidate == frame->stack.items[i].rel)
+            goto alias;
+    return false;
+alias:
+    wl_columnar_eval_stack_unary_alias_detach(frame);
+    return true;
+}
+
+int
+wl_columnar_eval_stack_unary_commit_attempt_controlled(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed)
+{
+    if (!committed)
+        return EINVAL;
+    *committed = false;
+    int rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc)
+        return rc;
+    wl_evaluation_control_t *control = frame->unary_control;
+    uint64_t id = frame->unary_attempt_id;
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    eval_entry_t *output = &frame->unary_output;
+    int verdict = !wl_columnar_eval_stack_unary_original_matches(frame)
+        || !output->rel || !output->owned || output->is_delta
+        || output->seg_boundaries || output->seg_count
+        || output->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || output->continuation ? EINVAL : 0;
+    rc = wl_columnar_eval_stack_attempt_tail(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_VALID_PHASE, frame->unary_top);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            return rc;
+    }
+    if (verdict)
+        return verdict;
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_HEAD_WORK);
+    if (rc)
+        return rc;
+    col_rel_t *candidate = output->rel;
+    bool alias = candidate == frame->unary_snapshot.rel
+        || candidate == frame->result.rel ||
+        candidate == frame->unary_retired.rel;
+    if (alias)
+        wl_columnar_eval_stack_unary_alias_detach(frame);
+    rc = wl_columnar_eval_stack_attempt_tail(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE, 0);
+    if (rc > 0 || !alias) {
+        if (rc)
+            return rc;
+    }
+    if (alias)
+        return EINVAL;
+    for (uint32_t i = 0; i < frame->stack.top; i++) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, id,
+                WL_COLUMNAR_EVAL_STACK_UNARY_SCAN_ROW_WORK);
+        if (rc)
+            return rc;
+        alias = candidate == frame->stack.items[i].rel;
+        if (alias)
+            wl_columnar_eval_stack_unary_alias_detach(frame);
+        rc = wl_columnar_eval_stack_attempt_tail(control, id,
+                WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE, i + 1);
+        if (rc > 0 || !alias) {
+            if (rc)
+                return rc;
+        }
+        if (alias)
+            return EINVAL;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_TERMINAL_WORK);
+    if (rc)
+        return rc;
+    verdict = wl_columnar_eval_stack_unary_original_matches(frame) ? 0 : EINVAL;
+    rc = wl_columnar_eval_stack_attempt_tail(control, id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE, frame->unary_top);
+    if (rc > 0 || !verdict) {
+        if (rc)
+            return rc;
+    }
+    if (verdict)
+        return verdict;
+    eval_entry_t *entry = &frame->stack.items[frame->unary_index];
+    wl_columnar_eval_stack_unary_entry_copy(&frame->unary_retired, entry);
+    wl_columnar_eval_stack_unary_entry_copy(entry, output);
+    wl_columnar_eval_stack_unary_entry_clear(output);
+    frame->unary_committed = true;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;
+    *committed = true;
+    return 0;
+}
+
+static int
+wl_columnar_eval_stack_unary_result(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return frame->unary_first_result ? frame->unary_first_result
+        : frame->unary_alias_rejected ? EINVAL : frame->unary_cleanup_result;
+}
+
+int
+wl_columnar_eval_stack_unary_finish(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result)
+{
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_IDLE)
+        return EINVAL;
+    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_DONE)
+        return wl_columnar_eval_stack_unary_result(frame);
+    bool first = frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;
+    if (first && !wl_columnar_eval_stack_unary_thread_valid(frame))
+        return EINVAL;
+    if (!first && frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED)
+        return EINVAL;
+    if (!frame->unary_result_saved) {
+        frame->unary_first_result = initiating_result;
+        frame->unary_result_saved = true;
+    }
+    bool alias = first && !frame->unary_committed
+        && wl_columnar_eval_stack_unary_output_sanitize(frame);
+    eval_entry_t *entry = frame->unary_committed ? &frame->unary_retired
+        : &frame->unary_output;
+    int rc = alias ? EINVAL : eval_entry_dispose(entry);
+    if (rc == 0)
+        wl_columnar_eval_stack_unary_entry_clear(entry);
+    frame->unary_cleanup_result = rc;
+    if (first)
+        wl_columnar_eval_stack_unary_binding_clear(frame);
+    frame->unary_phase = alias || rc == 0 ? WL_COLUMNAR_EVAL_STACK_UNARY_DONE
+        : WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
+    return wl_columnar_eval_stack_unary_result(frame);
+}
+
+int
+wl_columnar_eval_stack_unary_reset(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_DONE
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired))
+        return EBUSY;
+    wl_columnar_eval_stack_unary_binding_clear(frame);
+    frame->unary_index = 0;
+    frame->unary_top = 0;
+    frame->unary_committed = false;
+    frame->unary_result_saved = false;
+    frame->unary_first_result = 0;
+    frame->unary_cleanup_result = 0;
+    frame->unary_alias_rejected = false;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    return 0;
+}
+
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -649,6 +1144,10 @@ wl_columnar_eval_stack_cleanup_continuations(
 {
     if (frame->result.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
         (void)eval_entry_dispose(&frame->result);
+    if (frame->unary_output.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+        (void)eval_entry_dispose(&frame->unary_output);
+    if (frame->unary_retired.kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+        (void)eval_entry_dispose(&frame->unary_retired);
     for (uint32_t i = 0; i < frame->stack.top; i++)
         if (frame->stack.items[i].kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
             (void)eval_entry_dispose(&frame->stack.items[i]);
@@ -659,6 +1158,12 @@ wl_columnar_eval_stack_cleanup_dispose(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
     int result = eval_entry_dispose(&frame->result);
+    int output_rc = eval_entry_dispose(&frame->unary_output);
+    if (result == 0)
+        result = output_rc;
+    int retired_rc = eval_entry_dispose(&frame->unary_retired);
+    if (result == 0)
+        result = retired_rc;
     /* Visit lower entries even if a higher one refuses. Their destruction
      * can release dependencies needed by other pending frames. */
     for (uint32_t i = frame->stack.top; i > 0; i--) {
@@ -699,6 +1204,11 @@ wl_columnar_eval_stack_cleanup_finish(
     if (!handle || !*handle)
         return EINVAL;
     wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED)
+        return EBUSY;
     wl_col_session_t *sess = frame->session;
     if (sess->cleanup_active != frame)
         return EBUSY;

@@ -2131,5 +2131,58 @@ physical/credit/reference retirement internals remain explicit exclusions;
 this is a logical-work bound, not a latency bound. The physical-freed hook is
 mandatory, receives NULL control and cannot debit a successor attempt.
 
-This internal primitive leaves the frame layout and raw behavior unchanged.
-It does not activate FILTER/MAP, unary transactions or default evaluation routes.
+Attempt admission preserves the raw quota policy. Unary transactions extend
+the private frame storage: both raw and controlled admission charge its actual
+current size. Neither helper activates FILTER/MAP or default evaluation routes.
+
+## Persistent unary result replacement
+
+The internal `wl_columnar_eval_stack_unary_*` protocol keeps the original
+seven-field stack entry in place until a final saved-attempt cutoff. The
+provisional output and retired original have separate persistent slots; the
+existing frame result slot is never reused. Publication transfers the complete
+original entry to retirement, installs the complete canonical output in the
+same stack slot, and leaves stack depth unchanged. Cleanup refusal after
+publication preserves the new result and the original retired authority.
+
+Only the provisional relation pointer is writable through its accessor.
+Same-frame aliases to the input, result or live stack entries are detached
+without destruction during commit rejection and independently during first
+abort cleanup. Inactive stack cells do not own their stale pointers. No supported
+cross-frame ownership alias, raw mutation during a transaction, reentrancy or
+reader escape on a private output is permitted. Frames, input and allocator
+lifetimes remain the caller's responsibility.
+
+Begin admits initialization and a separate 256-unit first-finish allowance
+before exposing ACTIVE state or an output slot. The first initiating result is
+latched, including zero: later finish arguments never replace it. Return that
+first result when nonzero, otherwise persistent alias EINVAL, otherwise the
+latest cleanup result. Genuine EBUSY retains the exact independent output or
+retired input. First finish validates the original native host thread, then
+clears borrowed control/snapshot bindings; serialized retries may run on a later
+thread after the old control is destroyed. DONE does not dispose twice, and
+reset requires inert slots. Generic frame finish rejects an active transaction
+before unlinking it or consuming its handle; pending cleanup visits both new
+owning slots even if another result refuses disposal.
+
+Unary begin fees160/128/256 total544. Commit fees192/128/128-per-live-entry/128
+total `448 + 128*n` for an independent output. Head aliases pay320; an alias at
+live index `j` pays `320 + 128*(j+1)`. Input/output accessors have no debit and
+require caller envelopes48/56; their costs and relation construction are
+separate from these unit totals. All ordinary return, refusal and field-move
+work is counted. The first-finish scan explicitly compares four scalar pointers
+per loop, with a remainder of at most three; no hidden bulk comparison, callback
+or poll splits it. Sanitizer ceiling136 plus scaffold82 and ordinary disposer14
+gives232, below256. This conservative alias ceiling does not claim every alias
+is reachable after earlier head checks. Retry96, DONE24 and reset64 are bounded
+per-invocation inventories at the mandatory lifetime-cleanup boundary; one old
+begin debit does not finance arbitrarily many retries or whole pending lists.
+New cleanup guard success14/rejection15, disposer36 and continuation32 extensions
+are ordinary work. Narrow physical/token/ref retirement, control, allocator and
+instrumentation exclusions remain; future operators must compose adjacent work.
+
+The enlarged frame changes admission footprint and zero-chunk count `N`.
+Existing admission totals `928 + 224*N` and `1726 + 224*N` remain separate from
+unary fees; the TOKEN region now includes two explicit identity/IDLE stores and
+has envelope124 under its fee128. These logical source bounds are not latency
+bounds, default-operator coverage or whole issue #1821 completion.
