@@ -287,6 +287,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     int unary_first_result;
     int unary_cleanup_result;
     bool unary_alias_rejected;
+    wl_columnar_filter_context_t filter;
 };
 
 int
@@ -1067,9 +1068,10 @@ wl_columnar_eval_stack_unary_result(
         : frame->unary_alias_rejected ? EINVAL : frame->unary_cleanup_result;
 }
 
-int
-wl_columnar_eval_stack_unary_finish(
-    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result)
+static int
+wl_columnar_eval_stack_unary_finish_body(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result,
+    bool sanitize)
 {
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
@@ -1087,7 +1089,7 @@ wl_columnar_eval_stack_unary_finish(
         frame->unary_first_result = initiating_result;
         frame->unary_result_saved = true;
     }
-    bool alias = first && !frame->unary_committed
+    bool alias = first && !frame->unary_committed && sanitize
         && wl_columnar_eval_stack_unary_output_sanitize(frame);
     eval_entry_t *entry = frame->unary_committed ? &frame->unary_retired
         : &frame->unary_output;
@@ -1100,6 +1102,14 @@ wl_columnar_eval_stack_unary_finish(
     frame->unary_phase = alias || rc == 0 ? WL_COLUMNAR_EVAL_STACK_UNARY_DONE
         : WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
     return wl_columnar_eval_stack_unary_result(frame);
+}
+
+int
+wl_columnar_eval_stack_unary_finish(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result)
+{
+    return wl_columnar_eval_stack_unary_finish_body(frame, initiating_result,
+               true);
 }
 
 int
@@ -1121,6 +1131,104 @@ wl_columnar_eval_stack_unary_reset(
     frame->unary_cleanup_result = 0;
     frame->unary_alias_rejected = false;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    return 0;
+}
+
+/* Private continuation bridge: protocol refusal does not consume output.
+ * Generic callers always retain the original alias sanitation policy. */
+int
+wl_columnar_eval_stack_filter_finish(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int result, int *semantic,
+    bool *retained)
+{
+    if (!semantic || !retained
+        || !wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    wl_columnar_filter_context_t *ctx = &frame->filter;
+    if (ctx->identity != ctx || ctx->frame != frame
+        || ctx->session != frame->session
+        || frame->session->cleanup_active != frame || !ctx->thread_valid
+        || !ctx->busy || !ctx->unary_started
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH)
+        return EINVAL;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(ctx->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (ctx->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(ctx->owner_thread, pthread_self())) return EINVAL;
+#endif
+    switch (frame->unary_phase) {
+    case WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE:
+        if (!wl_columnar_eval_stack_unary_thread_valid(frame)
+            || frame->unary_committed
+            || (frame->unary_output.rel
+            && frame->unary_output.rel != ctx->private_output))
+            return EINVAL;
+        break;
+    case WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED:
+        if (!wl_columnar_eval_stack_unary_thread_valid(frame)
+            || !frame->unary_committed)
+            return EINVAL;
+        break;
+    case WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED:
+    case WL_COLUMNAR_EVAL_STACK_UNARY_DONE:
+        break;
+    default:
+        return EINVAL;
+    }
+    /* No evaluation of the borrowed marker after physical disposal, even if
+     * the original entry is retained and will require another host turn. */
+    ctx->private_output = NULL;
+    *semantic = wl_columnar_eval_stack_unary_finish_body(frame, result, false);
+    ctx->cleanup_result = frame->unary_cleanup_result;
+    *retained = frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_filter_context(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t **out)
+{
+    if (!out || !wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    *out = &frame->filter;
+    return 0;
+}
+
+/* Operator entry validation is callback-free and consumes no authority.
+ * IDLE frames have no creator-thread identity: callers serialize their use. */
+int
+wl_columnar_eval_stack_operator_stack(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    eval_stack_t **out)
+{
+    if (!out || !frame || !sess || frame->identity != frame
+        || frame->session != sess || frame->stack.top > COL_STACK_MAX)
+        return EINVAL;
+    if (frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || sess->cleanup_active != frame
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || frame->unary_control || frame->unary_attempt_id
+        || frame->unary_index || frame->unary_top || frame->unary_thread_valid
+        || frame->unary_committed || frame->unary_result_saved
+        || frame->unary_alias_rejected || frame->unary_first_result
+        || frame->unary_cleanup_result)
+        return EBUSY;
+    if (!frame->stack.top)
+        return EINVAL;
+    const eval_entry_t *entry = &frame->stack.items[frame->stack.top - 1];
+    if (entry->kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
+        return ENOTSUP;
+    if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || entry->continuation || !entry->rel)
+        return EINVAL;
+    *out = &frame->stack;
     return 0;
 }
 
@@ -1206,7 +1314,8 @@ wl_columnar_eval_stack_cleanup_finish(
     wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
-    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+    if (frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED)
         return EBUSY;
     wl_col_session_t *sess = frame->session;

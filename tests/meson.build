@@ -6378,6 +6378,22 @@ test_evaluation_copy_exe = executable(
 test('evaluation_copy', test_evaluation_copy_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# #1821: genuine FIFO numeric FILTER lifetime, budget and semantic witnesses.
+# Release-refusal instrumentation lives in these direct governor/control objects;
+# defining MEMORY on the test TU alone does not instrument testlib_prod.
+test_evaluation_numeric_operators_exe = executable(
+  'test_evaluation_numeric_operators',
+  files('test_evaluation_numeric_operators.c',
+        '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_numeric_operators', test_evaluation_numeric_operators_exe,
+     suite: ['unit', 'tsan'], timeout: 600)
+
 
 # Controlled ledger publication with real governor/peer composition.
 test_evaluation_output_materialization_exe = executable(
