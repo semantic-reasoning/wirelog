@@ -1,6 +1,6 @@
 /* Internal JOIN pipeline: a JOIN followed by its longest consumable prefix
- * of row-local FILTERs, optionally ended by one row-local MAP (Issues #1475,
- * #1370). */
+ * of row-local FILTERs and SEMIJOIN/ANTIJOIN probe stages, optionally ended
+ * by one row-local MAP (Issues #1475, #1370). */
 #ifndef WL_COLUMNAR_JOIN_PIPELINE_H
 #define WL_COLUMNAR_JOIN_PIPELINE_H
 
@@ -17,13 +17,17 @@ typedef enum {
 } wl_columnar_join_pipeline_eligibility_t;
 
 /* Conservative preflight for the continuation consumer.  Projection MAPs
- * and numeric expression MAPs (Issue #1777) are row-local without consulting
- * intern or extension/session state; string, digest, UUID, aggregate and
- * extension expressions remain excluded until their ownership and retry
- * contracts are defined.  Returns ELIGIBLE and *@tail_end (the last consumed
- * operator) when at least one operator after the JOIN is consumable; a MAP
- * ends the prefix.  Otherwise it returns why the first operator after the
- * JOIN is not consumed and sets *@tail_end to UINT32_MAX. */
+ * and numeric expression MAPs (Issue #1777) are row-local without
+ * consulting intern or extension/session state; string, digest, UUID,
+ * aggregate and extension expressions remain excluded until their ownership
+ * and retry contracts are defined.  A SEMIJOIN or ANTIJOIN stage passes
+ * this static check when it is keyed, unfiltered, not materialized and
+ * reads a relation whose name does not start with '$'; the run-time checks
+ * follow in wl_columnar_join_pipeline_try_eval.  Returns ELIGIBLE and
+ * *@tail_end (the last consumed operator) when at least one operator after
+ * the JOIN is consumable; a MAP ends the prefix.  Otherwise it returns why
+ * the first operator after the JOIN is not consumed and sets *@tail_end to
+ * UINT32_MAX. */
 wl_columnar_join_pipeline_eligibility_t
 wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
     uint32_t join_index, const wl_col_session_t *sess, uint32_t *tail_end);
