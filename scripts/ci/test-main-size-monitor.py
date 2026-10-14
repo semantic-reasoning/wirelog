@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise always-run main size reporting, including missing inputs."""
 import json
+import copy
 import importlib.util
 import os
 from pathlib import Path
@@ -9,6 +10,142 @@ import sys
 import tempfile
 from types import SimpleNamespace
 from unittest import mock
+
+def check_root_operands(profile):
+    cases = {
+        "/src": "<SOURCE>",
+        "/src/include": "<SOURCE>/include",
+        "-I/src/subprojects/nanoarrow/src": "-I<SOURCE>/subprojects/nanoarrow/src",
+        "/elsewhere/src/header": "/elsewhere/src/header",
+        "-I/elsewhere/src/header": "-I/elsewhere/src/header",
+        "-I/src-old/include": "-I/src-old/include",
+        "-L/src/lib": "-L<SOURCE>/lib",
+        "-B/src/tools": "-B<SOURCE>/tools",
+        "-isystem/src/include": "-isystem<SOURCE>/include",
+        "-iquote/src/include": "-iquote<SOURCE>/include",
+        "--sysroot=/src": "--sysroot=<SOURCE>",
+        "--ld-path=/src/bin/ld": "--ld-path=<SOURCE>/bin/ld",
+        "-Wl,--version-script=/src/export.map": "-Wl,--version-script=<SOURCE>/export.map",
+        "-Wl,-rpath,/src/lib:/elsewhere/src/lib:/src/other":
+            "-Wl,-rpath,<SOURCE>/lib:/elsewhere/src/lib:<SOURCE>/other",
+        "-Wl,-L/src/lib,--version-script,/src/export.map":
+            "-Wl,-L<SOURCE>/lib,--version-script,<SOURCE>/export.map",
+        "-Wl,-rpath=/src/lib,-rpath-link,/src/other":
+            "-Wl,-rpath=<SOURCE>/lib,-rpath-link,<SOURCE>/other",
+        "-I/src/with spaces/src": "-I<SOURCE>/with spaces/src",
+        "-I/src/suffix=literal/src": "-I<SOURCE>/suffix=literal/src",
+        "-I/src/suffix,with:punctuation/src": "-I<SOURCE>/suffix,with:punctuation/src",
+        "-I/src:literal": "-I/src:literal",
+        "-DROOT=/src": "-DROOT=/src",
+        "-DVALUES=/src,/src/header": "-DVALUES=/src,/src/header",
+        "--unknown=/src": "--unknown=/src",
+        "-Wl,-soname,/src": "-Wl,-soname,/src",
+        "-Wl,-soname,-L/src": "-Wl,-soname,-L/src",
+        "prefix /src/include": "prefix /src/include",
+        "<SOURCE>/nested/src": "<SOURCE>/nested/src",
+    }
+    for value, expected in cases.items():
+        actual = profile.replace_root(value, "/src", "<SOURCE>")
+        assert actual == expected, (value, actual, expected)
+        assert profile.replace_root(actual, "/src", "<SOURCE>") == actual
+    # Separate options are separate argv elements, never whitespace-split.
+    assert [profile.replace_root(v, "/src", "<SOURCE>") for v in
+            ["-I", "/src/include", "-isystem", "/src/space dir"]] == [
+                "-I", "<SOURCE>/include", "-isystem", "<SOURCE>/space dir"]
+    assert profile.replace_root("-I/root with spaces/src/include",
+                                "/root with spaces/src", "<SOURCE>") == "-I<SOURCE>/include"
+    assert profile.replace_root(r"-IC:\src\include\src", r"C:\src",
+                                "<SOURCE>") == r"-I<SOURCE>\include\src"
+    for build_root in ("/src/build", "/external/build"):
+        value = "-I" + build_root + "/nested/src"
+        actual = profile.replace_root(value, build_root, "<BUILD>")
+        assert profile.replace_root(actual, "/src", "<SOURCE>") == "-I<BUILD>/nested/src"
+
+def check_relocated_profiles(profile_script, temp, build):
+    evidence = build / "size-profile-regression"
+    evidence.mkdir(parents=True, exist_ok=True)
+    commands = []
+
+    def run(args, expected=0):
+        result = subprocess.run(list(map(str, args)), text=True, capture_output=True,
+                                encoding="utf-8")
+        commands.append({"argv": list(map(str, args)), "returncode": result.returncode,
+                         "stdout": result.stdout, "stderr": result.stderr})
+        (evidence / "commands.json").write_text(json.dumps(commands, indent=2) + "\n", encoding="utf-8")
+        assert result.returncode == expected, commands[-1]
+        return result.stdout.strip()
+
+    short = temp / "src"
+    unique = temp / "unique relocated checkout"
+    changed = temp / "different include checkout"
+    # The same relative suffix contains the *whole* short root. The old global
+    # replacement corrupts it only in the short checkout, reproducing /src's
+    # collision with nanoarrow/src without requiring permission to create /src.
+    suffix = "subprojects/nanoarrow" + str(short)
+    recipe = """project('profile-fixture', 'c', default_options: ['buildtype=release', 'b_lto=true'])
+inc = meson.project_source_root() / '@SUFFIX@'
+shared_library('wirelog', 'wirelog.c', install: false,
+  c_args: ['-I' + inc, '-isystem', inc],
+  link_args: ['-Wl,--version-script=' + meson.project_source_root() / 'exports.map'],
+  build_rpath: meson.project_source_root() / 'lib one' + ':' + meson.project_source_root() / 'lib two')
+"""
+    for source in (short, unique, changed):
+        include_suffix = suffix + ("/different" if source == changed else "")
+        (source / include_suffix).mkdir(parents=True)
+        (source / "meson.build").write_text(recipe.replace("@SUFFIX@", include_suffix), encoding="utf-8")
+        (source / "wirelog.c").write_text("int wirelog_fixture(void) { return 7; }\n", encoding="utf-8")
+        (source / "exports.map").write_text("{ global: wirelog_fixture; local: *; };\n", encoding="utf-8")
+    (evidence / "fixture.json").write_text(json.dumps({"recipe": recipe, "suffix": suffix,
+        "source": "int wirelog_fixture(void) { return 7; }\n",
+        "exports": "{ global: wirelog_fixture; local: *; };\n"}, indent=2) + "\n", encoding="utf-8")
+    profiles = {}
+    fingerprints = {}
+    for name, source, builddir in (("short", short, short / "build"),
+                                   ("unique", unique, unique / "build"),
+                                   ("external", unique, temp / "external relocated build"),
+                                   ("different", changed, changed / "build")):
+        run(["meson", "setup", builddir, source])
+        run(["meson", "compile", "-C", builddir])
+        profiles[name] = evidence / (name + ".profile.json")
+        run([sys.executable, profile_script, "capture", "--build-dir", builddir,
+             "--source-dir", source, "--source-sha", "profile-fixture", "--output", profiles[name]])
+        fingerprints[name] = run([sys.executable, profile_script, "fingerprint", profiles[name]])
+        raw = run(["meson", "introspect", "--targets", builddir])
+        (evidence / (name + ".targets.json")).write_text(raw + "\n", encoding="utf-8")
+        assert str(source / (suffix + ("/different" if name == "different" else ""))) in raw
+    for name in ("unique", "external"):
+        run([sys.executable, profile_script, "compare", profiles["short"], profiles[name]])
+        assert fingerprints["short"] == fingerprints[name]
+    run([sys.executable, profile_script, "compare", profiles["short"], profiles["different"]], expected=1)
+    assert fingerprints["short"] != fingerprints["different"]
+
+    # Actual captured evidence remains sensitive to every meaningful setting.
+    baseline = json.loads(profiles["short"].read_text(encoding="utf-8"))
+    mutations = [
+        (("tools", "host", "c", "id"), "different-compiler"),
+        (("tools", "host", "c", "version"), "different-version"),
+        (("selected_linker", "version_line"), "different-linker"),
+        (("selected_linker", "selected_flags"), ["-fuse-ld=lld"]),
+        (("options", "optimization"), "0"),
+        (("options", "b_lto"), False),
+        (("options", "wirelog_log_max_level"), "error"),
+        (("options", "mbedTLS"), "enabled"),
+        (("options", "default_library"), "static"),
+        (("effective_compile_arguments", 0, "parameters"), ["-DWL_LOG_COMPILE_MAX_LEVEL=0"]),
+        (("effective_link_arguments", 0, "parameters"), ["-Wl,--different-flag"]),
+    ]
+    for index, (keys, value) in enumerate(mutations):
+        variant = copy.deepcopy(baseline)
+        target = variant
+        for key in keys[:-1]:
+            target = target[key]
+        assert target.get(keys[-1]) != value
+        target[keys[-1]] = value
+        destination = evidence / ("negative-%d.profile.json" % index)
+        destination.write_text(json.dumps(variant, indent=2) + "\n", encoding="utf-8")
+        run([sys.executable, profile_script, "compare", profiles["short"], destination], expected=1)
+        assert run([sys.executable, profile_script, "fingerprint", destination]) != fingerprints["short"]
+    (evidence / "fingerprints.json").write_text(json.dumps(fingerprints, indent=2) + "\n", encoding="utf-8")
 
 root=Path(sys.argv[1]).resolve(); build=Path(sys.argv[2]).resolve()
 script=root/"scripts/ci/report-main-size.py"
@@ -45,6 +182,8 @@ with tempfile.TemporaryDirectory(prefix="wirelog-main-size-test-") as d:
     # an unrelated linker found on PATH. Unknown output fails closed.
     spec=importlib.util.spec_from_file_location("size_profile",profile_script)
     size_profile=importlib.util.module_from_spec(spec); spec.loader.exec_module(size_profile)
+    check_root_operands(size_profile)
+    check_relocated_profiles(profile_script, temp, build)
     sibling=str(profile_source)+"-neighbor/include"
     assert size_profile.replace_root(sibling,profile_source,"<SOURCE>")==sibling
     assert size_profile.replace_root(str(profile_source)+"/include",profile_source,"<SOURCE>")=="<SOURCE>/include"
