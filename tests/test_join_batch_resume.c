@@ -2511,6 +2511,115 @@ test_row_cap_trips_after_a_committed_batch(void)
 /* (11) Operator dispatch: an eligible shape uses the producer under the
  * knob and equals the oracle; excluded shapes fall back with the reason
  * recorded, or fail with ENOTSUP in strict mode. */
+/* #2177: the bounded sink translates a growth refusal to ENOSPC before
+ * the operator sees it. Calibrate from an actual successful output admission,
+ * then withhold the extra space needed while old/new growth buffers overlap. */
+static void
+test_operator_output_growth_denial(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    const uint64_t ample_budget = 1u << 24;
+    eval_stack_t stack;
+    col_rel_t *oracle = NULL;
+    wl_columnar_memory_governor_t *governor;
+    uint64_t baseline, output_bytes;
+    const col_arr_entry_t *entry;
+    uint32_t pins;
+    int rc;
+    bool ok = true;
+
+    TEST("operator marks output growth denial, preserving other errors");
+    if (!fixture_init(&f, ample_budget, keys, 1, 1, 300)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    /* Warm the persistent arrangement and retain a content oracle. Neither
+     * its ownership nor its reservation may change during failed attempts. */
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    entry = find_entry(f.sess, "right");
+    if (!oracle || oracle->nrows != 300 || !entry) {
+        FAIL("oracle or arrangement");
+        goto out;
+    }
+    pins = entry->pin_count;
+    governor = wl_columnar_memory_governor_ref_get(f.sess->memory_governor);
+    baseline = reserved_of(f.sess);
+    f.sess->join_batch_bytes = 64u * f.out->ncols * sizeof(int64_t);
+    f.sess->memory_budget_denied = false;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f.left, false);
+    rc = col_op_join(&f.op, &stack, f.sess);
+    if (rc != 0 || stack.top != 1 || !same_rows(stack.items[0].rel, oracle)
+        || f.sess->memory_budget_denied || reserved_of(f.sess) <= baseline) {
+        FAIL("ample-budget bounded output calibration");
+        eval_stack_drain(&stack);
+        goto out;
+    }
+    output_bytes = reserved_of(f.sess) - baseline;
+    eval_stack_drain(&stack);
+    if (reserved_of(f.sess) != baseline) {
+        FAIL("calibration output did not release its admission");
+        goto out;
+    }
+
+    for (unsigned which = 0; which < 4; which++) {
+        uint64_t budget = which == 0 ? baseline
+            : which == 1 ? baseline + output_bytes : ample_budget;
+        int expected = which < 2 ? ENOSPC : which == 2 ? ENOMEM : EOVERFLOW;
+        atomic_store_explicit(&governor->usable_bytes, budget,
+            memory_order_relaxed);
+        f.sess->memory_budget_denied = false;
+        f.sess->join_output_peak = 0;
+        f.sess->join_output_limit = which == 3 ? 1 : 0;
+        if (which == 2)
+            wl_columnar_relation_test_fail_next_prepare_resize();
+        eval_stack_init(&stack);
+        eval_stack_push(&stack, f.left, false);
+        rc = col_op_join(&f.op, &stack, f.sess);
+        wl_columnar_relation_test_clear_prepare_resize();
+        /* 64-row batches fit the producer's initial scratch. A committed
+         * batch followed by ENOMEM therefore targets the output resize,
+         * not an earlier descriptor, scratch, or initial-capacity failure. */
+        if (rc != expected || f.sess->memory_budget_denied != (which < 2)
+            || (which == 0 ? f.sess->join_output_peak != 0
+                : f.sess->join_output_peak < 64)
+            || stack.top != 0 || f.sess->join_batch_fallback_count != 0
+            || entry->pin_count != pins || reserved_of(f.sess) != baseline) {
+            printf(
+                "(case=%u rc=%d denied=%d peak=%llu reserved=%llu baseline=%llu) ",
+                which, rc, (int)f.sess->memory_budget_denied,
+                (unsigned long long)f.sess->join_output_peak,
+                (unsigned long long)reserved_of(f.sess),
+                (unsigned long long)baseline);
+            ok = false;
+        }
+        eval_stack_drain(&stack);
+    }
+    /* A fresh attempt after all refusals still produces the exact result. */
+    atomic_store_explicit(&governor->usable_bytes, ample_budget,
+        memory_order_relaxed);
+    f.sess->join_output_limit = 0;
+    f.sess->memory_budget_denied = false;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f.left, false);
+    rc = col_op_join(&f.op, &stack, f.sess);
+    ok = ok && rc == 0 && stack.top == 1
+        && same_rows(stack.items[0].rel, oracle)
+        && !f.sess->memory_budget_denied;
+    eval_stack_drain(&stack);
+    ok = ok && reserved_of(f.sess) == baseline && entry->pin_count == pins;
+    if (ok)
+        PASS();
+    else
+        FAIL("operator denial classification, progress, or cleanup");
+out:
+    wl_columnar_relation_test_clear_prepare_resize();
+    col_rel_destroy(oracle);
+    fixture_fini(&f);
+}
+
 static void
 test_operator_dispatch_and_eligibility(void)
 {
@@ -3458,6 +3567,7 @@ main(void)
     test_float_key();
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
+    test_operator_output_growth_denial();
     test_operator_dispatch_and_eligibility();
     test_operator_no_arrangement_probe_failure();
     test_operator_delta_and_filtered_fallbacks();

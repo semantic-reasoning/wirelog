@@ -402,7 +402,10 @@ static int
 wl_columnar_join_output_error(wl_col_session_t *sess, const col_rel_t *out,
     int rc)
 {
-    if (rc == ENOMEM && out && out->memory_budget_denial_pending) {
+    /* The bounded relation sink already maps a reservation refusal to
+     * ENOSPC; preserve its budget evidence before destroying the output. */
+    if ((rc == ENOMEM || rc == ENOSPC) && out
+        && out->memory_budget_denial_pending) {
         if (sess)
             sess->memory_budget_denied = true;
         return ENOSPC;
