@@ -13751,6 +13751,71 @@ wl_columnar_relation_constructor_auto_attempt(
     return rc;
 }
 
+/* Private untyped/no-timestamp operator constructor. The eight-byte builder
+ * preserves existing constructor entrypoint fees and copy granularity. */
+int
+wl_columnar_relation_new_auto_operator_attempt_controlled(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Only this fixed output normalization is a bootstrap exception.
+     * The exclusive writable slot must contain no live owned result. */
+    if (out)
+        *out = NULL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    bool valid = out && name;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc > 0 || valid) {
+        if (rc)
+            return rc;
+    } else
+        return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = NULL;
+    recipe.types = NULL;
+    recipe.has_graph_column = false;
+    recipe.graph_col_idx = 0;
+    recipe.declared_ncols = 0;
+    recipe.view_generation = 2;
+    recipe.storage_generation = 1;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name, ncols,
+            initial_capacity, false, governor, &recipe, &local,
+            control, attempt_id);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0)
+        abort();
+    return rc;
+}
+
 int
 wl_columnar_relation_new_auto_governed_attempt_controlled(
     const char *name, uint32_t ncols, uint32_t initial_capacity,
@@ -14952,6 +15017,39 @@ wl_columnar_relation_append_batch_row_operator_controlled(
 done:
     wl_columnar_relation_batch_capture_dispose(&capture);
     return rc;
+}
+
+/* Private untyped/no-timestamp MAP output. Caller owns original control and
+ * its immutable ID throughout capture, renewal and return arbitration. */
+int
+wl_columnar_relation_append_batch_numeric_row_operator_controlled(
+    wl_columnar_relation_append_batch_t *batch, const int64_t *values,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (rc) return rc;
+    bool valid = batch && batch->identity == batch && !batch->raw_mode
+        && batch->phase == WL_COLUMNAR_RELATION_BATCH_HELD
+        && batch->control == control && batch->attempt_id == attempt_id
+        && batch->raw.relation && values;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control,
+            attempt_id, WL_COLUMNAR_RELATION_SCALAR_SOURCE_SELECTED_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_ROW_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_append_batch_row_operator_controlled(batch,
+            values);
+    if (rc) return rc;
+    rc = wl_columnar_relation_attempt_guard(control, attempt_id);
+    if (rc) return rc;
+    return wl_evaluation_control_charge(control, 0);
 }
 
 /* Additive operator-specific selection preserves the legacy API below byte
