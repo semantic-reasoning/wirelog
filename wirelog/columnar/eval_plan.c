@@ -353,3 +353,277 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     }
     return false;
 }
+
+/* Opt-in numeric segment dispatch. Ordinary col_eval_relation_plan and public
+ * session admission remain unchanged. Host grants pay dispatch and retry work;
+ * child work continues to use its original operation attempt and own grants.
+ * HOST includes read-only validation before admission as well as current
+ * dispatch/retirement; its fee is distinct from the 256-slot poll quantum. */
+enum {
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK = 384,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_FORWARD_WORK = 128
+};
+
+static bool
+wl_columnar_eval_plan_numeric_thread(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (!record->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(record->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return record->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(record->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+bool
+wl_columnar_eval_plan_numeric_owner_valid(const void *owner,
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    return record && record->identity == record && record->frame == frame
+           && record->session && record->phase >
+           WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+           && record->phase <= WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
+           && wl_columnar_eval_plan_numeric_thread(record);
+}
+
+static int
+wl_columnar_eval_plan_numeric_fund(wl_evaluation_control_t *funding,
+    uint64_t id, const wl_evaluation_control_t *operation)
+{
+    if (!funding || funding == operation || !id
+        || wl_evaluation_control_active_attempt_id(funding) != id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(funding,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+    if (rc) return rc;
+    return wl_evaluation_control_active_attempt_id(funding) == id ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_eval_plan_numeric_validate(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (!record || !wl_columnar_eval_plan_numeric_owner_valid(record,
+        record->frame)) return EINVAL;
+    if (record->session->cleanup_active != record->frame) return EBUSY;
+    return wl_columnar_eval_stack_numeric_owner(record->frame, record);
+}
+
+static int
+wl_columnar_eval_plan_numeric_forward(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    if (!record->control || wl_evaluation_control_active_attempt_id(
+            record->control) != record->attempt_id) return EINVAL;
+    int rc = wl_evaluation_control_charge(record->control,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_FORWARD_WORK);
+    if (rc) return rc;
+    return wl_evaluation_control_active_attempt_id(record->control)
+           == record->attempt_id ? 0 : EINVAL;
+}
+
+void
+wl_columnar_eval_plan_numeric_attempt_init(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    /* Fresh caller-owned storage only; never reset a live continuation. */
+    if (record) memset(record, 0, sizeof(*record));
+}
+
+int
+wl_columnar_eval_plan_numeric_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!record || record->identity || record->phase || !plan || !plan->ops
+        || begin >= end || end > plan->op_count || !frame || !session
+        || !control || !id) return EINVAL;
+    int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
+    if (rc) return rc;
+    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    record->identity = record; record->frame = frame;
+    record->session = session; record->plan = plan;
+    record->control = control; record->attempt_id = id;
+    record->begin = begin; record->end = end; record->cursor = begin;
+    record->completed = 0; record->semantic_result = 0;
+    record->protocol_result = 0;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT;
+#if defined(WL_HAVE_C11_THREADS)
+    record->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    record->owner_thread = GetCurrentThreadId();
+#else
+    record->owner_thread = pthread_self();
+#endif
+    record->thread_valid = true;
+    rc = wl_columnar_eval_stack_numeric_claim(frame, session, record);
+    if (rc) {
+        record->control = NULL; record->identity = NULL;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+        record->thread_valid = false; record->frame = NULL;
+        record->session = NULL; record->plan = NULL;
+        wl_evaluation_control_release(control);
+    }
+    return rc;
+}
+
+int
+wl_columnar_eval_plan_numeric_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    if (rc) return rc;
+    rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT:
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (!rc) {
+            wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
+            if (kind != WL_PLAN_OP_FILTER && kind != WL_PLAN_OP_MAP)
+                rc = ENOTSUP;
+        }
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+        } else if (++record->cursor == record->end) {
+            record->cursor = record->begin;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY:
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+            return 0;
+        }
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_FILTER)
+            return wl_columnar_filter_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        return wl_columnar_filter_map_attempt_start_owned(
+            &record->plan->ops[record->cursor], record->frame,
+            record->session, record->control, record->attempt_id,
+            &record->child_status, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return wl_columnar_filter_op_attempt_step_owned(record->frame,
+                   &record->child_status, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_ACK_CHILD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return wl_columnar_filter_op_attempt_ack_owned(record->frame, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_ADVANCE:
+        if (record->semantic_result || ++record->cursor == record->end)
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+        else
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE:
+        /* Keep the original pin through ACK so even DONE status queries reject
+        * funding from that operation's successor without dangling pointers. */
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE;
+        return 0;
+    default:
+        return EBUSY;
+    }
+}
+
+int
+wl_columnar_eval_plan_numeric_consume_result(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    if (rc) return rc;
+    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING) return EBUSY;
+    rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    record->protocol_result = child_protocol;
+    if (child_protocol) {
+        record->phase = record->pending_action;
+        return 0;
+    }
+    if (record->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_ACK_CHILD) {
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_ADVANCE;
+        return 0;
+    }
+    switch (record->child_status.progress) {
+    case WL_COLUMNAR_FILTER_PROGRESS_YIELD:
+    case WL_COLUMNAR_FILTER_PROGRESS_RETAINED:
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD;
+        break;
+    case WL_COLUMNAR_FILTER_PROGRESS_DONE:
+        record->semantic_result = record->child_status.semantic_result;
+        if (!record->semantic_result) ++record->completed;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_ACK_CHILD;
+        break;
+    default:
+        record->protocol_result = EINVAL;
+        return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_attempt_status(
+    const wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_columnar_eval_plan_numeric_status_t *status,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!status) return EINVAL;
+    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    if (rc) return rc;
+    rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    status->phase = record->phase; status->completed = record->completed;
+    status->semantic_result = record->semantic_result;
+    status->protocol_result = record->protocol_result;
+    status->retained = record->protocol_result != 0
+        || (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        && record->child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_attempt_ack(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    if (rc) return rc;
+    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE || !record->control)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_numeric_unbind(record->frame, record->session,
+            record);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = record->control;
+    record->control = NULL;
+    record->identity = NULL; record->frame = NULL; record->session = NULL;
+    record->plan = NULL; record->thread_valid = false;
+    record->attempt_id = 0; record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+    wl_evaluation_control_release(control);
+    return 0;
+}

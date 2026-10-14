@@ -803,7 +803,7 @@ host_turn(host_queue_t *queue)
                       } } while (0)
 
 #define WL_COLUMNAR_FILTER_TEST_ACTIONS 16u
-#define WL_COLUMNAR_FILTER_TEST_SENTINELS 32u
+#define WL_COLUMNAR_FILTER_TEST_SENTINELS 48u
 #define WL_COLUMNAR_FILTER_TEST_TRACE_CAP 65536u
 
 /* Required by the direct governor object's MEMORY instrumentation. This
@@ -1669,7 +1669,7 @@ wl_columnar_filter_test_literal(uint32_t width, uint32_t rows, bool typed,
         L(224); L(224); wl_columnar_filter_test_literal_commit(&literal);
         L(160);
     }
-    R(192, 22); L(192); L(192); L(170);
+    R(192, 36); L(192); L(192); L(170);
     wl_columnar_filter_test_literal_single(&literal);
     uint32_t selected = 0, capacity = 64;
     bool transitioned = false;
@@ -3077,7 +3077,7 @@ wl_columnar_filter_test_map_literal(uint32_t width, uint32_t rows,
             wl_columnar_filter_test_map_literal_compile(&literal, program);
         }
     }
-    R(192, 22); L(192); L(192); L(170);
+    R(192, 36); L(192); L(192); L(170);
     wl_columnar_filter_test_literal_single(&literal);
     for (uint32_t row = 0; row < rows; ++row) {
         L(128); L(192); L(128); R(224, (width + 7u) / 8u);
@@ -3289,7 +3289,7 @@ main(void)
             1, false, false, false, NULL, 0);
     wl_evaluation_control_report_t shared = wl_columnar_filter_test_parity(1, 1,
             false, false, false, NULL, 0, true);
-    CHECK(shared.consumed == same.total + 128 + 16u * 512u + 32u * 291u);
+    CHECK(shared.consumed == same.total + 128 + 16u * 512u + 48u * 291u);
     free(same.prefix);
     wl_columnar_filter_test_budget(0, 0, false, false, false, NULL, 0, true);
     wl_columnar_filter_test_budget(1, 1, false, true, false, &yes, 0, false);

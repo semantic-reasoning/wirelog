@@ -5441,7 +5441,6 @@ typedef struct wl_columnar_filter_context {
     bool pin_owned;
     int execution_result, cleanup_result, semantic_result;
     uint32_t row, width, nrows;
-    bool result_latched;
     bool committed, unary_started;
     bool source_initialized, batch_initialized, drain_initialized;
     bool heap, admitted, credit_committed, ref_held;
@@ -5488,5 +5487,115 @@ extern void (*wl_columnar_filter_test_attempt_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 extern int wl_columnar_filter_test_attempt_fail_allocation;
 #endif
+
+/* Original-address numeric plan segments. This internal host-driven interface
+ * does not activate public session evaluation controls. The host binds one
+ * private input entry and keeps plan/frame/session storage live until ACK.
+ * Every action needs a distinct live host funding control. Never spin on a
+ * child return: consume its protocol result on a later host dispatch. */
+typedef enum {
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT = 0,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_ACK_CHILD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_ADVANCE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
+} wl_columnar_eval_plan_numeric_phase_t;
+
+typedef struct wl_columnar_eval_plan_numeric_attempt {
+    struct wl_columnar_eval_plan_numeric_attempt *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    uint32_t begin, end, cursor, completed;
+    wl_columnar_eval_plan_numeric_phase_t phase, pending_action;
+    wl_columnar_filter_status_t child_status;
+    int semantic_result, protocol_result;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+} wl_columnar_eval_plan_numeric_attempt_t;
+
+typedef struct {
+    wl_columnar_eval_plan_numeric_phase_t phase;
+    uint32_t completed;
+    int semantic_result, protocol_result;
+    bool retained;
+} wl_columnar_eval_plan_numeric_status_t;
+
+void wl_columnar_eval_plan_numeric_attempt_init(
+    wl_columnar_eval_plan_numeric_attempt_t *);
+bool wl_columnar_eval_plan_numeric_owner_valid(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_plan_numeric_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_plan_numeric_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_consume_result(
+    wl_columnar_eval_plan_numeric_attempt_t *, int,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_plan_numeric_attempt_status(
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_columnar_eval_plan_numeric_status_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_attempt_ack(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+
+/* Exact segment authority routes; NULL denotes an unbound standalone frame.
+ * Owner arguments are original stable records, not transferable capabilities. */
+int wl_columnar_eval_stack_numeric_owner(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+int wl_columnar_eval_stack_numeric_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *, const void *);
+int wl_columnar_eval_stack_numeric_unbind(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *, const void *);
+int wl_columnar_eval_stack_operator_stack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    eval_stack_t **, const void *);
+int wl_columnar_eval_stack_unary_begin_attempt_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, const void *);
+int wl_columnar_eval_stack_unary_reset_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+int wl_columnar_eval_stack_filter_finish_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, int, int *, bool *, const void *);
+int wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *);
+int wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *);
+int wl_columnar_filter_op_attempt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *);
+int wl_columnar_filter_op_attempt_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+
+int wl_columnar_eval_stack_unary_input_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const col_rel_t **, const void *);
+int wl_columnar_eval_stack_unary_output_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***, const void *);
+int wl_columnar_eval_stack_unary_commit_attempt_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
+int wl_columnar_eval_stack_filter_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
+    const void *);
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

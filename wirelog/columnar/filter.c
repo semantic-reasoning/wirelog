@@ -1925,12 +1925,23 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
     wl_evaluation_control_t *control, uint64_t attempt_id,
     wl_columnar_filter_status_t *status)
 {
-    if (!status) return EINVAL;
-    wl_columnar_filter_attempt_status_init(status);
-    if (!op) return EINVAL;
+    return wl_columnar_filter_op_attempt_start_owned(op, frame, sess, control,
+               attempt_id, status,
+               NULL);
+}
+
+int
+wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t attempt_id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!status || !op) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack(frame, sess, &stack);
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, sess, &stack,
+            owner);
     if (rc) return rc;
+    wl_columnar_filter_attempt_status_init(status);
     if (!control) {
         int result = wl_columnar_filter_op(op, stack, sess);
         status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
@@ -1938,7 +1949,7 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
         return 0;
     }
     wl_columnar_filter_context_t *ctx = NULL;
-    rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
     ctx->governor = NULL;
@@ -1947,7 +1958,7 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
-    ctx->committed = false; ctx->result_latched = false;
+    ctx->committed = false;
     ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
     ctx->execution_result = 0; ctx->cleanup_result = 0;
     ctx->semantic_result = 0; ctx->control = NULL; ctx->pin_owned = false;
@@ -2019,8 +2030,8 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 3, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_begin_attempt_controlled(frame, control,
-            attempt_id);
+    rc = wl_columnar_eval_stack_unary_begin_attempt_owned(frame, control,
+            attempt_id, owner);
     if (rc)
         goto done;
     ctx->unary_started = true;
@@ -2033,7 +2044,7 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
         goto done;
     const col_rel_t *input = NULL;
     col_rel_t **out_slot = NULL;
-    rc = wl_columnar_eval_stack_unary_input(frame, &input);
+    rc = wl_columnar_eval_stack_unary_input_owned(frame, &input, owner);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2041,7 +2052,7 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_WORK);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_output(frame, &out_slot);
+    rc = wl_columnar_eval_stack_unary_output_owned(frame, &out_slot, owner);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2245,13 +2256,13 @@ wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
             goto done;
         }
     }
-    /* Eleven future steps get two128 halves each from22 payments. Each
+    /* Eighteen future steps get two128 halves each from36 payments. Each
      * payment reserves64 for current loop/caller scaffolding,128 for future
      * first cleanup; common BATCH is separate margin, never spent twice.
      * First refusal uses prior PROGRAM caller funding; later refusal uses
      * its latest unused128 instead of any nonexistent future batch step.
      * This provisional capacity requires actual per-step/source recount. */
-    for (unsigned stage = 0; stage < 22; ++stage) {
+    for (unsigned stage = 0; stage < 36; ++stage) {
         rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                 WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK);
         if (rc)
@@ -2342,7 +2353,7 @@ done:
     /* Every live owner is embedded; cleanup returns through real host turns. */
     ctx->execution_result = wl_columnar_filter_status(sess, ctx->output, rc);
     ctx->semantic_result = ctx->execution_result;
-    ctx->result_latched = true; ctx->stage = WL_COLUMNAR_FILTER_STAGE_BATCH;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_BATCH;
     ctx->busy = false;
     wl_columnar_filter_attempt_status(ctx, status,
         WL_COLUMNAR_FILTER_PROGRESS_YIELD);
@@ -2479,12 +2490,23 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
     wl_evaluation_control_t *control, uint64_t attempt_id,
     wl_columnar_filter_status_t *status)
 {
-    if (!status) return EINVAL;
-    wl_columnar_filter_attempt_status_init(status);
-    if (!op) return EINVAL;
+    return wl_columnar_filter_map_attempt_start_owned(op, frame, sess, control,
+               attempt_id, status,
+               NULL);
+}
+
+int
+wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t attempt_id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!status || !op) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack(frame, sess, &stack);
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, sess, &stack,
+            owner);
     if (rc) return rc;
+    wl_columnar_filter_attempt_status_init(status);
     if (!control) {
         int result = col_op_map(op, stack, sess);
         status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
@@ -2492,7 +2514,7 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
         return 0;
     }
     wl_columnar_filter_context_t *ctx = NULL;
-    rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
     ctx->governor = NULL;
@@ -2501,7 +2523,7 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
-    ctx->committed = false; ctx->result_latched = false;
+    ctx->committed = false;
     ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
     ctx->execution_result = 0; ctx->cleanup_result = 0;
     ctx->semantic_result = 0; ctx->control = NULL; ctx->pin_owned = false;
@@ -2568,8 +2590,8 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 3, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_begin_attempt_controlled(frame, control,
-            attempt_id);
+    rc = wl_columnar_eval_stack_unary_begin_attempt_owned(frame, control,
+            attempt_id, owner);
     if (rc)
         goto done;
     ctx->unary_started = true;
@@ -2582,7 +2604,7 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
         goto done;
     const col_rel_t *input = NULL;
     col_rel_t **out_slot = NULL;
-    rc = wl_columnar_eval_stack_unary_input(frame, &input);
+    rc = wl_columnar_eval_stack_unary_input_owned(frame, &input, owner);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2590,7 +2612,7 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
             WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_WORK);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_output(frame, &out_slot);
+    rc = wl_columnar_eval_stack_unary_output_owned(frame, &out_slot, owner);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2769,13 +2791,13 @@ wl_columnar_filter_map_attempt_start(const wl_plan_op_t *op,
             control, attempt_id);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc) goto done;
-    /* Eleven future steps get two128 halves each from22 payments. Each
+    /* Eighteen future steps get two128 halves each from36 payments. Each
      * payment reserves64 for current loop/caller scaffolding,128 for future
      * first cleanup; common BATCH is separate margin, never spent twice.
      * First refusal uses prior PROGRAM caller funding; later refusal uses
      * its latest unused128 instead of any nonexistent future batch step.
      * This provisional capacity requires actual per-step/source recount. */
-    for (unsigned stage = 0; stage < 22; ++stage) {
+    for (unsigned stage = 0; stage < 36; ++stage) {
         rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                 WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK);
         if (rc)
@@ -2874,7 +2896,6 @@ done:
     /* Every live owner is embedded; cleanup returns through real host turns. */
     ctx->execution_result = wl_columnar_filter_status(sess, ctx->output, rc);
     ctx->semantic_result = ctx->execution_result;
-    ctx->result_latched = true;
     ctx->stage = ctx->table.initialized
         ? WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM :
         WL_COLUMNAR_FILTER_STAGE_BATCH;
@@ -2885,13 +2906,10 @@ done:
 }
 
 static int
-wl_columnar_filter_attempt_context(
+wl_columnar_filter_attempt_context_valid(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
-    wl_columnar_filter_context_t **out)
+    const wl_columnar_filter_context_t *ctx)
 {
-    int rc = wl_columnar_eval_stack_filter_context(frame, out);
-    if (rc) return rc;
-    wl_columnar_filter_context_t *ctx = *out;
     if (ctx->identity != ctx || ctx->frame != frame || !ctx->session
         || ctx->session->cleanup_active != frame
         || ctx->stage <= WL_COLUMNAR_FILTER_STAGE_INERT
@@ -2906,9 +2924,19 @@ wl_columnar_filter_op_attempt_step(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_columnar_filter_status_t *status)
 {
+    return wl_columnar_filter_op_attempt_step_owned(frame, status, NULL);
+}
+
+int
+wl_columnar_filter_op_attempt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
     if (!status) return EINVAL;
     wl_columnar_filter_context_t *ctx = NULL;
-    int rc = wl_columnar_filter_attempt_context(frame, &ctx);
+    int rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) {
         wl_columnar_filter_attempt_status_init(status);
         return rc;
@@ -3054,8 +3082,8 @@ wl_columnar_filter_op_attempt_step(
             rc = wl_columnar_filter_attempt_charge(ctx->control,
                     ctx->attempt_id, 0);
             if (!rc)
-                rc = wl_columnar_eval_stack_unary_commit_attempt_controlled(
-                    frame, &ctx->committed);
+                rc = wl_columnar_eval_stack_unary_commit_attempt_owned(
+                    frame, &ctx->committed, owner);
             ctx->execution_result = rc;
             ctx->semantic_result = rc;
         }
@@ -3077,9 +3105,9 @@ wl_columnar_filter_op_attempt_step(
     case WL_COLUMNAR_FILTER_STAGE_FINISH:
         if (ctx->unary_started) {
             bool finish_retained = false;
-            rc = wl_columnar_eval_stack_filter_finish(frame,
+            rc = wl_columnar_eval_stack_filter_finish_owned(frame,
                     ctx->execution_result, &ctx->semantic_result,
-                    &finish_retained);
+                    &finish_retained, owner);
             if (rc) goto protocol_error;
             if (finish_retained) goto retained;
         }
@@ -3087,7 +3115,7 @@ wl_columnar_filter_op_attempt_step(
         break;
     case WL_COLUMNAR_FILTER_STAGE_RESET:
         if (ctx->unary_started) {
-            rc = wl_columnar_eval_stack_unary_reset(frame);
+            rc = wl_columnar_eval_stack_unary_reset_owned(frame, owner);
             if (rc) {
                 if (rc != EBUSY) goto protocol_error;
                 goto retained;
@@ -3120,12 +3148,19 @@ int
 wl_columnar_filter_op_attempt_ack(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    return wl_columnar_filter_op_attempt_ack_owned(frame, NULL);
+}
+
+int
+wl_columnar_filter_op_attempt_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
     wl_columnar_filter_context_t *ctx = NULL;
-    int rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    int rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT)
         return 0;
-    rc = wl_columnar_filter_attempt_context(frame, &ctx);
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) return rc;
     if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
         || ctx->unary_started || ctx->source_initialized ||
@@ -3139,7 +3174,7 @@ wl_columnar_filter_op_attempt_ack(
         return EBUSY;
     ctx->thread_valid = false; ctx->frame = NULL; ctx->session = NULL;
     ctx->values = ctx->inline_values; ctx->governor = NULL;
-    ctx->attempt_id = 0; ctx->result_latched = false;
+    ctx->attempt_id = 0;
     ctx->execution_result = 0; ctx->cleanup_result = 0;
     ctx->semantic_result = 0; ctx->committed = false;
     ctx->credit_committed = false; ctx->drain_initialized = false;

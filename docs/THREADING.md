@@ -1673,7 +1673,7 @@ validates retained ownership under the destination's existing writer authority.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
-| `filter.c:wl_columnar_filter_op_attempt_start` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the exclusively owned original scratch token owner before reservation; no concurrent publication |
-| `filter.c:wl_columnar_filter_op_attempt_start#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition, then bind identity to this original token address |
+| `filter.c:wl_columnar_filter_op_attempt_start_owned` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the exclusively owned original scratch token owner before reservation; no concurrent publication |
+| `filter.c:wl_columnar_filter_op_attempt_start_owned#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition, then bind identity to this original token address |
 | `relation.c:wl_columnar_relation_row_body_operator` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | With original destination writers and exclusive token authority, verify relation ownership before operator-specific growth |
 | `relation.c:wl_columnar_relation_row_body_operator#2` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Require COMMITTED before growth; separate owner/state reads do not imply a coherent shared-governor snapshot |
