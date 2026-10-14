@@ -2366,7 +2366,7 @@ operator coverage required by #1821.
 The internal `wl_columnar_filter_op_attempt_start`, `step` and `ack` interface
 adds an opt-in FILTER operation to an original cleanup frame. A NULL control
 delegates to the existing raw FILTER. The normal engine dispatch is unchanged;
-MAP and the remaining operator integration are separate work.
+MAP shares this continuation; full evaluator integration remains separate work.
 
 The controlled path gathers from a protected scalar source and builds a private
 heap output. It supports numeric predicates, including an absent predicate,
@@ -2401,8 +2401,11 @@ The source-work accounting measures scalar operations and control flow, with
 each increment counted as arithmetic plus a store. It excludes instrumentation
 and the established allocator, control/reference and physical retirement
 interiors. It does not guarantee wall-clock latency or bounded atomic retries.
-The largest accepted cleanup interval is the CLEAR stage at 256 units,
-including outer dispatch. Fixture setup and observation occur outside those
+The private batch CLEAR stage now clears at most four fields per turn. Its
+54 fields require fourteen CLEAR turns and eighteen total first retirement
+turns. Both operators prepay thirty-six grants of 192 units: each grant assigns
+64 units to current setup and 128 to future retirement, covering eighteen
+256-unit retirement allowances. Retained retries require fresh host admission. Fixture setup and observation occur outside those
 bounded turns. Runtime correctness and performance require separate evidence;
 source accounting alone establishes neither throughput nor raw-path speed
 parity.
@@ -2453,5 +2456,94 @@ positive accounting or stale-attempt errors take precedence.
 This adds per-column compilation/table storage and conservative prepaid work,
 including six fixed table grants and a retirement grant per discoverable slot.
 It does not promise raw-path performance or activate the remaining operators
-required by #1821. The table-bearing cleanup frame remains 2808 bytes on the
+required by #1821. The segment binding enlarges the table-bearing cleanup frame to 2816 bytes on the
 validated 64-bit Linux ABI; other ABIs use their actual structure size.
+
+### Cooperative numeric plan segments
+
+The internal `wl_columnar_eval_plan_numeric_attempt_*` interface composes a
+nonempty `[begin, end)` slice of FILTER/MAP operators from a relation plan.
+The caller explicitly supplies one input relation in an original active cleanup
+frame. This does not execute VARIABLE lookup, delta selection, consolidation,
+recursive dispatch or session publication. Public session control admission and
+ordinary `col_eval_relation_plan()` behavior are unchanged.
+
+A segment holds one original operation-control reference and immutable attempt
+ID through its final acknowledgement. Opcode preflight visits one operator per
+host action before any operator starts. Numeric expression support is checked
+by the actual child compiler, including on empty input; an expression failure
+in a later operator can therefore leave an earlier private result. The unit of
+transaction is one operator, not the whole slice. Intermediate results remain
+reachable in the private frame and are never installed in a session by this
+interface.
+
+The original segment owns a dedicated frame binding from begin through ACK,
+including between children and after DONE. Generic frame disposal and competing
+standalone numeric/unary mutation return EBUSY while bound. Owner-aware child
+routes require the exact original segment and native thread. The trusted host
+must keep the plan, bytecode, frame, session and source storage live and immutable
+and must not mutate borrowed raw stack pointers while the segment is active.
+Start validates the frame before initializing caller status, so structural or
+ownership refusal leaves that output untouched. Segment begin validates the
+operation control before its single final frame claim; a failed claim clears
+its record and releases the pin without changing the frame.
+Initializing a fresh caller-owned segment is host setup work; reinitializing a
+live segment or copying it does not transfer ownership.
+
+Each action admits 384 units from a separate live host funding control and its
+saved attempt ID. This covers validation before admission and current action
+work, including each retained retry. The 384-unit fee is distinct from the
+256-unit maximum between checks. Each opcode preflight and operator entry also
+admits 128 units from the original operation before child admissions.
+This control must differ from the operation control. Admission failure performs
+no action and preserves pending work. Every retry and status query needs a fresh
+admission; cleanup after cancellation does not borrow a successor's evaluation
+budget. The caller keeps the borrowed funding control live throughout the call.
+This work accounting is logical admission, not elapsed time or exact executed
+instruction telemetry.
+
+A child call writes status into the original segment and returns its protocol
+result directly. The host supplies that exact result to
+`wl_columnar_eval_plan_numeric_consume_result()` on a later dispatch. Consuming
+an outcome twice or out of order is rejected. Child acknowledgement and starting
+the next operator likewise occupy separate dispatches. A positive protocol error
+parks the corresponding action for a separately funded retry; it is not semantic
+success or permission to abandon the frame. A synchronous loop cannot claim the
+host-return bounds. Status queries are separate admitted actions with disjoint
+output storage. After DONE, segment ACK releases its frame binding and control
+reference; result transfer, report completion and generic frame disposal are
+separate host operations.
+
+The source accounting distinguishes the largest interval from total current
+work paid by one host admission. The read-only prefix before a successful host
+admission is at most 61 units. Representative conservative ceilings are:
+
+| Action | Largest interval | Whole current action | Host admission |
+|---|---:|---:|---:|
+| Begin, including failed claim rollback | 160 | 181 | 384 |
+| Opcode preflight | 110 | 110 | 384 |
+| Operator entry, including refused first child charge | 239 | 324 | 384 |
+| Batch NEW retirement | 238 | 299 | 384 |
+| Batch CLEAR retirement | 204 | 265 | 384 |
+| Retained FINISH retry | 249 | 310 | 384 |
+| Child acknowledgement | 140 | 201 | 384 |
+| Consume child result | 100 | 100 | 384 |
+| Advance | 85 | 85 | 384 |
+| Release to DONE | 77 | 77 | 384 |
+| Status | 90 | 90 | 384 |
+| Segment acknowledgement | 210 | 210 | 384 |
+
+Child compiler, constructor and row work retains its own admissions. Owner-aware
+unary begin, input/output and commit-decision intervals are bounded by 204, 149
+and 203 respectively; the existing standalone COLUMN error tail remains the
+limiting 256-unit interval. Standalone FINISH and RESET plus acknowledgement
+are bounded by 249 and 248. These are source-model bounds under the primitive,
+allocator, reference and physical-retirement exclusions described above.
+They are not counts inferred from runtime hooks.
+
+The certified action ends at its direct return to the host. Fresh record
+initialization and the external host's queue scheduling are separately owned
+caller work, not free operations or hidden polling points. Adding a scheduler
+inside the production evaluator requires accounting for that scheduler before
+activating it. Each retained retry uses a new host admission; previously paid
+child retirement allowances are not spent a second time.

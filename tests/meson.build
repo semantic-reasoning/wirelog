@@ -6439,3 +6439,15 @@ test_evaluation_output_materialization_exe = executable(
 )
 test('evaluation_output_materialization', test_evaluation_output_materialization_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# Production numeric plan continuation, with a source-unique hook archive.
+test_evaluation_numeric_plan_exe = executable(
+  'test_evaluation_numeric_plan', files('test_evaluation_numeric_plan.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_numeric_plan', test_evaluation_numeric_plan_exe,
+     suite: ['unit', 'tsan'], timeout: 120)

@@ -8228,7 +8228,7 @@ wl_columnar_relation_private_batch_drain_step(
             || !wl_columnar_relation_private_batch_writers_inert(single))
             return EINVAL;
         unsigned count = 0;
-        while (count < 8 && drain->cursor < 54) {
+        while (count < 4 && drain->cursor < 54) {
             switch (drain->cursor) {
             case 0: single->set.identity = 0; break;
             case 1: single->set.acquisition_nonce = 0; break;

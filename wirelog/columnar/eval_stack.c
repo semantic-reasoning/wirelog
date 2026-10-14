@@ -288,6 +288,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     int unary_cleanup_result;
     bool unary_alias_rejected;
     wl_columnar_filter_context_t filter;
+    const void *numeric_plan_owner;
 };
 
 int
@@ -333,6 +334,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
     wl_columnar_memory_reservation_init(&frame->reservation);
     frame->identity = frame;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    frame->numeric_plan_owner = NULL;
     if (sess->memory_governor) {
         if (!wl_columnar_memory_reservation_move(&frame->reservation,
             &reservation)) {
@@ -364,7 +366,7 @@ wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
  * decisions and full move40; only allocator, original physical-credit-ref
  * retirement internals, control internals and instrumentation are excluded.
  * ENTRY103<=112, SETUP135<=144, RESERVE156<=192, ALLOC128<=144,
- * ZERO202<=208, TOKEN124<=128 (self/IDLE stores2), MOVE161<=176, COMMIT104<=128,
+ * ZERO202<=208, TOKEN125<=128 (self/IDLE/segment-owner stores3), MOVE161<=176, COMMIT104<=128,
  * EXTERNAL133<=144 including BOTH T29 tails on one debit. Six terminal
  * publication slots include active_count arithmetic/store2, no later hook.
  * ZERO counts16*(address+store+increment arithmetic/store+test)=80 plus
@@ -592,6 +594,7 @@ wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
     wl_columnar_memory_reservation_init(&frame->reservation);
     frame->identity = frame;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    frame->numeric_plan_owner = NULL;
     rc = wl_columnar_eval_stack_attempt_tail(control, attempt_id,
             WL_COLUMNAR_EVAL_STACK_TOKEN_PHASE, sizeof(*frame));
     if (rc)
@@ -725,7 +728,7 @@ typedef char wl_columnar_eval_stack_unary_envelopes_fit_t[
 typedef char wl_columnar_eval_stack_unary_contiguous_fits_t[
         (UINT64_C(232) <= WL_EVALUATION_CONTROL_QUANTUM
         && UINT64_C(136) <= WL_EVALUATION_CONTROL_QUANTUM
-        && UINT64_C(124) <= WL_COLUMNAR_EVAL_STACK_TOKEN_WORK) ? 1 : -1];
+        && UINT64_C(125) <= WL_COLUMNAR_EVAL_STACK_TOKEN_WORK) ? 1 : -1];
 
 static void
 wl_columnar_eval_stack_unary_entry_clear(eval_entry_t *entry)
@@ -767,6 +770,17 @@ wl_columnar_eval_stack_unary_frame_valid(
 {
     return frame && frame->identity == frame && frame->session
            && frame->stack.top <= COL_STACK_MAX;
+}
+
+int
+wl_columnar_eval_stack_numeric_owner(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    if (frame->numeric_plan_owner != owner) return EBUSY;
+    if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    return 0;
 }
 
 static bool
@@ -812,6 +826,17 @@ wl_columnar_eval_stack_unary_begin_attempt_controlled(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_evaluation_control_t *control, uint64_t attempt_id)
 {
+    return wl_columnar_eval_stack_unary_begin_attempt_owned(frame, control,
+               attempt_id, NULL);
+}
+
+int
+wl_columnar_eval_stack_unary_begin_attempt_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control, uint64_t attempt_id, const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
     int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
@@ -888,6 +913,16 @@ int
 wl_columnar_eval_stack_unary_input(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const col_rel_t **out)
 {
+    return wl_columnar_eval_stack_unary_input_owned(frame, out, NULL);
+}
+
+int
+wl_columnar_eval_stack_unary_input_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const col_rel_t **out,
+    const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
     if (!out)
         return EINVAL;
     int rc = wl_columnar_eval_stack_unary_forward(frame);
@@ -901,6 +936,16 @@ int
 wl_columnar_eval_stack_unary_output(
     wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t ***out_slot)
 {
+    return wl_columnar_eval_stack_unary_output_owned(frame, out_slot, NULL);
+}
+
+int
+wl_columnar_eval_stack_unary_output_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t ***out_slot,
+    const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
     if (!out_slot)
         return EINVAL;
     int rc = wl_columnar_eval_stack_unary_forward(frame);
@@ -976,6 +1021,17 @@ int
 wl_columnar_eval_stack_unary_commit_attempt_controlled(
     wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed)
 {
+    return wl_columnar_eval_stack_unary_commit_attempt_owned(frame, committed,
+               NULL);
+}
+
+int
+wl_columnar_eval_stack_unary_commit_attempt_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
+    const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
     if (!committed)
         return EINVAL;
     *committed = false;
@@ -1108,6 +1164,8 @@ int
 wl_columnar_eval_stack_unary_finish(
     wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result)
 {
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, NULL);
+    if (rc) return rc;
     return wl_columnar_eval_stack_unary_finish_body(frame, initiating_result,
                true);
 }
@@ -1116,7 +1174,17 @@ int
 wl_columnar_eval_stack_unary_reset(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
+    return wl_columnar_eval_stack_unary_reset_owned(frame, NULL);
+}
+
+int
+wl_columnar_eval_stack_unary_reset_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->numeric_plan_owner != owner) return EBUSY;
+    if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
     if (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_DONE
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
@@ -1141,8 +1209,20 @@ wl_columnar_eval_stack_filter_finish(
     wl_columnar_eval_stack_cleanup_frame_t *frame, int result, int *semantic,
     bool *retained)
 {
+    return wl_columnar_eval_stack_filter_finish_owned(frame, result, semantic,
+               retained, NULL);
+}
+
+int
+wl_columnar_eval_stack_filter_finish_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int result, int *semantic,
+    bool *retained, const void *owner)
+{
     if (!semantic || !retained
         || !wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->numeric_plan_owner != owner) return EBUSY;
+    if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
     wl_columnar_filter_context_t *ctx = &frame->filter;
     if (ctx->identity != ctx || ctx->frame != frame
@@ -1191,7 +1271,18 @@ wl_columnar_eval_stack_filter_context(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_columnar_filter_context_t **out)
 {
+    return wl_columnar_eval_stack_filter_context_owned(frame, out, NULL);
+}
+
+int
+wl_columnar_eval_stack_filter_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t **out, const void *owner)
+{
     if (!out || !wl_columnar_eval_stack_unary_frame_valid(frame))
+        return EINVAL;
+    if (frame->numeric_plan_owner != owner) return EBUSY;
+    if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
     *out = &frame->filter;
     return 0;
@@ -1204,6 +1295,16 @@ wl_columnar_eval_stack_operator_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
     eval_stack_t **out)
 {
+    return wl_columnar_eval_stack_operator_stack_owned(frame, sess, out, NULL);
+}
+
+int
+wl_columnar_eval_stack_operator_stack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    eval_stack_t **out, const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
     if (!out || !frame || !sess || frame->identity != frame
         || frame->session != sess || frame->stack.top > COL_STACK_MAX)
         return EINVAL;
@@ -1229,6 +1330,35 @@ wl_columnar_eval_stack_operator_stack(
         || entry->continuation || !entry->rel)
         return EINVAL;
     *out = &frame->stack;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    const void *owner)
+{
+    if (!owner || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack(frame, sess, &stack);
+    if (rc) return rc;
+    if (stack->top != 1) return EINVAL;
+    frame->numeric_plan_owner = owner;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_unbind(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    const void *owner)
+{
+    if (!owner) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, sess, &stack,
+            owner);
+    if (rc) return rc;
+    frame->numeric_plan_owner = NULL;
     return 0;
 }
 
@@ -1314,7 +1444,8 @@ wl_columnar_eval_stack_cleanup_finish(
     wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
-    if (frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+    if (frame->numeric_plan_owner
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED)
         return EBUSY;
