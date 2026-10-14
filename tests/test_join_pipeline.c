@@ -2,7 +2,9 @@
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/columnar/join_pipeline.h"
+#include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
+#include "../wirelog/wirelog.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -1295,6 +1297,8 @@ sel_expect_decline(wl_col_session_t *sess, col_rel_t *left,
     sel_plan_t p;
     eval_stack_t stack;
     uint32_t next_index = UINT32_MAX;
+    wl_columnar_join_pipeline_decline_t decline
+        = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NONE;
     int rc;
 
     sel_plan_init(&p, WL_DELTA_FORCE_FULL);
@@ -1306,11 +1310,13 @@ sel_expect_decline(wl_col_session_t *sess, col_rel_t *left,
     }
     sess->join_batch_bytes = SEL_BATCH_BYTES;
     rc = wl_columnar_join_pipeline_try_eval(&p.plan, 0, &stack, sess,
-            &next_index);
+            &next_index, &decline);
     if (rc != 0)
         fprintf(stderr, "  %s: try_eval rc=%d\n", message, rc);
     CHECK(rc == 0 && stack.top == 1 && stack.items[0].rel == left
         && next_index == 0, message);
+    CHECK(rc != 0 || decline == WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY,
+        "a zero-column input is left to the ordinary JOIN");
     (void)eval_stack_drain(&stack);
 }
 
@@ -1382,6 +1388,848 @@ test_pipeline_zero_column_left_declines(void)
     pipeline_session_destroy(sess);
 }
 
+/* ---- Successor classification and decline kinds (#1370 unit a1) ---- */
+
+#define A1_MAX_ROWS 16u
+#define A1_MAX_COLS 6u
+
+typedef struct {
+    int rc;
+    uint32_t stack_top;
+    bool left_kept;
+    uint32_t ncols;
+    uint32_t nrows;
+    int64_t rows[A1_MAX_ROWS][A1_MAX_COLS];
+} a1_run_t;
+
+static uint32_t a1_reduce_calls;
+
+static void
+a1_reduce_observer(eval_stack_t *stack, eval_entry_t *entry)
+{
+    (void)stack;
+    (void)entry;
+    a1_reduce_calls++;
+}
+
+static int
+a1_row_cmp(const void *a, const void *b)
+{
+    const int64_t *x = (const int64_t *)a;
+    const int64_t *y = (const int64_t *)b;
+    for (uint32_t c = 0; c < A1_MAX_COLS; c++) {
+        if (x[c] != y[c])
+            return x[c] < y[c] ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Evaluate @plan over @left (NULL: the two-row sel left) with @below, when
+ * non-NULL, pushed underneath it.  The stack owns both. */
+static a1_run_t
+a1_eval(wl_col_session_t *sess, const wl_plan_relation_t *plan,
+    uint32_t batch_bytes, col_rel_t *below, col_rel_t *left)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    a1_run_t run;
+    eval_stack_t stack;
+    uint32_t base_top;
+
+    memset(&run, 0, sizeof(run));
+    run.rc = ENOMEM;
+    eval_stack_init(&stack);
+    if (below && eval_stack_push(&stack, below, true) != 0) {
+        col_rel_destroy(below);
+        col_rel_destroy(left);
+        return run;
+    }
+    if (!left)
+        left = pipeline_relation("left", left_names, 2, left_rows, 2);
+    if (!left || eval_stack_push_delta(&stack, left, true, false) != 0) {
+        col_rel_destroy(left);
+        (void)eval_stack_drain(&stack);
+        return run;
+    }
+    base_top = stack.top;
+    a1_reduce_calls = 0;
+    sess->join_batch_bytes = batch_bytes;
+    run.rc = col_eval_relation_plan(plan, &stack, sess);
+    run.stack_top = stack.top;
+    run.left_kept = stack.top == base_top
+        && stack.items[stack.top - 1].rel == left;
+    if (run.rc == 0 && stack.top >= 1 && stack.items[stack.top - 1].rel) {
+        const col_rel_t *out = stack.items[stack.top - 1].rel;
+        run.ncols = out->ncols;
+        if (out->ncols > A1_MAX_COLS || out->nrows > A1_MAX_ROWS) {
+            run.nrows = UINT32_MAX;
+        } else {
+            run.nrows = out->nrows;
+            for (uint32_t r = 0; r < out->nrows; r++) {
+                for (uint32_t c = 0; c < out->ncols; c++)
+                    run.rows[r][c] = out->columns[c][r];
+            }
+            qsort(run.rows, run.nrows, sizeof(run.rows[0]), a1_row_cmp);
+        }
+    }
+    (void)eval_stack_drain(&stack);
+    return run;
+}
+
+/* @want holds @n rows of @ncols values, already sorted. */
+static bool
+a1_rows_are(const a1_run_t *run, uint32_t ncols, const int64_t *want,
+    uint32_t n)
+{
+    if (run->rc != 0 || run->ncols != ncols || run->nrows != n)
+        return false;
+    for (uint32_t r = 0; r < n; r++) {
+        for (uint32_t c = 0; c < ncols; c++) {
+            if (run->rows[r][c] != want[r * ncols + c])
+                return false;
+        }
+    }
+    return true;
+}
+
+static void
+a1_report(const char *name, const a1_run_t *run)
+{
+    fprintf(stderr, "  %s: rc=%d top=%u ncols=%u nrows=%u\n", name, run->rc,
+        run->stack_top, run->ncols, run->nrows);
+}
+
+static const char *const a1_keys[] = { "k" };
+static const uint32_t a1_group_k[] = { 0 };
+
+static void
+a1_join(wl_plan_op_t *op, const char *right, wl_delta_mode_t mode)
+{
+    memset(op, 0, sizeof(*op));
+    op->op = WL_PLAN_OP_JOIN;
+    op->right_relation = right;
+    op->left_keys = a1_keys;
+    op->right_keys = a1_keys;
+    op->key_count = 1;
+    op->delta_mode = mode;
+}
+
+/* COUNT(*) grouped by column 0. */
+static void
+a1_count_by_k(wl_plan_op_t *op)
+{
+    memset(op, 0, sizeof(*op));
+    op->op = WL_PLAN_OP_REDUCE;
+    op->agg_fn = WIRELOG_AGG_COUNT;
+    op->group_by_indices = a1_group_k;
+    op->group_by_count = 1;
+    op->aggregate_index = 1;
+}
+
+/* Codes for the classifier table: plain op values, plus these. */
+#define A1_EXCHANGE_W1 101
+#define A1_EXCHANGE_W4 104
+#define A1_EXCHANGE_NULL 110
+#define A1_UNKNOWN_OP 99
+
+static void
+test_successor_classifier_table(void)
+{
+    enum { SINK = WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK,
+           MAT = WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING };
+    static const struct {
+        int ops[6];
+        uint32_t n;
+        int want;
+        const char *name;
+    } rows[] = {
+        { { 0 }, 0, SINK, "end of plan" },
+        { { WL_PLAN_OP_CONCAT }, 1, SINK, "CONCAT" },
+        { { WL_PLAN_OP_CONSOLIDATE }, 1, SINK, "CONSOLIDATE" },
+        { { WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONSOLIDATE, A1_EXCHANGE_W1 }, 3,
+          SINK, "CONCAT CONSOLIDATE EXCHANGE(W=1)" },
+        { { WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONSOLIDATE, A1_EXCHANGE_W4 }, 3,
+          SINK, "CONCAT CONSOLIDATE EXCHANGE(W=4)" },
+        { { WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONSOLIDATE,
+            WL_PLAN_OP_CONSOLIDATE }, 3, SINK,
+          "CONCAT CONSOLIDATE CONSOLIDATE" },
+        { { WL_PLAN_OP_VARIABLE, WL_PLAN_OP_JOIN, WL_PLAN_OP_CONCAT }, 3,
+          SINK, "VAR JOIN CONCAT" },
+        { { WL_PLAN_OP_VARIABLE, WL_PLAN_OP_JOIN, WL_PLAN_OP_SEMIJOIN,
+            WL_PLAN_OP_CONCAT }, 4, SINK, "VAR JOIN SEMIJOIN CONCAT" },
+        { { WL_PLAN_OP_K_FUSION, WL_PLAN_OP_CONCAT }, 2, SINK,
+          "K_FUSION CONCAT" },
+        { { WL_PLAN_OP_LFTJ, WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONCAT }, 3, SINK,
+          "LFTJ CONCAT CONCAT" },
+        { { WL_PLAN_OP_REDUCE }, 1, MAT, "REDUCE" },
+        { { WL_PLAN_OP_REDUCE, A1_EXCHANGE_W1 }, 2, MAT,
+          "REDUCE EXCHANGE(W=1)" },
+        { { WL_PLAN_OP_JOIN }, 1, MAT, "JOIN" },
+        { { WL_PLAN_OP_CONCAT, WL_PLAN_OP_REDUCE }, 2, MAT, "CONCAT REDUCE" },
+        { { WL_PLAN_OP_FILTER, WL_PLAN_OP_CONCAT }, 2, MAT, "FILTER CONCAT" },
+        { { WL_PLAN_OP_VARIABLE, WL_PLAN_OP_VARIABLE, WL_PLAN_OP_CONCAT,
+            WL_PLAN_OP_CONCAT, WL_PLAN_OP_REDUCE }, 5, MAT,
+          "VAR VAR CONCAT CONCAT REDUCE" },
+        { { A1_EXCHANGE_W4, WL_PLAN_OP_REDUCE }, 2, SINK,
+          "EXCHANGE(W=4) REDUCE" },
+        { { A1_EXCHANGE_NULL }, 1, MAT, "EXCHANGE without metadata" },
+        { { A1_UNKNOWN_OP }, 1, MAT, "unknown op" },
+    };
+    wl_plan_op_exchange_t w1;
+    wl_plan_op_exchange_t w4;
+
+    memset(&w1, 0, sizeof(w1));
+    memset(&w4, 0, sizeof(w4));
+    w1.num_workers = 1;
+    w4.num_workers = 4;
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        wl_plan_op_t ops[7];
+        wl_plan_relation_t plan;
+        int got;
+
+        memset(ops, 0, sizeof(ops));
+        memset(&plan, 0, sizeof(plan));
+        ops[0].op = WL_PLAN_OP_JOIN;
+        for (uint32_t i = 0; i < rows[r].n; i++) {
+            int code = rows[r].ops[i];
+            wl_plan_op_t *op = &ops[i + 1u];
+            if (code == A1_EXCHANGE_W1 || code == A1_EXCHANGE_W4
+                || code == A1_EXCHANGE_NULL) {
+                op->op = WL_PLAN_OP_EXCHANGE;
+                op->opaque_data = code == A1_EXCHANGE_W1 ? (void *)&w1
+                    : code == A1_EXCHANGE_W4 ? (void *)&w4 : NULL;
+            } else {
+                op->op = (wl_plan_op_type_t)code;
+            }
+        }
+        plan.ops = ops;
+        plan.op_count = rows[r].n + 1u;
+        got = (int)wl_columnar_join_pipeline_successor(&plan, 1);
+        if (got != rows[r].want)
+            fprintf(stderr, "  JOIN %s: got %d, want %d\n", rows[r].name,
+                got, rows[r].want);
+        CHECK(got == rows[r].want,
+            "the successor classifier follows the JOIN's stack entry");
+    }
+}
+
+static col_rel_t *
+a1_empty(const char *name, uint32_t ncols)
+{
+    static const char *const names[] = { "a", "b", "c", "d", "e", "f" };
+    return pipeline_relation(name, names, ncols, NULL, 0);
+}
+
+static void
+test_relation_sink_successor_is_not_a_fallback(void)
+{
+    static const int64_t want[] = {
+        0, 10, 0, 100, 0, 10, 0, 101, 1, 20, 1, 200, 1, 20, 1, 201,
+    };
+    wl_plan_op_exchange_t w1;
+
+    memset(&w1, 0, sizeof(w1));
+    w1.num_workers = 1;
+    for (int shape = 0; shape < 2; shape++) {
+        for (int strict = 0; strict < 2; strict++) {
+            wl_plan_op_t ops[4];
+            wl_plan_relation_t plan;
+            a1_run_t run;
+            wl_col_session_t *sess = sel_session();
+
+            CHECK(sess != NULL, "relation-sink fixture");
+            if (!sess)
+                continue;
+            memset(&plan, 0, sizeof(plan));
+            a1_join(&ops[0], "right", WL_DELTA_AUTO);
+            memset(&ops[1], 0, sizeof(ops) - sizeof(ops[0]));
+            ops[1].op = WL_PLAN_OP_CONCAT;
+            ops[2].op = WL_PLAN_OP_CONSOLIDATE;
+            ops[3].op = WL_PLAN_OP_EXCHANGE;
+            ops[3].opaque_data = &w1;
+            plan.ops = ops;
+            plan.op_count = shape == 0 ? 2u : 4u;
+            sess->join_batch_strict = strict != 0;
+            run = a1_eval(sess, &plan, SEL_BATCH_BYTES, a1_empty("base", 4),
+                    NULL);
+            if (!a1_rows_are(&run, 4, want, 4)
+                || sess->join_batch_fallback_count != 0) {
+                a1_report(shape == 0 ? "JOIN CONCAT"
+                    : "JOIN CONCAT CONSOLIDATE EXCHANGE", &run);
+                fprintf(stderr, "  strict=%d fallbacks=%u\n", strict,
+                    sess->join_batch_fallback_count);
+            }
+            CHECK(a1_rows_are(&run, 4, want, 4),
+                "a JOIN feeding a relation sink returns the join rows");
+            CHECK(sess->join_batch_fallback_count == 0,
+                "a JOIN feeding a relation sink records no fallback");
+            pipeline_session_destroy(sess);
+        }
+    }
+}
+
+static wl_col_session_t *
+a1_boundary_session(void)
+{
+    static const char *const right2_names[] = { "k", "s" };
+    static const int64_t right2[] = { 0, 7 };
+    static const int64_t negated[] = { 1, 0 };
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *r2;
+    col_rel_t *neg;
+
+    if (!sess)
+        return NULL;
+    r2 = pipeline_relation("right2", right2_names, 2, right2, 1);
+    neg = pipeline_relation("$d$x", right2_names, 2, negated, 1);
+    if (!r2 || session_add_rel(sess, r2) != 0) {
+        col_rel_destroy(r2);
+        col_rel_destroy(neg);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    if (!neg || session_add_rel(sess, neg) != 0) {
+        col_rel_destroy(neg);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    if (!col_session_get_arrangement(&sess->base, "right2",
+        (const uint32_t[]){ 0 }, 1)) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static void
+test_materializing_boundaries_are_explicit(void)
+{
+    static const int64_t want_count[] = { 0, 2, 1, 2 };
+    static const int64_t want_join2[] = {
+        0, 10, 0, 100, 0, 7, 0, 10, 0, 101, 0, 7,
+    };
+    static const int64_t want_anti[] = { 0, 10, 0, 100, 0, 10, 0, 101 };
+    static const struct {
+        const char *name;
+        uint32_t ncols;
+        const int64_t *want;
+        uint32_t nwant;
+    } cases[] = {
+        { "JOIN -> REDUCE", 2, want_count, 2 },
+        { "JOIN -> JOIN", 6, want_join2, 2 },
+        { "JOIN -> ANTIJOIN($d$x)", 4, want_anti, 2 },
+    };
+
+    wl_columnar_ops_test_before_reduce_dispose = a1_reduce_observer;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        for (int strict = 0; strict < 2; strict++) {
+            wl_plan_op_t ops[2];
+            wl_plan_relation_t plan;
+            a1_run_t run;
+            wl_col_session_t *sess = a1_boundary_session();
+
+            CHECK(sess != NULL, "materializing-boundary fixture");
+            if (!sess)
+                continue;
+            memset(&plan, 0, sizeof(plan));
+            a1_join(&ops[0], "right", WL_DELTA_AUTO);
+            if (c == 0) {
+                a1_count_by_k(&ops[1]);
+            } else if (c == 1) {
+                a1_join(&ops[1], "right2", WL_DELTA_AUTO);
+            } else {
+                a1_join(&ops[1], "$d$x", WL_DELTA_AUTO);
+                ops[1].op = WL_PLAN_OP_ANTIJOIN;
+            }
+            plan.ops = ops;
+            plan.op_count = 2;
+            sess->join_batch_strict = strict != 0;
+            run = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+            if (!strict) {
+                if (!a1_rows_are(&run, cases[c].ncols, cases[c].want,
+                    cases[c].nwant))
+                    a1_report(cases[c].name, &run);
+                CHECK(a1_rows_are(&run, cases[c].ncols, cases[c].want,
+                    cases[c].nwant),
+                    "a materializing successor still gets the join rows");
+                CHECK(sess->join_batch_fallback_count == 1
+                    && sess->join_batch_last_reason
+                    == COL_JOIN_BATCH_EXCLUDED_PIPELINE,
+                    "a materializing successor records pipeline-not-"
+                    "consumable once");
+                CHECK(c != 0 || a1_reduce_calls == 1,
+                    "the REDUCE runs on the materialized join output");
+            } else {
+                if (run.rc != ENOTSUP || !run.left_kept)
+                    a1_report(cases[c].name, &run);
+                CHECK(run.rc == ENOTSUP && run.left_kept
+                    && a1_reduce_calls == 0,
+                    "strict mode refuses a materializing successor before "
+                    "the JOIN runs");
+            }
+            pipeline_session_destroy(sess);
+        }
+    }
+    wl_columnar_ops_test_before_reduce_dispose = NULL;
+}
+
+typedef enum {
+    A1_NB_FORCE_EMPTY,
+    A1_NB_MISSING_RIGHT,
+    A1_NB_ZERO_COLUMN_RIGHT,
+} a1_nothing_case_t;
+
+static void
+test_nothing_to_bound_follows_the_ordinary_join(void)
+{
+    static const char *const names[] = {
+        "forced-empty right operand", "missing right relation",
+        "zero-column empty right relation",
+    };
+
+    wl_columnar_ops_test_before_reduce_dispose = a1_reduce_observer;
+    for (int c = A1_NB_FORCE_EMPTY; c <= A1_NB_ZERO_COLUMN_RIGHT; c++) {
+        for (int strict = 0; strict < 2; strict++) {
+            wl_plan_op_t ops[2];
+            wl_plan_relation_t plan;
+            a1_run_t run;
+            wl_col_session_t *sess = c == A1_NB_FORCE_EMPTY
+                ? sel_case_session(SEL_FORCE_EMPTY)
+                : c == A1_NB_MISSING_RIGHT ? pipeline_session()
+                : sel_zero_column_session();
+
+            CHECK(sess != NULL, "nothing-to-bound fixture");
+            if (!sess)
+                continue;
+            memset(&plan, 0, sizeof(plan));
+            a1_join(&ops[0], "right", c == A1_NB_FORCE_EMPTY
+                ? WL_DELTA_FORCE_DELTA : WL_DELTA_AUTO);
+            a1_count_by_k(&ops[1]);
+            plan.ops = ops;
+            plan.op_count = 2;
+            sess->join_batch_strict = strict != 0;
+            run = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+            if (run.rc != 0 || run.nrows != 0
+                || sess->join_batch_fallback_count != 0) {
+                a1_report(names[c], &run);
+                fprintf(stderr, "  strict=%d fallbacks=%u\n", strict,
+                    sess->join_batch_fallback_count);
+            }
+            CHECK(run.rc == 0 && run.nrows == 0 && a1_reduce_calls == 1,
+                "a JOIN with nothing to bound returns the ordinary empty "
+                "result in both modes");
+            CHECK(sess->join_batch_fallback_count == 0,
+                "a JOIN with nothing to bound records no fallback");
+            pipeline_session_destroy(sess);
+        }
+    }
+    wl_columnar_ops_test_before_reduce_dispose = NULL;
+
+    /* A zero-column left still fails in the ordinary bounded JOIN (#2170);
+     * this pins that until the issue is fixed. */
+    for (int strict = 0; strict < 2; strict++) {
+        sel_plan_t p;
+        sel_run_t run;
+        wl_col_session_t *sess = sel_session();
+        col_rel_t *left = col_rel_new_auto("left", 0);
+
+        CHECK(sess && left, "zero-column left fixture");
+        if (!sess || !left) {
+            col_rel_destroy(left);
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+        sess->join_batch_strict = strict != 0;
+        run = sel_eval(sess, &p.plan, SEL_BATCH_BYTES, left);
+        if (run.rc != EINVAL || run.stack_top != 0)
+            fprintf(stderr, "  zero-column left, strict=%d: rc=%d top=%u\n",
+                strict, run.rc, run.stack_top);
+        CHECK(run.rc == EINVAL && run.stack_top == 0,
+            "a zero-column left still fails with EINVAL (#2170)");
+        pipeline_session_destroy(sess);
+    }
+}
+
+static void
+test_delta_right_decline_records_one_reason(void)
+{
+    static const int64_t want[][2] = { { 10, 101 } };
+    sel_plan_t p;
+    sel_run_t run;
+    wl_col_session_t *sess = sel_case_session(SEL_FORCE_DELTA);
+
+    CHECK(sess != NULL, "delta-right fixture");
+    if (!sess)
+        return;
+    sel_plan_init(&p, WL_DELTA_FORCE_DELTA);
+    run = sel_eval(sess, &p.plan, SEL_BATCH_BYTES, NULL);
+    CHECK(sel_rows_are(&run, want, 1), "a delta right operand joins $d$");
+    if (sess->join_batch_fallback_count != 1)
+        fprintf(stderr, "  non-strict delta right: %u fallbacks\n",
+            sess->join_batch_fallback_count);
+    CHECK(sess->join_batch_fallback_count == 1
+        && sess->join_batch_last_reason
+        == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT,
+        "a delta right operand records delta-right once");
+    pipeline_session_destroy(sess);
+
+    sess = sel_case_session(SEL_FORCE_DELTA);
+    CHECK(sess != NULL, "strict delta-right fixture");
+    if (sess) {
+        sess->join_batch_strict = true;
+        run = sel_eval(sess, &p.plan, SEL_BATCH_BYTES, NULL);
+        CHECK(run.rc == ENOTSUP && run.left_kept
+            && sess->join_batch_fallback_count == 1
+            && sess->join_batch_last_reason
+            == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT,
+            "strict mode refuses a delta right operand as delta-right");
+        pipeline_session_destroy(sess);
+    }
+
+    /* The operand decides before the shape: a delta right operand feeding
+     * a REDUCE is a delta-right refusal, not pipeline-not-consumable. */
+    sess = sel_case_session(SEL_FORCE_DELTA);
+    CHECK(sess != NULL, "strict delta-right REDUCE fixture");
+    if (sess) {
+        wl_plan_op_t ops[2];
+        wl_plan_relation_t plan;
+        a1_run_t a1;
+
+        memset(&plan, 0, sizeof(plan));
+        a1_join(&ops[0], "right", WL_DELTA_FORCE_DELTA);
+        a1_count_by_k(&ops[1]);
+        plan.ops = ops;
+        plan.op_count = 2;
+        sess->join_batch_strict = true;
+        a1 = a1_eval(sess, &plan, SEL_BATCH_BYTES, NULL, NULL);
+        if (sess->join_batch_last_reason
+            != COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT)
+            fprintf(stderr, "  delta right -> REDUCE: rc=%d reason=%d\n",
+                a1.rc, (int)sess->join_batch_last_reason);
+        CHECK(a1.rc == ENOTSUP && a1.left_kept
+            && sess->join_batch_last_reason
+            == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT,
+            "a delta right operand is refused as delta-right whatever "
+            "follows the JOIN");
+        pipeline_session_destroy(sess);
+    }
+}
+
+static wl_columnar_memory_governor_ref_t *
+a1_governor(uint64_t budget)
+{
+    wl_columnar_memory_resolution_t resolution;
+    memset(&resolution, 0, sizeof(resolution));
+    resolution.budget_bytes = budget;
+    resolution.usable_bytes = budget;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static uint64_t
+a1_reserved(wl_columnar_memory_governor_ref_t *governor)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+}
+
+#define A1_FANOUT 300u
+
+/* One left row against A1_FANOUT right rows on the same key, with the
+ * arrangement built before @governor is attached. */
+static wl_col_session_t *
+a1_fanout_session(wl_columnar_memory_governor_ref_t *governor,
+    uint64_t batch_bytes)
+{
+    static const char *const right_names[] = { "k", "r" };
+    int64_t rows[A1_FANOUT * 2u];
+    wl_col_session_t *sess = pipeline_session();
+    col_rel_t *right;
+
+    for (uint32_t i = 0; i < A1_FANOUT; i++) {
+        rows[2u * i] = 0;
+        rows[2u * i + 1u] = i;
+    }
+    right = pipeline_relation("right", right_names, 2, rows, A1_FANOUT);
+    if (!sess || !right || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    if (!col_session_get_arrangement(&sess->base, "right",
+        (const uint32_t[]){ 0 }, 1)) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    sess->memory_governor = governor;
+    sess->join_batch_bytes = (uint32_t)batch_bytes;
+    return sess;
+}
+
+static void
+a1_fanout_session_destroy(wl_col_session_t *sess)
+{
+    if (sess)
+        sess->memory_governor = NULL;
+    pipeline_session_destroy(sess);
+}
+
+static a1_run_t
+a1_fanout_reduce(uint64_t budget, uint64_t batch_bytes)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 1 };
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(budget);
+    wl_col_session_t *sess = governor
+        ? a1_fanout_session(governor, batch_bytes) : NULL;
+    wl_plan_op_t ops[2];
+    wl_plan_relation_t plan;
+    a1_run_t run;
+
+    memset(&run, 0, sizeof(run));
+    run.rc = ENOMEM;
+    if (sess) {
+        memset(&plan, 0, sizeof(plan));
+        a1_join(&ops[0], "right", WL_DELTA_AUTO);
+        a1_count_by_k(&ops[1]);
+        plan.ops = ops;
+        plan.op_count = 2;
+        run = a1_eval(sess, &plan, (uint32_t)batch_bytes, NULL,
+                pipeline_relation("left", left_names, 2, left_rows, 1));
+    }
+    a1_fanout_session_destroy(sess);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return run;
+}
+
+static void
+test_bounded_join_growth_denial_before_reduce(void)
+{
+    static const char *const probe_names[] = { "a", "b", "c", "d" };
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 1 };
+    static const int64_t want_count[] = { 0, A1_FANOUT };
+    col_rel_t *probe = pipeline_relation("probe", probe_names, 4, NULL, 0);
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(1u << 20);
+    wl_col_session_t *sess = NULL;
+    col_rel_t *left = NULL;
+    wl_columnar_continuation_t *producer = NULL;
+    uint64_t row_bytes = 0;
+    uint64_t initial = 0;
+    uint64_t grown = 0;
+    uint64_t base = 0;
+    uint64_t producer_bytes = 0;
+    uint64_t batch_bytes;
+    uint64_t budget;
+    uint32_t lk = 0;
+    uint32_t rk = 0;
+    wl_plan_op_t join;
+    a1_run_t run;
+
+    CHECK(probe && governor, "growth-denial fixture");
+    if (!probe || !governor
+        || !col_rel_retained_bytes_for(probe, 1, &row_bytes)
+        || !col_rel_retained_bytes_for(probe, COL_REL_INIT_CAP, &initial)
+        || !col_rel_retained_bytes_for(probe, 2u * COL_REL_INIT_CAP,
+        &grown)) {
+        CHECK(false, "growth-denial sizes");
+        col_rel_destroy(probe);
+        if (governor)
+            wl_columnar_memory_governor_ref_release(governor);
+        return;
+    }
+    col_rel_destroy(probe);
+    /* 64 rows per batch is the relation's initial capacity, so the
+     * producer's scratch never grows. */
+    batch_bytes = (uint64_t)COL_REL_INIT_CAP * row_bytes;
+
+    /* Measure the producer's admission on the same fixture. */
+    sess = a1_fanout_session(governor, batch_bytes);
+    left = pipeline_relation("left", left_names, 2, left_rows, 1);
+    a1_join(&join, "right", WL_DELTA_AUTO);
+    if (sess && left) {
+        base = a1_reserved(governor);
+        if (col_join_batch_producer_create(sess, &join, left, false, &lk,
+            &rk, 1, (uint32_t)batch_bytes, &producer) == 0)
+            producer_bytes = a1_reserved(governor) - base;
+        wl_columnar_continuation_destroy(producer);
+    }
+    col_rel_destroy(left);
+    a1_fanout_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(governor);
+    CHECK(producer_bytes > 0 && grown > initial,
+        "growth-denial premises: the producer is admitted and the output "
+        "grows");
+
+    /* The producer and the initial output fit; a later growth of the
+     * bounded output is denied.  A budget this far above the producer
+     * stays clear of the earlier denials that set memory_budget_denied. */
+    budget = base + producer_bytes + initial + grown / 2u;
+    wl_columnar_ops_test_before_reduce_dispose = a1_reduce_observer;
+    run = a1_fanout_reduce(budget, batch_bytes);
+    if (run.rc != ENOSPC || run.stack_top != 0 || a1_reduce_calls != 0) {
+        a1_report("growth denial", &run);
+        fprintf(stderr, "  budget=%llu reduce_calls=%u\n",
+            (unsigned long long)budget, a1_reduce_calls);
+    }
+    CHECK(run.rc == ENOSPC && run.stack_top == 0 && a1_reduce_calls == 0,
+        "a denied growth of the bounded join output fails with ENOSPC "
+        "before the REDUCE runs");
+
+    run = a1_fanout_reduce(1u << 20, batch_bytes);
+    CHECK(a1_rows_are(&run, 2, want_count, 1) && a1_reduce_calls == 1,
+        "the same JOIN -> REDUCE completes under a large budget");
+    wl_columnar_ops_test_before_reduce_dispose = NULL;
+}
+
+/* Walk every relation plan, and the K-Fusion copies inside it, calling
+ * @check on each operator list. */
+typedef void (*a1_ops_check_t)(const wl_plan_op_t *ops, uint32_t n,
+    void *context);
+
+static void
+a1_walk_plan(const wl_plan_t *plan, a1_ops_check_t check, void *context)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *st = &plan->strata[s];
+        for (uint32_t r = 0; r < st->relation_count; r++) {
+            const wl_plan_relation_t *rel = &st->relations[r];
+            check(rel->ops, rel->op_count, context);
+            for (uint32_t i = 0; i < rel->op_count; i++) {
+                const wl_plan_op_k_fusion_t *kf;
+                if (rel->ops[i].op != WL_PLAN_OP_K_FUSION
+                    || !rel->ops[i].opaque_data)
+                    continue;
+                kf = (const wl_plan_op_k_fusion_t *)rel->ops[i].opaque_data;
+                for (uint32_t d = 0; d < kf->k; d++)
+                    check(kf->k_ops[d], kf->k_op_counts[d], context);
+            }
+        }
+    }
+}
+
+typedef struct {
+    uint32_t joins;
+    uint32_t sinks;
+    uint32_t reduce_successors;
+    uint32_t unknown_ops;
+    uint32_t tail_sinks;
+    uint32_t tails;
+} a1_census_t;
+
+static void
+a1_census_ops(const wl_plan_op_t *ops, uint32_t n, void *context)
+{
+    a1_census_t *census = (a1_census_t *)context;
+    wl_plan_relation_t plan;
+
+    memset(&plan, 0, sizeof(plan));
+    plan.ops = ops;
+    plan.op_count = n;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t;
+        if ((uint32_t)ops[i].op > (uint32_t)WL_PLAN_OP_EXCHANGE)
+            census->unknown_ops++;
+        if (ops[i].op != WL_PLAN_OP_JOIN)
+            continue;
+        census->joins++;
+        if (wl_columnar_join_pipeline_successor(&plan, i + 1u)
+            == WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK)
+            census->sinks++;
+        else if (i + 1u < n && ops[i + 1u].op == WL_PLAN_OP_REDUCE)
+            census->reduce_successors++;
+        t = i + 1u;
+        while (t < n && ops[t].op == WL_PLAN_OP_FILTER)
+            t++;
+        if (t < n && ops[t].op == WL_PLAN_OP_MAP) {
+            census->tails++;
+            if (wl_columnar_join_pipeline_successor(&plan, t + 1u)
+                == WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK)
+                census->tail_sinks++;
+        }
+    }
+}
+
+static void
+a1_census_dump(const wl_plan_op_t *ops, uint32_t n, void *context)
+{
+    (void)context;
+    fprintf(stderr, "   ");
+    for (uint32_t i = 0; i < n; i++)
+        fprintf(stderr, " %d", (int)ops[i].op);
+    fprintf(stderr, "\n");
+}
+
+static bool
+a1_census(const char *source, a1_census_t *census)
+{
+    wirelog_error_t error = WIRELOG_OK;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    bool ok;
+
+    memset(census, 0, sizeof(*census));
+    ok = program && wirelog_optimize(program, &error)
+        && wl_plan_from_program(program, &plan) == 0 && plan;
+    if (ok)
+        a1_walk_plan(plan, a1_census_ops, census);
+    if (ok && census->unknown_ops != 0)
+        a1_walk_plan(plan, a1_census_dump, NULL);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    return ok;
+}
+
+static void
+test_successor_census_programs(void)
+{
+    static const char tc[] =
+        ".decl e(x: int32, y: int32)\n"
+        ".decl p(x: int32, y: int32)\n"
+        "p(x, y) :- e(x, y).\n"
+        "p(x, z) :- e(x, y), p(y, z).\n";
+    static const char counted[] =
+        ".decl e(x: int32, z: int32)\n"
+        ".decl f(z: int32, y: int32)\n"
+        ".decl c(x: int32, n: int32)\n"
+        "c(x, count(y)) :- e(x, z), f(z, y).\n";
+    static const char sg[] =
+        ".decl par(x: int32, y: int32)\n"
+        ".decl sg(x: int32, y: int32, d: int32)\n"
+        "sg(x, y, 0) :- par(p, x), par(p, y), x != y.\n"
+        "sg(x, y, d + 1) :- par(a, x), sg(a, b, d), par(b, y), d < 5.\n";
+    a1_census_t census;
+
+    CHECK(a1_census(tc, &census), "census: tc lowers");
+    if (census.joins == 0 || census.sinks != census.joins
+        || census.unknown_ops != 0)
+        fprintf(stderr, "  tc: joins=%u sinks=%u unknown=%u\n",
+            census.joins, census.sinks, census.unknown_ops);
+    CHECK(census.joins > 0 && census.sinks == census.joins
+        && census.unknown_ops == 0,
+        "census: every tc JOIN feeds a relation sink");
+
+    CHECK(a1_census(counted, &census), "census: count rule lowers");
+    if (census.reduce_successors == 0 || census.unknown_ops != 0)
+        fprintf(stderr, "  count: joins=%u sinks=%u reduce=%u\n",
+            census.joins, census.sinks, census.reduce_successors);
+    CHECK(census.reduce_successors > 0 && census.unknown_ops == 0,
+        "census: a JOIN feeding a REDUCE is materializing");
+
+    CHECK(a1_census(sg, &census), "census: sg lowers");
+    if (census.tails == 0 || census.tail_sinks != census.tails
+        || census.unknown_ops != 0)
+        fprintf(stderr, "  sg: joins=%u tails=%u tail_sinks=%u\n",
+            census.joins, census.tails, census.tail_sinks);
+    CHECK(census.tails > 0 && census.tail_sinks == census.tails
+        && census.unknown_ops == 0,
+        "census: a JOIN -> FILTER* -> MAP tail feeds a relation sink");
+}
+
 int
 main(void)
 {
@@ -1397,6 +2245,13 @@ main(void)
     test_pipeline_key_types_match_join();
     test_pipeline_zero_column_right_declines();
     test_pipeline_zero_column_left_declines();
+    test_successor_classifier_table();
+    test_relation_sink_successor_is_not_a_fallback();
+    test_materializing_boundaries_are_explicit();
+    test_nothing_to_bound_follows_the_ordinary_join();
+    test_delta_right_decline_records_one_reason();
+    test_bounded_join_growth_denial_before_reduce();
+    test_successor_census_programs();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);

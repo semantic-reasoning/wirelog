@@ -330,10 +330,65 @@ pipeline_resolve_key(const col_rel_t *rel, const char *name, uint32_t *out)
     return 0;
 }
 
+wl_columnar_join_successor_t
+wl_columnar_join_pipeline_successor(const wl_plan_relation_t *plan,
+    uint32_t first_unconsumed)
+{
+    /* Depth of the tracked entry below the top of the stack. */
+    uint32_t depth = 0;
+
+    if (!plan || (!plan->ops && plan->op_count > 0))
+        return WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING;
+    for (uint32_t i = first_unconsumed; i < plan->op_count; i++) {
+        const wl_plan_op_t *op = &plan->ops[i];
+        switch (op->op) {
+        case WL_PLAN_OP_VARIABLE:
+        case WL_PLAN_OP_LFTJ:
+        case WL_PLAN_OP_K_FUSION:
+            /* Push only. */
+            depth++;
+            break;
+        case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_JOIN:
+        case WL_PLAN_OP_SEMIJOIN:
+        case WL_PLAN_OP_ANTIJOIN:
+        case WL_PLAN_OP_REDUCE:
+            /* Pop one, push one: reads the tracked entry only at the top. */
+            if (depth == 0)
+                return WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING;
+            break;
+        case WL_PLAN_OP_CONSOLIDATE:
+            break;
+        /* CONCAT pops two and pushes their union; with fewer than two
+         * entries it passes the stack through, which leaves depth 0. */
+        case WL_PLAN_OP_CONCAT:
+            depth = depth <= 1u ? 0u : depth - 1u;
+            break;
+        case WL_PLAN_OP_EXCHANGE: {
+            const wl_plan_op_exchange_t *meta
+                = (const wl_plan_op_exchange_t *)op->opaque_data;
+            if (!meta)
+                return WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING;
+            if (meta->num_workers <= 1u)
+                break;
+            /* Pops the top into the exchange buffers and pushes nothing. */
+            if (depth == 0)
+                return WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK;
+            depth--;
+            break;
+        }
+        default:
+            return WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING;
+        }
+    }
+    return WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK;
+}
+
 int
 wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,
-    uint32_t *next_index)
+    uint32_t *next_index, wl_columnar_join_pipeline_decline_t *decline)
 {
     wl_columnar_join_pipeline_eligibility_t eligibility;
     const wl_plan_op_t *join;
@@ -352,31 +407,50 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
 
     if (next_index)
         *next_index = join_index;
+    if (decline)
+        *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
     eligibility = wl_columnar_join_pipeline_preflight(plan, join_index,
             sess, &map_index);
-    if (eligibility != WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE)
+    /* Session- and JOIN-level exclusions decline before the operand is
+     * examined; a shape exclusion is decided after it, so that what the
+     * JOIN reads takes precedence over what follows it. */
+    if (eligibility == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_OFF
+        || eligibility == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SESSION
+        || eligibility == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_JOIN)
         return 0;
+    /* The preflight also reports a missing plan or an index past its end
+     * as a shape exclusion; there is no JOIN to examine then. */
+    if (!plan || !plan->ops || join_index >= plan->op_count)
+        return 0;
+    if (decline)
+        *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NONE;
     if (!stack || stack->top == 0 || !sess)
         return EINVAL;
     join = &plan->ops[join_index];
-    map = &plan->ops[map_index];
     if (stack->items[stack->top - 1].kind
         != WL_COLUMNAR_EVAL_ENTRY_RELATION
         || !stack->items[stack->top - 1].rel)
         return EINVAL;
+    /* A missing right relation joins to an empty result in the ordinary
+     * JOIN.  ENOENT from col_join_batch_producer_create below is a
+     * different case, an unavailable arrangement, and stays a fallback. */
     right = session_find_rel(sess, join->right_relation);
-    if (!right)
-        return ENOENT;
+    if (!right) {
+        if (decline)
+            *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY;
+        return 0;
+    }
     /* Consume only a JOIN that would read the persistent relation itself.
-     * A $d$/$r$ delta or a forced-empty right operand is left on the stack
-     * for the ordinary JOIN, which selects it the same way.  Today every
-     * substituted right operand also sets used_right_delta; the pointer
-     * comparison also declines a future substitution that does not set it. */
+     * A forced-empty right operand is left to the ordinary JOIN here; a
+     * $d$/$r$ delta is declined below, after the key checks the ordinary
+     * JOIN also runs against it. */
     selection = wl_columnar_join_select_right(join, sess, right,
             stack->items[stack->top - 1].is_delta);
-    if (selection.force_empty || selection.used_right_delta
-        || selection.right != right)
+    if (selection.force_empty) {
+        if (decline)
+            *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY;
         return 0;
+    }
 
     lk = (uint32_t *)calloc(join->key_count, sizeof(*lk));
     rk = (uint32_t *)calloc(join->key_count, sizeof(*rk));
@@ -389,7 +463,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         rc = pipeline_resolve_key(stack->items[stack->top - 1].rel,
                 join->left_keys ? join->left_keys[i] : NULL, &lk[i]);
         if (rc == 0)
-            rc = pipeline_resolve_key(right,
+            rc = pipeline_resolve_key(selection.right,
                     join->right_keys ? join->right_keys[i] : NULL, &rk[i]);
         if (rc != 0) {
             free(lk);
@@ -403,18 +477,38 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
      * which indexes the column types by these keys. */
     for (uint32_t i = 0; i < join->key_count; i++) {
         if (lk[i] >= stack->items[stack->top - 1].rel->ncols
-            || rk[i] >= right->ncols) {
+            || rk[i] >= selection.right->ncols) {
             free(lk);
             free(rk);
+            if (decline)
+                *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY;
             return 0;
         }
     }
     if (!col_join_key_types_compatible(stack->items[stack->top - 1].rel, lk,
-        right, rk, join->key_count)) {
+        selection.right, rk, join->key_count)) {
         free(lk);
         free(rk);
         return EINVAL;
     }
+    /* Today every substituted right operand also sets used_right_delta;
+     * the pointer comparison also declines a future substitution that does
+     * not set it. */
+    if (selection.used_right_delta || selection.right != right) {
+        free(lk);
+        free(rk);
+        if (decline)
+            *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_DELTA_RIGHT;
+        return 0;
+    }
+    if (eligibility != WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE) {
+        free(lk);
+        free(rk);
+        if (decline)
+            *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
+        return 0;
+    }
+    map = &plan->ops[map_index];
 
     rc = col_join_batch_producer_create(sess, join,
             stack->items[stack->top - 1].rel,
