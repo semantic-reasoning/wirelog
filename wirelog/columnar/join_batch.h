@@ -123,6 +123,18 @@ typedef struct {
     bool begun;
 } col_join_batch_relation_sink_t;
 
+/* Grow @out so it holds at least @need rows, for a bounded join sink
+ * (Issue #2173).  When @need exceeds the capacity and double the capacity
+ * (clamped to UINT32_MAX) exceeds @need, the doubling is admitted first;
+ * only a budget denial of it is retried at exactly @need, with the denial
+ * cleared first, so a successful retry leaves no pending denial on @out.
+ * Otherwise @need itself is admitted; when it fits, that covers buffers
+ * @out owns but has not admitted yet.  Returns OK, RESERVATION_DENIED when
+ * the governor refuses the exact attempt, or SINK_FAILURE for any other
+ * failure, including a non-denial failure of the doubling. */
+wl_columnar_continuation_status_t
+col_join_batch_sink_grow(col_rel_t *out, uint64_t need);
+
 /* Initialise @ctx and fill @sink's callbacks.  Refuses pool-owned
  * relations (EINVAL): delta_pool_reset() never frees slot contents, so a
  * governor reference attached to a pooled relation would leak.  Attaches

@@ -3576,6 +3576,158 @@ out:
     fixture_fini(&f);
 }
 
+/* Issue #2173: 4096 output rows in 7-row batches (224 bytes over four int64
+ * columns).  Growing the output exactly to each batch reallocated it once
+ * per batch (578 storage generations measured); geometric growth needs a
+ * logarithmic number, so 24 = 2 * log2(4096) is a ceiling, not parity with
+ * the one-shot join. */
+static void
+test_sink_growth_is_geometric(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *oracle = NULL;
+    char msg[128];
+
+    TEST("relation sink grows its output geometrically across batches");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 4096)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 7u * 32u, &cont) != 0
+        || col_join_batch_rows_per_batch(cont) != 7u) {
+        FAIL("fixture or producer");
+        goto out;
+    }
+    if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0
+        || f.out->nrows != 4096u) {
+        FAIL("bounded run did not complete");
+        goto out;
+    }
+    if (f.out->storage_generation > 24u) {
+        snprintf(msg, sizeof(msg),
+            "output reached storage generation %" PRIu64 " (ceiling 24)",
+            f.out->storage_generation);
+        FAIL(msg);
+        goto out;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!oracle || !same_rows(oracle, f.out)) {
+        FAIL("bounded result differs from one-shot oracle");
+        goto out;
+    }
+    PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* Issue #2173 guard for the sink's exact fallback.  The budget is the
+ * exact-fit figure of test_exact_fit_and_one_byte_over: it admits growing
+ * the output from 64 to the 100 rows of the first batch, but not doubling
+ * it to 128.  The denied doubling is retried exactly and is not a failure:
+ * the publish succeeds at capacity 100 with no denial left pending.  One
+ * byte less denies the exact retry too, and that denial stays pending. */
+static void
+test_sink_denied_doubling_falls_back_to_exact(void)
+{
+    for (int deny = 0; deny < 2; deny++) {
+        fixture_t f;
+        fixture_t g;
+        const int64_t keys[] = { 0 };
+        wl_columnar_continuation_t *cont = NULL;
+        wl_columnar_continuation_sink_t sink;
+        col_join_batch_relation_sink_t sctx;
+        col_rel_t *oracle = NULL;
+        uint64_t r0;
+        uint64_t before;
+        uint64_t after;
+        uint64_t budget;
+        uint64_t live;
+        wl_columnar_continuation_status_t st;
+        bool ok;
+
+        memset(&g, 0, sizeof(g));
+        TEST(deny ? "sink exact retry denied too keeps the denial pending"
+                  : "sink retries a denied doubling at the exact need");
+        if (!fixture_init(&f, 1u << 24, keys, 1, 1, 100)
+            || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 100u * 32u, &cont) != 0
+            || col_join_batch_relation_sink_init(&sctx, &sink, f.sess,
+            f.out) != 0
+            || !col_rel_retained_bytes_for(f.out, f.out->capacity, &before)
+            || !col_rel_retained_bytes_for(f.out, 100u, &after)) {
+            FAIL("fixture or producer");
+            if (cont)
+                wl_columnar_continuation_destroy(cont);
+            fixture_fini(&f);
+            continue;
+        }
+        r0 = reserved_of(f.sess);
+        budget = r0 + 2u * after - before
+            + (uint64_t)f.out->ncols * sizeof(int64_t *)
+            - (uint64_t)deny;
+        wl_columnar_continuation_destroy(cont);
+        cont = NULL;
+        fixture_fini(&f);
+        if (!fixture_init(&f, budget, keys, 1, 1, 100)
+            || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 100u * 32u, &cont) != 0
+            || col_join_batch_relation_sink_init(&sctx, &sink, f.sess,
+            f.out) != 0) {
+            FAIL("fixture under the exact budget");
+            goto next;
+        }
+        r0 = reserved_of(f.sess);
+        st = wl_columnar_continuation_publish(cont, &sink);
+        if (deny) {
+            ok = st == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+                && f.out->nrows == 0u && f.out->capacity == COL_REL_INIT_CAP
+                && f.out->memory_budget_denial_pending;
+            if (!ok)
+                FAIL("denied exact retry was not reported as a denial");
+            else
+                PASS();
+            goto next;
+        }
+        ok = st == WL_COLUMNAR_CONTINUATION_OK && f.out->nrows == 100u
+            && f.out->capacity == 100u
+            && !f.out->memory_budget_denial_pending
+            && !f.sess->memory_budget_denied
+            && col_rel_retained_live_bytes(f.out, &live)
+            && live == f.out->retained_reserved_bytes
+            && reserved_of(f.sess) == r0 + 2u * (after - before);
+        if (!ok) {
+            FAIL("denied doubling was not retried at the exact need");
+            goto next;
+        }
+        if (col_join_batch_run_to_relation(cont, f.sess, f.out) != 0
+            || f.out->capacity != 100u
+            || f.out->memory_budget_denial_pending) {
+            FAIL("bounded run after the exact retry did not complete");
+            goto next;
+        }
+        /* The tight budget has no room for a one-shot result; the oracle
+         * runs on an identical fixture under a large budget. */
+        if (!fixture_init(&g, 1u << 24, keys, 1, 1, 100)
+            || (oracle = run_oracle(g.sess, g.left, &g.op)) == NULL
+            || !same_rows(oracle, f.out)) {
+            FAIL("exact-retry result differs from one-shot oracle");
+            goto next;
+        }
+        PASS();
+next:
+        if (oracle)
+            col_rel_destroy(oracle);
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&g);
+        fixture_fini(&f);
+    }
+}
+
 static void
 test_cross_key_collision_boundary(void)
 {
@@ -3748,6 +3900,8 @@ main(void)
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
     test_sink_prepare_resize_failure();
+    test_sink_growth_is_geometric();
+    test_sink_denied_doubling_falls_back_to_exact();
     test_cross_key_collision_boundary();
     test_env_parse();
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,

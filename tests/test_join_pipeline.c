@@ -423,6 +423,101 @@ cleanup:
     pipeline_session_destroy(sess);
 }
 
+/* Issue #2173: JOIN -> MAP consumes 4096 join rows in 7-row batches.
+ * Growing the pipeline output exactly to each batch reallocated it once per
+ * batch; geometric growth needs a logarithmic number of storage
+ * generations, so 24 = 2 * log2(4096) is a ceiling.  Every expected row
+ * (10, r) for r in [0, 4096) must appear exactly once. */
+#define PL_GROWTH_ROWS 4096u
+
+static void
+test_pipeline_sink_growth_is_geometric(void)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const char *const right_names[] = { "k", "r" };
+    static const char *const keys[] = { "k" };
+    static const uint32_t project[] = { 1, 3 };
+    static const int64_t left_rows[] = { 0, 10 };
+    int64_t *right_rows = calloc(2u * PL_GROWTH_ROWS, sizeof(*right_rows));
+    bool *seen = calloc(PL_GROWTH_ROWS, sizeof(*seen));
+    wl_col_session_t *sess = pipeline_session();
+    col_rel_t *left = NULL;
+    col_rel_t *right = NULL;
+    eval_stack_t stack;
+    wl_plan_op_t ops[2];
+    wl_plan_relation_t plan;
+    const col_rel_t *out;
+    bool rows_ok;
+    int rc;
+
+    memset(ops, 0, sizeof(ops));
+    memset(&plan, 0, sizeof(plan));
+    ops[0].op = WL_PLAN_OP_JOIN;
+    ops[0].right_relation = "right";
+    ops[0].left_keys = keys;
+    ops[0].right_keys = keys;
+    ops[0].key_count = 1;
+    ops[1].op = WL_PLAN_OP_MAP;
+    ops[1].project_indices = project;
+    ops[1].project_count = 2;
+    plan.ops = ops;
+    plan.op_count = 2;
+
+    if (!right_rows || !seen || !sess) {
+        CHECK(false, "pipeline growth fixture allocates");
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < PL_GROWTH_ROWS; i++) {
+        right_rows[2u * i] = 0;
+        right_rows[2u * i + 1u] = i;
+    }
+    left = pipeline_relation("left", left_names, 2, left_rows, 1);
+    right = pipeline_relation("right", right_names, 2, right_rows,
+            PL_GROWTH_ROWS);
+    if (!left || !right || session_add_rel(sess, right) != 0) {
+        CHECK(false, "pipeline growth relations");
+        goto cleanup;
+    }
+    right = NULL; /* session owns it */
+    CHECK(col_session_get_arrangement(&sess->base, "right",
+        (const uint32_t[]){ 0 }, 1) != NULL,
+        "pipeline growth builds the right arrangement");
+    eval_stack_init(&stack);
+    rc = eval_stack_push(&stack, left, true);
+    CHECK(rc == 0, "pipeline growth pushes the left relation");
+    if (rc != 0)
+        goto cleanup;
+    left = NULL;
+    rc = col_eval_relation_plan(&plan, &stack, sess);
+    out = rc == 0 && stack.top == 1 ? stack.items[0].rel : NULL;
+    CHECK(out && out->name && strcmp(out->name, "$join_pipeline") == 0
+        && out->ncols == 2 && out->nrows == PL_GROWTH_ROWS,
+        "pipeline growth output comes from the consumed pipeline");
+    if (out && out->storage_generation > 24u)
+        fprintf(stderr, "pipeline output storage generation %llu\n",
+            (unsigned long long)out->storage_generation);
+    CHECK(out && out->storage_generation <= 24u,
+        "pipeline sink grows its output geometrically across batches");
+    rows_ok = out && out->ncols == 2 && out->nrows == PL_GROWTH_ROWS;
+    for (uint32_t i = 0; rows_ok && i < out->nrows; i++) {
+        int64_t r = out->columns[1][i];
+        if (out->columns[0][i] != 10 || r < 0 || r >= PL_GROWTH_ROWS
+            || seen[r])
+            rows_ok = false;
+        else
+            seen[r] = true;
+    }
+    CHECK(rows_ok, "pipeline growth output holds every join row once");
+    (void)eval_stack_drain(&stack);
+
+cleanup:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    pipeline_session_destroy(sess);
+    free(seen);
+    free(right_rows);
+}
+
 /* ---- Issue #1777: row-local expression MAPs ---------------------------- */
 
 #define PL_VAR(digit) WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', (digit)
@@ -3575,6 +3670,7 @@ main(void)
     test_projection_pipeline();
     test_conservative_exclusions();
     test_pipeline_consumes_batches();
+    test_pipeline_sink_growth_is_geometric();
     test_expression_map_preflight();
     test_expression_pipeline_matches_oracle();
     test_pipeline_shared_row_accounting();

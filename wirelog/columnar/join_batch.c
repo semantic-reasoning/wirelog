@@ -9,9 +9,10 @@
  *     relation and its key row; destroy releases each exactly once, cancel
  *     releases the lease early and is idempotent;
  *   - the relation sink owns nothing: the output relation's retained token
- *     admits every visible byte, growth is admitted exactly to the batch
- *     that needs it, and an aborted batch only rewinds nrows (the admitted
- *     capacity stays, as after a failed bulk append in relation.c).
+ *     admits every visible byte, growth first asks for double the current
+ *     capacity and falls back to the batch's exact need only on a budget
+ *     denial (Issue #2173), and an aborted batch only rewinds nrows (the
+ *     admitted capacity stays, as after a failed bulk append in relation.c).
  */
 #include "columnar/join_batch.h"
 
@@ -618,6 +619,49 @@ col_join_batch_cursor_get(const wl_columnar_continuation_t *cont,
 
 /* ---- relation sink ----------------------------------------------------- */
 
+wl_columnar_continuation_status_t
+col_join_batch_sink_grow(col_rel_t *out, uint64_t need)
+{
+    bool denied = false;
+    int rc;
+
+    if (!out)
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    if (need > UINT32_MAX)
+        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    if (need > out->capacity) {
+        uint64_t doubled = 2u * (uint64_t)out->capacity;
+
+        if (doubled > UINT32_MAX)
+            doubled = UINT32_MAX;
+        /* A doubling that does not cover @need is not attempted: the exact
+         * attempt below is the larger one. */
+        if (doubled > need) {
+            rc = col_rel_reserve_capacity_admitted(out, (uint32_t)doubled,
+                    &denied);
+            if (rc == 0)
+                return WL_COLUMNAR_CONTINUATION_OK;
+            /* Only a budget denial of the doubling is retried.  Any other
+             * failure is reported as SINK_FAILURE without a second attempt,
+             * the classification the exact path gives it. */
+            if (rc != ENOMEM || !denied)
+                return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+            /* A denied doubling retried exactly is not a failure: clear its
+             * verdict so only the exact attempt's outcome remains visible
+             * (col_rel_reserve_capacity_admitted also clears the flag on
+             * entry). */
+            denied = false;
+            out->memory_budget_denial_pending = false;
+        }
+    }
+    rc = col_rel_reserve_capacity_admitted(out, (uint32_t)need, &denied);
+    if (rc == 0)
+        return WL_COLUMNAR_CONTINUATION_OK;
+    return (rc == ENOMEM && denied)
+           ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+           : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+}
+
 static wl_columnar_continuation_status_t
 sink_begin(void *context, const wl_columnar_continuation_batch_t *batch)
 {
@@ -637,8 +681,6 @@ sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     col_join_batch_relation_sink_t *s =
         (col_join_batch_relation_sink_t *)context;
     uint64_t need;
-    bool denied = false;
-    int rc;
 
     (void)bytes; /* the relation's own footprint formula is authoritative */
     if (!s || !s->begun || !s->out)
@@ -651,12 +693,9 @@ sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     * is what makes a retry after a failed append reservation-free. */
     if (need <= s->out->capacity)
         return WL_COLUMNAR_CONTINUATION_OK;
-    rc = col_rel_reserve_capacity_admitted(s->out, (uint32_t)need, &denied);
-    if (rc == 0)
-        return WL_COLUMNAR_CONTINUATION_OK;
-    return (rc == ENOMEM && denied)
-           ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
-           : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    /* Growing exactly to each batch reallocated the output once per batch
+    * (Issue #2173), so the growth is geometric with an exact fallback. */
+    return col_join_batch_sink_grow(s->out, need);
 }
 
 static wl_columnar_continuation_status_t
