@@ -5378,6 +5378,11 @@ int wl_columnar_relation_private_batch_drain_step(
 typedef enum {
     WL_COLUMNAR_FILTER_STAGE_INERT = 0,
     WL_COLUMNAR_FILTER_STAGE_RUNNING,
+    WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM,
+    WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL,
+    WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT,
+    WL_COLUMNAR_FILTER_STAGE_TABLE_REFERENCE,
+    WL_COLUMNAR_FILTER_STAGE_TABLE_CLEAR,
     WL_COLUMNAR_FILTER_STAGE_BATCH,
     WL_COLUMNAR_FILTER_STAGE_PROGRAM,
     WL_COLUMNAR_FILTER_STAGE_PHYSICAL,
@@ -5390,6 +5395,24 @@ typedef enum {
     WL_COLUMNAR_FILTER_STAGE_RESET,
     WL_COLUMNAR_FILTER_STAGE_DONE
 } wl_columnar_filter_stage_t;
+
+/* Original, nonmovable owner of a compiled MAP table. Only initialized_slots
+* are discoverable. Each slot's first retirement is admitted before it enters
+* that prefix; fixed physical/credit/reference retirement precedes allocation.
+* The table reference keeps the governor alive independently of source input.
+* A cleared table has no resources; dormant credit bits are not authority. */
+typedef struct {
+    wl_columnar_expr_attempt_numeric_t **programs;
+    uint32_t initialized_slots;
+    uint32_t retirement_cursor;
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_governor_ref_t *governor;
+    bool initialized;
+    bool allocated;
+    bool admitted;
+    bool committed;
+    bool ref_held;
+} wl_columnar_filter_program_table_t;
 
 typedef struct wl_columnar_filter_context {
     struct wl_columnar_filter_context *identity;
@@ -5425,6 +5448,7 @@ typedef struct wl_columnar_filter_context {
     col_rel_t *private_output;
     int64_t inline_values[16];
     int64_t *values;
+    wl_columnar_filter_program_table_t table;
 } wl_columnar_filter_context_t;
 
 /* Borrow embedded original context after original frame validation. No owner
