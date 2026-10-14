@@ -2683,6 +2683,12 @@ enum {
     WL_COLUMNAR_EVAL_STACK_COMMITTED_PHASE = 7,
     WL_COLUMNAR_EVAL_STACK_EXTERNAL_PHASE = 8,
     WL_COLUMNAR_EVAL_STACK_PHYSICAL_FREED_PHASE = 9,
+    WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_VALID_PHASE = 10,
+    WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_PREPARED_PHASE = 11,
+    WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE_CUTOFF_PHASE = 12,
+    WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_VALID_PHASE = 13,
+    WL_COLUMNAR_EVAL_STACK_UNARY_COLLISION_PHASE = 14,
+    WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE = 15,
 };
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_eval_stack_test_checkpoint)(
@@ -2691,6 +2697,45 @@ extern int wl_columnar_eval_stack_test_fail_allocation;
 /* Physical layout only, never an observed work total. */
 size_t wl_columnar_eval_stack_test_frame_size(void);
 #endif
+/* Persistent unary replacement, opt-in only. Begin binds nonNULL control and
+ * supplied active ID to an original LIFO frame with a valid relation top.
+ * Exclusive frame/session access; no raw stack/result mutation, reentrancy or
+ * input destruction until first finish. Native owner thread governs forward
+ * access and first finish. The original frame and its allocator stay live.
+ * Accessors have no callback/debit; caller funds their complete finite paths.
+ * Failure preserves accessor outputs. Input is borrowed; output exposes only
+ * an exclusive provisional rel slot, whose borrow expires on commit/finish.
+ * Same-frame aliases are detached without destruction on commit refusal AND
+ * abort before commit; cross-frame duplicate authority is unsupported.
+ * Output is independent private heap storage, with no supported reader escape
+ * until publication. Slot/output/control and caller outputs do not overlap.
+ * Commit's bool is normalized false even on refusal, true only on publication;
+ * later retirement cannot undo the internal committed outcome. */
+int wl_columnar_eval_stack_unary_begin_attempt_controlled(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_input(
+    wl_columnar_eval_stack_cleanup_frame_t *, const col_rel_t **);
+int wl_columnar_eval_stack_unary_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***);
+int wl_columnar_eval_stack_unary_commit_attempt_controlled(
+    wl_columnar_eval_stack_cleanup_frame_t *, bool *);
+/* Mandatory first finish latches initiating result including0, sanitizes
+ * provisional aliases, and retires output on abort or old input on commit.
+ * No old-control access; caller first drains all child source/batch authority.
+ * Real EBUSY retains the original owning slot. Later serialized finish/reset
+ * may run on another host thread after old control destruction. Return the
+ * latched first initiating result when nonzero (later arguments never replace
+ * the first zero), else persistent alias EINVAL, else latest
+ * cleanup result. Repeated DONE does not dispose again; reset requires DONE
+ * and inert owning slots. Generic frame finish rejects an active transaction
+ * before consuming the handle. No handle survives consumed frame cleanup.
+ * All new ordinary cleanup work needs explicit inventory; physical/token/ref
+ * retirement is the narrow mandatory boundary, not a blanket scan exemption. */
+int wl_columnar_eval_stack_unary_finish(
+    wl_columnar_eval_stack_cleanup_frame_t *, int);
+int wl_columnar_eval_stack_unary_reset(
+    wl_columnar_eval_stack_cleanup_frame_t *);
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame);
