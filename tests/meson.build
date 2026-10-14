@@ -194,6 +194,33 @@ testlib_prod = static_library(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: testlib_prod_c_args,
+  # The MEMORY-hook variant below extracts a strict subset of these objects.
+  override_options: ['unity=off'],
+)
+
+# Hook-heavy fixtures need one governor/control implementation per executable.
+# Reuse the unchanged common objects, replacing only the pair compiled with
+# MEMORY hooks; linking the original archive as well can duplicate ASan globals
+# under LTO even when the final visible symbols appear unique.
+testlib_prod_memory_hook_src = files(
+  '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c',
+)
+testlib_prod_memory_common_src = []
+foreach source : testlib_prod_src
+  if not testlib_prod_memory_hook_src.contains(source)
+    testlib_prod_memory_common_src += source
+  endif
+endforeach
+assert(testlib_prod_memory_common_src.length() + 2 == testlib_prod_src.length(),
+       'MEMORY-hook archive must replace exactly the governor/control pair')
+testlib_prod_memory_hooks = static_library(
+  'testlib_prod_memory_hooks',
+  testlib_prod_memory_hook_src,
+  objects: testlib_prod.extract_objects(testlib_prod_memory_common_src),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: testlib_prod_c_args + ['-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1'],
+  override_options: ['unity=off'],
 )
 
 # Linux allocation wrappers need native objects throughout the link so Clang
@@ -6334,13 +6361,12 @@ test('required_correctness_contract', py3,
 # #1821 controlled materialization, internal test hooks only.
 test_evaluation_work_exe = executable(
   'test_evaluation_work',
-  files('test_evaluation_work.c', '../wirelog/columnar/memory_governor.c',
-        '../wirelog/evaluation_control.c'),
+  files('test_evaluation_work.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
            '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
-  link_with: [testlib_prod],
+  link_with: [testlib_prod_memory_hooks],
 )
 test('evaluation_work', test_evaluation_work_exe,
      suite: ['unit', 'tsan'], timeout: 60)
@@ -6379,17 +6405,16 @@ test('evaluation_copy', test_evaluation_copy_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
 # #1821: genuine FIFO numeric FILTER lifetime, budget and semantic witnesses.
-# Release-refusal instrumentation lives in these direct governor/control objects;
-# defining MEMORY on the test TU alone does not instrument testlib_prod.
+# Release-refusal instrumentation comes from the source-unique MEMORY archive;
+# defining MEMORY on the test TU alone does not instrument production objects.
 test_evaluation_numeric_operators_exe = executable(
   'test_evaluation_numeric_operators',
-  files('test_evaluation_numeric_operators.c',
-        '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c'),
+  files('test_evaluation_numeric_operators.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
            '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
-  link_with: [testlib_prod],
+  link_with: [testlib_prod_memory_hooks],
 )
 test('evaluation_numeric_operators', test_evaluation_numeric_operators_exe,
      suite: ['unit', 'tsan'], timeout: 600)
