@@ -12836,6 +12836,150 @@ wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
     return rc;
 }
 
+/* Untyped/no-timestamp auto construction, G9/C12/T21 convention above.
+ * ENTRY: bootstrap20 + validity8 + tail21 + assignment1 + decisions8 +
+ * next charge12 + refusal/returns4 =74 <=80. Bootstrap includes both public
+ * dispatch and return; an initial refusal consumes0 and permits only this
+ * bounded scaffold and the single outNULL store. PREPARE: seven recipe stores
+ * + local1 + tail21 + result2 + next charge12 + refusal4 =47 <=64.
+ * BUILD_CALL: tail21 + result2 + child charge12 + refusal3 + caller14 =52.
+ * EXTERNAL: tail21 + assignment1 + conditions6 + store1 + cleanup decisions6
+ * + returns2 =37. Success and cleanup alternatives are safely overcounted.
+ * Full child return chains F0=3+1+14=18, F1=3+18=21, F2=3+21=24.
+ * This is two more than the old caller: bytes213/224, install178/220.
+ * COMMIT caller is92+20+2=114/128, including its explicit saved-ID guard.
+ * Reserve child168 + complete caller82 =250 <=256, conservatively composed.
+ * Commit's earlier168 is separated by actual child polls; its final cutoff
+ * and failed continuation are at most62, not168+114. INSTALL moves/install140
+ * + cutoff/caller20 + error16 +2 =178; no callback splits original moves.
+ * Only established control/allocator/instrumentation and mandatory physical,
+ * token/ref retirement bodies are excluded; ordinary decisions are included.
+ * Success costs512 plus the existing builder's admitted literal schedule.
+ * BUILD_CALL funds only caller work; each builder region admits separately.
+ * No recipe pointer survives this call; this is not a whole-call time bound. */
+enum {
+    WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK = 128,
+    WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK = 128,
+    WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK = 128,
+    WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK = 128,
+};
+
+typedef char wl_columnar_relation_auto_attempt_regions_bound[
+        (WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM
+        && UINT64_C(80) <= WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK
+        && UINT64_C(64) <= WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK
+        && UINT64_C(64) <= WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK
+        && UINT64_C(64) <= WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK
+        && UINT64_C(213) <= WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_BYTES_WORK
+        && UINT64_C(178) <=
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_INSTALL_WORK
+        && UINT64_C(114) <=
+        WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_COMMIT_CALLER_WORK
+        && UINT64_C(168) + UINT64_C(82) <= WL_EVALUATION_CONTROL_QUANTUM
+        && UINT64_C(62) <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+static int
+wl_columnar_relation_constructor_auto_attempt(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    wl_columnar_memory_governor_ref_t *governor, bool require_governor,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Only this fixed output normalization is a bootstrap exception.
+     * The exclusive writable slot must contain no live owned result. */
+    if (out)
+        *out = NULL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    bool valid = out && name && (!require_governor || governor);
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc > 0 || valid) {
+        if (rc)
+            return rc;
+    } else
+        return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = NULL;
+    recipe.types = NULL;
+    recipe.has_graph_column = false;
+    recipe.graph_col_idx = 0;
+    recipe.declared_ncols = 0;
+    recipe.view_generation = 2;
+    recipe.storage_generation = 1;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_build(name, ncols,
+            initial_capacity, false, governor, &recipe, &local,
+            control, attempt_id);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0)
+        abort();
+    return rc;
+}
+
+int
+wl_columnar_relation_new_auto_governed_attempt_controlled(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control)
+        return wl_columnar_relation_new_auto_governed(name, ncols,
+                   initial_capacity, false, governor, out);
+    return wl_columnar_relation_constructor_auto_attempt(name, ncols,
+               initial_capacity, governor, true, out, control, attempt_id);
+}
+
+int
+wl_columnar_relation_new_auto_attempt_controlled(
+    const char *name, uint32_t ncols, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control) {
+        if (!out)
+            return EINVAL;
+        *out = NULL;
+        col_rel_t *raw = col_rel_new_auto(name, ncols);
+        if (!raw)
+            return ENOMEM;
+        *out = raw;
+        return 0;
+    }
+    return wl_columnar_relation_constructor_auto_attempt(name, ncols,
+               COL_REL_INIT_CAP, NULL, false, out, control, attempt_id);
+}
+
 /* End caller-attempt-bound scalar constructor. */
 
 int

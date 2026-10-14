@@ -1786,6 +1786,631 @@ attempt_new_like_complete_literal(void)
     wl_columnar_memory_governor_ref_release(watched); watched = NULL;
 }
 
+/* Literal source schedule for auto constructors. Fees are independent numeric
+ * literals, never production enums or a measured consumed-work oracle. */
+typedef struct {
+    uint64_t prefix[8192], allocations[2048], total;
+    size_t count, allocation_count;
+} auto_literal_t;
+
+static void
+auto_literal_add(auto_literal_t *s, uint64_t work, bool allocation)
+{
+    CHECK(s->count < sizeof(s->prefix) / sizeof(s->prefix[0]));
+    s->total += work;
+    s->prefix[s->count++] = s->total;
+    if (allocation) {
+        CHECK(s->allocation_count <
+            sizeof(s->allocations) / sizeof(s->allocations[0]));
+        s->allocations[s->allocation_count++] = s->total;
+    }
+}
+
+static void
+auto_literal_bytes(auto_literal_t *s, uint64_t bytes)
+{
+    for (uint64_t pos = 0; pos < bytes; pos += 16)
+        auto_literal_add(s, 224, false);
+}
+
+static void
+auto_literal_name(auto_literal_t *s, uint32_t column)
+{
+    auto_literal_add(s, 96, false);
+    for (unsigned i = 0; i < digits(column); i++)
+        auto_literal_add(s, 96, false);
+    auto_literal_add(s, 192, false);
+}
+
+static void
+auto_literal(const char *name, uint32_t width, bool governed,
+    auto_literal_t *s)
+{
+    *s = (auto_literal_t){0};
+#define AUTO_R(v) auto_literal_add(s, (v), false)
+#define AUTO_A(v) auto_literal_add(s, (v), true)
+#define AUTO_POINTERS() do { for (uint32_t pos = 0; pos < width; \
+                                 pos += 16) { AUTO_R(192); } } while (0)
+#define AUTO_RESERVE(nonzero) do { AUTO_R(160); \
+                                   if (governed && (nonzero)) { AUTO_R(74); \
+                                                                AUTO_R(54); \
+                                                                AUTO_R(84); \
+                                                                AUTO_R(29); \
+                                   } } while (0)
+    AUTO_R(128); AUTO_R(128); AUTO_R(128); AUTO_R(192);
+    uint64_t name_bytes = strlen(name) + 1;
+    for (uint64_t i = 0; i < name_bytes; i++) AUTO_R(96);
+    for (unsigned i = 0; i < 6; i++) AUTO_R(96);
+    AUTO_R(96); /* no type bytes */
+    AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    if (governed) AUTO_R(96); /* scratch payload */
+    AUTO_R(128);
+    for (uint32_t i = 0; i < width; i++) {
+        auto_literal_name(s, i);
+        AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    }
+    AUTO_R(96); AUTO_RESERVE(true); AUTO_A(112);
+    auto_literal_bytes(s, sizeof(col_rel_t));
+    for (unsigned i = 0; i < 5; i++) AUTO_R(96);
+    AUTO_A(112); auto_literal_bytes(s, name_bytes);
+    AUTO_R(80); AUTO_R(112); AUTO_R(96);
+    AUTO_RESERVE(true); AUTO_RESERVE(width != 0);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) AUTO_A(112);
+        if (governed) AUTO_A(112);
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            auto_literal_name(s, i); AUTO_A(112);
+            auto_literal_bytes(s, 4u + digits(i));
+        }
+    }
+    AUTO_R(96); AUTO_A(112); auto_literal_bytes(s, 3);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            AUTO_A(128); AUTO_A(112); auto_literal_bytes(s, 2);
+            auto_literal_name(s, i); AUTO_A(112);
+            auto_literal_bytes(s, 4u + digits(i));
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        AUTO_R(128);
+        if (governed && (i < 2 || width)) {
+            AUTO_R(74); AUTO_R(54); AUTO_R(29);
+        }
+    }
+    AUTO_R(220); AUTO_R(128);
+#undef AUTO_RESERVE
+#undef AUTO_POINTERS
+#undef AUTO_A
+#undef AUTO_R
+}
+
+static int
+auto_attempt(const char *name, uint32_t width, uint32_t capacity,
+    bool governed, col_rel_t **out, wl_evaluation_control_t *c, uint64_t id)
+{
+    return governed
+        ? wl_columnar_relation_new_auto_governed_attempt_controlled(name,
+               width, capacity, watched, out, c, id)
+        : wl_columnar_relation_new_auto_attempt_controlled(name, width,
+               out, c, id);
+}
+
+static void
+auto_equal(col_rel_t *r, col_rel_t *raw, uint32_t width, uint32_t capacity,
+    bool governed)
+{
+    CHECK(r && raw && !r->nrows && !raw->nrows && r->ncols == width);
+    CHECK(r->capacity == capacity && raw->capacity == capacity);
+    CHECK(r->view_generation == raw->view_generation &&
+        r->view_generation == 2);
+    CHECK(r->storage_generation == raw->storage_generation &&
+        r->storage_generation == 1);
+    CHECK(r->storage_owner == r && r->storage_owner_generation == 1);
+    CHECK(!r->column_types && !raw->column_types && !r->timestamps &&
+        !raw->timestamps);
+    CHECK(!r->timestamp_capacity && !r->has_graph_column && !r->graph_col_idx &&
+        !r->declared_ncols);
+    CHECK(r->schema_ok && r->schema.n_children == width);
+    CHECK(strcmp(r->name, raw->name) == 0);
+    CHECK((r->row_scratch != NULL) == (governed && width != 0));
+    for (uint32_t i = 0; i < width; i++) {
+        CHECK(r->columns[i] && strcmp(r->col_names[i], raw->col_names[i]) == 0);
+        CHECK(strcmp(r->schema.children[i]->name,
+            raw->schema.children[i]->name) == 0);
+        CHECK(strcmp(r->schema.children[i]->format, "l") == 0);
+        CHECK(strcmp(raw->schema.children[i]->format, "l") == 0);
+    }
+}
+
+static void
+auto_prefixes(const char *name, uint32_t width, uint32_t capacity,
+    bool governed, bool all_prefixes)
+{
+    auto_literal_t s; auto_literal(name, width, governed, &s);
+    watched = governor();
+    for (size_t i = all_prefixes ? 0 : s.count - 1; i < s.count; i++) {
+        for (unsigned below = 0; below < 2; below++) {
+            wl_evaluation_control_t *c = control(s.prefix[i] - below);
+            col_rel_t *out = NULL;
+            external_out = &out;
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            int rc = auto_attempt(name, width, capacity, governed, &out, c,
+                    id);
+            external_out = NULL;
+            if (!below && i + 1 == s.count) {
+                CHECK(rc == 0 && out && finish(c, 0) == s.total);
+                col_rel_t *raw = NULL;
+                if (governed)
+                    CHECK(wl_columnar_relation_new_auto_governed(name, width,
+                        capacity, false, watched, &raw) == 0);
+                else raw = col_rel_new_auto(name, width);
+                auto_equal(out, raw, width,
+                    governed ? capacity : COL_REL_INIT_CAP, governed);
+                CHECK(col_rel_destroy_checked(raw) == 0 &&
+                    col_rel_destroy_checked(out) == 0);
+            } else {
+                CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !out);
+                attempt_phase_finish(c, rc);
+                wl_evaluation_control_report_t report;
+                CHECK(wl_evaluation_control_report(c, &report) == 0
+                    && report.attempt_id == id &&
+                    report.limit == s.prefix[i] - below
+                    && report.result == rc &&
+                    report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+                    && !report.execution_status && !report.cleanup_status
+                    && report.consumed ==
+                    (below ? (i ? s.prefix[i - 1] : 0) : s.prefix[i]));
+                /* At the independently identified commit128 -> child74
+                 * boundary, the prepaid caller has no reached tail when the
+                 * child refuses. This does not define expected consumption. */
+                if (governed && !below && i + 1 < s.count
+                    && s.prefix[i] - (i ? s.prefix[i - 1] : 0) == 128
+                    && s.prefix[i + 1] - s.prefix[i] == 74)
+                    CHECK(report.consumed - seen == 128);
+            }
+            CHECK(!reserved() &&
+                wl_columnar_memory_governor_ref_is_sole(watched));
+            release(c);
+        }
+    }
+    for (size_t i = 0; i < s.allocation_count; i++) {
+        wl_evaluation_control_t *c = control(0);
+        col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = (uint32_t)i + 1;
+        CHECK(auto_attempt(name, width, capacity, governed, &out, c,
+            wl_evaluation_control_active_attempt_id(c)) == ENOMEM && !out);
+        CHECK(!wl_columnar_relation_test_constructor_fail_allocation);
+        CHECK(finish(c, ENOMEM) == s.allocations[i] && !reserved());
+        CHECK(wl_columnar_memory_governor_ref_is_sole(watched)); release(c);
+    }
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+/* Callback occurrence inventory locates real seams only. Work expectations
+ * remain the independent literal schedule; no recorded telemetry defines it. */
+static unsigned auto_family, auto_target, auto_occurrences, auto_mode,
+    auto_hits;
+
+static unsigned auto_failed_rounds;
+
+static void
+auto_fault(wl_evaluation_control_t *c, unsigned family)
+{
+    if (attempt_restarted) {
+        attempt_successor_callbacks++; return;
+    }
+    if (family != auto_family) return;
+    auto_occurrences++;
+    if (!auto_target || auto_occurrences != auto_target) return;
+    auto_hits++;
+    if (auto_mode == 0) wl_evaluation_control_request_cancel(c);
+    else if (auto_mode == 1) CHECK(wl_evaluation_control_charge(c,
+            UINT64_MAX) == EOVERFLOW);
+    else attempt_restart(c);
+}
+
+static void
+auto_work_fault(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (!attempt_restarted) checkpoint(c, work);
+    auto_fault(c, 0);
+}
+
+static void
+auto_governor_fault(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)token; (void)phase;
+    CHECK(!wl_columnar_memory_governor_ref_is_sole(watched));
+    auto_fault(c, 1);
+}
+
+static void
+auto_commit_fault(wl_evaluation_control_t *c, unsigned stage)
+{
+    (void)stage; auto_fault(c, 2);
+}
+
+static void
+auto_identity_fault(wl_evaluation_control_t *c, uint64_t current)
+{
+    (void)current; auto_fault(c, 3);
+}
+
+static void
+auto_total_fault(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, uint64_t expected, bool transition)
+{
+    (void)g; (void)expected; CHECK(!transition); auto_fault(c, 4);
+}
+
+static void
+auto_after_total_fault(wl_evaluation_control_t *c,
+    wl_columnar_memory_governor_t *g, bool success, bool overflow)
+{
+    (void)g; CHECK(!overflow);
+    if (!attempt_restarted && !success) auto_failed_rounds++;
+    auto_fault(c, 5);
+}
+
+static void
+auto_callback_seams(bool governed)
+{
+    watched = governor();
+    wl_columnar_relation_test_work_checkpoint = auto_work_fault;
+    wl_columnar_memory_governor_test_work_checkpoint = auto_work_fault;
+    wl_columnar_memory_governor_test_checkpoint = auto_governor_fault;
+    wl_columnar_relation_test_constructor_committed = auto_commit_fault;
+    wl_columnar_relation_test_before_identity_cas = auto_identity_fault;
+    wl_columnar_memory_governor_test_before_total_cas = auto_total_fault;
+    wl_columnar_memory_governor_test_after_total_cas = auto_after_total_fault;
+    for (auto_family = 0; auto_family < 6; auto_family++) {
+        if (!governed &&
+            (auto_family == 1 || auto_family == 2 ||
+            auto_family >= 4)) continue;
+        auto_target = auto_occurrences = 0; attempt_restarted = false;
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        CHECK(auto_attempt("seams", 17, 0, governed, &out, c,
+            wl_evaluation_control_active_attempt_id(c)) == 0 && out);
+        unsigned count = auto_occurrences;
+        CHECK(count && finish(c, 0) > 0); release(c);
+        CHECK(col_rel_destroy_checked(out) == 0);
+        for (auto_target = 1; auto_target <= count; auto_target++) {
+            for (auto_mode = 0; auto_mode < 3; auto_mode++) {
+                auto_occurrences = auto_hits = 0;
+                attempt_restarted = false; attempt_successor_callbacks = 0;
+                c = control(0); out = NULL; external_out = &out;
+                int expected = auto_mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+                    : auto_mode == 1 ? EOVERFLOW : EINVAL;
+                CHECK(auto_attempt("seams", 17, 0, governed, &out, c,
+                    wl_evaluation_control_active_attempt_id(c)) == expected &&
+                    !out);
+                external_out = NULL;
+                CHECK(auto_hits == 1 && !attempt_successor_callbacks);
+                if (auto_mode == 2) {
+                    CHECK(attempt_restarted && attempt_old_report.consumed > 0);
+                    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+                    wl_evaluation_control_report_t next;
+                    CHECK(wl_evaluation_control_report(c,
+                        &next) == 0 && !next.consumed && !next.result);
+                } else attempt_phase_finish(c, expected);
+                CHECK(!reserved() &&
+                    wl_columnar_memory_governor_ref_is_sole(watched));
+                release(c);
+            }
+        }
+    }
+    attempt_restarted = false;
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_relation_test_constructor_committed = committed;
+    wl_columnar_relation_test_before_identity_cas = NULL;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+auto_failed_cas_seams(void)
+{
+    watched = governor();
+    wl_columnar_relation_test_work_checkpoint = auto_work_fault;
+    wl_columnar_memory_governor_test_work_checkpoint = auto_work_fault;
+    auto_literal_t s; auto_literal("failed CAS", 17, true, &s);
+    uint64_t failed_prefix = 0;
+    for (size_t i = 0; i + 2 < s.count; i++) {
+        uint64_t prior = i ? s.prefix[i - 1] : 0;
+        if (s.prefix[i] - prior == 74) {
+            CHECK(s.prefix[i + 1] - s.prefix[i] == 54
+                && s.prefix[i + 2] - s.prefix[i + 1] == 84);
+            failed_prefix = s.prefix[i + 2]; break;
+        }
+    }
+    CHECK(failed_prefix);
+    wl_columnar_memory_governor_test_before_total_cas = peer_race;
+    wl_columnar_memory_governor_test_after_total_cas = auto_after_total_fault;
+    auto_family = 5;
+    for (unsigned run = 0; run < 4; run++) {
+        wl_columnar_memory_reservation_init(&peer); peer_changed = false;
+        auto_target = run ? 1 : 0; auto_mode = run ? run - 1 : 0;
+        auto_occurrences = auto_hits = auto_failed_rounds = 0;
+        attempt_restarted = false; attempt_successor_callbacks = 0;
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        external_out = &out;
+        int expected = !run ? 0 : auto_mode ==
+            0 ? WL_EVALUATION_CONTROL_CANCELLED
+            : auto_mode == 1 ? EOVERFLOW : EINVAL;
+        CHECK(auto_attempt("failed CAS", 17, 1, true, &out, c,
+            wl_evaluation_control_active_attempt_id(c)) == expected);
+        external_out = NULL;
+        CHECK(peer_changed && auto_failed_rounds == 1 &&
+            !attempt_successor_callbacks);
+        if (!run) {
+            CHECK(out && finish(c, 0) == s.total + 84);
+            CHECK(col_rel_destroy_checked(out) == 0);
+        } else {
+            CHECK(!out && auto_hits == 1);
+            if (auto_mode == 2) {
+                CHECK(attempt_restarted &&
+                    attempt_old_report.consumed == failed_prefix);
+                CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+                wl_evaluation_control_report_t next;
+                CHECK(wl_evaluation_control_report(c, &next) == 0
+                    && !next.consumed && !next.result &&
+                    !next.execution_status && !next.cleanup_status);
+            } else {
+                attempt_phase_finish(c, expected);
+                wl_evaluation_control_report_t report;
+                CHECK(wl_evaluation_control_report(c,
+                    &report) == 0 && report.consumed == failed_prefix);
+            }
+        }
+        CHECK(reserved() == 17 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        CHECK(wl_columnar_memory_release(&peer) && !reserved()); release(c);
+    }
+    attempt_restarted = false;
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_after_total_cas = NULL;
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+auto_credits(const char *name, uint32_t width, uint32_t capacity,
+    uint64_t *d, uint64_t *m, uint64_t *p)
+{
+    *d = sizeof(col_rel_t) + strlen(name) + 1;
+    *m = 3;
+    for (uint32_t i = 0; i < width; i++)
+        *m += sizeof(char *) + sizeof(struct ArrowSchema *)
+            + sizeof(struct ArrowSchema) + 2 + 2 * (4u + digits(i));
+    *p = (uint64_t)width * ((capacity ? capacity : 1u) * sizeof(int64_t)
+        + sizeof(int64_t *) + sizeof(int64_t));
+}
+
+static void
+auto_governor_cases(void)
+{
+    watched = governor();
+    uint64_t d, m, p; auto_credits("credit", 17, 0, &d, &m, &p);
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(watched);
+    const uint64_t limits[] = {d - 1, d + m - 1, d + m + p - 1};
+    wl_columnar_memory_governor_test_checkpoint = attempt_constructor_pin;
+    for (unsigned i = 0; i < 3; i++) {
+        atomic_store_explicit(&g->usable_bytes, limits[i],
+            memory_order_release);
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        CHECK(auto_attempt("credit", 17, 0, true, &out, c,
+            wl_evaluation_control_active_attempt_id(c)) == ENOSPC && !out);
+        CHECK(finish(c, ENOSPC) > 0 && !reserved());
+        CHECK(wl_columnar_memory_governor_ref_is_sole(watched)); release(c);
+    }
+    atomic_store_explicit(&g->usable_bytes, WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        memory_order_release);
+    wl_columnar_memory_reservation_init(&peer); peer_changed = false;
+    wl_columnar_memory_governor_test_before_total_cas = peer_race;
+    auto_literal_t s; auto_literal("credit", 17, true, &s);
+    wl_evaluation_control_t *c = control(s.total + 84); col_rel_t *out = NULL;
+    CHECK(auto_attempt("credit", 17, 0, true, &out, c,
+        wl_evaluation_control_active_attempt_id(c)) == 0 && out);
+    CHECK(peer_changed && finish(c,
+        0) == s.total + 84 && reserved() == d + m + p + 17);
+    CHECK(out->descriptor_reserved_bytes == d &&
+        out->metadata_reserved_bytes == m
+        && out->retained_reserved_bytes == p);
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    CHECK(col_rel_destroy_checked(out) == 0 && reserved() == 17);
+    CHECK(wl_columnar_memory_release(&peer) && !reserved()); release(c);
+    CHECK(wl_columnar_memory_governor_ref_is_sole(watched));
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+auto_domains_and_bits(void)
+{
+    watched = governor();
+    col_rel_t *out = NULL;
+    CHECK(!col_rel_new_auto(NULL, 1));
+    CHECK(wl_columnar_relation_new_auto_attempt_controlled(NULL, 1, &out, NULL,
+        0) == ENOMEM && !out);
+    CHECK(wl_columnar_relation_new_auto_attempt_controlled("raw", 1, NULL, NULL,
+        0) == EINVAL);
+    CHECK(wl_columnar_relation_new_auto_governed_attempt_controlled("raw", 1, 0,
+        watched, &out, NULL, 0) == 0 && out && !out->capacity);
+    CHECK(col_rel_destroy_checked(out) == 0); out = NULL;
+    CHECK(wl_columnar_relation_new_auto_attempt_controlled("raw", 1, &out, NULL,
+        0) == 0 && out);
+    CHECK(out->capacity == COL_REL_INIT_CAP &&
+        col_rel_destroy_checked(out) == 0); out = NULL;
+    for (unsigned bad = 0; bad < 3; bad++) {
+        for (unsigned mode = 0; mode < 4; mode++) {
+            wl_evaluation_control_t *c = control(0);
+            auto_family = 0; auto_target = 1; auto_occurrences = auto_hits = 0;
+            auto_mode = mode; attempt_restarted = false;
+            attempt_successor_callbacks = 0;
+            if (mode <
+                3) wl_columnar_relation_test_work_checkpoint = auto_work_fault;
+            int expected = mode == 1 ? EOVERFLOW : EINVAL;
+            CHECK(wl_columnar_relation_new_auto_governed_attempt_controlled(
+                    bad == 0 ? NULL : "domain", 1, 0, bad == 1 ? NULL : watched,
+                    bad == 2 ? NULL : &out, c,
+                    wl_evaluation_control_active_attempt_id(c)) == expected &&
+                !out);
+            wl_columnar_relation_test_work_checkpoint = checkpoint;
+            if (mode == 2) {
+                CHECK(attempt_restarted && !attempt_successor_callbacks &&
+                    attempt_old_report.consumed == 128);
+                CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+                wl_evaluation_control_report_t next;
+                CHECK(wl_evaluation_control_report(c,
+                    &next) == 0 && !next.consumed);
+            } else CHECK(finish(c, expected) == 128);
+            release(c);
+        }
+    }
+    attempt_restarted = false;
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(auto_attempt("stale", 1, 1, false, &out, c,
+        id + 1) == EINVAL && !out);
+    CHECK(finish(c, EINVAL) == 0); release(c);
+    const uint64_t bits[] = {UINT64_C(0x8000000000000000),
+                             UINT64_C(0x3ff8000000000000)};
+    c = control(0);
+    CHECK(auto_attempt("map bits", 1, 1, false, &out, c,
+        wl_evaluation_control_active_attempt_id(c)) == 0 && out);
+    CHECK(finish(c, 0) > 0); release(c);
+    for (unsigned i = 0; i < 2; i++) {
+        int64_t lane; memcpy(&lane, &bits[i], sizeof(lane));
+        CHECK(col_rel_append_row(out, &lane) == 0);
+        CHECK(memcmp(&out->columns[0][i], &bits[i], sizeof(lane)) == 0);
+    }
+    CHECK(!out->column_types && strcmp(out->schema.children[0]->format,
+        "l") == 0);
+    CHECK(col_rel_destroy_checked(out) == 0 && !reserved());
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+}
+
+static void
+auto_published_frame_retention(void)
+{
+    watched = governor();
+    wl_col_session_t *sess = calloc(1, sizeof(*sess)); CHECK(sess);
+    wl_mem_ledger_init(&sess->mem_ledger, 0); sess->memory_governor = watched;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(sess, &frame) == 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    col_rel_t *input = col_rel_new_auto("borrowed", 1); CHECK(input);
+    CHECK(eval_stack_push(stack, input, false) == 0);
+    wl_evaluation_control_t *c = control(0);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(frame, c,
+        wl_evaluation_control_active_attempt_id(c)) == 0);
+    col_rel_t **slot = NULL;
+    CHECK(wl_columnar_eval_stack_unary_output(frame,
+        &slot) == 0 && slot && !*slot);
+    CHECK(auto_attempt("published", 1, 1, true, slot, c,
+        wl_evaluation_control_active_attempt_id(c)) == 0 && *slot);
+    col_rel_t *published = *slot;
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(wl_columnar_source_access_reader_acquire(&published->source_access,
+        &reader) == 0);
+    auto_literal_t literal; auto_literal("published", 1, true, &literal);
+    attempt_phase_finish(c, 0);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0
+        && !report.result && !report.execution_status && !report.cleanup_status
+        && report.consumed == 544 + literal.total);
+    release(c);
+    uint64_t retained_bytes = reserved();
+    CHECK(wl_columnar_eval_stack_unary_finish(frame, 0) == EBUSY);
+    CHECK(reserved() == retained_bytes && stack->top == 1 &&
+        stack->items[0].rel == input);
+    CHECK(wl_columnar_source_access_reader_release(&reader) == 0);
+    CHECK(wl_columnar_eval_stack_unary_finish(frame, 0) == 0);
+    CHECK(wl_columnar_eval_stack_unary_reset(frame) == 0);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 && !reserved());
+    CHECK(col_rel_destroy_checked(input) == 0);
+    CHECK(wl_columnar_memory_governor_ref_is_sole(watched));
+    free(sess); wl_columnar_memory_governor_ref_release(watched);
+    watched = NULL;
+}
+
+#ifndef _WIN32
+static wl_columnar_memory_reservation_t *auto_private_token;
+static col_rel_t *auto_private_relation;
+static uint64_t auto_private_cutoff;
+
+static void
+auto_private_observe(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    (void)c;
+    if (phase == WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF &&
+        !auto_private_token)
+        auto_private_token = token;
+}
+
+static void
+auto_private_committed(wl_evaluation_control_t *c, unsigned stage)
+{
+    (void)c; (void)stage;
+    CHECK(auto_private_token);
+    /* Read only the still-live original token, never unfinished descriptor
+     * fields. Save the owner address before the builder's token scope ends. */
+    auto_private_relation = (col_rel_t *)(uintptr_t)atomic_load_explicit(
+        &auto_private_token->owner_bits, memory_order_acquire);
+    CHECK(auto_private_relation);
+}
+
+static void
+auto_private_violation(wl_evaluation_control_t *c, uint64_t work)
+{
+    checkpoint(c, work);
+    if (seen != auto_private_cutoff) return;
+    CHECK(auto_private_relation && external_out && !*external_out);
+    /* Deliberately privileged invariant injection after completed install.
+     * This is unsupported private-reader escape, not retained-frame behavior. */
+    col_rel_t *private = auto_private_relation;
+    CHECK(private && private->schema_ok);
+    atomic_store_explicit(&private->source_access.state,
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_relaxed);
+    wl_evaluation_control_request_cancel(c);
+}
+
+static void
+auto_private_fail_stop(void)
+{
+    pid_t child = fork(); CHECK(child >= 0);
+    if (child == 0) {
+        struct rlimit no_core = {0, 0}; (void)setrlimit(RLIMIT_CORE, &no_core);
+        fclose(stderr); watched = governor(); auto_private_token = NULL;
+        auto_private_relation = NULL;
+        auto_literal_t s; auto_literal("private", 1, true, &s);
+        auto_private_cutoff = s.total;
+        wl_columnar_memory_governor_test_checkpoint = auto_private_observe;
+        wl_columnar_relation_test_constructor_committed =
+            auto_private_committed;
+        wl_columnar_relation_test_work_checkpoint = auto_private_violation;
+        wl_evaluation_control_t *c = control(0); col_rel_t *out = NULL;
+        external_out = &out;
+        (void)auto_attempt("private", 1, 1, true, &out, c,
+            wl_evaluation_control_active_attempt_id(c));
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(child, &status,
+        0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+}
+#endif
+
 int
 main(void)
 {
@@ -1827,8 +2452,21 @@ main(void)
     attempt_new_like_domain_precedence();
     attempt_new_like_governor_seams();
     attempt_new_like_complete_literal();
+    for (unsigned governed = 0; governed < 2; governed++) {
+        const uint32_t widths[] = {0, 1, 16, 17};
+        for (unsigned i = 0; i < 4; i++)
+            auto_prefixes(i ? "auto" : "", widths[i], i % 2, governed != 0,
+                true);
+        auto_prefixes(long_name, 1, 64, governed != 0, false);
+        auto_prefixes("wide", 300, 7, governed != 0, false);
+        auto_callback_seams(governed != 0);
+    }
+    auto_failed_cas_seams();
+    auto_governor_cases(); auto_domains_and_bits();
+    auto_published_frame_retention();
 #ifndef _WIN32
     new_like_release_fail_stop();
+    auto_private_fail_stop();
 #endif
     puts("evaluation_relation_creation: OK");
     return 0;
