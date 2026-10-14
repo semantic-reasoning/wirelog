@@ -147,22 +147,43 @@ normal_eval:
         case WL_PLAN_OP_JOIN:
             if (!sess->diff_operators_active && sess->join_batch_bytes > 0) {
                 uint32_t next_index = i;
+                wl_columnar_join_pipeline_decline_t decline
+                    = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NONE;
                 int pipeline_rc = wl_columnar_join_pipeline_try_eval(rplan, i,
-                        stack, sess, &next_index);
+                        stack, sess, &next_index, &decline);
                 if (pipeline_rc == 1) {
                     i = next_index;
                     continue;
                 }
-                if (pipeline_rc != 0 && pipeline_rc != ENOENT
-                    && pipeline_rc != ENOTSUP && pipeline_rc != EAGAIN)
+                /* An ORDINARY decline leaves the outcome to
+                 * wl_columnar_join_op.  A DELTA_RIGHT decline under strict
+                 * mode is refused here, so the left input stays on the
+                 * stack.  Otherwise a JOIN whose output reaches a relation
+                 * sink (end of plan, CONCAT, CONSOLIDATE, or an EXCHANGE
+                 * across more than one worker) has the outcome a final
+                 * JOIN would have, and one read by another operator is
+                 * recorded as pipeline-not-consumable.  TDD bound runs
+                 * refuse WIRELOG_JOIN_BATCH_BYTES, so the plan slices they
+                 * evaluate, whose end is not a rule's end, do not get
+                 * here. */
+                if (pipeline_rc == 0) {
+                    if (decline == WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY)
+                        goto ordinary_join;
+                    if (decline
+                        == WL_COLUMNAR_JOIN_PIPELINE_DECLINE_DELTA_RIGHT) {
+                        if (!sess->join_batch_strict)
+                            goto ordinary_join;
+                        col_join_batch_record_fallback(sess,
+                            COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT);
+                        return ENOTSUP;
+                    }
+                    if (wl_columnar_join_pipeline_successor(rplan, i + 1u)
+                        == WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK)
+                        goto ordinary_join;
+                } else if (pipeline_rc != ENOENT && pipeline_rc != ENOTSUP
+                    && pipeline_rc != EAGAIN) {
                     return pipeline_rc;
-                /* A final JOIN already has a supported bounded relation sink
-                 * in wl_columnar_join_op().  Only a JOIN with downstream
-                 * operators is a pipeline request that strict mode must
-                 * reject when this fused consumer cannot handle it. */
-                bool has_downstream = i + 1u < rplan->op_count;
-                if (pipeline_rc == 0 && !has_downstream)
-                    goto ordinary_join;
+                }
                 col_join_batch_record_fallback(sess,
                     COL_JOIN_BATCH_EXCLUDED_PIPELINE);
                 if (sess->join_batch_strict) {

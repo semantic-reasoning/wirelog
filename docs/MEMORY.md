@@ -1236,20 +1236,40 @@ FILTERs may use only numeric variables, numeric and boolean literals, and
 comparisons.  The MAP may project columns or evaluate numeric expressions --
 integer and float arithmetic and comparisons (#1777).  A MAP with a string,
 digest, UUID, aggregate or extension expression is not consumed; those have
-no batch contract yet.  A JOIN whose downstream operators are not
-consumable, or whose input goes stale mid-stream, falls back to the one-shot
-join with reason `pipeline-not-consumable` (`ENOTSUP` under
-`WIRELOG_JOIN_BATCH_STRICT=1`).  A FILTER or MAP failure inside the pipeline
-returns that operator's errno -- for MAP, `ERANGE` for a failed expression
-and `ENOSPC` for a denied admission -- and publishes no rows.
+no batch contract yet.  A pipeline whose input goes stale mid-stream, or
+whose arrangement is unavailable, re-runs on the ordinary JOIN with reason
+`pipeline-not-consumable` (`ENOTSUP` under `WIRELOG_JOIN_BATCH_STRICT=1`).
+A FILTER or MAP failure inside the pipeline returns that operator's errno --
+for MAP, `ERANGE` for a failed expression and `ENOSPC` for a denied
+admission -- and publishes no rows.
 
-Before it creates a producer, the pipeline applies the JOIN's right-operand
-selection, a key-column range check and the key-type check.  A `$d$` or
-`$r$` right operand, a forced-empty right operand, or a key that resolves
-outside a zero-column input is left to the ordinary JOIN, so under
-`WIRELOG_JOIN_BATCH_STRICT=1` a delta right operand with a consumable tail
-is `ENOTSUP`, as it is for the plain bounded JOIN.  A FLOAT key paired with
-a non-FLOAT key is `EINVAL`, as from the ordinary JOIN.
+When the pipeline does not consume a JOIN, the reason decides what is
+recorded.  These rules apply to non-differential evaluation only: the
+pipeline is not attempted while differential operators are active, so a
+strict differential `JOIN -> REDUCE` still runs.
+
+- For a keyed JOIN without a right filter that is not materialized, in a
+  session that is not a worker session, the pipeline first applies the
+  JOIN's right-operand selection, a key-column range check and the key-type
+  check, in that order and before looking at what follows the JOIN.  A
+  missing right relation, a forced-empty right operand, or a key that
+  resolves outside a zero-column input is left to the ordinary JOIN, whose
+  result stands in both modes and nothing is recorded; a zero-column left
+  input currently fails there with `EINVAL` (#2170).  A FLOAT key paired
+  with a non-FLOAT key is `EINVAL`, as from the ordinary JOIN.  A `$d$` or
+  `$r$` right operand records `delta-right`, and strict mode refuses it with
+  `ENOTSUP` before the JOIN runs.
+- Otherwise, when the session, the JOIN or the shape of its tail is not
+  consumable, what reads the JOIN's output decides.  If the output reaches
+  the end of the plan only through CONCAT, CONSOLIDATE, or an EXCHANGE that
+  partitions across more than one worker, nothing is recorded for the
+  pipeline and the JOIN has the outcome a final JOIN would have, under the
+  ordinary JOIN's own bounded-mode rules; for example, a cross JOIN still
+  records its own exclusion and is refused under strict mode.  If another
+  operator reads the output -- JOIN, REDUCE, or a FILTER, MAP, SEMIJOIN or
+  ANTIJOIN the pipeline did not consume -- the session records
+  `pipeline-not-consumable`, and strict mode returns `ENOTSUP` before the
+  JOIN runs.
 
 Ownership and admission:
 

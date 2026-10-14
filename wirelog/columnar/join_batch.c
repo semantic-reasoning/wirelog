@@ -72,9 +72,17 @@ col_join_batch_record_fallback(wl_col_session_t *sess,
     if (sess->join_batch_warned_reasons & bit)
         return;
     sess->join_batch_warned_reasons |= bit;
-    WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
-        "bounded join mode fell back to one-shot join: %s",
-        col_join_batch_eligibility_name(reason));
+    /* The pipeline reason is recorded when the fused JOIN -> FILTER* -> MAP
+     * consumer is not used; the JOIN still runs, and its output is
+     * materialized for the next operator. */
+    if (reason == COL_JOIN_BATCH_EXCLUDED_PIPELINE)
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "join pipeline not used; the JOIN's output is materialized for "
+            "the next operator: %s", col_join_batch_eligibility_name(reason));
+    else
+        WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_WARN,
+            "bounded join mode fell back to one-shot join: %s",
+            col_join_batch_eligibility_name(reason));
 }
 
 /* ---- producer ---------------------------------------------------------- */
