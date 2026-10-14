@@ -2458,6 +2458,104 @@ wl_columnar_filter_test_unsupported(void)
     }
 }
 
+/* Exercise real original table ownership before MAP forward execution exists.
+ * Setup/observation are outside the bounded FIFO turns. The independent
+ * setup control prepays each first table turn before publishing any owner. */
+static void
+wl_columnar_filter_test_table_retirement(unsigned slots, unsigned mode,
+    bool refuse)
+{
+    wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
+    CHECK(scenario);
+    wl_columnar_filter_test_prepare(scenario,
+        wl_columnar_filter_test_source(1, 0, false, false, false), true, NULL,
+        0, false);
+    wl_columnar_filter_test_schedule(scenario, 0, false);
+    wl_columnar_filter_test_one_turn(scenario);
+    wl_columnar_filter_test_one_turn(scenario); /* START returned, cleanup queued. */
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(wl_columnar_eval_stack_filter_context(scenario->filter.frame,
+        &ctx) == 0);
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_BATCH);
+    wl_columnar_filter_program_table_t *table = &ctx->table;
+    int setup_owner;
+    wl_evaluation_control_t *setup = wl_columnar_filter_test_control(0,
+            &setup_owner);
+    uint64_t setup_id = wl_evaluation_control_active_attempt_id(setup);
+    for (unsigned i = 0; i < 6; ++i)
+        CHECK(wl_evaluation_control_charge(setup, 256) == 0);
+    wl_columnar_memory_reservation_init(&table->credit);
+    table->initialized = true;
+    if (mode) {
+        table->governor = scenario->session->memory_governor;
+        wl_columnar_memory_governor_ref_retain(table->governor);
+        table->ref_held = true;
+        CHECK(wl_columnar_memory_reserve(
+                wl_columnar_memory_governor_ref_get(table->governor),
+                7 * sizeof(*table->programs), &table->credit));
+        table->admitted = true;
+    }
+    table->programs = malloc(7 * sizeof(*table->programs));
+    CHECK(table->programs);
+    table->allocated = true;
+    if (mode == 2) {
+        CHECK(wl_columnar_memory_commit(&table->credit, table->programs));
+        table->committed = true;
+    }
+    wl_columnar_filter_test_program_t program = {0};
+    wl_columnar_filter_test_constant(&program, WL_PLAN_EXPR_CONST_INT, 7);
+    for (unsigned i = 0; i < slots; ++i) {
+        CHECK(wl_evaluation_control_charge(setup, 256) == 0);
+        table->programs[i] = NULL;
+        ++table->initialized_slots;
+        if (i % 2 == 0) {
+            bool supported = false;
+            CHECK(wl_columnar_expr_compile_attempt_controlled(program.bytes,
+                program.size, table->governor, &table->programs[i], &supported,
+                setup, setup_id) == 0);
+            CHECK(supported && table->programs[i]);
+        }
+    }
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM;
+    unsigned freed = 0, turns = 0;
+    bool refused = false;
+    while (scenario->queue.count) {
+        CHECK(++turns < 128);
+        bool program_turn = ctx->stage == WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM
+            && ctx->table.retirement_cursor < slots;
+        if (refuse && !refused &&
+            ctx->stage == WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT) {
+            CHECK(!table->allocated && !table->programs && table->admitted);
+            wl_columnar_memory_governor_test_refuse_next_release();
+            refused = true;
+        }
+        wl_columnar_filter_test_one_turn(scenario);
+        if (program_turn) {
+            ++freed;
+            CHECK(table->retirement_cursor == freed);
+            CHECK(table->programs[freed - 1] == NULL);
+        }
+    }
+    CHECK(freed == slots);
+    if (refuse) {
+        CHECK(refused && scenario->filter.parked && table->admitted);
+        CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT);
+        wl_columnar_filter_test_schedule(scenario, 12, false);
+        wl_columnar_filter_test_drain(scenario);
+    }
+    CHECK(scenario->filter.done && !table->programs && !table->allocated);
+    CHECK(!table->admitted && !table->ref_held && !table->governor);
+    CHECK(!table->initialized_slots && !table->retirement_cursor &&
+        !table->committed);
+    CHECK(wl_evaluation_control_finish(setup, &setup_owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_detach(setup, &setup_owner) == 0);
+    wl_evaluation_control_release(setup);
+    wl_evaluation_control_report_t report =
+        wl_columnar_filter_test_complete(scenario);
+    CHECK(report.result == 0);
+    free(scenario);
+}
+
 int
 main(void)
 {
@@ -2499,6 +2597,10 @@ main(void)
     wl_columnar_filter_test_budget(17, 65, true, true, true, NULL, 0, false);
     wl_columnar_filter_test_budget(17, 133, false, true, false, &yes, 0, false);
     wl_columnar_filter_test_budget(1, 3, false, false, false, &no, 1, false);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        wl_columnar_filter_test_table_retirement(0, mode, false);
+        wl_columnar_filter_test_table_retirement(3, mode, mode == 2);
+    }
     wl_columnar_filter_test_no_first_admission();
     wl_columnar_filter_test_busy_finish();
     wl_columnar_filter_test_credit_retry();

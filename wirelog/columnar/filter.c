@@ -2389,6 +2389,57 @@ wl_columnar_filter_op_attempt_step(
     }
     ctx->busy = true;
     switch (ctx->stage) {
+    case WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM:
+        if (ctx->table.retirement_cursor < ctx->table.initialized_slots) {
+            uint32_t slot = ctx->table.retirement_cursor;
+            wl_columnar_expr_attempt_numeric_t *program =
+                ctx->table.programs[slot];
+            ctx->table.programs[slot] = NULL;
+            ++ctx->table.retirement_cursor;
+            wl_columnar_expr_attempt_numeric_free(program);
+            break;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL:
+        if (ctx->table.allocated) {
+            void *physical = (void *)ctx->table.programs;
+            ctx->table.programs = NULL;
+            ctx->table.allocated = false;
+            free(physical);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT:
+        if (ctx->table.admitted) {
+            bool released = ctx->table.committed
+                ? wl_columnar_memory_release(&ctx->table.credit)
+                : wl_columnar_memory_rollback(&ctx->table.credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL;
+                goto retained;
+            }
+            ctx->table.admitted = false;
+        }
+        ctx->cleanup_result = 0;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_REFERENCE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_TABLE_REFERENCE:
+        if (ctx->table.ref_held) {
+            wl_columnar_memory_governor_ref_t *ref = ctx->table.governor;
+            ctx->table.governor = NULL;
+            ctx->table.ref_held = false;
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_TABLE_CLEAR;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_TABLE_CLEAR:
+        ctx->table.initialized_slots = 0;
+        ctx->table.retirement_cursor = 0;
+        ctx->table.committed = false;
+        ctx->table.initialized = false;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_BATCH;
+        break;
     case WL_COLUMNAR_FILTER_STAGE_BATCH:
         if (ctx->batch_initialized) {
             if (!ctx->drain_initialized
@@ -2545,7 +2596,11 @@ wl_columnar_filter_op_attempt_ack(
         || ctx->unary_started || ctx->source_initialized ||
         ctx->batch_initialized
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
-        ctx->output || ctx->private_output)
+        ctx->output || ctx->private_output || ctx->table.programs
+        || ctx->table.initialized_slots || ctx->table.retirement_cursor
+        || ctx->table.allocated || ctx->table.admitted || ctx->table.ref_held
+        || ctx->table.governor || ctx->table.committed ||
+        ctx->table.initialized)
         return EBUSY;
     ctx->thread_valid = false; ctx->frame = NULL; ctx->session = NULL;
     ctx->values = ctx->inline_values; ctx->governor = NULL;

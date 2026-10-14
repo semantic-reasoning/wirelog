@@ -2382,3 +2382,21 @@ including outer dispatch. Fixture setup and observation occur outside those
 bounded turns. Runtime correctness and performance require separate evidence;
 source accounting alone establishes neither throughput nor raw-path speed
 parity.
+
+The private numeric continuation also supports an original compiled-program
+table. Its initialized prefix is the only set of discoverable slots; unused
+capacity is never scanned. Each table-program turn clears and retires at most
+one slot, including null slots. Separate turns retire the table allocation,
+its reservation, and its governor reference, then clear the scalar markers.
+Reservation refusal retains the credit stage after physical storage is gone.
+The original token and reference remain reachable for a separately funded
+retry. These stages precede ordinary batch retirement, so the source and
+original control remain alive throughout them.
+
+Table ownership requires advance admission: six fixed grants of 256 work units
+before acquiring table resources, and one grant of 256 before each slot joins
+the initialized prefix. These are conservative retirement reservations, not
+completed-work telemetry. Initializing and compiling slots require their own
+forward admissions. The extra table stages are dormant for FILTER. The table
+record enlarges every cleanup frame, including frames used outside cooperative
+numeric execution; frame admission and zeroing use the actual structure size.
