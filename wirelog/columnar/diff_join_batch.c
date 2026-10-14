@@ -5,6 +5,11 @@
  * continuation is created.  The continuation itself is read-only with
  * respect to the arrangement and holds a generation/source lease until it is
  * cancelled or destroyed.
+ *
+ * Output contract (Issue #2173): the producer emits join rows only, like the
+ * one-shot $join_diff path in join.c.  Its scratch relation carries no
+ * timestamps, and it reads neither input's timestamp column, so no input
+ * multiplicity reaches its output.
  */
 #include "columnar/diff_join_batch.h"
 
@@ -80,8 +85,8 @@ typedef struct {
 } col_diff_join_batch_producer_t;
 
 /* Preserve the rows already written while the relation grows.  The relation
- * resize path copies exactly nrows (including timestamps), so publishing the
- * live prefix before reserve is required for correctness. */
+ * resize path copies exactly nrows, so publishing the live prefix before
+ * reserve is required for correctness. */
 static wl_columnar_continuation_status_t
 grow_scratch(col_diff_join_batch_producer_t *p, uint32_t n)
 {
@@ -182,8 +187,7 @@ producer_validate(void *context,
         return false;
     if (pos.lr > p->left->nrows)
         return false;
-    if (c->timestamps != (p->left->timestamps != NULL
-        || p->right->timestamps != NULL))
+    if (c->timestamps != (p->batch && p->batch->timestamps != NULL))
         return false;
     return true;
 }
@@ -230,24 +234,6 @@ producer_produce(void *context,
                     p->right, rr, p->project_indices,
                     p->project_count) != 0)
                     return WL_COLUMNAR_CONTINUATION_INVALID;
-                if (p->batch->timestamps) {
-                    int64_t lm = p->left->timestamps
-                        ? p->left->timestamps[lr].multiplicity : 1;
-                    int64_t rm = p->right->timestamps
-                        ? p->right->timestamps[rr].multiplicity : 1;
-                    /* The left input is the delta-driving side.  Preserve
-                     * its provenance; the right arrangement contributes
-                     * multiplicity but does not replace that provenance. */
-                    if (p->left->timestamps)
-                        p->batch->timestamps[n]
-                            = p->left->timestamps[lr];
-                    else if (p->right->timestamps)
-                        p->batch->timestamps[n]
-                            = p->right->timestamps[rr];
-                    if (wl_columnar_arithmetic_checked_mul_int64(lm, rm,
-                        &p->batch->timestamps[n].multiplicity) != 0)
-                        return WL_COLUMNAR_CONTINUATION_INVALID;
-                }
                 n++;
                 /* Keep the live prefix structurally current, so every future
                  * relocation preserves the row just written. */
@@ -541,12 +527,12 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     p->arr = p->pin.arr;
     ocols = col_join_output_width(left, right, op);
     /* Session ownership is authoritative.  Without a session governor, the
-     * delta-driving left source owns this transient scratch; the right source
-     * is the fallback for legacy inputs that carry governance only there. */
-    bool timestamped = left->timestamps || right->timestamps;
+    * delta-driving left source owns this transient scratch; the right source
+    * is the fallback for legacy inputs that carry governance only there.
+    * The scratch carries no timestamps (see the output contract above). */
     if (descriptor_governor)
         rc = wl_columnar_relation_new_auto_governed("$diff_join_batch",
-                ocols, COL_REL_INIT_CAP, timestamped, descriptor_governor,
+                ocols, COL_REL_INIT_CAP, false, descriptor_governor,
                 &p->batch);
     else {
         p->batch = col_rel_new_auto("$diff_join_batch", ocols);
@@ -561,15 +547,6 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     rc = col_join_set_output_types(p->batch, left, right, op);
     if (rc != 0)
         goto fail;
-    if (timestamped && !p->batch->timestamps) {
-        p->batch->memory_budget_denial_pending = false;
-        rc = col_rel_enable_timestamps(p->batch);
-        if (rc != 0) {
-            if (rc == ENOMEM && p->batch->memory_budget_denial_pending)
-                rc = ENOSPC;
-            goto fail;
-        }
-    }
     if (!col_rel_retained_bytes_for(p->batch, 1u, &row_bytes)
         || row_bytes == 0) {
         rc = ENOTSUP;
@@ -590,8 +567,7 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     p->cursor.arr_generation = p->pin.generation;
     p->cursor.arr_indexed_rows = p->arr->indexed_rows;
     p->cursor.left_is_delta = left_is_delta;
-    p->cursor.timestamps = left->timestamps != NULL ||
-        right->timestamps != NULL;
+    p->cursor.timestamps = false;
     initial.input_identity = left->relation_identity;
     initial.arrangement_identity = right->relation_identity;
     initial.generation = p->cursor.arr_generation;

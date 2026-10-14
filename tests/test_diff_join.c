@@ -2097,8 +2097,155 @@ test_diff_arrangement_pin_lifetime(void)
     PASS;
 }
 
+/* Issue #2173: one col_op_join_diff over left {(1, 10)} and right
+ * {(1, 100 + i)} for i < 3.  join_batch_bytes = 0 is the one-shot path; 224
+ * is the bounded producer (7 rows per batch).  With @timestamped both inputs
+ * carry timestamps: left multiplicity 2, every right row @right_mult. */
+typedef struct {
+    int rc;
+    uint32_t nrows;
+    bool timestamps;
+    bool batched; /* result is the bounded producer's $join_diff_batch */
+    int64_t right_values[3];
+} diff_ts_run_t;
+
+static int
+diff_ts_cmp(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static diff_ts_run_t
+run_diff_join_timestamped(uint64_t batch_bytes, bool timestamped,
+    int64_t right_mult)
+{
+    const char *names[] = { "k", "v" };
+    char *lkeys[] = { "k" };
+    char *rkeys[] = { "k" };
+    diff_ts_run_t run = { .rc = ENOMEM };
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_rel("left", 2, names);
+    col_rel_t *right = make_rel("right", 2, names);
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    eval_entry_t result;
+    bool ok = sess && left && right
+        && col_rel_append_row(left, (int64_t[]){ 1, 10 }) == 0;
+
+    for (int64_t i = 0; ok && i < 3; i++)
+        ok = col_rel_append_row(right, (int64_t[]){ 1, 100 + i }) == 0;
+    if (ok && timestamped) {
+        ok = col_rel_enable_timestamps(left) == 0
+            && col_rel_enable_timestamps(right) == 0;
+        if (ok) {
+            left->timestamps[0].multiplicity = 2;
+            for (uint32_t i = 0; i < right->nrows; i++)
+                right->timestamps[i].multiplicity = right_mult;
+        }
+    }
+    if (!ok || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        goto out;
+    }
+    sess->join_batch_bytes = batch_bytes;
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = (const char *const *)lkeys;
+    op.right_keys = (const char *const *)rkeys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    run.rc = col_op_join_diff(&op, &stack, sess);
+    if (run.rc != 0) {
+        eval_stack_drain(&stack);
+        goto out;
+    }
+    result = eval_stack_pop(&stack);
+    if (result.rel) {
+        run.nrows = result.rel->nrows;
+        run.timestamps = result.rel->timestamps != NULL;
+        run.batched = result.rel->name
+            && strcmp(result.rel->name, "$join_diff_batch") == 0;
+        for (uint32_t i = 0; i < result.rel->nrows && i < 3u; i++)
+            run.right_values[i] = col_rel_get(result.rel, i, 3);
+        qsort(run.right_values, 3, sizeof(run.right_values[0]),
+            diff_ts_cmp);
+    }
+    free(result.seg_boundaries);
+    if (result.owned)
+        col_rel_destroy(result.rel);
+out:
+    col_rel_destroy(left);
+    if (sess)
+        destroy_mock_session(sess);
+    return run;
+}
+
+/* T1: a right multiplicity whose product with the left overflows int64
+ * failed the bounded run with EINVAL (measured: rc 22, no rows).  The
+ * bounded diff join now follows the one-shot $join_diff contract: it reads
+ * no input multiplicity and publishes no timestamps. */
 static void
-test_diff_join_batch_signed_timestamps(void)
+test_diff_join_batch_ignores_overflowing_multiplicity(void)
+{
+    diff_ts_run_t oneshot;
+    diff_ts_run_t bounded;
+
+    TEST("bounded diff join ignores an overflowing input multiplicity");
+    oneshot = run_diff_join_timestamped(0, true, INT64_MAX);
+    bounded = run_diff_join_timestamped(224, true, INT64_MAX);
+    if (bounded.rc != 0)
+        printf("(bounded rc=%d rows=%u) ", bounded.rc, bounded.nrows);
+    ASSERT_TRUE(oneshot.rc == 0 && oneshot.nrows == 3 && !oneshot.timestamps,
+        "one-shot oracle joins three rows without timestamps");
+    ASSERT_TRUE(bounded.rc == 0, "bounded diff join succeeds");
+    ASSERT_TRUE(!oneshot.batched && bounded.batched,
+        "only the 224-byte run takes the bounded producer");
+    ASSERT_TRUE(!bounded.timestamps, "bounded output carries no timestamps");
+    ASSERT_TRUE(bounded.nrows == oneshot.nrows
+        && memcmp(bounded.right_values, oneshot.right_values,
+        sizeof(bounded.right_values)) == 0,
+        "bounded rows equal the one-shot oracle");
+    PASS;
+}
+
+/* T1b: the output contract alone, without overflow.  With timestamped
+ * inputs the bounded output used to carry timestamps (measured: ts=1) while
+ * the one-shot output carries none. */
+static void
+test_diff_join_batch_output_has_no_timestamps(void)
+{
+    diff_ts_run_t oneshot;
+    diff_ts_run_t bounded;
+
+    TEST("bounded diff join output carries no timestamps");
+    oneshot = run_diff_join_timestamped(0, true, 0);
+    bounded = run_diff_join_timestamped(224, true, 0);
+    if (bounded.timestamps)
+        printf("(bounded ts=1) ");
+    ASSERT_TRUE(oneshot.rc == 0 && bounded.rc == 0,
+        "both join paths succeed");
+    ASSERT_TRUE(!oneshot.batched && bounded.batched,
+        "only the 224-byte run takes the bounded producer");
+    ASSERT_TRUE(!oneshot.timestamps && !bounded.timestamps,
+        "neither output carries timestamps");
+    ASSERT_TRUE(bounded.nrows == oneshot.nrows && bounded.nrows == 3
+        && memcmp(bounded.right_values, oneshot.right_values,
+        sizeof(bounded.right_values)) == 0,
+        "bounded rows equal the one-shot oracle");
+    PASS;
+}
+
+/* Formerly test_diff_join_batch_signed_timestamps, which pinned the
+ * multiplicity product introduced by ccd03237.  Issue #2173 removed that
+ * contract: the inputs keep their signed timestamps, but the producer's
+ * scratch and the output carry none, so every admitted byte figure below is
+ * the timestamp-free footprint of the scratch. */
+static void
+test_diff_join_batch_ignores_input_timestamps(void)
 {
     const char *names[] = { "k", "v" };
     const uint32_t key = 0;
@@ -2124,7 +2271,7 @@ test_diff_join_batch_signed_timestamps(void)
     uint64_t source_baseline;
     int rc;
 
-    TEST("differential bounded join grows timestamped scratch safely");
+    TEST("differential bounded join ignores input timestamps");
     ASSERT_TRUE(s && left && right, "differential batch fixture allocation");
     ASSERT_TRUE(col_rel_append_row(left, row) == 0, "left batch row");
     for (int64_t i = 0; i < 130; i++) {
@@ -2153,16 +2300,15 @@ test_diff_join_batch_signed_timestamps(void)
     op.key_count = 1;
     op.project_indices = project_indices;
     op.project_count = 2;
+    /* The output has the scratch's shape: two columns, no timestamps. */
     out = col_rel_new_auto("diff_batch_out", 2);
     ASSERT_TRUE(out && col_join_set_output_types(out, left, right, &op) == 0
-        && col_rel_enable_timestamps(out) == 0
         && col_rel_retained_bytes_for(out, 64u, &scratch_bytes),
         "source and scratch footprints measured");
     initial_payload_bytes = scratch_bytes + out->ncols
         * (sizeof(int64_t *) + sizeof(int64_t));
     growth_incoming_bytes = 2u * 128u * sizeof(int64_t)
-        + out->ncols * sizeof(int64_t *)
-        + 128u * sizeof(*out->timestamps);
+        + out->ncols * sizeof(int64_t *);
     admission_budget = initial_payload_bytes;
     source_governor = make_test_governor(4u * 1024u * 1024u);
     ASSERT_TRUE(source_governor
@@ -2290,46 +2436,21 @@ test_diff_join_batch_signed_timestamps(void)
     if (rc == 0 && wl_columnar_continuation_publish(cont, &sink)
         != WL_COLUMNAR_CONTINUATION_DONE)
         rc = EIO;
-    ASSERT_TRUE(rc == 0 && out->nrows == 130 && out->timestamps,
+    ASSERT_TRUE(rc == 0 && out->nrows == 130 && !out->timestamps,
         "differential batch completes across multiple batches");
-    bool seen_neg4 = false;
-    bool seen_pos2 = false;
-    bool seen_neg2 = false;
     bool seen_rows[130] = { false };
-    for (uint32_t i = 0; i < out->nrows; i++) {
-        switch (out->timestamps[i].multiplicity) {
-        case -4:
-            seen_neg4 = true;
-            break;
-        case 2:
-            seen_pos2 = true;
-            break;
-        case -2:
-            seen_neg2 = true;
-            break;
-        default:
-            break;
-        }
-    }
-    ASSERT_TRUE(seen_neg4 && seen_pos2 && seen_neg2,
-        "each signed multiplicity product is preserved");
     for (uint32_t i = 0; i < out->nrows; i++) {
         int64_t right_value = col_rel_get(out, i, 1);
         ASSERT_TRUE(right_value >= 100 && right_value < 230,
             "output match is within the exact oracle domain");
         uint32_t source_row = (uint32_t)(right_value - 100);
-        int64_t expected_mult = (int64_t[]){ -2, 2, -4 }[source_row % 3u];
-        ASSERT_TRUE(col_rel_get(out, i, 0) == 10
-            && col_rel_get(out, i, 1) == right_value
-            && !seen_rows[source_row]
-            && out->timestamps[i].multiplicity == expected_mult
-            && out->timestamps[i].iteration == 7
-            && out->timestamps[i].stratum == 3
-            && out->timestamps[i].worker == 2
-            && out->timestamps[i]._reserved == 0,
-            "delta-driving provenance is preserved across differential join");
+        ASSERT_TRUE(col_rel_get(out, i, 0) == 10 && !seen_rows[source_row],
+            "each output row is a distinct one-shot join row");
         seen_rows[source_row] = true;
     }
+    ASSERT_TRUE(left->timestamps[0].multiplicity == -2
+        && right->timestamps[1].multiplicity == -1,
+        "input timestamps are left unchanged");
     for (uint32_t i = 0; i < 130; i++)
         ASSERT_TRUE(seen_rows[i], "every input match appears exactly once");
 
@@ -2863,7 +2984,9 @@ main(void)
     test_arrangement_generation_rebuild();
     test_diff_arrangement_txn_ledger_accounting();
     test_diff_arrangement_pin_lifetime();
-    test_diff_join_batch_signed_timestamps();
+    test_diff_join_batch_ignores_overflowing_multiplicity();
+    test_diff_join_batch_output_has_no_timestamps();
+    test_diff_join_batch_ignores_input_timestamps();
     test_governed_auto_relation_schema();
     test_diff_join_batch_snapshot_reset_and_tail();
     test_diff_join_batch_snapshot_reset_without_growth();
