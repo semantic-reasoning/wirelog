@@ -2411,6 +2411,450 @@ auto_private_fail_stop(void)
 }
 #endif
 
+/* Original protected source: independent literal nested admission schedule. */
+static void
+scalar_source_report(wl_evaluation_control_t *c, uint64_t id, int rc,
+    uint64_t expected)
+{
+    CHECK(wl_evaluation_control_finish(c, &owner, rc > 0 ? rc : 0, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == id && report.consumed == expected
+        && report.result == rc && report.execution_status == (rc > 0 ? rc : 0)
+        && report.cleanup_status == 0);
+    if (rc < 0) CHECK(report.stop_reason == rc);
+    else if (rc == 0) CHECK(report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+}
+
+static int
+scalar_source_open(wl_columnar_relation_scalar_source_t *s,
+    col_rel_t *r, bool ts, wl_evaluation_control_t *c, bool *initialized)
+{
+    int rc = wl_columnar_relation_scalar_source_init_attempt_controlled(s,
+            initialized, c, wl_evaluation_control_active_attempt_id(c));
+    if (!rc) rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            s, r, ts);
+    return rc;
+}
+
+static void
+scalar_source_prefixes(uint32_t width)
+{
+    static const uint64_t fixed[] = {256, 256, 96, 144, 224, 96, 144, 224, 192};
+    uint64_t fees[64];
+    size_t count = sizeof(fixed) / sizeof(fixed[0]);
+    memcpy(fees, fixed, sizeof(fixed));
+    for (uint32_t i = 0; i < width; i += 8) fees[count++] = 224;
+    col_rel_t *r = new_like_source(width, false, true, 2);
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(r->memory_governor));
+    uint64_t prefix = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t previous = prefix; prefix += fees[i];
+        for (unsigned below = 0; below < 2; below++) {
+            wl_evaluation_control_t *c = control(prefix - below);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            wl_columnar_relation_scalar_source_t s;
+            bool initialized = true;
+            int rc = scalar_source_open(&s, r, true, c, &initialized);
+            int expected = !below && i + 1 == count
+                ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected);
+            CHECK(initialized == (i != 0 || !below));
+            if (initialized) {
+                CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+                CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED);
+                CHECK(!s.descriptor_reader.owner && !s.owner_reader.owner);
+            }
+            scalar_source_report(c, id, rc, below ? previous : prefix);
+            new_like_released(r);
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(r->memory_governor))
+                == baseline);
+            release(c);
+        }
+    }
+    CHECK(prefix == 1632 + 224 * ((width + 7u) / 8u));
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void *
+scalar_source_wrong_thread(void *arg)
+{
+    wl_columnar_relation_scalar_source_t *s = arg;
+    uint32_t width = 99, rows = 99; bool ts = false;
+    int64_t values[320] = {0};
+    CHECK(wl_columnar_relation_scalar_source_shape_attempt_controlled(s,
+        &width, &rows, &ts) == EINVAL && width == 99 && rows == 99);
+    CHECK(wl_columnar_relation_scalar_source_gather_attempt_controlled(s,
+        0, values, s->width) == EINVAL);
+    CHECK(wl_columnar_relation_scalar_source_end(s, EIO) == EINVAL);
+    return NULL;
+}
+
+static void
+scalar_source_twins(uint32_t width, bool typed, bool ts, bool alias_mode)
+{
+    col_rel_t *root = new_like_source(width, typed, true, 1);
+    col_rel_t *r = root;
+    if (alias_mode) {
+        r = col_rel_new_like("source alias", root);
+        CHECK(r && col_rel_install_shared_view(r, root) == 0);
+    }
+    uint64_t view = r->view_generation, storage = r->storage_generation;
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(root->memory_governor));
+    watched = governor();
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_scalar_source_t s;
+    bool initialized = false;
+    CHECK(scalar_source_open(&s, r, ts, c, &initialized) == 0 && initialized);
+    CHECK(s.descriptor == r && s.owner == root);
+    CHECK(s.descriptor_reader.identity == (uintptr_t)&s.descriptor_reader);
+    CHECK(s.owner_reader.identity == (uintptr_t)&s.owner_reader);
+    CHECK(s.descriptor_reader.owner == &r->descriptor_access);
+    CHECK(s.owner_reader.owner == &root->source_access);
+    wl_columnar_source_access_writer_t writer = {0};
+    CHECK(wl_columnar_source_access_writer_acquire(&r->descriptor_access,
+        &writer) == EBUSY);
+    CHECK(wl_columnar_source_access_writer_acquire(&root->source_access,
+        &writer) == EBUSY);
+    uint32_t got_width = 99, rows = 99; bool got_ts = !ts;
+    CHECK(wl_columnar_relation_scalar_source_shape_attempt_controlled(&s,
+        &got_width, &rows, &got_ts) == 0);
+    CHECK(got_width == width && rows == r->nrows && got_ts == ts);
+    int64_t values[320];
+    CHECK(width <= 320);
+    for (uint32_t row = 0; row < rows; row++) {
+        CHECK(wl_columnar_relation_scalar_source_gather_attempt_controlled(&s,
+            row, values, width) == 0);
+        for (uint32_t col = 0; col < width; col++)
+            CHECK(values[col] == r->columns[col][row]);
+    }
+    wl_columnar_relation_scalar_source_t copy = s;
+    CHECK(wl_columnar_relation_scalar_source_end(&copy, EIO) == EINVAL);
+    CHECK(wl_columnar_relation_scalar_source_shape_attempt_controlled(&copy,
+        &got_width, &rows, &got_ts) == EINVAL);
+    wl_thread_t thread;
+    CHECK(wl_thread_create(&thread, scalar_source_wrong_thread, &s) == 0);
+    CHECK(wl_thread_join(&thread) == 0);
+    CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    col_rel_t *out = NULL, *raw = NULL;
+    CHECK(wl_columnar_relation_scalar_source_new_like_attempt_controlled(&s,
+        "protected clone", watched, &out) == 0 && out);
+    CHECK(wl_columnar_relation_new_like_governed_checked_mode(
+            "protected clone", r, NULL, ts, &raw) == 0);
+    new_like_equal(out, raw, r);
+    CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, EIO) == 0);
+    CHECK(finish(c, 0) > 0);
+    release(c);
+    /* DRAINED owns no old control or source lifetime. */
+    CHECK(wl_columnar_relation_scalar_source_end(&s, ENOMEM) == 0);
+    new_like_released(r);
+    CHECK(r->view_generation == view && r->storage_generation == storage);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(root->memory_governor)) ==
+        baseline);
+    CHECK(col_rel_destroy_checked(out) == 0 &&
+        col_rel_destroy_checked(raw) == 0);
+    CHECK(reserved() == 0 && wl_columnar_memory_governor_ref_is_sole(watched));
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    if (alias_mode) CHECK(col_rel_destroy_checked(r) == 0);
+    CHECK(col_rel_destroy_checked(root) == 0);
+}
+
+static unsigned scalar_fault_mode;
+static uint64_t scalar_fault_at;
+static void
+scalar_source_checkpoint(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (attempt_restarted) {
+        attempt_successor_callbacks++; return;
+    }
+    checkpoint(c, work);
+    if (seen != scalar_fault_at) return;
+    if (scalar_fault_mode == 0) wl_evaluation_control_request_cancel(c);
+    else if (scalar_fault_mode == 1)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else attempt_restart(c);
+}
+
+static void
+scalar_source_seams(void)
+{
+    static const uint64_t prefixes[] = {256, 512, 608, 752, 976, 1072, 1216,
+                                        1440,
+                                        1632, 1856, 2080, 2304};
+    col_rel_t *r = new_like_source(17, false, false, 2);
+    wl_columnar_relation_test_work_checkpoint = scalar_source_checkpoint;
+    for (scalar_fault_mode = 0; scalar_fault_mode < 3; scalar_fault_mode++)
+        for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+            wl_evaluation_control_t *c = control(0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            attempt_restarted = false; attempt_successor_callbacks = 0;
+            scalar_fault_at = prefixes[i];
+            wl_columnar_relation_scalar_source_t s; bool initialized = false;
+            int expected = scalar_fault_mode == 0
+                ? WL_EVALUATION_CONTROL_CANCELLED
+                : scalar_fault_mode == 1 ? EOVERFLOW : EINVAL;
+            CHECK(scalar_source_open(&s, r, false, c,
+                &initialized) == expected);
+            CHECK(initialized && wl_columnar_relation_scalar_source_end(&s,
+                expected) == expected);
+            new_like_released(r);
+            if (attempt_restarted) {
+                CHECK(attempt_old_report.attempt_id == id
+                    && attempt_old_report.consumed == prefixes[i]);
+                CHECK(attempt_successor_callbacks == 0);
+                scalar_source_report(c,
+                    wl_evaluation_control_active_attempt_id(c), 0, 0);
+            } else scalar_source_report(c, id, expected, prefixes[i]);
+            release(c);
+        }
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    attempt_restarted = false;
+    /* The first live END remains available after an interrupted init. */
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void
+scalar_source_gather_prefixes(void)
+{
+    col_rel_t *r = new_like_source(17, true, false, 2);
+    static const uint64_t fees[] = {128, 224, 224, 224};
+    for (unsigned shape = 0; shape < 2; shape++) {
+        uint64_t prefix = 0;
+        size_t count = shape ? 1 : sizeof(fees)/sizeof(fees[0]);
+        for (size_t i = 0; i < count; i++) {
+            uint64_t previous = prefix; prefix += fees[i];
+            for (unsigned below = 0; below < 2; below++) {
+                wl_evaluation_control_t *c = control(2304 + prefix - below);
+                uint64_t id = wl_evaluation_control_active_attempt_id(c);
+                wl_columnar_relation_scalar_source_t s; bool init = false;
+                CHECK(scalar_source_open(&s, r, false, c, &init) == 0 && init);
+                int64_t values[17];
+                for (unsigned j = 0; j < 17; j++)values[j] = -999;
+                uint32_t width = 99, rows = 99; bool ts = true;
+                int rc = shape
+                    ?
+                    wl_columnar_relation_scalar_source_shape_attempt_controlled(
+                    &s, &width, &rows, &ts)
+                    :
+                    wl_columnar_relation_scalar_source_gather_attempt_controlled
+                    (
+                    &s, 1, values, 17);
+                int expected = !below && i+1 == count
+                    ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT;
+                CHECK(rc == expected);
+                if (shape) {
+                    CHECK(expected ? width == 99 && rows == 99 && ts
+                        : width == 17 && rows == 2 && !ts);
+                } else {
+                    unsigned copied = (below ? i : i+1);
+                    copied = copied ? (copied-1)*8 : 0;
+                    if (copied > 17)copied = 17;
+                    for (unsigned j = 0; j < 17; j++)
+                        CHECK(values[j] ==
+                            (j < copied ? r->columns[j][1] : -999));
+                }
+                CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+                scalar_source_report(c, id, rc, 2304+(below?previous:prefix));
+                release(c); new_like_released(r);
+            }
+        }
+    }
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void
+scalar_source_like_literal(void)
+{
+    col_rel_t *r = new_like_source(0, false, false, 2);
+    watched = governor();
+    /* Empty recipe and no TS exactly match independent auto builder inputs.
+     * Same three128 caller phases and external128, but no new source readers. */
+    auto_literal_t literal; auto_literal("protected", 0, true, &literal);
+    for (size_t i = 0; i < literal.count; i++)
+        for (unsigned below = 0; below < 2; below++) {
+            wl_evaluation_control_t *c = control(1632+literal.prefix[i]-below);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            wl_columnar_relation_scalar_source_t s; bool init = false;
+            CHECK(scalar_source_open(&s, r, false, c, &init) == 0 && init);
+            col_rel_t *out = r;
+            int rc =
+                wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+                &s, "protected", watched, &out);
+            int expected = !below && i+1 == literal.count
+                ?0:WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected && (expected ? out == NULL : out != NULL));
+            CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+            scalar_source_report(c, id, rc,
+                1632+(below?(i?literal.prefix[i-1]:0):literal.prefix[i]));
+            if (out)CHECK(col_rel_destroy_checked(out) == 0);
+            CHECK(reserved() == 0 &&
+                wl_columnar_memory_governor_ref_is_sole(watched));
+            new_like_released(r); release(c);
+        }
+    for (size_t i = 0; i < literal.allocation_count; i++) {
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_columnar_relation_scalar_source_t s; bool init = false;
+        CHECK(scalar_source_open(&s, r, false, c, &init) == 0 && init);
+        col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = (uint32_t)i+1;
+        int rc = wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+            &s, "protected", watched, &out);
+        CHECK(rc == ENOMEM && !out
+            && wl_columnar_relation_test_constructor_fail_allocation == 0);
+        CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+        scalar_source_report(c, id, rc, 1632+literal.allocations[i]);
+        CHECK(reserved() == 0 &&
+            wl_columnar_memory_governor_ref_is_sole(watched));
+        new_like_released(r); release(c);
+    }
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static wl_columnar_relation_scalar_source_t *scalar_reader_record;
+static wl_columnar_source_access_gate_t *scalar_reader_gate;
+static unsigned scalar_reader_mode, scalar_reader_hits;
+static void
+scalar_reader_after(wl_evaluation_control_t *c,
+    wl_columnar_source_access_gate_t *gate, bool acquired)
+{
+    if (gate != scalar_reader_gate || !acquired)return;
+    CHECK(!scalar_reader_hits++);
+    CHECK(scalar_reader_record->owner_reader.owner == gate);
+    CHECK(scalar_reader_record->descriptor_reader.owner != NULL);
+    if (scalar_reader_mode == 0)wl_evaluation_control_request_cancel(c);
+    else if (scalar_reader_mode == 1)
+        CHECK(wl_evaluation_control_charge(c, UINT64_MAX) == EOVERFLOW);
+    else attempt_restart(c);
+}
+
+static void
+scalar_source_reader_authority(void)
+{
+    col_rel_t *r = new_like_source(1, false, false, 2);
+    for (scalar_reader_mode = 0; scalar_reader_mode < 3; scalar_reader_mode++) {
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_columnar_relation_scalar_source_t s; bool init = false;
+        scalar_reader_record = &s; scalar_reader_gate = &r->source_access;
+        scalar_reader_hits = 0; attempt_restarted = false;
+        attempt_successor_callbacks = 0;
+        wl_columnar_relation_test_after_reader_cas = scalar_reader_after;
+        int rc = scalar_source_open(&s, r, false, c, &init);
+        wl_columnar_relation_test_after_reader_cas = NULL;
+        int expected = scalar_reader_mode == 0?WL_EVALUATION_CONTROL_CANCELLED:
+            scalar_reader_mode == 1?EOVERFLOW:EINVAL;
+        CHECK(rc == expected && init && scalar_reader_hits == 1);
+        CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+            && !s.owner_reader.owner && !s.descriptor_reader.owner);
+        new_like_released(r);
+        if (attempt_restarted) {
+            CHECK(attempt_old_report.attempt_id == id
+                && attempt_old_report.consumed == 1216);
+            scalar_source_report(c, wl_evaluation_control_active_attempt_id(c),
+                0, 0);
+        } else scalar_source_report(c, id, rc, 1216);
+        release(c);
+    }
+    attempt_restarted = false;
+    /* Force an actual failed strong CAS on each original gate. */
+    race_gates[0] = &r->descriptor_access; race_gates[1] = &r->source_access;
+    gate_rounds[0] = gate_rounds[1] = 1;
+    memset(gate_peers, 0, sizeof(gate_peers));
+    wl_columnar_relation_test_before_reader_cas = reader_race;
+    wl_evaluation_control_t *c = control(1856+288);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    wl_columnar_relation_scalar_source_t s; bool init = false;
+    CHECK(scalar_source_open(&s, r, false, c, &init) == 0 && init);
+    wl_columnar_relation_test_before_reader_cas = NULL;
+    CHECK(gate_rounds[0] == 0 && gate_rounds[1] == 0);
+    CHECK(gate_peers[0].owner && gate_peers[1].owner);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    scalar_source_report(c, id, 0, 2144);
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(wl_columnar_source_access_reader_release(&gate_peers[i]) == 0);
+        race_gates[i] = NULL;
+    }
+    release(c); new_like_released(r);
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
+static void
+scalar_source_domains(void)
+{
+    col_rel_t *r = new_like_source(1, false, false, 2);
+    /* Refused initialization publishes only its disjoint false flag. */
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    wl_columnar_relation_scalar_source_t s; bool init = true;
+    CHECK(wl_columnar_relation_scalar_source_init_attempt_controlled(&s,
+        &init, c, id+1) == EINVAL && !init);
+    scalar_source_report(c, id, EINVAL, 0); release(c);
+    for (unsigned mode = 0; mode < 7; mode++) {
+        c = control(0); id = wl_evaluation_control_active_attempt_id(c);
+        CHECK(scalar_source_open(&s, r, false, c, &init) == 0 && init);
+        uint32_t width = 99, rows = 99; bool ts = true; int64_t value = -999;
+        col_rel_t *out = r;
+        int rc;
+        if (mode ==
+            0) rc = wl_columnar_relation_scalar_source_shape_attempt_controlled(
+                &s, NULL, &rows, &ts);
+        else if (mode <
+            4) rc =
+                wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                &s, mode == 1?2:0, mode == 2?NULL:&value, mode == 3?0:1);
+        else if (mode ==
+            4) rc =
+                wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+                &s, NULL, NULL, &out);
+        else if (mode ==
+            5) rc =
+                wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+                &s, "x", NULL, NULL);
+        else {
+            CHECK(wl_columnar_relation_scalar_source_end(&s, EIO) == EIO);
+            rc = wl_columnar_relation_scalar_source_shape_attempt_controlled(
+                &s, &width, &rows, &ts);
+        }
+        CHECK(rc == EINVAL && width == 99 && rows == 99 && ts && value == -999);
+        if (mode == 4)CHECK(out == NULL);
+        CHECK(wl_columnar_relation_scalar_source_end(&s,
+            rc) == (mode == 6?EIO:rc));
+        scalar_source_report(c, id, rc, 1856+(mode == 6?0:128));
+        release(c); new_like_released(r);
+    }
+    /* Typed classifier rejection retains domain priority over cancellation;
+     * positive accounting/stale errors win at the admitted classifier tail. */
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wirelog_compound_kind_t kind = r->compound_kind;
+        r->compound_kind = (wirelog_compound_kind_t)99;
+        c = control(0); id = wl_evaluation_control_active_attempt_id(c);
+        scalar_fault_mode = mode; scalar_fault_at = 976;
+        attempt_restarted = false; attempt_successor_callbacks = 0;
+        wl_columnar_relation_test_work_checkpoint = scalar_source_checkpoint;
+        int rc = scalar_source_open(&s, r, false, c, &init);
+        wl_columnar_relation_test_work_checkpoint = checkpoint;
+        CHECK(rc == (mode == 0?EINVAL:mode == 1?EOVERFLOW:EINVAL) && init);
+        r->compound_kind = kind; new_like_released(r);
+        if (attempt_restarted) {
+            CHECK(attempt_old_report.attempt_id == id
+                && attempt_old_report.consumed == 976);
+            scalar_source_report(c, wl_evaluation_control_active_attempt_id(c),
+                0, 0);
+        } else scalar_source_report(c, id, rc, 976);
+        release(c);
+    }
+    attempt_restarted = false;
+    CHECK(col_rel_destroy_checked(r) == 0);
+}
+
 int
 main(void)
 {
@@ -2468,6 +2912,21 @@ main(void)
     new_like_release_fail_stop();
     auto_private_fail_stop();
 #endif
+    const uint32_t scalar_widths[] = {0, 1, 8, 9, 17, 300};
+    for (size_t i = 0; i < sizeof(scalar_widths)/sizeof(scalar_widths[0]); i++)
+        scalar_source_prefixes(scalar_widths[i]);
+    scalar_source_reader_authority();
+    scalar_source_domains();
+    scalar_source_gather_prefixes();
+    scalar_source_seams();
+    scalar_source_like_literal();
+    for (unsigned typed = 0; typed < 2; typed++)for (unsigned ts = 0; ts < 2;
+            ts++) {
+            scalar_source_twins(0, typed != 0, ts != 0, false);
+            scalar_source_twins(17, typed != 0, ts != 0, false);
+            scalar_source_twins(17, typed != 0, ts != 0, true);
+        }
+    scalar_source_twins(300, true, true, false);
     puts("evaluation_relation_creation: OK");
     return 0;
 }

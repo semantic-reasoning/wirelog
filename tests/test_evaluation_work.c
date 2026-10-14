@@ -4985,6 +4985,381 @@ test_row_denial_precedence(void)
         }
 }
 
+/* Protected physical selected rows, including real post-return retirement. */
+static uint64_t
+selected_source_setup(wl_columnar_relation_scalar_source_t *s, col_rel_t *r,
+    bool ts, wl_evaluation_control_t *c)
+{
+    bool initialized = false;
+    CHECK(wl_columnar_relation_scalar_source_init_attempt_controlled(s,
+        &initialized, c, wl_evaluation_control_active_attempt_id(c)) == 0
+        && initialized);
+    CHECK(wl_columnar_relation_scalar_source_begin_attempt_controlled(s, r, ts)
+        == 0);
+    return 1632+224*((r->ncols+7u)/8u);
+}
+
+static void
+selected_report(wl_evaluation_control_t *c, uint64_t id, int rc, uint64_t work)
+{
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_finish(c, &owner, rc > 0?rc:0, 0) == rc);
+    CHECK(wl_evaluation_control_report(c, &report) == 0
+        && report.attempt_id == id && report.consumed == work
+        && report.result == rc);
+}
+
+static void
+selected_literal_prefixes(uint32_t width, bool ts)
+{
+    /* Independent nested B2 schedule, with real wide S reserve/commit. */
+    uint64_t fees[256]; size_t n = 0;
+    fees[n++] = 192; fees[n++] = 256;
+    if (ts)fees[n++] = 128;
+    fees[n++] = 128;
+    fees[n++] = 220; fees[n++] = 80;
+    if (width > 16) {
+        const uint64_t wide[] = {80, 74, 54, 84, 29, 74, 54, 29, 32};
+        for (size_t i = 0; i < sizeof(wide)/sizeof(wide[0]);
+            i++) fees[n++] = wide[i];
+    }
+    for (uint32_t i = 0; i < width; i++)fees[n++] = 36;
+    fees[n++] = 63; fees[n++] = 103;
+    for (unsigned pass = 0; pass < 3; pass++)
+        for (uint32_t i = 0; i < width; i++)fees[n++] = 36;
+    if (ts)for (size_t pos = 0; pos < sizeof(col_delta_timestamp_t); pos += 16)
+            fees[n++] = 183;
+    fees[n++] = 48; fees[n++] = 256;
+    if (ts)fees[n++] = 128;
+    uint64_t prefix = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t previous = prefix; prefix += fees[i];
+        for (unsigned below = 0; below < 2; below++) {
+            col_rel_t *src = relation(width, 2, 2, ts, NULL);
+            col_rel_t *dst = relation(width, 4, 0, ts, NULL);
+            if (ts) {
+                src->timestamps[1]._reserved = 77;
+                src->timestamps[1].multiplicity = -9;
+            }
+            wl_evaluation_control_t *c = control(1632+224*((width+7u)/8u)+668+
+                    prefix-below);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            wl_columnar_relation_scalar_source_t s;
+            uint64_t setup = selected_source_setup(&s, src, ts, c)+668;
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch,
+                dst, c) == 0);
+            int64_t values[17];
+            for (uint32_t col = 0; col < width;
+                col++) values[col] = src->columns[col][1];
+            int rc =
+                wl_columnar_relation_append_batch_selected_source_row_controlled
+                (
+                &batch, &s, 1, values, width);
+            int expected = !below &&
+                i+1 == n?0:WL_EVALUATION_CONTROL_WORK_LIMIT;
+            CHECK(rc == expected);
+            CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, rc)
+                == rc && batch.phase == WL_COLUMNAR_RELATION_BATCH_ENDED);
+            CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+            selected_report(c, id, rc, setup+(below?previous:prefix));
+            if (!rc) {
+                CHECK(dst->nrows == 1);
+                for (uint32_t col = 0; col < width;
+                    col++) CHECK(dst->columns[col][0] == values[col]);
+                if (ts) {
+                    col_delta_timestamp_t *a = &dst->timestamps[0];
+                    col_delta_timestamp_t *b = &src->timestamps[1];
+                    CHECK(a->iteration == b->iteration &&
+                        a->stratum == b->stratum
+                        && a->worker == b->worker &&
+                        a->_reserved == b->_reserved
+                        && a->multiplicity == b->multiplicity);
+                }
+            }
+            /* A late refusal may leave a private committed row. Discard it. */
+            released(src); released(dst); release(c); destroy(dst);
+            destroy(src);
+        }
+    }
+    CHECK(prefix ==
+        832+514+144*width+(width >
+        16?510:0)+(ts?256+183*((sizeof(col_delta_timestamp_t)+15)/16):0));
+}
+
+static unsigned selected_renewals;
+static void
+selected_renewed(wl_columnar_relation_append_batch_t *batch)
+{
+    CHECK(batch->phase == WL_COLUMNAR_RELATION_BATCH_ENDED);
+    selected_renewals++;
+}
+
+static void
+selected_twins(uint32_t width, bool preserve, bool destination_ts)
+{
+    col_rel_t *src = relation(width, 270, 270, true, NULL);
+    col_rel_t *dst = relation(width, 2, 0, destination_ts, NULL);
+    col_rel_t *raw = relation(width, 2, 0, destination_ts, NULL);
+    for (uint32_t i = 0; i < src->nrows; i++) {
+        src->timestamps[i].iteration = 100+i;
+        src->timestamps[i].stratum = 300-i;
+        src->timestamps[i].worker = i%4;
+        src->timestamps[i]._reserved = 701+i;
+        src->timestamps[i].multiplicity = i%3 == 0?0:i%3 == 1?-7:5;
+    }
+    /* A noTS wrapper may target a TS-capable destination: raw defaults stay. */
+    bool ts = preserve && destination_ts;
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_relation_scalar_source_t s;
+    selected_source_setup(&s, src, ts, c);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, dst,
+        c) == 0);
+    selected_renewals = 0;
+    wl_columnar_relation_test_batch_renewed = selected_renewed;
+    int64_t values[17]; CHECK(width <= 17);
+    uint64_t scratch_credit = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(src->memory_governor));
+    for (uint32_t row = 0; row < src->nrows; row++) {
+        CHECK(wl_columnar_relation_scalar_source_gather_attempt_controlled(&s,
+            row, values, width) == 0);
+        CHECK(wl_columnar_relation_append_batch_selected_source_row_controlled(
+                &batch, &s, row, values, width) == 0);
+        CHECK(col_rel_append_row(raw, values) == 0);
+        if (ts) {
+            raw->timestamps[row].iteration = src->timestamps[row].iteration;
+            raw->timestamps[row].stratum = src->timestamps[row].stratum;
+            raw->timestamps[row].worker = src->timestamps[row].worker;
+            raw->timestamps[row]._reserved = src->timestamps[row]._reserved;
+            raw->timestamps[row].multiplicity =
+                src->timestamps[row].multiplicity;
+        }
+    }
+    wl_columnar_relation_test_batch_renewed = NULL;
+    CHECK(selected_renewals > 0);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, 0) == 0);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, 0) == 0);
+    CHECK(dst->nrows == 270 && raw->nrows == 270);
+    payload_equal(dst, raw, 0);
+    CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(src->memory_governor)) ==
+        scratch_credit);
+    CHECK(finish(c, 0) > 0); release(c); destroy(raw); destroy(dst);
+    destroy(src);
+}
+
+static wl_evaluation_control_t *selected_capture_control;
+static wl_columnar_memory_reservation_t *selected_capture_token;
+static wl_columnar_memory_governor_t *selected_capture_governor;
+static col_rel_t *selected_capture_destination;
+static uint64_t selected_old_id, selected_old_work;
+static unsigned selected_capture_phase, selected_capture_mode,
+    selected_capture_hits;
+static unsigned selected_successor_hooks;
+static bool selected_capture_armed, selected_capture_restarted;
+static bool selected_capture_observed;
+
+static void
+selected_capture_checkpoint(wl_evaluation_control_t *c,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (selected_capture_restarted) {
+        selected_successor_hooks++; return;
+    }
+    if (selected_capture_armed &&
+        phase == WL_COLUMNAR_MEMORY_GOVERNOR_COMMIT_CUTOFF
+        && token->governor == selected_capture_governor
+        && token->bytes == 17*sizeof(int64_t)) {
+        CHECK(c == selected_capture_control && !selected_capture_observed);
+        selected_capture_token = token;
+        selected_capture_observed = true;
+    }
+}
+
+static void
+selected_capture_work(wl_evaluation_control_t *c, uint64_t work)
+{
+    if (selected_capture_restarted) {
+        selected_successor_hooks++; return;
+    }
+    checkpoint(c, work);
+}
+
+void
+wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
+    unsigned phase)
+{
+    if (!selected_capture_armed || token != selected_capture_token
+        || phase != selected_capture_phase || selected_capture_hits)return;
+    CHECK(token->identity == token && token->bytes == 17*sizeof(int64_t));
+    CHECK(token->governor == selected_capture_governor);
+    CHECK(selected_capture_destination->nrows == 1);
+    selected_capture_hits++;
+    if (selected_capture_mode == 0)
+        wl_evaluation_control_request_cancel(selected_capture_control);
+    else if (selected_capture_mode == 1)
+        CHECK(wl_evaluation_control_charge(selected_capture_control, UINT64_MAX)
+            == EOVERFLOW);
+    else {
+        CHECK(wl_evaluation_control_finish(selected_capture_control, &owner, 0,
+            0) == 0);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(selected_capture_control,
+            &report) == 0
+            && report.attempt_id == selected_old_id);
+        selected_old_work = report.consumed;
+        CHECK(wl_evaluation_control_reset(selected_capture_control) == 0);
+        CHECK(wl_evaluation_control_begin(selected_capture_control,
+            &owner) == 0);
+        CHECK(wl_evaluation_control_active_attempt_id(selected_capture_control)
+            != selected_old_id);
+        selected_capture_restarted = true;
+    }
+}
+
+static void
+selected_capture_retirement(void)
+{
+    unsigned phases[] = {WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM,
+                         WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED};
+    for (unsigned p = 0; p < 2; p++)for (unsigned mode = 0; mode < 3; mode++) {
+            col_rel_t *src = relation(17, 2, 2, true, NULL);
+            col_rel_t *dst = relation(17, 4, 0, true, NULL);
+            wl_columnar_memory_governor_t *g =
+                wl_columnar_memory_governor_ref_get(dst->memory_governor);
+            wl_columnar_memory_reservation_t peer = {0};
+            wl_columnar_memory_reservation_init(&peer);
+            CHECK(wl_columnar_memory_reserve(g, 17, &peer)
+                && wl_columnar_memory_commit(&peer, &peer));
+            uint64_t baseline = wl_columnar_memory_reserved(g);
+            wl_evaluation_control_t *c = control(0);
+            wl_columnar_relation_scalar_source_t s;
+            selected_source_setup(&s, src, true, c);
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch,
+                dst, c) == 0);
+            int64_t values[17];
+            CHECK(wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                    &s,
+                    1, values, 17) == 0);
+            selected_capture_control = c; selected_capture_destination = dst;
+            selected_capture_governor = g; selected_capture_token = NULL;
+            selected_capture_phase = phases[p]; selected_capture_mode = mode;
+            selected_capture_hits = selected_successor_hooks = 0;
+            selected_old_id = wl_evaluation_control_active_attempt_id(c);
+            selected_old_work = 0; selected_capture_restarted = false;
+            selected_capture_observed = false;
+            selected_capture_armed = true;
+            wl_columnar_memory_governor_test_checkpoint =
+                selected_capture_checkpoint;
+            wl_columnar_relation_test_work_checkpoint = selected_capture_work;
+            wl_columnar_memory_governor_test_work_checkpoint =
+                selected_capture_work;
+            int rc =
+                wl_columnar_relation_append_batch_selected_source_row_controlled
+                (
+                &batch, &s, 1, values, 17);
+            selected_capture_armed = false;
+            selected_capture_token = NULL;
+            CHECK(rc ==
+                (mode == 0?WL_EVALUATION_CONTROL_CANCELLED:mode ==
+                1?EOVERFLOW:EINVAL));
+            CHECK(selected_capture_hits == 1 && selected_capture_observed);
+            CHECK(dst->nrows == 1 && dst->timestamps[0].iteration == 0
+                && dst->timestamps[0]._reserved == 0);
+            CHECK(wl_columnar_memory_reserved(g) == baseline);
+            CHECK(selected_successor_hooks == 0);
+            CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+                rc) == rc);
+            CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+            wl_columnar_memory_governor_test_checkpoint = NULL;
+            wl_columnar_relation_test_work_checkpoint = checkpoint;
+            wl_columnar_memory_governor_test_work_checkpoint = checkpoint;
+            if (mode == 2) {
+                CHECK(selected_old_work == 8314);
+                selected_report(c, wl_evaluation_control_active_attempt_id(c),
+                    0, 0);
+            } else selected_report(c, selected_old_id, rc, 8314);
+            CHECK(wl_columnar_memory_release(&peer));
+            CHECK(wl_columnar_memory_reserved(g) == baseline-17);
+            released(src); released(dst); release(c); destroy(dst);
+            destroy(src);
+        }
+    selected_capture_restarted = false;
+}
+
+static void *
+selected_wrong_thread(void *arg)
+{
+    wl_columnar_relation_scalar_source_t *s = arg;
+    int64_t values[17] = {0};
+    CHECK(wl_columnar_relation_append_batch_selected_source_row_controlled(
+            NULL, s, 0, values, s->width) == EINVAL);
+    return NULL;
+}
+
+static void
+selected_domains(void)
+{
+    for (unsigned mode = 0; mode < 6; mode++) {
+        col_rel_t *src = relation(1, 2, 2, true, NULL);
+        col_rel_t *dst = relation(1, 4, 0, mode != 3, NULL);
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_columnar_relation_scalar_source_t s;
+        selected_source_setup(&s, src, true, c);
+        wl_columnar_relation_append_batch_t batch = {0};
+        CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, dst,
+            c) == 0);
+        int64_t value = 11;
+        wl_columnar_relation_scalar_source_t copied_source = s;
+        wl_columnar_relation_append_batch_t copied_batch = batch;
+        int rc =
+            wl_columnar_relation_append_batch_selected_source_row_controlled(
+            mode == 4?&copied_batch:&batch, mode == 5?&copied_source:&s,
+            mode == 0?2:1, mode == 1?NULL:&value, mode == 2?0:1);
+        CHECK(rc == EINVAL && dst->nrows == 0);
+        wl_thread_t thread;
+        CHECK(wl_thread_create(&thread, selected_wrong_thread, &s) == 0);
+        CHECK(wl_thread_join(&thread) == 0);
+        CHECK(s.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD
+            && batch.phase == WL_COLUMNAR_RELATION_BATCH_HELD);
+        CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+            rc) == rc);
+        CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+        selected_report(c, id, rc, 2524+(mode == 5?0:mode == 3?448:192));
+        release(c); destroy(dst); destroy(src);
+    }
+    /* Private wide capture allocation failure returns its original credit,
+     * without consuming a source reader or publishing any destination row. */
+    col_rel_t *src = relation(17, 2, 2, false, NULL);
+    col_rel_t *dst = relation(17, 4, 0, false, NULL);
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(dst->memory_governor));
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    wl_columnar_relation_scalar_source_t s;
+    selected_source_setup(&s, src, false, c);
+    wl_columnar_relation_append_batch_t batch = {0};
+    CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch, dst,
+        c) == 0);
+    int64_t values[17] = {0};
+    wl_columnar_relation_test_growth_fail_allocation = 1;
+    int rc = wl_columnar_relation_append_batch_selected_source_row_controlled(
+        &batch, &s, 1, values, 17);
+    CHECK(rc == ENOMEM &&
+        wl_columnar_relation_test_growth_fail_allocation == 0);
+    CHECK(dst->nrows == 0 && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(dst->memory_governor)) ==
+        baseline);
+    CHECK(wl_columnar_relation_append_batch_end_controlled(&batch, rc) == rc);
+    CHECK(wl_columnar_relation_scalar_source_end(&s, rc) == rc);
+    /* setup2972 + wrapper576 + B2 capture220+80+80+241+157+32 */
+    selected_report(c, id, rc, 4358);
+    release(c); destroy(dst); destroy(src);
+}
+
 int
 main(void)
 {
@@ -5085,6 +5460,20 @@ main(void)
     test_metadata_peer_and_ledger();
     test_metadata_scope();
     test_metadata_wide_table_and_advisory();
+    selected_domains();
+    selected_literal_prefixes(0, false);
+    selected_literal_prefixes(1, false);
+    selected_literal_prefixes(1, true);
+    selected_literal_prefixes(17, false);
+    selected_literal_prefixes(17, true);
+    selected_capture_retirement();
+    const uint32_t selected_widths[] = {0, 1, 17};
+    for (size_t i = 0; i < sizeof(selected_widths)/sizeof(selected_widths[0]);
+        i++) {
+        selected_twins(selected_widths[i], false, false);
+        selected_twins(selected_widths[i], false, true);
+        selected_twins(selected_widths[i], true, true);
+    }
     puts("evaluation_work: OK");
     return 0;
 }

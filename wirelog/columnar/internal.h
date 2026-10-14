@@ -3457,6 +3457,98 @@ int
 wl_columnar_relation_new_auto_attempt_controlled(
     const char *name, uint32_t ncols, col_rel_t **out,
     wl_evaluation_control_t *control, uint64_t attempt_id);
+/* Original protected scalar source, opt-in nonNULL-control only. Never copy
+ * or move an initialized live record; serialize all access and do not invoke
+ * begin/end/init reentrantly from child callbacks. Caller keeps descriptor,
+ * canonical owner, metadata and pool/arena lifetimes through end: readers
+ * prevent mutation but do not pin those allocations. Forward calls require
+ * the original native thread and live original control/immutable attempt ID.
+ * End drains actual original reader tokens independent of outer phase and
+ * does not access control. DRAINED repeat returns the first result, including
+ * zero, without accessing old control or source. Wrong live thread/copy is
+ * rejected without changing original authority; release corruption aborts. */
+typedef enum {
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_INERT,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD,
+    WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+} wl_columnar_relation_scalar_source_phase_t;
+
+typedef struct wl_columnar_relation_scalar_source {
+    struct wl_columnar_relation_scalar_source *identity;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_relation_scalar_source_phase_t phase;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    wl_columnar_source_access_reader_t descriptor_reader;
+    wl_columnar_source_access_reader_t owner_reader;
+    const col_rel_t *descriptor;
+    col_rel_t *owner;
+    const int64_t *const *columns;
+    const col_delta_timestamp_t *timestamps;
+    const char *const *names;
+    const wirelog_column_type_t *types;
+    uint32_t width, nrows, capacity, timestamp_capacity;
+    uint64_t descriptor_identity, descriptor_view_generation;
+    uint64_t descriptor_storage_generation, owner_identity;
+    uint64_t owner_storage_generation;
+    bool has_graph_column;
+    uint32_t graph_col_idx, declared_ncols;
+    bool preserve_timestamps;
+    bool first_result_saved;
+    int first_result;
+} wl_columnar_relation_scalar_source_t;
+
+/* Init requires new or proven DRAINED original storage and a disjoint live
+ * flag. Only *initialized=false is permitted before admission. Never inspect
+ * or end a refused uninitialized record. Once initialized is true, even an
+ * interrupted init has complete cleanup-safe inert fields and can be ended.
+ * INIT admission prepays the ordinary bookkeeping of one first live End;
+ * End adds no control debit and does not inspect a freed/stopped control. */
+int wl_columnar_relation_scalar_source_init_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, bool *initialized,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+int wl_columnar_relation_scalar_source_begin_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
+    bool preserve_timestamps);
+/* Disjoint exclusive scalar outputs publish only after a successful tail. */
+int wl_columnar_relation_scalar_source_shape_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, uint32_t *width,
+    uint32_t *nrows, bool *timestamped);
+/* Exact snapshot width, bounded row and nonNULL exclusive nonoverlapping
+ * values even for nullary input. Stop may leave a private gathered prefix;
+ * it must not be published. Reads descriptor columns, never source scratch. */
+int wl_columnar_relation_scalar_source_gather_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, uint32_t row,
+    int64_t *values, uint32_t width);
+/* Exclusive empty out; single outNULL bootstrap. Already-held readers protect
+ * recipe pointers; no reacquisition. Failed private local is checked-destroyed
+ * or fail-stopped, not retained by a stillNULL external/frame slot. */
+int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Original controlled HELD batch, same original control/ID, private self-owned
+ * destination distinct from descriptor/owner, matching width, stable values.
+ * Preserve selected TS fields and signed multiplicity exactly; noTS performs
+ * no source/destination timestamp element accesses in this wrapper. A later failure can leave an
+ * appended private row: drain batch and source and discard the whole output.
+ * Save local control/ID before child; first successful return action guards
+ * those locals before any record/lease/row/TS read. Reload current pointers
+ * after renewal. Caller must inspect actual ENDED authority on batch drain. */
+int wl_columnar_relation_append_batch_selected_source_row_controlled(
+    wl_columnar_relation_append_batch_t *batch,
+    wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
+    const int64_t *values, uint32_t width);
+int wl_columnar_relation_scalar_source_end(
+    wl_columnar_relation_scalar_source_t *source, int initiating_result);
+
 /* Fresh private scalar construction. Same strict non-NULL name/governor/out
 * domain as raw; NULL control delegates raw. The name remains immutable for
 * this call. Logical work counts byte scans/copies/zeroing, generated digits,

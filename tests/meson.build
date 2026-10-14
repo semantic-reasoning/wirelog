@@ -6333,14 +6333,17 @@ test('required_correctness_contract', py3,
 
 # #1821 controlled materialization, internal test hooks only.
 test_evaluation_work_exe = executable(
-  'test_evaluation_work', files('test_evaluation_work.c'),
+  'test_evaluation_work',
+  files('test_evaluation_work.c', '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
-  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
   link_with: [testlib_prod],
 )
 test('evaluation_work', test_evaluation_work_exe,
-     suite: ['unit'], timeout: 60)
+     suite: ['unit', 'tsan'], timeout: 60)
 
 # #1821: numeric expression preparation, execution and governed disposal.
 test_evaluation_numeric_exe = executable(
@@ -6362,7 +6365,7 @@ test_evaluation_relation_creation_exe = executable(
   link_with: [testlib_prod],
 )
 test('evaluation_relation_creation', test_evaluation_relation_creation_exe,
-     suite: ['unit'], timeout: 60)
+     suite: ['unit', 'tsan'], timeout: 60)
 
 # #1821 physical-row projection with original attempt and resource authority.
 test_evaluation_copy_exe = executable(
