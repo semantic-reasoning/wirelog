@@ -1230,24 +1230,48 @@ keyed joins have the separate producer described below.
 
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the
-operators after it that are row-local FILTERs, optionally ended by one
-row-local MAP.  A MAP always ends the tail.  The full join intermediate is
-therefore not materialized while the pipeline runs: each batch is filtered
-(and mapped) into one output relation, which is published only after the
-last batch and has the schema the sequential operators would publish -- the
-JOIN output's for a FILTER ending, `col0..` without types for a MAP ending.
-Operators after the tail run as before, and what reads the tail's output
-decides strict mode as described below.  The FILTERs may use only numeric
-variables, numeric and boolean literals, and comparisons.  The MAP may
-project columns or evaluate numeric expressions -- integer and float
-arithmetic and comparisons (#1777).  A MAP with a string, digest, UUID,
-aggregate or extension expression is not consumed; those have no batch
-contract yet.  A pipeline whose input goes stale mid-stream, or whose
-arrangement is unavailable, re-runs on the ordinary JOIN with reason
+operators after it that are row-local FILTERs or consumable SEMIJOIN and
+ANTIJOIN probe stages (below), optionally ended by one row-local MAP.  A MAP
+always ends the tail.  The full join intermediate is therefore not
+materialized while the pipeline runs: each batch is filtered (and mapped)
+into one output relation, which is published only after the last batch and
+has the schema the sequential operators would publish -- the JOIN output's
+for a FILTER ending, the last stage's after a probe stage, `col0..` without
+types for a MAP ending.  Operators after the tail run as before, and what
+reads the tail's output decides strict mode as described below.  The FILTERs
+may use only numeric variables, numeric and boolean literals, and
+comparisons.  The MAP may project columns or evaluate numeric expressions --
+integer and float arithmetic and comparisons (#1777).  A MAP with a string,
+digest, UUID, aggregate or extension expression is not consumed; those have
+no batch contract yet.  A pipeline whose input goes stale mid-stream, or
+whose arrangement is unavailable, re-runs on the ordinary JOIN with reason
 `pipeline-not-consumable` (`ENOTSUP` under `WIRELOG_JOIN_BATCH_STRICT=1`).
 A FILTER or MAP failure inside the pipeline returns that operator's errno --
 for MAP, `ERANGE` for a failed expression and `ENOSPC` for a denied
 admission -- and publishes no rows.
+
+The tail may also contain SEMIJOIN and ANTIJOIN probe stages (#1370).  A
+stage is consumed when it is keyed, has no right filter, is not materialized
+and reads a relation whose name does not start with `$`, and when, checked
+once per pipeline against the stage's input, that relation exists and the
+keys resolve in range with compatible types.  A stage that fails the
+run-time check ends the tail before it and runs as before.  Each consumed
+stage probes a hash set built once per pipeline, on the first batch that
+reaches the stage, from its right relation as it is when the pipeline
+starts; a change to that relation, checked whenever a batch reaches the
+stage, is reported as stale (`pipeline-not-consumable`, `ENOTSUP` under
+`WIRELOG_JOIN_BATCH_STRICT=1`).  In a governed session each set holds the
+bytes the standalone operator admits for it (`nbuckets * 4` plus `max(nrows,
+1)` next links for SEMIJOIN, `nrows + 1` for ANTIJOIN) from that first batch
+until the pipeline ends, on top of the producer and output terms below; it
+scales with the right relation, not with `WIRELOG_JOIN_BATCH_BYTES`.  A
+stage's per-batch output and row scratch, and for a parallel SEMIJOIN its
+worker contexts and offsets, are held only while that batch is in the tail.
+Setting the stages up admits at most two zero-row stage output templates at
+a time, and the last one is held until the output relation exists, after the
+producer.  Because the pipeline holds the producer, its output and the sets
+at once, a budget the sequential operators fit can deny the pipeline; a
+denied set fails it with `ENOSPC`, keeping the left input.
 
 When the pipeline does not consume a JOIN, the reason decides what is
 recorded.  These rules apply to non-differential evaluation only: the

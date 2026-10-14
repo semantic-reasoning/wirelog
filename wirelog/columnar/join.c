@@ -105,7 +105,7 @@ wl_columnar_join_effective_governor(const wl_col_session_t *sess,
                                                    : NULL);
 }
 
-static wl_columnar_memory_governor_ref_t *
+wl_columnar_memory_governor_ref_t *
 wl_columnar_join_output_governor(const wl_col_session_t *sess,
     const col_rel_t *left,
     const col_rel_t *right)

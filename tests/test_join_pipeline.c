@@ -11,6 +11,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define setenv wl_test_setenv_
+#define unsetenv wl_test_unsetenv_
+#endif
+
 static int failures;
 
 #define CHECK(condition, message) do { \
@@ -2803,6 +2821,751 @@ test_filter_tail_budget_sweep(void)
         "the FILTER tail budget sweep sees both denial and completion");
 }
 
+/* ---- SEMIJOIN/ANTIJOIN probe stages in the tail (#1370 unit a2b2) ----- */
+
+/* testlib_prod defines this under WL_TEST_JOIN_CACHE_HOOK, which this test
+ * is not compiled with. */
+extern bool wl_columnar_join_test_last_semijoin_parallel_admitted;
+
+static const char *const a3_stage_names[] = { "a", "b" };
+static const char *const a3_col3[] = { "col3" };
+static const char *const a3_col1[] = { "col1" };
+static const char *const a3_a[] = { "a" };
+
+/* sel_session plus S(a,b) = {(101,0),(200,0)} and N(a,b) = {(101,0)}. */
+static wl_col_session_t *
+a3_session(bool with_s)
+{
+    static const int64_t s_rows[] = { 101, 0, 200, 0 };
+    static const int64_t n_rows[] = { 101, 0 };
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *s = with_s
+        ? pipeline_relation("S", a3_stage_names, 2, s_rows, 2) : NULL;
+    col_rel_t *n = pipeline_relation("N", a3_stage_names, 2, n_rows, 1);
+
+    if (!sess || (with_s && (!s || session_add_rel(sess, s) != 0))) {
+        if (!sess || s)
+            col_rel_destroy(s);
+        col_rel_destroy(n);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    if (!n || session_add_rel(sess, n) != 0) {
+        col_rel_destroy(n);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static void
+a3_stage(wl_plan_op_t *op, wl_plan_op_type_t type, const char *right,
+    const char *const *left_key)
+{
+    memset(op, 0, sizeof(*op));
+    op->op = type;
+    op->right_relation = right;
+    op->left_keys = left_key;
+    op->right_keys = a3_a;
+    op->key_count = 1;
+}
+
+static uint8_t a3_true[] = { WL_PLAN_EXPR_BOOL, 1 };
+
+static void
+test_stage_grammar_preflight(void)
+{
+    enum { SEMI_S = 1, ANTI_N, SEMI_S_PROJ, SEMI_TMP, SEMI_FILTERED,
+           SEMI_NOKEY, SEMI_MAT, ANTI_NULL, F_NUM, M_PROJ, J_OP, C_OP };
+    static const uint32_t project[] = { 0, 3 };
+    static const struct {
+        int ops[4];
+        uint32_t n;
+        wl_columnar_join_pipeline_eligibility_t want;
+        uint32_t want_end;
+        const char *name;
+    } rows[] = {
+        { { SEMI_S, C_OP }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "SEMI CONCAT" },
+        { { ANTI_N, M_PROJ }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 2,
+          "ANTI MAP" },
+        { { F_NUM, SEMI_S_PROJ, ANTI_N, M_PROJ }, 4,
+          WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 4, "FILTER SEMI ANTI MAP" },
+        { { SEMI_S, J_OP }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "SEMI JOIN" },
+        /* Same as before a2b2: the FILTER is consumed, the SEMI is not. */
+        { { F_NUM, SEMI_TMP }, 2, WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE, 1,
+          "FILTER SEMI($d$S)" },
+        { { SEMI_TMP }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
+          UINT32_MAX, "SEMI($d$S)" },
+        { { SEMI_FILTERED }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
+          UINT32_MAX, "SEMI with a right filter" },
+        { { SEMI_NOKEY }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
+          UINT32_MAX, "SEMI without keys" },
+        { { SEMI_MAT }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
+          UINT32_MAX, "materialized SEMI" },
+        { { ANTI_NULL }, 1, WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE,
+          UINT32_MAX, "ANTI without a relation" },
+    };
+    wl_col_session_t sess;
+
+    memset(&sess, 0, sizeof(sess));
+    sess.join_batch_bytes = 4096;
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        wl_plan_op_t ops[5];
+        wl_plan_relation_t plan;
+        uint32_t tail_end = 0;
+        wl_columnar_join_pipeline_eligibility_t got;
+
+        memset(ops, 0, sizeof(ops));
+        memset(&plan, 0, sizeof(plan));
+        a1_join(&ops[0], "right", WL_DELTA_AUTO);
+        for (uint32_t i = 0; i < rows[r].n; i++) {
+            wl_plan_op_t *op = &ops[i + 1u];
+            switch (rows[r].ops[i]) {
+            case SEMI_S:
+            case SEMI_S_PROJ:
+            case SEMI_FILTERED:
+            case SEMI_NOKEY:
+            case SEMI_MAT:
+                a3_stage(op, WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+                if (rows[r].ops[i] == SEMI_S_PROJ) {
+                    op->project_indices = project;
+                    op->project_count = 2;
+                } else if (rows[r].ops[i] == SEMI_FILTERED) {
+                    op->right_filter_expr = (wl_plan_expr_buffer_t){
+                        a3_true, sizeof(a3_true)
+                    };
+                } else if (rows[r].ops[i] == SEMI_NOKEY) {
+                    op->key_count = 0;
+                } else if (rows[r].ops[i] == SEMI_MAT) {
+                    op->materialized = true;
+                }
+                break;
+            case SEMI_TMP:
+                a3_stage(op, WL_PLAN_OP_SEMIJOIN, "$d$S", a3_col3);
+                break;
+            case ANTI_N:
+                a3_stage(op, WL_PLAN_OP_ANTIJOIN, "N", a3_col3);
+                break;
+            case ANTI_NULL:
+                a3_stage(op, WL_PLAN_OP_ANTIJOIN, NULL, a3_col3);
+                break;
+            case F_NUM:
+                op->op = WL_PLAN_OP_FILTER;
+                op->filter_expr = (wl_plan_expr_buffer_t){ a3_true,
+                                                           sizeof(a3_true) };
+                break;
+            case M_PROJ:
+                op->op = WL_PLAN_OP_MAP;
+                op->project_indices = project;
+                op->project_count = 2;
+                break;
+            case J_OP:
+                a1_join(op, "right", WL_DELTA_AUTO);
+                break;
+            default:
+                op->op = WL_PLAN_OP_CONCAT;
+                break;
+            }
+        }
+        plan.ops = ops;
+        plan.op_count = rows[r].n + 1u;
+        got = wl_columnar_join_pipeline_preflight(&plan, 0, &sess,
+                &tail_end);
+        if (got != rows[r].want || tail_end != rows[r].want_end)
+            fprintf(stderr, "  JOIN %s: verdict %d end %u, want %d end %u\n",
+                rows[r].name, (int)got, tail_end, (int)rows[r].want,
+                rows[r].want_end);
+        CHECK(got == rows[r].want && tail_end == rows[r].want_end,
+            "a consumable SEMIJOIN/ANTIJOIN stage extends the tail");
+    }
+}
+
+typedef enum {
+    A3_SEMI_CONCAT,     /* JOIN -> SEMI(S) -> CONCAT */
+    A3_ANTI_MAP,        /* JOIN -> ANTI(N) -> MAP[0,3] */
+    A3_CHAIN,           /* JOIN -> FILTER -> SEMI(S,[0,3]) -> ANTI(N,col1) */
+    A3_FILTER_AFTER,    /* JOIN -> SEMI(S) -> FILTER(true) */
+    A3_SEMI_PROJ_END,   /* JOIN -> SEMI(S,[0,3]) */
+    A3_ANTI_END,        /* JOIN -> ANTI(N) */
+} a3_shape_t;
+
+typedef struct {
+    wl_plan_op_t ops[5];
+    wl_plan_relation_t plan;
+    uint32_t stages;
+} a3_plan_t;
+
+static void
+a3_plan_init(a3_plan_t *p, a3_shape_t shape)
+{
+    static const uint32_t project[] = { 0, 3 };
+    uint32_t n = 0;
+
+    memset(p, 0, sizeof(*p));
+    a1_join(&p->ops[n++], "right", WL_DELTA_AUTO);
+    switch (shape) {
+    case A3_SEMI_CONCAT:
+        a3_stage(&p->ops[n++], WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+        p->ops[n++].op = WL_PLAN_OP_CONCAT;
+        p->stages = 1;
+        break;
+    case A3_ANTI_MAP:
+        a3_stage(&p->ops[n++], WL_PLAN_OP_ANTIJOIN, "N", a3_col3);
+        p->ops[n].op = WL_PLAN_OP_MAP;
+        p->ops[n].project_indices = project;
+        p->ops[n++].project_count = 2;
+        p->stages = 1;
+        break;
+    case A3_CHAIN:
+        p->ops[n].op = WL_PLAN_OP_FILTER;
+        p->ops[n++].filter_expr = (wl_plan_expr_buffer_t){ a3_true,
+                                                           sizeof(a3_true) };
+        a3_stage(&p->ops[n], WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+        p->ops[n].project_indices = project;
+        p->ops[n++].project_count = 2;
+        a3_stage(&p->ops[n++], WL_PLAN_OP_ANTIJOIN, "N", a3_col1);
+        p->stages = 2;
+        break;
+    case A3_FILTER_AFTER:
+        a3_stage(&p->ops[n++], WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+        p->ops[n].op = WL_PLAN_OP_FILTER;
+        p->ops[n++].filter_expr = (wl_plan_expr_buffer_t){ a3_true,
+                                                           sizeof(a3_true) };
+        p->stages = 1;
+        break;
+    case A3_SEMI_PROJ_END:
+        a3_stage(&p->ops[n], WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+        p->ops[n].project_indices = project;
+        p->ops[n++].project_count = 2;
+        p->stages = 1;
+        break;
+    default:
+        a3_stage(&p->ops[n++], WL_PLAN_OP_ANTIJOIN, "N", a3_col3);
+        p->stages = 1;
+        break;
+    }
+    p->plan.ops = p->ops;
+    p->plan.op_count = n;
+}
+
+static void
+test_probe_stage_pipeline_matches_oracle(void)
+{
+    static const int64_t want_semi[] = { 0, 10, 0, 101, 1, 20, 1, 200 };
+    static const int64_t want_anti[] = { 0, 100, 1, 200, 1, 201 };
+    static const int64_t want_chain[] = { 1, 200 };
+    static const struct {
+        a3_shape_t shape;
+        uint32_t ncols;
+        const int64_t *want;
+        uint32_t nwant;
+        const char *name;
+    } cases[] = {
+        { A3_SEMI_CONCAT, 4, want_semi, 2, "JOIN SEMI CONCAT" },
+        { A3_ANTI_MAP, 2, want_anti, 3, "JOIN ANTI MAP" },
+        { A3_CHAIN, 2, want_chain, 1, "JOIN FILTER SEMI ANTI" },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        for (int knob = 0; knob < 2; knob++) {
+            for (int strict = 0; strict < 2; strict++) {
+                a3_plan_t p;
+                a1_run_t run;
+                uint32_t builds;
+                uint32_t emits;
+                wl_col_session_t *sess = a3_session(true);
+
+                CHECK(sess != NULL, "probe stage fixture");
+                if (!sess)
+                    continue;
+                a3_plan_init(&p, cases[c].shape);
+                sess->join_batch_strict = strict != 0;
+                builds = wl_columnar_join_test_probe_set_build_calls;
+                emits = wl_columnar_join_test_probe_emits;
+                run = a1_eval(sess, &p.plan, knob ? SEL_BATCH_BYTES : 0,
+                        cases[c].shape == A3_SEMI_CONCAT
+                        ? a1_empty("base", 4) : NULL, NULL);
+                builds = wl_columnar_join_test_probe_set_build_calls - builds;
+                emits = wl_columnar_join_test_probe_emits - emits;
+                if (!a1_rows_are(&run, cases[c].ncols, cases[c].want,
+                    cases[c].nwant)
+                    || (knob && (builds != p.stages
+                    || emits != 2u * p.stages))
+                    || sess->join_batch_fallback_count != 0) {
+                    a1_report(cases[c].name, &run);
+                    fprintf(stderr, "  knob=%d strict=%d builds=%u emits=%u "
+                        "fallbacks=%u\n", knob, strict, builds, emits,
+                        sess->join_batch_fallback_count);
+                }
+                CHECK(a1_rows_are(&run, cases[c].ncols, cases[c].want,
+                    cases[c].nwant),
+                    "a probe-stage tail returns the oracle rows");
+                CHECK(!knob || (builds == p.stages
+                    && emits == 2u * p.stages),
+                    "each stage builds its set once and probes every batch");
+                CHECK(sess->join_batch_fallback_count == 0,
+                    "a probe-stage tail feeding a relation sink records "
+                    "nothing");
+                pipeline_session_destroy(sess);
+            }
+        }
+    }
+
+    /* Two rows per worker over two workers inside one batch take the
+     * parallel SEMIJOIN path, which a governed session reports. */
+    {
+        a3_plan_t p;
+        a1_run_t run;
+        wl_columnar_memory_governor_ref_t *governor = a1_governor(1u << 20);
+        wl_col_session_t *sess = governor ? a3_session(true) : NULL;
+        int env_rc = setenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS", "1", 1);
+
+        CHECK(sess && env_rc == 0, "parallel probe stage fixture");
+        if (sess && env_rc == 0) {
+            sess->memory_governor = governor;
+            sess->num_workers = 2;
+            a3_plan_init(&p, A3_SEMI_CONCAT);
+            wl_columnar_join_test_last_semijoin_parallel_admitted = false;
+            run = a1_eval(sess, &p.plan, 4u * 32u, a1_empty("base", 4),
+                    NULL);
+            CHECK(a1_rows_are(&run, 4, want_semi, 2)
+                && wl_columnar_join_test_last_semijoin_parallel_admitted,
+                "a parallel SEMIJOIN stage returns the oracle rows");
+        }
+        (void)unsetenv("WIRELOG_JOIN_PAR_MIN_LEFT_ROWS");
+        a1_fanout_session_destroy(sess);
+        if (governor)
+            wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+/* Evaluate @shape and record the published relation's schema. */
+static int
+a3_stage_output(a3_shape_t shape, uint32_t batch_bytes, bool timestamped,
+    a2_schema_t *schema)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    a3_plan_t p;
+    eval_stack_t stack;
+    wl_col_session_t *sess = a3_session(true);
+    col_rel_t *left = pipeline_relation("left", left_names, 2, left_rows, 2);
+    int rc = ENOMEM;
+
+    memset(schema, 0, sizeof(*schema));
+    eval_stack_init(&stack);
+    if (sess && left)
+        rc = timestamped ? col_rel_enable_timestamps(left) : 0;
+    if (rc == 0)
+        rc = eval_stack_push_delta(&stack, left, true, false);
+    if (rc != 0) {
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return rc;
+    }
+    a3_plan_init(&p, shape);
+    sess->join_batch_bytes = batch_bytes;
+    rc = col_eval_relation_plan(&p.plan, &stack, sess);
+    if (rc == 0 && stack.top == 1 && stack.items[0].rel
+        && stack.items[0].rel->ncols <= A2_SCHEMA_COLS) {
+        const col_rel_t *out = stack.items[0].rel;
+        schema->ncols = out->ncols;
+        schema->timestamps = out->timestamps != NULL;
+        schema->typed = out->column_types != NULL;
+        for (uint32_t c = 0; c < out->ncols; c++) {
+            if (out->col_names && out->col_names[c])
+                snprintf(schema->names[c], sizeof(schema->names[c]), "%s",
+                    out->col_names[c]);
+            if (out->column_types)
+                schema->types[c] = out->column_types[c];
+        }
+    } else if (rc == 0) {
+        rc = EINVAL;
+    }
+    (void)eval_stack_drain(&stack);
+    pipeline_session_destroy(sess);
+    return rc;
+}
+
+static void
+test_stage_output_parity(void)
+{
+    static const a3_shape_t shapes[] = {
+        A3_SEMI_PROJ_END, A3_ANTI_END, A3_FILTER_AFTER,
+    };
+
+    for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+        for (int ts = 0; ts < 2; ts++) {
+            a2_schema_t off;
+            a2_schema_t on;
+            int off_rc = a3_stage_output(shapes[s], 0, ts != 0, &off);
+            uint32_t emits = wl_columnar_join_test_probe_emits;
+            int on_rc = a3_stage_output(shapes[s], SEL_BATCH_BYTES, ts != 0,
+                    &on);
+
+            emits = wl_columnar_join_test_probe_emits - emits;
+            if (off_rc != 0 || on_rc != 0 || !a2_same_schema(&off, &on)
+                || emits < 2)
+                fprintf(stderr, "  stage parity %zu ts=%d: rc %d/%d "
+                    "ncols %u/%u emits=%u\n", s, ts, off_rc, on_rc,
+                    off.ncols, on.ncols, emits);
+            CHECK(off_rc == 0 && on_rc == 0 && a2_same_schema(&off, &on),
+                "a probe-stage tail publishes the sequential schema");
+            CHECK(emits >= 2, "the parity run consumed the probe stage");
+        }
+    }
+}
+
+static void
+test_probe_stage_runtime_truncation(void)
+{
+    static const int64_t all_rows[] = {
+        0, 10, 0, 100, 0, 10, 0, 101, 1, 20, 1, 200, 1, 20, 1, 201,
+    };
+
+    for (int with_filter = 0; with_filter < 2; with_filter++) {
+        for (int strict = 0; strict < 2; strict++) {
+            wl_plan_op_t ops[4];
+            wl_plan_relation_t plan;
+            a1_run_t run;
+            uint32_t n = 0;
+            uint32_t builds = wl_columnar_join_test_probe_set_build_calls;
+            /* No S: the stage cannot be consumed at run time. */
+            wl_col_session_t *sess = a3_session(false);
+
+            CHECK(sess != NULL, "truncation fixture");
+            if (!sess)
+                continue;
+            memset(ops, 0, sizeof(ops));
+            memset(&plan, 0, sizeof(plan));
+            a1_join(&ops[n++], "right", WL_DELTA_AUTO);
+            if (with_filter) {
+                ops[n].op = WL_PLAN_OP_FILTER;
+                ops[n++].filter_expr = (wl_plan_expr_buffer_t){
+                    a3_true, sizeof(a3_true)
+                };
+            }
+            a3_stage(&ops[n++], WL_PLAN_OP_SEMIJOIN, "S", a3_col3);
+            ops[n++].op = WL_PLAN_OP_CONCAT;
+            plan.ops = ops;
+            plan.op_count = n;
+            sess->join_batch_strict = strict != 0;
+            run = a1_eval(sess, &plan, SEL_BATCH_BYTES, a1_empty("base", 4),
+                    NULL);
+            builds = wl_columnar_join_test_probe_set_build_calls - builds;
+            if (!strict) {
+                /* A missing right keeps every row, as the standalone
+                 * SEMIJOIN does. */
+                CHECK(a1_rows_are(&run, 4, all_rows, 4) && builds == 0,
+                    "a stage over a missing relation is left to the "
+                    "standalone SEMIJOIN");
+                CHECK(sess->join_batch_fallback_count
+                    == (with_filter ? 0u : 1u),
+                    "a truncated tail records what its successor decides");
+            } else {
+                CHECK(run.rc == ENOTSUP && run.left_kept,
+                    "strict mode refuses a tail whose output the truncated "
+                    "stage reads");
+            }
+            pipeline_session_destroy(sess);
+        }
+    }
+}
+
+static col_rel_t *a3_touch_target;
+static bool a3_touch_storage;
+static uint32_t a3_emit_calls;
+
+static void
+a3_touch_on_first_emit(const col_rel_t *left)
+{
+    (void)left;
+    if (a3_emit_calls++ == 0 && a3_touch_target) {
+        if (a3_touch_storage)
+            wl_columnar_relation_touch_storage(a3_touch_target);
+        else
+            wl_columnar_relation_touch_view(a3_touch_target);
+    }
+}
+
+static void
+test_probe_stage_staleness(void)
+{
+    static const int64_t want_semi[] = { 0, 10, 0, 101, 1, 20, 1, 200 };
+
+    for (int storage = 0; storage < 2; storage++) {
+        for (int strict = 0; strict < 2; strict++) {
+            a3_plan_t p;
+            a1_run_t run;
+            uint32_t builds = wl_columnar_join_test_probe_set_build_calls;
+            uint32_t emits = wl_columnar_join_test_probe_emits;
+            wl_col_session_t *sess = a3_session(true);
+
+            CHECK(sess != NULL, "staleness fixture");
+            if (!sess)
+                continue;
+            a3_plan_init(&p, A3_SEMI_CONCAT);
+            sess->join_batch_strict = strict != 0;
+            a3_touch_target = session_find_rel(sess, "S");
+            a3_touch_storage = storage != 0;
+            a3_emit_calls = 0;
+            wl_columnar_join_test_before_probe_emit = a3_touch_on_first_emit;
+            run = a1_eval(sess, &p.plan, SEL_BATCH_BYTES, a1_empty("base", 4),
+                    NULL);
+            wl_columnar_join_test_before_probe_emit = NULL;
+            a3_touch_target = NULL;
+            builds = wl_columnar_join_test_probe_set_build_calls - builds;
+            emits = wl_columnar_join_test_probe_emits - emits;
+            if (!strict) {
+                if (!a1_rows_are(&run, 4, want_semi, 2) || builds != 2
+                    || emits != 2 || sess->join_batch_fallback_count != 1)
+                    fprintf(stderr, "  stale storage=%d: rc=%d builds=%u "
+                        "emits=%u fallbacks=%u\n", storage, run.rc, builds,
+                        emits, sess->join_batch_fallback_count);
+                CHECK(a1_rows_are(&run, 4, want_semi, 2) && builds == 2
+                    && emits == 2,
+                    "a stage right changed mid-pipeline re-runs on the "
+                    "ordinary path");
+                CHECK(sess->join_batch_fallback_count == 1
+                    && sess->join_batch_last_reason
+                    == COL_JOIN_BATCH_EXCLUDED_PIPELINE,
+                    "a stale stage right records pipeline-not-consumable");
+            } else {
+                CHECK(run.rc == ENOTSUP && run.left_kept,
+                    "strict mode refuses a stale stage right");
+            }
+            pipeline_session_destroy(sess);
+        }
+    }
+}
+
+/* S grows by 300 rows so that the probe set dominates the budget. */
+static wl_col_session_t *
+a3_big_s_session(wl_columnar_memory_governor_ref_t *governor)
+{
+    wl_col_session_t *sess = a3_session(true);
+    col_rel_t *s = sess ? session_find_rel(sess, "S") : NULL;
+
+    for (int64_t k = 1000; s && k < 1300; k++) {
+        int64_t row[] = { k, 0 };
+        if (col_rel_append_row(s, row) != 0) {
+            pipeline_session_destroy(sess);
+            return NULL;
+        }
+    }
+    if (!s) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    sess->memory_governor = governor;
+    return sess;
+}
+
+static void
+test_probe_set_denial_keeps_left(void)
+{
+    a3_plan_t p;
+    a1_run_t run;
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(1u << 20);
+    wl_col_session_t *sess = governor ? a3_big_s_session(governor) : NULL;
+    uint64_t at_entry = 0;
+    uint64_t admitted = 0;
+    uint32_t builds;
+    uint32_t denials;
+    uint32_t emits;
+
+    CHECK(sess != NULL, "probe-set denial calibration fixture");
+    if (!sess) {
+        if (governor)
+            wl_columnar_memory_governor_ref_release(governor);
+        return;
+    }
+    /* Calibrate: the reserved bytes when the set is built, and its size. */
+    a3_plan_init(&p, A3_SEMI_CONCAT);
+    run = a1_eval(sess, &p.plan, SEL_BATCH_BYTES, a1_empty("base", 4), NULL);
+    at_entry = wl_columnar_join_test_probe_set_reserved_at_entry;
+    admitted = wl_columnar_join_test_probe_set_admitted_bytes;
+    CHECK(run.rc == 0 && admitted > 0, "probe-set denial calibration");
+    {
+        /* A SEMIJOIN stage sizes its set as the standalone SEMIJOIN does. */
+        col_rel_t *s = session_find_rel(sess, "S");
+        uint64_t want = 0;
+        CHECK(s && wl_columnar_join_probe_set_bytes(s->nrows,
+            WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS, &want) == 0
+            && admitted == want,
+            "a SEMIJOIN stage admits the SEMIJOIN probe-set size");
+    }
+    a1_fanout_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(governor);
+    if (run.rc != 0 || admitted == 0)
+        return;
+
+    governor = a1_governor(at_entry + admitted - 1u);
+    sess = governor ? a3_big_s_session(governor) : NULL;
+    CHECK(sess != NULL, "probe-set denial fixture");
+    if (!sess) {
+        if (governor)
+            wl_columnar_memory_governor_ref_release(governor);
+        return;
+    }
+    builds = wl_columnar_join_test_probe_set_build_calls;
+    denials = wl_columnar_join_test_probe_set_build_denials;
+    emits = wl_columnar_join_test_probe_emits;
+    run = a1_eval(sess, &p.plan, SEL_BATCH_BYTES, a1_empty("base", 4), NULL);
+    builds = wl_columnar_join_test_probe_set_build_calls - builds;
+    denials = wl_columnar_join_test_probe_set_build_denials - denials;
+    emits = wl_columnar_join_test_probe_emits - emits;
+    if (run.rc != ENOSPC || !run.left_kept || builds != 1 || denials != 1
+        || emits != 0)
+        fprintf(stderr, "  probe-set denial: rc=%d top=%u kept=%d builds=%u "
+            "denials=%u emits=%u\n", run.rc, run.stack_top,
+            (int)run.left_kept, builds, denials, emits);
+    CHECK(run.rc == ENOSPC && run.left_kept && builds == 1 && denials == 1
+        && emits == 0,
+        "a denied probe set fails the pipeline with the left input kept");
+    CHECK(a1_reserved(governor) == 0,
+        "a denied probe set leaves nothing reserved");
+    a1_fanout_session_destroy(sess);
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_emit_rejects_set_for_other_keys(void)
+{
+    static const wl_plan_op_type_t types[] = {
+        WL_PLAN_OP_SEMIJOIN, WL_PLAN_OP_ANTIJOIN,
+    };
+    wl_col_session_t *sess = a3_session(true);
+    col_rel_t *s = sess ? session_find_rel(sess, "S") : NULL;
+    col_rel_t *probe = s ? col_rel_new_auto("probe", 2) : NULL;
+    const uint32_t key0[] = { 0 };
+    const uint32_t key1[] = { 1 };
+    const uint32_t key01[] = { 0, 1 };
+    wl_columnar_join_probe_set_t set;
+
+    memset(&set, 0, sizeof(set));
+    CHECK(probe && wl_columnar_join_probe_set_build(sess, NULL, s, key0, 1,
+        WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS, &set) == 0,
+        "other-keys emit fixture");
+    for (size_t t = 0; probe && set.built && t < 2; t++) {
+        wl_plan_op_t op;
+        col_rel_t *out = NULL;
+        int rc_key;
+        int rc_count;
+
+        memset(&op, 0, sizeof(op));
+        op.op = types[t];
+        op.key_count = 1;
+        rc_key = t == 0
+            ? wl_columnar_semijoin_emit(&op, sess, probe, s, key0, key1,
+                &set, &out)
+            : wl_columnar_antijoin_emit(&op, sess, probe, s, key0, key1,
+                &set, &out);
+        CHECK(rc_key == EINVAL && out == NULL && set.built,
+            "an emit refuses a set built over another key column");
+        op.key_count = 2;
+        rc_count = t == 0
+            ? wl_columnar_semijoin_emit(&op, sess, probe, s, key01, key01,
+                &set, &out)
+            : wl_columnar_antijoin_emit(&op, sess, probe, s, key01, key01,
+                &set, &out);
+        CHECK(rc_count == EINVAL && out == NULL && set.built,
+            "an emit refuses a set built over another key count");
+    }
+    wl_columnar_join_probe_set_release(&set);
+    col_rel_destroy(probe);
+    pipeline_session_destroy(sess);
+}
+
+typedef struct {
+    uint32_t stage_joins;
+    uint32_t mismatches;
+} a3_census_t;
+
+static bool
+a3_stage_static_ok(const wl_plan_op_t *op)
+{
+    return op->key_count > 0 && op->right_filter_expr.size == 0
+           && !op->materialized && op->right_relation
+           && op->right_relation[0] != '$';
+}
+
+static void
+a3_census_ops(const wl_plan_op_t *ops, uint32_t n, void *context)
+{
+    a3_census_t *census = (a3_census_t *)context;
+    wl_col_session_t sess;
+
+    memset(&sess, 0, sizeof(sess));
+    sess.join_batch_bytes = 4096;
+    for (uint32_t i = 0; i + 1u < n; i++) {
+        const wl_plan_op_t *join = &ops[i];
+        const wl_plan_op_t *next = &ops[i + 1u];
+        wl_plan_relation_t slice;
+        wl_columnar_join_pipeline_eligibility_t got;
+        bool want;
+
+        if (join->op != WL_PLAN_OP_JOIN || join->key_count == 0
+            || join->right_filter_expr.size != 0 || join->materialized
+            || (next->op != WL_PLAN_OP_SEMIJOIN
+            && next->op != WL_PLAN_OP_ANTIJOIN))
+            continue;
+        census->stage_joins++;
+        memset(&slice, 0, sizeof(slice));
+        slice.ops = ops;
+        slice.op_count = i + 2u;
+        got = wl_columnar_join_pipeline_preflight(&slice, i, &sess, NULL);
+        want = a3_stage_static_ok(next);
+        if ((got == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE) != want)
+            census->mismatches++;
+    }
+}
+
+static void
+test_stage_census(void)
+{
+    static const char sip[] =
+        ".decl a(x: int32, y: int32)\n"
+        ".decl b(y: int32, z: int32)\n"
+        ".decl c(z: int32, w: int32)\n"
+        ".decl r(x: int32, w: int32)\n"
+        "r(x, w) :- a(x, y), b(y, z), c(z, w).\n";
+    static const char negated[] =
+        ".decl e(x: int32, y: int32)\n"
+        ".decl f(y: int32, z: int32)\n"
+        ".decl g(z: int32)\n"
+        ".decl r(x: int32, z: int32)\n"
+        "r(x, z) :- e(x, y), f(y, z), !g(z).\n";
+    const char *const programs[] = { sip, negated };
+    a3_census_t census;
+
+    memset(&census, 0, sizeof(census));
+    for (size_t p = 0; p < sizeof(programs) / sizeof(programs[0]); p++) {
+        wirelog_error_t error = WIRELOG_OK;
+        wirelog_program_t *program = wirelog_parse_string(programs[p],
+                &error);
+        wl_plan_t *plan = NULL;
+        bool ok = program && wirelog_optimize(program, &error)
+            && wl_plan_from_program(program, &plan) == 0 && plan;
+
+        CHECK(ok, "stage census program lowers");
+        if (ok)
+            a1_walk_plan(plan, a3_census_ops, &census);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+    if (census.stage_joins == 0 || census.mismatches != 0)
+        fprintf(stderr, "  stage census: joins=%u mismatches=%u\n",
+            census.stage_joins, census.mismatches);
+    CHECK(census.stage_joins > 0,
+        "the census lowers at least one JOIN followed by a probe stage");
+    CHECK(census.mismatches == 0,
+        "a lowered JOIN followed by a probe stage is eligible exactly when "
+        "the stage is statically consumable");
+}
+
 int
 main(void)
 {
@@ -2832,6 +3595,14 @@ main(void)
     test_map_ends_the_tail_before_a_filter();
     test_filter_tail_output_parity();
     test_filter_tail_budget_sweep();
+    test_stage_grammar_preflight();
+    test_probe_stage_pipeline_matches_oracle();
+    test_stage_output_parity();
+    test_probe_stage_runtime_truncation();
+    test_probe_stage_staleness();
+    test_probe_set_denial_keeps_left();
+    test_emit_rejects_set_for_other_keys();
+    test_stage_census();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);

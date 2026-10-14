@@ -2910,6 +2910,11 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
 bool
 col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
     const col_rel_t *right, const uint32_t *rk, uint32_t key_count);
+/* The governor a JOIN-family operator charges for its output and scratch:
+ * the session's, else @left's, else @right's. */
+wl_columnar_memory_governor_ref_t *
+wl_columnar_join_output_governor(const wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right);
 /* Hash probe set over a right relation's key columns, shared by SEMIJOIN,
  * ANTIJOIN and the join pipeline.  The two operators size the next links
  * differently, and both sizes are part of their admitted footprint. */

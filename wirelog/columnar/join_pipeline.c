@@ -119,6 +119,18 @@ wl_columnar_join_pipeline_map_is_consumable(const wl_plan_op_t *map)
     return true;
 }
 
+/* Whether @op is a SEMIJOIN/ANTIJOIN probe stage the pipeline can apply
+ * per batch, judged from the plan alone: keyed, no right filter, not
+ * materialized, and reading a named relation that is not an evaluator
+ * temporary ("$" prefix: $d$, $r$ and the like). */
+static bool
+wl_columnar_join_pipeline_stage_is_consumable(const wl_plan_op_t *op)
+{
+    return op->key_count > 0 && op->right_filter_expr.size == 0
+           && !op->materialized && op->right_relation
+           && op->right_relation[0] != '$';
+}
+
 wl_columnar_join_pipeline_eligibility_t
 wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
     uint32_t join_index, const wl_col_session_t *sess, uint32_t *tail_end)
@@ -151,6 +163,12 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
             if (op->materialized
                 || !wl_columnar_join_pipeline_expr_is_row_local(
                     &op->filter_expr, false))
+                break;
+            i++;
+            continue;
+        }
+        if (op->op == WL_PLAN_OP_SEMIJOIN || op->op == WL_PLAN_OP_ANTIJOIN) {
+            if (!wl_columnar_join_pipeline_stage_is_consumable(op))
                 break;
             i++;
             continue;
@@ -190,11 +208,39 @@ wl_columnar_join_pipeline_eligibility_name(
     }
 }
 
+/* A SEMIJOIN/ANTIJOIN stage: its right relation as found at setup, the
+ * key columns resolved against the stage input, and the probe set, built
+ * on the first batch that reaches the stage. */
+typedef struct {
+    bool active;
+    col_rel_t *right;
+    uint32_t *lk;
+    uint32_t *rk;
+    uint64_t identity;
+    uint64_t view_generation;
+    uint64_t storage_generation;
+    wl_columnar_join_probe_set_t set;
+} wl_join_pipeline_stage_t;
+
+static void
+pipeline_stages_release(wl_join_pipeline_stage_t *stages, uint32_t count)
+{
+    if (!stages)
+        return;
+    for (uint32_t i = 0; i < count; i++) {
+        wl_columnar_join_probe_set_release(&stages[i].set);
+        free(stages[i].lk);
+        free(stages[i].rk);
+    }
+    free(stages);
+}
+
 typedef struct {
     wl_col_session_t *sess;
     const wl_plan_relation_t *plan;
     uint32_t first_tail;
     uint32_t tail_end;
+    wl_join_pipeline_stage_t *stages; /* indexed by op - first_tail */
     col_rel_t *out;
     uint32_t pending_begin;
     int error; /* errno of a failed FILTER/MAP, reported unchanged */
@@ -244,6 +290,51 @@ wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows)
 }
 #endif
 
+/* Apply one probe stage to the batch on top of @batch_stack.  EAGAIN when
+ * the stage's right relation changed since setup. */
+static int
+pipeline_apply_stage(wl_join_pipeline_sink_t *sink, const wl_plan_op_t *op,
+    wl_join_pipeline_stage_t *stage, eval_stack_t *batch_stack)
+{
+    eval_entry_t input;
+    col_rel_t *output = NULL;
+    int rc;
+
+    if (stage->right->relation_identity != stage->identity
+        || stage->right->view_generation != stage->view_generation
+        || stage->right->storage_generation != stage->storage_generation
+        || stage->view_generation == UINT64_MAX
+        || stage->storage_generation == UINT64_MAX)
+        return EAGAIN;
+    rc = eval_stack_pop_relation(batch_stack, &input);
+    if (rc != 0)
+        return rc;
+    if (!stage->set.built) {
+        rc = wl_columnar_join_probe_set_build(sink->sess,
+                wl_columnar_join_output_governor(sink->sess, input.rel,
+                stage->right), stage->right, stage->rk, op->key_count,
+                op->op == WL_PLAN_OP_SEMIJOIN
+                ? WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS
+                : WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE, &stage->set);
+        if (rc != 0) {
+            (void)eval_entry_dispose(&input);
+            return rc;
+        }
+    }
+    rc = op->op == WL_PLAN_OP_SEMIJOIN
+        ? wl_columnar_semijoin_emit(op, sink->sess, input.rel, stage->right,
+            stage->lk, stage->rk, &stage->set, &output)
+        : wl_columnar_antijoin_emit(op, sink->sess, input.rel, stage->right,
+            stage->lk, stage->rk, &stage->set, &output);
+    (void)eval_entry_dispose(&input);
+    if (rc != 0)
+        return rc;
+    rc = eval_stack_push(batch_stack, output, true);
+    if (rc != 0)
+        col_rel_destroy(output);
+    return rc;
+}
+
 static wl_columnar_continuation_status_t
 pipeline_sink_append(void *context,
     const wl_columnar_continuation_batch_t *batch)
@@ -264,9 +355,13 @@ pipeline_sink_append(void *context,
     }
     for (uint32_t i = sink->first_tail; i <= sink->tail_end; i++) {
         const wl_plan_op_t *op = &sink->plan->ops[i];
-        rc = op->op == WL_PLAN_OP_MAP
-            ? col_op_map(op, &batch_stack, sink->sess)
-            : wl_columnar_filter_op(op, &batch_stack, sink->sess);
+        if (op->op == WL_PLAN_OP_SEMIJOIN || op->op == WL_PLAN_OP_ANTIJOIN)
+            rc = pipeline_apply_stage(sink, op,
+                    &sink->stages[i - sink->first_tail], &batch_stack);
+        else
+            rc = op->op == WL_PLAN_OP_MAP
+                ? col_op_map(op, &batch_stack, sink->sess)
+                : wl_columnar_filter_op(op, &batch_stack, sink->sess);
         if (rc != 0) {
             (void)eval_stack_drain(&batch_stack);
             sink->error = rc;
@@ -395,6 +490,113 @@ wl_columnar_join_pipeline_successor(const wl_plan_relation_t *plan,
     return WL_COLUMNAR_JOIN_SUCCESSOR_RELATION_SINK;
 }
 
+/* Walk the statically consumable tail and set up its probe stages.  A
+ * stage whose right relation is missing, or whose keys do not resolve in
+ * range with compatible types against the stage input, ends the tail
+ * before it (*@tail_end is lowered).  On success with at least one stage,
+ * *@stages holds one slot per tail operator and *@final_template the
+ * schema of the last stage's output; both are NULL when the tail has no
+ * stage.  Errors are the output constructors' or ENOMEM. */
+static int
+pipeline_setup_stages(const wl_plan_relation_t *plan, uint32_t join_index,
+    uint32_t *tail_end, wl_col_session_t *sess, const col_rel_t *left,
+    const col_rel_t *right, const wl_plan_op_t *join,
+    wl_join_pipeline_stage_t **stages_out, col_rel_t **final_template)
+{
+    wl_join_pipeline_stage_t *stages;
+    col_rel_t *tpl = NULL;
+    uint32_t count = *tail_end - join_index;
+    bool any = false;
+    int rc;
+
+    *stages_out = NULL;
+    *final_template = NULL;
+    for (uint32_t i = join_index + 1u; i <= *tail_end; i++) {
+        if (plan->ops[i].op == WL_PLAN_OP_SEMIJOIN
+            || plan->ops[i].op == WL_PLAN_OP_ANTIJOIN)
+            any = true;
+    }
+    if (!any)
+        return 0;
+    stages = (wl_join_pipeline_stage_t *)calloc(count, sizeof(*stages));
+    if (!stages)
+        return ENOMEM;
+    tpl = col_rel_new_auto("$join_pipeline_shape",
+            col_join_output_width(left, right, join));
+    rc = tpl ? col_join_set_output_types(tpl, left, right, join) : ENOMEM;
+    if (rc != 0) {
+        col_rel_destroy(tpl);
+        free(stages);
+        return rc;
+    }
+    for (uint32_t i = join_index + 1u; i <= *tail_end; i++) {
+        const wl_plan_op_t *op = &plan->ops[i];
+        wl_join_pipeline_stage_t *stage = &stages[i - join_index - 1u];
+        col_rel_t *stage_right;
+        col_rel_t *next = NULL;
+        bool usable = true;
+
+        if (op->op != WL_PLAN_OP_SEMIJOIN && op->op != WL_PLAN_OP_ANTIJOIN)
+            continue; /* FILTER keeps its input's schema; a MAP ends it */
+        stage_right = session_find_rel(sess, op->right_relation);
+        if (stage_right) {
+            stage->lk = (uint32_t *)calloc(op->key_count, sizeof(uint32_t));
+            stage->rk = (uint32_t *)calloc(op->key_count, sizeof(uint32_t));
+            if (!stage->lk || !stage->rk) {
+                rc = ENOMEM;
+                break;
+            }
+            for (uint32_t k = 0; k < op->key_count && usable; k++) {
+                if (pipeline_resolve_key(tpl,
+                    op->left_keys ? op->left_keys[k] : NULL,
+                    &stage->lk[k]) != 0
+                    || pipeline_resolve_key(stage_right,
+                    op->right_keys ? op->right_keys[k] : NULL,
+                    &stage->rk[k]) != 0
+                    || stage->lk[k] >= tpl->ncols
+                    || stage->rk[k] >= stage_right->ncols)
+                    usable = false;
+            }
+            if (usable && !col_join_key_types_compatible(tpl, stage->lk,
+                stage_right, stage->rk, op->key_count))
+                usable = false;
+        } else {
+            usable = false;
+        }
+        if (!usable) {
+            /* The operator runs on its own after the tail, as today. */
+            free(stage->lk);
+            free(stage->rk);
+            stage->lk = NULL;
+            stage->rk = NULL;
+            *tail_end = i - 1u;
+            break;
+        }
+        rc = op->op == WL_PLAN_OP_SEMIJOIN
+            ? wl_columnar_semijoin_new_output(op, sess, tpl, stage_right,
+                &next)
+            : wl_columnar_antijoin_new_output(op, sess, tpl, stage_right,
+                &next);
+        if (rc != 0)
+            break;
+        col_rel_destroy(tpl);
+        tpl = next;
+        stage->active = true;
+        stage->right = stage_right;
+        stage->identity = stage_right->relation_identity;
+        stage->view_generation = stage_right->view_generation;
+        stage->storage_generation = stage_right->storage_generation;
+    }
+    if (rc != 0) {
+        col_rel_destroy(tpl);
+        pipeline_stages_release(stages, count);
+        return rc;
+    }
+    *stages_out = stages;
+    *final_template = tpl;
+    return 0;
+}
+
 int
 wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,
@@ -413,6 +615,8 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t tail_end = UINT32_MAX;
     uint32_t *lk = NULL;
     uint32_t *rk = NULL;
+    wl_join_pipeline_stage_t *stages = NULL;
+    col_rel_t *stage_template = NULL;
     int rc;
 
     if (next_index)
@@ -518,6 +722,27 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
         return 0;
     }
+    /* Probe stages: resolve each against the schema its input would have,
+     * truncating the tail before a stage the pipeline cannot apply.  The
+     * schemas come from zero-row templates built with the operators' own
+     * output constructors; no operator runs. */
+    rc = pipeline_setup_stages(plan, join_index, &tail_end, sess,
+            stack->items[stack->top - 1].rel, right, join, &stages,
+            &stage_template);
+    if (rc != 0) {
+        free(lk);
+        free(rk);
+        return rc;
+    }
+    if (tail_end == join_index) {
+        free(lk);
+        free(rk);
+        pipeline_stages_release(stages, tail_end - join_index);
+        col_rel_destroy(stage_template);
+        if (decline)
+            *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_NOT_ELIGIBLE;
+        return 0;
+    }
     last = &plan->ops[tail_end];
     /* Strict mode refuses a tail whose output another operator reads
      * before any producer exists; eval_plan records
@@ -527,6 +752,8 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         == WL_COLUMNAR_JOIN_SUCCESSOR_MATERIALIZING) {
         free(lk);
         free(rk);
+        pipeline_stages_release(stages, tail_end - join_index);
+        col_rel_destroy(stage_template);
         return ENOTSUP;
     }
 
@@ -536,14 +763,21 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             sess->join_batch_bytes, &continuation);
     free(lk);
     free(rk);
-    if (rc != 0)
+    if (rc != 0) {
+        pipeline_stages_release(stages, tail_end - join_index);
+        col_rel_destroy(stage_template);
         return rc;
+    }
 
     /* The output has the schema the sequential tail would publish: a MAP's
      * is new_auto(project_count), as in col_op_map(); a FILTER's is its
      * input's, which is the JOIN output's for a FILTER-only tail. */
     if (last->op == WL_PLAN_OP_MAP) {
         out = col_rel_new_auto("$join_pipeline", last->project_count);
+        rc = out ? 0 : ENOMEM;
+    } else if (stage_template) {
+        /* The last stage's schema; new_like copies no timestamps. */
+        out = col_rel_new_like("$join_pipeline", stage_template);
         rc = out ? 0 : ENOMEM;
     } else {
         out = col_rel_new_auto("$join_pipeline",
@@ -552,10 +786,13 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         rc = out ? col_join_set_output_types(out,
                 stack->items[stack->top - 1].rel, right, join) : ENOMEM;
     }
+    col_rel_destroy(stage_template);
+    stage_template = NULL;
     if (rc != 0) {
         col_rel_destroy(out);
         wl_columnar_continuation_cancel(continuation);
         wl_columnar_continuation_destroy(continuation);
+        pipeline_stages_release(stages, tail_end - join_index);
         return rc;
     }
     if (sess->memory_governor) {
@@ -566,6 +803,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             col_rel_destroy(out);
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
+            pipeline_stages_release(stages, tail_end - join_index);
             return rc;
         }
     }
@@ -576,6 +814,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     sink_ctx.plan = plan;
     sink_ctx.first_tail = join_index + 1u;
     sink_ctx.tail_end = tail_end;
+    sink_ctx.stages = stages;
     sink_ctx.out = out;
     memset(&sink, 0, sizeof(sink));
     sink.context = &sink_ctx;
@@ -596,6 +835,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
             col_rel_destroy(out);
+            pipeline_stages_release(stages, tail_end - join_index);
             if (eval_stack_repush_entry(stack, &left_entry) != 0)
                 return EFAULT;
             if (status == WL_COLUMNAR_CONTINUATION_STALE)
@@ -613,12 +853,15 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
             col_rel_destroy(out);
+            pipeline_stages_release(stages, tail_end - join_index);
             if (eval_stack_repush_entry(stack, &left_entry) != 0)
                 return EFAULT;
             return EOVERFLOW;
         }
     }
     wl_columnar_continuation_destroy(continuation);
+    pipeline_stages_release(stages, tail_end - join_index);
+    stages = NULL;
     rc = eval_entry_dispose(&left_entry);
     if (rc != 0) {
         col_rel_destroy(out);
