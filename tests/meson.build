@@ -3287,7 +3287,9 @@ test_tdd_insert_stratum_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('tdd_insert_stratum', test_tdd_insert_stratum_exe)
+# Repeated session/worker cases exceeded the default 30s in CI with allocator
+# perturbation enabled. Match the bounded budget of the adjacent oracle test.
+test('tdd_insert_stratum', test_tdd_insert_stratum_exe, timeout: 120)
 
 test_tdd_insert_oracle_exe = executable(
   'test_tdd_insert_oracle',
