@@ -1402,10 +1402,14 @@ at `rows_per_batch`; #1481's lazy growth covers the non-differential producer
 only, so a small differential join under a large `N` still reserves the knob.
 The right relation is incrementally indexed in a differential transaction
 before the continuation starts; that cache transaction is committed before a
-differential generation/source pin is held for the continuation.  Each batch
-preserves the signed timestamp multiplicity product (`left * right`).  Stale
-input, generation changes, overflow, cancellation, or failed admission discard
-the output relation and release the differential pin exactly once.
+differential generation/source pin is held for the continuation.  Since #2173
+the bounded differential join publishes the one-shot `$join_diff` contract:
+its scratch and its `$join_diff_batch` output carry no timestamps, and the
+producer reads neither input's timestamp column, so it neither reads nor
+multiplies input multiplicities.  (Until #2173 each batch carried the signed
+product `left * right`, which failed the join with `EINVAL` on overflow.)
+Stale input, generation changes, overflow, cancellation, or failed admission
+discard the output relation and release the differential pin exactly once.
 Materialized/cache joins and delta-right, filtered, cross, worker, and other
 unsupported shapes remain on their existing one-shot paths until their
 publication contracts are bounded.

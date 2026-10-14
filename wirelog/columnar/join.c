@@ -3216,9 +3216,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* Differential bounded mode uses a dedicated producer because the
-     * differential registry has signed/timestamped rows and a separate
-     * generation lease.  Materialized results remain on the one-shot path
-     * until their cache transaction can be made operation-atomic. */
+     * differential registry has its own arrangement and a separate
+     * generation lease.  Like the one-shot $join_diff below, its output
+     * carries no timestamps (Issue #2173).  Materialized results remain on
+     * the one-shot path until their cache transaction can be made
+     * operation-atomic. */
     if (sess->join_batch_bytes > 0 && sess->coordinator) {
         if (sess->join_batch_strict) {
             wl_columnar_join_key_scratch_free(&key_scratch, &lk);
@@ -3237,8 +3239,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_t *bounded_out = NULL;
         int bounded_rc = wl_columnar_join_new_output(sess, left, right,
                 "$join_diff_batch", col_join_output_width(left, right, op),
-                COL_REL_INIT_CAP, left->timestamps || right->timestamps,
-                true, &bounded_out);
+                COL_REL_INIT_CAP, false, true, &bounded_out);
         if (bounded_rc == 0)
             bounded_rc = col_join_set_output_types(bounded_out, left, right,
                     op);
