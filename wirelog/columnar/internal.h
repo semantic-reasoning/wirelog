@@ -2910,6 +2910,64 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
 bool
 col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
     const col_rel_t *right, const uint32_t *rk, uint32_t key_count);
+/* Hash probe set over a right relation's key columns, shared by SEMIJOIN,
+ * ANTIJOIN and the join pipeline.  The two operators size the next links
+ * differently, and both sizes are part of their admitted footprint. */
+typedef enum {
+    WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS = 0,      /* max(nrows, 1): SEMIJOIN */
+    WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE, /* nrows + 1: ANTIJOIN */
+} wl_columnar_join_probe_next_t;
+typedef struct {
+    const col_rel_t *right;
+    const uint32_t *rk;
+    uint32_t kc;
+    uint32_t nbuckets;
+    uint32_t *head;
+    uint32_t *next;
+    wl_columnar_memory_reservation_t reservation;
+    bool admitted;
+    bool built;
+} wl_columnar_join_probe_set_t;
+int
+wl_columnar_join_probe_set_bytes(uint32_t nrows,
+    wl_columnar_join_probe_next_t next_mode, uint64_t *bytes);
+int
+wl_columnar_join_probe_set_build(wl_col_session_t *sess,
+    wl_columnar_memory_governor_ref_t *governor, const col_rel_t *right,
+    const uint32_t *rk, uint32_t kc, wl_columnar_join_probe_next_t next_mode,
+    wl_columnar_join_probe_set_t *set);
+bool
+wl_columnar_join_probe_set_contains(const wl_columnar_join_probe_set_t *set,
+    const col_rel_t *left, uint32_t lr, const uint32_t *lk);
+/* Frees the arrays and rolls the admission back; a second call does
+ * nothing. */
+void
+wl_columnar_join_probe_set_release(wl_columnar_join_probe_set_t *set);
+/* The operator's output relation for @left: SEMIJOIN projects
+ * op->project_indices with left output types; ANTIJOIN is like @left with
+ * no timestamps.  Errors are the operator's own at that step. */
+int
+wl_columnar_semijoin_new_output(const wl_plan_op_t *op,
+    wl_col_session_t *sess, const col_rel_t *left, const col_rel_t *right,
+    col_rel_t **out);
+int
+wl_columnar_antijoin_new_output(const wl_plan_op_t *op,
+    wl_col_session_t *sess, const col_rel_t *left, const col_rel_t *right,
+    col_rel_t **out);
+/* Probe @left against @right into a new output in *@out.  @set is either
+ * unbuilt (zeroed, or left by a failed wl_columnar_join_probe_set_build)
+ * or built over @right and @rk; a built set for another relation or key
+ * list is EINVAL.  A built @set is used and left built; otherwise the emit
+ * builds one at the operator's hash step and releases it before
+ * returning. */
+int
+wl_columnar_semijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,
+    const uint32_t *rk, wl_columnar_join_probe_set_t *set, col_rel_t **out);
+int
+wl_columnar_antijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,
+    const uint32_t *rk, wl_columnar_join_probe_set_t *set, col_rel_t **out);
 /* Type-aware key equality for a candidate pair; arrangement chains may
  * return collision rows, so every probe verifies the keys. */
 static inline bool
@@ -5320,6 +5378,14 @@ extern void (*wl_columnar_ops_test_before_map_dispose)(eval_stack_t *,
 extern bool wl_columnar_ops_test_map_fail_output_alloc;
 extern void (*wl_columnar_ops_test_before_reduce_dispose)(eval_stack_t *,
     eval_entry_t *);
+/* Probe-set and SEMIJOIN/ANTIJOIN emit observation points; they also count
+ * the calls the standalone operators make. */
+extern uint32_t wl_columnar_join_test_probe_set_build_calls;
+extern uint32_t wl_columnar_join_test_probe_set_build_denials;
+extern uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+extern uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
+extern uint32_t wl_columnar_join_test_probe_emits;
+extern void (*wl_columnar_join_test_before_probe_emit)(const col_rel_t *left);
 extern bool wl_columnar_ops_test_reduce_fail_output_alloc;
 extern bool wl_columnar_diff_test_fail_copy_alloc;
 extern bool wl_columnar_diff_test_fail_copy_append;

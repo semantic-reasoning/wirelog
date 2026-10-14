@@ -2272,168 +2272,225 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
 }
 
+/* --- PROBE SETS ---------------------------------------------------------- */
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Observation points for the SEMIJOIN/ANTIJOIN probe sets and emits.  They
+ * also count the calls the standalone operators make. */
+uint32_t wl_columnar_join_test_probe_set_build_calls;
+uint32_t wl_columnar_join_test_probe_set_build_denials;
+uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
+uint32_t wl_columnar_join_test_probe_emits;
+void (*wl_columnar_join_test_before_probe_emit)(const col_rel_t *left);
+#endif
+
+/* The admitted footprint of a probe set: head buckets plus next links. */
 int
-wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
-    wl_col_session_t *sess)
+wl_columnar_join_probe_set_bytes(uint32_t nrows,
+    wl_columnar_join_probe_next_t next_mode, uint64_t *bytes)
 {
-    /* out and its copies remain private until push; right_filtered is the
-     * uncached operation-owned fallback. Antijoin completes its synchronous
-     * probes before cleanup, and no filtered relation is transferred to cache. */
-    eval_entry_t left_e;
-    int pop_rc = eval_stack_pop_relation(stack, &left_e);
-    if (pop_rc != 0)
-        return pop_rc;
+    uint32_t nbuckets;
+    uint64_t head_bytes = 0;
+    uint64_t next_bytes = 0;
+    uint64_t next_len;
 
-    col_rel_t *right_filtered = NULL;
-    col_rel_t *right = session_find_rel(sess, op->right_relation);
-    if (!right) {
-        /* If right relation doesn't exist, antijoin keeps all left rows */
-        return eval_stack_repush_entry(stack, &left_e);
-    }
+    if (!bytes)
+        return EINVAL;
+    if (col_join_bucket_count(nrows, &nbuckets) != 0)
+        return ENOMEM;
+    next_len = next_mode == WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE
+        ? (uint64_t)nrows + 1u : (nrows > 0 ? nrows : 1u);
+    if (!wl_columnar_memory_size_mul(nbuckets, sizeof(uint32_t), &head_bytes)
+        || !wl_columnar_memory_size_mul(next_len, sizeof(uint32_t),
+        &next_bytes)
+        || head_bytes > SIZE_MAX || next_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(head_bytes, next_bytes, bytes))
+        return EOVERFLOW;
+    return 0;
+}
 
-    /* Issue #386: antijoin filter caching is not yet implemented.
-     * Antijoin always uses an ephemeral pool-allocated filtered relation, so
-     * the per-iteration filter cost is O(N) — acceptable for current workloads
-     * but a candidate for follow-up optimization. */
-    if (op->right_filter_expr.size > 0) {
-        col_rel_t *filtered = NULL;
-        int filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
-            &op->right_filter_expr, right, sess->delta_pool, sess->intern,
-            sess->memory_governor ? sess->memory_governor :
-            right->memory_governor, sess, &filtered);
-        if (filter_rc != 0) {
-            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
-            return cleanup_rc != 0 ? cleanup_rc : filter_rc;
+int
+wl_columnar_join_probe_set_build(wl_col_session_t *sess,
+    wl_columnar_memory_governor_ref_t *governor, const col_rel_t *right,
+    const uint32_t *rk, uint32_t kc, wl_columnar_join_probe_next_t next_mode,
+    wl_columnar_join_probe_set_t *set)
+{
+    uint32_t nbuckets;
+    size_t next_len;
+
+    if (!set || !right)
+        return EINVAL;
+    memset(set, 0, sizeof(*set));
+    wl_columnar_memory_reservation_init(&set->reservation);
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_join_test_probe_set_build_calls++;
+    wl_columnar_join_test_probe_set_reserved_at_entry = governor
+        ? wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor)) : 0;
+    wl_columnar_join_test_probe_set_admitted_bytes = 0;
+#endif
+    if (col_join_bucket_count(right->nrows, &nbuckets) != 0)
+        return ENOMEM;
+    next_len = next_mode == WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE
+        ? (size_t)right->nrows + 1u
+        : (size_t)(right->nrows > 0 ? right->nrows : 1u);
+    if (governor) {
+        uint64_t hash_bytes = 0;
+        wl_columnar_memory_admission_status_t status;
+        if (wl_columnar_join_probe_set_bytes(right->nrows, next_mode,
+            &hash_bytes) != 0)
+            return EOVERFLOW;
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(governor), hash_bytes,
+            &set->reservation);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED && sess)
+                sess->memory_budget_denied = true;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                wl_columnar_join_test_probe_set_build_denials++;
+#endif
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                       ? ENOSPC
+                       : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                       ? EOVERFLOW
+                       : ENOMEM;
         }
-        right = filtered;
-        right_filtered = filtered;
+        set->admitted = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_columnar_join_test_probe_set_admitted_bytes = hash_bytes;
+#endif
     }
-
-    col_rel_t *left = left_e.rel;
-    wl_columnar_memory_governor_ref_t *scratch_governor
-        = wl_columnar_join_output_governor(sess, left, right);
-    uint32_t kc = op->key_count;
-
-    wl_columnar_join_key_scratch_t key_scratch;
-    int key_rc = wl_columnar_join_key_scratch_alloc(sess, left, right, kc,
-            &key_scratch);
-    uint32_t *lk = key_scratch.left_keys;
-    uint32_t *rk = key_scratch.right_keys;
-    if (key_rc != 0) {
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, key_rc);
+    set->head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
+    set->next = (uint32_t *)malloc(next_len * sizeof(uint32_t));
+    if (!set->head || !set->next) {
+        wl_columnar_join_probe_set_release(set);
+        return ENOMEM;
     }
+    for (uint32_t rr = 0; rr < right->nrows; rr++) {
+        uint32_t h = col_join_hash_rel_keys(right, rr, rk, kc)
+            & (nbuckets - 1);
+        set->next[rr] = set->head[h];
+        set->head[h] = rr + 1; /* 1-based; 0 = end of chain */
+    }
+    set->right = right;
+    set->rk = rk;
+    set->kc = kc;
+    set->nbuckets = nbuckets;
+    set->built = true;
+    return 0;
+}
+
+bool
+wl_columnar_join_probe_set_contains(const wl_columnar_join_probe_set_t *set,
+    const col_rel_t *left, uint32_t lr, const uint32_t *lk)
+{
+    uint32_t h = col_join_hash_rel_keys(left, lr, lk, set->kc)
+        & (set->nbuckets - 1);
+    for (uint32_t e = set->head[h]; e != 0; e = set->next[e - 1]) {
+        if (col_join_keys_match_rel(left, lr, lk, set->right, e - 1,
+            set->rk, set->kc))
+            return true;
+    }
+    return false;
+}
+
+void
+wl_columnar_join_probe_set_release(wl_columnar_join_probe_set_t *set)
+{
+    if (!set)
+        return;
+    free(set->head);
+    free(set->next);
+    set->head = NULL;
+    set->next = NULL;
+    if (set->admitted)
+        (void)wl_columnar_memory_rollback(&set->reservation);
+    set->admitted = false;
+    set->built = false;
+}
+
+/* A prebuilt set must index the relation and key columns the emit
+ * probes; otherwise its chains would answer for another relation. */
+static bool
+wl_columnar_join_probe_set_matches(const wl_columnar_join_probe_set_t *set,
+    const col_rel_t *right, const uint32_t *rk, uint32_t kc)
+{
+    if (set->right != right || set->kc != kc)
+        return false;
     for (uint32_t k = 0; k < kc; k++) {
-        lk[k] = col_op_resolve_key(left,
-                op->left_keys ? op->left_keys[k] : NULL, "left", "ANTIJOIN",
-                op->right_relation);
-        rk[k] = col_op_resolve_key(right,
-                op->right_keys ? op->right_keys[k] : NULL, "right", "ANTIJOIN",
-                op->right_relation);
+        if (set->rk[k] != rk[k])
+            return false;
     }
-    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
-    }
+    return true;
+}
 
+/* --- ANTIJOIN ------------------------------------------------------------ */
+
+int
+wl_columnar_antijoin_new_output(const wl_plan_op_t *op,
+    wl_col_session_t *sess, const col_rel_t *left, const col_rel_t *right,
+    col_rel_t **out_p)
+{
     col_rel_t *out = NULL;
     wl_columnar_memory_governor_ref_t *output_governor
         = wl_columnar_join_output_governor(sess, left, right);
-    int output_rc = output_governor
+    int output_rc;
+
+    (void)op;
+    *out_p = NULL;
+    output_rc = output_governor
         ? wl_columnar_relation_new_like_governed_checked_mode("$antijoin",
             left, output_governor, false, &out)
         : ((out = col_rel_pool_new_like(sess->delta_pool, "$antijoin", left))
             ? 0 : ENOMEM);
     if (output_rc != 0) {
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
         if (output_rc == ENOSPC)
             sess->memory_budget_denied = true;
-        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
+        return output_rc;
     }
     col_join_attach_ledger(sess, out);
+    *out_p = out;
+    return 0;
+}
+
+int
+wl_columnar_antijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,
+    const uint32_t *rk, wl_columnar_join_probe_set_t *set, col_rel_t **out_p)
+{
+    wl_columnar_memory_governor_ref_t *scratch_governor
+        = wl_columnar_join_output_governor(sess, left, right);
+    uint32_t kc = op->key_count;
+    wl_columnar_join_probe_set_t local_set;
+    bool own_set = !set->built;
+
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_join_test_probe_emits++;
+    if (wl_columnar_join_test_before_probe_emit)
+        wl_columnar_join_test_before_probe_emit(left);
+#endif
+    *out_p = NULL;
+    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc))
+        return EINVAL;
+    col_rel_t *out = NULL;
+    int output_rc = wl_columnar_antijoin_new_output(op, sess, left, right,
+            &out);
+    if (output_rc != 0)
+        return output_rc;
 
     /* Hash antijoin: build hash set from right, iterate left. */
-    uint32_t aj_nbuckets;
-    if (col_join_bucket_count(right->nrows, &aj_nbuckets) != 0) {
-        col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-    wl_columnar_memory_reservation_t aj_hash_reservation;
-    bool aj_hash_admitted = false;
-    wl_columnar_memory_reservation_init(&aj_hash_reservation);
-    if (scratch_governor) {
-        uint64_t head_bytes = 0;
-        uint64_t next_bytes = 0;
-        uint64_t hash_bytes = 0;
-        wl_columnar_memory_admission_status_t status;
-        bool sized = wl_columnar_memory_size_mul(aj_nbuckets,
-                sizeof(uint32_t), &head_bytes)
-            && wl_columnar_memory_size_mul(
-            (uint64_t)right->nrows + 1u, sizeof(uint32_t), &next_bytes)
-            && head_bytes <= SIZE_MAX && next_bytes <= SIZE_MAX
-            && wl_columnar_memory_size_add(head_bytes, next_bytes,
-                &hash_bytes);
-        if (!sized) {
+    if (own_set) {
+        int build_rc = wl_columnar_join_probe_set_build(sess,
+                scratch_governor, right, rk, kc,
+                WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE, &local_set);
+        if (build_rc != 0) {
             col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e, EOVERFLOW);
+            return build_rc;
         }
-        status = wl_columnar_memory_reserve_checked(
-            wl_columnar_memory_governor_ref_get(scratch_governor),
-            hash_bytes, &aj_hash_reservation);
-        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
-            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                sess->memory_budget_denied = true;
-            col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e,
-                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-                           ? ENOSPC
-                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                           ? EOVERFLOW
-                           : ENOMEM);
-        }
-        aj_hash_admitted = true;
-    }
-    uint32_t *aj_head = (uint32_t *)calloc(aj_nbuckets, sizeof(uint32_t));
-    uint32_t *aj_next
-        = (uint32_t *)malloc(((size_t)right->nrows + 1u)
-            * sizeof(uint32_t));
-    if (!aj_head || !aj_next) {
-        free(aj_head);
-        free(aj_next);
-        if (aj_hash_admitted)
-            (void)wl_columnar_memory_rollback(&aj_hash_reservation);
-        col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-    for (uint32_t rr = 0; rr < right->nrows; rr++) {
-        uint32_t h = col_join_hash_rel_keys(right, rr, rk, kc)
-            & (aj_nbuckets - 1);
-        aj_next[rr] = aj_head[h];
-        aj_head[h] = rr + 1;
+        set = &local_set;
     }
     int aj_rc = 0;
     wl_columnar_memory_reservation_t aj_row_reservation;
@@ -2475,16 +2532,7 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_rel_append_batch_t aj_batch = { 0 };
         aj_rc = col_rel_append_batch_begin(&aj_batch, out);
         for (uint32_t lr = 0; lr < left->nrows && aj_rc == 0; lr++) {
-            uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
-                & (aj_nbuckets - 1);
-            bool found = false;
-            for (uint32_t e = aj_head[h]; e != 0 && !found;
-                e = aj_next[e - 1]) {
-                uint32_t rr = e - 1;
-                if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
-                    found = true;
-            }
-            if (!found) {
+            if (!wl_columnar_join_probe_set_contains(set, left, lr, lk)) {
                 for (uint32_t c = 0; c < left->ncols; c++)
                     lrow_buf[c] = left->columns[c][lr];
                 aj_rc = col_rel_append_batch_row(&aj_batch, lrow_buf);
@@ -2494,58 +2542,40 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     free(lrow_buf);
 antijoin_done:
-    free(aj_head);
-    free(aj_next);
+    if (own_set)
+        wl_columnar_join_probe_set_release(&local_set);
     if (aj_row_admitted)
         (void)wl_columnar_memory_rollback(&aj_row_reservation);
-    if (aj_hash_admitted)
-        (void)wl_columnar_memory_rollback(&aj_hash_reservation);
     if (aj_rc != 0) {
         aj_rc = wl_columnar_join_output_error(sess, out, aj_rc);
         col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, aj_rc);
+        return aj_rc;
     }
-    wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-    wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-    if (right_filtered)
-        col_rel_destroy(right_filtered);
-    return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
+    *out_p = out;
+    return 0;
 }
 
-/* --- SEMIJOIN ------------------------------------------------------------ */
-
 int
-wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
+wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
     /* out and its copies remain private until push; right_filtered is the
-     * uncached operation-owned fallback. Semijoin completes its synchronous
+     * uncached operation-owned fallback. Antijoin completes its synchronous
      * probes before cleanup, and no filtered relation is transferred to cache. */
-    col_rel_t *right = NULL;
-    bool bound_delta = false;
-    if (sess->tdd_input_run) {
-        int bound_rc = wl_columnar_eval_tdd_plan_resolve_input(sess, op, true,
-                &right, &bound_delta);
-        if (bound_rc != 0)
-            return bound_rc;
-    } else {
-        right = session_find_rel(sess, op->right_relation);
-    }
-    col_rel_t *right_filtered = NULL;
     eval_entry_t left_e;
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
         return pop_rc;
 
-    if (!right)
+    col_rel_t *right_filtered = NULL;
+    col_rel_t *right = session_find_rel(sess, op->right_relation);
+    if (!right) {
+        /* If right relation doesn't exist, antijoin keeps all left rows */
         return eval_stack_repush_entry(stack, &left_e);
+    }
 
-    /* Issue #386: semijoin filter caching is not yet implemented.
-     * Semijoin always uses an ephemeral pool-allocated filtered relation, so
+    /* Issue #386: antijoin filter caching is not yet implemented.
+     * Antijoin always uses an ephemeral pool-allocated filtered relation, so
      * the per-iteration filter cost is O(N) — acceptable for current workloads
      * but a candidate for follow-up optimization. */
     if (op->right_filter_expr.size > 0) {
@@ -2563,8 +2593,6 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     col_rel_t *left = left_e.rel;
-    wl_columnar_memory_governor_ref_t *scratch_governor
-        = wl_columnar_join_output_governor(sess, left, right);
     uint32_t kc = op->key_count;
 
     wl_columnar_join_key_scratch_t key_scratch;
@@ -2579,10 +2607,10 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     for (uint32_t k = 0; k < kc; k++) {
         lk[k] = col_op_resolve_key(left,
-                op->left_keys ? op->left_keys[k] : NULL, "left", "SEMIJOIN",
+                op->left_keys ? op->left_keys[k] : NULL, "left", "ANTIJOIN",
                 op->right_relation);
         rk[k] = col_op_resolve_key(right,
-                op->right_keys ? op->right_keys[k] : NULL, "right", "SEMIJOIN",
+                op->right_keys ? op->right_keys[k] : NULL, "right", "ANTIJOIN",
                 op->right_relation);
     }
     if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
@@ -2593,10 +2621,34 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
     }
 
+    wl_columnar_join_probe_set_t set;
+    col_rel_t *out = NULL;
+    memset(&set, 0, sizeof(set));
+    int emit_rc = wl_columnar_antijoin_emit(op, sess, left, right, lk, rk,
+            &set, &out);
+    wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+    wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+    if (right_filtered)
+        col_rel_destroy(right_filtered);
+    if (emit_rc != 0)
+        return wl_columnar_join_dispose_left(stack, &left_e, emit_rc);
+    return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
+}
+
+/* --- SEMIJOIN ------------------------------------------------------------ */
+
+int
+wl_columnar_semijoin_new_output(const wl_plan_op_t *op,
+    wl_col_session_t *sess, const col_rel_t *left, const col_rel_t *right,
+    col_rel_t **out_p)
+{
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
     col_rel_t *out = NULL;
-    int output_rc = wl_columnar_join_new_output(sess, left, right, "$semijoin",
+    int output_rc;
+
+    *out_p = NULL;
+    output_rc = wl_columnar_join_new_output(sess, left, right, "$semijoin",
             ocols, COL_REL_INIT_CAP,
 #ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
             wl_columnar_join_test_enable_semijoin_timestamps,
@@ -2604,22 +2656,43 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             false,
 #endif
             false, &out);
-    if (output_rc != 0) {
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
-    }
+    if (output_rc != 0)
+        return output_rc;
     output_rc = col_join_set_left_output_types(out, left, op);
     if (output_rc != 0) {
         col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, output_rc);
+        return output_rc;
     }
+    *out_p = out;
+    return 0;
+}
+
+int
+wl_columnar_semijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,
+    const uint32_t *rk, wl_columnar_join_probe_set_t *set, col_rel_t **out_p)
+{
+    wl_columnar_memory_governor_ref_t *scratch_governor
+        = wl_columnar_join_output_governor(sess, left, right);
+    uint32_t kc = op->key_count;
+    wl_columnar_join_probe_set_t local_set;
+    bool own_set = !set->built;
+
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_columnar_join_test_probe_emits++;
+    if (wl_columnar_join_test_before_probe_emit)
+        wl_columnar_join_test_before_probe_emit(left);
+#endif
+    *out_p = NULL;
+    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc))
+        return EINVAL;
+    /* Output: project_indices selects output columns from left */
+    uint32_t ocols = op->project_count ? op->project_count : left->ncols;
+    col_rel_t *out = NULL;
+    int output_rc = wl_columnar_semijoin_new_output(op, sess, left, right,
+            &out);
+    if (output_rc != 0)
+        return output_rc;
     wl_columnar_memory_reservation_t sj_row_reservation;
     bool sj_row_admitted = false;
     wl_columnar_memory_reservation_init(&sj_row_reservation);
@@ -2629,12 +2702,7 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (!wl_columnar_memory_size_mul(ocols ? ocols : 1,
             sizeof(int64_t), &row_bytes)) {
             col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e,
-                       EOVERFLOW);
+            return EOVERFLOW;
         }
         status = wl_columnar_memory_reserve_checked(
             wl_columnar_memory_governor_ref_get(scratch_governor),
@@ -2644,15 +2712,10 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
             col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e,
-                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-                           ? ENOSPC
-                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                           ? EOVERFLOW : ENOMEM);
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                       ? ENOSPC
+                       : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                       ? EOVERFLOW : ENOMEM;
         }
         sj_row_admitted = true;
     }
@@ -2661,107 +2724,26 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (sj_row_admitted)
             (void)wl_columnar_memory_rollback(&sj_row_reservation);
         col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
+        return ENOMEM;
     }
 
     /* Build hash set from right relation join keys: O(|R|) */
-    uint32_t nbuckets;
-    if (col_join_bucket_count(right->nrows, &nbuckets) != 0) {
-        free(tmp);
-        tmp = NULL;
-        if (sj_row_admitted)
-            (void)wl_columnar_memory_rollback(&sj_row_reservation);
-        col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-    wl_columnar_memory_reservation_t sj_hash_reservation;
-    bool sj_hash_admitted = false;
-    wl_columnar_memory_reservation_init(&sj_hash_reservation);
-    if (scratch_governor) {
-        uint64_t head_bytes = 0;
-        uint64_t next_bytes = 0;
-        uint64_t hash_bytes = 0;
-        wl_columnar_memory_admission_status_t status;
-        bool sized = wl_columnar_memory_size_mul(nbuckets,
-                sizeof(uint32_t), &head_bytes)
-            && wl_columnar_memory_size_mul(
-            right->nrows > 0 ? right->nrows : 1,
-            sizeof(uint32_t), &next_bytes)
-            && head_bytes <= SIZE_MAX && next_bytes <= SIZE_MAX
-            && wl_columnar_memory_size_add(head_bytes, next_bytes,
-                &hash_bytes);
-        if (!sized) {
+    if (own_set) {
+        int build_rc = wl_columnar_join_probe_set_build(sess,
+                scratch_governor, right, rk, kc,
+                WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS, &local_set);
+        if (build_rc != 0) {
             free(tmp);
-            tmp = NULL;
             if (sj_row_admitted)
                 (void)wl_columnar_memory_rollback(&sj_row_reservation);
             col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e, EOVERFLOW);
+            return build_rc;
         }
-        status = wl_columnar_memory_reserve_checked(
-            wl_columnar_memory_governor_ref_get(scratch_governor),
-            hash_bytes, &sj_hash_reservation);
-        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
-            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
-            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                sess->memory_budget_denied = true;
-            free(tmp);
-            tmp = NULL;
-            if (sj_row_admitted)
-                (void)wl_columnar_memory_rollback(&sj_row_reservation);
-            col_rel_destroy(out);
-            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-            if (right_filtered)
-                col_rel_destroy(right_filtered);
-            return wl_columnar_join_dispose_left(stack, &left_e,
-                       status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
-                           ? ENOSPC
-                           : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
-                           ? EOVERFLOW
-                           : ENOMEM);
-        }
-        sj_hash_admitted = true;
+        set = &local_set;
     }
-    uint32_t *ht_head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
-    uint32_t *ht_next = (uint32_t *)malloc((right->nrows > 0 ? right->nrows : 1)
-            * sizeof(uint32_t));
-    if (!ht_head || !ht_next) {
-        free(ht_head);
-        free(ht_next);
-        free(tmp);
-        ht_head = NULL;
-        ht_next = NULL;
-        tmp = NULL;
-        if (sj_row_admitted)
-            (void)wl_columnar_memory_rollback(&sj_row_reservation);
-        if (sj_hash_admitted)
-            (void)wl_columnar_memory_rollback(&sj_hash_reservation);
-        col_rel_destroy(out);
-        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
-        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, ENOMEM);
-    }
-    for (uint32_t rr = 0; rr < right->nrows; rr++) {
-        uint32_t h = col_join_hash_rel_keys(right, rr, rk, kc)
-            & (nbuckets - 1);
-        ht_next[rr] = ht_head[h];
-        ht_head[h] = rr + 1; /* 1-based; 0 = end of chain */
-    }
+    uint32_t *ht_head = set->head;
+    uint32_t *ht_next = set->next;
+    uint32_t nbuckets = set->nbuckets;
 
     int sj_rc = 0;
     uint32_t min_left = col_join_parallel_min_left_rows();
@@ -2932,16 +2914,7 @@ semijoin_parallel_done:
         col_rel_append_batch_t sj_batch = { 0 };
         sj_rc = col_rel_append_batch_begin(&sj_batch, out);
         for (uint32_t lr = 0; lr < left->nrows && sj_rc == 0; lr++) {
-            uint32_t h = col_join_hash_rel_keys(left, lr, lk, kc)
-                & (nbuckets - 1);
-            bool found = false;
-            for (uint32_t e = ht_head[h]; e != 0 && !found;
-                e = ht_next[e - 1]) {
-                uint32_t rr = e - 1;
-                if (col_join_keys_match_rel(left, lr, lk, right, rr, rk, kc))
-                    found = true;
-            }
-            if (found) {
+            if (wl_columnar_join_probe_set_contains(set, left, lr, lk)) {
                 if (op->project_count > 0 && op->project_indices) {
                     for (uint32_t c = 0; c < ocols; c++) {
                         uint32_t si = op->project_indices[c];
@@ -2961,26 +2934,103 @@ semijoin_parallel_done:
 semijoin_done:
     free(tmp);
     tmp = NULL;
-    free(ht_head);
-    free(ht_next);
+    if (own_set)
+        wl_columnar_join_probe_set_release(&local_set);
     if (sj_row_admitted)
         (void)wl_columnar_memory_rollback(&sj_row_reservation);
-    if (sj_hash_admitted)
-        (void)wl_columnar_memory_rollback(&sj_hash_reservation);
     if (sj_rc != 0) {
         sj_rc = wl_columnar_join_output_error(sess, out, sj_rc);
         col_rel_destroy(out);
+        return sj_rc;
+    }
+    *out_p = out;
+    return 0;
+}
+
+int
+wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
+    wl_col_session_t *sess)
+{
+    /* out and its copies remain private until push; right_filtered is the
+     * uncached operation-owned fallback. Semijoin completes its synchronous
+     * probes before cleanup, and no filtered relation is transferred to cache. */
+    col_rel_t *right = NULL;
+    bool bound_delta = false;
+    if (sess->tdd_input_run) {
+        int bound_rc = wl_columnar_eval_tdd_plan_resolve_input(sess, op, true,
+                &right, &bound_delta);
+        if (bound_rc != 0)
+            return bound_rc;
+    } else {
+        right = session_find_rel(sess, op->right_relation);
+    }
+    col_rel_t *right_filtered = NULL;
+    eval_entry_t left_e;
+    int pop_rc = eval_stack_pop_relation(stack, &left_e);
+    if (pop_rc != 0)
+        return pop_rc;
+
+    if (!right)
+        return eval_stack_repush_entry(stack, &left_e);
+
+    /* Issue #386: semijoin filter caching is not yet implemented.
+     * Semijoin always uses an ephemeral pool-allocated filtered relation, so
+     * the per-iteration filter cost is O(N) — acceptable for current workloads
+     * but a candidate for follow-up optimization. */
+    if (op->right_filter_expr.size > 0) {
+        col_rel_t *filtered = NULL;
+        int filter_rc = wl_columnar_filter_apply_right_filter_governed_checked(
+            &op->right_filter_expr, right, sess->delta_pool, sess->intern,
+            sess->memory_governor ? sess->memory_governor :
+            right->memory_governor, sess, &filtered);
+        if (filter_rc != 0) {
+            int cleanup_rc = eval_stack_dispose_entry(stack, &left_e);
+            return cleanup_rc != 0 ? cleanup_rc : filter_rc;
+        }
+        right = filtered;
+        right_filtered = filtered;
+    }
+
+    col_rel_t *left = left_e.rel;
+    uint32_t kc = op->key_count;
+
+    wl_columnar_join_key_scratch_t key_scratch;
+    int key_rc = wl_columnar_join_key_scratch_alloc(sess, left, right, kc,
+            &key_scratch);
+    uint32_t *lk = key_scratch.left_keys;
+    uint32_t *rk = key_scratch.right_keys;
+    if (key_rc != 0) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, key_rc);
+    }
+    for (uint32_t k = 0; k < kc; k++) {
+        lk[k] = col_op_resolve_key(left,
+                op->left_keys ? op->left_keys[k] : NULL, "left", "SEMIJOIN",
+                op->right_relation);
+        rk[k] = col_op_resolve_key(right,
+                op->right_keys ? op->right_keys[k] : NULL, "right", "SEMIJOIN",
+                op->right_relation);
+    }
+    if (!col_join_key_types_compatible(left, lk, right, rk, kc)) {
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
         if (right_filtered)
             col_rel_destroy(right_filtered);
-        return wl_columnar_join_dispose_left(stack, &left_e, sj_rc);
+        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
     }
 
+    wl_columnar_join_probe_set_t set;
+    col_rel_t *out = NULL;
+    memset(&set, 0, sizeof(set));
+    int emit_rc = wl_columnar_semijoin_emit(op, sess, left, right, lk, rk,
+            &set, &out);
     wl_columnar_join_key_scratch_free(&key_scratch, &lk);
     wl_columnar_join_key_scratch_free(&key_scratch, &rk);
     if (right_filtered)
         col_rel_destroy(right_filtered);
+    if (emit_rc != 0)
+        return wl_columnar_join_dispose_left(stack, &left_e, emit_rc);
     return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
 }
 

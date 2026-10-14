@@ -88,6 +88,12 @@ extern bool wl_columnar_join_test_last_cross_ctx_admitted;
 extern bool wl_columnar_join_test_last_keyed_parallel_admitted;
 extern bool wl_columnar_join_test_last_semijoin_parallel_admitted;
 extern bool wl_columnar_merge_test_fail_concat_boundaries_alloc;
+/* testlib_prod defines these under WL_SESSION_TEST_HOOKS, which this test
+ * is not compiled with. */
+extern uint32_t wl_columnar_join_test_probe_set_build_calls;
+extern uint32_t wl_columnar_join_test_probe_set_build_denials;
+extern uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+extern uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
 
 static uint32_t test_join_submit_calls;
 static uint32_t test_join_submit_fail_at;
@@ -2377,6 +2383,278 @@ test_filter_join_hash_denial_unwinds_scratch(void)
         }
         col_rel_destroy(left);
         destroy_session(sess);
+    }
+}
+
+/* ---- shared SEMI/ANTI probe set (#1370 unit a2a) ------------------------ */
+
+/* A one-column "k" relation holding the keys 0 .. @n - 1. */
+static col_rel_t *
+probe_keys_rel(const char *name, uint32_t n)
+{
+    const char *cn[] = { "k" };
+    col_rel_t *rel = make_rel(name, 1, cn);
+    for (uint32_t i = 0; rel && i < n; i++) {
+        int64_t row[] = { (int64_t)i };
+        if (col_rel_append_row(rel, row) != 0) {
+            col_rel_destroy(rel);
+            return NULL;
+        }
+    }
+    return rel;
+}
+
+static bool
+probe_set_hand_bytes(uint32_t nrows, wl_columnar_join_probe_next_t mode,
+    uint64_t *bytes)
+{
+    uint64_t buckets = wl_columnar_filter_next_pow2(2u * nrows);
+    uint64_t len = mode == WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE
+        ? (uint64_t)nrows + 1u : (nrows ? nrows : 1u);
+    *bytes = (buckets + len) * sizeof(uint32_t);
+    return buckets > 0;
+}
+
+static void
+test_probe_set_helper_contract(void)
+{
+    static const uint32_t sizes[] = { 2, 300 };
+    static const wl_columnar_join_probe_next_t modes[] = {
+        WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS,
+        WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE,
+    };
+    const uint32_t key = 0;
+
+    TEST("probe set admits, answers and releases as specified");
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+            wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+            col_rel_t *right = make_right(sizes[s], 1);
+            col_rel_t *probe = probe_keys_rel("probe", 2u * sizes[s] + 2u);
+            wl_columnar_join_probe_set_t set;
+            uint64_t want = 0;
+            uint64_t bytes = 0;
+            uint64_t before;
+            uint32_t calls;
+            bool ok = sess && right && probe;
+            int rc;
+
+            memset(&set, 0, sizeof(set));
+            ok = ok && probe_set_hand_bytes(sizes[s], modes[m], &want)
+                && wl_columnar_join_probe_set_bytes(sizes[s], modes[m],
+                    &bytes) == 0 && bytes == want;
+            before = ok ? reserved_of(sess) : 0;
+            calls = wl_columnar_join_test_probe_set_build_calls;
+            rc = ok ? wl_columnar_join_probe_set_build(sess,
+                    sess->memory_governor, right, &key, 1, modes[m], &set)
+                : EINVAL;
+            ok = ok && rc == 0 && set.built
+                && reserved_of(sess) - before == want
+                && wl_columnar_join_test_probe_set_build_calls == calls + 1u
+                && wl_columnar_join_test_probe_set_reserved_at_entry
+                == before;
+            for (uint32_t r = 0; ok && r < probe->nrows; r++) {
+                /* make_right(n, 1) holds exactly the keys 0 .. n - 1. */
+                bool want_found = r < sizes[s];
+                if (wl_columnar_join_probe_set_contains(&set, probe, r, &key)
+                    != want_found)
+                    ok = false;
+            }
+            wl_columnar_join_probe_set_release(&set);
+            ok = ok && !set.built && reserved_of(sess) == before;
+            wl_columnar_join_probe_set_release(&set);
+            ok = ok && reserved_of(sess) == before;
+            if (!ok) {
+                printf("FAIL: rows=%u mode=%d rc=%d bytes=%llu want=%llu\n",
+                    sizes[s], (int)modes[m], rc, (unsigned long long)bytes,
+                    (unsigned long long)want);
+                tests_failed++;
+                col_rel_destroy(probe);
+                col_rel_destroy(right);
+                destroy_session(sess);
+                return;
+            }
+
+            /* One byte short of the set: denied, nothing kept. */
+            {
+                wl_columnar_memory_governor_t *gov
+                    = wl_columnar_memory_governor_ref_get(
+                        sess->memory_governor);
+                uint64_t usable = atomic_load_explicit(&gov->usable_bytes,
+                        memory_order_acquire);
+                uint32_t denials
+                    = wl_columnar_join_test_probe_set_build_denials;
+                atomic_store_explicit(&gov->usable_bytes,
+                    before + want - 1u, memory_order_release);
+                sess->memory_budget_denied = false;
+                rc = wl_columnar_join_probe_set_build(sess,
+                        sess->memory_governor, right, &key, 1, modes[m],
+                        &set);
+                atomic_store_explicit(&gov->usable_bytes, usable,
+                    memory_order_release);
+                ok = rc == ENOSPC && !set.built
+                    && sess->memory_budget_denied
+                    && wl_columnar_join_test_probe_set_build_denials
+                    == denials + 1u
+                    && reserved_of(sess) == before;
+            }
+            col_rel_destroy(probe);
+            col_rel_destroy(right);
+            destroy_session(sess);
+            if (!ok) {
+                printf("FAIL: denial rows=%u mode=%d rc=%d\n", sizes[s],
+                    (int)modes[m], rc);
+                tests_failed++;
+                return;
+            }
+        }
+    }
+
+    /* A zero-row right builds and finds nothing; no governor admits
+     * nothing. */
+    {
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(0, 0);
+        col_rel_t *probe = probe_keys_rel("probe", 4);
+        wl_columnar_join_probe_set_t set;
+        uint64_t before = sess ? reserved_of(sess) : 0;
+        bool ok = sess && right && probe;
+
+        memset(&set, 0, sizeof(set));
+        ok = ok && wl_columnar_join_probe_set_build(sess, NULL, right, &key,
+                1, WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS, &set) == 0
+            && set.built && reserved_of(sess) == before
+            && wl_columnar_join_test_probe_set_reserved_at_entry == 0;
+        for (uint32_t r = 0; ok && r < probe->nrows; r++) {
+            if (wl_columnar_join_probe_set_contains(&set, probe, r, &key))
+                ok = false;
+        }
+        wl_columnar_join_probe_set_release(&set);
+        col_rel_destroy(probe);
+        col_rel_destroy(right);
+        destroy_session(sess);
+        if (!ok) {
+            FAIL("zero-row or ungoverned probe set");
+            return;
+        }
+    }
+    PASS();
+}
+
+static bool
+same_relation(const col_rel_t *a, const col_rel_t *b)
+{
+    if (!a || !b || a->ncols != b->ncols || a->nrows != b->nrows
+        || (a->timestamps == NULL) != (b->timestamps == NULL)
+        || (a->column_types == NULL) != (b->column_types == NULL))
+        return false;
+    for (uint32_t c = 0; c < a->ncols; c++) {
+        const char *an = a->col_names ? a->col_names[c] : NULL;
+        const char *bn = b->col_names ? b->col_names[c] : NULL;
+        if ((an == NULL) != (bn == NULL) || (an && strcmp(an, bn) != 0))
+            return false;
+        if (a->column_types && a->column_types[c] != b->column_types[c])
+            return false;
+        for (uint32_t r = 0; r < a->nrows; r++) {
+            if (a->columns[c][r] != b->columns[c][r])
+                return false;
+        }
+    }
+    return true;
+}
+
+static void
+test_semi_anti_emit_prebuilt_matches_standalone(void)
+{
+    const char *left_keys[] = { "k" };
+    const char *right_keys[] = { "k" };
+    const uint32_t key = 0;
+
+    for (uint32_t which = 0; which < 2; which++) {
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(3, 2);
+        col_rel_t *left = make_left(8, 5);
+        wl_plan_op_t op;
+        eval_entry_t standalone = { 0 };
+        wl_columnar_join_probe_set_t set;
+        col_rel_t *first = NULL;
+        col_rel_t *second = NULL;
+        wl_columnar_join_probe_next_t mode = which == 0
+            ? WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS
+            : WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE;
+        uint64_t before;
+        uint32_t calls;
+        bool ok;
+
+        TEST(which == 0
+            ? "SEMI emit over a prebuilt set matches the standalone op"
+            : "ANTI emit over a prebuilt set matches the standalone op");
+        memset(&set, 0, sizeof(set));
+        memset(&op, 0, sizeof(op));
+        op.right_relation = "right";
+        op.key_count = 1;
+        op.left_keys = left_keys;
+        op.right_keys = right_keys;
+        ok = sess && right && left && session_add_rel(sess, right) == 0;
+        if (!ok) {
+            FAIL("fixture");
+            col_rel_destroy(left);
+            if (!sess)
+                col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
+        uint64_t want_bytes = 0;
+        ok = run_filter_join(which == 0 ? wl_columnar_semijoin_op
+                : wl_columnar_antijoin_op, sess, left, &op,
+                &standalone) == 0;
+        /* The standalone operator sizes its own set: max(nrows, 1) next
+         * links for SEMIJOIN, nrows + 1 for ANTIJOIN. */
+        ok = ok && probe_set_hand_bytes(right->nrows, mode, &want_bytes)
+            && wl_columnar_join_test_probe_set_admitted_bytes
+            == want_bytes;
+        before = reserved_of(sess);
+        calls = wl_columnar_join_test_probe_set_build_calls;
+        ok = ok && wl_columnar_join_probe_set_build(sess,
+                sess->memory_governor, right, &key, 1, mode, &set) == 0;
+        if (ok && which == 0) {
+            ok = wl_columnar_semijoin_emit(&op, sess, left, right, &key,
+                    &key, &set, &first) == 0
+                && wl_columnar_semijoin_emit(&op, sess, left, right, &key,
+                    &key, &set, &second) == 0;
+        } else if (ok) {
+            ok = wl_columnar_antijoin_emit(&op, sess, left, right, &key,
+                    &key, &set, &first) == 0
+                && wl_columnar_antijoin_emit(&op, sess, left, right, &key,
+                    &key, &set, &second) == 0;
+        }
+        ok = ok && set.built && same_relation(first, standalone.rel)
+            && same_relation(second, standalone.rel)
+            && wl_columnar_join_test_probe_set_build_calls == calls + 1u;
+        /* A set built over another relation is refused. */
+        {
+            col_rel_t *other = make_right(3, 2);
+            col_rel_t *refused = NULL;
+            int rc = !other ? ENOMEM : which == 0
+                ? wl_columnar_semijoin_emit(&op, sess, left, other, &key,
+                    &key, &set, &refused)
+                : wl_columnar_antijoin_emit(&op, sess, left, other, &key,
+                    &key, &set, &refused);
+            ok = ok && rc == EINVAL && refused == NULL && set.built;
+            col_rel_destroy(other);
+        }
+        col_rel_destroy(first);
+        col_rel_destroy(second);
+        wl_columnar_join_probe_set_release(&set);
+        ok = ok && reserved_of(sess) == before;
+        if (standalone.owned)
+            col_rel_destroy(standalone.rel);
+        col_rel_destroy(left);
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("emit over a prebuilt set differs from the standalone op");
     }
 }
 
@@ -4768,6 +5046,8 @@ main(void)
     test_projected_output_is_governed();
     test_join_output_growth_denial_is_typed();
     test_filter_join_hash_denial_unwinds_scratch();
+    test_probe_set_helper_contract();
+    test_semi_anti_emit_prebuilt_matches_standalone();
     test_source_governed_join_key_scratch_denial();
     test_source_governed_join_key_scratch_alloc_failure();
     test_source_governor_output_precedence();
