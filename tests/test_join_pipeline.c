@@ -1468,8 +1468,8 @@ test_pipeline_zero_column_right_declines(void)
 static void
 test_pipeline_zero_column_left_declines(void)
 {
-    /* Only the pipeline's own decision is asserted: the ordinary bounded
-     * JOIN still rejects a zero-column left (issue #2170). */
+    /* Only the pipeline's own decision is asserted here; the ordinary JOIN
+     * then joins the empty input without a producer (issue #2170). */
     wl_col_session_t *sess = sel_session();
     col_rel_t *left = col_rel_new_auto("left", 0);
     CHECK(sess && left, "zero-column left fixture");
@@ -1918,8 +1918,8 @@ test_nothing_to_bound_follows_the_ordinary_join(void)
     }
     wl_columnar_ops_test_before_reduce_dispose = NULL;
 
-    /* A zero-column left still fails in the ordinary bounded JOIN (#2170);
-     * this pins that until the issue is fixed. */
+    /* A zero-column empty left is joined by the ordinary JOIN without a
+     * producer and yields the empty result in both modes (#2170). */
     for (int strict = 0; strict < 2; strict++) {
         sel_plan_t p;
         sel_run_t run;
@@ -1935,11 +1935,14 @@ test_nothing_to_bound_follows_the_ordinary_join(void)
         sel_plan_init(&p, WL_DELTA_FORCE_FULL);
         sess->join_batch_strict = strict != 0;
         run = sel_eval(sess, &p.plan, SEL_BATCH_BYTES, left);
-        if (run.rc != EINVAL || run.stack_top != 0)
-            fprintf(stderr, "  zero-column left, strict=%d: rc=%d top=%u\n",
-                strict, run.rc, run.stack_top);
-        CHECK(run.rc == EINVAL && run.stack_top == 0,
-            "a zero-column left still fails with EINVAL (#2170)");
+        if (run.rc != 0 || run.stack_top != 1 || run.nrows != 0
+            || sess->join_batch_fallback_count != 0)
+            fprintf(stderr, "  zero-column left, strict=%d: rc=%d top=%u "
+                "rows=%u fallbacks=%u\n", strict, run.rc, run.stack_top,
+                run.nrows, sess->join_batch_fallback_count);
+        CHECK(run.rc == 0 && run.stack_top == 1 && run.nrows == 0
+            && sess->join_batch_fallback_count == 0,
+            "a zero-column empty left joins to the empty result");
         pipeline_session_destroy(sess);
     }
 }
