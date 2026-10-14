@@ -340,6 +340,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     const wl_plan_op_t *map;
     eval_entry_t left_entry;
     col_rel_t *right;
+    wl_columnar_join_selection_t selection;
     col_rel_t *out = NULL;
     wl_columnar_continuation_t *continuation = NULL;
     wl_join_pipeline_sink_t sink_ctx;
@@ -366,6 +367,16 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     right = session_find_rel(sess, join->right_relation);
     if (!right)
         return ENOENT;
+    /* Consume only a JOIN that would read the persistent relation itself.
+     * A $d$/$r$ delta or a forced-empty right operand is left on the stack
+     * for the ordinary JOIN, which selects it the same way.  Today every
+     * substituted right operand also sets used_right_delta; the pointer
+     * comparison also declines a future substitution that does not set it. */
+    selection = wl_columnar_join_select_right(join, sess, right,
+            stack->items[stack->top - 1].is_delta);
+    if (selection.force_empty || selection.used_right_delta
+        || selection.right != right)
+        return 0;
 
     lk = (uint32_t *)calloc(join->key_count, sizeof(*lk));
     rk = (uint32_t *)calloc(join->key_count, sizeof(*rk));
@@ -385,6 +396,24 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             free(rk);
             return ENOTSUP;
         }
+    }
+    /* A key that resolved out of range came from the column-0 fallback
+     * above on a zero-column relation; the ordinary JOIN handles that
+     * input, so decline it.  This check must precede the type check,
+     * which indexes the column types by these keys. */
+    for (uint32_t i = 0; i < join->key_count; i++) {
+        if (lk[i] >= stack->items[stack->top - 1].rel->ncols
+            || rk[i] >= right->ncols) {
+            free(lk);
+            free(rk);
+            return 0;
+        }
+    }
+    if (!col_join_key_types_compatible(stack->items[stack->top - 1].rel, lk,
+        right, rk, join->key_count)) {
+        free(lk);
+        free(rk);
+        return EINVAL;
     }
 
     rc = col_join_batch_producer_create(sess, join,

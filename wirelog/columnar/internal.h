@@ -2782,8 +2782,9 @@ uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row);
 
-/* join.c helpers shared with join_batch.c (Issue #1446).  Internal only:
- * hidden visibility keeps them out of the library's export map. */
+/* join.c helpers shared with join_batch.c (Issue #1446) and
+ * join_pipeline.c.  Internal only: hidden visibility keeps them out of the
+ * library's export map. */
 uint32_t
 col_join_output_width(const col_rel_t *left, const col_rel_t *right,
     const wl_plan_op_t *op);
@@ -2803,6 +2804,23 @@ col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
  * worker session installed one. */
 bool
 col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out);
+/* The right operand a JOIN reads: the named relation, its $d$ or $r$
+ * delta when the delta mode, iteration and retraction pass select one
+ * (used_right_delta), or nothing at all (force_empty). */
+typedef struct {
+    col_rel_t *right;
+    bool used_right_delta;
+    bool force_empty;
+} wl_columnar_join_selection_t;
+wl_columnar_join_selection_t
+wl_columnar_join_select_right(const wl_plan_op_t *op,
+    wl_col_session_t *sess, col_rel_t *right, bool left_is_delta);
+/* False when a FLOAT key column is paired with a non-FLOAT one.  Reads
+ * column_types[lk[k]] and column_types[rk[k]] when a relation has column
+ * types, so those keys must be in range for it. */
+bool
+col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
+    const col_rel_t *right, const uint32_t *rk, uint32_t key_count);
 /* Type-aware key equality for a candidate pair; arrangement chains may
  * return collision rows, so every probe verifies the keys. */
 static inline bool

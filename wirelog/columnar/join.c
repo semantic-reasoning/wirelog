@@ -575,7 +575,7 @@ col_join_set_left_output_types(col_rel_t *out, const col_rel_t *left,
     return rc;
 }
 
-static bool
+bool
 col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
     const col_rel_t *right, const uint32_t *rk, uint32_t key_count)
 {
@@ -1151,13 +1151,7 @@ col_join_pair_batch_end(col_rel_append_batch_t *batch, int rc)
     return rc != 0 ? rc : end_rc;
 }
 
-typedef struct {
-    col_rel_t *right;
-    bool used_right_delta;
-    bool force_empty;
-} wl_columnar_join_selection_t;
-
-static wl_columnar_join_selection_t
+wl_columnar_join_selection_t
 wl_columnar_join_select_right(const wl_plan_op_t *op,
     wl_col_session_t *sess, col_rel_t *right, bool left_is_delta)
 {

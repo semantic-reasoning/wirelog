@@ -51,6 +51,9 @@ pipeline_session_destroy(wl_col_session_t *sess)
         arr_free_contents(&sess->arr_entries[i].arr);
     }
     free(sess->arr_entries);
+    /* The ordinary JOIN over a $d$ right operand builds a delta
+     * arrangement. */
+    col_session_free_delta_arrangements(sess);
     session_rel_free_hash(sess);
     delta_pool_destroy(sess->delta_pool);
     free(sess);
@@ -974,6 +977,411 @@ test_excluded_map_is_diagnosed(void)
     pipeline_session_destroy(sess);
 }
 
+/* Right-operand selection, key-index range and key-type parity with the
+ * ordinary JOIN.  Plan: JOIN(k) -> FILTER(true) -> MAP[v, r] over
+ * right = {(0,100),(0,101),(1,200),(1,201)} and left = {(0,10),(1,20)}.
+ * join_batch_bytes = 64 is two 32-byte join rows per batch, so a consumed
+ * full-relation JOIN runs the MAP twice and a declined one runs it once. */
+#define SEL_BATCH_BYTES 64u
+#define SEL_MAX_ROWS 8u
+
+typedef struct {
+    int rc;
+    uint32_t stack_top;
+    bool left_kept;
+    uint32_t nrows;
+    int64_t rows[SEL_MAX_ROWS][2];
+} sel_run_t;
+
+static const char *const sel_names[] = { "k", "r" };
+
+static int
+sel_add(wl_col_session_t *sess, const char *name, const int64_t *rows,
+    uint32_t nrows)
+{
+    col_rel_t *rel = pipeline_relation(name, sel_names, 2, rows, nrows);
+    if (!rel)
+        return ENOMEM;
+    if (session_add_rel(sess, rel) != 0) {
+        col_rel_destroy(rel);
+        return ENOMEM;
+    }
+    return 0;
+}
+
+static wl_col_session_t *
+sel_session(void)
+{
+    static const int64_t right[] = { 0, 100, 0, 101, 1, 200, 1, 201 };
+    wl_col_session_t *sess = pipeline_session();
+    if (!sess)
+        return NULL;
+    if (sel_add(sess, "right", right, 4) != 0
+        || !col_session_get_arrangement(&sess->base, "right",
+        (const uint32_t[]){ 0 }, 1)) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static int
+sel_row_cmp(const void *a, const void *b)
+{
+    const int64_t *x = (const int64_t *)a;
+    const int64_t *y = (const int64_t *)b;
+    for (uint32_t c = 0; c < 2; c++) {
+        if (x[c] != y[c])
+            return x[c] < y[c] ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Evaluate @plan over @left (owned by the stack; NULL builds the default
+ * two-row non-delta left) with the given batch budget. */
+static sel_run_t
+sel_eval(wl_col_session_t *sess, const wl_plan_relation_t *plan,
+    uint32_t batch_bytes, col_rel_t *left)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    sel_run_t run;
+    eval_stack_t stack;
+
+    memset(&run, 0, sizeof(run));
+    run.rc = ENOMEM;
+    if (!left)
+        left = pipeline_relation("left", left_names, 2, left_rows, 2);
+    eval_stack_init(&stack);
+    if (!left || eval_stack_push_delta(&stack, left, true, false) != 0) {
+        col_rel_destroy(left);
+        return run;
+    }
+    sess->join_batch_bytes = batch_bytes;
+    run.rc = col_eval_relation_plan(plan, &stack, sess);
+    run.stack_top = stack.top;
+    run.left_kept = stack.top == 1 && stack.items[0].rel == left;
+    if (run.rc == 0 && stack.top == 1 && stack.items[0].rel
+        && stack.items[0].rel->ncols == 2
+        && stack.items[0].rel->nrows <= SEL_MAX_ROWS) {
+        const col_rel_t *out = stack.items[0].rel;
+        run.nrows = out->nrows;
+        for (uint32_t r = 0; r < out->nrows; r++) {
+            run.rows[r][0] = out->columns[0][r];
+            run.rows[r][1] = out->columns[1][r];
+        }
+        qsort(run.rows, run.nrows, sizeof(run.rows[0]), sel_row_cmp);
+    } else if (run.rc == 0) {
+        run.nrows = UINT32_MAX;
+    }
+    (void)eval_stack_drain(&stack);
+    return run;
+}
+
+static bool
+sel_rows_are(const sel_run_t *run, const int64_t (*want)[2], uint32_t n)
+{
+    if (run->rc != 0 || run->nrows != n)
+        return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (run->rows[i][0] != want[i][0] || run->rows[i][1] != want[i][1])
+            return false;
+    }
+    return true;
+}
+
+typedef struct {
+    wl_plan_op_t ops[3];
+    wl_plan_relation_t plan;
+} sel_plan_t;
+
+static void
+sel_plan_init(sel_plan_t *p, wl_delta_mode_t mode)
+{
+    static const char *const keys[] = { "k" };
+    static const uint32_t project[] = { 1, 3 };
+    static uint8_t predicate[] = { WL_PLAN_EXPR_BOOL, 1 };
+    memset(p, 0, sizeof(*p));
+    p->ops[0].op = WL_PLAN_OP_JOIN;
+    p->ops[0].right_relation = "right";
+    p->ops[0].left_keys = keys;
+    p->ops[0].right_keys = keys;
+    p->ops[0].key_count = 1;
+    p->ops[0].delta_mode = mode;
+    p->ops[1].op = WL_PLAN_OP_FILTER;
+    p->ops[1].filter_expr = (wl_plan_expr_buffer_t){ predicate,
+                                                     sizeof(predicate) };
+    p->ops[2].op = WL_PLAN_OP_MAP;
+    p->ops[2].project_indices = project;
+    p->ops[2].project_count = 2;
+    p->plan.ops = p->ops;
+    p->plan.op_count = 3;
+}
+
+typedef enum {
+    SEL_FORCE_DELTA,
+    SEL_FORCE_EMPTY,
+    SEL_AUTO,
+    SEL_RETRACTION,
+    SEL_FULL,
+} sel_case_t;
+
+static wl_col_session_t *
+sel_case_session(sel_case_t c)
+{
+    static const int64_t delta[] = { 0, 101 };
+    static const int64_t retracted[] = { 1, 201 };
+    wl_col_session_t *sess = sel_session();
+    if (!sess)
+        return NULL;
+    sess->current_iteration = c == SEL_RETRACTION ? 0u : 1u;
+    sess->retraction_right_pass = c == SEL_RETRACTION;
+    if ((c == SEL_FORCE_DELTA || c == SEL_AUTO || c == SEL_FULL)
+        && sel_add(sess, "$d$right", delta, 1) != 0) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    if (c == SEL_RETRACTION && sel_add(sess, "$r$right", retracted, 1) != 0) {
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static void
+test_pipeline_right_selection_matches_join(void)
+{
+    static const int64_t want_delta[][2] = { { 10, 101 } };
+    static const int64_t want_retracted[][2] = { { 20, 201 } };
+    static const int64_t want_full[][2] = {
+        { 10, 100 }, { 10, 101 }, { 20, 200 }, { 20, 201 },
+    };
+    static const struct {
+        sel_case_t c;
+        wl_delta_mode_t mode;
+        const int64_t (*want)[2];
+        uint32_t nwant;
+        const char *name;
+    } cases[] = {
+        { SEL_FORCE_DELTA, WL_DELTA_FORCE_DELTA, want_delta, 1,
+          "FORCE_DELTA reads $d$right" },
+        { SEL_FORCE_EMPTY, WL_DELTA_FORCE_DELTA, NULL, 0,
+          "FORCE_DELTA without $d$right is empty" },
+        { SEL_AUTO, WL_DELTA_AUTO, want_delta, 1,
+          "AUTO with a non-delta left reads the smaller $d$right" },
+        { SEL_RETRACTION, WL_DELTA_FORCE_FULL, want_retracted, 1,
+          "retraction right pass reads $r$right" },
+        { SEL_FULL, WL_DELTA_FORCE_FULL, want_full, 4,
+          "FORCE_FULL reads the persistent relation" },
+    };
+
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        sel_plan_t p;
+        sel_run_t off;
+        sel_run_t on;
+        uint32_t on_map_calls;
+        wl_col_session_t *off_sess = sel_case_session(cases[i].c);
+        wl_col_session_t *on_sess = sel_case_session(cases[i].c);
+
+        CHECK(off_sess && on_sess, cases[i].name);
+        if (!off_sess || !on_sess) {
+            pipeline_session_destroy(off_sess);
+            pipeline_session_destroy(on_sess);
+            continue;
+        }
+        sel_plan_init(&p, cases[i].mode);
+        pl_observe_reset();
+        off = sel_eval(off_sess, &p.plan, 0, NULL);
+        pl_observe_reset();
+        on = sel_eval(on_sess, &p.plan, SEL_BATCH_BYTES, NULL);
+        on_map_calls = pl_map_calls;
+        if (!sel_rows_are(&off, cases[i].want, cases[i].nwant)
+            || !sel_rows_are(&on, cases[i].want, cases[i].nwant)) {
+            fprintf(stderr, "  %s: off rc=%d rows=%u, on rc=%d rows=%u\n",
+                cases[i].name, off.rc, off.nrows, on.rc, on.nrows);
+            CHECK(false, "batched JOIN reads the right operand the ordinary "
+                "JOIN selects");
+        }
+        if (cases[i].c == SEL_FULL) {
+            CHECK(on_map_calls == 2,
+                "a full-relation JOIN is consumed batch by batch");
+        } else {
+            if (on_map_calls != 1)
+                fprintf(stderr, "  %s: %u MAP calls\n", cases[i].name,
+                    on_map_calls);
+            CHECK(on_map_calls == 1,
+                "a delta or empty right operand is left to the ordinary JOIN");
+        }
+        if (cases[i].c != SEL_FORCE_EMPTY && cases[i].c != SEL_FULL) {
+            CHECK(on_sess->join_batch_last_reason
+                == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT,
+                "a delta right operand records the delta-right fallback");
+        }
+        pipeline_session_destroy(off_sess);
+        pipeline_session_destroy(on_sess);
+    }
+
+    {
+        sel_plan_t p;
+        sel_run_t on;
+        wl_col_session_t *sess = sel_case_session(SEL_FORCE_DELTA);
+        CHECK(sess != NULL, "strict delta-right fixture");
+        if (sess) {
+            sel_plan_init(&p, WL_DELTA_FORCE_DELTA);
+            sess->join_batch_strict = true;
+            pl_observe_reset();
+            on = sel_eval(sess, &p.plan, SEL_BATCH_BYTES, NULL);
+            CHECK(on.rc == ENOTSUP && on.left_kept && pl_map_calls == 0,
+                "strict mode rejects a delta right operand with a tail and "
+                "keeps the left input");
+            pipeline_session_destroy(sess);
+        }
+    }
+    pl_observe_reset();
+    wl_columnar_ops_test_before_map_dispose = NULL;
+}
+
+static void
+test_pipeline_key_types_match_join(void)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const wirelog_column_type_t left_types[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64,
+    };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    static const uint32_t budgets[] = { 0, SEL_BATCH_BYTES };
+
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); b++) {
+        sel_plan_t p;
+        sel_run_t run;
+        wl_col_session_t *sess = sel_session();
+        col_rel_t *left = col_rel_new_auto("left", 2);
+        int rc = !left ? ENOMEM : col_rel_set_schema(left, 2, left_names);
+        if (rc == 0)
+            rc = col_rel_set_column_types(left, left_types, 2);
+        for (uint32_t r = 0; rc == 0 && r < 2; r++)
+            rc = col_rel_append_row(left, left_rows + 2u * r);
+        CHECK(sess && rc == 0, "key-type fixture");
+        if (!sess || rc != 0) {
+            col_rel_destroy(left);
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+        pl_observe_reset();
+        run = sel_eval(sess, &p.plan, budgets[b], left);
+        if (run.rc != EINVAL)
+            fprintf(stderr, "  budget %u: rc=%d rows=%u\n", budgets[b],
+                run.rc, run.nrows);
+        CHECK(run.rc == EINVAL && pl_map_calls == 0,
+            "a FLOAT key against an INT64 key is EINVAL");
+        /* The ordinary JOIN disposes its left input on failure; the
+         * pipeline fails before popping it. */
+        CHECK(budgets[b] == 0 || run.left_kept,
+            "the batched key-type failure keeps the left input");
+        pipeline_session_destroy(sess);
+    }
+    pl_observe_reset();
+    wl_columnar_ops_test_before_map_dispose = NULL;
+}
+
+/* Call the pipeline directly and require that it leaves the stack alone. */
+static void
+sel_expect_decline(wl_col_session_t *sess, col_rel_t *left,
+    const char *message)
+{
+    sel_plan_t p;
+    eval_stack_t stack;
+    uint32_t next_index = UINT32_MAX;
+    int rc;
+
+    sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+    eval_stack_init(&stack);
+    if (eval_stack_push_delta(&stack, left, true, false) != 0) {
+        col_rel_destroy(left);
+        CHECK(false, message);
+        return;
+    }
+    sess->join_batch_bytes = SEL_BATCH_BYTES;
+    rc = wl_columnar_join_pipeline_try_eval(&p.plan, 0, &stack, sess,
+            &next_index);
+    if (rc != 0)
+        fprintf(stderr, "  %s: try_eval rc=%d\n", message, rc);
+    CHECK(rc == 0 && stack.top == 1 && stack.items[0].rel == left
+        && next_index == 0, message);
+    (void)eval_stack_drain(&stack);
+}
+
+/* A session whose "right" relation has no columns and no rows. */
+static wl_col_session_t *
+sel_zero_column_session(void)
+{
+    wl_col_session_t *sess = pipeline_session();
+    col_rel_t *right = col_rel_new_auto("right", 0);
+    if (!sess || !right || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
+static void
+test_pipeline_zero_column_right_declines(void)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    static const uint32_t budgets[] = { 0, SEL_BATCH_BYTES };
+
+    for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); b++) {
+        sel_plan_t p;
+        sel_run_t run;
+        wl_col_session_t *sess = sel_zero_column_session();
+        CHECK(sess != NULL, "zero-column right fixture");
+        if (!sess)
+            continue;
+        sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+        run = sel_eval(sess, &p.plan, budgets[b], NULL);
+        if (run.rc != 0 || run.nrows != 0)
+            fprintf(stderr, "  budget %u: rc=%d rows=%u\n", budgets[b],
+                run.rc, run.nrows);
+        CHECK(run.rc == 0 && run.nrows == 0,
+            "an empty zero-column right side joins to an empty result");
+        pipeline_session_destroy(sess);
+    }
+
+    {
+        wl_col_session_t *sess = sel_zero_column_session();
+        col_rel_t *left = pipeline_relation("left", left_names, 2,
+                left_rows, 2);
+        CHECK(sess && left, "zero-column right decline fixture");
+        if (sess && left)
+            sel_expect_decline(sess, left,
+                "the pipeline declines a zero-column right side");
+        else
+            col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+    }
+}
+
+static void
+test_pipeline_zero_column_left_declines(void)
+{
+    /* Only the pipeline's own decision is asserted: the ordinary bounded
+     * JOIN still rejects a zero-column left (issue #2170). */
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *left = col_rel_new_auto("left", 0);
+    CHECK(sess && left, "zero-column left fixture");
+    if (sess && left)
+        sel_expect_decline(sess, left,
+            "the pipeline declines a zero-column left side");
+    else
+        col_rel_destroy(left);
+    pipeline_session_destroy(sess);
+}
+
 int
 main(void)
 {
@@ -985,6 +1393,10 @@ main(void)
     test_expression_pipeline_failures_roll_back();
     test_expression_pipeline_budget_sweep();
     test_excluded_map_is_diagnosed();
+    test_pipeline_right_selection_matches_join();
+    test_pipeline_key_types_match_join();
+    test_pipeline_zero_column_right_declines();
+    test_pipeline_zero_column_left_declines();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);
