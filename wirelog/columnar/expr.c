@@ -1760,6 +1760,20 @@ struct wl_columnar_expr_attempt_numeric {
     wl_columnar_memory_reservation_t token;
 };
 
+#ifdef WL_SESSION_TEST_HOOKS
+size_t
+wl_columnar_expr_test_attempt_numeric_owner_size(void)
+{
+    return sizeof(wl_columnar_expr_attempt_numeric_t);
+}
+
+size_t
+wl_columnar_expr_test_attempt_numeric_instruction_size(void)
+{
+    return sizeof(expr_instr_t);
+}
+#endif
+
 /* Logical source funding, including ordinary outward refusal paths.
  * G9 saved-ID guard; C13 guarded debit prefix; T26 tail/T29 with caller.
  * Reservation init10; original move40; fixed ref retain4/get3.

@@ -2328,3 +2328,49 @@ prefixes include nested child admissions and report the original completed
 attempt. A reached-tail sum can omit prepaid caller fees and is not the
 billing oracle. These primitives do not activate FILTER/MAP or complete the
 operator coverage required by #1821.
+
+### Cooperative numeric FILTER
+
+The internal `wl_columnar_filter_op_attempt_start`, `step` and `ack` interface
+adds an opt-in FILTER operation to an original cleanup frame. A NULL control
+delegates to the existing raw FILTER. The normal engine dispatch is unchanged;
+MAP and the remaining operator integration are separate work.
+
+The controlled path gathers from a protected scalar source and builds a private
+heap output. It supports numeric predicates, including an absent predicate,
+and preserves selected row order, schema metadata and all five timestamp
+fields. Unsupported expressions fail without an unmetered fallback. The
+original stack entry is replaced only after successful completion. A stopped
+attempt discards its private output and preserves the original entry.
+
+The current contract requires original frame and control authority, serialized
+use on the owning thread, and private output without escaped readers or
+pool/arena aliases. Every descendant uses the saved attempt ID. Restarting a
+control does not authorize old work to debit the successor. A configured work
+limit of zero means unlimited; a positive limit below the first admission
+refuses execution with zero consumed work.
+
+Cleanup advances through separately scheduled stages. If FINISH retains the
+original input because a reader still holds it, the operation stays at FINISH.
+Each subsequent retry needs a fresh host credit. RESET begins only after
+FINISH releases that ownership, and a retained RESET stays at RESET. Execution
+and cleanup results are distinct; callers must retain the frame until DONE and
+acknowledgment, then perform checked frame destruction.
+
+The test host uses a finite FIFO and returns after one job. Its lifecycle
+credits are one-shot: a successful non-sentinel admission consumes 512 work
+units, and a sentinel consumes 291. Scheduling consumes a credit before enqueue,
+including enqueue failure. A spent credit does not prove that the queued job
+has returned. The external host must establish that all dependent jobs have
+returned or been canceled before releasing their targets; the lifetime-ready
+argument is that host's assertion, not an automatic scan of arbitrary jobs.
+
+The source-work accounting measures scalar operations and control flow, with
+each increment counted as arithmetic plus a store. It excludes instrumentation
+and the established allocator, control/reference and physical retirement
+interiors. It does not guarantee wall-clock latency or bounded atomic retries.
+The largest accepted cleanup interval is the CLEAR stage at 256 units,
+including outer dispatch. Fixture setup and observation occur outside those
+bounded turns. Runtime correctness and performance require separate evidence;
+source accounting alone establishes neither throughput nor raw-path speed
+parity.

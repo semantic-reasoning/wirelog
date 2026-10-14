@@ -2736,6 +2736,13 @@ int wl_columnar_eval_stack_unary_finish(
     wl_columnar_eval_stack_cleanup_frame_t *, int);
 int wl_columnar_eval_stack_unary_reset(
     wl_columnar_eval_stack_cleanup_frame_t *);
+/* Callback-free original/session/LIFO/IDLE validator. Borrowed stack is
+ * written only on success; failed validation changes no authority. Caller
+ * serializes frame/session use; IDLE has no stored creator-thread identity. */
+int wl_columnar_eval_stack_operator_stack(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    eval_stack_t **);
+
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame);
@@ -3534,6 +3541,12 @@ int wl_columnar_relation_scalar_source_gather_attempt_controlled(
 int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const char *name,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Operator-only pinned constructor uses eight-byte byte admissions. Original
+ * source/control storage lifetimes and publication contracts are unchanged;
+ * legacy constructor keeps its own sixteen-byte budget/event protocol. */
+int wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
 /* Original controlled HELD batch, same original control/ID, private self-owned
  * destination distinct from descriptor/owner, matching width, stable values.
  * Preserve selected TS fields and signed multiplicity exactly; noTS performs
@@ -3543,6 +3556,13 @@ int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
  * those locals before any record/lease/row/TS read. Reload current pointers
  * after renewal. Caller must inspect actual ENDED authority on batch drain. */
 int wl_columnar_relation_append_batch_selected_source_row_controlled(
+    wl_columnar_relation_append_batch_t *batch,
+    wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
+    const int64_t *values, uint32_t width);
+/* Operator-specific selection adds two separately admitted pure-validation
+ * cutpoints before destination reads and hooks. Original control storage is
+ * caller-pinned and lifecycle serialized. Legacy selected API is unchanged. */
+int wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
     wl_columnar_relation_append_batch_t *batch,
     wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
     const int64_t *values, uint32_t width);
@@ -4314,6 +4334,9 @@ wl_columnar_expr_eval_attempt_controlled(
     const int64_t *row, uint32_t ncols, int64_t *value, bool *failed,
     wl_evaluation_control_t *control, uint64_t attempt_id);
 #ifdef WL_SESSION_TEST_HOOKS
+/* Configured ABI dimensions for independent attempt-owner resource oracles. */
+size_t wl_columnar_expr_test_attempt_numeric_owner_size(void);
+size_t wl_columnar_expr_test_attempt_numeric_instruction_size(void);
 /* phases:1/2 consumed byte in first/second pass;3 evaluated instruction;
  * 4 reserved;5 moved;6 committed before publication;7 evaluation publication;
  * 8 physical storage freed but credit still held (mandatory cleanup, NULL ctl).
@@ -5270,6 +5293,143 @@ extern bool wl_columnar_diff_test_fail_copy_alloc;
 extern bool wl_columnar_diff_test_fail_copy_append;
 extern bool wl_columnar_merge_test_fail_copy_alloc;
 extern bool wl_columnar_merge_test_fail_copy_append;
+#endif
+
+/* Opt-in numeric FILTER with original frame-owned cooperative cleanup.
+ * Each YIELD resumes on a later host dispatch on the same native thread.
+ * Keep session/source/backing alive until DONE acknowledgement. A synchronous
+ * pump cannot claim the per-dispatch bound. NULL control delegates raw FILTER.
+ * Status contains no authority; protocol errno never consumes a live context. */
+typedef enum {
+    WL_COLUMNAR_FILTER_PROGRESS_NOT_STARTED = 0,
+    WL_COLUMNAR_FILTER_PROGRESS_YIELD,
+    WL_COLUMNAR_FILTER_PROGRESS_RETAINED,
+    WL_COLUMNAR_FILTER_PROGRESS_DONE
+} wl_columnar_filter_progress_t;
+
+typedef struct {
+    wl_columnar_filter_progress_t progress;
+    int execution_result;
+    int cleanup_result;
+    int semantic_result;
+    bool committed;
+} wl_columnar_filter_status_t;
+
+typedef enum {
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_NEW = 0,
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER,
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_CLEAR,
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_FINAL,
+    WL_COLUMNAR_RELATION_PRIVATE_BATCH_DONE
+} wl_columnar_relation_private_batch_phase_t;
+
+typedef struct wl_columnar_relation_private_batch_drain {
+    struct wl_columnar_relation_private_batch_drain *identity;
+    wl_columnar_relation_append_batch_t *batch;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    uint64_t bound_nonce;
+    col_rel_t *bound_relation;
+    wl_columnar_relation_private_batch_phase_t phase;
+    uint32_t cursor;
+    int release_error;
+    bool result_saved;
+} wl_columnar_relation_private_batch_drain_t;
+
+/* Original initialized private self-owned scalar B2 output only. This API
+ * drains genuine partial acquisition/renewal states, including owner_count0
+ * with descriptor authority. Each invocation retires at most one writer or
+ * clears at most eight meaningful fields. No control access or debit. Caller
+ * keeps original storage/relation alive and serializes the native owner.
+ * Nonzero protocol/release status preserves remaining original authority.
+ * done means authority drained, not semantic success; first result is latched
+ * independently. Existing raw and B2 end entrypoints retain their contracts. */
+void wl_columnar_relation_private_batch_drain_init(
+    wl_columnar_relation_private_batch_drain_t *);
+int wl_columnar_relation_private_batch_drain_step(
+    wl_columnar_relation_private_batch_drain_t *,
+    wl_columnar_relation_append_batch_t *, int, bool *);
+
+typedef enum {
+    WL_COLUMNAR_FILTER_STAGE_INERT = 0,
+    WL_COLUMNAR_FILTER_STAGE_RUNNING,
+    WL_COLUMNAR_FILTER_STAGE_BATCH,
+    WL_COLUMNAR_FILTER_STAGE_PROGRAM,
+    WL_COLUMNAR_FILTER_STAGE_PHYSICAL,
+    WL_COLUMNAR_FILTER_STAGE_CREDIT,
+    WL_COLUMNAR_FILTER_STAGE_REFERENCE,
+    WL_COLUMNAR_FILTER_STAGE_SOURCE,
+    WL_COLUMNAR_FILTER_STAGE_DECIDE,
+    WL_COLUMNAR_FILTER_STAGE_CONTROL,
+    WL_COLUMNAR_FILTER_STAGE_FINISH,
+    WL_COLUMNAR_FILTER_STAGE_RESET,
+    WL_COLUMNAR_FILTER_STAGE_DONE
+} wl_columnar_filter_stage_t;
+
+typedef struct wl_columnar_filter_context {
+    struct wl_columnar_filter_context *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    bool busy;
+    wl_columnar_filter_stage_t stage;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    bool pin_owned;
+    int execution_result, cleanup_result, semantic_result;
+    uint32_t row, width, nrows;
+    bool result_latched;
+    bool committed, unary_started;
+    bool source_initialized, batch_initialized, drain_initialized;
+    bool heap, admitted, credit_committed, ref_held;
+    wl_columnar_relation_scalar_source_t source;
+    wl_columnar_relation_append_batch_t batch;
+    wl_columnar_relation_private_batch_drain_t batch_drain;
+    wl_columnar_expr_attempt_numeric_t *program;
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_governor_ref_t *governor;
+    col_rel_t *output;
+    /* Constructor provenance, erased before any output disposal. */
+    col_rel_t *private_output;
+    int64_t inline_values[16];
+    int64_t *values;
+} wl_columnar_filter_context_t;
+
+/* Borrow embedded original context after original frame validation. No owner
+ * transfer or old-control access; callers never copy the returned record. */
+int wl_columnar_eval_stack_filter_context(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **);
+/* Private finish-status bridge, validated original live FILTER context only.
+ * semantic is the designated context semantic_result slot or a disjoint live
+ * external int; retained is a live bool disjoint from frame/context/semantic.
+ * Protocol refusal leaves both outputs untouched. No other context aliasing. */
+int wl_columnar_eval_stack_filter_finish(
+    wl_columnar_eval_stack_cleanup_frame_t *, int, int *, bool *);
+int wl_columnar_filter_op_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+int wl_columnar_filter_op_attempt_step(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *);
+int wl_columnar_filter_op_attempt_ack(wl_columnar_eval_stack_cleanup_frame_t *);
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_filter_test_attempt_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+extern int wl_columnar_filter_test_attempt_fail_allocation;
 #endif
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

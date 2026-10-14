@@ -1664,3 +1664,16 @@ old control/source lifetime ends. Joined-thread fixtures exercise rejection
 before the original thread drains. No new atomic site is introduced: this
 record composes the existing source-access and control primitives. Both
 creation and work fixtures participate in the existing TSan suite.
+
+### Cooperative FILTER atomic sites
+
+These four sites extend the preceding inventory from 318 to 322. FILTER uses
+an original thread-confined scratch token; its operator-specific row growth
+validates retained ownership under the destination's existing writer authority.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `filter.c:wl_columnar_filter_op_attempt_start` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the exclusively owned original scratch token owner before reservation; no concurrent publication |
+| `filter.c:wl_columnar_filter_op_attempt_start#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition, then bind identity to this original token address |
+| `relation.c:wl_columnar_relation_row_body_operator` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | With original destination writers and exclusive token authority, verify relation ownership before operator-specific growth |
+| `relation.c:wl_columnar_relation_row_body_operator#2` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Require COMMITTED before growth; separate owner/state reads do not imply a coherent shared-governor snapshot |

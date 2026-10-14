@@ -1714,3 +1714,846 @@ col_filt_cache_pin_release(col_filt_cache_pin_t *pin)
     }
     memset(pin, 0, sizeof(*pin));
 }
+
+/* Numeric transactional FILTER source draft. Tariffs below are provisional
+ * until the independent expanded-source gate; no measured bound is claimed. */
+enum {
+    WL_COLUMNAR_FILTER_ATTEMPT_ENTRY_WORK = 224,
+    WL_COLUMNAR_FILTER_ATTEMPT_INIT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_UNARY_BEGIN_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_INPUT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_GOVERNOR_PIN_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_SIZE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_RESERVE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_ALLOCATE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_COMMIT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_PREDICATE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_BATCH_BEGIN_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_NUMERIC_EVAL_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SELECTION_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_INIT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_BEGIN_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_SHAPE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_COMPILE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_GATHER_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SELECTED_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_BATCH_INIT_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_ROW_WORK = 128,
+    /* Provisional named first-retirement admissions, not count certificates. */
+    WL_COLUMNAR_FILTER_ATTEMPT_LIFECYCLE_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_UNARY_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_REFERENCE_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_RETIRE_WORK = 192,
+    WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_RETIRE_WORK = 192,
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_filter_test_attempt_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t);
+int wl_columnar_filter_test_attempt_fail_allocation = -1;
+#endif
+
+static int
+wl_columnar_filter_attempt_guard(wl_evaluation_control_t *control, uint64_t id)
+{
+    return !control || !id
+           || wl_evaluation_control_active_attempt_id(control) != id
+        ? EINVAL : 0;
+}
+
+static int
+wl_columnar_filter_attempt_charge(wl_evaluation_control_t *control,
+    uint64_t id, uint64_t work)
+{
+    int rc = wl_columnar_filter_attempt_guard(control, id);
+    return rc ? rc : wl_evaluation_control_charge(control, work);
+}
+
+static int
+wl_columnar_filter_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_filter_attempt_guard(control, id);
+    if (rc)
+        return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_filter_test_attempt_checkpoint)
+        wl_columnar_filter_test_attempt_checkpoint(control, phase, progress);
+#else
+    (void)phase;
+    (void)progress;
+#endif
+    return wl_columnar_filter_attempt_charge(control, id, 0);
+}
+
+/* A child can finish/restart the attempt in a hook. Check immutable locals
+ * before any further callback/debit, and arbitrate positive control errors. */
+static int
+wl_columnar_filter_attempt_return(wl_evaluation_control_t *control,
+    uint64_t id, int child_result)
+{
+    int tail = wl_columnar_filter_attempt_charge(control, id, 0);
+    return tail > 0 ? tail : child_result ? child_result : tail;
+}
+
+static void *
+wl_columnar_filter_attempt_allocate(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_filter_test_attempt_fail_allocation >= 0) {
+        if (wl_columnar_filter_test_attempt_fail_allocation == 0)
+            return NULL;
+        --wl_columnar_filter_test_attempt_fail_allocation;
+    }
+#endif
+    return malloc(bytes);
+}
+
+static void
+wl_columnar_filter_attempt_single_init(
+    wl_columnar_relation_mutation_single_t *single)
+{
+    single->set.identity = 0;
+    single->set.acquisition_nonce = 0;
+    single->set.roles = 0;
+    single->set.descriptors = 0;
+    single->set.owners = 0;
+    single->set.leases = 0;
+    single->set.initializations = 0;
+    single->set.descriptor_count = 0;
+    single->set.owner_count = 0;
+    single->set.lease_count = 0;
+    single->set.initialization_count = 0;
+    single->set.descriptors_acquired = 0;
+    single->set.owners_acquired = 0;
+    single->set.terminal_sequence = 0;
+    single->set.terminal_expected_events = 0;
+    single->set.terminal_observed_events = 0;
+    single->set.terminal_sequence_consumed = 0;
+    single->set.published = 0;
+    single->role.relation = 0;
+    single->role.role_flags = 0;
+    single->descriptor.relation = 0;
+    single->owners[0].owner = 0;
+    single->owners[1].owner = 0;
+    single->lease.identity = 0;
+    single->lease.acquisition_nonce = 0;
+    single->lease.set = 0;
+    single->lease.relation = 0;
+    single->lease.owner = 0;
+    single->lease.descriptor_slot = 0;
+    single->lease.owner_slot = 0;
+    single->lease.self_owner_slot = 0;
+    single->lease.relation_identity = 0;
+    single->lease.relation_generation = 0;
+    single->lease.owner_identity = 0;
+    single->lease.owner_generation = 0;
+    single->lease.role_flags = 0;
+    single->lease.detached = 0;
+    single->lease.storage_transitioned = 0;
+    single->initialization.relation = 0;
+    single->initialization.owner_identity = 0;
+    single->initialization.owner_generation = 0;
+    single->initialization.borrows = 0;
+    single->descriptor.writer.owner = 0;
+    single->descriptor.writer.secondary_owner = 0;
+    single->descriptor.writer.identity = 0;
+    single->descriptor.writer.thread_valid = 0;
+    single->owners[0].writer.owner = 0;
+    single->owners[0].writer.secondary_owner = 0;
+    single->owners[0].writer.identity = 0;
+    single->owners[0].writer.thread_valid = 0;
+    single->owners[1].writer.owner = 0;
+    single->owners[1].writer.secondary_owner = 0;
+    single->owners[1].writer.identity = 0;
+    single->owners[1].writer.thread_valid = 0;
+}
+
+static void
+wl_columnar_filter_attempt_batch_init(
+    wl_columnar_relation_append_batch_t *batch)
+{
+    batch->identity = NULL; batch->control = NULL; batch->attempt_id = 0;
+    batch->phase = WL_COLUMNAR_RELATION_BATCH_EMPTY;
+    batch->raw_mode = false; batch->result_saved = false;
+    batch->saved_result = 0;
+    batch->raw.relation = NULL; batch->raw.active = false;
+    batch->raw.verified_generation = 0;
+    wl_columnar_filter_attempt_single_init(&batch->raw.single);
+}
+
+static bool
+wl_columnar_filter_attempt_thread(const wl_columnar_filter_context_t *ctx)
+{
+    if (!ctx->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(ctx->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return ctx->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(ctx->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static void
+wl_columnar_filter_attempt_status_init(wl_columnar_filter_status_t *status)
+{
+    status->progress = WL_COLUMNAR_FILTER_PROGRESS_NOT_STARTED;
+    status->execution_result = 0; status->cleanup_result = 0;
+    status->semantic_result = 0; status->committed = false;
+}
+
+static void
+wl_columnar_filter_attempt_status(const wl_columnar_filter_context_t *ctx,
+    wl_columnar_filter_status_t *status, wl_columnar_filter_progress_t progress)
+{
+    status->progress = progress;
+    status->execution_result = ctx->execution_result;
+    status->cleanup_result = ctx->cleanup_result;
+    status->semantic_result = ctx->semantic_result;
+    status->committed = ctx->committed;
+}
+
+int
+wl_columnar_filter_op_attempt_start(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t attempt_id,
+    wl_columnar_filter_status_t *status)
+{
+    if (!status) return EINVAL;
+    wl_columnar_filter_attempt_status_init(status);
+    if (!op) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack(frame, sess, &stack);
+    if (rc) return rc;
+    if (!control) {
+        int result = wl_columnar_filter_op(op, stack, sess);
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = result; status->semantic_result = result;
+        return 0;
+    }
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    if (rc) return rc;
+    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->governor = NULL;
+    ctx->values = ctx->inline_values;
+    ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->drain_initialized = false;
+    ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
+    ctx->ref_held = false; ctx->unary_started = false;
+    ctx->committed = false; ctx->result_latched = false;
+    ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->semantic_result = 0; ctx->control = NULL; ctx->pin_owned = false;
+    ctx->thread_valid = false; ctx->busy = false;
+    ctx->frame = frame; ctx->session = sess; ctx->attempt_id = attempt_id;
+    /* Existing control/reference interior has no finite CAS or time claim. */
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    ctx->control = control; ctx->pin_owned = true; ctx->identity = ctx;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true; ctx->busy = true;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 1, 0);
+    if (rc)
+        goto done;
+    /* First-retirement ledger (all numbers provisional until source recount):
+     * 10 LIFECYCLE slots cover BATCH/PROGRAM/PHYSICAL/CREDIT/REFERENCE/SOURCE/
+     * DECIDE/CONTROL/FINISH/RESET, each including status/FIFO host suffix;
+     * RESET also includes same-turn ACK. Each is paid before any child owner.
+     * Owner supplements below pay that stage's actual nonempty child routing;
+     * child prepaid retirement is counted once, never also spent on our host.
+     * Partial prepay refusal owns only fixed context/control activation. Its
+     * ten no-op/release turns + ACK are the explicitly unpaid bounded lifecycle
+     * bootstrap exception, including first ENTRY refusal with consumed0.
+     * No live child or indefinite retry is covered by that exception. */
+    for (unsigned stage = 0; stage < 10; ++stage) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_LIFECYCLE_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 17, stage);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_INIT_WORK);
+    if (rc)
+        goto done;
+    ctx->credit.governor = NULL; ctx->credit.bytes = 0;
+    ctx->credit.replacement_bytes = 0;
+    ctx->credit.transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    atomic_init(&ctx->credit.owner_bits, 0);
+    atomic_init(&ctx->credit.state, WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+    ctx->credit.identity = &ctx->credit;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 2, 0);
+    if (rc)
+        goto done;
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 2; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_UNARY_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 18, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_UNARY_BEGIN_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 3, 0);
+    if (rc)
+        goto done;
+    rc = wl_columnar_eval_stack_unary_begin_attempt_controlled(frame, control,
+            attempt_id);
+    if (rc)
+        goto done;
+    ctx->unary_started = true;
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_INPUT_WORK);
+    if (rc)
+        goto done;
+    const col_rel_t *input = NULL;
+    col_rel_t **out_slot = NULL;
+    rc = wl_columnar_eval_stack_unary_input(frame, &input);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_eval_stack_unary_output(frame, &out_slot);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 1; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 19, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_INIT_WORK);
+    if (rc)
+        goto done;
+    rc =
+        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
+            &ctx->source_initialized, control, attempt_id);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_BEGIN_WORK);
+    if (rc)
+        goto done;
+    rc =
+        wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        &ctx->source,
+        input, true);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    uint32_t width = 0, rows = 0;
+    bool timestamped = false;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_SOURCE_SHAPE_WORK);
+    if (rc)
+        goto done;
+    rc =
+        wl_columnar_relation_scalar_source_shape_attempt_controlled(
+        &ctx->source,
+        &width, &rows, &timestamped);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    ctx->width = width; ctx->nrows = rows;
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 1; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_REFERENCE_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 20, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_GOVERNOR_PIN_WORK);
+    if (rc)
+        goto done;
+    ctx->governor = sess->memory_governor
+        ? sess->memory_governor : input->memory_governor;
+    wl_columnar_memory_governor_ref_retain(ctx->governor);
+    ctx->ref_held = ctx->governor != NULL;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 4, width);
+    if (rc)
+        goto done;
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 1; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 21, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
+    if (rc)
+        goto done;
+    rc =
+        wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
+        &ctx->source, "$filter", ctx->governor, out_slot);
+    /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
+    ctx->output = *out_slot;
+    ctx->private_output = *out_slot;
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 2; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 22, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_SIZE_WORK);
+    if (rc)
+        goto done;
+    uint64_t bytes = 0;
+    bool sized = wl_columnar_memory_size_mul(width, sizeof(int64_t), &bytes)
+        && bytes <= SIZE_MAX;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 5, width);
+    if (rc > 0 || sized) {
+        if (rc)
+            goto done;
+    } else {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    if (width > 16) {
+        if (ctx->governor) {
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_RESERVE_WORK);
+            if (rc)
+                goto done;
+            rc = wl_columnar_filter_attempt_tail(control, attempt_id, 6, width);
+            if (rc)
+                goto done;
+            wl_columnar_memory_admission_status_t status;
+            rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+                wl_columnar_memory_governor_ref_get(ctx->governor), bytes,
+                &ctx->credit, &status, control, attempt_id);
+            if (rc)
+                goto done;
+            ctx->admitted = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+                || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+            int admission = ctx->admitted ? 0
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : EINVAL;
+            rc = wl_columnar_filter_attempt_return(control, attempt_id,
+                    admission);
+            if (rc)
+                goto done;
+        }
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_ALLOCATE_WORK);
+        if (rc)
+            goto done;
+        ctx->values = wl_columnar_filter_attempt_allocate((size_t)bytes);
+        ctx->heap = ctx->values != NULL;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 7, width);
+        if (rc > 0 || ctx->heap) {
+            if (rc)
+                goto done;
+        } else {
+            rc = ENOMEM;
+            goto done;
+        }
+        if (ctx->admitted) {
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_COMMIT_WORK);
+            if (rc)
+                goto done;
+            rc = wl_columnar_filter_attempt_tail(control, attempt_id, 8, width);
+            if (rc)
+                goto done;
+            rc = wl_columnar_memory_governor_commit_attempt_controlled(
+                &ctx->credit, ctx->values, &ctx->credit_committed, control,
+                attempt_id);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc)
+                goto done;
+        }
+    }
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 1; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 23, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_PREDICATE_WORK);
+    if (rc)
+        goto done;
+    bool has_expression = op->filter_expr.data && op->filter_expr.size;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 9, 0);
+    if (rc)
+        goto done;
+    if (has_expression) {
+        bool supported = false;
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_PROGRAM_COMPILE_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_expr_compile_attempt_controlled(op->filter_expr.data,
+                op->filter_expr.size, ctx->governor, &ctx->program, &supported,
+                control, attempt_id);
+        rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+        if (rc)
+            goto done;
+        if (!supported) {
+            rc = ENOTSUP;
+            goto done;
+        }
+    }
+    /* Eleven future steps get two128 halves each from22 payments. Each
+     * payment reserves64 for current loop/caller scaffolding,128 for future
+     * first cleanup; common BATCH is separate margin, never spent twice.
+     * First refusal uses prior PROGRAM caller funding; later refusal uses
+     * its latest unused128 instead of any nonexistent future batch step.
+     * This provisional capacity requires actual per-step/source recount. */
+    for (unsigned stage = 0; stage < 22; ++stage) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_BATCH_RETIRE_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 16, stage);
+        if (rc)
+            goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_BATCH_INIT_WORK);
+    if (rc)
+        goto done;
+    wl_columnar_filter_attempt_batch_init(&ctx->batch);
+    ctx->batch_initialized = true;
+    wl_columnar_relation_private_batch_drain_init(&ctx->batch_drain);
+    ctx->drain_initialized = true;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 10, 0);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_BATCH_BEGIN_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_filter_attempt_tail(control, attempt_id, 11, 0);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+            *out_slot, control);
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
+    for (uint32_t row = 0; row < rows; ++row) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_ROW_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 12, row);
+        if (rc)
+            goto done;
+        ctx->row = row;
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_GATHER_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_relation_scalar_source_gather_attempt_controlled(
+            &ctx->source, row, ctx->values, width);
+        rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+        if (rc)
+            goto done;
+        bool selected = true;
+        if (ctx->program) {
+            int64_t value = 0;
+            bool failed = false;
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_FILTER_ATTEMPT_NUMERIC_EVAL_WORK);
+            if (rc)
+                goto done;
+            rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
+                    ctx->values, width, &value, &failed, control, attempt_id);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc)
+                goto done;
+            selected = !failed && value != 0;
+        }
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_SELECTION_WORK);
+        if (rc)
+            goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 13, row);
+        if (rc)
+            goto done;
+        if (selected) {
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                    WL_COLUMNAR_FILTER_ATTEMPT_SELECTED_WORK);
+            if (rc)
+                goto done;
+            rc =
+                wl_columnar_relation_append_batch_selected_source_row_operator_controlled
+                (
+                &ctx->batch, &ctx->source, row, ctx->values, width);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc)
+                goto done;
+        }
+    }
+
+done:
+    /* Every live owner is embedded; cleanup returns through real host turns. */
+    ctx->execution_result = wl_columnar_filter_status(sess, ctx->output, rc);
+    ctx->semantic_result = ctx->execution_result;
+    ctx->result_latched = true; ctx->stage = WL_COLUMNAR_FILTER_STAGE_BATCH;
+    ctx->busy = false;
+    wl_columnar_filter_attempt_status(ctx, status,
+        WL_COLUMNAR_FILTER_PROGRESS_YIELD);
+    return 0;
+}
+
+static int
+wl_columnar_filter_attempt_context(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t **out)
+{
+    int rc = wl_columnar_eval_stack_filter_context(frame, out);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = *out;
+    if (ctx->identity != ctx || ctx->frame != frame || !ctx->session
+        || ctx->session->cleanup_active != frame
+        || ctx->stage <= WL_COLUMNAR_FILTER_STAGE_INERT
+        || ctx->stage > WL_COLUMNAR_FILTER_STAGE_DONE
+        || !wl_columnar_filter_attempt_thread(ctx))
+        return EINVAL;
+    return ctx->busy ? EBUSY : 0;
+}
+
+int
+wl_columnar_filter_op_attempt_step(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status)
+{
+    if (!status) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_filter_attempt_context(frame, &ctx);
+    if (rc) {
+        wl_columnar_filter_attempt_status_init(status);
+        return rc;
+    }
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING) {
+        wl_columnar_filter_attempt_status_init(status);
+        return EBUSY;
+    }
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_DONE) {
+        wl_columnar_filter_attempt_status(ctx, status,
+            WL_COLUMNAR_FILTER_PROGRESS_DONE);
+        return 0;
+    }
+    ctx->busy = true;
+    switch (ctx->stage) {
+    case WL_COLUMNAR_FILTER_STAGE_BATCH:
+        if (ctx->batch_initialized) {
+            if (!ctx->drain_initialized
+                || ctx->batch_drain.identity != &ctx->batch_drain) {
+                rc = EINVAL;
+                goto protocol_error;
+            }
+            bool done;
+            rc = wl_columnar_relation_private_batch_drain_step(
+                &ctx->batch_drain, &ctx->batch, ctx->execution_result, &done);
+            if (rc) {
+                if (ctx->batch_drain.release_error != rc)
+                    goto protocol_error;
+                ctx->cleanup_result = rc;
+                goto retained;
+            }
+            ctx->cleanup_result = 0;
+            if (!done) break;
+            ctx->batch_initialized = false;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_PROGRAM;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_PROGRAM: {
+        wl_columnar_expr_attempt_numeric_t *program = ctx->program;
+        ctx->program = NULL;
+        wl_columnar_expr_attempt_numeric_free(program);
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_PHYSICAL;
+        break;
+    }
+    case WL_COLUMNAR_FILTER_STAGE_PHYSICAL:
+        if (ctx->heap) {
+            int64_t *physical = ctx->values;
+            ctx->values = ctx->inline_values;
+            ctx->heap = false;
+            free(physical);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_CREDIT;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_CREDIT:
+        if (ctx->admitted) {
+            bool released = ctx->credit_committed
+                ? wl_columnar_memory_release(&ctx->credit)
+                : wl_columnar_memory_rollback(&ctx->credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL;
+                goto retained;
+            }
+            ctx->admitted = false;
+        }
+        ctx->cleanup_result = 0;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_REFERENCE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_REFERENCE:
+        if (ctx->ref_held) {
+            wl_columnar_memory_governor_ref_t *ref = ctx->governor;
+            ctx->governor = NULL; ctx->ref_held = false;
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_SOURCE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_SOURCE:
+        if (ctx->source_initialized) {
+            (void)wl_columnar_relation_scalar_source_end(&ctx->source,
+                ctx->execution_result);
+            if (ctx->source.phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+                abort();
+            ctx->source_initialized = false;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_DECIDE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_DECIDE:
+        if (!ctx->pin_owned) {
+            rc = EINVAL;
+            goto protocol_error;
+        }
+        if (!ctx->execution_result && ctx->unary_started) {
+            rc = wl_columnar_filter_attempt_charge(ctx->control,
+                    ctx->attempt_id, 0);
+            if (!rc)
+                rc = wl_columnar_eval_stack_unary_commit_attempt_controlled(
+                    frame, &ctx->committed);
+            ctx->execution_result = rc;
+            ctx->semantic_result = rc;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_CONTROL;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_CONTROL: {
+        if (!ctx->pin_owned) {
+            rc = EINVAL;
+            goto protocol_error;
+        }
+        /* After this stage no helper may evaluate dormant old control values. */
+        wl_evaluation_control_t *control = ctx->control;
+        ctx->control = NULL; ctx->pin_owned = false;
+        ctx->output = NULL;
+        wl_evaluation_control_release(control);
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_FINISH;
+        break;
+    }
+    case WL_COLUMNAR_FILTER_STAGE_FINISH:
+        if (ctx->unary_started) {
+            bool finish_retained = false;
+            rc = wl_columnar_eval_stack_filter_finish(frame,
+                    ctx->execution_result, &ctx->semantic_result,
+                    &finish_retained);
+            if (rc) goto protocol_error;
+            if (finish_retained) goto retained;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_RESET;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_RESET:
+        if (ctx->unary_started) {
+            rc = wl_columnar_eval_stack_unary_reset(frame);
+            if (rc) {
+                if (rc != EBUSY) goto protocol_error;
+                goto retained;
+            }
+            ctx->unary_started = false;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_DONE;
+        break;
+    default:
+        rc = EINVAL;
+        goto protocol_error;
+    }
+    ctx->busy = false;
+    wl_columnar_filter_attempt_status(ctx, status,
+        ctx->stage == WL_COLUMNAR_FILTER_STAGE_DONE
+        ? WL_COLUMNAR_FILTER_PROGRESS_DONE : WL_COLUMNAR_FILTER_PROGRESS_YIELD);
+    return 0;
+retained:
+    ctx->busy = false;
+    wl_columnar_filter_attempt_status(ctx, status,
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    return 0;
+protocol_error:
+    ctx->busy = false;
+    wl_columnar_filter_attempt_status_init(status);
+    return rc;
+}
+
+int
+wl_columnar_filter_op_attempt_ack(
+    wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    wl_columnar_filter_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    if (rc) return rc;
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT)
+        return 0;
+    rc = wl_columnar_filter_attempt_context(frame, &ctx);
+    if (rc) return rc;
+    if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
+        || ctx->unary_started || ctx->source_initialized ||
+        ctx->batch_initialized
+        || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
+        ctx->output || ctx->private_output)
+        return EBUSY;
+    ctx->thread_valid = false; ctx->frame = NULL; ctx->session = NULL;
+    ctx->values = ctx->inline_values; ctx->governor = NULL;
+    ctx->attempt_id = 0; ctx->result_latched = false;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->semantic_result = 0; ctx->committed = false;
+    ctx->credit_committed = false; ctx->drain_initialized = false;
+    ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_INERT;
+    return 0;
+}
