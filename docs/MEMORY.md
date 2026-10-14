@@ -2186,3 +2186,48 @@ Existing admission totals `928 + 224*N` and `1726 + 224*N` remain separate from
 unary fees; the TOKEN region now includes two explicit identity/IDLE stores and
 has envelope124 under its fee128. These logical source bounds are not latency
 bounds, default-operator coverage or whole issue #1821 completion.
+### Caller-attempt auto construction
+
+The internal `wl_columnar_relation_new_auto_governed_attempt_controlled` and
+`wl_columnar_relation_new_auto_attempt_controlled` primitives prepare empty,
+untyped, scalar relations without timestamps for a later MAP transaction.
+They use the supplied original attempt ID throughout construction. The governed
+form requires a governor and preserves the requested logical capacity, including
+zero; a positive-width zero-capacity relation still allocates one physical lane
+element. The plain form uses `COL_REL_INIT_CAP` (64) and private heap storage.
+It does not introduce pool or arena reuse or promise the raw operator's peak.
+Generated names, schema, default graph/declaration fields and generations match
+the corresponding raw constructors. FLOAT values remain raw lane bits, including
+negative zero; these functions do not attach FLOAT type metadata.
+
+The caller supplies an exclusive writable output slot with no live owned value.
+A single output-NULL normalization store is the bounded bootstrap exception;
+an initial refusal may consume zero work while executing the fixed rejection
+scaffold. Recipe and local initialization occur only after paid admission.
+NULL control delegates raw behavior: the plain wrapper maps a raw NULL result,
+including a NULL name, to ENOMEM. Controlled invalid arguments return EINVAL,
+with positive accounting errors and stale-attempt errors taking precedence over
+cancellation. No new public API or operator dispatch is enabled here.
+
+Four new admissions cost 128 each. Successful billing is 512 plus the actual
+existing builder schedule, including all three reserve and commit caller fees
+even without a governor. Each nonzero governed D/M/P child adds reserve fees
+74+54+84+29 and commit fees 74+54+29; a real failed reserve CAS adds another 84.
+The new wrapper envelopes are 80/64/64/64. Expanded child return chains are
+18/21/24; the inherited COMMIT caller envelope is 92+20+2=114, within its 128 fee.
+The conservative reserve composition is 168+82=250, within the 256 quantum.
+Actual child polls separate earlier commit work from its final continuation
+(at most 62); the move/install and caller edge fit 178 within the existing 220.
+These are source-work bounds with the established control, allocator,
+instrumentation and mandatory physical/token/reference retirement exclusions,
+not whole-call latency bounds.
+
+Until the final original-ID admission and tail succeed, the completed relation
+belongs to a lexical private local. A stop destroys it with checked destruction;
+an impossible private destruction refusal aborts rather than losing ownership.
+A still-NULL frame slot owns nothing. After actual publication into a registered
+unary frame slot, legitimate readers may make later cleanup return EBUSY; that
+slot retains ownership for a serialized retry after the reader is released.
+Privileged test hooks can recover an owner address from a still-live committed
+reservation, but acquiring private readers is an invariant violation. The death
+fixture for that violation is distinct from supported postpublication retention.

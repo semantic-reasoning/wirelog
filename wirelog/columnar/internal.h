@@ -3447,6 +3447,34 @@ int
 wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Caller-attempt-bound untyped auto construction without timestamps.
+ * The supplied nonzero ID is immutable; name/control/governor remain live
+ * and the output slot is exclusive, disjoint, and holds no live owned result.
+ * One fixed output-normalization store may occur on inactive/stale/first
+ * admission refusal. All recipe/local initialization requires paid work.
+ * Governed mode is strict (non-NULL governor) and preserves explicit capacity;
+ * plain mode uses the raw default capacity and private heap storage, without
+ * a pool/arena or equivalent allocator/peak-threshold promise.
+ * NULL control delegates each raw counterpart. Raw plain pointer failure maps
+ * to ENOMEM, including NULL name; controlled NULL name reports EINVAL.
+ * No types or timestamp buffers are installed; FLOAT lanes remain raw bits.
+ * Until actual publication, only the private lexical local owns the output.
+ * A stop checked-destroys it or fails stop on impossible destruction refusal;
+ * a still-NULL caller/frame slot cannot retain private failed authority.
+ * No supported private reader/ownership escape is allowed before publication.
+ * This is not pointer secrecy: privileged instrumentation can recover committed
+ * owner_bits, but must not read unfinished storage or acquire private readers.
+ * After publication the original caller slot owns normal cleanup and may use
+ * the persistent unary protocol. No recipe pointer survives this call. */
+int
+wl_columnar_relation_new_auto_governed_attempt_controlled(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+int
+wl_columnar_relation_new_auto_attempt_controlled(
+    const char *name, uint32_t ncols, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
 /* Fresh private scalar construction. Same strict non-NULL name/governor/out
 * domain as raw; NULL control delegates raw. The name remains immutable for
 * this call. Logical work counts byte scans/copies/zeroing, generated digits,
