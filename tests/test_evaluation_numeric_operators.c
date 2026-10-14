@@ -33,6 +33,9 @@ typedef struct {
     wl_evaluation_control_t *external_control;
     uint64_t original_id;
     wl_columnar_filter_status_t status;
+    int (*start)(const wl_plan_op_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+        wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+        wl_columnar_filter_status_t *);
     int protocol_result;
     bool started, parked, done;
     uint64_t last_turn;
@@ -60,7 +63,7 @@ host_filter_dispatch(host_queue_t *queue, host_job_t *job)
     wl_columnar_filter_status_t status;
     int protocol = entry->started
         ? wl_columnar_filter_op_attempt_step(entry->frame, &status)
-        : wl_columnar_filter_op_attempt_start(entry->op, entry->frame,
+        : entry->start(entry->op, entry->frame,
             entry->session, entry->external_control, entry->original_id,
             &status);
     entry->last_turn = queue->turn;
@@ -1032,6 +1035,7 @@ wl_columnar_filter_test_prepare(wl_columnar_filter_test_scenario_t *scenario,
     }
     scenario->funding_id =
         wl_evaluation_control_active_attempt_id(scenario->funding);
+    scenario->filter.start = wl_columnar_filter_op_attempt_start;
     scenario->filter.session = scenario->session;
     scenario->filter.op = &scenario->op;
     scenario->filter.external_control = scenario->target;
@@ -1798,7 +1802,7 @@ wl_columnar_filter_test_native_finish(void *argument)
 }
 
 static void
-wl_columnar_filter_test_busy_finish(void)
+wl_columnar_filter_test_busy_finish(bool map)
 {
     wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
     CHECK(scenario);
@@ -1807,6 +1811,11 @@ wl_columnar_filter_test_busy_finish(void)
     CHECK(wl_columnar_source_access_reader_acquire(&input->source_access,
         &reader) == 0);
     wl_columnar_filter_test_prepare(scenario, input, true, NULL, 0, false);
+    if (map) {
+        scenario->op.op = WL_PLAN_OP_MAP;
+        scenario->op.project_count = 2;
+        scenario->filter.start = wl_columnar_filter_map_attempt_start;
+    }
     wl_columnar_filter_test_schedule(scenario, 0, false);
     wl_columnar_filter_test_one_turn(scenario);
     wl_columnar_filter_test_sentinel(scenario);
@@ -2184,13 +2193,21 @@ wl_columnar_filter_test_peer_collision(void)
 }
 
 static void
-wl_columnar_filter_test_credit_retry(void)
+wl_columnar_filter_test_credit_retry(bool map)
 {
     wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
     CHECK(scenario);
     wl_columnar_filter_test_prepare(scenario,
         wl_columnar_filter_test_source(17, 1, false, false, false), true, NULL,
         0, false);
+    if (map) {
+        scenario->op.op = WL_PLAN_OP_MAP;
+        scenario->op.project_count = 2;
+        scenario->filter.start = wl_columnar_filter_map_attempt_start;
+    }
+    wl_columnar_filter_stage_t stage = map
+        ? WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT :
+        WL_COLUMNAR_FILTER_STAGE_CREDIT;
     wl_columnar_filter_test_schedule(scenario, 0, false);
     wl_columnar_filter_test_one_turn(scenario);
     wl_columnar_filter_test_sentinel(scenario);
@@ -2203,8 +2220,9 @@ wl_columnar_filter_test_credit_retry(void)
             wl_columnar_filter_context_t *ctx = NULL;
             CHECK(wl_columnar_eval_stack_filter_context(scenario->filter.frame,
                 &ctx) == 0);
-            if (!armed && ctx->stage == WL_COLUMNAR_FILTER_STAGE_CREDIT) {
-                CHECK(ctx->admitted && !ctx->heap &&
+            if (!armed && ctx->stage == stage) {
+                CHECK(map ? ctx->table.admitted && !ctx->table.programs
+                    : ctx->admitted && !ctx->heap &&
                     ctx->values == ctx->inline_values);
                 wl_columnar_memory_governor_test_refuse_next_release();
                 armed = true;
@@ -2220,8 +2238,9 @@ wl_columnar_filter_test_credit_retry(void)
     wl_columnar_filter_context_t *ctx = NULL;
     CHECK(wl_columnar_eval_stack_filter_context(scenario->filter.frame,
         &ctx) == 0);
-    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_CREDIT && ctx->admitted &&
-        !ctx->heap);
+    CHECK(ctx->stage == stage);
+    CHECK(map ? ctx->table.admitted && !ctx->table.programs
+        : ctx->admitted && !ctx->heap);
     uint64_t held = wl_columnar_filter_test_reserved(scenario->session);
     wl_columnar_filter_test_schedule(scenario, 12, false);
     wl_columnar_filter_test_sentinel(scenario);
@@ -2388,7 +2407,7 @@ wl_columnar_filter_test_host_credit_boundaries(void)
 
 static void
 wl_columnar_filter_test_nonfinite(wl_columnar_filter_test_program_t *program,
-    bool referenced)
+    bool referenced, bool map)
 {
     wl_col_session_t *raw_session = wl_columnar_filter_test_session();
     wl_columnar_eval_stack_cleanup_frame_t *raw_frame = NULL;
@@ -2403,12 +2422,23 @@ wl_columnar_filter_test_nonfinite(wl_columnar_filter_test_program_t *program,
     wl_plan_op_t op = {.op = WL_PLAN_OP_FILTER};
     op.filter_expr.data = program->bytes;
     op.filter_expr.size = program->size;
-    int raw_result = wl_columnar_filter_op(&op, raw_stack, raw_session);
+    wl_plan_expr_buffer_t expression = {.data = program->bytes,
+                                        .size = program->size};
+    if (map) {
+        op.op = WL_PLAN_OP_MAP; op.project_count = 2;
+        op.map_expr_count = 1; op.map_exprs = &expression;
+    }
+    int raw_result = map ? col_op_map(&op, raw_stack, raw_session)
+        : wl_columnar_filter_op(&op, raw_stack, raw_session);
     wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
     CHECK(scenario);
     col_rel_t *input = wl_columnar_filter_test_source(2, 5, true, false, false);
     input->columns[1][4] = wl_columnar_float_to_bits(NAN);
     wl_columnar_filter_test_prepare(scenario, input, true, program, 0, false);
+    if (map) {
+        scenario->op = op;
+        scenario->filter.start = wl_columnar_filter_map_attempt_start;
+    }
     wl_columnar_filter_test_run(scenario);
     CHECK(scenario->filter.done);
     int controlled_result = scenario->filter.status.execution_result;
@@ -2556,6 +2586,675 @@ wl_columnar_filter_test_table_retirement(unsigned slots, unsigned mode,
     free(scenario);
 }
 
+static void
+wl_columnar_filter_test_map_prepare(
+    wl_columnar_filter_test_scenario_t *scenario,
+    uint32_t width, uint32_t rows, bool typed, bool timestamps,
+    const wl_plan_op_t *op, uint64_t limit)
+{
+    wl_columnar_filter_test_prepare(scenario,
+        wl_columnar_filter_test_source(width, rows, typed, timestamps, false),
+        true, NULL, limit, false);
+    scenario->op = *op;
+    scenario->filter.start = wl_columnar_filter_map_attempt_start;
+}
+
+static void
+wl_columnar_filter_test_map_run(wl_columnar_filter_test_scenario_t *scenario)
+{
+    wl_columnar_filter_test_schedule(scenario, 0, false);
+    wl_columnar_filter_test_one_turn(scenario);
+    wl_columnar_filter_test_sentinel(scenario);
+    unsigned turns = 0;
+    while (scenario->queue.count) {
+        CHECK(++turns < 4096);
+        bool sentinel = scenario->queue.jobs[scenario->queue.head]->dispatch
+            == host_sentinel_dispatch;
+        wl_columnar_filter_test_one_turn(scenario);
+        if (sentinel && scenario->filter.job.queued &&
+            scenario->sentinel_next < 4)
+            wl_columnar_filter_test_sentinel(scenario);
+    }
+    CHECK(scenario->filter.done || scenario->filter.parked);
+}
+
+static void
+wl_columnar_filter_test_map_original(
+    wl_columnar_filter_test_scenario_t *scenario,
+    const eval_entry_t *original)
+{
+    eval_stack_t *stack =
+        wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+    CHECK(stack->top == 1);
+    const eval_entry_t *entry = &stack->items[0];
+    CHECK(entry->kind == original->kind && entry->rel == original->rel
+        && entry->owned == original->owned &&
+        entry->continuation == original->continuation);
+    CHECK(entry->is_delta == original->is_delta &&
+        entry->seg_boundaries == original->seg_boundaries &&
+        entry->seg_count == original->seg_count);
+}
+
+static wl_evaluation_control_report_t
+wl_columnar_filter_test_map_case(uint32_t width, uint32_t rows,
+    uint32_t outputs,
+    unsigned mode, uint32_t expr_count, bool typed, uint64_t limit,
+    int expected)
+{
+    wl_columnar_filter_test_program_t *programs = calloc(outputs ? outputs : 1,
+            sizeof(*programs));
+    wl_plan_expr_buffer_t *expressions = calloc(expr_count ? expr_count : 1,
+            sizeof(*expressions));
+    uint32_t *indices = calloc(outputs ? outputs : 1, sizeof(*indices));
+    CHECK(programs && expressions && indices);
+    for (uint32_t c = 0; c < outputs; ++c) {
+        indices[c] = c + 1 == outputs ? width + 3 : width ? (c + 1) % width : 0;
+        if (mode && c < expr_count && c % 2 == 0) {
+            wl_columnar_filter_test_program_t *program = &programs[c];
+            if (mode == 1 || mode == 3) {
+                wl_columnar_filter_test_variable(program, WL_PLAN_EXPR_VAR, 0);
+                wl_columnar_filter_test_constant(program,
+                    WL_PLAN_EXPR_CONST_INT, mode == 3 ? 0 : c + 7);
+                wl_columnar_filter_test_opcode(program,
+                    mode ==
+                    3 ? WL_PLAN_EXPR_ARITH_DIV : WL_PLAN_EXPR_ARITH_ADD);
+            } else if (mode == 5) {
+                wl_columnar_filter_test_variable(program,
+                    WL_PLAN_EXPR_VAR_FLOAT, width - 1);
+                wl_columnar_filter_test_constant(program,
+                    WL_PLAN_EXPR_CONST_FLOAT, wl_columnar_float_to_bits(0.25));
+                wl_columnar_filter_test_opcode(program, WL_PLAN_EXPR_ARITH_ADD);
+            } else if (mode == 6) {
+                wl_columnar_filter_test_constant(program,
+                    WL_PLAN_EXPR_CONST_INT, INT64_MAX);
+                wl_columnar_filter_test_constant(program,
+                    WL_PLAN_EXPR_CONST_INT, 1);
+                wl_columnar_filter_test_opcode(program, WL_PLAN_EXPR_ARITH_ADD);
+            } else if (mode == 2) {
+                wl_columnar_filter_test_constant(program,
+                    WL_PLAN_EXPR_CONST_FLOAT,
+                    wl_columnar_float_to_bits(-0.5));
+            } else {
+                wl_columnar_filter_test_opcode(program, WL_PLAN_EXPR_CONST_STR);
+            }
+            expressions[c].data = program->bytes;
+            expressions[c].size = program->size;
+        }
+    }
+    wl_plan_op_t op = {0};
+    op.op = WL_PLAN_OP_MAP;
+    op.project_count = outputs;
+    op.project_indices = indices;
+    op.map_exprs = mode ? expressions : NULL;
+    op.map_expr_count = expr_count;
+    wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
+    CHECK(scenario);
+    wl_columnar_filter_test_map_prepare(scenario, width, rows, typed, true, &op,
+        limit);
+    eval_stack_t *stack =
+        wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+    eval_entry_t original = stack->items[0];
+    wl_columnar_filter_test_map_run(scenario);
+    CHECK(scenario->filter.done &&
+        scenario->filter.status.execution_result == expected);
+    if (!expected) {
+        wl_col_session_t *raw_session = wl_columnar_filter_test_session();
+        eval_stack_t raw_stack = {0};
+        CHECK(eval_stack_push(&raw_stack,
+            wl_columnar_filter_test_source(width, rows, typed, true, false),
+            true) == 0);
+        CHECK(col_op_map(&op, &raw_stack, raw_session) == 0);
+        CHECK(scenario->filter.status.committed && stack->top == 1);
+        wl_columnar_filter_test_equal(stack->items[0].rel,
+            raw_stack.items[0].rel);
+        CHECK(!stack->items[0].rel->column_types &&
+            !stack->items[0].rel->timestamps);
+        CHECK(eval_stack_dispose_entry(&raw_stack, &raw_stack.items[0]) == 0);
+        CHECK(!wl_columnar_filter_test_reserved(raw_session));
+        wl_columnar_memory_governor_ref_release(raw_session->memory_governor);
+        free(raw_session);
+    } else {
+        CHECK(!scenario->filter.status.committed);
+        wl_columnar_filter_test_map_original(scenario, &original);
+        if (expected == ERANGE) {
+            wl_col_session_t *raw_session = wl_columnar_filter_test_session();
+            eval_stack_t raw_stack = {0};
+            CHECK(eval_stack_push(&raw_stack,
+                wl_columnar_filter_test_source(width, rows, typed, true, false),
+                true) == 0);
+            CHECK(col_op_map(&op, &raw_stack, raw_session) == ERANGE);
+            CHECK(!raw_stack.top &&
+                !wl_columnar_filter_test_reserved(raw_session));
+            wl_columnar_memory_governor_ref_release(
+                raw_session->memory_governor);
+            free(raw_session);
+        }
+    }
+    wl_evaluation_control_report_t report =
+        wl_columnar_filter_test_complete(scenario);
+    CHECK(report.result == expected);
+    free(scenario); free(indices); free(expressions); free(programs);
+    return report;
+}
+
+static void
+wl_columnar_filter_test_map_faults(uint32_t width, uint32_t rows)
+{
+    wl_columnar_filter_test_program_t program = {0};
+    wl_columnar_filter_test_constant(&program, WL_PLAN_EXPR_CONST_INT, 3);
+    wl_plan_expr_buffer_t expressions[2] = {{0}};
+    expressions[0].data = program.bytes; expressions[0].size = program.size;
+    wl_plan_op_t op = {0};
+    op.op = WL_PLAN_OP_MAP; op.project_count = width + 1;
+    op.map_exprs = expressions; op.map_expr_count = 2;
+    unsigned count = 0, exercised = 0;
+    wl_columnar_filter_test_event_t *events = NULL;
+    for (unsigned event = 0; event <= count; ++event) {
+        if (event && width > 1) {
+            const wl_columnar_filter_test_event_t *item = &events[event - 1];
+            bool selected = false;
+            if (item->row == 0 || item->row == 64 || item->row == 128) {
+                bool first = true, last = true;
+                for (unsigned j = 0; j < count; ++j) {
+                    if (events[j].family != item->family ||
+                        events[j].phase != item->phase ||
+                        events[j].row != item->row) continue;
+                    if (j < event - 1) first = false;
+                    if (j > event - 1) last = false;
+                }
+                selected = first || last;
+            }
+            if (!selected) continue;
+        }
+        if (event) ++exercised;
+        unsigned modes = event ? 3 : 1;
+        for (unsigned mode = 0; mode < modes; ++mode) {
+            wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                    sizeof(*scenario));
+            CHECK(scenario);
+            wl_columnar_filter_test_map_prepare(scenario, width, rows, false,
+                false,
+                &op, 0);
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+            eval_entry_t original = stack->items[0];
+            wl_columnar_filter_test_trace_begin(scenario, event, mode);
+            wl_columnar_filter_test_map_run(scenario);
+            CHECK(scenario->filter.done &&
+                !wl_columnar_filter_test_successor_callbacks);
+            if (!event) {
+                count = wl_columnar_filter_test_event_count;
+                CHECK(count && !scenario->filter.status.execution_result);
+                events = malloc(count * sizeof(*events));
+                CHECK(events);
+                memcpy(events, wl_columnar_filter_test_events,
+                    count * sizeof(*events));
+            } else {
+                CHECK(wl_columnar_filter_test_event_count >= event);
+                int expected = mode == 0 ? WL_EVALUATION_CONTROL_CANCELLED
+                    : mode == 1 ? EOVERFLOW : EINVAL;
+                CHECK(scenario->filter.status.execution_result == expected);
+                wl_columnar_filter_test_map_original(scenario, &original);
+            }
+            wl_columnar_filter_test_trace_end();
+            wl_columnar_filter_test_complete(scenario);
+            free(scenario);
+        }
+    }
+    printf(
+        "MAP fault checkpoints width=%u rows=%u actual=%u exercised=%u modes=3\n",
+        width, rows, count, exercised);
+    free(events);
+}
+
+static void
+wl_columnar_filter_test_map_allocations(void)
+{
+    wl_columnar_filter_test_program_t program = {0};
+    wl_columnar_filter_test_constant(&program, WL_PLAN_EXPR_CONST_INT, 9);
+    wl_plan_expr_buffer_t expressions[17] = {{0}};
+    for (unsigned i = 0; i < 17; ++i) {
+        expressions[i].data = program.bytes; expressions[i].size = program.size;
+    }
+    wl_plan_op_t op = {0};
+    op.op = WL_PLAN_OP_MAP; op.project_count = 17;
+    op.map_exprs = expressions; op.map_expr_count = 17;
+    unsigned counts[3] = {0};
+    for (unsigned family = 0; family < 3; ++family) {
+        for (unsigned ordinal = 0; ordinal <= counts[family]; ++ordinal) {
+            wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                    sizeof(*scenario));
+            CHECK(scenario);
+            wl_columnar_filter_test_map_prepare(scenario, 17, 2, false, true,
+                &op, 0);
+            if (family ==
+                0) wl_columnar_relation_test_constructor_fail_allocation =
+                    ordinal ? ordinal : UINT32_MAX;
+            if (family ==
+                1) wl_columnar_expr_test_fail_allocation =
+                    ordinal ? (int)ordinal - 1 : 100000;
+            if (family ==
+                2) wl_columnar_filter_test_attempt_fail_allocation =
+                    ordinal ? (int)ordinal - 1 : 100000;
+            wl_columnar_filter_test_map_run(scenario);
+            if (!ordinal) {
+                counts[family] = family ==
+                    0 ? UINT32_MAX -
+                    wl_columnar_relation_test_constructor_fail_allocation
+                    : family ==
+                    1 ? (unsigned)(100000 -
+                    wl_columnar_expr_test_fail_allocation)
+                    : (unsigned)(100000 -
+                    wl_columnar_filter_test_attempt_fail_allocation);
+                CHECK(counts[family] &&
+                    scenario->filter.status.execution_result == 0);
+            } else {
+                CHECK(scenario->filter.status.execution_result == ENOMEM);
+                CHECK(!scenario->filter.status.committed &&
+                    !scenario->session->memory_budget_denied);
+            }
+            wl_columnar_relation_test_constructor_fail_allocation = 0;
+            wl_columnar_expr_test_fail_allocation = -1;
+            wl_columnar_filter_test_attempt_fail_allocation = -1;
+            wl_columnar_filter_test_complete(scenario);
+            free(scenario);
+        }
+        printf("MAP allocation family=%u reached=%u injected=%u\n", family,
+            counts[family], counts[family]);
+    }
+}
+
+static void
+wl_columnar_filter_test_map_literal_bytes(wl_columnar_filter_test_literal_t *s,
+    uint64_t bytes)
+{
+    wl_columnar_filter_test_literal_repeat(s, 224, (bytes + 7u) / 8u);
+}
+
+static void
+wl_columnar_filter_test_map_literal_name(wl_columnar_filter_test_literal_t *s,
+    uint32_t column)
+{
+    wl_columnar_filter_test_literal_add(s, 96);
+    for (unsigned i = 0; i < wl_columnar_filter_test_digits(column); i++)
+        wl_columnar_filter_test_literal_add(s, 96);
+    wl_columnar_filter_test_literal_add(s, 192);
+}
+
+static void
+wl_columnar_filter_test_map_literal_auto(const char *name, uint32_t width,
+    bool governed,
+    wl_columnar_filter_test_literal_t *s)
+{
+#define AUTO_R(v) wl_columnar_filter_test_literal_add(s, (v))
+#define AUTO_A(v) wl_columnar_filter_test_literal_add(s, (v))
+#define AUTO_POINTERS() do { for (uint32_t pos = 0; pos < width; \
+                                 pos += 8) { AUTO_R(192); } } while (0)
+#define AUTO_RESERVE(nonzero) do { AUTO_R(160); \
+                                   if (governed && (nonzero)) { AUTO_R(74); \
+                                                                AUTO_R(54); \
+                                                                AUTO_R(84); \
+                                                                AUTO_R(29); \
+                                   } } while (0)
+    AUTO_R(128); AUTO_R(128); AUTO_R(128); AUTO_R(192);
+    uint64_t name_bytes = strlen(name) + 1;
+    for (uint64_t i = 0; i < name_bytes; i++) AUTO_R(96);
+    for (unsigned i = 0; i < 6; i++) AUTO_R(96);
+    AUTO_R(96); /* no type bytes */
+    AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    if (governed) AUTO_R(96); /* scratch payload */
+    AUTO_R(128);
+    for (uint32_t i = 0; i < width; i++) {
+        wl_columnar_filter_test_map_literal_name(s, i);
+        AUTO_R(96); AUTO_R(96); AUTO_R(96);
+    }
+    AUTO_R(96); AUTO_RESERVE(true); AUTO_A(112);
+    wl_columnar_filter_test_map_literal_bytes(s, sizeof(col_rel_t));
+    for (unsigned i = 0; i < 5; i++) AUTO_R(96);
+    AUTO_A(112); wl_columnar_filter_test_map_literal_bytes(s, name_bytes);
+    AUTO_R(80); AUTO_R(112); AUTO_R(96);
+    AUTO_RESERVE(true); AUTO_RESERVE(width != 0);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) AUTO_A(112);
+        if (governed) AUTO_A(112);
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            wl_columnar_filter_test_map_literal_name(s, i); AUTO_A(112);
+            wl_columnar_filter_test_map_literal_bytes(s,
+                4u + wl_columnar_filter_test_digits(i));
+        }
+    }
+    AUTO_R(96); AUTO_A(112); wl_columnar_filter_test_map_literal_bytes(s, 3);
+    if (width) {
+        AUTO_A(112); AUTO_POINTERS();
+        for (uint32_t i = 0; i < width; i++) {
+            AUTO_A(128); AUTO_A(112);
+            wl_columnar_filter_test_map_literal_bytes(s, 2);
+            wl_columnar_filter_test_map_literal_name(s, i); AUTO_A(112);
+            wl_columnar_filter_test_map_literal_bytes(s,
+                4u + wl_columnar_filter_test_digits(i));
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        AUTO_R(128);
+        if (governed && (i < 2 || width)) {
+            AUTO_R(74); AUTO_R(54); AUTO_R(29);
+        }
+    }
+    AUTO_R(220); AUTO_R(128);
+#undef AUTO_RESERVE
+#undef AUTO_POINTERS
+#undef AUTO_A
+#undef AUTO_R
+}
+
+static void
+wl_columnar_filter_test_map_literal_row(
+    wl_columnar_filter_test_literal_t *literal,
+    uint32_t width, uint32_t selected_before, uint32_t capacity,
+    bool timestamps,
+    bool renewal)
+{
+#define L(v) wl_columnar_filter_test_literal_add(literal, (v))
+#define R(v, n) wl_columnar_filter_test_literal_repeat(literal, (v), (n))
+    L(192);
+    if (timestamps) L(128);
+    L(128); L(220); L(80);
+    if (width > 16) {
+        L(80); wl_columnar_filter_test_literal_reserve(literal);
+        wl_columnar_filter_test_literal_commit(literal); L(32);
+    }
+    R(36, width);
+    if (renewal) {
+        L(128); wl_columnar_filter_test_literal_single(literal); L(220);
+    }
+    L(63); L(103); R(36, (uint64_t)width * 2u);
+    if (selected_before < capacity) {
+        R(36, width);
+        if (timestamps) R(183, (sizeof(col_delta_timestamp_t) + 7u) / 8u);
+        L(48);
+    } else {
+        R(83, 5); L(76);
+        if (width ||
+            timestamps) wl_columnar_filter_test_literal_reserve(literal);
+        if (width) {
+            L(32); /* Pointer table allocation; lanes are initialized individually. */
+            for (uint32_t c = 0; c < width; ++c) {
+                L(32); R(183, selected_before); L(36);
+            }
+        }
+        if (timestamps) {
+            L(32);
+            R(183,
+                (uint64_t)capacity *
+                ((sizeof(col_delta_timestamp_t) + 7u) / 8u));
+            R(183, (sizeof(col_delta_timestamp_t) + 7u) / 8u);
+        }
+        L(69); L(151);
+        if (width || timestamps) {
+            L(26); L(228);
+        }
+        L(48);
+    }
+
+#undef R
+#undef L
+}
+
+static void
+wl_columnar_filter_test_map_literal_compile(
+    wl_columnar_filter_test_literal_t *literal,
+    const wl_columnar_filter_test_program_t *program)
+{
+#define L(v) wl_columnar_filter_test_literal_add(literal, (v))
+#define R(v, n) wl_columnar_filter_test_literal_repeat(literal, (v), (n))
+    L(128);
+    for (unsigned pass = 0; pass < 2; ++pass){
+        if (pass){
+            L(224); L(224);
+            wl_columnar_filter_test_literal_reserve(literal); R(224, 2);
+        }
+        uint32_t pos = 0;
+        while (pos < program->size){
+            L(192); L(224);
+            uint8_t tag = program->bytes[pos];
+            uint32_t length = 1, digits = 0;
+            if (tag == WL_PLAN_EXPR_CONST_INT ||
+                tag == WL_PLAN_EXPR_CONST_FLOAT) length = 9;
+            if (tag == WL_PLAN_EXPR_VAR || tag == WL_PLAN_EXPR_VAR_FLOAT){
+                uint16_t name_length;
+                memcpy(&name_length, program->bytes + pos + 1,
+                    sizeof(name_length));
+                length = 3u + name_length;
+                digits = name_length - 3u;
+            }
+            R(224, length); R(192, digits);
+            if (pass) L(192);
+            pos += length;
+        }
+    }
+    L(224); L(224); wl_columnar_filter_test_literal_commit(literal);
+    L(160);
+#undef R
+#undef L
+}
+
+/* Independent ordered fee schedule for generated untyped MAP results. Geometry
+ * and expression bytecode are fixture inputs; no measured total or production
+ * fee enum is used to construct the oracle. */
+static wl_columnar_filter_test_literal_t
+wl_columnar_filter_test_map_literal(uint32_t width, uint32_t rows,
+    uint32_t outputs, const wl_columnar_filter_test_program_t *program)
+{
+    wl_columnar_filter_test_literal_t literal = {0};
+    literal.capacity = 262144;
+    literal.prefix = malloc(literal.capacity * sizeof(*literal.prefix));
+    CHECK(literal.prefix);
+#define L(v) wl_columnar_filter_test_literal_add(&literal, (v))
+#define R(v, n) wl_columnar_filter_test_literal_repeat(&literal, (v), (n))
+    L(224); R(192, 10); L(192); R(192, 2); L(192);
+    L(160); L(128); L(256); L(192); L(192);
+    L(192); L(192); L(256); L(192); L(256);
+    L(96); L(144); L(224); L(96); L(144);
+    L(224); L(192); R(224, (width + 7u) / 8u);
+    L(192); L(128); L(192); L(192); L(192); L(192);
+    wl_columnar_filter_test_map_literal_auto("$map", outputs, true, &literal);
+    R(192, 2); L(192);
+    if ((uint64_t)width + outputs > 16) {
+        L(192); wl_columnar_filter_test_literal_reserve(&literal);
+        L(192); L(192); wl_columnar_filter_test_literal_commit(&literal);
+    }
+    L(192); R(256, 6); L(192);
+    if (outputs) {
+        L(192); L(192); wl_columnar_filter_test_literal_reserve(&literal);
+        L(192); L(192); wl_columnar_filter_test_literal_commit(&literal);
+    }
+    for (uint32_t c = 0; c < outputs; ++c) {
+        L(256); L(192);
+        if (program && c == 0) {
+            L(192);
+            wl_columnar_filter_test_map_literal_compile(&literal, program);
+        }
+    }
+    R(192, 22); L(192); L(192); L(170);
+    wl_columnar_filter_test_literal_single(&literal);
+    for (uint32_t row = 0; row < rows; ++row) {
+        L(128); L(192); L(128); R(224, (width + 7u) / 8u);
+        for (uint32_t c = 0; c < outputs; ++c) {
+            L(192);
+            if (program && c == 0) {
+                L(192); L(96);
+                for (uint32_t i = 0; i < program->instructions; ++i) {
+                    L(64); L(224);
+                    if (program->tags[i] == WL_PLAN_EXPR_VAR_FLOAT) L(160);
+                }
+                L(96);
+            }
+            L(192);
+        }
+        L(192);
+        wl_columnar_filter_test_map_literal_row(&literal, outputs, row, rows,
+            false, false);
+    }
+    L(192); L(128); L(128); L(128);
+#undef R
+#undef L
+    return literal;
+}
+
+static void
+wl_columnar_filter_test_map_budget(uint32_t width, uint32_t rows,
+    uint32_t outputs, bool expression, bool every_prefix)
+{
+    wl_columnar_filter_test_program_t program = {0};
+    wl_columnar_filter_test_constant(&program, WL_PLAN_EXPR_CONST_INT, 11);
+    wl_plan_expr_buffer_t expr = {0};
+    expr.data = program.bytes; expr.size = program.size;
+    wl_plan_op_t op = {0};
+    op.op = WL_PLAN_OP_MAP; op.project_count = outputs;
+    if (expression) {
+        op.map_exprs = &expr; op.map_expr_count = 1;
+    }
+    wl_columnar_filter_test_literal_t literal =
+        wl_columnar_filter_test_map_literal(
+        width, rows, outputs, expression ? &program : NULL);
+    for (size_t prefix = every_prefix ? 0 : literal.count - 1;
+        prefix < literal.count; ++prefix){
+        for (int delta = -1; delta <= 1; ++delta) {
+            uint64_t limit = literal.prefix[prefix] + delta;
+            wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                    sizeof(*scenario));
+            CHECK(scenario);
+            wl_columnar_filter_test_map_prepare(scenario, width, rows, false,
+                false, &op, limit);
+            eval_stack_t *stack =
+                wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+            eval_entry_t original = stack->items[0];
+            wl_columnar_filter_test_map_run(scenario);
+            int expected = limit <
+                literal.total ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+            CHECK(scenario->filter.done &&
+                scenario->filter.status.execution_result == expected);
+            if (expected) wl_columnar_filter_test_map_original(scenario,
+                    &original);
+            wl_evaluation_control_report_t report =
+                wl_columnar_filter_test_complete(scenario);
+            uint64_t consumed = 0;
+            for (size_t i = 0; i < literal.count && literal.prefix[i] <= limit;
+                ++i)
+                consumed = literal.prefix[i];
+            if (report.consumed != consumed)
+                fprintf(stderr,
+                    "MAP literal width=%u rows=%u outputs=%u prefix=%zu limit=%llu expected=%llu got=%llu total=%llu\n",
+                    width, rows, outputs, prefix, (unsigned long long)limit,
+                    (unsigned long long)consumed,
+                    (unsigned long long)report.consumed,
+                    (unsigned long long)literal.total);
+            CHECK(report.consumed == consumed && report.result == expected);
+            free(scenario);
+        }
+    }
+    free(literal.prefix);
+}
+
+static void
+wl_columnar_filter_test_map_failed_table_hook(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    if (phase == 103) wl_columnar_filter_test_event(control, 1, phase,
+            progress);
+}
+
+static void
+wl_columnar_filter_test_map_error_priority(void)
+{
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        wl_plan_op_t op = {0};
+        op.op = WL_PLAN_OP_MAP; op.project_count = 2;
+        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                sizeof(*scenario));
+        CHECK(scenario);
+        wl_columnar_filter_test_map_prepare(scenario, 1, 1, false, false, &op,
+            0);
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+        eval_entry_t original = stack->items[0];
+        wl_columnar_filter_test_trace_begin(scenario, 1, mode);
+        wl_columnar_relation_test_work_checkpoint = NULL;
+        wl_columnar_expr_test_checkpoint = NULL;
+        wl_columnar_eval_stack_test_checkpoint = NULL;
+        wl_columnar_memory_governor_test_work_checkpoint = NULL;
+        wl_columnar_memory_governor_test_checkpoint = NULL;
+        wl_columnar_filter_test_attempt_checkpoint =
+            wl_columnar_filter_test_map_failed_table_hook;
+        wl_columnar_filter_test_attempt_fail_allocation = 0;
+        wl_columnar_filter_test_map_run(scenario);
+        wl_columnar_filter_test_attempt_fail_allocation = -1;
+        CHECK(wl_columnar_filter_test_event_count == 1);
+        CHECK(!wl_columnar_filter_test_successor_callbacks);
+        int expected = mode == 0 ? ENOMEM : mode == 1 ? EOVERFLOW : EINVAL;
+        CHECK(scenario->filter.done &&
+            scenario->filter.status.execution_result == expected);
+        CHECK(!scenario->session->memory_budget_denied);
+        wl_columnar_filter_test_map_original(scenario, &original);
+        wl_columnar_filter_test_trace_end();
+        wl_columnar_filter_test_complete(scenario);
+        free(scenario);
+    }
+}
+
+/* The frame keeps its original governor; detach only the session's output
+ * policy during MAP to exercise its ungoverned capacity/growth branch. */
+static void
+wl_columnar_filter_test_map_ungoverned(void)
+{
+    unsigned reached = 0;
+    for (unsigned ordinal = 0; ordinal <= reached; ++ordinal) {
+        wl_plan_op_t op = {0};
+        op.op = WL_PLAN_OP_MAP; op.project_count = 17;
+        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                sizeof(*scenario));
+        CHECK(scenario);
+        wl_columnar_filter_test_map_prepare(scenario, 17, 133, false, false,
+            &op, 0);
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+        eval_entry_t original = stack->items[0];
+        wl_columnar_memory_governor_ref_t *governor =
+            scenario->session->memory_governor;
+        scenario->session->memory_governor = NULL;
+        wl_columnar_relation_test_growth_fail_allocation =
+            ordinal ? ordinal : UINT32_MAX;
+        wl_columnar_filter_test_map_run(scenario);
+        if (!ordinal) reached = UINT32_MAX -
+                wl_columnar_relation_test_growth_fail_allocation;
+        wl_columnar_relation_test_growth_fail_allocation = 0;
+        scenario->session->memory_governor = governor;
+        CHECK(scenario->filter.done);
+        if (ordinal) {
+            CHECK(scenario->filter.status.execution_result == ENOMEM);
+            wl_columnar_filter_test_map_original(scenario, &original);
+        } else {
+            CHECK(!scenario->filter.status.execution_result);
+            CHECK(stack->items[0].rel->nrows == 133 &&
+                stack->items[0].rel->ncols == 17);
+            col_rel_t *expected = wl_columnar_filter_test_source(17, 133, false,
+                    false, false);
+            for (uint32_t c = 0; c < 17; ++c)
+                for (uint32_t r = 0; r < 133; ++r)
+                    CHECK(stack->items[0].rel->columns[c][r] ==
+                        expected->columns[c][r]);
+            CHECK(col_rel_destroy_checked(expected) == 0);
+        }
+        wl_columnar_filter_test_complete(scenario);
+        free(scenario);
+    }
+    CHECK(reached > 0);
+    printf("MAP ungoverned growth allocations reached=%u injected=%u\n",
+        reached, reached);
+}
+
 int
 main(void)
 {
@@ -2602,16 +3301,47 @@ main(void)
         wl_columnar_filter_test_table_retirement(3, mode, mode == 2);
     }
     wl_columnar_filter_test_no_first_admission();
-    wl_columnar_filter_test_busy_finish();
-    wl_columnar_filter_test_credit_retry();
+    wl_columnar_filter_test_busy_finish(false);
+    wl_columnar_filter_test_busy_finish(true);
+    wl_columnar_filter_test_credit_retry(false);
+    wl_columnar_filter_test_credit_retry(true);
     wl_columnar_filter_test_host_credit_boundaries();
     wl_columnar_filter_test_peer_collision();
     wl_columnar_filter_test_unsupported();
-    wl_columnar_filter_test_nonfinite(&mixed, false);
-    wl_columnar_filter_test_nonfinite(&floating, true);
+    wl_columnar_filter_test_nonfinite(&mixed, false, false);
+    wl_columnar_filter_test_nonfinite(&mixed, false, true);
+    wl_columnar_filter_test_nonfinite(&floating, true, false);
+    wl_columnar_filter_test_nonfinite(&floating, true, true);
     wl_columnar_filter_test_faults(1, 1, true, &yes, true);
     wl_columnar_filter_test_faults(17, 133, true, &yes, false);
     wl_columnar_filter_test_allocations(&yes);
+    const uint32_t map_widths[] = {0, 1, 17, 37, 129};
+    for (unsigned i = 0; i < 5; ++i) {
+        uint32_t width = map_widths[i];
+        wl_columnar_filter_test_map_case(width, 0, width, 0, width + 2, false,
+            0, 0);
+        wl_columnar_filter_test_map_case(width, 3, width, 0, width, true, 0, 0);
+        wl_columnar_filter_test_map_case(width, 133, width + 1, 1,
+            width / 2 + 1, false, 0, 0);
+        wl_columnar_filter_test_map_case(width, 3, width, 2, width + 2, true, 0,
+            0);
+    }
+    wl_columnar_filter_test_map_case(17, 270, 37, 5, 37, true, 0, 0);
+    wl_columnar_filter_test_map_case(1, 3, 2, 6, 2, false, 0, ERANGE);
+    wl_columnar_filter_test_map_case(1, 3, 2, 3, 2, false, 0, ERANGE);
+    wl_columnar_filter_test_map_case(1, 0, 2, 4, 2, false, 0, ENOTSUP);
+    wl_columnar_filter_test_map_case(1, 3, 2, 4, 2, false, 0, ENOTSUP);
+    wl_evaluation_control_report_t map_first = wl_columnar_filter_test_map_case(
+        1, 1, 2, 1, 2, false, 1, WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(map_first.consumed == 0);
+    wl_columnar_filter_test_map_budget(0, 0, 0, false, true);
+    wl_columnar_filter_test_map_budget(1, 1, 2, true, true);
+    wl_columnar_filter_test_map_budget(17, 133, 37, true, false);
+    wl_columnar_filter_test_map_faults(1, 1);
+    wl_columnar_filter_test_map_faults(17, 133);
+    wl_columnar_filter_test_map_allocations();
+    wl_columnar_filter_test_map_error_priority();
+    wl_columnar_filter_test_map_ungoverned();
     printf(
         "numeric FILTER: semantic, literal, FIFO, retention, authority and fault witnesses passed\n");
     return 0;

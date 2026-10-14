@@ -2400,3 +2400,34 @@ completed-work telemetry. Initializing and compiling slots require their own
 forward admissions. The extra table stages are dormant for FILTER. The table
 record enlarges every cleanup frame, including frames used outside cooperative
 numeric execution; frame admission and zeroing use the actual structure size.
+
+### Cooperative numeric MAP
+
+`wl_columnar_filter_map_attempt_start` uses the same persistent context and
+`wl_columnar_filter_op_attempt_step`/`ack` protocol as FILTER. It is an opt-in
+internal entry point; normal engine dispatch remains unchanged. NULL control
+uses raw MAP. Controlled MAP compiles each effective numeric expression once,
+then gathers each input row once and evaluates output columns in order.
+Missing expressions use the configured projection (or the column ordinal);
+out-of-range projections yield zero. The private result has generated names,
+no column type array and no timestamps, matching raw MAP. Output width may
+differ from input width. Unsupported expressions fail during preflight even
+for zero rows; numeric evaluation failure returns ERANGE. There is no raw
+fallback after controlled preflight starts.
+
+The private auto constructor and numeric row append use the existing eight-byte
+operator builders. Output capacity equals the input row count with a governor;
+the ungoverned path begins at 64 rows and uses existing batch growth. Combined
+input/output scratch sizing is checked before allocation. Compiled programs,
+the table allocation and its original credit/reference are retired before the
+ordinary batch and source stages. Stopped execution preserves every field of
+the original stack entry; successful execution publishes only the complete
+output. Retained FINISH and credit refusal require fresh host retry funding.
+Allocation failure remains ENOMEM when cancellation arrives at the same tail;
+positive accounting or stale-attempt errors take precedence.
+
+This adds per-column compilation/table storage and conservative prepaid work,
+including six fixed table grants and a retirement grant per discoverable slot.
+It does not promise raw-path performance or activate the remaining operators
+required by #1821. The table-bearing cleanup frame remains 2808 bytes on the
+validated 64-bit Linux ABI; other ABIs use their actual structure size.

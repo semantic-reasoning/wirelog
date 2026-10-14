@@ -3482,6 +3482,14 @@ int
 wl_columnar_relation_new_auto_attempt_controlled(
     const char *name, uint32_t ncols, col_rel_t **out,
     wl_evaluation_control_t *control, uint64_t attempt_id);
+/* Private operator constructor: non-NULL original control only, untyped and
+ * without timestamps; explicit initial capacity, private heap ownership. */
+int wl_columnar_relation_new_auto_operator_attempt_controlled(
+    const char *, uint32_t, uint32_t, wl_columnar_memory_governor_ref_t *,
+    col_rel_t **, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_relation_append_batch_numeric_row_operator_controlled(
+    wl_columnar_relation_append_batch_t *, const int64_t *,
+    wl_evaluation_control_t *, uint64_t);
 /* Original protected scalar source, opt-in nonNULL-control only. Never copy
  * or move an initialized live record; serialize all access and do not invoke
  * begin/end/init reentrantly from child callbacks. Caller keeps descriptor,
@@ -5467,6 +5475,13 @@ int wl_columnar_filter_op_attempt_start(const wl_plan_op_t *,
 int wl_columnar_filter_op_attempt_step(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *);
 int wl_columnar_filter_op_attempt_ack(wl_columnar_eval_stack_cleanup_frame_t *);
+
+/* MAP uses the same original numeric continuation and the same step/ack
+ * functions above. NULL control delegates col_op_map. Numeric-only controlled
+ * execution refuses unsupported expressions without interpreter fallback. */
+int wl_columnar_filter_map_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
 
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_filter_test_attempt_checkpoint)(
