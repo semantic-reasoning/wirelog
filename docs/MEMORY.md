@@ -1270,6 +1270,10 @@ strict differential `JOIN -> REDUCE` still runs.
   ANTIJOIN the pipeline did not consume -- the session records
   `pipeline-not-consumable`, and strict mode returns `ENOTSUP` before the
   JOIN runs.
+- When the pipeline would consume the tail but another operator reads the
+  tail's output, strict mode returns `ENOTSUP` before any producer exists
+  and records `pipeline-not-consumable`; without strict mode the pipeline
+  runs and nothing is recorded.
 
 Ownership and admission:
 
