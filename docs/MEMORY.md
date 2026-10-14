@@ -1323,11 +1323,24 @@ Ownership and admission:
 - The output relation is heap allocated (never from the delta pool, whose
   reset frees nothing) and attached to the session governor.  Its retained
   token owns every visible output byte: the sink admits the capacity the
-  relation already owns at attach, grows it to exactly the rows the next
-  batch needs (`col_rel_reserve_capacity_admitted`, no doubling), and holds
-  no token of its own.  Exact fit therefore means the governor admits the
-  retained footprint formula of `relation.c` for the new capacity while the
-  old buffers are still live.
+  relation already owns at attach, grows it when the next batch does not
+  fit (`col_rel_reserve_capacity_admitted`), and holds no token of its own.
+  Since #2173 the growth is geometric with an exact fallback: the sink first
+  asks for double the current capacity (clamped to `UINT32_MAX`, and to at
+  least the rows the batch needs), and only when the governor denies that
+  doubling does it retry at exactly the rows the batch needs.  A denied
+  doubling that is retried exactly is not a failure: the denial is cleared
+  before the retry, so a successful retry leaves no denial pending.  Any
+  other failure of the doubling fails the batch without a retry, including
+  an allocation failure that no governor denied, so near memory exhaustion
+  a batch that the exact-fit rule would have admitted can fail.  Either
+  way the governor admits the retained footprint formula of `relation.c`
+  for the new capacity while the old buffers are still live.  The exact-fit
+  rule it replaces reallocated and copied the whole output for every batch
+  that did not fit: 4096 output rows in 7-row batches reached storage
+  generation 578, and reach 7 with geometric growth
+  (`test_join_batch_resume.c:test_sink_growth_is_geometric`).  The
+  consumed pipeline's output relation grows by the same rule.
 - A batch becomes visible only when the sink commits it; the cursor
   advances only after commit.  A sink failure before commit rewinds
   `nrows` and retries the same batch without a new reservation; the
@@ -1338,11 +1351,18 @@ Ownership and admission:
   allocation (`sizeof(col_join_batch_producer_t)` plus the key row and the
   key-index arrays -- note that this makes the struct's size a governed
   quantity, so a field added to it is not free) plus scratch
-  (`rows_per_batch * row_bytes`) plus the sink's growth
-  increment for the next batch, transiently up to twice
-  `rows_per_batch * row_bytes` during the exact-fit resize.  Since #1481
-  the scratch reaches that bound only if the join's fanout demands it, but
-  it carries the same 2x transient when it does: every step holds the old
+  (`rows_per_batch * row_bytes`) plus the sink's growth for the next batch.
+  Since #2173 a growth asks for `new = max(2 * old, need)` rows, where
+  `old` is the current capacity and `need` the rows the output holds after
+  the batch (at most `old + rows_per_batch`); when the governor denies
+  that request, it retries at exactly `need`, which was the rule for every
+  growth before #2173.  After a growth the admitted output capacity is
+  therefore at most twice the rows the output holds; an output that never
+  grew keeps the 64-row capacity it was created with, which can exceed
+  twice its rows.  The resize transiently holds the old and the new output
+  buffers, `(old + new) * row_bytes`.  Since #1481 the scratch reaches its
+  `rows_per_batch` bound only if the join's fanout demands it, but it
+  carries a 2x transient of its own when it does: every step holds the old
   buffers while reserving the new, so the peak is
   `(old + new) * row_bytes`.  BUDGET AGAINST 2x.  A clean doubling is
   1.5x, but the final clamped step can approach 2x -- measured 1.8x at

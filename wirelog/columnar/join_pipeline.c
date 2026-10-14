@@ -263,22 +263,14 @@ static wl_columnar_continuation_status_t
 pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
 {
     wl_join_pipeline_sink_t *sink = (wl_join_pipeline_sink_t *)context;
-    uint64_t need;
-    int rc;
-    bool denied = false;
 
     (void)bytes;
     if (!sink || !sink->begun || !sink->out)
         return WL_COLUMNAR_CONTINUATION_INVALID;
-    need = (uint64_t)sink->out->nrows + rows;
-    if (need > UINT32_MAX)
-        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
-    rc = col_rel_reserve_capacity_admitted(sink->out, (uint32_t)need,
-            &denied);
-    if (rc == 0)
-        return WL_COLUMNAR_CONTINUATION_OK;
-    return rc == ENOMEM && denied ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
-                        : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    /* Same growth rule as the relation sink (Issue #2173): double first,
+     * exact on a budget denial. */
+    return col_join_batch_sink_grow(sink->out,
+               (uint64_t)sink->out->nrows + rows);
 }
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
