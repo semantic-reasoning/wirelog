@@ -3664,6 +3664,235 @@ test_stage_census(void)
         "the stage is statically consumable");
 }
 
+/* ---- Issue #1370 unit P: keep-all SEMIJOIN pass-through in a plan ------ */
+
+static const char *const p_canon_names[] = { "col0", "col1" };
+static const char *const p_col0[] = { "col0" };
+static const char *const p_col3[] = { "col3" };
+
+/* Register @name(col0, col1) typed INT64 with @rows. */
+static col_rel_t *
+p_add_canon(wl_col_session_t *sess, const char *name, const int64_t *rows,
+    uint32_t nrows)
+{
+    static const wirelog_column_type_t types[] = { WIRELOG_TYPE_INT64,
+                                                   WIRELOG_TYPE_INT64 };
+    col_rel_t *rel = pipeline_relation(name, p_canon_names, 2, rows, nrows);
+
+    if (!rel || col_rel_set_column_types(rel, types, 2) != 0
+        || session_add_rel(sess, rel) != 0) {
+        col_rel_destroy(rel);
+        return NULL;
+    }
+    return rel;
+}
+
+/* ALL(a, b): a holds every col3 value the sel JOIN produces, and the col0
+ * values 0 and 1, so a SEMIJOIN on either column keeps every row. */
+static int
+p_add_all(wl_col_session_t *sess)
+{
+    static const int64_t rows[] = { 0, 0, 1, 0, 100, 0, 101, 0, 200, 0,
+                                    201, 0 };
+    col_rel_t *rel = pipeline_relation("ALL", a3_stage_names, 2, rows, 6);
+
+    if (!rel || session_add_rel(sess, rel) != 0) {
+        col_rel_destroy(rel);
+        return ENOMEM;
+    }
+    return 0;
+}
+
+static void
+p_semijoin(wl_plan_op_t *op, const char *const *left_key)
+{
+    a3_stage(op, WL_PLAN_OP_SEMIJOIN, "ALL", left_key);
+}
+
+/* P4: VARIABLE(R) -> SEMIJOIN(ALL) -> CONSOLIDATE over a borrowed session
+ * relation.  The result is R's rows, and R itself is untouched: same
+ * rows, same storage generation, still registered. */
+static void
+test_semijoin_pass_through_borrowed_variable(void)
+{
+    static const int64_t r_rows[] = { 1, 7, 0, 5, 1, 7 };
+    static const int64_t want[] = { 0, 5, 1, 7 };
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *r = NULL;
+    wl_plan_op_t ops[3];
+    wl_plan_relation_t plan;
+    a1_run_t run;
+    uint64_t storage_generation = 0;
+
+    if (sess && p_add_all(sess) == 0)
+        r = p_add_canon(sess, "R", r_rows, 3);
+    CHECK(sess && r, "P4 fixture");
+    if (!sess || !r) {
+        pipeline_session_destroy(sess);
+        return;
+    }
+    storage_generation = r->storage_generation;
+    memset(ops, 0, sizeof(ops));
+    ops[0].op = WL_PLAN_OP_VARIABLE;
+    ops[0].relation_name = "R";
+    p_semijoin(&ops[1], p_col0);
+    ops[2].op = WL_PLAN_OP_CONSOLIDATE;
+    plan.ops = ops;
+    plan.op_count = 3;
+    run = a1_eval(sess, &plan, 0, NULL, a1_empty("unused", 2));
+    /* a1_eval pushes its own left; the VARIABLE result sits above it. */
+    CHECK(run.rc == 0 && run.ncols == 2 && run.nrows == 2
+        && run.rows[0][0] == want[0] && run.rows[0][1] == want[1]
+        && run.rows[1][0] == want[2] && run.rows[1][1] == want[3],
+        "P4 borrowed VARIABLE -> SEMIJOIN -> CONSOLIDATE equals the oracle");
+    CHECK(session_find_rel(sess, "R") == r && r->nrows == 3
+        && r->storage_generation == storage_generation
+        && r->columns[0][0] == 1 && r->columns[1][1] == 5
+        && r->columns[0][2] == 1 && r->columns[1][2] == 7,
+        "P4 the borrowed session relation is unmodified");
+    pipeline_session_destroy(sess);
+}
+
+/* P5: VARIABLE(A) VARIABLE(B) CONCAT -> SEMIJOIN(ALL) carries no segment
+ * boundaries, and with a CONSOLIDATE after it the result is the sorted
+ * distinct union. */
+static void
+test_semijoin_pass_through_drops_segments(void)
+{
+    static const int64_t a_rows[] = { 1, 9, 0, 3 };
+    static const int64_t b_rows[] = { 0, 3, 1, 2 };
+    static const int64_t want[] = { 0, 3, 1, 2, 1, 9 };
+
+    for (int consolidate = 0; consolidate < 2; consolidate++) {
+        wl_col_session_t *sess = sel_session();
+        wl_plan_op_t ops[5];
+        wl_plan_relation_t plan;
+        eval_stack_t stack;
+        bool ok = sess && p_add_all(sess) == 0
+            && p_add_canon(sess, "A", a_rows, 2)
+            && p_add_canon(sess, "B", b_rows, 2);
+        int rc;
+
+        CHECK(ok, "P5 fixture");
+        if (!ok) {
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        memset(ops, 0, sizeof(ops));
+        ops[0].op = WL_PLAN_OP_VARIABLE;
+        ops[0].relation_name = "A";
+        ops[1].op = WL_PLAN_OP_VARIABLE;
+        ops[1].relation_name = "B";
+        ops[2].op = WL_PLAN_OP_CONCAT;
+        p_semijoin(&ops[3], p_col0);
+        ops[4].op = WL_PLAN_OP_CONSOLIDATE;
+        plan.ops = ops;
+        plan.op_count = consolidate ? 5u : 4u;
+        sess->join_batch_bytes = 0;
+        eval_stack_init(&stack);
+        rc = col_eval_relation_plan(&plan, &stack, sess);
+        if (!consolidate) {
+            CHECK(rc == 0 && stack.top == 1 && stack.items[0].rel
+                && stack.items[0].rel->nrows == 4
+                && stack.items[0].seg_count == 0
+                && stack.items[0].seg_boundaries == NULL,
+                "P5 keep-all SEMIJOIN over a CONCAT has no segments");
+        } else {
+            const col_rel_t *out = rc == 0 && stack.top == 1
+                ? stack.items[0].rel : NULL;
+            ok = out && out->ncols == 2 && out->nrows == 3;
+            for (uint32_t i = 0; ok && i < 3; i++)
+                ok = out->columns[0][i] == want[2u * i]
+                    && out->columns[1][i] == want[2u * i + 1u];
+            CHECK(ok, "P5 CONCAT -> SEMIJOIN -> CONSOLIDATE equals the "
+                "oracle");
+        }
+        (void)eval_stack_drain(&stack);
+        pipeline_session_destroy(sess);
+    }
+}
+
+/* P12: the bounded pipeline's probe stages are unchanged.  JOIN ->
+ * SEMIJOIN(ALL, col3) -> MAP[0,3] keeps every join row; with the knob on
+ * the tail is still consumed into $join_pipeline, its set is built once and
+ * every batch is probed (two 2-row batches at SEL_BATCH_BYTES), and with
+ * the knob off the rows are the same. */
+static void
+test_semijoin_keep_all_stage_unchanged(void)
+{
+    static const uint32_t project[] = { 0, 3 };
+    static const int64_t want[] = { 0, 100, 0, 101, 1, 200, 1, 201 };
+
+    for (int knob = 0; knob < 2; knob++) {
+        wl_col_session_t *sess = sel_session();
+        wl_plan_op_t ops[3];
+        wl_plan_relation_t plan;
+        eval_stack_t stack;
+        static const char *const left_names[] = { "k", "v" };
+        static const int64_t left_rows[] = { 0, 10, 1, 20 };
+        col_rel_t *left = pipeline_relation("left", left_names, 2,
+                left_rows, 2);
+        uint32_t builds;
+        uint32_t emits;
+        bool ok = sess && left && p_add_all(sess) == 0;
+        int rc;
+
+        CHECK(ok, "P12 fixture");
+        if (!ok) {
+            col_rel_destroy(left);
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        memset(ops, 0, sizeof(ops));
+        a1_join(&ops[0], "right", WL_DELTA_AUTO);
+        p_semijoin(&ops[1], p_col3);
+        ops[2].op = WL_PLAN_OP_MAP;
+        ops[2].project_indices = project;
+        ops[2].project_count = 2;
+        plan.ops = ops;
+        plan.op_count = 3;
+        eval_stack_init(&stack);
+        rc = eval_stack_push(&stack, left, true);
+        CHECK(rc == 0, "P12 push");
+        if (rc != 0) {
+            col_rel_destroy(left);
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        sess->join_batch_bytes = knob ? SEL_BATCH_BYTES : 0;
+        builds = wl_columnar_join_test_probe_set_build_calls;
+        emits = wl_columnar_join_test_probe_emits;
+        rc = col_eval_relation_plan(&plan, &stack, sess);
+        builds = wl_columnar_join_test_probe_set_build_calls - builds;
+        emits = wl_columnar_join_test_probe_emits - emits;
+        {
+            const col_rel_t *out = rc == 0 && stack.top == 1
+                ? stack.items[0].rel : NULL;
+            int64_t got[8];
+            ok = out && out->ncols == 2 && out->nrows == 4;
+            for (uint32_t i = 0; ok && i < 4; i++) {
+                got[2u * i] = out->columns[0][i];
+                got[2u * i + 1u] = out->columns[1][i];
+            }
+            if (ok)
+                qsort(got, 4, 2u * sizeof(int64_t), sel_row_cmp);
+            ok = ok && memcmp(got, want, sizeof(want)) == 0;
+            if (knob)
+                ok = ok && out->name
+                    && strcmp(out->name, "$join_pipeline") == 0
+                    && builds == 1u && emits == 2u;
+            if (!ok)
+                fprintf(stderr, "  P12 knob=%d rc=%d builds=%u emits=%u\n",
+                    knob, rc, builds, emits);
+        }
+        CHECK(ok, knob
+            ? "P12 a keep-all SEMIJOIN stage still probes every batch"
+            : "P12 a keep-all sequential SEMIJOIN returns the join rows");
+        (void)eval_stack_drain(&stack);
+        pipeline_session_destroy(sess);
+    }
+}
+
 int
 main(void)
 {
@@ -3702,6 +3931,9 @@ main(void)
     test_probe_set_denial_keeps_left();
     test_emit_rejects_set_for_other_keys();
     test_stage_census();
+    test_semijoin_pass_through_borrowed_variable();
+    test_semijoin_pass_through_drops_segments();
+    test_semijoin_keep_all_stage_unchanged();
     if (failures)
         fprintf(stderr, "%d join pipeline preflight checks failed\n",
             failures);
