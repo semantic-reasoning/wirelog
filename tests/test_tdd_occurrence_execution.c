@@ -24,9 +24,23 @@ extern int (*wl_columnar_eval_test_bound_slice_after_eval)(
     wl_columnar_eval_tdd_run_t *);
 extern int (*wl_columnar_eval_test_bound_slice_before_release)(
     wl_columnar_eval_tdd_run_t *);
+
+/* A worker copies its coordinator's bounded join knob
+ * (WIRELOG_JOIN_BATCH_BYTES and WIRELOG_JOIN_BATCH_STRICT, read when the
+ * session is created), and a TDD bound run refuses it with ENOTSUP.  Clear
+ * it on each worker these tests create, as the production insertion caller
+ * does for its clones (eval_tdd_insert.c, insert_clone_prepare). */
+static void
+worker_clear_join_batch(wl_col_session_t *worker)
+{
+    worker->join_batch_bytes = 0;
+    worker->join_batch_strict = false;
+}
+
 #ifdef WL_TEST_ALLOC_WRAP
 void *__real_calloc(size_t, size_t);
 static int fail_calloc_after = -1;
+
 void *__wrap_calloc(size_t n, size_t size)
 {
     if (fail_calloc_after >= 0 && fail_calloc_after-- == 0)
@@ -100,6 +114,7 @@ run_one(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     const wl_columnar_eval_tdd_plan_slice_t *slice = &manifest->slices[si];
     wl_col_session_t worker = {0};
     CHECK(col_worker_session_create(coord, w, NULL, 0, &worker) == 0);
+    worker_clear_join_batch(&worker);
     /* A bound read must win over both full and delta registry aliases. */
     const char *wrong_names[] = {"valueFlow", "memoryAlias", "$d$valueFlow",
                                  "$r$valueFlow", "$d$memoryAlias",
@@ -227,6 +242,7 @@ negative_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     const wl_columnar_eval_tdd_plan_slice_t *slice = &manifest->slices[si];
     wl_col_session_t worker = {0};
     CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+    worker_clear_join_batch(&worker);
     col_rel_t *flow = relation("valueFlow", full_flow, 4, 0, 0);
     col_rel_t *memory = relation("memoryAlias", full_memory, 3, 0, 0);
     col_rel_t *delta = relation("partition", delta_flow, 3, 0, 0);
@@ -460,6 +476,7 @@ synthetic_cases(wl_col_session_t *coord)
         for (uint32_t rows = 0; rows < 3; rows++) {
             wl_col_session_t worker = {0};
             CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+            worker_clear_join_batch(&worker);
             col_rel_t *full = relation("p", full_flow, 4, 0, 0);
             col_rel_t *delta = relation("partition", delta_flow, rows, 0, 0);
             CHECK(full && delta);
@@ -561,6 +578,7 @@ seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
 {
     wl_col_session_t worker = {0};
     CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+    worker_clear_join_batch(&worker);
     col_rel_t *assign = relation("assign", seed_assign, 5, 0, 0);
     CHECK(assign);
     wl_columnar_eval_tdd_plan_slice_t *slice = &manifest->slices[si];
@@ -863,6 +881,7 @@ seed_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
             shapes |= 1u << shape;
             wl_col_session_t worker = {0};
             CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+            worker_clear_join_batch(&worker);
             col_rel_t *assign = relation("assign", seed_assign, rows, 0, 0);
             CHECK(assign);
             const wl_columnar_eval_tdd_plan_read_t *read =
@@ -935,6 +954,7 @@ k1_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
         for (uint32_t w = 0; w < widths[wi]; w++) {
             wl_col_session_t worker = {0};
             CHECK(col_worker_session_create(coord, w, NULL, 0, &worker) == 0);
+            worker_clear_join_batch(&worker);
             /* Alternate missing and conflicting registry entries. */
             const int64_t bad_rows[][2] = {{777, 888}};
             const char *bad_names[] = {"assign", "dereference", "valueAlias",

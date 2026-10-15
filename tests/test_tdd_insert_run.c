@@ -49,6 +49,18 @@ static int tests_failed = 0;
         } while (0)
 
 static int snapshot_token;
+
+/* A worker copies its coordinator's bounded join knob
+ * (WIRELOG_JOIN_BATCH_BYTES and WIRELOG_JOIN_BATCH_STRICT, read when the
+ * session is created), and a TDD bound run refuses it with ENOTSUP.  Clear
+ * it on each worker these tests create, as the production insertion caller
+ * does for its clones (eval_tdd_insert.c, insert_clone_prepare). */
+static void
+worker_clear_join_batch(wl_col_session_t *worker)
+{
+    worker->join_batch_bytes = 0;
+    worker->join_batch_strict = false;
+}
 static char message[256];
 
 #define MAX_COLS 4
@@ -223,6 +235,7 @@ run_instance(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     rc = col_worker_session_create(coord, 0, NULL, 0, &worker);
     if (rc != 0)
         return rc;
+    worker_clear_join_batch(&worker);
     memset(&run, 0, sizeof(run));
     rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m,
             slice_index, &snapshot_token, NULL, 0, 1, inputs,
@@ -615,14 +628,22 @@ done:
     return;
 }
 
+/* What try_begin sets on its worker clone before beginning. */
+typedef enum {
+    WORKER_PLAIN,
+    WORKER_DIFF_ACTIVE,
+    WORKER_JOIN_BATCH_BYTES,
+    WORKER_JOIN_BATCH_STRICT,
+} worker_state_t;
+
 /* Begin instance @s of @m with @inputs on a fresh worker clone, which gets
- * @diff_active, and return what begin returns.  A refused begin must leave
- * the run handle empty and the worker free. */
+ * @state, and return what begin returns.  A refused begin must leave the
+ * run handle empty and the worker free. */
 static int
 try_begin(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     const wl_columnar_eval_tdd_plan_manifest_t *m, uint32_t s,
     const wl_columnar_eval_tdd_input_t *inputs, uint32_t count,
-    const void *snapshot, bool diff_active, bool *left_clean)
+    const void *snapshot, worker_state_t state, bool *left_clean)
 {
     wl_col_session_t worker;
     wl_columnar_eval_tdd_run_t run;
@@ -631,7 +652,11 @@ try_begin(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     memset(&worker, 0, sizeof(worker));
     if (col_worker_session_create(coord, 0, NULL, 0, &worker) != 0)
         return -1;
-    worker.diff_operators_active = diff_active;
+    worker_clear_join_batch(&worker);
+    worker.diff_operators_active = state == WORKER_DIFF_ACTIVE;
+    if (state == WORKER_JOIN_BATCH_BYTES)
+        worker.join_batch_bytes = 224;
+    worker.join_batch_strict = state == WORKER_JOIN_BATCH_STRICT;
     memset(&run, 0, sizeof(run));
     int rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m, s,
             snapshot, NULL, 0, 1, inputs, count, &run);
@@ -641,13 +666,16 @@ try_begin(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     if (out)
         col_rel_destroy(out);
     worker.diff_operators_active = false;
+    worker_clear_join_batch(&worker);
     if (col_worker_session_destroy(&worker) != 0)
         return -1;
     return rc;
 }
 
 /* Inputs that do not match the instance are refused before the run takes
- * anything, and so is a worker whose differential operators are active. */
+ * anything, and so is a worker whose differential operators are active or
+ * that asks for bounded join batching (join_batch_bytes or
+ * join_batch_strict). */
 static void
 test_refused_inputs(void)
 {
@@ -661,7 +689,7 @@ test_refused_inputs(void)
     bool clean = false;
     bool have_manifest = false;
 
-    BEGIN("mismatched inputs and an active differential worker are refused");
+    BEGIN("mismatched inputs, differential and batching workers are refused");
     CHECK(fixture_open(&f,
         ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
         ".decl t(x: int64, y: int64)\n"
@@ -681,13 +709,13 @@ test_refused_inputs(void)
                 session_find_rel(coord, m.reads[m.slices[0].read_start + r]
                 .relation_name));
     /* The inputs as captured run. */
-    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token, false, &clean)
-        != 0) {
+    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token, WORKER_PLAIN,
+        &clean) != 0) {
         FAIL("the matching inputs did not run");
         goto done;
     }
     /* Another snapshot than the one the inputs were captured under. */
-    if (try_begin(coord, sp, &m, 0, inputs, 2, &other_snapshot, false,
+    if (try_begin(coord, sp, &m, 0, inputs, 2, &other_snapshot, WORKER_PLAIN,
         &clean) != EINVAL || !clean) {
         FAIL("a snapshot mismatch was not refused cleanly");
         goto done;
@@ -697,21 +725,33 @@ test_refused_inputs(void)
     for (uint32_t r = 0; r < 2; r++)
         if (bad[r].read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_FULL)
             bad[r].partition = &some_partition;
-    if (try_begin(coord, sp, &m, 0, bad, 2, &snapshot_token, false, &clean)
-        != EINVAL || !clean) {
+    if (try_begin(coord, sp, &m, 0, bad, 2, &snapshot_token, WORKER_PLAIN,
+        &clean) != EINVAL || !clean) {
         FAIL("a partitioned FULL read was not refused cleanly");
         goto done;
     }
     /* Fewer inputs than the instance reads. */
-    if (try_begin(coord, sp, &m, 0, inputs, 1, &snapshot_token, false, &clean)
-        != EINVAL || !clean) {
+    if (try_begin(coord, sp, &m, 0, inputs, 1, &snapshot_token, WORKER_PLAIN,
+        &clean) != EINVAL || !clean) {
         FAIL("a missing input was not refused cleanly");
         goto done;
     }
     /* Differential operators choose their own operands. */
-    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token, true, &clean)
-        != ENOTSUP || !clean) {
+    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token,
+        WORKER_DIFF_ACTIVE, &clean) != ENOTSUP || !clean) {
         FAIL("an active differential worker was not refused cleanly");
+        goto done;
+    }
+    /* A bound run does not batch its joins: a worker that asks for the
+     * bounded join knob, or only for its strict mode, is refused. */
+    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token,
+        WORKER_JOIN_BATCH_BYTES, &clean) != ENOTSUP || !clean) {
+        FAIL("a worker with join_batch_bytes set was not refused cleanly");
+        goto done;
+    }
+    if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token,
+        WORKER_JOIN_BATCH_STRICT, &clean) != ENOTSUP || !clean) {
+        FAIL("a worker with join_batch_strict set was not refused cleanly");
         goto done;
     }
     tests_passed++;
@@ -801,6 +841,7 @@ run_range(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
         col_rel_destroy(range);
         return rc;
     }
+    worker_clear_join_batch(&worker);
     memset(&run, 0, sizeof(run));
     rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m, s,
             &snapshot_token, &partition_token, run_index, run_count, inputs,
