@@ -3893,6 +3893,231 @@ test_semijoin_keep_all_stage_unchanged(void)
     }
 }
 
+/* ---- Issue #2185: bounded JOIN budget denials are reported ------------- */
+
+/* A budget denial on the bounded JOIN paths returns ENOSPC and is visible
+ * through wl_columnar_session_budget_denied().  Each case uses one budget
+ * derived from admissions measured in the same binary:
+ *   - T(ops, match): the smallest budget a run fits, found by bisection on
+ *     whether the run succeeds (the classification under test plays no
+ *     part).  One byte below T(ops, false) denies the largest admission of
+ *     a run whose left row matches nothing: the pipeline output's governor
+ *     attachment, or the operator's scratch column types.  Between
+ *     T(ops, false) and T(ops, true) only the output's growth (and, for the
+ *     pipeline, its MAP batches) is left to deny; the midpoint is used,
+ *     because just below T(ops, true) the sink's exact retry after a
+ *     denied doubling can still fit;
+ *   - the footprint of a relation created standalone the way the path
+ *     creates it, under a measuring governor. */
+#define D2_RIGHT_ROWS PL_GROWTH_ROWS
+
+void wl_columnar_relation_test_fail_next_prepare_resize(void);
+void wl_columnar_relation_test_clear_prepare_resize(void);
+
+typedef struct {
+    int rc;
+    bool denied; /* wl_columnar_session_budget_denied() before teardown */
+} d2_run_t;
+
+/* One run on a fresh session: left(k, v) = {(@match ? 0 : 1, 10)} against
+ * right(k, r) with D2_RIGHT_ROWS rows of k = 0, at join_batch_bytes = 224
+ * (7 rows per batch), under an enforcing governor of @budget attached after
+ * the inputs and the arrangement exist.  @ops == 2 evaluates JOIN -> MAP,
+ * which the bounded pipeline consumes; @ops == 1 evaluates the JOIN alone,
+ * which runs the bounded operator.  @fail_resize injects one non-budget
+ * resize-preparation failure. */
+static d2_run_t
+d2_run(uint64_t budget, uint32_t ops, bool match, bool fail_resize)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const char *const right_names[] = { "k", "r" };
+    static const char *const keys[] = { "k" };
+    static const uint32_t project[] = { 1, 3 };
+    const int64_t left_rows[] = { match ? 0 : 1, 10 };
+    d2_run_t run = { .rc = ENOMEM, .denied = false };
+    int64_t *right_rows = calloc(2u * D2_RIGHT_ROWS, sizeof(*right_rows));
+    wl_col_session_t *sess = pipeline_session();
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(budget);
+    col_rel_t *left = NULL;
+    col_rel_t *right = NULL;
+    wl_plan_op_t plan_ops[2];
+    wl_plan_relation_t plan;
+    eval_stack_t stack;
+
+    if (!right_rows || !sess || !governor)
+        goto out;
+    for (uint32_t i = 0; i < D2_RIGHT_ROWS; i++)
+        right_rows[2u * i + 1u] = i;
+    left = pipeline_relation("left", left_names, 2, left_rows, 1);
+    right = pipeline_relation("right", right_names, 2, right_rows,
+            D2_RIGHT_ROWS);
+    if (!left || !right || session_add_rel(sess, right) != 0)
+        goto out;
+    right = NULL; /* session owns it */
+    if (!col_session_get_arrangement(&sess->base, "right",
+        (const uint32_t[]){ 0 }, 1))
+        goto out;
+    memset(plan_ops, 0, sizeof(plan_ops));
+    memset(&plan, 0, sizeof(plan));
+    plan_ops[0].op = WL_PLAN_OP_JOIN;
+    plan_ops[0].right_relation = "right";
+    plan_ops[0].left_keys = keys;
+    plan_ops[0].right_keys = keys;
+    plan_ops[0].key_count = 1;
+    plan_ops[1].op = WL_PLAN_OP_MAP;
+    plan_ops[1].project_indices = project;
+    plan_ops[1].project_count = 2;
+    plan.ops = plan_ops;
+    plan.op_count = ops;
+    sess->memory_governor = governor;
+    eval_stack_init(&stack);
+    if (eval_stack_push(&stack, left, true) != 0)
+        goto out;
+    left = NULL;
+    if (fail_resize)
+        wl_columnar_relation_test_fail_next_prepare_resize();
+    run.rc = col_eval_relation_plan(&plan, &stack, sess);
+    wl_columnar_relation_test_clear_prepare_resize();
+    run.denied = wl_columnar_session_budget_denied(sess);
+    (void)eval_stack_drain(&stack);
+out:
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    if (sess)
+        sess->memory_governor = NULL;
+    pipeline_session_destroy(sess);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    free(right_rows);
+    return run;
+}
+
+/* The smallest budget d2_run(@ops, @match) succeeds at, or 0. */
+static uint64_t
+d2_threshold(uint32_t ops, bool match)
+{
+    uint64_t lo = 0;
+    uint64_t hi = UINT64_C(1) << 24;
+
+    if (d2_run(hi, ops, match, false).rc != 0)
+        return 0;
+    while (hi - lo > 1u) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (d2_run(mid, ops, match, false).rc == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return hi;
+}
+
+/* Bytes a governed relation admits at creation, measured on its own
+ * governor: what wl_columnar_relation_new_auto_governed(@name, @ncols,
+ * @capacity) reserves. */
+static uint64_t
+d2_created_bytes(const char *name, uint32_t ncols, uint32_t capacity)
+{
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(1u << 24);
+    col_rel_t *rel = NULL;
+    uint64_t bytes = 0;
+
+    if (governor && wl_columnar_relation_new_auto_governed(name, ncols,
+        capacity, false, governor, &rel) == 0)
+        bytes = a1_reserved(governor);
+    col_rel_destroy(rel);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return bytes;
+}
+
+/* Bytes the pipeline admits when it attaches its two-column output
+ * ($join_pipeline, a MAP ending) to the session governor. */
+static uint64_t
+d2_attached_bytes(void)
+{
+    wl_columnar_memory_governor_ref_t *governor = a1_governor(1u << 24);
+    col_rel_t *rel = col_rel_new_auto("$join_pipeline", 2);
+    uint64_t bytes = 0;
+
+    if (governor && rel && col_rel_attach_memory_governor(rel, governor) == 0
+        && col_rel_reserve_capacity_admitted(rel, rel->capacity, NULL) == 0)
+        bytes = a1_reserved(governor);
+    col_rel_destroy(rel);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return bytes;
+}
+
+static void
+d2_check(const char *what, uint64_t budget, uint32_t ops, bool match,
+    bool fail_resize, int want_rc, bool want_denied)
+{
+    d2_run_t run = d2_run(budget, ops, match, fail_resize);
+    bool ok = budget > 0 && run.rc == want_rc && run.denied == want_denied;
+
+    if (!ok)
+        fprintf(stderr, "  %s: budget=%llu rc=%d denied=%d (want %d/%d)\n",
+            what, (unsigned long long)budget, run.rc, (int)run.denied,
+            want_rc, (int)want_denied);
+    CHECK(ok, what);
+}
+
+static void
+test_bounded_join_budget_denials_reported(void)
+{
+    const uint64_t key_scratch = 2u * sizeof(uint32_t); /* one key */
+    const uint64_t map_scratch = 2u * sizeof(int64_t);  /* one 2-col row */
+    /* The pipeline's and the operator's thresholds, matching and not. */
+    uint64_t pipe_match = d2_threshold(2, true);
+    uint64_t pipe_none = d2_threshold(2, false);
+    uint64_t op_match = d2_threshold(1, true);
+    uint64_t op_none = d2_threshold(1, false);
+    /* The producer's scratch ($join_batch) and the operator's output
+     * ($join) are four-column relations of COL_REL_INIT_CAP rows. */
+    uint64_t scratch = d2_created_bytes("$join_batch", 4, COL_REL_INIT_CAP);
+    uint64_t op_out = d2_created_bytes("$join", 4, COL_REL_INIT_CAP);
+    /* A 7-row batch's MAP output. */
+    uint64_t map_out = d2_created_bytes("$map", 2, 7);
+    uint64_t attach = d2_attached_bytes();
+
+    CHECK(pipe_match && pipe_none && op_match && op_none && scratch
+        && op_out && map_out && attach && pipe_none > attach + scratch
+        && pipe_match > pipe_none && op_match > op_none,
+        "#2185 fixture measurements");
+    /* Row 1: the pipeline producer's scratch constructor.  Below the
+     * output attachment and the scratch types, half the scratch. */
+    d2_check("#2185 row 1: pipeline scratch denial is a budget denial",
+        pipe_none - attach - scratch / 2u, 2, false, false, ENOSPC, true);
+    /* Row 2: the pipeline output's governor attachment, the last setup
+     * admission of a run that emits nothing. */
+    d2_check("#2185 row 2: pipeline output attachment denial is a budget "
+        "denial", pipe_none - 1u, 2, false, false, ENOSPC, true);
+    /* Row 3: the pipeline output's growth. */
+    d2_check("#2185 row 3: pipeline output growth denial is a budget denial",
+        pipe_none + (pipe_match - pipe_none) / 2u, 2, true, false, ENOSPC,
+        true);
+    /* Row 4: the operator producer's scratch constructor, half the scratch
+     * below the run's scratch-types peak. */
+    d2_check("#2185 row 4: operator scratch denial is a budget denial",
+        op_none - scratch / 2u, 1, false, false, ENOSPC, true);
+    /* Row 5: the operator producer's scratch column types, the last setup
+     * admission of an operator run that emits nothing. */
+    d2_check("#2185 row 5: operator scratch types denial is a budget denial",
+        op_none - 1u, 1, false, false, ENOSPC, true);
+    /* Guards: bands reported correctly before #2185 stay correct. */
+    d2_check("#2185 guard: operator output creation denial",
+        key_scratch + op_out / 2u, 1, true, false, ENOSPC, true);
+    d2_check("#2185 guard: operator output growth denial (#2177)",
+        op_none + (op_match - op_none) / 2u, 1, true, false, ENOSPC, true);
+    d2_check("#2185 guard: pipeline MAP output denial",
+        pipe_none + map_scratch + map_out / 2u, 2, true, false, ENOSPC,
+        true);
+    /* Guard: a non-budget failure of the pipeline output's growth stays
+     * unclassified. */
+    d2_check("#2185 guard: pipeline resize-preparation failure is not a "
+        "budget denial", UINT64_C(1) << 24, 2, true, true, ENOMEM, false);
+}
+
 int
 main(void)
 {
@@ -3931,6 +4156,7 @@ main(void)
     test_probe_set_denial_keeps_left();
     test_emit_rejects_set_for_other_keys();
     test_stage_census();
+    test_bounded_join_budget_denials_reported();
     test_semijoin_pass_through_borrowed_variable();
     test_semijoin_pass_through_drops_segments();
     test_semijoin_keep_all_stage_unchanged();

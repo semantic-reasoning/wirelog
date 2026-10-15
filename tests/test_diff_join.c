@@ -2963,6 +2963,310 @@ test_diff_join_batch_last_row_multimatch_continuation(void)
     PASS;
 }
 
+/* ---- Issue #2185: differential bounded JOIN budget denials ------------- */
+
+/* A budget denial on the differential bounded JOIN returns ENOSPC and is
+ * visible through wl_columnar_session_budget_denied().  Each case uses one
+ * budget derived from admissions measured in this binary:
+ *   - T(match): the smallest budget a run fits, found by bisection on
+ *     whether the run succeeds (the classification under test plays no
+ *     part).  One byte below T(false) denies the largest admission of a run
+ *     that emits nothing, the arrangement's hash table.  Between T(false)
+ *     and T(true) only the output's growth is left to deny; the midpoint
+ *     is used, because just below T(true) the sink's exact retry after a
+ *     denied doubling can still fit;
+ *   - the footprint of the output relation created standalone the way the
+ *     path creates it. */
+#define D2_DIFF_RIGHT_ROWS 4096u
+
+typedef struct {
+    int rc;
+    bool denied; /* wl_columnar_session_budget_denied() before teardown */
+} d2_diff_run_t;
+
+/* col_op_join_diff (WL_DELTA_FORCE_FULL) of left {(@match ? 1 : 2, 10)}
+ * against right {(1, 100 + i)} for i < D2_DIFF_RIGHT_ROWS, at
+ * join_batch_bytes = 224 on a fresh session under an enforcing governor of
+ * @budget.  A left row that matches nothing still indexes the right
+ * relation, so that run's largest admission is the arrangement's hash
+ * table.  @fail_resize injects one non-budget resize-preparation failure. */
+static d2_diff_run_t
+d2_diff_run(uint64_t budget, bool match, bool fail_resize)
+{
+    const char *names[] = { "k", "v" };
+    char *lkeys[] = { "k" };
+    char *rkeys[] = { "k" };
+    d2_diff_run_t run = { .rc = ENOMEM, .denied = false };
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_rel("left", 2, names);
+    col_rel_t *right = make_rel("right", 2, names);
+    wl_columnar_memory_governor_ref_t *governor = make_test_governor(budget);
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    bool ok = sess && left && right && governor
+        && col_rel_append_row(left, (int64_t[]){ match ? 1 : 2, 10 }) == 0;
+
+    for (int64_t i = 0; ok && i < (int64_t)D2_DIFF_RIGHT_ROWS; i++)
+        ok = col_rel_append_row(right, (int64_t[]){ 1, 100 + i }) == 0;
+    if (!ok || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        goto out;
+    }
+    sess->join_batch_bytes = 224;
+    sess->memory_governor = governor;
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = (const char *const *)lkeys;
+    op.right_keys = (const char *const *)rkeys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    if (fail_resize)
+        wl_columnar_relation_test_fail_next_prepare_resize();
+    run.rc = col_op_join_diff(&op, &stack, sess);
+    wl_columnar_relation_test_clear_prepare_resize();
+    run.denied = wl_columnar_session_budget_denied(sess);
+    while (stack.top > 0) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+    }
+out:
+    col_rel_destroy(left);
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return run;
+}
+
+/* The smallest budget d2_diff_run(@match) succeeds at, or 0. */
+static uint64_t
+d2_diff_threshold(bool match)
+{
+    uint64_t lo = 0;
+    uint64_t hi = UINT64_C(1) << 24;
+
+    if (d2_diff_run(hi, match, false).rc != 0)
+        return 0;
+    while (hi - lo > 1u) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (d2_diff_run(mid, match, false).rc == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return hi;
+}
+
+/* Issue #2185 (differential producer scratch): the producer's
+ * $diff_join_batch scratch is created after the right relation's
+ * arrangement transaction, whose peak holds the arrangement and its working
+ * copy.  With D2_DIFF_RIGHT_ROWS narrow rows that peak is above every
+ * scratch admission, so a budget cannot deny the scratch first.  Here the
+ * right relation has D2_DIFF_WIDE_COLS columns and D2_DIFF_WIDE_ROWS rows:
+ * the scratch is as wide as the output, while the arrangement's size does
+ * not depend on the width, so the scratch and its column types become the
+ * run's largest admissions.  One left row matches every right row. */
+#define D2_DIFF_WIDE_COLS 16u
+#define D2_DIFF_WIDE_ROWS 4u
+
+static d2_diff_run_t
+d2_diff_wide_run(uint64_t budget)
+{
+    const char *left_names[] = { "k", "v" };
+    const char *right_names[D2_DIFF_WIDE_COLS];
+    char right_buf[D2_DIFF_WIDE_COLS][8];
+    char *lkeys[] = { "k" };
+    char *rkeys[] = { "k" };
+    int64_t row[D2_DIFF_WIDE_COLS];
+    d2_diff_run_t run = { .rc = ENOMEM, .denied = false };
+    wl_col_session_t *sess = make_mock_session();
+    col_rel_t *left = make_rel("left", 2, left_names);
+    col_rel_t *right = NULL;
+    wl_columnar_memory_governor_ref_t *governor = make_test_governor(budget);
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    bool ok;
+
+    for (uint32_t c = 0; c < D2_DIFF_WIDE_COLS; c++) {
+        snprintf(right_buf[c], sizeof(right_buf[c]), c ? "c%u" : "k", c);
+        right_names[c] = right_buf[c];
+    }
+    right = make_rel("right", D2_DIFF_WIDE_COLS, right_names);
+    ok = sess && left && right && governor
+        && col_rel_append_row(left, (int64_t[]){ 1, 10 }) == 0;
+    for (uint32_t r = 0; ok && r < D2_DIFF_WIDE_ROWS; r++) {
+        row[0] = 1;
+        for (uint32_t c = 1; c < D2_DIFF_WIDE_COLS; c++)
+            row[c] = (int64_t)(100u * r + c);
+        ok = col_rel_append_row(right, row) == 0;
+    }
+    if (!ok || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        goto out;
+    }
+    sess->join_batch_bytes = 224;
+    sess->memory_governor = governor;
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = (const char *const *)lkeys;
+    op.right_keys = (const char *const *)rkeys;
+    op.delta_mode = WL_DELTA_FORCE_FULL;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    run.rc = col_op_join_diff(&op, &stack, sess);
+    run.denied = wl_columnar_session_budget_denied(sess);
+    while (stack.top > 0) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+    }
+out:
+    col_rel_destroy(left);
+    if (sess) {
+        sess->memory_governor = NULL;
+        destroy_mock_session(sess);
+    }
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return run;
+}
+
+/* The smallest budget d2_diff_wide_run succeeds at, or 0. */
+static uint64_t
+d2_diff_wide_threshold(void)
+{
+    uint64_t lo = 0;
+    uint64_t hi = UINT64_C(1) << 24;
+
+    if (d2_diff_wide_run(hi).rc != 0)
+        return 0;
+    while (hi - lo > 1u) {
+        uint64_t mid = lo + (hi - lo) / 2u;
+        if (d2_diff_wide_run(mid).rc == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return hi;
+}
+
+static void
+d2_diff_wide_case(const char *name, uint64_t budget)
+{
+    d2_diff_run_t run;
+
+    TEST(name);
+    run = d2_diff_wide_run(budget);
+    if (budget == 0 || run.rc != ENOSPC || !run.denied) {
+        printf("(budget=%llu rc=%d denied=%d) ", (unsigned long long)budget,
+            run.rc, (int)run.denied);
+        FAIL("unexpected result or classification");
+        return;
+    }
+    PASS;
+}
+
+static void
+d2_diff_case(const char *name, uint64_t budget, bool match,
+    bool fail_resize, int want_rc, bool want_denied)
+{
+    d2_diff_run_t run;
+
+    TEST(name);
+    run = d2_diff_run(budget, match, fail_resize);
+    if (budget == 0 || run.rc != want_rc || run.denied != want_denied) {
+        printf("(budget=%llu rc=%d denied=%d) ", (unsigned long long)budget,
+            run.rc, (int)run.denied);
+        FAIL("unexpected result or classification");
+        return;
+    }
+    PASS;
+}
+
+static void
+test_diff_join_batch_budget_denials_reported(void)
+{
+    const uint64_t key_scratch = 2u * sizeof(uint32_t); /* one key */
+    uint64_t match = d2_diff_threshold(true);
+    uint64_t none = d2_diff_threshold(false);
+    uint64_t out = 0;
+    wl_columnar_memory_governor_ref_t *governor
+        = make_test_governor(UINT64_C(1) << 24);
+    col_rel_t *probe = NULL;
+
+    /* $join_diff_batch is created like this, then typed. */
+    if (governor && wl_columnar_relation_new_auto_governed(
+            "$join_diff_batch", 4, COL_REL_INIT_CAP, false, governor,
+            &probe) == 0)
+        out = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor));
+    col_rel_destroy(probe);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    /* Row 6: the output's column types, the first admission after the
+     * output exists. */
+    d2_diff_case("#2185 row 6: diff output types denial is a budget denial",
+        out ? key_scratch + out + 1u : 0, true, false, ENOSPC, true);
+    /* Row 7: the arrangement's hash-table growth. */
+    d2_diff_case("#2185 row 7: diff arrangement growth denial is a budget "
+        "denial", none ? none - 1u : 0, false, false, ENOSPC, true);
+    /* A successful run right after that denial reports none: the
+     * arrangement's working copy, taken with malloc, must not start with a
+     * stale pending denial from memory a denied copy used before.  This
+     * fails before the fix only when malloc reuses that memory, as glibc
+     * does here; elsewhere it can pass without exercising the fix. */
+    d2_diff_case("#2185 guard: a run after an arrangement denial reports "
+        "none", UINT64_C(1) << 24, true, false, 0, false);
+    /* Row 8: the output's growth. */
+    d2_diff_case("#2185 row 8: diff output growth denial is a budget denial",
+        match && none && match > none ? none + (match - none) / 2u : 0, true,
+        false, ENOSPC, true);
+    /* Guards: the output creation stays a budget denial, and a non-budget
+     * failure of the output's growth stays unclassified. */
+    d2_diff_case("#2185 guard: diff output creation denial",
+        out ? key_scratch + out / 2u : 0, true, false, ENOSPC, true);
+    d2_diff_case("#2185 guard: diff resize-preparation failure is not a "
+        "budget denial", UINT64_C(1) << 24, true, true, ENOMEM, false);
+    /* Rows 9 and 10: the differential producer's scratch constructor and
+     * its column types, in the wide fixture.  The run's threshold denies
+     * the scratch's column types, its largest admission: the typed
+     * metadata, reserved while the untyped metadata is still held.  The
+     * threshold less that typed metadata, less one byte, denies the last
+     * admission of the constructor instead.  The typed metadata is measured
+     * on a standalone scratch-shaped relation. */
+    {
+        uint64_t wide = d2_diff_wide_threshold();
+        uint64_t typed_metadata = 0;
+        wirelog_column_type_t types[2u + D2_DIFF_WIDE_COLS];
+        governor = make_test_governor(UINT64_C(1) << 24);
+        probe = NULL;
+        for (uint32_t c = 0; c < 2u + D2_DIFF_WIDE_COLS; c++)
+            types[c] = WIRELOG_TYPE_INT64;
+        if (governor && wl_columnar_relation_new_auto_governed(
+                "$diff_join_batch", 2u + D2_DIFF_WIDE_COLS, COL_REL_INIT_CAP,
+                false, governor, &probe) == 0
+            && col_rel_set_column_types(probe, types,
+            2u + D2_DIFF_WIDE_COLS) == 0)
+            typed_metadata = probe->metadata_reserved_bytes;
+        col_rel_destroy(probe);
+        if (governor)
+            wl_columnar_memory_governor_ref_release(governor);
+        d2_diff_wide_case("#2185 row 9: diff scratch denial is a budget "
+            "denial", wide > typed_metadata && typed_metadata
+            ? wide - typed_metadata - 1u : 0);
+        d2_diff_wide_case("#2185 row 10: diff scratch types denial is a "
+            "budget denial", wide ? wide - 1u : 0);
+    }
+}
+
 /* ========================================================================
  * MAIN
  * ======================================================================== */
@@ -2987,6 +3291,7 @@ main(void)
     test_diff_join_batch_ignores_overflowing_multiplicity();
     test_diff_join_batch_output_has_no_timestamps();
     test_diff_join_batch_ignores_input_timestamps();
+    test_diff_join_batch_budget_denials_reported();
     test_governed_auto_relation_schema();
     test_diff_join_batch_snapshot_reset_and_tail();
     test_diff_join_batch_snapshot_reset_without_growth();

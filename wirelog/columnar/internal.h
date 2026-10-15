@@ -2910,6 +2910,15 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
 bool
 col_join_key_types_compatible(const col_rel_t *left, const uint32_t *lk,
     const col_rel_t *right, const uint32_t *rk, uint32_t key_count);
+/* Issue #2185: a step of a bounded JOIN path that failed with a budget
+ * denial -- ENOSPC, or ENOMEM while @rel (which may be NULL) holds a pending
+ * denial -- is reported as ENOSPC and recorded on @sess, so
+ * wl_columnar_session_budget_denied() still sees it after the path destroys
+ * the relation that carried the evidence.  Any other @rc is returned
+ * unchanged. */
+int
+wl_columnar_join_budget_denial(wl_col_session_t *sess, const col_rel_t *rel,
+    int rc);
 /* The governor a JOIN-family operator charges for its output and scratch:
  * the session's, else @left's, else @right's. */
 wl_columnar_memory_governor_ref_t *

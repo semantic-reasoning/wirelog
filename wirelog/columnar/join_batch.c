@@ -502,9 +502,12 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         p->batch = col_rel_new_auto("$join_batch", ocols);
         rc = p->batch ? 0 : ENOMEM;
     }
-    if (rc != 0)
+    if (rc != 0) {
+        rc = wl_columnar_join_budget_denial(sess, NULL, rc);
         goto fail;
-    rc = col_join_set_output_types(p->batch, left, right, op);
+    }
+    rc = wl_columnar_join_budget_denial(sess, p->batch,
+            col_join_set_output_types(p->batch, left, right, op));
     if (rc != 0)
         goto fail;
     if (timestamped && !p->batch->timestamps) {

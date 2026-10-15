@@ -398,6 +398,17 @@ wl_columnar_join_new_output(wl_col_session_t *sess, const col_rel_t *left,
     return 0;
 }
 
+int
+wl_columnar_join_budget_denial(wl_col_session_t *sess, const col_rel_t *rel,
+    int rc)
+{
+    if (rc == ENOMEM && rel && rel->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC && sess)
+        sess->memory_budget_denied = true;
+    return rc;
+}
+
 static int
 wl_columnar_join_output_error(wl_col_session_t *sess, const col_rel_t *out,
     int rc)
@@ -3376,14 +3387,14 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 "$join_diff_batch", col_join_output_width(left, right, op),
                 COL_REL_INIT_CAP, false, true, &bounded_out);
         if (bounded_rc == 0)
-            bounded_rc = col_join_set_output_types(bounded_out, left, right,
-                    op);
+            bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
+                    col_join_set_output_types(bounded_out, left, right, op));
         if (bounded_rc == 0)
             bounded_rc = col_diff_join_batch_producer_create(sess, op, left,
                     left_e.is_delta, lk, rk, kc, sess->join_batch_bytes, &cont);
         if (bounded_rc == 0) {
-            bounded_rc = col_join_batch_run_to_relation(cont, sess,
-                    bounded_out);
+            bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
+                    col_join_batch_run_to_relation(cont, sess, bounded_out));
             wl_columnar_continuation_destroy(cont);
             cont = NULL;
         }

@@ -1448,6 +1448,21 @@ Materialized/cache joins and delta-right, filtered, cross, worker, and other
 unsupported shapes remain on their existing one-shot paths until their
 publication contracts are bounded.
 
+A governor denial on these bounded paths is reported as a budget denial: the
+JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
+afterwards because the session's `memory_budget_denied` is set before the
+object that carried the denial is discarded (#2185).  That covers both
+producers' scratch relations and their column types (`$join_batch` for the
+non-differential join and the consumed pipeline, `$diff_join_batch` for the
+differential join), the consumed pipeline's output attachment and growth,
+the operator's and the differential join's output growth, the differential
+output's column types, and the differential arrangement's hash-table growth.
+A failure that no governor denied, such as a resize-preparation failure of
+the output, stays `ENOMEM` and is not reported as a denial.  The
+differential arrangement's creation and copy reservations in the same
+transaction still return `ENOMEM` when denied; the check is already true for
+them.
+
 LFTJ is outside bounded mode.  `WIRELOG_JOIN_BATCH_BYTES` and
 `WIRELOG_JOIN_BATCH_STRICT` do not apply to `col_op_lftj`: it builds the
 whole `$lftj` output in one append batch before publishing it, and strict

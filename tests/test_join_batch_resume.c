@@ -3549,7 +3549,9 @@ test_sink_prepare_resize_failure(void)
         || reserved_of(f.sess) != reserved
         || !same_rows(before_output, f.out)
         || !col_join_batch_cursor_get(cont, &before)
-        || !same_join_batch_cursor(&before, &cursor_before)) {
+        || !same_join_batch_cursor(&before, &cursor_before)
+        /* #2185: a non-budget failure is not reported as a denial. */
+        || wl_columnar_session_budget_denied(f.sess)) {
         FAIL("resize preparation failure was misclassified or not rolled back");
         goto out;
     }
