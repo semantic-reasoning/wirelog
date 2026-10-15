@@ -2822,9 +2822,9 @@ constructor caller75, rather than append arbitrary scheduling after a child.
 
 `wl_columnar_join_op_attempt_start` uses the original cleanup frame and its
 embedded continuation. A NULL control delegates to the existing raw JOIN.
-The controlled path currently supports cross JOIN on scalar inputs during
-initial, serial, nonrecursive evaluation. The containing stratum must be
-nonrecursive. Keyed JOIN is rejected until the following implementation unit.
+The controlled path supports cross and multi-key hash JOIN on scalar inputs
+during initial, serial, nonrecursive evaluation. The containing stratum must
+be nonrecursive.
 Right filters, materialized hints, configured join batches, differential or
 retraction evaluation, TDD and parallel/shared-output execution are outside
 this entrypoint's domain and return `ENOTSUP`; they do not enter raw execution.
@@ -2877,3 +2877,46 @@ prepayment completes no source, batch, scratch or unary output is activated;
 empty cleanup after partial prepayment and every retained retry use fresh
 HOST384 actions. This inventory describes admitted logical work, including
 unused reservations, rather than exact executed-work telemetry.
+
+### Controlled multi-key JOIN (#1821)
+
+Keyed JOIN uses a private ephemeral chained hash table, preserving duplicate
+multiplicity and canonical typed tuple bags. Each key name, hash key, bucket
+initialization slot, insertion, left probe and candidate comparison has an
+original-attempt admission. Empty-bucket misses and rejected collisions are
+charged even when no output row is produced. The raw arrangement/cache and
+parallel strategies remain outside this route; physical row order and memory
+budget thresholds need not match them.
+
+Exact column names take precedence. After a failed exact-name scan, the
+portable `col<N>` fallback accepts ASCII whitespace before an optional sign
+and decimal digits. A complete representable nonnegative value selects that
+column when in range. Missing names, absent digits, negative values, trailing
+ASCII junk and out-of-range representable indices use column zero. Complete
+positive values above `INT_MAX` and non-ASCII bytes encountered before an
+ASCII malformed suffix terminates parsing return `ENOTSUP`; exact names with those spellings remain valid. This explicit domain
+avoids locale and implementation-dependent `strtol` narrowing. Positive-key
+zero-width operands return `EINVAL`. Missing/forced-empty right skips key
+resolution, while present empty operands still undergo key/type preflight.
+FLOAT/non-FLOAT key pairs fail with `EINVAL`; different non-FLOAT types do not
+match. Finite FLOAT keys share the existing signed-zero hash/equality rule.
+Encountered nonfinite key bits return `EINVAL`, without a claim about global
+malformed-input ordering across raw strategies.
+
+Scratch slot0 owns the two key-index arrays, slot1 the existing type/row
+staging, and slot2 the aligned heads/next image. All sizes and bucket growth
+are checked; initialization advances explicitly rather than calling `calloc`.
+Partial initialization needs no per-element destructor, so the existing fixed
+physical/credit/reference/clear retirement stages remain sufficient. Source
+readers remain held through the last value gather and append. Publication,
+delta selection, HOST384 financing and separately scheduled generic cleanup
+retain the cross-JOIN contract above.
+
+The J3 source inventory bounds each parser/hash cell at112 slots and typed
+match cell at120, within its128 admission. Including the separately funded
+73-slot caller, new composed regions remain at most193; existing COLUMN256,
+typed constructor253 and B2 validation252 remain limiting. Primitive physical,
+control/ref/token exclusions remain as above. A nonempty cross JOIN now also
+admits192 for selection and192 per reached left row; these are new forward
+admissions rather than borrowed unused retirement shares. The three original
+scratch records and84 first-retirement payments remain unchanged.

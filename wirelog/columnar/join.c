@@ -29,6 +29,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -4225,6 +4226,148 @@ wl_columnar_join_attempt_status(const wl_columnar_filter_context_t *context,
     status->committed = context->committed;
 }
 
+/* J3 written-source inventory: suffix classifier48+tail28+arbitration18+
+ * next-refusal18=112; hash5+9+28+28+35+7=112; typed equality54 gives
+ * match2+54+1+28+6+24+5=120. Each fits CELL128; nested original caller73
+ * makes the largest new composed region193. Existing child COLUMN256,
+ * constructor253/B2 validation252 remain limiting; no internal subtraction.
+ * The three original scratch retirement capacities already exist in J2. */
+typedef char wl_columnar_join_attempt_new_cells_fit[
+        (112 <= WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK
+        && 120 <= WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK
+        && 193 <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+/* Exact-name precedence and the documented portable col<N> fallback domain.
+ * Every examined registry/name/parser unit has its own original-ID admission. */
+static int
+wl_columnar_join_attempt_key(const wl_columnar_relation_scalar_source_t *source,
+    const char *key, uint32_t *out, wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    *out = 0;
+    if (!key || !source->names) return 0;
+    for (uint32_t column = 0; column < source->width; ++column) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        const char *name = source->names[column];
+        rc = wl_columnar_join_attempt_tail(control, id, 21, column);
+        if (rc) return rc;
+        if (!name) continue;
+        for (size_t byte = 0; ; ++byte) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) return rc;
+            unsigned char wanted = (unsigned char)key[byte];
+            unsigned char actual = (unsigned char)name[byte];
+            bool equal = wanted == actual;
+            rc = wl_columnar_join_attempt_tail(control, id, 22, byte);
+            if (rc) return rc;
+            if (!equal) break;
+            if (!wanted) {
+                if (column > INT_MAX) return ENOTSUP;
+                *out = column; return 0;
+            }
+        }
+    }
+    for (unsigned byte = 0; byte < 3; ++byte) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        bool equal = key[byte] == "col"[byte];
+        rc = wl_columnar_join_attempt_tail(control, id, 23, byte);
+        if (rc) return rc;
+        if (!equal) return 0;
+    }
+    size_t byte = 3;
+    bool initial = true, negative = false, digits = false, overflow = false;
+    uint32_t value = 0;
+    for (;;) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        unsigned char ch = (unsigned char)key[byte];
+        int typed = ch >= 128 ? ENOTSUP : 0;
+        bool finished = typed != 0;
+        bool whitespace = ch == ' ' || ch == '\t' || ch == '\n'
+            || ch == '\r' || ch == '\f' || ch == '\v';
+        if (!finished && initial && whitespace) {
+            ++byte;
+        } else if (!finished && initial && (ch == '+' || ch == '-')) {
+            initial = false; negative = ch == '-'; ++byte;
+        } else if (!finished && ch >= '0' && ch <= '9') {
+            initial = false; digits = true;
+            uint32_t digit = (uint32_t)(ch - '0');
+            if (!overflow) {
+                if (value > ((uint32_t)INT_MAX - digit) / 10u) overflow = true;
+                else value = value * 10u + digit;
+            }
+            ++byte;
+        } else if (!finished) {
+            finished = true;
+            if (!ch && digits && !negative && overflow) typed = ENOTSUP;
+        }
+        rc = wl_columnar_join_attempt_tail(control, id, 23, byte);
+        if (rc > 0) return rc;
+        if (typed) return typed;
+        if (rc) return rc;
+        if (finished) {
+            if (!ch && digits && !negative && !overflow &&
+                value < source->width)
+                *out = value;
+            return 0;
+        }
+    }
+}
+
+static int
+wl_columnar_join_attempt_hash(const col_rel_t *relation, uint32_t row,
+    const uint32_t *keys, uint32_t count, uint32_t *out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    uint32_t hash = 2166136261u;
+    for (uint32_t key = 0; key < count; ++key) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        uint32_t column = keys[key];
+        int64_t bits = relation->columns[column][row];
+        bool valid = !relation->column_types
+            || relation->column_types[column] != WIRELOG_TYPE_FLOAT
+            || wl_columnar_float_bits_valid(bits);
+        if (valid) hash = wl_columnar_hash_value(hash, relation, column, bits);
+        rc = wl_columnar_join_attempt_tail(control, id, 27, key);
+        if (rc > 0) return rc;
+        if (!valid) return EINVAL;
+        if (rc) return rc;
+    }
+    *out = hash;
+    return 0;
+}
+
+static int
+wl_columnar_join_attempt_match(const col_rel_t *left, uint32_t left_row,
+    const uint32_t *left_keys, const col_rel_t *right, uint32_t right_row,
+    const uint32_t *right_keys, uint32_t count, bool *out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    *out = false;
+    for (uint32_t key = 0; key < count; ++key) {
+        int rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) return rc;
+        uint32_t lc = left_keys[key], rc_column = right_keys[key];
+        bool equal = wl_columnar_value_equal(left, lc,
+                left->columns[lc][left_row], right, rc_column,
+                right->columns[rc_column][right_row]);
+        rc = wl_columnar_join_attempt_tail(control, id, 30, key);
+        if (rc) return rc;
+        if (!equal) return 0;
+    }
+    *out = true;
+    return 0;
+}
+
 int
 wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
@@ -4290,7 +4433,7 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     ctx->thread_valid = true; ctx->busy = true;
     ctx->join_initialized = true; ctx->join_decision_pending = true;
     ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
-    bool supported = op->op == WL_PLAN_OP_JOIN && !op->key_count
+    bool supported = op->op == WL_PLAN_OP_JOIN
         && !op->right_filter_expr.size && !op->materialized
         && (!op->project_count || op->project_indices)
         && !session->current_iteration && !session->diff_operators_active
@@ -4413,6 +4556,75 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
+    wl_columnar_memory_governor_ref_t *governor = session->memory_governor
+        ? session->memory_governor : left->memory_governor
+        ? left->memory_governor : right ? right->memory_governor : NULL;
+    uint32_t *left_keys = NULL, *right_keys = NULL;
+    bool keyed = op->key_count && right && !forced_empty;
+    rc = wl_columnar_join_attempt_tail(control, id, 24, op->key_count);
+    if (rc) goto done;
+    if (keyed) {
+        if (!ctx->source.width || !ctx->join_right.width) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint64_t key_bytes = 0;
+        bool key_sized = wl_columnar_memory_size_mul(op->key_count,
+                2u * sizeof(uint32_t), &key_bytes) && key_bytes <= SIZE_MAX;
+        rc = wl_columnar_join_attempt_tail(control, id, 24, key_bytes);
+        if (rc > 0 || key_sized) {
+            if (rc) goto done;
+        } else {
+            rc = EOVERFLOW; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_scratch(&ctx->join_scratch[0], key_bytes,
+                governor, control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        left_keys = ctx->join_scratch[0].physical;
+        right_keys = left_keys + op->key_count;
+        for (uint32_t key = 0; key < op->key_count; ++key) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_key(&ctx->source,
+                    op->left_keys ? op->left_keys[key] : NULL,
+                    &left_keys[key], control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_key(&ctx->join_right,
+                    op->right_keys ? op->right_keys[key] : NULL,
+                    &right_keys[key], control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            wirelog_column_type_t lt = ctx->source.types
+                ? ctx->source.types[left_keys[key]] : WIRELOG_TYPE_INT64;
+            wirelog_column_type_t rt = ctx->join_right.types
+                ? ctx->join_right.types[right_keys[key]] : WIRELOG_TYPE_INT64;
+            bool compatible = (lt == WIRELOG_TYPE_FLOAT) ==
+                (rt == WIRELOG_TYPE_FLOAT);
+            rc = wl_columnar_join_attempt_tail(control, id, 25, key);
+            if (rc > 0 || compatible) {
+                if (rc) goto done;
+            } else {
+                rc = EINVAL; goto done;
+            }
+        }
+    }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
     uint64_t width64 =
         projected ? op->project_count : (uint64_t)ctx->source.width
         + (right ? ctx->join_right.width : 0);
@@ -4433,9 +4645,7 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
         rc = EOVERFLOW; goto done;
     }
     ctx->width = (uint32_t)width64; ctx->nrows = ctx->source.nrows;
-    wl_columnar_memory_governor_ref_t *governor = session->memory_governor
-        ? session->memory_governor : left->memory_governor
-        ? left->memory_governor : right ? right->memory_governor : NULL;
+
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
@@ -4488,8 +4698,99 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
             ctx->output, control);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
+    uint32_t buckets = 1;
+    uint32_t *heads = NULL, *next = NULL;
+    if (keyed) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        if (ctx->join_right.nrows > UINT32_MAX / 2u) {
+            rc = ENOMEM; goto done;
+        }
+        uint32_t target = ctx->join_right.nrows * 2u;
+        rc = wl_columnar_join_attempt_tail(control, id, 26, target);
+        if (rc) goto done;
+        while (buckets < target) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            bool fits = buckets <= UINT32_MAX / 2u;
+            if (fits) buckets *= 2u;
+            rc = wl_columnar_join_attempt_tail(control, id, 26, buckets);
+            if (rc > 0 || fits) {
+                if (rc) goto done;
+            } else {
+                rc = ENOMEM; goto done;
+            }
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint64_t slots = 0, hash_bytes = 0;
+        bool hash_sized = wl_columnar_memory_size_add(buckets,
+                ctx->join_right.nrows, &slots)
+            && wl_columnar_memory_size_mul(slots, sizeof(uint32_t), &hash_bytes)
+            && hash_bytes <= SIZE_MAX;
+        rc = wl_columnar_join_attempt_tail(control, id, 26, hash_bytes);
+        if (rc > 0 || hash_sized) {
+            if (rc) goto done;
+        } else {
+            rc = EOVERFLOW; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_scratch(&ctx->join_scratch[2], hash_bytes,
+                governor, control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        heads = ctx->join_scratch[2].physical; next = heads + buckets;
+        for (uint64_t slot = 0; slot < slots; ++slot) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            heads[slot] = UINT32_MAX;
+            rc = wl_columnar_join_attempt_tail(control, id, 26, slot);
+            if (rc) goto done;
+        }
+        for (uint32_t row = 0; row < ctx->join_right.nrows; ++row) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            uint32_t hash = 0;
+            rc = wl_columnar_join_attempt_hash(right, row, right_keys,
+                    op->key_count, &hash, control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t bucket = hash & (buckets - 1u);
+            next[row] = heads[bucket]; heads[bucket] = row;
+            rc = wl_columnar_join_attempt_tail(control, id, 28, row);
+            if (rc) goto done;
+        }
+    }
     for (uint32_t lr = 0; lr < ctx->source.nrows; ++lr) {
-        for (uint32_t rr = 0; rr < ctx->join_right.nrows; ++rr) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint32_t first = 0;
+        if (keyed) {
+            uint32_t hash = 0;
+            rc = wl_columnar_join_attempt_hash(left, lr, left_keys,
+                    op->key_count, &hash, control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            first = heads[hash & (buckets - 1u)];
+            rc = wl_columnar_join_attempt_tail(control, id, 29, lr);
+            if (rc) goto done;
+        }
+        for (uint32_t rr = first; rr < ctx->join_right.nrows;
+            rr = keyed ? next[rr] : rr + 1u) {
             rc = wl_columnar_join_attempt_charge(control, id,
                     WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
             if (rc) goto done;
@@ -4497,6 +4798,18 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
             rc = wl_columnar_join_attempt_tail(control, id, 17,
                     (uint64_t)lr * ctx->join_right.nrows + rr);
             if (rc) goto done;
+            if (keyed) {
+                rc = wl_columnar_join_attempt_charge(control, id,
+                        WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+                if (rc) goto done;
+                bool match = false;
+                rc = wl_columnar_join_attempt_match(left, lr, left_keys,
+                        right, rr, right_keys, op->key_count, &match, control,
+                        id);
+                rc = wl_columnar_join_attempt_return(control, id, rc);
+                if (rc) goto done;
+                if (!match) continue;
+            }
             for (uint32_t c = 0; c < ctx->width; ++c) {
                 rc = wl_columnar_join_attempt_charge(control, id,
                         WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
