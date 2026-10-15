@@ -3566,6 +3566,58 @@ join_activation_fixtures(void)
     }
 }
 
+/* A real running operator context is the only route to its unary admission. */
+static wl_columnar_filter_test_scenario_t *admission_scenario;
+static bool admission_seen;
+
+static void
+admission_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != 3) return;
+    CHECK(!admission_seen);
+    admission_seen = true;
+    wl_columnar_eval_stack_cleanup_frame_t *frame =
+        admission_scenario->filter.frame;
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context(frame, &context));
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(context->busy && !context->unary_started);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(frame,
+        control, id) == EBUSY);
+    wl_columnar_filter_context_t copy = *context;
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame,
+        &copy, control, id, NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame,
+        context, control, id + 1, NULL) == EINVAL);
+    CHECK(context->busy && !context->unary_started);
+}
+
+static void
+admission_cases(void)
+{
+    for (unsigned map = 0; map < 2; ++map) {
+        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                sizeof(*scenario));
+        CHECK(scenario);
+        wl_plan_op_t op = {0}; op.project_count = 1;
+        op.op = map ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER;
+        wl_columnar_filter_test_map_prepare(scenario, 1, 2, false, false,
+            &op, 0);
+        if (!map) scenario->filter.start = wl_columnar_filter_op_attempt_start;
+        admission_scenario = scenario; admission_seen = false;
+        wl_columnar_filter_test_attempt_checkpoint = admission_checkpoint;
+        wl_columnar_filter_test_map_run(scenario);
+        wl_columnar_filter_test_attempt_checkpoint = NULL;
+        CHECK(admission_seen);
+        wl_evaluation_control_report_t report =
+            wl_columnar_filter_test_complete(scenario);
+        CHECK(!report.result); free(scenario);
+    }
+    admission_scenario = NULL;
+}
+
 int
 main(void)
 {
@@ -3655,6 +3707,7 @@ main(void)
     wl_columnar_filter_test_map_ungoverned();
     for (unsigned mode = 0; mode < 4; ++mode) join_workspace_fixture(mode);
     join_activation_fixtures();
+    admission_cases();
     printf(
         "numeric FILTER: semantic, literal, FIFO, retention, authority and fault witnesses passed\n");
     return 0;

@@ -3027,6 +3027,150 @@ join_typed_operator_fixtures(void)
     release(ctl);
 }
 
+static void
+sorted_stamp_drain(wl_columnar_relation_append_batch_t *batch, int rc)
+{
+    wl_columnar_relation_private_batch_drain_t drain;
+    wl_columnar_relation_private_batch_drain_init(&drain);
+    bool done = false;
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 20);
+        CHECK(!wl_columnar_relation_private_batch_drain_step(&drain, batch,
+            rc, &done));
+    }
+}
+
+static void *
+sorted_stamp_wrong_thread(void *arg)
+{
+    wl_columnar_relation_append_batch_t *batch = arg;
+    CHECK(wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
+            batch, batch->control, batch->attempt_id) == EINVAL);
+    return NULL;
+}
+
+static void
+sorted_stamp_faults(void)
+{
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        col_rel_t *r = col_rel_new_auto("$stamp", 1); CHECK(r);
+        if (mode == 3) {
+            wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+            CHECK(!col_rel_set_column_types(r, &type, 1));
+        }
+        wl_evaluation_control_t *c = control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        wl_columnar_relation_append_batch_t batch = {0};
+        CHECK(!wl_columnar_relation_append_batch_begin_controlled(&batch, r,
+            c));
+        if (!mode) {
+            wl_thread_t thread;
+            CHECK(!wl_thread_create(&thread, sorted_stamp_wrong_thread,
+                &batch));
+            CHECK(!wl_thread_join(&thread));
+        } else if (mode == 1) cancel_at = 1116;
+        else if (mode == 2) {
+            (void)finish(c, 0); retry(c, 0);
+        } else {
+            uint64_t nonce = batch.raw.single.set.acquisition_nonce;
+            for (unsigned n = 0; n < 130; ++n) {
+                int64_t value = wl_columnar_float_to_bits((double)n);
+                CHECK(
+                    !wl_columnar_relation_append_batch_row_controlled(
+                        &batch, &value));
+            }
+            CHECK(batch.raw.single.set.acquisition_nonce != nonce);
+        }
+        int rc =
+            wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
+            &batch, c, id);
+        CHECK(rc == (mode == 1 ? WL_EVALUATION_CONTROL_CANCELLED :
+            mode == 2 ? EINVAL : 0));
+        if (rc) CHECK(!r->sorted_nrows && !r->run_count);
+        sorted_stamp_drain(&batch, rc);
+        CHECK(r->nrows == (mode == 3 ? 130u : 0u));
+        if (mode == 3) CHECK(r->sorted_nrows == 130 && r->run_count == 1 &&
+                r->run_ends[0] == 130 &&
+                r->column_types[0] == WIRELOG_TYPE_FLOAT);
+        if (mode == 3) {
+            /* Legacy growing-row hooks are checkpoints, not an admitted-work
+             * oracle. This case verifies renewed authority and cache lifetime. */
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_finish(c, &owner, 0, 0));
+            CHECK(!wl_evaluation_control_report(c, &report));
+            CHECK(report.attempt_id == id && !report.result &&
+                report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+        } else (void)finish(c, mode == 2 ? 0 : rc);
+        release(c); col_rel_destroy(r);
+    }
+}
+
+/* A sorted cache stamp changes neither rows nor generations and survives the
+ * genuine staged original-writer drain. These fees are independent literals,
+ * provisional until the production source certificate is accepted. */
+static void
+sorted_stamp_cases(void)
+{
+    wl_columnar_relation_test_work_checkpoint = checkpoint;
+    for (unsigned rows = 0; rows <= 2; ++rows) {
+        const uint64_t limits[] = {0, 668 + 127, 668 + 128,
+                                   668 + 128 + 191, 668 + 320, 668 + 447,
+                                   668 + 448};
+        for (unsigned j = 0; j < sizeof(limits) / sizeof(limits[0]); ++j) {
+            col_rel_t *r = col_rel_new_auto("$stamp", 1);
+            CHECK(r);
+            for (unsigned n = 0; n < rows; ++n) {
+                int64_t value = n;
+                CHECK(!col_rel_append_row(r, &value));
+            }
+            wl_evaluation_control_t *c = control(limits[j]);
+            uint64_t id = wl_evaluation_control_active_attempt_id(c);
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(!wl_columnar_relation_append_batch_begin_controlled(&batch,
+                r, c));
+            uint64_t storage = r->storage_generation, view = r->view_generation;
+            wl_columnar_relation_append_batch_t copy = batch;
+            CHECK(
+                wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+                (
+                    &copy, c, id) == EINVAL);
+            CHECK(
+                wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+                (
+                    &batch, c, id + 1) == EINVAL);
+            CHECK(
+                wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+                (
+                    &batch, NULL, id) == EINVAL);
+            int rc =
+                wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+                (
+                &batch, c, id);
+            CHECK(rc == ((!limits[j] || limits[j] >= 1116) ? 0 :
+                WL_EVALUATION_CONTROL_WORK_LIMIT));
+            CHECK(r->nrows == rows && r->storage_generation == storage &&
+                r->view_generation == view);
+            if (!rc) CHECK(r->sorted_nrows == rows &&
+                    r->run_count == (rows ? 1u : 0u) && r->run_ends[0] == rows);
+            else CHECK(!r->sorted_nrows && !r->run_count);
+            wl_columnar_relation_private_batch_drain_t drain;
+            wl_columnar_relation_private_batch_drain_init(&drain);
+            bool done = false;
+            for (unsigned turn = 0; !done; ++turn) {
+                CHECK(turn < 20);
+                CHECK(!wl_columnar_relation_private_batch_drain_step(&drain,
+                    &batch, rc, &done));
+            }
+            if (!rc) CHECK(r->sorted_nrows == rows &&
+                    r->run_count == (rows ? 1u : 0u));
+            uint64_t expected = !limits[j] || limits[j] >= 1116 ? 1116 :
+                limits[j] < 796 ? 668 : limits[j] < 988 ? 796 : 988;
+            CHECK(finish(c, rc) == expected);
+            release(c); col_rel_destroy(r);
+        }
+    }
+}
+
 int
 main(void)
 {
@@ -3100,6 +3244,8 @@ main(void)
         }
     scalar_source_twins(300, true, true, false);
     join_typed_operator_fixtures();
+    sorted_stamp_cases();
+    sorted_stamp_faults();
     puts("evaluation_relation_creation: OK");
     return 0;
 }

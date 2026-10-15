@@ -3680,6 +3680,16 @@ int wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
     wl_columnar_relation_append_batch_t *batch,
     wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
     const int64_t *values, uint32_t width);
+/* Stamp derived sorted caches on an already sorted-and-unique private noTS
+ * output, using scalar row comparison. The caller completes dedup first.
+ * Requires original native-thread HELD fixed-one writer, current control/ID,
+ * and exclusively serialized output lifetime. No later append is permitted.
+ * Does not scan/verify ordering or uniqueness, or change rows/generations.
+ * Caller separately funds its <=64-slot continuation to the next real poll
+ * or host return. Metadata survives
+ * the ordinary batch drain. NULL control is invalid. Caller pins control. */
+int wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
+    wl_columnar_relation_append_batch_t *, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_scalar_source_end(
     wl_columnar_relation_scalar_source_t *source, int initiating_result);
 
