@@ -830,6 +830,11 @@ wl_columnar_eval_stack_unary_begin_attempt_controlled(
                attempt_id, NULL);
 }
 
+static int
+wl_columnar_eval_stack_unary_begin_attempt_body(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+
 int
 wl_columnar_eval_stack_unary_begin_attempt_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
@@ -837,8 +842,46 @@ wl_columnar_eval_stack_unary_begin_attempt_owned(
 {
     int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
     if (authority) return authority;
-    if (!wl_columnar_eval_stack_unary_frame_valid(frame))
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    if (frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT) return EBUSY;
+    return wl_columnar_eval_stack_unary_begin_attempt_body(frame, control,
+               attempt_id);
+}
+
+int
+wl_columnar_eval_stack_unary_begin_attempt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t *context, wl_evaluation_control_t *control,
+    uint64_t attempt_id, const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    if (context != &frame->filter) return EINVAL;
+    if (context->identity != context || context->frame != frame
+        || context->session != frame->session
+        || frame->session->cleanup_active != frame
+        || context->stage != WL_COLUMNAR_FILTER_STAGE_RUNNING
+        || !context->busy || !context->thread_valid || !context->pin_owned
+        || context->unary_started || !control || !attempt_id
+        || context->control != control || context->attempt_id != attempt_id)
         return EINVAL;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(context->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (context->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(context->owner_thread, pthread_self())) return EINVAL;
+#endif
+    return wl_columnar_eval_stack_unary_begin_attempt_body(frame, control,
+               attempt_id);
+}
+
+static int
+wl_columnar_eval_stack_unary_begin_attempt_body(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
     int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
             WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK);
     if (rc)

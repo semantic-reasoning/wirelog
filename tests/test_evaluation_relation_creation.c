@@ -1,6 +1,7 @@
 /* #1821: real governed fresh construction, before engine integration. */
 #include "../wirelog/columnar/internal.h"
 #include <stdio.h>
+#include <math.h>
 #ifndef _WIN32
 #include <signal.h>
 #include <sys/resource.h>
@@ -2855,6 +2856,177 @@ scalar_source_domains(void)
     CHECK(col_rel_destroy_checked(r) == 0);
 }
 
+/* Typed JOIN constructor/append reuse: these tests use real credits and the
+ * original checked row wrapper, not a separate unguarded append entrypoint. */
+static void
+join_typed_operator_fixtures(void)
+{
+    const uint32_t widths[] = {0, 1, 17, 129};
+    for (unsigned gi = 0; gi < 2; ++gi) {
+        watched = gi ? governor() : NULL;
+        for (unsigned wi = 0; wi < 4; ++wi) {
+            uint32_t width = widths[wi];
+            wirelog_column_type_t *types = malloc((width ? width : 1) *
+                    sizeof(*types));
+            int64_t *row = calloc(width ? width : 1, sizeof(*row));
+            CHECK(types && row);
+            for (uint32_t c = 0; c < width; ++c) {
+                types[c] = c % 7 + WIRELOG_TYPE_INT32;
+                row[c] = types[c] == WIRELOG_TYPE_FLOAT
+                    ? wl_columnar_float_to_bits(-0.0) : (int64_t)c;
+            }
+            wl_evaluation_control_t *ctl = control(0);
+            uint64_t id = wl_evaluation_control_active_attempt_id(ctl);
+            col_rel_t *out = NULL;
+            CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    "$join", width, width ? types : NULL, watched, &out, ctl,
+                    id) == 0);
+            CHECK(out && out->ncols == width && !out->nrows &&
+                !out->timestamps);
+            CHECK(out->capacity == COL_REL_INIT_CAP && !out->has_graph_column);
+            for (uint32_t c = 0; c < width; ++c) {
+                char name[32]; snprintf(name, sizeof(name), "col%u", c);
+                CHECK(strcmp(out->col_names[c], name) == 0);
+                CHECK(out->column_types[c] == types[c]);
+            }
+            wl_columnar_relation_append_batch_t batch = {0};
+            CHECK(wl_columnar_relation_append_batch_begin_controlled(&batch,
+                out, ctl) == 0);
+            for (unsigned r = 0; r < 65; ++r)
+                CHECK(
+                    wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                    (
+                        &batch, row, ctl, id) == 0);
+            CHECK(wl_columnar_relation_append_batch_end_controlled(&batch,
+                0) == 0);
+            CHECK(out->nrows == 65);
+            for (uint32_t c = 0; c < width; ++c) {
+                CHECK(out->column_types[c] == types[c]);
+                int64_t expected = types[c] == WIRELOG_TYPE_FLOAT ? 0 : row[c];
+                CHECK(out->columns[c][0] == expected &&
+                    out->columns[c][64] == expected);
+            }
+            /* Existing wrapper must retain typed finite-value validation. */
+            if (width > 4) {
+                row[4] = wl_columnar_float_to_bits(INFINITY);
+                wl_columnar_relation_append_batch_t invalid = {0};
+                CHECK(wl_columnar_relation_append_batch_begin_controlled(
+                        &invalid, out, ctl) == 0);
+                CHECK(
+                    wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                    (
+                        &invalid, row, ctl, id) == EINVAL);
+                CHECK(wl_columnar_relation_append_batch_end_controlled(&invalid,
+                    EINVAL) == EINVAL);
+                CHECK(out->nrows == 65);
+            }
+            CHECK(wl_evaluation_control_finish(ctl, &owner, 0, 0) == 0);
+            release(ctl);
+            CHECK(col_rel_destroy_checked(out) == 0);
+            CHECK(!watched || reserved() == 0);
+            free(types); free(row);
+        }
+        if (watched) wl_columnar_memory_governor_ref_release(watched);
+        watched = NULL;
+    }
+    watched = governor();
+    wirelog_column_type_t allocation_types[17];
+    for (unsigned c = 0; c < 17; ++c) allocation_types[c] = WIRELOG_TYPE_FLOAT;
+    bool allocation_completed = false;
+    for (unsigned ordinal = 1; ordinal < 128; ++ordinal) {
+        wl_evaluation_control_t *ctl = control(0);
+        col_rel_t *out = NULL;
+        wl_columnar_relation_test_constructor_fail_allocation = ordinal;
+        int rc = wl_columnar_relation_new_typed_operator_attempt_controlled(
+            "$join", 17, allocation_types, watched, &out, ctl,
+            wl_evaluation_control_active_attempt_id(ctl));
+        bool injected = !wl_columnar_relation_test_constructor_fail_allocation;
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        if (rc) CHECK(rc == ENOMEM && injected && !out);
+        else {
+            CHECK(out && !injected && ordinal > 20);
+            CHECK(col_rel_destroy_checked(out) == 0);
+            allocation_completed = true;
+        }
+        CHECK(wl_evaluation_control_finish(ctl, &owner, rc, 0) == rc);
+        release(ctl);
+        CHECK(!reserved() && wl_columnar_memory_governor_ref_is_sole(watched));
+        if (allocation_completed) break;
+    }
+    CHECK(allocation_completed);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    wl_columnar_memory_resolution_t tiny = {
+        .budget_bytes = 1, .usable_bytes = 1,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK,
+    };
+    watched = wl_columnar_memory_governor_ref_create(&tiny); CHECK(watched);
+    wl_evaluation_control_t *denied_control = control(0);
+    col_rel_t *denied_output = NULL;
+    CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled("$join",
+        17,
+        allocation_types, watched, &denied_output, denied_control,
+        wl_evaluation_control_active_attempt_id(denied_control)) == ENOSPC);
+    CHECK(!denied_output && !reserved());
+    CHECK(wl_evaluation_control_finish(denied_control, &owner, ENOSPC,
+        0) == ENOSPC);
+    release(denied_control);
+    wl_columnar_memory_governor_ref_release(watched); watched = NULL;
+    const uint64_t prefix_limits[] = {1, 127, 128, 255, 256, 383, 384};
+    const uint64_t prefix_consumed[] = {0, 0, 128, 128, 256, 256, 384};
+    const wirelog_column_type_t valid_type = WIRELOG_TYPE_FLOAT;
+    for (unsigned i = 0; i < sizeof(prefix_limits) / sizeof(prefix_limits[0]);
+        ++i) {
+        wl_evaluation_control_t *ctl = control(prefix_limits[i]);
+        col_rel_t *out = NULL;
+        CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled(
+                "$join", 1, &valid_type, NULL, &out, ctl,
+                wl_evaluation_control_active_attempt_id(ctl)) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!out);
+        CHECK(wl_evaluation_control_finish(ctl, &owner, 0,
+            0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(ctl, &report) == 0);
+        CHECK(report.consumed == prefix_consumed[i]);
+        release(ctl);
+    }
+    wl_evaluation_control_t *cancelled = control(0);
+    col_rel_t *cancelled_output = NULL;
+    cancel_at = 256; /* ENTRY128 then first TYPE128, before PREPARE/build. */
+    CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled("$join", 1,
+        &valid_type, NULL, &cancelled_output, cancelled,
+        wl_evaluation_control_active_attempt_id(cancelled)) ==
+        WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!cancelled_output);
+    CHECK(finish(cancelled, WL_EVALUATION_CONTROL_CANCELLED) == 256);
+    release(cancelled); cancel_at = 0;
+    wirelog_column_type_t invalid_type = (wirelog_column_type_t)99;
+    const uint64_t limits[] = {1, 127, 128, 255, 256, 383, 384};
+    for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
+        wl_evaluation_control_t *ctl = control(limits[i]);
+        col_rel_t *out = NULL;
+        int rc = wl_columnar_relation_new_typed_operator_attempt_controlled(
+            "limit", 1, &invalid_type, NULL, &out, ctl,
+            wl_evaluation_control_active_attempt_id(ctl));
+        CHECK((rc == WL_EVALUATION_CONTROL_WORK_LIMIT || rc == EINVAL) && !out);
+        CHECK(wl_evaluation_control_finish(ctl, &owner, rc > 0 ? rc : 0,
+            0) == rc);
+        release(ctl);
+    }
+    wl_evaluation_control_t *ctl = control(0);
+    col_rel_t *out = NULL;
+    CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled("bad", 1,
+        &invalid_type, NULL, &out, ctl,
+        wl_evaluation_control_active_attempt_id(ctl)) == EINVAL && !out);
+    CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled("bad", 1,
+        NULL, NULL, &out, ctl,
+        wl_evaluation_control_active_attempt_id(ctl)) == EINVAL && !out);
+    CHECK(wl_evaluation_control_finish(ctl, &owner, EINVAL, 0) == EINVAL);
+    release(ctl);
+}
+
 int
 main(void)
 {
@@ -2927,6 +3099,7 @@ main(void)
             scalar_source_twins(17, typed != 0, ts != 0, true);
         }
     scalar_source_twins(300, true, true, false);
+    join_typed_operator_fixtures();
     puts("evaluation_relation_creation: OK");
     return 0;
 }
