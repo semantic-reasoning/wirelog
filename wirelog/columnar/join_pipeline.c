@@ -563,6 +563,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     sink.abort = pipeline_sink_abort;
 
     for (;;) {
+        uint64_t before = out->nrows;
         wl_columnar_continuation_status_t status
             = wl_columnar_continuation_publish(continuation, &sink);
         if (status == WL_COLUMNAR_CONTINUATION_DONE)
@@ -583,7 +584,9 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
              * the restored input on the one-shot path. */
             return sink_ctx.error != 0 ? sink_ctx.error : ENOMEM;
         }
-        if (col_join_output_limit_reached(sess, out)) {
+        /* Preserve the pipeline's post-FILTER/MAP output cap semantics. */
+        if (wl_columnar_join_output_limit_reached(sess, out,
+            out->nrows - before)) {
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
             col_rel_destroy(out);

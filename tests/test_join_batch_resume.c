@@ -2508,6 +2508,46 @@ test_row_cap_trips_after_a_committed_batch(void)
     fixture_fini(&f);
 }
 
+static void
+test_shared_cap_counts_only_committed_rows(void)
+{
+    const int64_t keys[] = { 0 };
+    const int64_t existing[] = { 0, 0, 0, 0 };
+
+    for (unsigned capped = 0; capped < 2; capped++) {
+        fixture_t f;
+        wl_columnar_continuation_t *cont = NULL;
+        atomic_uint_fast64_t count;
+        atomic_init(&count, 5);
+        TEST("shared cap charges batch rows once, excluding existing output");
+        if (!fixture_init(&f, 1u << 24, keys, 1, 1, 100)) {
+            FAIL("fixture");
+            fixture_fini(&f);
+            continue;
+        }
+        f.sess->join_output_shared_count = &count;
+        f.sess->join_output_shared_limit = capped ? 20 : UINT64_MAX;
+        int rc = col_rel_append_row(f.out, existing);
+        if (rc == 0)
+            rc = col_rel_append_row(f.out, existing);
+        if (rc == 0)
+            rc = col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+                    KEY0, KEY0, 1, 7u * 32u, &cont);
+        if (rc == 0)
+            rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+        if (rc == (capped ? EOVERFLOW : 0)
+            && f.out->nrows == (capped ? 23u : 102u)
+            && atomic_load_explicit(&count,
+            memory_order_relaxed) == (capped ? 26u : 105u))
+            PASS();
+        else
+            FAIL("shared cap lost rows or counted preexisting/cumulative rows");
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+    }
+}
+
 /* (11) Operator dispatch: an eligible shape uses the producer under the
  * knob and equals the oracle; excluded shapes fall back with the reason
  * recorded, or fail with ENOTSUP in strict mode. */
@@ -3567,6 +3607,7 @@ main(void)
     test_float_key();
     test_unsupported_budget_and_pooled_output();
     test_row_cap_trips_after_a_committed_batch();
+    test_shared_cap_counts_only_committed_rows();
     test_operator_output_growth_denial();
     test_operator_dispatch_and_eligibility();
     test_operator_no_arrangement_probe_failure();

@@ -414,7 +414,8 @@ wl_columnar_join_output_error(wl_col_session_t *sess, const col_rel_t *out,
 }
 
 bool
-col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
+wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
+    const col_rel_t *out, uint64_t added_rows)
 {
     if (!sess)
         return false;
@@ -429,12 +430,26 @@ col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
     if (limit == 0)
         return false;
     if (sess->join_output_shared_count) {
-        uint64_t n = (uint64_t)atomic_fetch_add_explicit(
-            sess->join_output_shared_count, 1,
-            memory_order_relaxed) + UINT64_C(1);
-        return n >= limit;
+        uint_fast64_t n = atomic_load_explicit(sess->join_output_shared_count,
+                memory_order_relaxed);
+        if (added_rows == 0)
+            return n >= limit;
+        for (;;) {
+            uint_fast64_t next = added_rows > UINT64_MAX - n
+                ? UINT64_MAX : n + added_rows;
+            if (atomic_compare_exchange_weak_explicit(
+                    sess->join_output_shared_count, &n, next,
+                    memory_order_relaxed, memory_order_relaxed))
+                return next >= limit;
+        }
     }
     return out && out->nrows >= limit;
+}
+
+bool
+col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out)
+{
+    return wl_columnar_join_output_limit_reached(sess, out, 1);
 }
 
 static int

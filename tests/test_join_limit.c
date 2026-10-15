@@ -431,6 +431,81 @@ test_disabled_limit_records_high_water(void)
     return ok ? 0 : 1;
 }
 
+static void
+test_shared_row_accounting(void)
+{
+    TEST("shared cap counts committed rows, zero increments and saturation");
+    atomic_uint_fast64_t count;
+    atomic_init(&count, 0);
+    wl_col_session_t a = {0}, b = {0};
+    col_rel_t out = {0};
+    a.join_output_shared_count = b.join_output_shared_count = &count;
+    a.join_output_shared_limit = b.join_output_shared_limit = 10;
+    out.nrows = 7;
+    bool ok = !wl_columnar_join_output_limit_reached(&a, &out, 7);
+    ok = ok && !wl_columnar_join_output_limit_reached(&b, &out, 0)
+        && atomic_load_explicit(&count, memory_order_relaxed) == 7;
+    ok = ok && wl_columnar_join_output_limit_reached(&b, &out, 3)
+        && atomic_load_explicit(&count, memory_order_relaxed) == 10;
+    ok = ok && wl_columnar_join_output_limit_reached(&a, &out, 0)
+        && atomic_load_explicit(&count, memory_order_relaxed) == 10;
+    ok = ok && col_join_output_limit_reached(&a, &out)
+        && atomic_load_explicit(&count, memory_order_relaxed) == 11;
+    atomic_store_explicit(&count, 8, memory_order_relaxed);
+    ok = ok && wl_columnar_join_output_limit_reached(&b, &out, 7)
+        && atomic_load_explicit(&count, memory_order_relaxed) == 15;
+    a.join_output_shared_limit = 0;
+    out.nrows = 19;
+    ok = ok && !wl_columnar_join_output_limit_reached(&a, &out, 7)
+        && atomic_load_explicit(&count,
+            memory_order_relaxed) == 15 && a.join_output_peak == 19;
+    a.join_output_shared_limit = UINT64_MAX;
+    atomic_store_explicit(&count, UINT64_MAX - 2, memory_order_relaxed);
+    ok = ok && wl_columnar_join_output_limit_reached(&a, &out, 7)
+        && atomic_load_explicit(&count, memory_order_relaxed) == UINT64_MAX;
+    ok = ok && col_join_output_limit_reached(&a, &out)
+        && atomic_load_explicit(&count, memory_order_relaxed) == UINT64_MAX;
+    if (ok)
+        PASS();
+    else
+        FAIL("incorrect shared row accounting");
+}
+
+static void *
+shared_row_worker(void *opaque)
+{
+    wl_col_session_t sess = {0};
+    sess.join_output_shared_count = opaque;
+    sess.join_output_shared_limit = UINT64_MAX;
+    for (uint32_t i = 0; i < 10000; i++)
+        (void)wl_columnar_join_output_limit_reached(&sess, NULL, 7);
+    return NULL;
+}
+
+static void
+test_concurrent_shared_row_accounting(void)
+{
+    TEST("concurrent workers preserve every committed row increment");
+    atomic_uint_fast64_t count;
+    atomic_init(&count, 0);
+    wl_thread_t threads[4];
+    unsigned started = 0;
+    bool ok = true;
+    while (started < 4) {
+        if (wl_thread_create(&threads[started], shared_row_worker, &count) != 0)
+            break;
+        started++;
+    }
+    for (unsigned i = 0; i < started; i++)
+        if (wl_thread_join(&threads[i]) != 0)
+            ok = false;
+    if (ok && started == 4 && atomic_load_explicit(&count,
+        memory_order_relaxed) == 280000)
+        PASS();
+    else
+        FAIL("lost concurrent increments or thread failure");
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -448,6 +523,8 @@ main(void)
     test_limit_constant_across_workers();
     test_invalid_env_values();
     test_disabled_limit_records_high_water();
+    test_shared_row_accounting();
+    test_concurrent_shared_row_accounting();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
     printf("Failed: %d/%d\n", tests_failed, tests_run);

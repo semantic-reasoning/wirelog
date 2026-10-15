@@ -2240,8 +2240,8 @@ typedef struct wl_col_session_t {
      * number needed to decide whether dividing the row cap by W is right:
      * compare a worker's peak against single_threaded_peak / W. */
     uint64_t join_output_peak;
-    /* Shared join-output counter for relation-level TDD workers. Borrowed from
-     * the coordinator while a single non-recursive relation plan is running;
+    /* Shared join-output counter for K-fusion and relation-level TDD workers.
+     * Borrowed from the coordinator while the worker cohort is running;
      * NULL uses the session-local join_output_limit semantics. */
     atomic_uint_fast64_t *join_output_shared_count;
     uint64_t join_output_shared_limit;
@@ -2882,9 +2882,15 @@ int
 col_join_write_pair_at(col_rel_t *out, uint64_t out_row,
     const col_rel_t *left, uint32_t lr, const col_rel_t *right, uint32_t rr,
     const uint32_t *project_indices, uint32_t project_count);
-/* Legacy row cap (WIRELOG_JOIN_OUTPUT_LIMIT): true once @out holds at
- * least the session's limit; the shared TDD counter is consulted when a
- * worker session installed one. */
+/* Legacy row cap (WIRELOG_JOIN_OUTPUT_LIMIT): account @added_rows newly
+ * committed output rows in a shared K-fusion/TDD counter, saturating at
+ * UINT64_MAX. Without a shared counter, compare @out's total row count.
+ * A disabled cap records the local high-water mark without charging rows.
+ * Zero added rows still checks an enabled cap. */
+bool
+wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
+    const col_rel_t *out, uint64_t added_rows);
+/* Scalar callers have just committed one row. */
 bool
 col_join_output_limit_reached(wl_col_session_t *sess, const col_rel_t *out);
 /* The right operand a JOIN reads: the named relation, its $d$ or $r$
