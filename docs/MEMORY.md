@@ -1467,6 +1467,25 @@ planned an LFTJ.  These counts describe the repository's workloads, not a
 bound: an EDB-only star join on one key multiplies its inputs' per-key
 fanouts.
 
+Cross joins and the ephemeral hash path also stay one-shot.  On the
+non-differential path outside worker sessions, a join with no key columns
+(`key_count == 0`) is excluded from the bounded producer and, when it
+reaches the eligibility check, records `cross-join`; an otherwise eligible
+keyed join whose persistent arrangement is unavailable runs the ephemeral
+hash probe and records `no-arrangement`; under `WIRELOG_JOIN_BATCH_STRICT`
+both return `ENOTSUP`.  The differential bounded path requires a key
+column, so outside worker sessions a differential cross join runs as
+one-shot `$join_diff`; nothing is recorded and strict mode does not refuse
+it.  In a worker session either kind of join that reaches the JOIN
+operator's bounded-mode decision records `worker-session` instead, and
+strict mode refuses it there.  When this paragraph was written (#1370), the
+knob-on test suite ran 613 cross joins with at most 6,400 output rows, the
+ten `bench_flowlog` programs one (100 rows), and DOOP 16 before its run
+stopped (10,792 rows in total), and no workload recorded the
+`no-arrangement` fallback.  These counts describe the repository's
+workloads, not a bound: a cross join's output is the product of its
+inputs' row counts.
+
 ## 10b. Plain STEP completion recovery (#1713)
 
 A join output that is **heap-owned** is admitted under the session governor
