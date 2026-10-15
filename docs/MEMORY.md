@@ -1448,6 +1448,25 @@ Materialized/cache joins and delta-right, filtered, cross, worker, and other
 unsupported shapes remain on their existing one-shot paths until their
 publication contracts are bounded.
 
+LFTJ is outside bounded mode.  `WIRELOG_JOIN_BATCH_BYTES` and
+`WIRELOG_JOIN_BATCH_STRICT` do not apply to `col_op_lftj`: it builds the
+whole `$lftj` output in one append batch before publishing it, and strict
+mode does not refuse it.  The planner forms LFTJ only from a chain of at
+least three EDB relations joined on one shared `col<N>` key
+(`lftj_chain_len` in `exec_plan_gen.c`).  When the session has a memory
+governor, `col_op_lftj` reserves its staging before allocating, including
+`nrows * ncols * 8` bytes per input for the input copy it makes when no
+sorted arrangement can be pinned, and the `$lftj` output's growth is
+admitted by that governor; a denial returns `ENOSPC` and sets
+`memory_budget_denied` (`test_lftj_integration`).  Without a session
+governor neither that input copy nor the output is admitted, even when the
+inputs carry a governor; that remains #1978 work.  When this paragraph
+was written (#1370), the knob-on test suite ran LFTJ 10 times with at most
+3 output rows, and none of the ten `bench_flowlog` programs nor DOOP
+planned an LFTJ.  These counts describe the repository's workloads, not a
+bound: an EDB-only star join on one key multiplies its inputs' per-key
+fanouts.
+
 ## 10b. Plain STEP completion recovery (#1713)
 
 A join output that is **heap-owned** is admitted under the session governor
