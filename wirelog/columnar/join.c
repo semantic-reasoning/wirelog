@@ -2383,6 +2383,7 @@ wl_columnar_join_probe_set_build(wl_col_session_t *sess,
     set->rk = rk;
     set->kc = kc;
     set->nbuckets = nbuckets;
+    set->next_mode = next_mode;
     set->built = true;
     return 0;
 }
@@ -2417,18 +2418,118 @@ wl_columnar_join_probe_set_release(wl_columnar_join_probe_set_t *set)
 }
 
 /* A prebuilt set must index the relation and key columns the emit
- * probes; otherwise its chains would answer for another relation. */
+ * probes; otherwise its chains would answer for another relation.  It must
+ * also have the emitting operator's next-link mode, which is part of that
+ * operator's admitted footprint. */
 static bool
 wl_columnar_join_probe_set_matches(const wl_columnar_join_probe_set_t *set,
-    const col_rel_t *right, const uint32_t *rk, uint32_t kc)
+    const col_rel_t *right, const uint32_t *rk, uint32_t kc,
+    wl_columnar_join_probe_next_t next_mode)
 {
-    if (set->right != right || set->kc != kc)
+    if (set->right != right || set->kc != kc || set->next_mode != next_mode)
         return false;
     for (uint32_t k = 0; k < kc; k++) {
         if (set->rk[k] != rk[k])
             return false;
     }
     return true;
+}
+
+/* --- KEEP-ALL PASS-THROUGH (Issue #1370) --------------------------------- */
+
+/* Whether a keep-all SEMIJOIN (@semijoin) or ANTIJOIN may return its input
+ * entry instead of a copy.  Each condition keeps the input equal to the
+ * copy the operator would build, as far as later operators can observe:
+ *   - not a TDD bound run, which matches bound inputs by relation name;
+ *   - a non-empty input without timestamps or compound metadata (the copy
+ *     has neither);
+ *   - column names present and non-NULL: a copy names every column, and a
+ *     name lookup (col_rel_col_idx) on a relation without names fails;
+ *   - SEMIJOIN only, because its copy is a fresh col0..colN relation with
+ *     the left's types: an identity projection, column types present, no
+ *     graph column, and each name exactly "col<i>", so every name lookup
+ *     resolves as it would on the copy.  ANTIJOIN's copy is created like
+ *     its left (col_rel_new_like), names, types and graph column included.
+ * The input keeps what the copy would not carry and no later operator
+ * compares: its relation name, and any sort metadata (sorted_nrows,
+ * run_ends), with which a CONSOLIDATE may merge instead of sort. */
+static bool
+wl_columnar_filter_join_may_pass_through(const wl_plan_op_t *op,
+    const wl_col_session_t *sess, const col_rel_t *left, bool semijoin)
+{
+    if (sess->tdd_input_run || left->nrows == 0 || left->timestamps
+        || left->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || left->compound_arity_len != 0 || !left->col_names)
+        return false;
+    for (uint32_t c = 0; c < left->ncols; c++) {
+        if (!left->col_names[c])
+            return false;
+    }
+    if (!semijoin)
+        return true;
+#ifdef WL_TEST_JOIN_TIMESTAMP_HOOK
+    if (wl_columnar_join_test_enable_semijoin_timestamps)
+        return false;
+#endif
+    if (!left->column_types || left->has_graph_column)
+        return false;
+    if (op->project_count > 0) {
+        if (op->project_count != left->ncols || !op->project_indices)
+            return false;
+        for (uint32_t c = 0; c < op->project_count; c++) {
+            if (op->project_indices[c] != c)
+                return false;
+        }
+    }
+    for (uint32_t c = 0; c < left->ncols; c++) {
+        char name[16];
+        snprintf(name, sizeof(name), "col%u", c);
+        if (strcmp(left->col_names[c], name) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* Build @set over @right in the operator's own next-link mode (the mode
+ * its emit requires) and report in *@keeps_all whether the operator keeps
+ * every row of @left: SEMIJOIN when every row is contained, ANTIJOIN when
+ * none is.  The scan stops at the first row the operator drops.  On
+ * success @set stays built for the emit; on failure it is not built. */
+static int
+wl_columnar_filter_join_scan_keeps_all(wl_col_session_t *sess,
+    const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,
+    const uint32_t *rk, uint32_t kc, bool semijoin,
+    wl_columnar_join_probe_set_t *set, bool *keeps_all)
+{
+    uint32_t lr = 0;
+    int rc = wl_columnar_join_probe_set_build(sess,
+            wl_columnar_join_output_governor(sess, left, right), right, rk,
+            kc, semijoin ? WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS
+            : WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE, set);
+
+    *keeps_all = false;
+    if (rc != 0)
+        return rc;
+    while (lr < left->nrows
+        && wl_columnar_join_probe_set_contains(set, left, lr, lk) == semijoin)
+        lr++;
+    *keeps_all = lr == left->nrows;
+    return 0;
+}
+
+/* Publish @left_e itself as the operator's result.  It keeps its
+ * ownership; it loses its CONCAT segment boundaries (a copy has none, so
+ * a CONSOLIDATE sorts instead of merging) and is published as not a delta,
+ * as the copy is. */
+static int
+wl_columnar_filter_join_pass_through(eval_stack_t *stack,
+    eval_entry_t *left_e)
+{
+    free(left_e->seg_boundaries);
+    left_e->seg_boundaries = NULL;
+    left_e->seg_count = 0;
+    left_e->is_delta = false;
+    return eval_stack_repush_entry(stack, left_e);
 }
 
 /* --- ANTIJOIN ------------------------------------------------------------ */
@@ -2477,7 +2578,8 @@ wl_columnar_antijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
         wl_columnar_join_test_before_probe_emit(left);
 #endif
     *out_p = NULL;
-    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc))
+    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc,
+        WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS_PLUS_ONE))
         return EINVAL;
     col_rel_t *out = NULL;
     int output_rc = wl_columnar_antijoin_new_output(op, sess, left, right,
@@ -2627,15 +2729,26 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     wl_columnar_join_probe_set_t set;
     col_rel_t *out = NULL;
+    bool keeps_all = false;
+    int emit_rc = 0;
     memset(&set, 0, sizeof(set));
-    int emit_rc = wl_columnar_antijoin_emit(op, sess, left, right, lk, rk,
-            &set, &out);
+    /* Issue #1370: a keep-all ANTIJOIN returns its input.  Otherwise the
+     * set built for the scan is the one the emit probes. */
+    if (wl_columnar_filter_join_may_pass_through(op, sess, left, false))
+        emit_rc = wl_columnar_filter_join_scan_keeps_all(sess, left, right,
+                lk, rk, kc, false, &set, &keeps_all);
+    if (emit_rc == 0 && !keeps_all)
+        emit_rc = wl_columnar_antijoin_emit(op, sess, left, right, lk, rk,
+                &set, &out);
+    wl_columnar_join_probe_set_release(&set);
     wl_columnar_join_key_scratch_free(&key_scratch, &lk);
     wl_columnar_join_key_scratch_free(&key_scratch, &rk);
     if (right_filtered)
         col_rel_destroy(right_filtered);
     if (emit_rc != 0)
         return wl_columnar_join_dispose_left(stack, &left_e, emit_rc);
+    if (keeps_all)
+        return wl_columnar_filter_join_pass_through(stack, &left_e);
     return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
 }
 
@@ -2688,7 +2801,8 @@ wl_columnar_semijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
         wl_columnar_join_test_before_probe_emit(left);
 #endif
     *out_p = NULL;
-    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc))
+    if (!own_set && !wl_columnar_join_probe_set_matches(set, right, rk, kc,
+        WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS))
         return EINVAL;
     /* Output: project_indices selects output columns from left */
     uint32_t ocols = op->project_count ? op->project_count : left->ncols;
@@ -3026,15 +3140,26 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
     wl_columnar_join_probe_set_t set;
     col_rel_t *out = NULL;
+    bool keeps_all = false;
+    int emit_rc = 0;
     memset(&set, 0, sizeof(set));
-    int emit_rc = wl_columnar_semijoin_emit(op, sess, left, right, lk, rk,
-            &set, &out);
+    /* Issue #1370: a keep-all SEMIJOIN returns its input.  Otherwise the
+     * set built for the scan is the one the emit probes. */
+    if (wl_columnar_filter_join_may_pass_through(op, sess, left, true))
+        emit_rc = wl_columnar_filter_join_scan_keeps_all(sess, left, right,
+                lk, rk, kc, true, &set, &keeps_all);
+    if (emit_rc == 0 && !keeps_all)
+        emit_rc = wl_columnar_semijoin_emit(op, sess, left, right, lk, rk,
+                &set, &out);
+    wl_columnar_join_probe_set_release(&set);
     wl_columnar_join_key_scratch_free(&key_scratch, &lk);
     wl_columnar_join_key_scratch_free(&key_scratch, &rk);
     if (right_filtered)
         col_rel_destroy(right_filtered);
     if (emit_rc != 0)
         return wl_columnar_join_dispose_left(stack, &left_e, emit_rc);
+    if (keeps_all)
+        return wl_columnar_filter_join_pass_through(stack, &left_e);
     return wl_columnar_join_publish_after_left(stack, &left_e, out, false);
 }
 

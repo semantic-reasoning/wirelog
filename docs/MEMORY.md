@@ -1273,6 +1273,40 @@ producer.  Because the pipeline holds the producer, its output and the sets
 at once, a budget the sequential operators fit can deny the pipeline; a
 denied set fails it with `ENOSPC`, keeping the left input.
 
+Outside the pipeline, the SEMIJOIN and ANTIJOIN operators
+(`wl_columnar_semijoin_op`, `wl_columnar_antijoin_op`) return their input
+entry instead of a copy when they would keep every input row (#1370), with
+the knob on or off.  Before emitting, the operator builds its probe set in
+its own next-link mode and scans the input, stopping at the first row it
+would drop; a scan that drops nothing publishes the input itself, with its
+ownership unchanged, without CONCAT segment boundaries and as not a delta,
+and a scan that drops a row hands the same set to the emit, which builds no
+other.  The input passes through only when the copy would be equal to it as
+later operators observe it: not in a TDD bound run, a non-empty input
+without timestamps or compound metadata, and every column named; for
+SEMIJOIN also an identity projection, column types present, no graph
+column, and each name exactly `col<i>` (the copy is a fresh
+`col0..colN` relation, and a name lookup tries an exact match before the
+`col<N>` fallback).  ANTIJOIN's copy is created like its input, names
+included.  A passed-through input keeps its relation name and any sort
+metadata (`sorted_nrows`, `run_ends`), which a copy does not carry, so a
+CONSOLIDATE over it may merge sorted runs instead of sorting; the rows are
+the same.  The pass-through admits only the probe set and the key scratch,
+which the copying operator also admits; it skips the copy's output and its
+row scratch.  The scan costs probe work: when the first dropped row comes
+late, the scan and then the emit both probe the input, up to twice the
+copying operator's probe work, with the same memory.  The pipeline's probe
+stages are unchanged: they copy each batch through the emit.  Measured on
+DOOP (zxing facts, workers 1, `WIRELOG_JOIN_BATCH_BYTES=65536`,
+`MALLOC_PERTURB_` unset, a `MemoryMax=90G` user scope) at the 51,666th
+differential JOIN dispatch, just after a 641,550,746-row JOIN whose
+SEMIJOIN keeps every row: peak RSS (VmHWM) was 35.5 GB with the
+pass-through against 56.0 GB without it (-36.7%), the session ledger peak
+35.3 GB against 69.7 GB (-49.3%), and the time to that point 554 s
+against 765 s.
+These are single runs at one checkpoint; the full DOOP run does not
+complete under that scope (#2182).
+
 When the pipeline does not consume a JOIN, the reason decides what is
 recorded.  These rules apply to non-differential evaluation only: the
 pipeline is not attempted while differential operators are active, so a

@@ -2930,6 +2930,7 @@ typedef struct {
     uint32_t *head;
     uint32_t *next;
     wl_columnar_memory_reservation_t reservation;
+    wl_columnar_join_probe_next_t next_mode; /* as built */
     bool admitted;
     bool built;
 } wl_columnar_join_probe_set_t;
@@ -2961,10 +2962,10 @@ wl_columnar_antijoin_new_output(const wl_plan_op_t *op,
     col_rel_t **out);
 /* Probe @left against @right into a new output in *@out.  @set is either
  * unbuilt (zeroed, or left by a failed wl_columnar_join_probe_set_build)
- * or built over @right and @rk; a built set for another relation or key
- * list is EINVAL.  A built @set is used and left built; otherwise the emit
- * builds one at the operator's hash step and releases it before
- * returning. */
+ * or built over @right and @rk in the operator's next-link mode; a built
+ * set for another relation, key list or mode is EINVAL.  A built @set is
+ * used and left built; otherwise the emit builds one at the operator's
+ * hash step and releases it before returning. */
 int
 wl_columnar_semijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
     const col_rel_t *left, const col_rel_t *right, const uint32_t *lk,

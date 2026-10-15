@@ -2658,6 +2658,452 @@ test_semi_anti_emit_prebuilt_matches_standalone(void)
     }
 }
 
+/* ---- Issue #1370 unit P: keep-all SEMIJOIN/ANTIJOIN pass-through ------- */
+
+/* left(@names, default col0, col1): @n rows, column 0 = @key_base +
+ * i % @keys, typed INT64.  The default names and the types are what a JOIN
+ * output carries, so a keep-all SEMIJOIN over it may return its input. */
+static col_rel_t *
+make_named_left(uint32_t n, uint32_t keys, int64_t key_base,
+    const char *const *names)
+{
+    const wirelog_column_type_t types[2] = { WIRELOG_TYPE_INT64,
+                                             WIRELOG_TYPE_INT64 };
+    col_rel_t *left = NULL;
+
+    /* A fresh relation takes @names; make_rel's col_rel_new_auto has
+     * already named its columns. */
+    if (col_rel_alloc(&left, "left") != 0
+        || col_rel_set_schema(left, 2, names) != 0
+        || col_rel_set_column_types(left, types, 2) != 0) {
+        col_rel_destroy(left);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t row[] = { key_base + (int64_t)(keys ? i % keys : 0),
+                          (int64_t)i };
+        if (col_rel_append_row(left, row) != 0) {
+            col_rel_destroy(left);
+            return NULL;
+        }
+    }
+    return left;
+}
+
+static col_rel_t *
+make_canon_left(uint32_t n, uint32_t keys, int64_t key_base)
+{
+    return make_named_left(n, keys, key_base, NULL);
+}
+
+typedef struct {
+    int rc;
+    col_rel_t *rel;
+    bool owned;
+    bool is_delta;
+    uint32_t seg_count;
+} p_run_t;
+
+/* Run one SEMIJOIN or ANTIJOIN over @left pushed with @owned and an
+ * is_delta of true.  On failure the stack is drained as the evaluator
+ * would. */
+static p_run_t
+p_run(bool semijoin, wl_col_session_t *sess, col_rel_t *left,
+    const wl_plan_op_t *op, bool owned)
+{
+    p_run_t run = { .rc = EINVAL };
+    eval_stack_t stack;
+    eval_entry_t e;
+
+    eval_stack_init(&stack);
+    if (eval_stack_push_delta(&stack, left, owned, true) != 0)
+        return run;
+    run.rc = semijoin ? wl_columnar_semijoin_op(op, &stack, sess)
+        : wl_columnar_antijoin_op(op, &stack, sess);
+    if (run.rc != 0) {
+        while (stack.top > 0) {
+            e = eval_stack_pop(&stack);
+            if (e.owned)
+                col_rel_destroy(e.rel);
+        }
+        return run;
+    }
+    e = eval_stack_pop(&stack);
+    run.rel = e.rel;
+    run.owned = e.owned;
+    run.is_delta = e.is_delta;
+    run.seg_count = e.seg_count;
+    free(e.seg_boundaries);
+    return run;
+}
+
+/* Destroy a run's result and @left exactly once each.  @pushed_owned says
+ * whether the stack owned @left: then a failed run drained it and a copying
+ * run disposed of it, and only a passed-through @left is still ours. */
+static void
+p_release(p_run_t *run, col_rel_t *left, bool pushed_owned)
+{
+    if (run->rc != 0) {
+        if (!pushed_owned)
+            col_rel_destroy(left);
+    } else if (run->rel == left) {
+        col_rel_destroy(left);
+    } else {
+        if (run->owned)
+            col_rel_destroy(run->rel);
+        if (!pushed_owned)
+            col_rel_destroy(left);
+    }
+    run->rel = NULL;
+}
+
+static void
+p_filter_op(wl_plan_op_t *op, const char *const *lk, const char *const *rk)
+{
+    memset(op, 0, sizeof(*op));
+    op->right_relation = "right";
+    op->key_count = 1;
+    op->left_keys = lk;
+    op->right_keys = rk;
+}
+
+static bool
+p_same_rows(const col_rel_t *rel, const int64_t *col0, const int64_t *col1,
+    uint32_t n)
+{
+    if (!rel || rel->nrows != n || rel->ncols != 2)
+        return false;
+    for (uint32_t r = 0; r < n; r++) {
+        if (rel->columns[0][r] != col0[r] || rel->columns[1][r] != col1[r])
+            return false;
+    }
+    return true;
+}
+
+/* P1 (SEMIJOIN, every left row matches) and P2 (ANTIJOIN, no left row
+ * matches), each with an owned and a borrowed input: the operator returns
+ * the input entry itself, ownership unchanged, is_delta false, rows
+ * unchanged. */
+static void
+test_filter_join_keep_all_passes_input_through(void)
+{
+    static const char *const lk[] = { "col0" };
+    static const char *const rk[] = { "k" };
+
+    for (uint32_t c = 0; c < 4; c++) {
+        bool semijoin = c < 2;
+        bool owned = (c & 1u) == 0;
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(4, 1);
+        col_rel_t *left = make_canon_left(8, 4, semijoin ? 0 : 100);
+        int64_t want0[8];
+        int64_t want1[8];
+        wl_plan_op_t op;
+        p_run_t run = { .rc = EINVAL };
+        bool ok;
+
+        TEST(semijoin
+            ? (owned ? "P1 keep-all SEMIJOIN returns its owned input"
+                     : "P1 keep-all SEMIJOIN returns its borrowed input")
+            : (owned ? "P2 keep-all ANTIJOIN returns its owned input"
+                     : "P2 keep-all ANTIJOIN returns its borrowed input"));
+        ok = sess && right && left && session_add_rel(sess, right) == 0;
+        if (!ok) {
+            FAIL("fixture");
+            col_rel_destroy(left);
+            if (!sess)
+                col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
+        for (uint32_t r = 0; r < 8; r++) {
+            want0[r] = left->columns[0][r];
+            want1[r] = left->columns[1][r];
+        }
+        p_filter_op(&op, lk, rk);
+        run = p_run(semijoin, sess, left, &op, owned);
+        ok = run.rc == 0 && run.rel == left && run.owned == owned
+            && !run.is_delta && run.seg_count == 0
+            && p_same_rows(run.rel, want0, want1, 8);
+        p_release(&run, left, owned);
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("keep-all filter join did not return its input entry");
+    }
+}
+
+/* P3: the pass-through needs no output relation.  The budget admits the
+ * input, the key scratch, the probe set, a 64-row output with its row
+ * scratch, and a slack that covers the output's creation transient but is
+ * below one growth step of that output.  The copy of a 200-row left must
+ * grow its output past COL_REL_INIT_CAP, so a copying operator builds its
+ * probe set and is then denied at that growth (it prints how far it got);
+ * the pass-through succeeds.  The 64-row output's settled footprint is
+ * measured on a non-matching SEMIJOIN, which builds the same output and
+ * keeps none of it. */
+static void
+test_semijoin_keep_all_fits_where_copy_is_denied(void)
+{
+    static const char *const lk[] = { "col0" };
+    static const char *const rk[] = { "k" };
+    const uint32_t nleft = 200; /* > COL_REL_INIT_CAP + 2 */
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(4, 1);
+    col_rel_t *probe_left = make_canon_left(4, 1, 100);
+    col_rel_t *left = NULL;
+    wl_plan_op_t op;
+    p_run_t run = { .rc = EINVAL };
+    uint64_t set_bytes = 0;
+    uint64_t before;
+    uint64_t out_init;
+    uint64_t budget;
+    uint64_t grow_from = 0;
+    uint64_t grow_to = 0;
+    const uint64_t slack = 256u;
+    uint32_t builds;
+    uint32_t denials;
+    bool ok;
+
+    TEST("P3 keep-all SEMIJOIN fits a budget its copy exceeds");
+    p_filter_op(&op, lk, rk);
+    ok = sess && right && session_add_rel(sess, right) == 0;
+    if (!ok && !sess)
+        col_rel_destroy(right);
+    ok = ok && probe_left
+        && wl_columnar_join_probe_set_bytes(right->nrows,
+            WL_COLUMNAR_JOIN_PROBE_NEXT_ROWS, &set_bytes) == 0;
+    if (ok) {
+        before = reserved_of(sess);
+        run = p_run(true, sess, probe_left, &op, false);
+        ok = run.rc == 0 && run.rel && run.rel != probe_left
+            && run.rel->nrows == 0;
+        out_init = ok ? reserved_of(sess) - before : 0;
+        p_release(&run, probe_left, false);
+        probe_left = NULL;
+    }
+    left = ok ? make_canon_left(nleft, 4, 0) : NULL;
+    if (!ok || !left) {
+        FAIL("fixture or output measurement");
+        col_rel_destroy(probe_left);
+        col_rel_destroy(left);
+        destroy_session(sess);
+        return;
+    }
+    before = reserved_of(sess);
+    ok = col_rel_retained_bytes_for(left, COL_REL_INIT_CAP, &grow_from)
+        && col_rel_retained_bytes_for(left, 2u * COL_REL_INIT_CAP, &grow_to)
+        && slack < grow_to - grow_from;
+    /* Key scratch: two uint32 key positions; row scratch: one output
+     * row. */
+    budget = before + 2u * sizeof(uint32_t) + set_bytes + out_init
+        + 2u * sizeof(int64_t) + slack;
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(
+            sess->memory_governor)->usable_bytes, budget,
+        memory_order_release);
+    builds = wl_columnar_join_test_probe_set_build_calls;
+    denials = wl_columnar_join_test_probe_set_build_denials;
+    run = p_run(true, sess, left, &op, true);
+    /* A copying operator reports here how far it got: the probe set built
+     * without a denial means only a later step, the output's growth, was
+     * refused. */
+    if (run.rc != 0)
+        printf("(rc=%d set built=%u denied=%u) ", run.rc,
+            wl_columnar_join_test_probe_set_build_calls - builds,
+            wl_columnar_join_test_probe_set_build_denials - denials);
+    ok = ok && run.rc == 0 && run.rel == left && run.owned
+        && run.rel->nrows == nleft && reserved_of(sess) == before;
+    p_release(&run, left, true);
+    destroy_session(sess);
+    if (ok)
+        PASS();
+    else
+        FAIL("keep-all SEMIJOIN was denied as if it copied its input");
+}
+
+/* P6-P11 and P13 guards: each case keeps every left row but must still
+ * produce a distinct copy, because the copy would differ from the input
+ * (P6 timestamps, P7 compound metadata, P8 a reordering projection, P13
+ * column names a later name lookup resolves differently), or because the
+ * input is empty (P10) or the run is a TDD bound run (P11). */
+enum {
+    P_GUARD_TIMESTAMPS,
+    P_GUARD_COMPOUND,
+    P_GUARD_PROJECTION,
+    P_GUARD_EMPTY,
+    P_GUARD_TDD,
+    P_GUARD_SWAPPED_NAMES,
+    P_GUARD_DECLARED_NAMES,
+    P_GUARD_COUNT
+};
+
+static char p_tdd_token;
+
+static void
+test_filter_join_keep_all_guards_copy(void)
+{
+    static const char *const lk[] = { "col0" };
+    static const char *const rk[] = { "k" };
+    static const char *const names[P_GUARD_COUNT] = {
+        "P6 timestamped left is copied, not passed through",
+        "P7 compound left is copied, not passed through",
+        "P8 reordering projection is copied, not passed through",
+        "P10 empty left is copied, not passed through",
+        "P11 TDD bound run copies a keep-all ANTIJOIN input",
+        "P13 left named (col1, col0) is copied by SEMIJOIN",
+        "P13 left named (k, v) is copied by SEMIJOIN",
+    };
+
+    for (uint32_t g = 0; g < P_GUARD_COUNT; g++) {
+        static const uint32_t swap[] = { 1, 0 };
+        static const char *const swapped[] = { "col1", "col0" };
+        static const char *const declared[] = { "k", "v" };
+        static const char *const declared_key[] = { "k" };
+        bool semijoin = g != P_GUARD_TDD;
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(4, 1);
+        col_rel_t *left = make_named_left(g == P_GUARD_EMPTY ? 0 : 8, 4,
+                semijoin ? 0 : 100, g == P_GUARD_SWAPPED_NAMES ? swapped
+                : g == P_GUARD_DECLARED_NAMES ? declared : NULL);
+        wl_plan_op_t op;
+        p_run_t run = { .rc = EINVAL };
+        bool ok = sess && right && left && session_add_rel(sess, right) == 0;
+
+        TEST(names[g]);
+        p_filter_op(&op, lk, rk);
+        if (ok && g == P_GUARD_TIMESTAMPS)
+            ok = col_rel_enable_timestamps(left) == 0;
+        if (ok && g == P_GUARD_COMPOUND) {
+            const col_rel_logical_col_t logical[2] = {
+                { WIRELOG_COMPOUND_KIND_NONE, 0, 0 },
+                { WIRELOG_COMPOUND_KIND_SIDE, 2, 1 }
+            };
+            ok = col_rel_apply_compound_schema(left, logical, 2) == 0
+                && left->compound_kind != WIRELOG_COMPOUND_KIND_NONE;
+        }
+        if (g == P_GUARD_PROJECTION) {
+            op.project_indices = swap;
+            op.project_count = 2;
+        }
+        /* ANTIJOIN only tests tdd_input_run for NULL; it never follows
+         * it, so an opaque token marks the run as bound. */
+        if (g == P_GUARD_TDD)
+            sess->tdd_input_run = (wl_columnar_eval_tdd_run_t *)(void *)
+                &p_tdd_token;
+        if (g == P_GUARD_SWAPPED_NAMES)
+            op.left_keys = swapped;
+        if (g == P_GUARD_DECLARED_NAMES)
+            op.left_keys = declared_key;
+        if (!ok) {
+            FAIL("fixture");
+            col_rel_destroy(left);
+            if (!sess)
+                col_rel_destroy(right);
+            destroy_session(sess);
+            continue;
+        }
+        run = p_run(semijoin, sess, left, &op, false);
+        ok = run.rc == 0 && run.rel && run.rel != left && run.owned
+            && run.rel->nrows == left->nrows && !run.rel->timestamps;
+        /* The copy carries the names a later operator resolves: col<i>
+         * at position i for SEMIJOIN. */
+        if (ok && semijoin && g != P_GUARD_EMPTY)
+            ok = col_rel_col_idx(run.rel, "col1") == 1
+                && col_rel_col_idx(run.rel, "col0") == 0;
+        if (g == P_GUARD_TDD)
+            sess->tdd_input_run = NULL;
+        p_release(&run, left, false);
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("guarded keep-all filter join was not copied");
+    }
+}
+
+/* ANTIJOIN's copy is created like its left (col_rel_new_like), names
+ * included, so a left with declared names still passes through. */
+static void
+test_antijoin_keep_all_declared_names_pass_through(void)
+{
+    static const char *const lk[] = { "k" };
+    static const char *const rk[] = { "k" };
+    static const char *const declared[] = { "k", "v" };
+    wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+    col_rel_t *right = make_right(4, 1);
+    col_rel_t *left = make_named_left(8, 4, 100, declared);
+    wl_plan_op_t op;
+    p_run_t run = { .rc = EINVAL };
+    bool ok = sess && right && left && session_add_rel(sess, right) == 0;
+
+    TEST("keep-all ANTIJOIN over declared names returns its input");
+    if (ok) {
+        p_filter_op(&op, lk, rk);
+        run = p_run(false, sess, left, &op, true);
+        ok = run.rc == 0 && run.rel == left
+            && col_rel_col_idx(left, "k") == 0;
+        p_release(&run, left, true);
+    } else {
+        if (!sess)
+            col_rel_destroy(right);
+        col_rel_destroy(left);
+    }
+    destroy_session(sess);
+    if (ok)
+        PASS();
+    else
+        FAIL("keep-all ANTIJOIN over declared names was copied");
+}
+
+/* P9: the only row the operator drops is the last one, so a scan that
+ * stops one row early would pass the input through.  The result is a
+ * copy without that row, and destroying it returns the governor to where
+ * it was: the probe set built for the scan is released. */
+static void
+test_filter_join_last_row_miss_copies(void)
+{
+    static const char *const lk[] = { "col0" };
+    static const char *const rk[] = { "k" };
+
+    for (uint32_t which = 0; which < 2; which++) {
+        bool semijoin = which == 0;
+        wl_col_session_t *sess = make_session(64ull * 1024 * 1024);
+        col_rel_t *right = make_right(1, 1);
+        col_rel_t *left = make_canon_left(10, 1, 0);
+        wl_plan_op_t op;
+        p_run_t run = { .rc = EINVAL };
+        uint64_t before = 0;
+        bool ok = sess && right && left && session_add_rel(sess, right) == 0;
+
+        TEST(semijoin ? "P9 SEMIJOIN whose last row misses is copied"
+                      : "P9 ANTIJOIN whose last row matches is copied");
+        if (ok) {
+            /* Rows 0..8 have key 0 (in right), row 9 does not, for
+             * SEMIJOIN; ANTIJOIN gets the mirror image. */
+            for (uint32_t r = 0; r < 10; r++)
+                left->columns[0][r] = semijoin ? (r == 9 ? 99 : 0)
+                    : (r == 9 ? 0 : 99);
+            p_filter_op(&op, lk, rk);
+            before = reserved_of(sess);
+            run = p_run(semijoin, sess, left, &op, false);
+            ok = run.rc == 0 && run.rel && run.rel != left
+                && run.rel->nrows == 9;
+            for (uint32_t r = 0; ok && r < 9; r++)
+                ok = run.rel->columns[1][r] == (int64_t)r;
+        } else if (!sess) {
+            col_rel_destroy(right);
+        }
+        p_release(&run, left, false);
+        ok = ok && reserved_of(sess) == before;
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("last-row miss was passed through or leaked its set");
+    }
+}
+
 static void
 test_source_governed_anti_semi_outputs(void)
 {
@@ -5048,6 +5494,11 @@ main(void)
     test_filter_join_hash_denial_unwinds_scratch();
     test_probe_set_helper_contract();
     test_semi_anti_emit_prebuilt_matches_standalone();
+    test_filter_join_keep_all_passes_input_through();
+    test_semijoin_keep_all_fits_where_copy_is_denied();
+    test_filter_join_keep_all_guards_copy();
+    test_antijoin_keep_all_declared_names_pass_through();
+    test_filter_join_last_row_miss_copies();
     test_source_governed_join_key_scratch_denial();
     test_source_governed_join_key_scratch_alloc_failure();
     test_source_governor_output_precedence();
