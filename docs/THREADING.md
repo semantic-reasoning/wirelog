@@ -1571,7 +1571,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains 323 call sites.
+The complete current atomic-source inventory contains 332 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1670,7 +1670,7 @@ creation and work fixtures participate in the existing TSan suite.
 
 These four sites extended the preceding inventory from 318 to 322. The shared
 JOIN row-counter load/CAS pair adds one net site, bringing the current total
-to 323. FILTER uses
+to 323 before the probe-set and CONSOLIDATE sites below. FILTER uses
 an original thread-confined scratch token; its operator-specific row growth
 validates retained ownership under the destination's existing writer authority.
 
@@ -1712,3 +1712,19 @@ A saved operation ID prevents later charges to a replacement attempt. Cleanup
 uses separately funded host actions and the original resource tokens. The JOIN
 delta flag and output are published together inside the existing callback-free
 unary cutoff; no new atomic site or memory-order protocol is introduced.
+
+
+The initial scalar cooperative CONSOLIDATE composes the original scalar source,
+private writer and common unary FILTER lifecycle on one serialized native
+thread. Its row/index scratch has one original reservation and allocation base;
+index swaps transfer only local borrows. Its explicit private token initialization
+adds two atomic source sites, taking the inventory from 330 to 332. Original
+control/attempt checks guard every child return; retaining control storage does
+not authorize a successor debit. Input/session/plan/governor lifetimes extend
+through ACK. Generic frame disposal remains an external host operation.
+
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `filter.c:wl_columnar_filter_consolidate_attempt_start` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the private original scratch token owner before reservation; no concurrent publication |
+| `filter.c:wl_columnar_filter_consolidate_attempt_start#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition and bind the original token identity before callbacks |

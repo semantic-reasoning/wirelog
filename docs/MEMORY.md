@@ -2975,3 +2975,40 @@ output when an operator fails. Its source bound requires a separately funded
 caller continuation of at most 64 logical slots to the next actual poll or host
 return. This preparation does not activate CONSOLIDATE
 or change the default evaluator.
+
+
+### Initial scalar CONSOLIDATE
+
+`wl_columnar_filter_consolidate_attempt_start` provides an internal opt-in
+sorted-distinct operation on a single original frame entry. It uses the common
+FILTER step/ACK lifecycle. The default evaluator still calls raw consolidation;
+NULL control delegates that same raw implementation. The containing stratum must
+be nonrecursive and the session, plan, original scalar source and governor must
+remain immutable and live through ACK, on one serialized native host thread.
+Delta entries (including zero/one row), timestamps/weights, differential,
+retraction, TDD, coordinator, shared-output and parallel contexts are rejected.
+
+The operation pins the original scalar source, validates finite FLOAT cells and
+stably sorts row indices with bottom-up merge sort. Comparisons use signed
+integer lanes and numerical FLOAT order, treating signed zeros as equal. Every
+comparison lane, transfer, exhausted run and duplicate candidate is paid;
+all-duplicate input therefore still consumes work. Sorted-prefix and segment
+hints do not replace sorting. Width zero collapses nonempty input to one tuple.
+
+One governed scratch allocation contains the row buffer and two index arrays:
+`8 * (max(width, 1) + input_rows)` bytes, with checked sizing. Local swaps move
+index borrows; the context keeps the allocation base. Every supported input,
+including empty/singleton input, gets a private output preserving source names,
+types and graph metadata. Allocation, capacity, ownership, representative zero
+bits and quota peaks can differ from raw fast paths. No allocation or speed
+parity is promised. After full deduplication the original HELD B2 writer stamps
+canonical sorted/unique caches; no append follows. B2 drains before scratch,
+credit and source retirement; publication occurs only at the common decision.
+
+The fixture's two-job FIFO returns through an independent witness between host
+actions. Each actual start/step/ACK/retry requires a new distinct funding-control
+grant before the engine action. Refusal parks the original handle. A retained
+owned-input FINISH retry preserves the published output and uses fresh funding.
+Fixture setup, reports and generic arbitrary-width frame destruction are external
+work. This interface does not activate complete UNION queries, recursive
+consolidation or default cooperative evaluation.
