@@ -3325,6 +3325,126 @@ cleanup:
 #undef OC_CHECK
 }
 
+/* Issue #2182: the differential CONSOLIDATE (col_op_consolidate_diff)
+ * reports a governor denial of its consolidation workspace as a budget
+ * denial: ENOSPC, and wl_columnar_session_budget_denied() true.  The owned
+ * input is disposed on that failure, as before.  The budget is the
+ * governor's reserved total once the input is admitted, so the input fits
+ * and the operator's first new admission is denied:
+ *   - D3_DIFF_KWAY_HASH: count > 10000 rows in two CONCAT segments, the
+ *     k-way branch's hash-dedup scratch;
+ *   - D3_DIFF_KWAY_SORT: 64 rows in two segments, the k-way branch's
+ *     sort-and-merge workspace;
+ *   - D3_DIFF_FULL_SORT: 64 rows, one segment and no sorted prefix, the
+ *     fallback radix sort;
+ *   - D3_DIFF_PREFIX: 64 rows whose first half is a sorted prefix, the
+ *     incremental merge.
+ * D3_DIFF_ALLOC_FAULT fails the hash-dedup allocation under an ample
+ * budget instead, on an input carrying a stale pending denial: a failure
+ * no governor denied stays ENOMEM and is not reported as a denial. */
+enum {
+    D3_DIFF_KWAY_HASH,
+    D3_DIFF_KWAY_SORT,
+    D3_DIFF_FULL_SORT,
+    D3_DIFF_PREFIX,
+    D3_DIFF_ALLOC_FAULT,
+};
+
+static void
+test_diff_cons_workspace_denial(unsigned shape)
+{
+    static const char *const names[] = {
+        "#2182 diff CONS k-way hash-dedup scratch denial is ENOSPC",
+        "#2182 diff CONS k-way sort workspace denial is ENOSPC",
+        "#2182 diff CONS full radix sort denial is ENOSPC",
+        "#2182 diff CONS incremental merge denial is ENOSPC",
+        "#2182 diff CONS allocation failure stays ENOMEM, unreported",
+    };
+    bool large = shape == D3_DIFF_KWAY_HASH || shape == D3_DIFF_ALLOC_FAULT;
+    uint32_t count = large ? 12000u : 64u;
+    uint32_t segments = shape == D3_DIFF_FULL_SORT
+        || shape == D3_DIFF_PREFIX ? 1u : 2u;
+    col_rel_t *rel = col_rel_new_auto("diff-cons", 2);
+    wl_columnar_memory_governor_ref_t *ref =
+        test_consolidate_governor_create(UINT64_C(1) << 30);
+    wl_columnar_memory_governor_t *g = ref
+        ? wl_columnar_memory_governor_ref_get(ref) : NULL;
+    wl_col_session_t sess = { 0 };
+    eval_stack_t stack;
+    const char *failure = NULL;
+    int rc = 0;
+
+    TEST(names[shape]);
+    eval_stack_init(&stack);
+#define D3_CHECK(c, m) do { if (!(c)) { failure = m; goto cleanup; } } \
+        while (0)
+    D3_CHECK(rel && ref, "fixture");
+    for (uint32_t i = 0; i < count; i++) {
+        /* Descending with duplicates, so every path has work to do. */
+        int64_t row[2] = { (int64_t)((count - i) % (count / 2u)), 7 };
+        if (shape == D3_DIFF_PREFIX && i < count / 2u)
+            row[0] = (int64_t)i * 2;
+        D3_CHECK(col_rel_append_row(rel, row) == 0, "append");
+    }
+    if (shape == D3_DIFF_PREFIX) {
+        rel->sorted_nrows = count / 2u;
+        rel->run_count = 1;
+        rel->run_ends[0] = count / 2u;
+    }
+    D3_CHECK(col_rel_attach_memory_governor(rel, ref) == 0, "governor");
+    sess.memory_governor = ref;
+    D3_CHECK(eval_stack_push(&stack, rel, true) == 0, "owned entry");
+    rel = NULL; /* the stack owns it */
+    if (segments >= 2) {
+        eval_entry_t *entry = &stack.items[stack.top - 1];
+        entry->seg_boundaries = malloc(3u * sizeof(uint32_t));
+        D3_CHECK(entry->seg_boundaries, "boundaries");
+        entry->seg_count = 2;
+        entry->seg_boundaries[0] = 0;
+        entry->seg_boundaries[1] = count / 2u;
+        entry->seg_boundaries[2] = count;
+    }
+    if (shape == D3_DIFF_ALLOC_FAULT) {
+        /* Stale evidence from an earlier denial must not turn this failure
+         * into one; the k-way engine clears it before it admits. */
+        stack.items[stack.top - 1].rel->memory_budget_denial_pending = true;
+        fail_consolidate_allocation_at("hash_table");
+    } else {
+        atomic_store_explicit(&g->usable_bytes,
+            wl_columnar_memory_reserved(g), memory_order_seq_cst);
+    }
+    rc = col_op_consolidate_diff(&stack, &sess);
+    if (shape == D3_DIFF_ALLOC_FAULT) {
+        D3_CHECK(consolidate_fail_used, "allocation fault not reached");
+        D3_CHECK(rc == ENOMEM && !wl_columnar_session_budget_denied(&sess),
+            "allocation failure was reported as a budget denial");
+    } else {
+        if (rc != ENOSPC || !wl_columnar_session_budget_denied(&sess))
+            printf("(rc=%d denied=%d) ", rc,
+                (int)wl_columnar_session_budget_denied(&sess));
+        D3_CHECK(rc == ENOSPC && wl_columnar_session_budget_denied(&sess),
+            "workspace denial was not reported as a budget denial");
+    }
+    /* As before #2182, a refused owned input is disposed. */
+    D3_CHECK(stack.top == 0 && wl_columnar_memory_reserved(g) == 0,
+        "refused owned input was not disposed");
+cleanup:
+    clear_consolidate_allocation_failure();
+    while (stack.top) {
+        eval_entry_t e = eval_stack_pop(&stack);
+        free(e.seg_boundaries);
+        if (e.owned)
+            col_rel_destroy(e.rel);
+    }
+    col_rel_destroy(rel);
+    if (ref)
+        wl_columnar_memory_governor_ref_release(ref);
+#undef D3_CHECK
+    if (failure)
+        FAIL(failure);
+    PASS();
+}
+
 int
 main(void)
 {
@@ -3336,6 +3456,9 @@ main(void)
     test_governed_owned_cons(64, 8, 2, 2, false);
     test_governed_owned_cons(20000, 5000, 3, 0, false);
     test_governed_owned_cons(12000, 12000, 2, 0, false);
+    for (unsigned shape = D3_DIFF_KWAY_HASH; shape <= D3_DIFF_ALLOC_FAULT;
+        shape++)
+        test_diff_cons_workspace_denial(shape);
 
     printf("=== test_consolidate_kway_merge (TDD RED PHASE) ===\n\n");
     printf("NOTE: Expected to FAIL at link time until US-002 GREEN phase\n");
