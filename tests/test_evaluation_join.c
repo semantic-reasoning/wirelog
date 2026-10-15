@@ -131,6 +131,23 @@ run(fixture_t *f)
     CHECK(f->witnesses == f->turns && f->turns > 1);
 }
 
+/* Test teardown is an external, unbounded session-owner action. Raw JOIN may
+ * cache primary arrangements; those caches do not belong to its output. */
+static void
+raw_registry_clear(wl_col_session_t *session)
+{
+    for (uint32_t i = 0; i < session->arr_count; ++i) {
+        CHECK(!session->arr_entries[i].pin_count);
+        free(session->arr_entries[i].rel_name);
+        free(session->arr_entries[i].key_cols);
+        arr_free_contents(&session->arr_entries[i].arr);
+        col_arr_detach_memory_governor(&session->arr_entries[i].arr);
+    }
+    free(session->arr_entries);
+    session->arr_entries = NULL; session->arr_count = 0; session->arr_cap = 0;
+    session_rel_free_hash(session);
+}
+
 static void
 fixture_close(fixture_t *f)
 {
@@ -148,9 +165,9 @@ fixture_close(fixture_t *f)
     CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
     wl_evaluation_control_release(f->operation);
     wl_evaluation_control_release(f->funding);
+    raw_registry_clear(&f->session);
     if (!f->owns_left) col_rel_destroy(f->left);
     for (unsigned i = 0; i < 2; ++i) col_rel_destroy(f->registry[i]);
-    free(f->session.rel_hash_head); free(f->session.rel_hash_next);
 }
 
 static void
@@ -196,9 +213,9 @@ compare_raw(fixture_t *f)
         CHECK(actual_count == expected_count);
     }
     CHECK(stack.items[0].owned);
+    raw_registry_clear(&raw);
     col_rel_destroy(b); col_rel_destroy(left);
     for (unsigned i = 0; i < 2; ++i) col_rel_destroy(right[i]);
-    free(raw.rel_hash_head); free(raw.rel_hash_next);
 }
 
 static void
@@ -249,13 +266,17 @@ parity_cases(void)
 }
 
 static void
-generated_case(void)
+generated_case(bool keyed)
 {
     wirelog_error_t error;
-    wirelog_program_t *program = wirelog_parse_string(
-        ".decl left(x: int64)\n.decl right(y: int64)\n"
+    const char *text = keyed
+        ? ".decl left(x: int64, y: int64)\n.decl right(x: int64, z: int64)\n"
+        ".decl output(x: int64, y: int64, z: int64)\n"
+        "output(x, y, z) :- left(x, y), right(x, z).\n"
+        : ".decl left(x: int64)\n.decl right(y: int64)\n"
         ".decl output(x: int64, y: int64)\n"
-        "output(x, y) :- left(x), right(y).\n", &error);
+        "output(x, y) :- left(x), right(y).\n";
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
     CHECK(program);
     wl_plan_t *plan = NULL;
     CHECK(!wl_plan_from_program(program, &plan));
@@ -267,12 +288,12 @@ generated_case(void)
             for (uint32_t o = 0; o < rel->op_count; ++o)
                 if (rel->ops[o].op == WL_PLAN_OP_JOIN) join = &rel->ops[o];
         }
-    CHECK(join && !join->key_count);
-    fixture_t f; fixture_init(&f, 1, 3, 5, 0);
+    CHECK(join && (join->key_count != 0) == keyed);
+    fixture_t f; fixture_init(&f, keyed ? 2 : 1, 3, 5, 0);
     f.op = *join;
     if (strcmp(f.registry[0]->name, join->right_relation)) {
         col_rel_destroy(f.registry[0]);
-        f.registry[0] = relation_new(join->right_relation, 1, 5);
+        f.registry[0] = relation_new(join->right_relation, keyed ? 2 : 1, 5);
     }
     compare_raw(&f); fixture_close(&f);
     wl_plan_free(plan); wirelog_program_free(program);
@@ -482,11 +503,423 @@ interrupt_cases(void)
     fixture_close(&f);
 }
 
+static void
+keyed_cases(void)
+{
+    /* Later keys must discriminate even when the complete hashes collide in
+     * the same bucket. Swap key positions across the two input schemas. */
+    fixture_t composite; fixture_init(&composite, 2, 3, 4, 0);
+    const char *left_keys[] = {"col0", "col1"};
+    const char *right_keys[] = {"col1", "col0"};
+    uint32_t prefix = wl_columnar_hash_value(2166136261u, composite.left, 0, 1);
+    uint32_t composite_bucket = wl_columnar_hash_value(prefix, composite.left,
+            1, 0) & 7u;
+    int64_t composite_collision = 1;
+    while ((wl_columnar_hash_value(prefix, composite.left, 1,
+        composite_collision) & 7u)
+        != composite_bucket) ++composite_collision;
+    for (uint32_t r = 0; r < 3; ++r) {
+        composite.left->columns[0][r] = 1;
+        composite.left->columns[1][r] = r ? composite_collision : 0;
+    }
+    for (uint32_t r = 0; r < 4; ++r) {
+        composite.registry[0]->columns[0][r] = 0;
+        composite.registry[0]->columns[1][r] = 1;
+    }
+    composite.op.key_count = 2; composite.op.left_keys = left_keys;
+    composite.op.right_keys = right_keys;
+    compare_raw(&composite);
+    col_rel_t *matched = wl_columnar_eval_stack_cleanup_stack(
+        composite.frame)->items[0].rel;
+    CHECK(matched->nrows == 4);
+    for (uint32_t r = 0; r < matched->nrows; ++r)
+        CHECK(matched->columns[0][r] == 1 && matched->columns[1][r] == 0 &&
+            matched->columns[2][r] == 0 && matched->columns[3][r] == 1);
+    fixture_close(&composite);
+    const unsigned counts[] = {1, 2, 17, 129};
+    const char *keys[129];
+    for (unsigned key = 0; key < 129;
+        ++key) keys[key] = key & 1 ? "col16" : "col0";
+    for (unsigned i = 0; i < 4; ++i) {
+        fixture_t f; fixture_init(&f, 17, 3, 5, 0);
+        f.op.key_count = counts[i]; f.op.left_keys = keys;
+        f.op.right_keys = keys;
+        compare_raw(&f); fixture_close(&f);
+    }
+    fixture_t duplicates; fixture_init(&duplicates, 2, 65, 2, 0);
+    for (uint32_t r = 0; r < 65; ++r) duplicates.left->columns[0][r] = 1;
+    for (uint32_t r = 0; r < 2; ++r) duplicates.registry[0]->columns[0][r] = 1;
+    duplicates.op.key_count = 1;
+    compare_raw(&duplicates); fixture_close(&duplicates);
+    fixture_t projection; fixture_init(&projection, 17, 3, 5, 0);
+    uint32_t indices[] = {33, 0, UINT32_MAX};
+    projection.op.key_count = 1;
+    projection.op.project_count = 3; projection.op.project_indices = indices;
+    compare_raw(&projection); fixture_close(&projection);
+
+    fixture_t no_match; fixture_init(&no_match, 2, 3, 5, 0);
+    uint32_t bucket = wl_columnar_hash_value(2166136261u, no_match.left, 0,
+            0) & 15u;
+    int64_t collision = 1;
+    while ((wl_columnar_hash_value(2166136261u, no_match.left, 0,
+        collision) & 15u)
+        != bucket) ++collision;
+    for (uint32_t r = 0; r < 3; ++r) no_match.left->columns[0][r] = collision;
+    for (uint32_t r = 0; r < 5; ++r) no_match.registry[0]->columns[0][r] = 0;
+    no_match.op.key_count = 1;
+    compare_raw(&no_match);
+    CHECK(!wl_columnar_eval_stack_cleanup_stack(
+            no_match.frame)->items[0].rel->nrows);
+    fixture_close(&no_match);
+}
+
+static void
+key_grammar_cases(void)
+{
+    const char *valid[] = {NULL, "unknown", "col", "col ", "col+", "col-7",
+                           "col12x", "col12 ", "col0x10", "col0", "col+0",
+                           "col-0",
+                           "col  +12", "col\t12", "col00012",
+                           "col999999999999999999999x",
+                           "col-999999999999999999999", "col2147483647"};
+    for (unsigned i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i) {
+        fixture_t f; fixture_init(&f, 17, 3, 5, 0);
+        f.op.key_count = 1; f.op.left_keys = &valid[i];
+        f.op.right_keys = &valid[i];
+        compare_raw(&f); fixture_close(&f);
+    }
+    const char *unsupported[] = {"col2147483648", "col4294967297",
+                                 "col999999999999999999999", "col\302\240"};
+    for (unsigned i = 0; i < 4; ++i) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+        f.op.key_count = 1; f.op.left_keys = &unsupported[i];
+        run(&f);
+        CHECK(f.status.semantic_result == ENOTSUP && !f.status.committed);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            f.left);
+        fixture_close(&f);
+    }
+    for (unsigned i = 1; i < 4; ++i) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+        const char *name = unsupported[i];
+        for (unsigned side = 0; side < 2; ++side) {
+            col_rel_t *rel = side ? f.registry[0] : f.left;
+            free(rel->col_names[1]);
+            rel->col_names[1] = malloc(strlen(name) + 1);
+            CHECK(rel->col_names[1]);
+            strcpy(rel->col_names[1], name);
+        }
+        f.op.key_count = 1; f.op.left_keys = &name; f.op.right_keys = &name;
+        compare_raw(&f); fixture_close(&f);
+    }
+    fixture_t missing_names; fixture_init(&missing_names, 2, 3, 5, 0);
+    const char *lk = "col1", *rk = "col0";
+    for (unsigned side = 0; side < 2; ++side) {
+        col_rel_t *rel = side ? missing_names.registry[0] : missing_names.left;
+        for (uint32_t c = 0; c < rel->ncols; ++c) free(rel->col_names[c]);
+        free(rel->col_names); rel->col_names = NULL;
+    }
+    missing_names.op.key_count = 1;
+    missing_names.op.left_keys = &lk; missing_names.op.right_keys = &rk;
+    run(&missing_names);
+    CHECK(!missing_names.status.semantic_result &&
+        missing_names.status.committed);
+    col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(missing_names.frame)->items[0].rel;
+    CHECK(out->nrows == 3);
+    for (uint32_t r = 0; r < out->nrows;
+        ++r) CHECK(out->columns[0][r] == out->columns[2][r]);
+    fixture_close(&missing_names);
+}
+
+static void
+key_empty_and_type_cases(void)
+{
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        fixture_t f; fixture_init(&f, 0, 3, 0, 0);
+        f.op.key_count = 1;
+        if (mode == 1) f.op.right_relation = "missing";
+        if (mode == 2) {
+            f.op.delta_mode = WL_DELTA_FORCE_DELTA;
+            f.session.delta_seeded = true;
+        }
+        if (mode) compare_raw(&f);
+        else {
+            run(&f);
+            CHECK(f.status.semantic_result == EINVAL && !f.status.committed);
+        }
+        fixture_close(&f);
+    }
+    fixture_t mismatch; fixture_init(&mismatch, 1, 0, 0, 0);
+    wirelog_column_type_t floating = WIRELOG_TYPE_FLOAT;
+    CHECK(!col_rel_set_column_types(mismatch.left, &floating, 1));
+    mismatch.op.key_count = 1;
+    run(&mismatch);
+    CHECK(mismatch.status.semantic_result == EINVAL &&
+        !mismatch.status.committed);
+    fixture_close(&mismatch);
+
+    fixture_t integer; fixture_init(&integer, 1, 0, 0, 0);
+    wirelog_column_type_t int32 = WIRELOG_TYPE_INT32;
+    CHECK(!col_rel_set_column_types(integer.left, &int32, 1));
+    int64_t value = 1;
+    CHECK(!col_rel_append_row(integer.left, &value));
+    CHECK(!col_rel_append_row(integer.registry[0], &value));
+    integer.op.key_count = 1;
+    compare_raw(&integer); fixture_close(&integer);
+
+    fixture_t zero; fixture_init(&zero, 1, 0, 0, 0);
+    CHECK(!col_rel_set_column_types(zero.left, &floating, 1));
+    CHECK(!col_rel_set_column_types(zero.registry[0], &floating, 1));
+    for (unsigned side = 0; side < 2; ++side) {
+        col_rel_t *rel = side ? zero.registry[0] : zero.left;
+        int64_t bits = 0;
+        CHECK(!col_rel_append_row(rel, &bits));
+        CHECK(!col_rel_append_row(rel, &bits));
+        double minus_zero = -0.0;
+        memcpy(&rel->columns[0][0], &minus_zero, sizeof(minus_zero));
+    }
+    zero.op.key_count = 1;
+    compare_raw(&zero); fixture_close(&zero);
+    for (unsigned side = 0; side < 2; ++side) {
+        fixture_t invalid; fixture_init(&invalid, 1, 0, 0, 0);
+        CHECK(!col_rel_set_column_types(invalid.left, &floating, 1));
+        CHECK(!col_rel_set_column_types(invalid.registry[0], &floating, 1));
+        int64_t bits = 0;
+        CHECK(!col_rel_append_row(invalid.left, &bits));
+        CHECK(!col_rel_append_row(invalid.registry[0], &bits));
+        uint64_t infinity = UINT64_C(0x7ff0000000000000);
+        col_rel_t *rel = side ? invalid.registry[0] : invalid.left;
+        memcpy(&rel->columns[0][0], &infinity, sizeof(infinity));
+        invalid.op.key_count = 1;
+        run(&invalid);
+        CHECK(invalid.status.semantic_result == EINVAL &&
+            !invalid.status.committed);
+        fixture_close(&invalid);
+    }
+}
+
+static bool hash_image_sized;
+
+static void
+hash_init_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    /* Five right rows choose16 buckets and an84-byte image. Wait until size
+     * calculation finishes, then stop after the second initialized slot. */
+    if (phase != 26) return;
+    if (progress == 84) {
+        hash_image_sized = true; return;
+    }
+    if (hash_image_sized && progress == 1) checkpoint(control, phase, progress);
+}
+
+static void
+key_governor_cases(void)
+{
+    const uint64_t budgets[] = {500, 1024u * 1024u};
+    for (unsigned i = 0; i < 2; ++i) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0); f.op.key_count = 1;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = budgets[i], .usable_bytes = budgets[i],
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor); f.session.memory_governor = governor;
+        wl_columnar_memory_reservation_t peer;
+        wl_columnar_memory_reservation_init(&peer);
+        CHECK(wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(governor), 128, &peer)
+            == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        if (i) compare_raw(&f);
+        else {
+            run(&f);
+            CHECK(f.status.semantic_result == ENOSPC && !f.status.committed);
+        }
+        fixture_close(&f);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) == 128);
+        CHECK(wl_columnar_memory_rollback(&peer));
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+static void
+key_literal_prefixes(void)
+{
+#ifndef _MSC_VER
+    /* Independent ungoverned width1/FORCE_FULL recipe, no CAS contention:
+    * source =256 INIT+256 BEGIN+2*(96 entry+144 strong CAS)+224 resolve
+    * +224 validate+192 snapshot+224 one column chunk =1856 per side.
+    * Before key sizing:192 ENTRY+84*192 retirement+10*192 parents
+    * +544 unary child+2*1856 source+7*128 lookup =23392.
+    * Then192 sizing/parent/init/alloc/key-parent;128 slot/first byte.
+    * MSVC's permitted weak-CAS spuriosity has no fixed success prefix. */
+    const uint64_t limits[] = {23391, 23392, 23583, 23584, 23775, 23776,
+                               23967, 23968, 24159, 24160, 24351, 24352, 24479,
+                               24480, 24607, 24608};
+    const uint64_t consumed[] = {23200, 23392, 23392, 23584, 23584, 23776,
+                                 23776, 23968, 23968, 24160, 24160, 24352,
+                                 24352, 24480, 24480, 24608};
+    const char *key = "col0";
+    for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
+        fixture_t f; fixture_init(&f, 1, 3, 5, limits[i]);
+        f.op.delta_mode = WL_DELTA_FORCE_FULL; f.op.key_count = 1;
+        f.op.left_keys = &key; f.op.right_keys = &key;
+        run(&f);
+        CHECK(f.status.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!f.status.committed);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            f.left);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            f.status.semantic_result, 0) == f.status.semantic_result);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.consumed == consumed[i]);
+        fixture_close(&f);
+    }
+#endif
+}
+
+/* Independent fixed-width2, ungoverned, typed noTS "$join" constructor
+ * schedule. These literals describe the published admission table, without
+ * reading production enums or measuring a run. Descriptor bytes use this ABI. */
+static uint64_t
+typed_constructor_two(void)
+{
+    return 512u + 2u * 128u /* external typed wrapper */
+           + 192u + 6u * 96u /* builder header and relation-name scan */
+           + 6u * 96u + 96u + 2u * 96u + 3u * 96u + 128u /* checked sizes */
+           + 2u * (96u + 96u + 192u + 3u * 96u) /* generated-name sizes */
+           + 96u + 160u + 112u + 224u * ((sizeof(col_rel_t) + 7u) / 8u)
+           + 5u * 96u + 112u + 224u + 80u + 112u + 96u + 2u * 160u
+           + 112u + 192u + 2u * 112u /* columns and two payload allocations */
+           + 112u + 192u + 2u * (96u + 96u + 192u + 112u + 224u) /* names */
+           + 112u + 2u * 96u /* type array and two type lanes */
+           + 96u + 112u + 224u /* Arrow root */
+           + 112u + 192u /* Arrow child-pointer table */
+           + 2u * (128u + 112u + 96u + 224u + 96u + 96u + 192u + 112u + 224u)
+           + 3u * 128u + 220u; /* unused ungoverned commit calls and install */
+}
+
+static void
+hash_literal_prefixes(void)
+{
+#ifndef _MSC_VER
+    /* First key's compatibility ends at26208. Width192, scratch1 three192,
+     * two type lanes128, constructor parent192 gives27424 before constructor.
+     * Two batch parents192 and child170+single(94+19+39+39+45+52+45+21+144)
+     * give H=28476+constructor. Five right rows:16 heads+5 next slots,
+     * four doublings; each build row192+128 hash+128 link. All candidates
+     * are deliberate collisions with unequal keys, so no output fees. */
+    const uint64_t h = 28476u + typed_constructor_two();
+    const uint64_t boundaries[] = {192, 320, 704, 896, 1088, 1280, 1472, 1600,
+                                   4160, 4352, 4480, 4608, 6400, 6592, 6720,
+                                   6848, 6976, 7168, 7296};
+    const uint64_t predecessors[] = {0, 192, 576, 704, 896, 1088, 1280, 1472,
+                                     4032, 4160, 4352, 4480, 6272, 6400, 6592,
+                                     6720, 6848, 6976, 7168};
+    const char *key = "col0";
+    for (unsigned b = 0; b < sizeof(boundaries) / sizeof(boundaries[0]); ++b)
+        for (unsigned minus = 0; minus < 2; ++minus) {
+            fixture_t f; fixture_init(&f, 1, 3, 5, h + boundaries[b] - minus);
+            f.op.delta_mode = WL_DELTA_FORCE_FULL; f.op.key_count = 1;
+            f.op.left_keys = &key; f.op.right_keys = &key;
+            uint32_t bucket = wl_columnar_hash_value(2166136261u, f.left, 0,
+                    0) & 15u;
+            int64_t collision = 1;
+            while ((wl_columnar_hash_value(2166136261u, f.left, 0,
+                collision) & 15u)
+                != bucket) ++collision;
+            for (uint32_t r = 0; r < 3; ++r) f.left->columns[0][r] = collision;
+            for (uint32_t r = 0; r < 5; ++r) f.registry[0]->columns[0][r] = 0;
+            run(&f);
+            CHECK(f.status.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(!f.status.committed);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.left);
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                f.status.semantic_result, 0) == f.status.semantic_result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report));
+            CHECK(report.consumed ==
+                h + (minus ? predecessors[b] : boundaries[b]));
+            fixture_close(&f);
+        }
+#endif
+}
+
+static void
+key_interrupt_cases(void)
+{
+    const char *key = "col  +0";
+    for (unsigned restart = 0; restart < 2; ++restart)
+        for (unsigned phase = 21; phase <= 30; ++phase) {
+            fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+            f.op.key_count = 1; f.op.left_keys = &key; f.op.right_keys = &key;
+            if (phase == 30) {
+                uint32_t bucket = wl_columnar_hash_value(2166136261u, f.left, 0,
+                        0) & 15u;
+                int64_t collision = 1;
+                while ((wl_columnar_hash_value(2166136261u, f.left, 0,
+                    collision) & 15u)
+                    != bucket) ++collision;
+                for (uint32_t r = 0; r < 3;
+                    ++r) f.left->columns[0][r] = collision;
+                for (uint32_t r = 0; r < 5;
+                    ++r) f.registry[0]->columns[0][r] = 0;
+            }
+            hook_fixture = &f; hook_phase = phase; hook_calls = 0;
+            hook_restart = restart;
+            wl_columnar_join_test_attempt_checkpoint = checkpoint;
+            run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+            CHECK(hook_calls == 1 && !f.status.committed);
+            CHECK(f.status.semantic_result ==
+                (restart ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.left);
+            int result = restart ? 0 : f.status.semantic_result;
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                result, 0) == result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report));
+            if (restart) CHECK(!report.consumed);
+            fixture_close(&f);
+        }
+    for (int ordinal = 0; ordinal < 3; ++ordinal) {
+        fixture_t f; fixture_init(&f, 2, 3, 5, 0); f.op.key_count = 1;
+        wl_columnar_join_test_attempt_fail_allocation = ordinal;
+        run(&f); wl_columnar_join_test_attempt_fail_allocation = -1;
+        CHECK(f.status.semantic_result == ENOMEM && !f.status.committed);
+        fixture_close(&f);
+    }
+    fixture_t partial; fixture_init(&partial, 2, 3, 5, 0);
+    partial.op.key_count = 1;
+    hook_fixture = &partial; hook_phase = 26; hook_calls = 0;
+    hook_restart = false;
+    hash_image_sized = false;
+    wl_columnar_join_test_attempt_checkpoint = hash_init_checkpoint;
+    run(&partial); wl_columnar_join_test_attempt_checkpoint = NULL;
+    CHECK(hash_image_sized && hook_calls == 1);
+    CHECK(partial.status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!partial.status.committed);
+    fixture_close(&partial);
+}
+
 int
 main(void)
 {
-    parity_cases(); generated_case(); limit_cases(); funding_case();
+    parity_cases(); generated_case(false); generated_case(true); limit_cases();
+    funding_case();
     retained_case(); governor_cases(); publication_case(); interrupt_cases();
-    puts("ordinary cross JOIN raw parity and work-limit cleanup passed");
+    keyed_cases(); key_grammar_cases(); key_empty_and_type_cases();
+    key_interrupt_cases(); key_governor_cases(); key_literal_prefixes();
+    hash_literal_prefixes();
+    puts("ordinary cross/keyed JOIN raw parity and work-limit cleanup passed");
     return 0;
 }
