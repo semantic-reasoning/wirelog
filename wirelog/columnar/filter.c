@@ -1884,7 +1884,7 @@ wl_columnar_filter_attempt_single_init(
     single->owners[1].writer.thread_valid = 0;
 }
 
-static void
+void
 wl_columnar_filter_attempt_batch_init(
     wl_columnar_relation_append_batch_t *batch)
 {
@@ -3180,7 +3180,28 @@ wl_columnar_filter_op_attempt_step_owned(
                 abort();
             ctx->source_initialized = false;
         }
-        ctx->stage = WL_COLUMNAR_FILTER_STAGE_DECIDE;
+        ctx->stage = ctx->join_decision_pending
+            ? WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE :
+            WL_COLUMNAR_FILTER_STAGE_DECIDE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE:
+        if (!ctx->pin_owned || !ctx->join_decision_pending) {
+            rc = EINVAL; goto protocol_error;
+        }
+        if (!ctx->execution_result && ctx->unary_started) {
+            rc = wl_columnar_filter_attempt_charge(ctx->control,
+                    ctx->attempt_id, 0);
+            if (!rc)
+                rc =
+                    wl_columnar_eval_stack_unary_commit_join_attempt_context_owned
+                    (
+                    frame, ctx, &ctx->committed, owner);
+            ctx->execution_result = rc;
+            ctx->semantic_result = rc;
+        }
+        ctx->join_result_is_delta = false;
+        ctx->join_decision_pending = false;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_CONTROL;
         break;
     case WL_COLUMNAR_FILTER_STAGE_DECIDE:
         if (!ctx->pin_owned) {
@@ -3274,6 +3295,7 @@ wl_columnar_filter_op_attempt_ack_owned(
     if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
         || ctx->unary_started || ctx->source_initialized ||
         ctx->batch_initialized || ctx->join_initialized
+        || ctx->join_decision_pending || ctx->join_result_is_delta
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
         ctx->output || ctx->private_output || ctx->table.programs
         || ctx->table.initialized_slots || ctx->table.retirement_cursor
