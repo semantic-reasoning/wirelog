@@ -265,12 +265,20 @@ pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     wl_join_pipeline_sink_t *sink = (wl_join_pipeline_sink_t *)context;
 
     (void)bytes;
+    wl_columnar_continuation_status_t status;
+
     if (!sink || !sink->begun || !sink->out)
         return WL_COLUMNAR_CONTINUATION_INVALID;
     /* Same growth rule as the relation sink (Issue #2173): double first,
      * exact on a budget denial. */
-    return col_join_batch_sink_grow(sink->out,
-               (uint64_t)sink->out->nrows + rows);
+    status = col_join_batch_sink_grow(sink->out,
+            (uint64_t)sink->out->nrows + rows);
+    /* The publish loop destroys the output on failure, so a denied growth
+     * is reported through the sink's error as a budget denial (#2185). */
+    if (status == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED)
+        sink->error = wl_columnar_join_budget_denial(sink->sess, NULL,
+                ENOSPC);
+    return status;
 }
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
@@ -792,6 +800,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         if (rc == 0)
             rc = col_rel_reserve_capacity_admitted(out, out->capacity, NULL);
         if (rc != 0) {
+            rc = wl_columnar_join_budget_denial(sess, out, rc);
             col_rel_destroy(out);
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);

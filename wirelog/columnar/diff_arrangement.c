@@ -455,6 +455,9 @@ col_diff_arrangement_deep_copy_with_memory_governor_status(
     * caller attaches the right ledger.  Never inherit the source's. */
     copy->ledger = NULL;
     copy->memory_governor = NULL;
+    /* The struct comes from malloc: a copy starts with no pending budget
+    * denial, which wl_columnar_session_budget_denied() reads (#2185). */
+    copy->memory_budget_denial_pending = 0;
     wl_columnar_memory_reservation_init(&copy->reservation);
     copy->reserved_bytes = 0;
     if (key_bytes)

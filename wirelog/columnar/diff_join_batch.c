@@ -346,6 +346,12 @@ index_right(wl_col_session_t *sess, const char *name, const col_rel_t *right,
         return rc;
     arr = txn.working;
     rc = col_diff_arrangement_ensure_ht_capacity(arr, right->nrows);
+    /* The working copy carrying the denial is discarded by the abort below,
+     * so the session records it (#2185). */
+    if (rc == ENOMEM && arr->memory_budget_denial_pending) {
+        rc = ENOSPC;
+        sess->memory_budget_denied = true;
+    }
     if (rc == 0) {
         /* A source snapshot change resets this private copy in txn_begin,
          * so public appends rebuild from row zero.  Retain the tail walk for
@@ -538,13 +544,16 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
         p->batch = col_rel_new_auto("$diff_join_batch", ocols);
         rc = p->batch ? 0 : ENOMEM;
     }
-    if (rc != 0)
+    if (rc != 0) {
+        rc = wl_columnar_join_budget_denial(sess, NULL, rc);
         goto fail;
+    }
     if (!p->batch) {
         rc = ENOMEM;
         goto fail;
     }
-    rc = col_join_set_output_types(p->batch, left, right, op);
+    rc = wl_columnar_join_budget_denial(sess, p->batch,
+            col_join_set_output_types(p->batch, left, right, op));
     if (rc != 0)
         goto fail;
     if (!col_rel_retained_bytes_for(p->batch, 1u, &row_bytes)
