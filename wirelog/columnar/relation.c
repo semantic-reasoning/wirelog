@@ -15155,6 +15155,57 @@ wl_columnar_relation_selected_operator_checkpoint(
     return 0;
 }
 
+/* Fixed-one stamp: first128 partitions80 current/48 middle continuation;
+ * middle229 fits192+48, final current<=64 fits128. The logical interval bound
+ * includes a separately funded caller<=64; it is not a whole-call time bound.
+ * No new retirement owner is acquired. Input is already sorted and unique. */
+int
+wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
+    wl_columnar_relation_append_batch_t *batch,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!batch || batch->identity != batch || !control || !attempt_id
+        || batch->control != control || batch->attempt_id != attempt_id
+        || batch->raw_mode || batch->phase != WL_COLUMNAR_RELATION_BATCH_HELD
+        || !batch->raw.active || !batch->raw.relation)
+        return EINVAL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, 128);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            128);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            192);
+    if (rc) return rc;
+    rc = wl_columnar_relation_batch_validate(batch);
+    int checkpoint = wl_columnar_relation_selected_operator_checkpoint(
+        control, attempt_id, rc);
+    if (checkpoint) return checkpoint;
+    int checked_tail = wl_columnar_relation_constructor_attempt_tail(control,
+            attempt_id, 192);
+    if (checked_tail > 0 || !rc) rc = checked_tail;
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            128);
+    if (rc) return rc;
+    col_rel_t *output = batch->raw.relation;
+    bool supported = output->storage_owner == output && !output->timestamps
+        && !output->pool_owned && !output->arena_owned
+        && output->compound_kind == WIRELOG_COMPOUND_KIND_NONE;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control,
+            attempt_id, 128);
+    if (tail > 0 || supported) {
+        if (tail) return tail;
+    } else return ENOTSUP;
+    /* The final tail is the cutoff. No callback, row mutation, generation
+     * advance or fallible work intervenes before these private cache stores. */
+    output->sorted_nrows = output->nrows;
+    output->run_count = output->nrows ? 1 : 0;
+    output->run_ends[0] = output->nrows;
+    return 0;
+}
+
 int
 wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
     wl_columnar_relation_append_batch_t *batch,

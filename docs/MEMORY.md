@@ -2955,3 +2955,23 @@ control/ref/token exclusions remain as above. A nonempty cross JOIN now also
 admits192 for selection and192 per reached left row; these are new forward
 admissions rather than borrowed unused retirement shares. The three original
 scratch records and84 first-retirement payments remain unchanged.
+
+The cooperative unary admission used by FILTER/MAP requires the original
+RUNNING embedded context, native thread, frame/session, pinned control and
+immutable attempt ID. A standalone unary begin refuses an active operator
+context. The context route shares the original admission body and does not
+transfer authority through a copied context or an armed bypass flag.
+
+`wl_columnar_relation_append_batch_mark_sorted_operator_controlled` stamps
+sorted-prefix/run caches of an already sorted-and-unique, exclusively private
+no-timestamp
+output under its original HELD fixed-one B2 writer. Ordering and uniqueness
+under scalar row comparison are caller preconditions: complete deduplication
+before stamping. The helper does not scan rows to establish either property. No append may
+follow the stamp. Its final control cutoff precedes callback-free cache stores;
+rows, shape and generations do not change. Existing staged B2 retirement leaves
+these caches intact. A failed stamp leaves them unchanged; discard the private
+output when an operator fails. Its source bound requires a separately funded
+caller continuation of at most 64 logical slots to the next actual poll or host
+return. This preparation does not activate CONSOLIDATE
+or change the default evaluator.
