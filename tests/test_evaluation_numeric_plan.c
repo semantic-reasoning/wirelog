@@ -114,7 +114,12 @@ engine_dispatch(fixture_t *f)
     } else {
         f->pending_protocol = wl_columnar_eval_plan_numeric_attempt_step(
             &f->record, f->funding, f->funding_id);
-        CHECK(!f->pending_protocol);
+        CHECK(!f->pending_protocol ||
+            (f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING &&
+            f->record.pending_action >=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT &&
+            f->record.pending_action <=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END));
     }
 }
 
@@ -632,6 +637,692 @@ test_host_boundaries(void)
     }
 }
 
+/* Source-bound fragments use an empty original frame and a stable, unique-name
+ * registry. Raw parity runs on deep-copied descriptors in a separate session. */
+static void
+source_fixture(fixture_t *f, uint32_t width, uint32_t rows, uint64_t limit)
+{
+    fixture_init(f, width, rows, limit);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(eval_stack_pop(stack).rel == f->input);
+    memset(&stack->items[0], 0, sizeof(stack->items[0]));
+}
+
+static void
+source_begin(fixture_t *f, const wl_plan_relation_t *plan,
+    col_rel_t **registry, uint32_t count)
+{
+    f->session.rels = registry; f->session.nrels = count;
+    f->session.rel_cap = count;
+    CHECK(!wl_columnar_eval_plan_numeric_source_attempt_begin(&f->record,
+        plan, 0, plan->op_count, f->frame, &f->session, f->operation,
+        f->operation_id, f->funding, f->funding_id));
+}
+
+static void
+until_phase(fixture_t *f, wl_columnar_eval_plan_numeric_phase_t phase)
+{
+    unsigned turns = 0;
+    while (f->record.phase != phase) {
+        CHECK(++turns < 100000);
+        CHECK(f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+static void
+same_relation(const col_rel_t *a, const col_rel_t *b)
+{
+    CHECK(a && b && a->nrows == b->nrows && a->ncols == b->ncols);
+    CHECK(a->has_graph_column == b->has_graph_column);
+    CHECK(a->graph_col_idx == b->graph_col_idx);
+    CHECK(a->declared_ncols == b->declared_ncols);
+    CHECK((a->timestamps != NULL) == (b->timestamps != NULL));
+    CHECK((a->column_types != NULL) == (b->column_types != NULL));
+    for (uint32_t c = 0; c < a->ncols; ++c) {
+        CHECK(!strcmp(a->col_names[c], b->col_names[c]));
+        if (a->column_types) CHECK(a->column_types[c] == b->column_types[c]);
+        for (uint32_t r = 0; r < a->nrows; ++r)
+            CHECK(col_rel_get(a, r, c) == col_rel_get(b, r, c));
+    }
+    for (uint32_t r = 0; a->timestamps && r < a->nrows; ++r) {
+        CHECK(a->timestamps[r].stratum == b->timestamps[r].stratum);
+        CHECK(a->timestamps[r].worker == b->timestamps[r].worker);
+        CHECK(a->timestamps[r]._reserved == b->timestamps[r]._reserved);
+        CHECK(a->timestamps[r].iteration == b->timestamps[r].iteration);
+        CHECK(a->timestamps[r].multiplicity == b->timestamps[r].multiplicity);
+    }
+}
+
+static void
+source_raw_parity(fixture_t *f, const wl_plan_relation_t *plan)
+{
+    wl_col_session_t raw = {0};
+    wl_mem_ledger_init(&raw.mem_ledger, 0);
+    raw.delta_seeded = f->session.delta_seeded;
+    raw.nrels = f->session.nrels; raw.rel_cap = raw.nrels;
+    raw.rels = calloc(raw.nrels ? raw.nrels : 1, sizeof(*raw.rels));
+    CHECK(raw.rels);
+    for (uint32_t i = 0; i < raw.nrels; ++i)
+        if (f->session.rels[i])
+            CHECK(!col_rel_deep_copy(f->session.rels[i], &raw.rels[i], NULL));
+    eval_stack_t stack = {0};
+    for (uint32_t i = 0; i < plan->op_count; ++i) {
+        const wl_plan_op_t *op = &plan->ops[i];
+        int rc = op->op == WL_PLAN_OP_VARIABLE ? col_op_variable(op, &stack,
+                &raw)
+            : op->op == WL_PLAN_OP_MAP ? col_op_map(op, &stack, &raw)
+            : wl_columnar_filter_op(op, &stack, &raw);
+        CHECK(!rc);
+    }
+    eval_stack_t *actual = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(actual->top == 1 && stack.top == 1);
+    same_relation(actual->items[0].rel, stack.items[0].rel);
+    CHECK(actual->items[0].is_delta == stack.items[0].is_delta);
+    CHECK(!eval_stack_drain(&stack));
+    session_rel_free_hash(&raw);
+    for (uint32_t i = 0; i < raw.nrels; ++i) col_rel_destroy(raw.rels[i]);
+    free(raw.rels);
+    CHECK(!f->session.rel_hash_nbuckets); /* No raw lookup/hash fallback. */
+}
+
+static void
+test_source_generated(void)
+{
+    for (unsigned floating = 0; floating < 2; ++floating) {
+        const char *text = floating
+            ? ".decl input(x: float)\n.decl output(y: float)\n"
+            "output(x + 1.25) :- input(x), x > -3.0.\n"
+            : ".decl input(x: int64)\n.decl output(y: int64)\n"
+            "output(x + 1) :- input(x), x > 2.\n";
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const wl_plan_relation_t *rp = NULL;
+        for (uint32_t s = 0; s < plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+                if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                    rp = &plan->strata[s].relations[r];
+        CHECK(rp && rp->ops[0].op == WL_PLAN_OP_VARIABLE);
+        uint32_t end = 1;
+        while (end < rp->op_count && (rp->ops[end].op == WL_PLAN_OP_FILTER
+            || rp->ops[end].op == WL_PLAN_OP_MAP)) ++end;
+        wl_plan_relation_t fragment = {.ops = rp->ops, .op_count = end};
+        const uint32_t widths[] = {1, 17, 129};
+        for (unsigned w = 0; w < 3; ++w)
+            for (unsigned rows = 0; rows <= 133; rows += 133) {
+                fixture_t f; source_fixture(&f, widths[w], rows, 0);
+                if (floating) {
+                    source_float(&f);
+                    memset(&wl_columnar_eval_stack_cleanup_stack(
+                            f.frame)->items[0],
+                        0, sizeof(eval_entry_t));
+                }
+                CHECK(!col_rel_enable_timestamps(f.input));
+                for (uint32_t r = 0; r < rows; ++r) {
+                    f.input->timestamps[r].stratum = 3;
+                    f.input->timestamps[r].worker = 2;
+                    f.input->timestamps[r].iteration = r;
+                    f.input->timestamps[r].multiplicity = r % 2 ? -3 : 5;
+                }
+                col_rel_t *registry[] = {NULL, f.input};
+                source_begin(&f, &fragment, registry, 2); run(&f);
+                CHECK(!f.record.semantic_result && f.record.source_installed);
+                CHECK(f.record.completed == end - 1);
+                source_raw_parity(&f, &fragment); fixture_close(&f);
+            }
+        /* Real generated numeric operands, in both three-operator orders. */
+        const wl_plan_op_t *filter = NULL, *map = NULL;
+        for (uint32_t i = 1; i < end; ++i) {
+            if (rp->ops[i].op == WL_PLAN_OP_FILTER) filter = &rp->ops[i];
+            if (rp->ops[i].op == WL_PLAN_OP_MAP) map = &rp->ops[i];
+        }
+        CHECK(filter && map);
+        for (unsigned order = 0; order < 2; ++order) {
+            wl_plan_op_t ops[] = {rp->ops[0], *filter, *map, *filter};
+            if (order) {
+                ops[1] = *map; ops[2] = *filter; ops[3] = *map;
+            }
+            wl_plan_relation_t chain = {.ops = ops, .op_count = 4};
+            fixture_t f; source_fixture(&f, 1, 17, 0);
+            if (floating) {
+                source_float(&f);
+                memset(&wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0],
+                    0, sizeof(eval_entry_t));
+            }
+            col_rel_t *registry[] = {f.input};
+            source_begin(&f, &chain, registry, 1); run(&f);
+            CHECK(!f.record.semantic_result && f.record.completed == 3);
+            source_raw_parity(&f, &chain); fixture_close(&f);
+        }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_source_delta_modes(void)
+{
+    const unsigned modes[] = {WL_DELTA_AUTO, WL_DELTA_FORCE_FULL,
+                              WL_DELTA_FORCE_DELTA, WL_DELTA_FORCE_EMPTY,
+                              WL_DELTA_FORCE_EMPTY_AFTER_SEED, 99};
+    const uint32_t delta_rows[] = {0, 3, 7, 11};
+    for (unsigned seeded = 0; seeded < 2; ++seeded)
+        for (unsigned m = 0; m < 6; ++m)
+            for (unsigned d = 0; d < 5; ++d) {
+                fixture_t f; source_fixture(&f, 1, 7, 0);
+                f.session.delta_seeded = seeded != 0;
+                col_rel_t *delta = source_new(1, d ? delta_rows[d - 1] : 0);
+                CHECK(!wl_columnar_relation_rename_checked(delta, "$d$input"));
+                col_rel_t *registry[] = {f.input, d ? delta : NULL};
+                wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                                       .relation_name = "input",
+                                       .delta_mode = modes[m]},
+                                      {.op = WL_PLAN_OP_MAP,
+                                       .project_count = 1}};
+                wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+                source_begin(&f, &rp, registry, 2); run(&f);
+                CHECK(!f.record.semantic_result);
+                bool chosen_delta = d && delta->nrows
+                    && (modes[m] == WL_DELTA_FORCE_DELTA
+                    || (modes[m] != WL_DELTA_FORCE_FULL
+                    && modes[m] != WL_DELTA_FORCE_EMPTY && delta->nrows < 7));
+                CHECK(f.record.source_selected ==
+                    (chosen_delta ? delta : f.input));
+                bool empty = modes[m] == WL_DELTA_FORCE_EMPTY
+                    || (modes[m] == WL_DELTA_FORCE_DELTA
+                    && !chosen_delta && seeded);
+                CHECK(f.record.source_empty == empty);
+                source_raw_parity(&f, &rp); fixture_close(&f);
+                col_rel_destroy(delta);
+            }
+    fixture_t f; source_fixture(&f, 0, 3, 0);
+    col_rel_t *registry[] = {f.input};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 0}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    source_begin(&f, &rp, registry, 1); run(&f);
+    CHECK(!f.record.semantic_result); source_raw_parity(&f, &rp);
+    fixture_close(&f);
+}
+
+static void
+test_source_long_names(void)
+{
+    const unsigned lengths[] = {251, 252, 253, 511};
+    for (unsigned n = 0; n < 4; ++n) {
+        char name[513], other[513], delta_name[256];
+        memset(name, 'a', lengths[n]); name[lengths[n]] = '\0';
+        memcpy(other, name, lengths[n] + 1); other[lengths[n] - 1] = 'b';
+        snprintf(delta_name, sizeof(delta_name), "$d$%.252s", name);
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        CHECK(!wl_columnar_relation_rename_checked(f.input, name));
+        col_rel_t *miss = source_new(1, 7), *delta = source_new(1, 3);
+        CHECK(!wl_columnar_relation_rename_checked(miss, other));
+        CHECK(!wl_columnar_relation_rename_checked(delta, delta_name));
+        col_rel_t *registry[] = {miss, NULL, f.input, delta};
+        wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                               .relation_name = name},
+                              {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+        wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+        source_begin(&f, &rp, registry, 4); run(&f);
+        CHECK(!f.record.semantic_result && f.record.source_full == f.input
+            && f.record.source_selected == delta);
+        source_raw_parity(&f, &rp); fixture_close(&f);
+        col_rel_destroy(miss); col_rel_destroy(delta);
+    }
+}
+
+static void
+test_source_scan_stops(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                           .relation_name = "missing"},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        col_rel_t *registry[128];
+        for (unsigned i = 0; i < 128; ++i) registry[i] = NULL;
+        registry[127] = f.input;
+        source_begin(&f, &rp, registry, 128);
+        until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL);
+        for (unsigned i = 0; i < 17; ++i) {
+            engine_dispatch(&f); ++f.witnesses;
+        }
+        CHECK(f.record.source_slot == 17 && !f.record.source_installed);
+        if (mode == 0) wl_evaluation_control_request_cancel(f.operation);
+        else if (mode == 1) {
+            CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                0, 0));
+            CHECK(!wl_evaluation_control_begin(f.operation,
+                &f.operation_owner));
+        }
+        run(&f);
+        CHECK(f.record.semantic_result == (mode == 0
+            ? WL_EVALUATION_CONTROL_CANCELLED : mode == 1 ? EINVAL : ENOENT));
+        CHECK(!f.record.completed && !f.record.source_installed);
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+        if (mode == 1) {
+            uint64_t next =
+                wl_evaluation_control_active_attempt_id(f.operation);
+            CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                0, 0));
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report));
+            CHECK(report.attempt_id == next && !report.consumed);
+        }
+        fixture_close(&f);
+    }
+}
+
+static void
+test_source_owned_handoff(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    for (unsigned restart = 0; restart < 2; ++restart) {
+        fixture_t f; source_fixture(&f, 17, 7, 0);
+        col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+        until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL);
+        eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(f.frame);
+        col_rel_t *empty = result->rel;
+        CHECK(empty && result->owned && !empty->nrows &&
+            !f.record.source_initialized);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+        if (restart) {
+            CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                0, 0));
+            CHECK(!wl_evaluation_control_begin(f.operation,
+                &f.operation_owner));
+        } else wl_evaluation_control_request_cancel(f.operation);
+        run(&f);
+        CHECK(f.record.semantic_result ==
+            (restart ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(!f.record.source_installed && result->rel == empty &&
+            result->owned);
+        CHECK(!wl_columnar_eval_plan_numeric_attempt_ack(&f.record, f.funding,
+            f.funding_id));
+        CHECK(result->rel == empty && result->owned);
+        /* Real reader makes generic disposal transfer the frame to pending;
+         * ACK did not destroy the result or grant a successor work. */
+        wl_columnar_source_access_reader_t reader = {0};
+        CHECK(!col_rel_source_reader_acquire(empty, &reader));
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+        CHECK(!f.frame && f.session.cleanup_pending_count == 1);
+        CHECK(!col_rel_source_reader_release(&reader));
+        CHECK(!wl_columnar_eval_stack_cleanup_retry(&f.session));
+        CHECK(!f.session.cleanup_pending_count &&
+            !f.session.cleanup_reserved_bytes);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            restart ? 0 : WL_EVALUATION_CONTROL_CANCELLED, 0) ==
+            (restart ? 0 : WL_EVALUATION_CONTROL_CANCELLED));
+        if (restart) {
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation,
+                &report) && !report.consumed);
+        }
+        CHECK(!wl_evaluation_control_finish(f.funding, &f.funding_owner, 0, 0));
+        CHECK(!wl_evaluation_control_detach(f.operation, &f.operation_owner));
+        CHECK(!wl_evaluation_control_detach(f.funding, &f.funding_owner));
+        wl_evaluation_control_release(f.operation);
+        wl_evaluation_control_release(f.funding);
+        col_rel_destroy(f.input);
+    }
+}
+
+static void
+test_source_allocation_failures(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    bool completed = false;
+    for (unsigned ordinal = 1; ordinal < 128; ++ordinal) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+        until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW);
+        wl_columnar_relation_test_constructor_fail_allocation = ordinal;
+        engine_dispatch(&f); ++f.witnesses;
+        int result = f.pending_protocol;
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        run(&f);
+        CHECK(!f.session.memory_budget_denied);
+        if (result) {
+            CHECK(result == ENOMEM && f.record.semantic_result == ENOMEM);
+            CHECK(!f.record.source_installed);
+            CHECK(!wl_columnar_eval_stack_cleanup_result(f.frame)->rel);
+        } else {
+            CHECK(!f.record.semantic_result); completed = true;
+        }
+        fixture_close(&f);
+        if (completed) break;
+    }
+    CHECK(completed);
+}
+
+static void
+test_source_authority(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    fixture_t f; source_fixture(&f, 1, 7, 0);
+    col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+    wl_columnar_eval_plan_numeric_attempt_t copy = f.record, other;
+    CHECK(wl_columnar_eval_plan_numeric_attempt_step(&copy, f.funding,
+        f.funding_id) == EINVAL);
+    wl_thread_t thread; CHECK(!wl_thread_create(&thread, wrong_thread, &f));
+    CHECK(!wl_thread_join(&thread));
+    wl_columnar_eval_plan_numeric_attempt_init(&other);
+    CHECK(wl_columnar_eval_plan_numeric_source_attempt_begin(&other, &rp, 0, 2,
+        f.frame, &f.session, f.operation, f.operation_id, f.funding,
+        f.funding_id) == EBUSY);
+    CHECK(!other.identity && !other.control);
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session, &nested));
+    CHECK(wl_columnar_eval_plan_numeric_attempt_step(&f.record, f.funding,
+        f.funding_id) == EBUSY);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT);
+    CHECK(!wl_columnar_eval_stack_numeric_source_output(f.frame, &f.session,
+        &f.record));
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(f.frame);
+    CHECK(result->owned && !result->rel);
+    CHECK(wl_columnar_eval_stack_numeric_source_output(f.frame, &f.session,
+        &f.record) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_attempt_ack(&f.record, f.funding,
+        f.funding_id) == EBUSY);
+    f.record.phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW;
+    until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL);
+    col_rel_t *empty = result->rel;
+    CHECK(empty && result->owned);
+    result->seg_count = 1;
+    CHECK(wl_columnar_eval_stack_numeric_source_install(f.frame, &f.session,
+        &f.record) == EBUSY);
+    CHECK(result->rel == empty && !f.record.source_installed);
+    result->seg_count = 0;
+    CHECK(!wl_columnar_eval_stack_numeric_source_install(f.frame, &f.session,
+        &f.record));
+    CHECK(!result->rel && !result->owned && !result->is_delta
+        && !result->seg_count && !result->seg_boundaries &&
+        !result->continuation
+        && result->kind == WL_COLUMNAR_EVAL_ENTRY_RELATION);
+    CHECK(wl_columnar_eval_stack_numeric_source_install(f.frame, &f.session,
+        &f.record) == EBUSY);
+    f.record.cursor = f.record.begin;
+    f.record.phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT;
+    run(&f); CHECK(!f.record.semantic_result); fixture_close(&f);
+}
+
+static void
+test_source_unsupported(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    for (unsigned domain = 0; domain < 7; ++domain) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        if (domain == 0) f.session.current_iteration = 1;
+        if (domain == 1) f.session.retraction_seeded = true;
+        if (domain == 2) f.session.retraction_right_pass = true;
+        if (domain == 3) f.session.tdd_input_run = (void *)&f;
+        if (domain == 4) f.session.tdd_subpass_active = true;
+        if (domain == 5) f.session.tdd_outbound_only_active = true;
+        if (domain == 6) f.session.diff_operators_active = true;
+        CHECK(wl_columnar_eval_plan_numeric_source_attempt_begin(&f.record,
+            &rp, 0, 2, f.frame, &f.session, f.operation, f.operation_id,
+            f.funding, f.funding_id) == ENOTSUP);
+        CHECK(!f.record.identity && !f.record.control);
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+        f.session.current_iteration = 0; f.session.retraction_seeded = false;
+        f.session.retraction_right_pass = false; f.session.tdd_input_run = NULL;
+        f.session.tdd_subpass_active = false;
+        f.session.tdd_outbound_only_active = false;
+        f.session.diff_operators_active = false;
+        col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+        run(&f); CHECK(!f.record.semantic_result); fixture_close(&f);
+    }
+    for (unsigned bad = 0; bad < 3; ++bad) {
+        wl_plan_op_t invalid[] = {ops[0], ops[1], ops[1]};
+        invalid[bad].op = WL_PLAN_OP_JOIN;
+        wl_plan_relation_t unsupported = {.ops = invalid, .op_count = 3};
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        col_rel_t *registry[] = {f.input};
+        source_begin(&f, &unsupported, registry, 1);
+        run(&f); CHECK(f.record.semantic_result == ENOTSUP);
+        CHECK(!f.record.source_slot && !f.record.source_byte
+            && !f.record.source_installed && !f.session.rel_hash_nbuckets);
+        fixture_close(&f);
+    }
+    for (unsigned missing = 0; missing < 2; ++missing) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        ops[0].relation_name = missing ? NULL : "input";
+        source_begin(&f, &rp, NULL, 0); run(&f);
+        CHECK(f.record.semantic_result == ENOENT && !f.record.source_installed);
+        fixture_close(&f);
+    }
+}
+
+static bool source_rejected_checkpoint;
+static void
+source_cancel_rejected(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase == 12 && progress == 37) {
+        source_rejected_checkpoint = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+test_source_no_output(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(x: int64)\n.decl output(x: int64)\n"
+        "output(x) :- input(x), x < 0.\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *rp = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                rp = &plan->strata[s].relations[r];
+    CHECK(rp && rp->ops[0].op == WL_PLAN_OP_VARIABLE);
+    uint32_t end = 1;
+    while (end < rp->op_count && (rp->ops[end].op == WL_PLAN_OP_FILTER
+        || rp->ops[end].op == WL_PLAN_OP_MAP)) ++end;
+    wl_plan_relation_t fragment = {.ops = rp->ops, .op_count = end};
+    for (unsigned cancel = 0; cancel < 2; ++cancel) {
+        fixture_t f; source_fixture(&f, 1, 133, 0);
+        col_rel_t *registry[] = {f.input};
+        source_begin(&f, &fragment, registry, 1);
+        source_rejected_checkpoint = false;
+        if (cancel) wl_columnar_filter_test_attempt_checkpoint =
+                source_cancel_rejected;
+        run(&f); wl_columnar_filter_test_attempt_checkpoint = NULL;
+        if (cancel) {
+            CHECK(source_rejected_checkpoint && f.record.semantic_result ==
+                WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(!f.record.completed && !f.record.child_status.committed);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.input);
+        } else {
+            CHECK(!f.record.semantic_result);
+            CHECK(!wl_columnar_eval_stack_cleanup_stack(
+                    f.frame)->items[0].rel->nrows);
+            source_raw_parity(&f, &fragment);
+        }
+        fixture_close(&f);
+    }
+    /* A generated FILTER-only tail preserves the raw empty-variable TS
+     * policy (empty inputs drop TS even when the template had timestamps). */
+    wl_plan_op_t empty_ops[2] = {rp->ops[0], rp->ops[1]};
+    CHECK(empty_ops[1].op == WL_PLAN_OP_FILTER);
+    empty_ops[0].delta_mode = WL_DELTA_FORCE_EMPTY;
+    wl_plan_relation_t empty = {.ops = empty_ops, .op_count = 2};
+    fixture_t f; source_fixture(&f, 2, 7, 0);
+    f.input->has_graph_column = true;
+    f.input->graph_col_idx = 1; f.input->declared_ncols = 1;
+    CHECK(!col_rel_enable_timestamps(f.input));
+    col_rel_t *registry[] = {f.input}; source_begin(&f, &empty, registry, 1);
+    run(&f); CHECK(!f.record.semantic_result);
+    CHECK(!wl_columnar_eval_stack_cleanup_stack(
+            f.frame)->items[0].rel->timestamps);
+    source_raw_parity(&f, &empty); fixture_close(&f);
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void
+test_source_denial(void)
+{
+    fixture_t f; source_fixture(&f, 1, 7, 0);
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = 1, .usable_bytes = 1,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV, .status = WL_COLUMNAR_MEMORY_OK
+    };
+    f.session.memory_governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f.session.memory_governor);
+    col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+    run(&f);
+    CHECK(f.record.semantic_result == ENOSPC && f.session.memory_budget_denied);
+    CHECK(!f.record.source_installed &&
+        !wl_columnar_eval_stack_cleanup_result(f.frame)->rel);
+    wl_columnar_memory_governor_ref_t *governor = f.session.memory_governor;
+    fixture_close(&f);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_source_pending_funding(void)
+{
+    fixture_t f; source_fixture(&f, 1, 7, 0);
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+    until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW);
+    engine_dispatch(&f); ++f.witnesses;
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING);
+    col_rel_t *empty = wl_columnar_eval_stack_cleanup_result(f.frame)->rel;
+    CHECK(empty && f.record.source_initialized);
+    int poor_owner = 0;
+    wl_evaluation_control_t *poor = control_new(383, &poor_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(poor);
+    CHECK(wl_columnar_eval_plan_numeric_consume_result(&f.record,
+        f.pending_protocol, poor, id) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        && wl_columnar_eval_stack_cleanup_result(f.frame)->rel == empty
+        && f.record.source_initialized);
+    CHECK(wl_evaluation_control_finish(poor, &poor_owner, 0, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_detach(poor, &poor_owner));
+    wl_evaluation_control_release(poor);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    run(&f);
+    CHECK(f.record.semantic_result == EINVAL && !f.record.source_initialized);
+    CHECK(!f.record.source_installed &&
+        wl_columnar_eval_stack_cleanup_result(f.frame)->rel == empty);
+    uint64_t next = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report));
+    CHECK(report.attempt_id == next && !report.consumed);
+    fixture_close(&f);
+    CHECK(!wl_columnar_relation_scalar_source_end(&f.record.source, EINVAL));
+}
+
+static void
+test_source_work_boundaries(void)
+{
+    /* Independently stated interface tariffs: two source opcode admissions
+     * of128, then128 for each name byte. Limits383/384/385 bracket the first
+     * actual name byte; no scalar-source/constructor admission is reached. */
+    const uint64_t limits[] = {1, 127, 128, 255, 256, 383, 384, 385};
+    const uint64_t expected[] = {0, 0, 128, 128, 256, 256, 384, 384};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    for (unsigned i = 0; i < 8; ++i) {
+        fixture_t f; source_fixture(&f, 1, 7, limits[i]);
+        col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+        run(&f);
+        CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!f.record.source_initialized && !f.record.source_installed);
+        CHECK(f.record.source_byte == (limits[i] >= 384 ? 1 : 0));
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            f.record.semantic_result, 0) == f.record.semantic_result);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.attempt_id == f.operation_id &&
+            report.consumed == expected[i]);
+        fixture_close(&f);
+    }
+    fixture_t f; source_fixture(&f, 1, 7, 0);
+    CHECK(!wl_evaluation_control_charge(f.operation, UINT64_MAX - 64));
+    col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
+    run(&f);
+    CHECK(f.record.semantic_result == EOVERFLOW && !f.record.source_installed);
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+        EOVERFLOW, 0) == EOVERFLOW);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report));
+    CHECK(report.consumed == UINT64_MAX - 64 && !report.stop_reason);
+    fixture_close(&f);
+}
+
+static void
+test_source_host_boundaries(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t rp = {.ops = ops, .op_count = 2};
+    for (uint64_t limit = 383; limit <= 384; ++limit) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        col_rel_t *registry[] = {f.input};
+        f.session.rels = registry; f.session.nrels = 1; f.session.rel_cap = 1;
+        int owner = 0;
+        wl_evaluation_control_t *host = control_new(limit, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(host);
+        int rc = wl_columnar_eval_plan_numeric_source_attempt_begin(&f.record,
+                &rp, 0, 2, f.frame, &f.session, f.operation, f.operation_id,
+                host, id);
+        CHECK(rc == (limit == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (limit == 383) {
+            CHECK(!f.record.identity && !f.record.control);
+            source_begin(&f, &rp, registry, 1);
+        } else {
+            CHECK(wl_columnar_eval_plan_numeric_attempt_step(&f.record, host,
+                id) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT);
+        }
+        CHECK(wl_evaluation_control_finish(host, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(host, &report));
+        CHECK(report.consumed == (limit == 383 ? 0 : 384));
+        CHECK(!wl_evaluation_control_detach(host, &owner));
+        wl_evaluation_control_release(host);
+        run(&f); CHECK(!f.record.semantic_result); fixture_close(&f);
+    }
+}
+
 int
 main(void)
 {
@@ -640,6 +1331,13 @@ main(void)
     test_intermediate_stop(); test_literal_prefixes(); test_retained_input();
     test_pending_funding(); test_later_allocation_failure();
     test_begin_rollback(); test_host_boundaries();
+    test_source_generated(); test_source_delta_modes();
+    test_source_long_names();
+    test_source_scan_stops(); test_source_owned_handoff();
+    test_source_allocation_failures(); test_source_authority();
+    test_source_unsupported(); test_source_no_output(); test_source_denial();
+    test_source_pending_funding(); test_source_work_boundaries();
+    test_source_host_boundaries();
     puts("numeric plan tests passed");
     return 0;
 }
