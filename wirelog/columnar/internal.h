@@ -5388,11 +5388,11 @@ extern void (*wl_columnar_filter_test_before_filter_dispose)(eval_stack_t *,
     eval_entry_t *);
 /* Probe-set and SEMIJOIN/ANTIJOIN emit observation points; they also count
  * the calls the standalone operators make. */
-extern uint32_t wl_columnar_join_test_probe_set_build_calls;
-extern uint32_t wl_columnar_join_test_probe_set_build_denials;
-extern uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
-extern uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
-extern uint32_t wl_columnar_join_test_probe_emits;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_calls;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_denials;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_admitted_bytes;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_emits;
 extern void (*wl_columnar_join_test_before_probe_emit)(const col_rel_t *left);
 extern bool wl_columnar_ops_test_reduce_fail_output_alloc;
 extern bool wl_columnar_diff_test_fail_copy_alloc;
