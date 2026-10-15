@@ -333,13 +333,14 @@ operations reserve unique nonwrapping values and do not publish payload state.
 The test-only stores reset allocator state before tests and do not race with
 allocation.
 
-### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (19 rows)
+### 5.4 `wirelog/columnar/join.c` — keyed-join cancel/budget and typed output (20 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `join.c:wl_columnar_join_original_is_accounted` | `source->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the committed reservation before accepting the existing relation as an accounted single-owner fallback; pairs with the governor's release publication |
 | `join.c:col_join_pair_cache_append` | `wl_columnar_join_test_fail_pair_commit` | `atomic_exchange_explicit` | `acq_rel` | Consume the one-shot test-only pair-commit failure flag without racing its setter |
-| `join.c:col_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Tuple-budget accumulator across keyed-join workers; counter only |
+| `join.c:wl_columnar_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_load_explicit` | `relaxed` | Observe the committed-row counter shared by JOIN workers; counter only, no payload publication |
+| `join.c:wl_columnar_join_output_limit_reached#2` | `sess->join_output_shared_count` | `atomic_compare_exchange_weak_explicit` | `relaxed` / `relaxed` | Add newly committed rows, saturating at UINT64_MAX without exposing wraparound; counter only, no payload publication |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
 | `join.c:col_join_keyed_count_worker_fn#3` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |
@@ -522,7 +523,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 
 ### 5.12 Existing inventory total
 
-21 + 4 + 9 + 19 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **112 atomic call sites**
+21 + 4 + 9 + 20 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **113 atomic call sites**
 before the source-access contract below.
 
 ### 5.13 `wirelog/columnar/source_access.h` — relation source gate (21 rows)
@@ -1570,7 +1571,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains312 call sites.
+The complete current atomic-source inventory contains 323 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1646,7 +1647,7 @@ supply the ownership contract.
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#2` | `wl_next_relation_identity` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | MSVC strong identity reservation; no counter rewind after cancellation or stale return |
 | `relation.c:wl_columnar_relation_constructor_attempt_identity#3` | `wl_next_relation_identity` | `atomic_compare_exchange_strong_explicit` | relaxed/relaxed | Non-MSVC separately admitted strong identity retry, with original-ID guard after the before-CAS seam |
 
-These six sites extend the complete current inventory from312 to318. Existing
+These six sites extended the then-current inventory from 312 to 318. Existing
 original reservation initialization and move helpers are reused; their source
 sites are already in the audit. Constructor cleanup frees physical images
 before original credit refunds and releases its early retained governor
@@ -1667,7 +1668,9 @@ creation and work fixtures participate in the existing TSan suite.
 
 ### Cooperative FILTER atomic sites
 
-These four sites extend the preceding inventory from 318 to 322. FILTER uses
+These four sites extended the preceding inventory from 318 to 322. The shared
+JOIN row-counter load/CAS pair adds one net site, bringing the current total
+to 323. FILTER uses
 an original thread-confined scratch token; its operator-specific row growth
 validates retained ownership under the destination's existing writer authority.
 
