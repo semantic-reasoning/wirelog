@@ -932,7 +932,13 @@ row mutation. Prepublication admission and allocation refusal retain the full
 owned entry and segment metadata for retry. A cleanup error after successful
 normalization retains the normalized owner and clears obsolete boundaries.
 Ungoverned routing and the earlier invalid-float disposal behavior remain
-unchanged.
+unchanged. The differential CONSOLIDATE (`col_op_consolidate_diff`) reports a
+governor denial of its consolidation workspace -- the k-way branch's merge or
+hash-dedup scratch, the fallback radix sort, or the incremental merge -- as
+`ENOSPC` and sets `memory_budget_denied` before it disposes of the relation
+that carried the denial (#2182). Unlike governed owned CONS, it still disposes
+of an owned input on that refusal unless checked destruction refuses, as
+before; an allocator failure stays `ENOMEM`.
 
 This is CONCAT, VARIABLE empty-output, MAP, REDUCE and borrowed CONS result
 coverage, not completion of all temporary admission (#1978/#1369). LFTJ still

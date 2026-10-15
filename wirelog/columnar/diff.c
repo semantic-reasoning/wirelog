@@ -23,11 +23,20 @@ bool wl_columnar_diff_test_fail_copy_append;
 #endif
 
 static int
-col_op_diff_cleanup_owned_relation(eval_stack_t *stack, eval_entry_t *entry,
-    col_rel_t *rel, bool owned, int primary_rc)
+col_op_diff_cleanup_owned_relation(eval_stack_t *stack, wl_col_session_t *sess,
+    eval_entry_t *entry, col_rel_t *rel, bool owned, int primary_rc)
 {
     int cleanup_rc;
 
+    /* Issue #2182: a governor denial of the consolidation workspace leaves
+     * ENOMEM with the relation's pending flag set.  Report it as a budget
+     * denial before the relation, and with it that evidence, is destroyed,
+     * as the copy path above does. */
+    if (primary_rc == ENOMEM && rel && rel->memory_budget_denial_pending) {
+        primary_rc = ENOSPC;
+        if (sess)
+            sess->memory_budget_denied = true;
+    }
     if (!owned)
         return primary_rc;
     cleanup_rc = col_rel_destroy_checked(rel);
@@ -182,7 +191,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
              * writer lease leaves the relation on the evaluator stack for a
              * later retry, and the retry still needs the original k-way
              * boundaries. */
-            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+            return col_op_diff_cleanup_owned_relation(stack, sess, &e, work,
                        work_owned, rc);
         }
         free(e.seg_boundaries);
@@ -209,7 +218,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
         /* Phase 1: sort only the unsorted suffix using radix sort */
         int sort_rc = col_rel_radix_sort(work, sn, delta_count);
         if (sort_rc != 0) {
-            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+            return col_op_diff_cleanup_owned_relation(stack, sess, &e, work,
                        work_owned, sort_rc);
         }
 
@@ -239,7 +248,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
                 new_cap = max_rows;
             int grid_rc = col_rel_reserve_merge_grid(work, new_cap);
             if (grid_rc != 0)
-                return col_op_diff_cleanup_owned_relation(stack, &e, work,
+                return col_op_diff_cleanup_owned_relation(stack, sess, &e, work,
                            work_owned, grid_rc);
             merged_cols = work->merge_columns;
             used_merge_buf = true;
@@ -315,7 +324,7 @@ col_op_consolidate_diff(eval_stack_t *stack, wl_col_session_t *sess)
     {
         int sort_rc = col_rel_radix_sort_int64(work);
         if (sort_rc != 0) {
-            return col_op_diff_cleanup_owned_relation(stack, &e, work,
+            return col_op_diff_cleanup_owned_relation(stack, sess, &e, work,
                        work_owned, sort_rc);
         }
     }
