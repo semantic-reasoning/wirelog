@@ -781,6 +781,65 @@ test_expression_pipeline_matches_oracle(void)
 }
 
 static void
+test_pipeline_shared_row_accounting(void)
+{
+    wl_plan_expr_buffer_t exprs[] = {
+        { pl_sum, sizeof(pl_sum) }, { pl_scaled, sizeof(pl_scaled) },
+    };
+    static uint8_t reject_all[] = { WL_PLAN_EXPR_BOOL, 0 };
+    wl_col_session_t *sess = expr_pipeline_session();
+    pl_plan_t p;
+    atomic_uint_fast64_t count;
+    atomic_init(&count, 0);
+    CHECK(sess != NULL, "shared pipeline fixture");
+    if (!sess)
+        return;
+    pl_plan_init(&p, exprs, 2);
+    pl_run_t want = pl_run(sess, &p.plan, 0);
+    sess->join_output_shared_count = &count;
+    sess->join_output_shared_limit = UINT64_MAX;
+    pl_observe_reset();
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    uint32_t fallbacks = sess->join_batch_fallback_count;
+    pl_run_t got = pl_run(sess, &p.plan, 7u * 32u);
+    CHECK(pl_same_rows(&got, &want) && got.nrows == PL_FILTERED_ROWS
+        && atomic_load_explicit(&count,
+        memory_order_relaxed) == PL_FILTERED_ROWS,
+        "shared pipeline counts every post-FILTER/MAP row exactly once");
+    CHECK(pl_map_calls > 1 && pl_map_max_rows <= PL_BATCH_ROWS
+        && sess->join_batch_fallback_count == fallbacks,
+        "shared accounting runs across bounded batches without fallback");
+    free(got.rows);
+    free(want.rows);
+
+    atomic_store_explicit(&count, 0, memory_order_relaxed);
+    sess->join_output_shared_limit = 10;
+    got = pl_run(sess, &p.plan, 7u * 32u);
+    CHECK(got.rc == EOVERFLOW && got.stack_top == 1
+        && got.restored_left_rows == PL_KEYS
+        && atomic_load_explicit(&count,
+        memory_order_relaxed) >= 10 && atomic_load_explicit(&count,
+        memory_order_relaxed) <= 16,
+        "shared pipeline overflow restores input within one output batch");
+    free(got.rows);
+
+    atomic_store_explicit(&count, 0, memory_order_relaxed);
+    sess->join_output_shared_limit = 1;
+    p.ops[1].filter_expr = (wl_plan_expr_buffer_t){ reject_all,
+                                                    sizeof(reject_all) };
+    pl_observe_reset();
+    got = pl_run(sess, &p.plan, 7u * 32u);
+    CHECK(got.rc == 0 && got.rows && got.nrows == 0
+        && atomic_load_explicit(&count,
+        memory_order_relaxed) == 0 && pl_map_calls > 1,
+        "filtered-empty successful batches do not charge the shared cap");
+    free(got.rows);
+    wl_columnar_ops_test_before_map_dispose = NULL;
+    pl_observe_reset();
+    pipeline_session_destroy(sess);
+}
+
+static void
 test_expression_pipeline_failures_roll_back(void)
 {
     /* col1 / (col0 - 3): only key 3, the last left row, divides by zero. */
@@ -2337,6 +2396,7 @@ main(void)
     test_pipeline_consumes_batches();
     test_expression_map_preflight();
     test_expression_pipeline_matches_oracle();
+    test_pipeline_shared_row_accounting();
     test_expression_pipeline_failures_roll_back();
     test_expression_pipeline_budget_sweep();
     test_excluded_map_is_diagnosed();

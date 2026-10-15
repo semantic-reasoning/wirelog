@@ -4162,6 +4162,8 @@ test_join_overflow_exe = executable(
 )
 
 test('join_overflow', test_join_overflow_exe)
+test('join_overflow_batched', test_join_overflow_exe,
+  env: ['WIRELOG_JOIN_BATCH_BYTES=224'])
 
 # ============================================================================
 # WL_MAX_WORKERS Clamping Tests (Issue #398)

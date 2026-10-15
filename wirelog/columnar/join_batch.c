@@ -774,13 +774,15 @@ col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
         return rc;
     }
     for (;;) {
+        uint64_t before = out->nrows;
         wl_columnar_continuation_status_t status
             = wl_columnar_continuation_publish(cont, &sink);
         switch (status) {
         case WL_COLUMNAR_CONTINUATION_OK:
-            /* Legacy row cap, evaluated once per committed batch: it may
-             * be overshot by at most rows_per_batch - 1 rows. */
-            if (col_join_output_limit_reached(sess, out)) {
+            /* Charge only this committed batch. Each concurrent producer
+             * can overshoot the shared cap by its in-flight batch. */
+            if (wl_columnar_join_output_limit_reached(sess, out,
+                out->nrows - before)) {
                 wl_columnar_continuation_cancel(cont);
                 return EOVERFLOW;
             }
