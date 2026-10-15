@@ -5635,6 +5635,15 @@ extern int wl_columnar_join_test_attempt_fail_allocation;
  * Protocol refusal leaves both outputs untouched. No other context aliasing. */
 int wl_columnar_eval_stack_filter_finish(
     wl_columnar_eval_stack_cleanup_frame_t *, int, int *, bool *);
+/* Initial serial nonrecursive scalar sorted distinct. No delta/timestamps,
+ * differential/retraction/TDD/parallel context. Caller pins immutable plan,
+ * session, source and governor through ACK. Always private materialization,
+ * including zero/one row; logical parity does not imply allocation parity.
+ * NULL control delegates raw CONSOLIDATE. Reuse common FILTER step/ACK. */
+int wl_columnar_filter_consolidate_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+
 int wl_columnar_filter_op_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
