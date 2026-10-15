@@ -454,6 +454,7 @@ wl_columnar_eval_plan_numeric_attempt_begin(
     record->session = session; record->plan = plan;
     record->control = control; record->attempt_id = id;
     record->begin = begin; record->end = end; record->cursor = begin;
+    record->source_mode = false;
     record->completed = 0; record->semantic_result = 0;
     record->protocol_result = 0;
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT;
@@ -476,6 +477,286 @@ wl_columnar_eval_plan_numeric_attempt_begin(
     return rc;
 }
 
+/* Each lookup action visits one NULL slot or one name byte. The registry,
+ * names and descriptors are immutable under the serialized host contract.
+ * The virtual delta name matches snprintf(dname,256,"$d$%s",name), including
+ * its 252-byte source-name truncation; full names remain unbounded. */
+static void
+wl_columnar_eval_plan_numeric_source_lookup(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    bool delta = record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA;
+    if (record->source_slot == record->source_count) {
+        if (!delta) {
+            record->semantic_result = ENOENT;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+        } else {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT;
+        }
+        return;
+    }
+    col_rel_t *candidate = record->source_registry[record->source_slot];
+    if (!candidate || !candidate->name) {
+        ++record->source_slot;
+        record->source_byte = 0;
+        return;
+    }
+    const char *name = record->plan->ops[record->source_begin].relation_name;
+    size_t byte = record->source_byte;
+    char wanted;
+    if (!delta) wanted = name[byte];
+    else if (byte < 3) wanted = "$d$"[byte];
+    else if (byte == 255) wanted = '\0';
+    else wanted = name[byte - 3];
+    char actual = candidate->name[byte];
+    if (actual != wanted) {
+        ++record->source_slot;
+        record->source_byte = 0;
+    } else if (actual) {
+        ++record->source_byte;
+    } else if (delta) {
+        record->source_delta = candidate;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT;
+    } else {
+        record->source_full = candidate;
+        record->source_slot = 0; record->source_byte = 0;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA;
+    }
+}
+
+static void
+wl_columnar_eval_plan_numeric_source_select(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    const wl_plan_op_t *op = &record->plan->ops[record->source_begin];
+    col_rel_t *full = record->source_full, *delta = record->source_delta;
+    record->source_selected = full;
+    if (op->delta_mode == WL_DELTA_FORCE_EMPTY) {
+        record->source_empty = true;
+    } else if (op->delta_mode == WL_DELTA_FORCE_DELTA) {
+        if (delta && delta->nrows) {
+            record->source_selected = delta;
+            record->source_is_delta = true;
+        } else if (record->session->delta_seeded) {
+            record->source_empty = true;
+            record->source_is_delta = true;
+        }
+    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && delta
+        && delta->nrows && delta->nrows < full->nrows) {
+        /* Includes FORCE_EMPTY_AFTER_SEED and unknown modes at iteration0,
+         * matching the raw VARIABLE fallback to AUTO. */
+        record->source_selected = delta;
+        record->source_is_delta = true;
+    }
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT;
+}
+
+/* Forward source actions are one registry byte/opcode or a finite state
+ * transition. Child calls return directly; their results are consumed only
+ * on a later separately funded host turn. */
+static int
+wl_columnar_eval_plan_numeric_source_step(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    int rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL:
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = record->source_initialized
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT: {
+        wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
+        bool supported = record->cursor == record->source_begin
+            ? kind == WL_PLAN_OP_VARIABLE
+            : kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP;
+        if (!supported) {
+            record->semantic_result = ENOTSUP;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+        } else if (++record->cursor == record->end) {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL:
+        if (!record->plan->ops[record->source_begin].relation_name) {
+            record->semantic_result = ENOENT;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+            return 0;
+        }
+    /* fall through */
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA:
+        wl_columnar_eval_plan_numeric_source_lookup(record);
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT:
+        wl_columnar_eval_plan_numeric_source_select(record);
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &record->source, &record->source_initialized,
+            record->control, record->attempt_id);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_HOLD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &record->source, record->source_selected, !record->source_empty);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT:
+        rc = wl_columnar_eval_stack_numeric_source_output(record->frame,
+                record->session, record);
+        if (rc) return rc;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &record->source,
+            record->source_is_delta ? "$empty_delta" : "$empty_skip",
+            record->session->memory_governor
+                   ? record->session->memory_governor
+                   : record->source_selected->memory_governor,
+            record->source_output);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
+        return wl_columnar_relation_scalar_source_end(&record->source,
+                   record->semantic_result);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL:
+        rc = wl_columnar_eval_stack_numeric_source_install(record->frame,
+                record->session, record);
+        if (rc) return rc;
+        record->cursor = record->begin;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT;
+        return 0;
+    default:
+        return EBUSY;
+    }
+}
+
+static int
+wl_columnar_eval_plan_numeric_source_consume(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_result)
+{
+    record->protocol_result = 0;
+    switch (record->pending_action) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT:
+        if (child_result) {
+            record->semantic_result = child_result;
+            record->phase = record->source_initialized
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+        } else {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_HOLD;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_HOLD:
+        if (child_result) {
+            record->semantic_result = child_result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
+        } else {
+            record->phase = record->source_empty
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW:
+        if (child_result == ENOSPC)
+            record->session->memory_budget_denied = true;
+        record->semantic_result = child_result;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END:
+        if (record->source.phase !=
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+            record->protocol_result = child_result ? child_result : EBUSY;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END;
+            return 0;
+        }
+        if (!record->semantic_result) record->semantic_result = child_result;
+        record->source_initialized = false;
+        record->phase = record->semantic_result
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL;
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
+int
+wl_columnar_eval_plan_numeric_source_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!record || record->identity || record->phase || !plan || !plan->ops
+        || begin >= end || end > plan->op_count || end - begin < 2
+        || !frame || !session || !control || !id
+        || (session->nrels && !session->rels)) return EINVAL;
+    if (session->current_iteration || session->retraction_seeded
+        || session->retraction_right_pass || session->tdd_input_run
+        || session->tdd_subpass_active || session->tdd_outbound_only_active
+        || session->diff_operators_active) return ENOTSUP;
+    int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
+    if (rc) return rc;
+    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    record->identity = record; record->frame = frame;
+    record->session = session; record->plan = plan;
+    record->control = control; record->attempt_id = id;
+    record->begin = begin + 1; record->end = end; record->cursor = begin;
+    record->completed = 0; record->semantic_result = 0;
+    record->protocol_result = 0;
+    record->source_mode = true; record->source_installed = false;
+    record->source_empty = false; record->source_is_delta = false;
+    record->source_initialized = false; record->source_slot_borrowed = false;
+    record->source_registry = session->rels;
+    record->source_count = session->nrels;
+    record->source_slot = 0; record->source_byte = 0;
+    record->source_begin = begin;
+    record->source_full = NULL; record->source_delta = NULL;
+    record->source_selected = NULL; record->source_output = NULL;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT;
+#if defined(WL_HAVE_C11_THREADS)
+    record->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    record->owner_thread = GetCurrentThreadId();
+#else
+    record->owner_thread = pthread_self();
+#endif
+    record->thread_valid = true;
+    rc = wl_columnar_eval_stack_numeric_source_claim(frame, session, record);
+    if (rc) {
+        record->control = NULL; record->identity = NULL;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+        record->thread_valid = false; record->frame = NULL;
+        record->session = NULL; record->plan = NULL;
+        record->source_registry = NULL; record->source_mode = false;
+        wl_evaluation_control_release(control);
+    }
+    return rc;
+}
+
 int
 wl_columnar_eval_plan_numeric_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *record,
@@ -487,6 +768,17 @@ wl_columnar_eval_plan_numeric_attempt_step(
             record->control);
     if (rc) return rc;
     switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_HOLD:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL:
+        return wl_columnar_eval_plan_numeric_source_step(record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT:
         rc = wl_columnar_eval_plan_numeric_forward(record);
         if (!rc) {
@@ -556,6 +848,10 @@ wl_columnar_eval_plan_numeric_consume_result(
     rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
+    if (record->pending_action >= WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT
+        && record->pending_action <= WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END)
+        return wl_columnar_eval_plan_numeric_source_consume(record,
+                   child_protocol);
     record->protocol_result = child_protocol;
     if (child_protocol) {
         record->phase = record->pending_action;
@@ -616,8 +912,13 @@ wl_columnar_eval_plan_numeric_attempt_ack(
     rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
-    rc = wl_columnar_eval_stack_numeric_unbind(record->frame, record->session,
-            record);
+    if (record->source_mode && !record->source_installed)
+        rc = wl_columnar_eval_stack_numeric_source_release(record->frame,
+                record->session, record);
+    else
+        rc = wl_columnar_eval_stack_numeric_unbind(record->frame,
+                record->session,
+                record);
     if (rc) return rc;
     wl_evaluation_control_t *control = record->control;
     record->control = NULL;

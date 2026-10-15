@@ -1362,6 +1362,138 @@ wl_columnar_eval_stack_numeric_unbind(
     return 0;
 }
 
+/* Source binding owns an initially empty frame. These separate routes leave
+ * the tight nonempty numeric/unary validators unchanged. Registry and frame
+ * access are serialized; raw borrowed pointers must not mutate this workspace. */
+static int
+wl_columnar_eval_stack_numeric_source_frame(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner, bool prepared)
+{
+    if (!frame || !sess || frame->identity != frame || frame->session != sess
+        || !owner || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    if (sess->cleanup_active != frame || frame->stack.top
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->stack.items[0])
+        || frame->unary_control || frame->unary_attempt_id
+        || frame->unary_index || frame->unary_top || frame->unary_thread_valid
+        || frame->unary_committed || frame->unary_result_saved
+        || frame->unary_alias_rejected || frame->unary_first_result
+        || frame->unary_cleanup_result)
+        return EBUSY;
+    if (!prepared) {
+        if (!wl_columnar_eval_stack_unary_entry_inert(&frame->result))
+            return EBUSY;
+    } else if (!frame->result.owned
+        || frame->result.is_delta != owner->source_is_delta
+        || frame->result.seg_boundaries || frame->result.seg_count
+        || frame->result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || frame->result.continuation
+        || owner->source_output != &frame->result.rel) {
+        return EBUSY;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_source_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
+            false);
+    if (rc) return rc;
+    if (frame->numeric_plan_owner) return EBUSY;
+    frame->numeric_plan_owner = owner;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_source_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
+            false);
+    if (rc) return rc;
+    if (frame->numeric_plan_owner != owner || !owner->source_mode
+        || owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT
+        || owner->source_slot_borrowed || owner->source_installed)
+        return EBUSY;
+    frame->result.rel = NULL; frame->result.owned = true;
+    frame->result.is_delta = owner->source_is_delta;
+    frame->result.seg_boundaries = NULL; frame->result.seg_count = 0;
+    frame->result.kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->result.continuation = NULL;
+    owner->source_output = &frame->result.rel;
+    owner->source_slot_borrowed = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_source_install(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
+            owner && owner->source_slot_borrowed);
+    if (rc) return rc;
+    if (frame->numeric_plan_owner != owner || !owner->source_mode
+        || owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL
+        || owner->source_initialized || owner->source_installed
+        || owner->source_empty != owner->source_slot_borrowed)
+        return EBUSY;
+    col_rel_t *rel = owner->source_empty ? frame->result.rel
+        : owner->source_selected;
+    if (!rel) return EINVAL;
+    /* All fallible/stopping work and the last saved-ID check precede this
+     * callback-free ownership transfer. No destructor or debit follows it. */
+    frame->stack.items[0].rel = rel;
+    frame->stack.items[0].owned = owner->source_empty;
+    frame->stack.items[0].is_delta = owner->source_is_delta;
+    frame->stack.items[0].seg_boundaries = NULL;
+    frame->stack.items[0].seg_count = 0;
+    frame->stack.items[0].kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->stack.items[0].continuation = NULL;
+    frame->result.rel = NULL; frame->result.owned = false;
+    frame->result.is_delta = false; frame->result.seg_boundaries = NULL;
+    frame->result.seg_count = 0;
+    frame->result.kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->result.continuation = NULL;
+    frame->stack.top = 1;
+    owner->source_slot_borrowed = false;
+    owner->source_output = NULL;
+    owner->source_installed = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_numeric_source_release(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
+            owner && owner->source_slot_borrowed);
+    if (rc) return rc;
+    if (frame->numeric_plan_owner != owner || !owner->source_mode
+        || owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
+        || owner->source_initialized || owner->source_installed)
+        return EBUSY;
+    /* The result, possibly owned/nonNULL, stays in the original frame.
+     * Its later generic disposal is a separate caller action, not an ACK
+     * suffix. On disposal refusal cleanup_finish consumes the handle and
+     * transfers authority to session.cleanup_pending for cleanup_retry. */
+    frame->numeric_plan_owner = NULL;
+    owner->source_slot_borrowed = false;
+    owner->source_output = NULL;
+    return 0;
+}
+
 eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame)

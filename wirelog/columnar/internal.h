@@ -5580,6 +5580,16 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_ACK_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_ADVANCE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_FULL,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_DELTA,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INIT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_HOLD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SLOT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
@@ -5596,6 +5606,15 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_eval_plan_numeric_phase_t phase, pending_action;
     wl_columnar_filter_status_t child_status;
     int semantic_result, protocol_result;
+    /* Source mode borrows an immutable registry; no lookup hash is built. */
+    col_rel_t **source_registry;
+    uint32_t source_count, source_slot, source_begin;
+    size_t source_byte;
+    col_rel_t *source_full, *source_delta, *source_selected;
+    col_rel_t **source_output;
+    wl_columnar_relation_scalar_source_t source;
+    bool source_mode, source_installed, source_empty, source_is_delta;
+    bool source_initialized, source_slot_borrowed;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
 #elif defined(_WIN32) || defined(_WIN64)
@@ -5622,6 +5641,17 @@ int wl_columnar_eval_plan_numeric_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
+/* Initial ordinary VARIABLE + FILTER/MAP fragment. Keep registry, names,
+ * descriptors and source contents immutable and live through ACK. Unknown
+ * delta modes use AUTO as in the raw VARIABLE operator. The containing
+ * stratum must be nonrecursive (a caller precondition; relation plans do not
+ * carry that fact). No TDD, retraction,
+ * iterative or differential evaluation; NULL control is invalid. */
+int wl_columnar_eval_plan_numeric_source_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -5635,6 +5665,19 @@ int wl_columnar_eval_plan_numeric_attempt_status(
 int wl_columnar_eval_plan_numeric_attempt_ack(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+
+int wl_columnar_eval_stack_numeric_source_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_numeric_source_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_numeric_source_install(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_numeric_source_release(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
 
 /* Exact segment authority routes; NULL denotes an unbound standalone frame.
  * Owner arguments are original stable records, not transferable capabilities. */

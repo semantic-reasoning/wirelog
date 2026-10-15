@@ -2674,3 +2674,58 @@ caller work, not free operations or hidden polling points. Adding a scheduler
 inside the production evaluator requires accounting for that scheduler before
 activating it. Each retained retry uses a new host admission; previously paid
 child retirement allowances are not spent a second time.
+
+### Initial source-bound numeric fragments (#1821)
+
+`wl_columnar_eval_plan_numeric_source_attempt_begin` extends the internal
+numeric segment protocol to one leading VARIABLE followed by FILTER/MAP.
+It claims an empty original cleanup frame and preserves that owner through
+lookup, construction, execution and final ACK. The containing stratum must be
+nonrecursive: this is a caller precondition because relation plans do not
+carry stratum recursion metadata. Nonzero iteration, retraction, TDD and
+differential session contexts are refused with ENOTSUP. Public session
+controls and ordinary relation-plan dispatch remain gated as before.
+
+The host keeps the registry array, unique relation names, descriptors,
+contents, governor binding and plan immutable and live through ACK. Active
+frame ownership is not a registry lock. Callbacks may cancel or restart the
+operation control but must not mutate this session. Lookup visits one registry
+slot or one name byte per admitted forward action; it neither builds a hash
+nor delegates to raw lookup. Full names are not truncated. Delta lookup uses
+exactly the raw 256-byte `$d$` name policy: three prefix bytes, at most252
+source-name bytes, then NUL. FORCE_FULL selects full input, FORCE_EMPTY selects
+an owned empty input, and FORCE_DELTA selects a nonempty delta or, when seeded,
+an owned empty delta; without a seed it falls back to full input. AUTO,
+FORCE_EMPTY_AFTER_SEED at iteration0 and unknown modes select a nonempty delta
+only when it is strictly smaller than full input. Missing full names are
+ENOENT. Unsupported opcodes are rejected before registry lookup/input install.
+
+A held original scalar-source record validates the selected descriptor.
+Compound representations unsupported by that scalar contract return ENOTSUP;
+there is no interpreter fallback. Empty construction retains names, scalar
+types and graph metadata and follows the raw VARIABLE policy of dropping
+timestamps. It uses private heap storage rather than the raw pool, so its
+allocation/peak behavior may differ. Authoritative ENOSPC sets the session's
+memory-denial flag; allocator ENOMEM and operation stops do not fabricate it.
+
+Before the empty constructor runs, its output slot belongs to the original
+frame result entry. Source initialization, acquisition, constructor, End and
+result consumption are separate host actions. Success transfers all seven
+entry fields into the input exactly once, clearing the old result. A stop
+before installation leaves any constructed result owned by the frame. Error
+ACK drains source authority and unbinds without destroying or clearing that
+result. The caller then schedules generic frame cleanup separately. Early
+finish refusal preserves the handle; disposal refusal may consume it and
+transfer the frame to `session.cleanup_pending`, which requires cleanup_retry.
+The caller retains the session/job and initiating semantic result until that
+pending cleanup completes. Arbitrary metadata destruction and pending-frame
+traversal are outside this fragment's action certificate, as in supplied-input
+numeric segments; ACK does not make them bounded. This API does not activate
+public evaluation or close the remaining JOIN/recursive/publication coverage.
+
+Existing distinct host384 funding applies to each successful begin, step,
+consume, status or ACK action; operation128 is admitted for each source
+opcode, lookup slot/byte, selection and input-install action. Existing numeric
+tail preflight is charged separately. A stopped operation never supplies
+cleanup work from a successor attempt. Caller initialization and external
+queue scheduling remain separately owned work, not an unmetered API loop.
