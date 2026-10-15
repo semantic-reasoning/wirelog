@@ -1542,6 +1542,48 @@ stopped (10,792 rows in total), and no workload recorded the
 workloads, not a bound: a cross join's output is the product of its
 inputs' row counts.
 
+When this paragraph was written (#1370), bounded mode was checked by two gates
+over the test suite without its tidy, abi, perf and bench suites.  The knob-on
+gate (`WIRELOG_JOIN_BATCH_BYTES=224`, `MALLOC_PERTURB_=165`) ran at timeout
+multiplier 1.0 and reported no failing test on the tree that integrated the
+#1370 changes.  The strict gate adds `WIRELOG_JOIN_BATCH_STRICT=1` and ran at
+multiplier 0.3; at 0.3 the slow tests (`example_13_daemon_style_paced`,
+`tdd_recursive`) can time out on budget alone, and its one TIMEOUT was
+`example_13_daemon_style_paced`.  The other strict failures are expected:
+strict mode turns each recorded fallback into `ENOTSUP`, so a test whose
+program plans a shape bounded mode does not cover can fail under it, and the
+strict gate is compared by test name against its previous list rather than
+expected to be empty.
+
+Cost, measured when this paragraph was written (#1370) with `bench_flowlog`
+release builds, `WIRELOG_MEMORY_BUDGET` pinned at 64 GiB in both arms, and the
+CPU governor at `schedutil`, so the figures are indicative.  The default path
+compares, with the knob off, the tree with the later #1370 changes against the
+tree before them, which already contained the first #1370 pipeline units (the
+operand checks and the successor-based fallback decisions) and the earlier
+bounded producer, over nine interleaved rounds; the explicit knob compares
+`WIRELOG_JOIN_BATCH_BYTES` of 1 MiB against the knob off on the #1370 tree of
+that time, over five interleaved rounds.  Every pair produced the same tuple
+counts, and CSPA's result digest matched (also at 64 KiB).  The cause of CSPA's
+difference under the explicit knob is not established.
+
+| Workload | Default path (knob off) | Explicit knob (1 MiB) |
+|---|---|---|
+| CSPA | -2.3% | -24.4% |
+| Galen | +1.0% | -0.5% |
+| Polonius | -4.9% | +13.2% |
+
+Bounded mode is not chosen automatically: it runs only when
+`WIRELOG_JOIN_BATCH_BYTES` is set, and #2186 records the measurements and a
+design for an automatic mode.  When this paragraph was written (#1370), it
+would not have helped the two workloads measured under memory pressure.  On
+DOOP under a 90 GiB cgroup budget, the bytes reserved above the session's
+starting reservation reached at most 36.5% of the usable budget above it at
+any JOIN dispatch, and the run stopped at a single large CONSOLIDATE scratch
+request.  CSPA's smallest passing `WIRELOG_MEMORY_BUDGET` among those probed
+was the same with the knob off and at 1 MiB, consistent with its pressure
+being the JOIN outputs, which the relation sink still materializes.
+
 ## 10b. Plain STEP completion recovery (#1713)
 
 A join output that is **heap-owned** is admitted under the session governor
