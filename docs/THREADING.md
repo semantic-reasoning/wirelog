@@ -1698,3 +1698,17 @@ synchronize nothing, and tests read them after the operator call returns.
 | `join.c:wl_columnar_join_probe_set_build#5` | `wl_columnar_join_test_probe_set_admitted_bytes` | `atomic_store_explicit` | relaxed | Record the admitted hash bytes for single-builder tests; last writer wins under concurrency |
 | `join.c:wl_columnar_antijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count ANTIJOIN emits for tests; counter only |
 | `join.c:wl_columnar_semijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count SEMIJOIN emits for tests; counter only |
+
+### Controlled ordinary JOIN confinement
+
+The controlled JOIN start and shared step/acknowledgement protocol serialize
+access to the original embedded operator context. The live context, left/right
+source-reader records and each scratch reservation retain their original
+addresses on the owning native thread. Callers keep plan, session registry,
+names, operand allocations and governors stable through acknowledgement;
+reader gates prevent mutation and do not replace allocation ownership.
+Cancellation may be requested through the existing evaluation-control API.
+A saved operation ID prevents later charges to a replacement attempt. Cleanup
+uses separately funded host actions and the original resource tokens. The JOIN
+delta flag and output are published together inside the existing callback-free
+unary cutoff; no new atomic site or memory-order protocol is introduced.

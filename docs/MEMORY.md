@@ -2817,3 +2817,63 @@ enums include INT32 through BOOL; invalid lanes retain typed-error precedence.
 Inherited builder endpoints include both types-present metadata and noTS
 construction; a future JOIN caller must prove its own suffix within the allowed
 constructor caller75, rather than append arbitrary scheduling after a child.
+
+### Controlled cross JOIN transaction (#1821)
+
+`wl_columnar_join_op_attempt_start` uses the original cleanup frame and its
+embedded continuation. A NULL control delegates to the existing raw JOIN.
+The controlled path currently supports cross JOIN on scalar inputs during
+initial, serial, nonrecursive evaluation. The containing stratum must be
+nonrecursive. Keyed JOIN is rejected until the following implementation unit.
+Right filters, materialized hints, configured join batches, differential or
+retraction evaluation, TDD and parallel/shared-output execution are outside
+this entrypoint's domain and return `ENOTSUP`; they do not enter raw execution.
+
+The caller keeps the plan, session registry and names, input allocations and
+bound governors stable until acknowledgement. Left and selected right have
+separate original scalar-source readers, including self JOIN. Registry slots,
+name bytes, projected type lanes, cross-product pairs and gathered cells each
+have explicit saved-attempt admissions. The output remains private in the
+original unary transaction; an execution error preserves the complete original
+stack entry. Output-limit accounting is independent of work and memory limits:
+the inclusive threshold returns `EOVERFLOW` and discards private output.
+
+The result's delta flag is selected while forward work is admitted. Unprojected
+ordinary results retain left-delta or selected-right-delta, including an empty
+ordinary result. Projection, missing right and forced-empty selection clear it.
+After both input readers and JOIN scratch drain, a dedicated JOIN decision
+publishes the relation and flag within the same existing callback-free unary
+cutoff. Generic FILTER/MAP publication still clears delta. Private-output delta
+mutation remains invalid; callers cannot patch the published flag afterward.
+
+Every start, shared `wl_columnar_filter_op_attempt_step`, acknowledgement and
+retained retry requires a new HOST384 action grant from a separate live funding
+control and its immutable attempt ID. Funding failure parks the original
+continuation without entering the action. A stopped operation, or a successor
+attempt on the same operation control, does not fund cleanup. Each dispatch
+returns to the host before another cleanup action; an unbounded synchronous
+pump does not inherit this claim. Generic frame cleanup after acknowledgement
+is an external caller action under its existing retention contract.
+
+For this written cross-JOIN caller, ENTRY192 covers current initialization142
+plus20 original-pin retirement slots. First refusal returns with an inert
+context (conservative160 slots through actual host return); initialized entry
+and next refusal have a conservative191-slot envelope. Child-return callers
+stay within73 slots, or75 including constructor output markers. Existing
+COLUMN256, typed constructor253 and B2 validation252 endpoints remain bounded.
+The shared publication wrapper/store yields generic DECIDE205; dedicated
+JOIN_DECIDE237, SOURCE182 and same-action RESET+ACK251 are conservative maxima.
+The actual host uses separate ACK dispatches and no same-action queue loop.
+
+First-retirement capacity is84 admissions of192: each partitions64 current
+payment-loop work from128 future slots. Two future shares fund each of42 named
+first turns: common PROGRAM/BATCH/PHYSICAL/CREDIT/REFERENCE/SOURCE/CONTROL/
+FINISH/RESET/ACK (10), JOIN_BATCH drain (at most18), three scratch records with
+four stages each (12), right source (1), JOIN_DECIDE (1). Common BATCH and
+ordinary DECIDE are bypassed; the reserved common-BATCH shares are unused and
+forfeited with all other unused capacity. Source INIT and unary FIRST_FINISH fund their existing
+primitive interiors independently; those slots are not charged twice. Before
+prepayment completes no source, batch, scratch or unary output is activated;
+empty cleanup after partial prepayment and every retained retry use fresh
+HOST384 actions. This inventory describes admitted logical work, including
+unused reservations, rather than exact executed-work telemetry.

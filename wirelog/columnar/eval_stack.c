@@ -1068,6 +1068,10 @@ wl_columnar_eval_stack_unary_commit_attempt_controlled(
                NULL);
 }
 
+static int
+wl_columnar_eval_stack_unary_commit_attempt_body(
+    wl_columnar_eval_stack_cleanup_frame_t *, bool *, bool);
+
 int
 wl_columnar_eval_stack_unary_commit_attempt_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
@@ -1075,6 +1079,46 @@ wl_columnar_eval_stack_unary_commit_attempt_owned(
 {
     int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
     if (authority) return authority;
+    return wl_columnar_eval_stack_unary_commit_attempt_body(frame, committed,
+               false);
+}
+
+int
+wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t *context, bool *committed, const void *owner)
+{
+    int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (authority) return authority;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    if (context != &frame->filter) return EINVAL;
+    if (context->identity != context || context->frame != frame
+        || context->session != frame->session
+        || frame->session->cleanup_active != frame
+        || context->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+        || !context->busy || !context->thread_valid || !context->pin_owned
+        || !context->unary_started || !context->join_decision_pending
+        || !context->control || !context->attempt_id
+        || context->control != frame->unary_control
+        || context->attempt_id != frame->unary_attempt_id)
+        return EINVAL;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(context->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (context->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(context->owner_thread, pthread_self())) return EINVAL;
+#endif
+    bool delta = context->join_result_is_delta;
+    return wl_columnar_eval_stack_unary_commit_attempt_body(frame, committed,
+               delta);
+}
+
+static int
+wl_columnar_eval_stack_unary_commit_attempt_body(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
+    bool publication_is_delta)
+{
     if (!committed)
         return EINVAL;
     *committed = false;
@@ -1152,6 +1196,7 @@ wl_columnar_eval_stack_unary_commit_attempt_owned(
     eval_entry_t *entry = &frame->stack.items[frame->unary_index];
     wl_columnar_eval_stack_unary_entry_copy(&frame->unary_retired, entry);
     wl_columnar_eval_stack_unary_entry_copy(entry, output);
+    entry->is_delta = publication_is_delta;
     wl_columnar_eval_stack_unary_entry_clear(output);
     frame->unary_committed = true;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;

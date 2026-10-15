@@ -5502,6 +5502,7 @@ typedef enum {
     WL_COLUMNAR_FILTER_STAGE_REFERENCE,
     WL_COLUMNAR_FILTER_STAGE_SOURCE,
     WL_COLUMNAR_FILTER_STAGE_DECIDE,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE,
     WL_COLUMNAR_FILTER_STAGE_CONTROL,
     WL_COLUMNAR_FILTER_STAGE_FINISH,
     WL_COLUMNAR_FILTER_STAGE_RESET,
@@ -5575,6 +5576,7 @@ typedef struct wl_columnar_filter_context {
     /* Fixed original JOIN ownership, inactive for FILTER/MAP. join_initialized
      * remains true until B2/right/readers and all scratch records are drained. */
     bool join_initialized, join_right_initialized;
+    bool join_decision_pending, join_result_is_delta;
     uint32_t join_retirement_cursor;
     wl_columnar_relation_scalar_source_t join_right;
     wl_columnar_join_scratch_t join_scratch[WL_COLUMNAR_JOIN_SCRATCH_COUNT];
@@ -5590,6 +5592,33 @@ int wl_columnar_eval_stack_filter_context(
 int wl_columnar_eval_stack_unary_begin_attempt_context_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t *,
     wl_evaluation_control_t *, uint64_t, const void *);
+/* JOIN decision belongs to the exact original busy JOIN_DECIDE context.
+ * Publication flag is captured before the existing callback-free cutoff;
+ * private output delta remains false. Generic unary commit stays false. */
+int wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t *,
+    bool *, const void *);
+/* Meaningful-field initializer: new or proven ENDED/inert storage only,
+ * never a live/retained/DRAINING batch. No live authority may be erased. */
+void wl_columnar_filter_attempt_batch_init(
+    wl_columnar_relation_append_batch_t *);
+
+/* Controlled initial nonrecursive ordinary JOIN. Hosts keep op/session,
+ * registry, descriptors, backing and governor bindings immutable/live until
+ * ACK, serialize the native owner and forbid same-context reentry. Each
+ * start/step/ACK/retry requires a fresh distinct live HOST384 grant from the
+ * canonical caller; operation control pays forward/first-retirement work.
+ * NULL control delegates raw JOIN. Step/ACK use the shared filter protocol.
+ * Generic frame/pending cleanup remains a separate external host action. */
+int wl_columnar_join_op_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_join_test_attempt_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+extern int wl_columnar_join_test_attempt_fail_allocation;
+#endif
+
 /* Private finish-status bridge, validated original live FILTER context only.
  * semantic is the designated context semantic_result slot or a disjoint live
  * external int; retained is a live bool disjoint from frame/context/semantic.
