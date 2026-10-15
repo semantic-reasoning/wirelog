@@ -108,6 +108,12 @@ col_join_batch_rows_per_batch(const wl_columnar_continuation_t *cont);
 uint32_t
 col_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont);
 
+/* Bytes admitted for the producer's descriptor allocation (the struct plus
+ * the key row and the key-index arrays); 0 without a governor or for a NULL
+ * continuation.  Test surface for the per-producer bound (#1370). */
+uint64_t
+col_join_batch_descriptor_bytes(const wl_columnar_continuation_t *cont);
+
 /* Copy of the producer's full cursor for tests and diagnostics. */
 bool
 col_join_batch_cursor_get(const wl_columnar_continuation_t *cont,

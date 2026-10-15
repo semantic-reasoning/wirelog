@@ -320,6 +320,14 @@ extern void (*wl_columnar_memory_governor_test_before_total_cas)(
     wl_evaluation_control_t *, wl_columnar_memory_governor_t *, uint64_t, bool);
 extern void (*wl_columnar_memory_governor_test_after_total_cas)(
     wl_evaluation_control_t *, wl_columnar_memory_governor_t *, bool, bool);
+/* Called after every admission that raises a governor's reserved total,
+ * with the new total, on the admitting thread; tests use it to record a
+ * high-water mark (#1370).  Set and clear it only while no other thread can
+ * admit to any governor.  It runs after the total is published but before
+ * the reservation's own state is, so the callback must not call back into
+ * the governor. */
+extern void (*wl_columnar_memory_governor_test_admitted)(
+    wl_columnar_memory_governor_t *, uint64_t);
 #endif
 
 /* Initialize a caller-owned token before its first reserve or reuse.

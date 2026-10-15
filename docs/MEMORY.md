@@ -1387,31 +1387,59 @@ Ownership and admission:
   capacity admitted for it is retained, as after a failed bulk append.
   Any mutation of either input or a rebuild of the arrangement between
   batches is reported as stale rather than resumed.
-- Per-producer bound, unchanged as the WORST case: the descriptor
-  allocation (`sizeof(col_join_batch_producer_t)` plus the key row and the
-  key-index arrays -- note that this makes the struct's size a governed
-  quantity, so a field added to it is not free) plus scratch
-  (`rows_per_batch * row_bytes`) plus the sink's growth for the next batch.
-  Since #2173 a growth asks for `new = max(2 * old, need)` rows, where
-  `old` is the current capacity and `need` the rows the output holds after
-  the batch (at most `old + rows_per_batch`); when the governor denies
-  that request, it retries at exactly `need`, which was the rule for every
+- Per-producer bound (measured, #1370).  Under a governor, a bounded
+  producer's own reservations are, between scratch growths, `D + S +
+  P(cap)`, and during a growth at most `D + S + P(old) + P(new) + R`,
+  where:
+  - `D` is the descriptor allocation: the producer struct plus the key row
+    and the key-index arrays (the struct's size is a governed quantity, so
+    a field added to it is not free);
+  - `S` is the scratch relation's fixed reservations: its descriptor and
+    owned name, and its metadata (column names, types, Arrow schema);
+  - `P(n)` is the scratch payload for `n` rows,
+    `col_rel_retained_bytes_for(scratch, n)`, timestamps included when the
+    left input carries them.  The scratch starts at the 64 rows a fresh
+    relation pre-allocates and grows on demand to `cap < rows_per_batch / 2
+    ? 2 * cap : rows_per_batch`, so `cap` never exceeds
+    `max(rows_per_batch, 64)` and never drops below 64; when one row is
+    wider than `N / 64`, the 64-row floor alone exceeds the knob's `N`
+    bytes;
+  - `R` is the one row of scratch (`ncols * 8` bytes) the payload
+    transaction charges while a growth is pending.
+  On top of `D + S + P(64)`, create also holds briefly the column-type
+  metadata that `col_join_set_output_types` installs while the scratch's
+  untyped metadata is still reserved.  Without a governor the same
+  allocations are made but nothing is admitted.  A clean doubling holds
+  1.5x the new payload, but `P(old) + P(new)` approaches `2 *
+  P(rows_per_batch)` when the last doubling is clamped (measured 1.8x at
+  `rows_per_batch = 80`, 1.64x at 100, 1.985x at 65), and which step lands
+  last depends on where `rows_per_batch` falls relative to the doubling
+  sequence, so budget against twice the scratch payload.  The right relation's
+  arrangement is not part of the bound.  On the non-differential path the plain
+  JOIN operator builds or rebuilds its persistent arrangement before it creates
+  the producer, but the consumed pipeline creates the producer directly, and
+  that create builds a missing or stale arrangement after admitting the
+  descriptor, so a pipeline's create can peak at the descriptor plus that
+  build.  The differential arrangement is described below.  The output
+  relation is a separate account: its own fixed reservations and
+  `P_out(capacity)`, and during each growth `P_out(old) + P_out(new)` plus
+  its own `R`.  The sink asks for `new = max(2 * old, need)` rows, where
+  `need` is at most `old + rows_per_batch`, and retries at exactly `need`
+  when the governor denies the doubling, which was the rule for every
   growth before #2173.  After a growth the admitted output capacity is
   therefore at most twice the rows the output holds; an output that never
   grew keeps the 64-row capacity it was created with, which can exceed
-  twice its rows.  The resize transiently holds the old and the new output
-  buffers, `(old + new) * row_bytes`.  Since #1481 the scratch reaches its
-  `rows_per_batch` bound only if the join's fanout demands it, but it
-  carries a 2x transient of its own when it does: every step holds the old
-  buffers while reserving the new, so the peak is
-  `(old + new) * row_bytes`.  BUDGET AGAINST 2x.  A clean doubling is
-  1.5x, but the final clamped step can approach 2x -- measured 1.8x at
-  `rows_per_batch = 80`, 1.64x at 100, 1.985x at 65 -- and which step
-  lands last depends on where `rows_per_batch` falls relative to the
-  doubling sequence, so the ratio is not predictable from the knob alone.
-  The full join result is still materialized into the output relation:
-  this unit bounds producer memory and admits output growth, it does not
-  bound the output itself.
+  twice its rows.  For a non-differential JOIN into a relation sink, the
+  join's peak is the larger of the producer's growth transient plus the
+  output's current footprint and the output's growth transient plus the
+  producer's current footprint; on a large result the output's last growth
+  dominates.  A consumed pipeline adds its tail's transients (each batch's
+  FILTER or MAP output, and the probe sets its SEMIJOIN and ANTIJOIN stages
+  build once per pipeline), and a differential join's create-time
+  arrangement transaction (below) can exceed both terms.  The full join
+  result is still materialized into the output relation: this unit bounds
+  producer memory and admits output growth, it does not bound the output
+  itself.
 - A grow the governor refuses is answered with a SHORT BATCH, not a failed
   produce: the producer parks on the candidate it was about to write and
   emits what it has, so a tight budget costs batch boundaries rather than
@@ -1437,9 +1465,16 @@ Ownership and admission:
   admission is the bound.
 
 Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when bounded
-mode is enabled for a normal keyed join.  Its scratch is still sized EAGERLY
-at `rows_per_batch`; #1481's lazy growth covers the non-differential producer
-only, so a small differential join under a large `N` still reserves the knob.
+mode is enabled for a normal keyed join.  Its scratch grows lazily by the same
+rule as the non-differential producer, and the per-producer bound above
+applies to it with its own descriptor; its scratch is never timestamped.  Its
+create also runs the right relation's differential arrangement transaction in
+`index_right`.  Once an earlier create has committed that arrangement,
+`index_right` deep-copies it on every create, even when no row is new, and
+grows the copy's hash table when new rows need it; until that transaction
+commits, the governor holds the arrangement twice.  The arrangement belongs to
+the session and outlives the producer, so this transaction is outside the
+per-producer bound; it ends, committed or aborted, before the first batch.
 The right relation is incrementally indexed in a differential transaction
 before the continuation starts; that cache transaction is committed before a
 differential generation/source pin is held for the continuation.  Since #2173
