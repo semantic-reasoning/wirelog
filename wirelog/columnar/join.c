@@ -2280,12 +2280,14 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
 
 #ifdef WL_SESSION_TEST_HOOKS
 /* Observation points for the SEMIJOIN/ANTIJOIN probe sets and emits.  They
- * also count the calls the standalone operators make. */
-uint32_t wl_columnar_join_test_probe_set_build_calls;
-uint32_t wl_columnar_join_test_probe_set_build_denials;
-uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
-uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
-uint32_t wl_columnar_join_test_probe_emits;
+ * also count the calls the standalone operators make.  TDD worker threads
+ * can build probe sets and emit concurrently, so every update is a relaxed
+ * atomic. */
+atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_calls;
+atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_denials;
+atomic_uint_fast64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+atomic_uint_fast64_t wl_columnar_join_test_probe_set_admitted_bytes;
+atomic_uint_fast64_t wl_columnar_join_test_probe_emits;
 void (*wl_columnar_join_test_before_probe_emit)(const col_rel_t *left);
 #endif
 
@@ -2328,11 +2330,14 @@ wl_columnar_join_probe_set_build(wl_col_session_t *sess,
     memset(set, 0, sizeof(*set));
     wl_columnar_memory_reservation_init(&set->reservation);
 #ifdef WL_SESSION_TEST_HOOKS
-    wl_columnar_join_test_probe_set_build_calls++;
-    wl_columnar_join_test_probe_set_reserved_at_entry = governor
-        ? wl_columnar_memory_reserved(
-        wl_columnar_memory_governor_ref_get(governor)) : 0;
-    wl_columnar_join_test_probe_set_admitted_bytes = 0;
+    atomic_fetch_add_explicit(&wl_columnar_join_test_probe_set_build_calls,
+        1u, memory_order_relaxed);
+    atomic_store_explicit(&wl_columnar_join_test_probe_set_reserved_at_entry,
+        governor ? wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor)) : 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&wl_columnar_join_test_probe_set_admitted_bytes, 0,
+        memory_order_relaxed);
 #endif
     if (col_join_bucket_count(right->nrows, &nbuckets) != 0)
         return ENOMEM;
@@ -2354,7 +2359,9 @@ wl_columnar_join_probe_set_build(wl_col_session_t *sess,
                 sess->memory_budget_denied = true;
 #ifdef WL_SESSION_TEST_HOOKS
             if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
-                wl_columnar_join_test_probe_set_build_denials++;
+                atomic_fetch_add_explicit(
+                    &wl_columnar_join_test_probe_set_build_denials, 1u,
+                    memory_order_relaxed);
 #endif
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
                        ? ENOSPC
@@ -2364,7 +2371,8 @@ wl_columnar_join_probe_set_build(wl_col_session_t *sess,
         }
         set->admitted = true;
 #ifdef WL_SESSION_TEST_HOOKS
-        wl_columnar_join_test_probe_set_admitted_bytes = hash_bytes;
+        atomic_store_explicit(&wl_columnar_join_test_probe_set_admitted_bytes,
+            hash_bytes, memory_order_relaxed);
 #endif
     }
     set->head = (uint32_t *)calloc(nbuckets, sizeof(uint32_t));
@@ -2573,7 +2581,8 @@ wl_columnar_antijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
     bool own_set = !set->built;
 
 #ifdef WL_SESSION_TEST_HOOKS
-    wl_columnar_join_test_probe_emits++;
+    atomic_fetch_add_explicit(&wl_columnar_join_test_probe_emits, 1u,
+        memory_order_relaxed);
     if (wl_columnar_join_test_before_probe_emit)
         wl_columnar_join_test_before_probe_emit(left);
 #endif
@@ -2796,7 +2805,8 @@ wl_columnar_semijoin_emit(const wl_plan_op_t *op, wl_col_session_t *sess,
     bool own_set = !set->built;
 
 #ifdef WL_SESSION_TEST_HOOKS
-    wl_columnar_join_test_probe_emits++;
+    atomic_fetch_add_explicit(&wl_columnar_join_test_probe_emits, 1u,
+        memory_order_relaxed);
     if (wl_columnar_join_test_before_probe_emit)
         wl_columnar_join_test_before_probe_emit(left);
 #endif

@@ -356,7 +356,7 @@ allocation.
 | `join.c:col_join_cross_fill_worker_fn#3` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a later left-side output column |
 | `join.c:col_join_cross_fill_worker_fn#4` | `*ctx->write_error` | `atomic_store_explicit` | `relaxed` | Publish a failure from a right-side output column |
 | `join.c:col_join_parallel_cross` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes worker write status after the workqueue barrier |
-| `join.c:wl_columnar_semijoin_emit` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes typed semijoin fill status after the workqueue barrier |
+| `join.c:wl_columnar_semijoin_emit#2` | `write_error` | `atomic_load_explicit` | `relaxed` | Coordinator observes typed semijoin fill status after the workqueue barrier |
 
 ### 5.5 `wirelog/columnar/kfusion.c` — K-fusion shared counter and reservation (2 rows)
 
@@ -1680,3 +1680,21 @@ validates retained ownership under the destination's existing writer authority.
 | `filter.c:wl_columnar_filter_op_attempt_start_owned#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition, then bind identity to this original token address |
 | `relation.c:wl_columnar_relation_row_body_operator` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | With original destination writers and exclusive token authority, verify relation ownership before operator-specific growth |
 | `relation.c:wl_columnar_relation_row_body_operator#2` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Require COMMITTED before growth; separate owner/state reads do not imply a coherent shared-governor snapshot |
+
+### Probe-set test counter atomic sites
+
+These seven sites extend the preceding inventory from 323 to 330. They exist
+only in builds with `WL_SESSION_TEST_HOOKS`, where tests observe the
+SEMIJOIN/ANTIJOIN probe sets and emits. TDD worker threads can build probe
+sets and emit concurrently, so each update is a relaxed atomic; the counters
+synchronize nothing, and tests read them after the operator call returns.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `join.c:wl_columnar_join_probe_set_build` | `wl_columnar_join_test_probe_set_build_calls` | `atomic_fetch_add_explicit` | relaxed | Count probe-set builds for tests; counter only |
+| `join.c:wl_columnar_join_probe_set_build#2` | `wl_columnar_join_test_probe_set_reserved_at_entry` | `atomic_store_explicit` | relaxed | Record the governor's reserved bytes at build entry for single-builder tests; last writer wins under concurrency |
+| `join.c:wl_columnar_join_probe_set_build#3` | `wl_columnar_join_test_probe_set_admitted_bytes` | `atomic_store_explicit` | relaxed | Reset the admitted-bytes observation at build entry; last writer wins under concurrency |
+| `join.c:wl_columnar_join_probe_set_build#4` | `wl_columnar_join_test_probe_set_build_denials` | `atomic_fetch_add_explicit` | relaxed | Count probe-set admission denials for tests; counter only |
+| `join.c:wl_columnar_join_probe_set_build#5` | `wl_columnar_join_test_probe_set_admitted_bytes` | `atomic_store_explicit` | relaxed | Record the admitted hash bytes for single-builder tests; last writer wins under concurrency |
+| `join.c:wl_columnar_antijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count ANTIJOIN emits for tests; counter only |
+| `join.c:wl_columnar_semijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count SEMIJOIN emits for tests; counter only |

@@ -90,10 +90,10 @@ extern bool wl_columnar_join_test_last_semijoin_parallel_admitted;
 extern bool wl_columnar_merge_test_fail_concat_boundaries_alloc;
 /* testlib_prod defines these under WL_SESSION_TEST_HOOKS, which this test
  * is not compiled with. */
-extern uint32_t wl_columnar_join_test_probe_set_build_calls;
-extern uint32_t wl_columnar_join_test_probe_set_build_denials;
-extern uint64_t wl_columnar_join_test_probe_set_reserved_at_entry;
-extern uint64_t wl_columnar_join_test_probe_set_admitted_bytes;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_calls;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_build_denials;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_reserved_at_entry;
+extern atomic_uint_fast64_t wl_columnar_join_test_probe_set_admitted_bytes;
 
 static uint32_t test_join_submit_calls;
 static uint32_t test_join_submit_fail_at;
@@ -2910,8 +2910,9 @@ test_semijoin_keep_all_fits_where_copy_is_denied(void)
      * refused. */
     if (run.rc != 0)
         printf("(rc=%d set built=%u denied=%u) ", run.rc,
-            wl_columnar_join_test_probe_set_build_calls - builds,
-            wl_columnar_join_test_probe_set_build_denials - denials);
+            (unsigned)(wl_columnar_join_test_probe_set_build_calls - builds),
+            (unsigned)(wl_columnar_join_test_probe_set_build_denials
+            - denials));
     ok = ok && run.rc == 0 && run.rel == left && run.owned
         && run.rel->nrows == nleft && reserved_of(sess) == before;
     p_release(&run, left, true);
