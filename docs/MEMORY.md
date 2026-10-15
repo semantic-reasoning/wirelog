@@ -2750,3 +2750,70 @@ opcode, lookup slot/byte, selection and input-install action. Existing numeric
 tail preflight is charged separately. A stopped operation never supplies
 cleanup work from a successor attempt. Caller initialization and external
 queue scheduling remain separately owned work, not an unmetered API loop.
+
+### Ordinary JOIN workspace and typed output (#1821)
+
+The cooperative operator workspace now has three fixed original JOIN scratch
+records and a second protected scalar-source record. These are prerequisites
+for the ordinary cross/keyed JOIN implementation; this change alone does not
+activate JOIN or public evaluation controls. Every cleanup frame contains the
+workspace, including frames used by unlimited evaluation. Frame admission uses
+its actual `sizeof`, and controlled frame clearing retains its existing
+bounded byte chunks rather than treating the larger allocation as free work.
+
+An active shared context excludes ordinary unary admission, including the
+interval before its unary snapshot exists. The private context-authorized
+route checks the exact embedded address before dereferencing the supplied
+context, original identity/session/frame/native thread, live control pin,
+saved ID and RUNNING/busy state. FILTER and MAP use this route as well. It is
+an internal serialized start protocol: hosts and callbacks must not reenter
+the authorized route using another operator's context. An inert frame has no
+implied creator-thread identity.
+
+`wl_columnar_relation_new_typed_operator_attempt_controlled` accepts an
+immutable initialized scalar type array of the exact requested width, generates
+`colN` names, uses capacity64 without timestamps, and publishes into an exclusive
+original output slot only after the final saved-ID check. Width0 permits NULL
+types. Invalid scalar enum lanes are checked in charged steps. Name, type-array,
+governor and original control storage remain live through the call. Its recipe
+never escapes. Failed unpublished lexical outputs use the existing checked
+private destruction/fail-stop contract; a NULL external slot does not own those
+lexical resources. The existing checked numeric-row operator wrapper also
+supports typed noTS private output, including FLOAT validation and signed-zero
+normalization. Its source/lease/renewal/original-ID protections remain intact.
+
+JOIN cleanup enters its own BATCH stage. It completely drains actual original
+batch authority before ending the right source or retiring any scratch storage.
+Each fixed scratch record then advances through physical free, original credit
+release/rollback, governor-reference release and marker clearing on separate
+host turns. A refused credit release preserves the original token and reference
+for a separately funded retry. The left source and original output remain
+reachable through the existing common continuation. Generic frame/pending-list
+destruction stays a separately scheduled caller action; no arbitrary metadata
+traversal or allocator-time bound is introduced.
+
+The JOIN forward caller must admit each owner's first retirement before that
+owner becomes discoverable. Fresh independently funded host actions pay actual
+cleanup dispatches and retries; a stopped operation or successor is never used
+as cleanup funding. This prerequisite commit does not supply a JOIN start or
+claim that unwritten start's accounting. Existing FILTER/MAP lifecycle grants
+and their default execution routes remain subject to their own exact source
+bounds.
+
+The written-source inventory uses the existing logical scalar-slot convention,
+not elapsed time or hook sums. The context-authorized unary entry adds21 slots
+(including native validation and shared-body return): the conservative owned
+family envelope is225, and its caller prefix151 fits the existing192 allowance.
+The single added ACK predicate changes the existing standalone RESET+ACK
+ceiling248 to249. Later COLUMN256 and FINISH249 regions are unchanged. New JOIN
+retirement envelopes include their canonical caller: BATCH at most254,
+right-source180, and each fixed scratch stage at most120. A fresh distinct
+HOST384 grant pays each action; it does not change the polling quantum256.
+
+Typed construction retains ENTRY128, one validation128 per scalar lane,
+PREPARE128, BUILD_CALL128 and existing builder/external admissions. Conservative
+local ENTRY85, lane70 and PREPARE49 fit those existing regions. Supported scalar
+enums include INT32 through BOOL; invalid lanes retain typed-error precedence.
+Inherited builder endpoints include both types-present metadata and noTS
+construction; a future JOIN caller must prove its own suffix within the allowed
+constructor caller75, rather than append arbitrary scheduling after a child.

@@ -2040,8 +2040,8 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 3, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_begin_attempt_owned(frame, control,
-            attempt_id, owner);
+    rc = wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+            control, attempt_id, owner);
     if (rc)
         goto done;
     ctx->unary_started = true;
@@ -2600,8 +2600,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 3, 0);
     if (rc)
         goto done;
-    rc = wl_columnar_eval_stack_unary_begin_attempt_owned(frame, control,
-            attempt_id, owner);
+    rc = wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+            control, attempt_id, owner);
     if (rc)
         goto done;
     ctx->unary_started = true;
@@ -3013,6 +3013,105 @@ wl_columnar_filter_op_attempt_step_owned(
         ctx->table.initialized = false;
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_BATCH;
         break;
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH:
+        if (ctx->batch_initialized) {
+            if (!ctx->drain_initialized
+                || ctx->batch_drain.identity != &ctx->batch_drain) {
+                rc = EINVAL;
+                goto protocol_error;
+            }
+            bool done;
+            rc = wl_columnar_relation_private_batch_drain_step(
+                &ctx->batch_drain, &ctx->batch, ctx->execution_result, &done);
+            if (rc) {
+                if (ctx->batch_drain.release_error != rc)
+                    goto protocol_error;
+                ctx->cleanup_result = rc;
+                goto retained;
+            }
+            ctx->cleanup_result = 0;
+            if (!done) break;
+            ctx->batch_initialized = false;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE:
+        if (ctx->join_right_initialized) {
+            (void)wl_columnar_relation_scalar_source_end(&ctx->join_right,
+                ctx->execution_result);
+            if (ctx->join_right.phase !=
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+                abort();
+            ctx->join_right_initialized = false;
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
+        break;
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL: {
+        if (!ctx->join_initialized
+            || ctx->join_retirement_cursor >= WL_COLUMNAR_JOIN_SCRATCH_COUNT) {
+            rc = EINVAL; goto protocol_error;
+        }
+        wl_columnar_join_scratch_t *scratch =
+            &ctx->join_scratch[ctx->join_retirement_cursor];
+        if (scratch->initialized && scratch->allocated) {
+            void *physical = scratch->physical;
+            scratch->physical = NULL; scratch->allocated = false;
+            free(physical);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT;
+        break;
+    }
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT: {
+        if (!ctx->join_initialized
+            || ctx->join_retirement_cursor >= WL_COLUMNAR_JOIN_SCRATCH_COUNT) {
+            rc = EINVAL; goto protocol_error;
+        }
+        wl_columnar_join_scratch_t *scratch =
+            &ctx->join_scratch[ctx->join_retirement_cursor];
+        if (scratch->initialized && scratch->admitted) {
+            bool released = scratch->committed
+                ? wl_columnar_memory_release(&scratch->credit)
+                : wl_columnar_memory_rollback(&scratch->credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL; goto retained;
+            }
+            scratch->admitted = false;
+        }
+        ctx->cleanup_result = 0;
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_REFERENCE;
+        break;
+    }
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_REFERENCE: {
+        if (!ctx->join_initialized
+            || ctx->join_retirement_cursor >= WL_COLUMNAR_JOIN_SCRATCH_COUNT) {
+            rc = EINVAL; goto protocol_error;
+        }
+        wl_columnar_join_scratch_t *scratch =
+            &ctx->join_scratch[ctx->join_retirement_cursor];
+        if (scratch->initialized && scratch->ref_held) {
+            wl_columnar_memory_governor_ref_t *ref = scratch->governor;
+            scratch->governor = NULL; scratch->ref_held = false;
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+        ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_CLEAR;
+        break;
+    }
+    case WL_COLUMNAR_FILTER_STAGE_JOIN_CLEAR: {
+        if (!ctx->join_initialized
+            || ctx->join_retirement_cursor >= WL_COLUMNAR_JOIN_SCRATCH_COUNT) {
+            rc = EINVAL; goto protocol_error;
+        }
+        wl_columnar_join_scratch_t *scratch =
+            &ctx->join_scratch[ctx->join_retirement_cursor];
+        scratch->initialized = false; scratch->committed = false;
+        ++ctx->join_retirement_cursor;
+        if (ctx->join_retirement_cursor == WL_COLUMNAR_JOIN_SCRATCH_COUNT) {
+            ctx->join_retirement_cursor = 0;
+            ctx->join_initialized = false;
+            ctx->stage = WL_COLUMNAR_FILTER_STAGE_PROGRAM;
+        } else ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
+        break;
+    }
     case WL_COLUMNAR_FILTER_STAGE_BATCH:
         if (ctx->batch_initialized) {
             if (!ctx->drain_initialized
@@ -3174,7 +3273,7 @@ wl_columnar_filter_op_attempt_ack_owned(
     if (rc) return rc;
     if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
         || ctx->unary_started || ctx->source_initialized ||
-        ctx->batch_initialized
+        ctx->batch_initialized || ctx->join_initialized
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
         ctx->output || ctx->private_output || ctx->table.programs
         || ctx->table.initialized_slots || ctx->table.retirement_cursor

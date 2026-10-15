@@ -3566,6 +3566,15 @@ wl_columnar_relation_new_auto_attempt_controlled(
 int wl_columnar_relation_new_auto_operator_attempt_controlled(
     const char *, uint32_t, uint32_t, wl_columnar_memory_governor_ref_t *,
     col_rel_t **, wl_evaluation_control_t *, uint64_t);
+/* Private typed noTS operator construction. types contains exactly ncols
+* immutable initialized scalar lanes (NULL allowed only at width0). Keep
+* name/types/governor/control live through return; no recipe escapes. The
+* exclusive output slot owns no live result on entry. Fixed outNULL bootstrap
+* precedes admission; publication follows the final original-ID check. */
+int wl_columnar_relation_new_typed_operator_attempt_controlled(
+    const char *, uint32_t, const wirelog_column_type_t *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     wl_columnar_relation_append_batch_t *, const int64_t *,
     wl_evaluation_control_t *, uint64_t);
@@ -5475,6 +5484,12 @@ int wl_columnar_relation_private_batch_drain_step(
 typedef enum {
     WL_COLUMNAR_FILTER_STAGE_INERT = 0,
     WL_COLUMNAR_FILTER_STAGE_RUNNING,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_REFERENCE,
+    WL_COLUMNAR_FILTER_STAGE_JOIN_CLEAR,
     WL_COLUMNAR_FILTER_STAGE_TABLE_PROGRAM,
     WL_COLUMNAR_FILTER_STAGE_TABLE_PHYSICAL,
     WL_COLUMNAR_FILTER_STAGE_TABLE_CREDIT,
@@ -5511,6 +5526,18 @@ typedef struct {
     bool ref_held;
 } wl_columnar_filter_program_table_t;
 
+/* Original fixed JOIN scratch owner. Only initialized records may own
+ * credits; each record retains its own governor until physical-before-credit
+ * retirement completes. Never copy a live reservation or original record. */
+typedef struct {
+    void *physical;
+    wl_columnar_memory_reservation_t credit;
+    wl_columnar_memory_governor_ref_t *governor;
+    bool initialized, allocated, admitted, committed, ref_held;
+} wl_columnar_join_scratch_t;
+
+#define WL_COLUMNAR_JOIN_SCRATCH_COUNT 3u
+
 typedef struct wl_columnar_filter_context {
     struct wl_columnar_filter_context *identity;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
@@ -5545,12 +5572,24 @@ typedef struct wl_columnar_filter_context {
     int64_t inline_values[16];
     int64_t *values;
     wl_columnar_filter_program_table_t table;
+    /* Fixed original JOIN ownership, inactive for FILTER/MAP. join_initialized
+     * remains true until B2/right/readers and all scratch records are drained. */
+    bool join_initialized, join_right_initialized;
+    uint32_t join_retirement_cursor;
+    wl_columnar_relation_scalar_source_t join_right;
+    wl_columnar_join_scratch_t join_scratch[WL_COLUMNAR_JOIN_SCRATCH_COUNT];
 } wl_columnar_filter_context_t;
 
 /* Borrow embedded original context after original frame validation. No owner
  * transfer or old-control access; callers never copy the returned record. */
 int wl_columnar_eval_stack_filter_context(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **);
+/* Serialized owning start only: the exact original RUNNING/busy context
+ * authorizes admission; standalone unary begin refuses an active context.
+ * Neither callers nor callbacks may reenter this private authorized route. */
+int wl_columnar_eval_stack_unary_begin_attempt_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t *,
+    wl_evaluation_control_t *, uint64_t, const void *);
 /* Private finish-status bridge, validated original live FILTER context only.
  * semantic is the designated context semantic_result slot or a disjoint live
  * external int; retained is a live bool disjoint from frame/context/semantic.

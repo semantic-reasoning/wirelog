@@ -3255,6 +3255,317 @@ wl_columnar_filter_test_map_ungoverned(void)
         reached, reached);
 }
 
+/* J1 component driver: setup is caller-owned work; each cleanup dispatch gets
+ * a fresh grant from distinct funding and returns before the next queue turn. */
+typedef struct {
+    host_job_t job;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_columnar_filter_status_t status;
+    wl_evaluation_control_t *funding;
+    bool done, ack;
+    unsigned turns;
+} join_workspace_job_t;
+
+static void
+join_workspace_dispatch(host_queue_t *queue, host_job_t *job)
+{
+    join_workspace_job_t *entry = job->data;
+    CHECK(wl_evaluation_control_charge(entry->funding, 384) == 0);
+    if (entry->ack) {
+        CHECK(wl_columnar_filter_op_attempt_ack(entry->frame) == 0);
+        entry->done = true;
+    } else {
+        CHECK(wl_columnar_filter_op_attempt_step(entry->frame,
+            &entry->status) == 0);
+        entry->ack = entry->status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        CHECK(entry->ack ||
+            entry->status.progress == WL_COLUMNAR_FILTER_PROGRESS_YIELD
+            || entry->status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    }
+    ++entry->turns;
+    if (!entry->done &&
+        entry->status.progress != WL_COLUMNAR_FILTER_PROGRESS_RETAINED)
+        CHECK(host_enqueue(queue, job) == 0);
+}
+
+static void *
+join_workspace_wrong_thread(void *data)
+{
+    wl_columnar_filter_context_t *ctx = data;
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(ctx->frame,
+        ctx, ctx->control, ctx->attempt_id, NULL) == EINVAL);
+    return NULL;
+}
+
+static bool join_batch_release_refused;
+static int
+join_batch_release_once(wl_columnar_relation_mutation_single_t *single,
+    unsigned slot)
+{
+    CHECK(slot == 1 && single->set.owners_acquired == 1
+        && single->set.descriptors_acquired == 1);
+    CHECK(!join_batch_release_refused);
+    join_batch_release_refused = true;
+    return EBUSY;
+}
+
+static void
+join_workspace_fixture(unsigned mode)
+{
+    wl_col_session_t *session = wl_columnar_filter_test_session();
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(session, &frame) == 0);
+    uint64_t frame_credit = wl_columnar_filter_test_reserved(session);
+    col_rel_t *input = wl_columnar_filter_test_source(17, 1, true, false,
+            false);
+    col_rel_t *right = wl_columnar_filter_test_source(1, 1, false, false,
+            false);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(frame);
+    CHECK(eval_stack_push(stack, input, true) == 0);
+    int operation_owner = 0;
+    wl_evaluation_control_t *operation = wl_columnar_filter_test_control(0,
+            &operation_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(operation);
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(wl_columnar_eval_stack_filter_context(frame, &ctx) == 0);
+    ctx->identity = ctx; ctx->frame = frame; ctx->session = session;
+    ctx->control = operation; ctx->attempt_id = id;
+    CHECK(wl_evaluation_control_retain(operation) == 0);
+    ctx->pin_owned = true; ctx->thread_valid = true; ctx->busy = true;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->values = ctx->inline_values;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
+    /* The ordinary route refuses the real pre-unary activation gap. */
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(frame,
+        operation, id) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_owned(frame, operation, id,
+        NULL) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame,
+        (wl_columnar_filter_context_t *)(uintptr_t)1, operation, id,
+        NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+        operation, id + 1, NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+        NULL, id, NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+        operation, id, &operation_owner) == EBUSY);
+    wl_thread_t wrong_thread;
+    CHECK(wl_thread_create(&wrong_thread, join_workspace_wrong_thread,
+        ctx) == 0);
+    CHECK(wl_thread_join(&wrong_thread) == 0);
+    wl_columnar_eval_stack_cleanup_frame_t *inner = NULL;
+    CHECK(wl_columnar_eval_stack_cleanup_begin(session, &inner) == 0);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+        operation, id, NULL) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&inner) == 0 && !inner);
+    CHECK(!ctx->unary_started && stack->top == 1 &&
+        stack->items[0].rel == input);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+        operation, id, NULL) == 0);
+    ctx->unary_started = true;
+    col_rel_t **slot = NULL;
+    CHECK(wl_columnar_eval_stack_unary_output(frame, &slot) == 0);
+    CHECK(wl_columnar_relation_new_typed_operator_attempt_controlled("$join",
+        17,
+        input->column_types, session->memory_governor, slot, operation,
+        id) == 0);
+    ctx->output = *slot; ctx->private_output = *slot;
+    CHECK(wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->source,
+            &ctx->source_initialized, operation, id) == 0);
+    CHECK(wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->source, input, false) == 0);
+    CHECK(wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->join_right,
+            &ctx->join_right_initialized, operation, id) == 0);
+    CHECK(wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->join_right, right, false) == 0);
+    wl_columnar_relation_private_batch_drain_init(&ctx->batch_drain);
+    ctx->drain_initialized = true; ctx->batch_initialized = true;
+    wl_columnar_source_access_reader_t reader = {0};
+    if (mode == 2) CHECK(col_rel_source_reader_acquire(ctx->output,
+            &reader) == 0);
+    int begin_rc =
+        wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+            ctx->output, operation);
+    CHECK(begin_rc == (mode == 2 ? EBUSY : 0));
+    if (mode == 2) CHECK(col_rel_source_reader_release(&reader) == 0);
+    ctx->join_initialized = true;
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i) {
+        wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[i];
+        if (mode == 0 && i == 2) continue; /* Genuine never-initialized slot. */
+        wl_columnar_memory_reservation_init(&scratch->credit);
+        scratch->initialized = true;
+        scratch->governor = session->memory_governor;
+        wl_columnar_memory_governor_ref_retain(scratch->governor);
+        scratch->ref_held = true;
+        if (i == 0 && mode == 0) continue; /* Original reference only. */
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+                scratch->governor), 17, &scratch->credit));
+        scratch->admitted = true;
+        if (i != 1) {
+            scratch->physical = malloc(17); CHECK(scratch->physical);
+            scratch->allocated = true;
+            CHECK(wl_columnar_memory_commit(&scratch->credit,
+                scratch->physical));
+            scratch->committed = true;
+        }
+    }
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            session->memory_governor), 19, &peer));
+    uint64_t before = wl_columnar_filter_test_reserved(session);
+    wl_evaluation_control_request_cancel(operation);
+    CHECK(wl_evaluation_control_charge(operation,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(operation, &operation_owner, 0,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_begin(operation, &operation_owner) == 0);
+    CHECK(wl_evaluation_control_active_attempt_id(operation) != id);
+    ctx->execution_result = mode ==
+        2 ? begin_rc : WL_EVALUATION_CONTROL_CANCELLED;
+    ctx->semantic_result = ctx->execution_result; ctx->busy = false;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH;
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == EBUSY && frame);
+    int funding_owner = 0;
+    wl_evaluation_control_t *funding = wl_columnar_filter_test_control(0,
+            &funding_owner);
+    join_workspace_job_t entry = {.frame = frame, .funding = funding};
+    host_queue_t queue = {0};
+    entry.job.dispatch = join_workspace_dispatch; entry.job.data = &entry;
+    CHECK(host_enqueue(&queue, &entry.job) == 0);
+    bool refused = false, witnessed_batch = false, witnessed_right = false;
+    join_batch_release_refused = false;
+    while (queue.count) {
+        CHECK(entry.turns < 64);
+        if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH) {
+            CHECK(ctx->join_right_initialized && ctx->join_initialized);
+            CHECK(ctx->join_scratch[0].ref_held);
+            witnessed_batch = true;
+        }
+        if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE) {
+            CHECK(!ctx->batch_initialized && ctx->join_scratch[0].ref_held);
+            witnessed_right = true;
+        }
+        if (mode == 3 && !join_batch_release_refused
+            && ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH
+            && ctx->batch_drain.phase ==
+            WL_COLUMNAR_RELATION_PRIVATE_BATCH_OWNER) {
+            wl_columnar_relation_test_single_release = join_batch_release_once;
+        }
+        if (mode == 1 && !refused &&
+            ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT) {
+            CHECK(!ctx->join_scratch[0].allocated &&
+                ctx->join_scratch[0].admitted);
+            wl_columnar_memory_governor_test_refuse_next_release();
+            refused = true;
+        }
+        CHECK(host_turn(&queue) == 0); /* A real return between retire phases. */
+        if (entry.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED) {
+            CHECK(!queue.count);
+            CHECK(ctx->join_scratch[0].admitted &&
+                ctx->join_scratch[0].ref_held);
+            if (mode == 3) {
+                CHECK(join_batch_release_refused
+                    && ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH);
+                CHECK(ctx->join_scratch[0].allocated &&
+                    ctx->join_scratch[0].physical);
+                CHECK(ctx->join_right_initialized && ctx->source_initialized);
+                CHECK(ctx->batch.raw.single.set.owners_acquired == 1
+                    && ctx->batch.raw.single.set.descriptors_acquired == 1);
+                wl_columnar_relation_test_single_release = NULL;
+            } else {
+                CHECK(mode == 1 && refused && !ctx->join_scratch[0].physical);
+            }
+            CHECK(host_enqueue(&queue, &entry.job) == 0); /* Fresh funding on retry. */
+        }
+    }
+    CHECK(wl_evaluation_control_finish(funding, &funding_owner, 0, 0) == 0);
+    wl_evaluation_control_report_t funding_report;
+    CHECK(wl_evaluation_control_report(funding, &funding_report) == 0);
+    CHECK(funding_report.consumed == (uint64_t)entry.turns * 384);
+    CHECK(wl_evaluation_control_detach(funding, &funding_owner) == 0);
+    wl_evaluation_control_release(funding);
+    CHECK(join_batch_release_refused == (mode == 3));
+    CHECK(entry.done && witnessed_batch && witnessed_right &&
+        (refused == (mode == 1)));
+    CHECK(entry.status.semantic_result ==
+        (mode == 2 ? EBUSY : WL_EVALUATION_CONTROL_CANCELLED));
+    CHECK(stack->top == 1 && stack->items[0].rel == input &&
+        stack->items[0].owned);
+    CHECK(!ctx->join_initialized && !ctx->join_right_initialized);
+    CHECK(wl_columnar_filter_test_reserved(session) == frame_credit + 19);
+    CHECK(wl_columnar_filter_test_reserved(session) < before);
+    CHECK(wl_evaluation_control_finish(operation, &operation_owner, 0, 0) == 0);
+    wl_evaluation_control_report_t successor;
+    CHECK(wl_evaluation_control_report(operation,
+        &successor) == 0 && successor.consumed == 0);
+    CHECK(wl_evaluation_control_detach(operation, &operation_owner) == 0);
+    wl_evaluation_control_release(operation);
+    CHECK(wl_columnar_memory_rollback(&peer));
+    CHECK(col_rel_destroy_checked(right) == 0);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame) == 0 && !frame);
+    CHECK(!wl_columnar_filter_test_reserved(session));
+    CHECK(wl_columnar_memory_governor_ref_is_sole(session->memory_governor));
+    wl_columnar_memory_governor_ref_release(session->memory_governor);
+    free(session);
+}
+
+static wl_columnar_eval_stack_cleanup_frame_t *join_activation_frame;
+static bool join_activation_seen;
+
+static void
+join_activation_hook(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != 3 || join_activation_seen) return;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(wl_columnar_eval_stack_filter_context(join_activation_frame,
+        &ctx) == 0);
+    CHECK(ctx->busy && !ctx->unary_started);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_controlled(
+            join_activation_frame,
+            control, ctx->attempt_id) == EBUSY);
+    CHECK(ctx->busy && !ctx->unary_started);
+    join_activation_seen = true;
+}
+
+static void
+join_activation_fixtures(void)
+{
+    for (unsigned map = 0; map < 2; ++map) {
+        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                sizeof(*scenario));
+        CHECK(scenario);
+        wl_columnar_filter_test_prepare(scenario,
+            wl_columnar_filter_test_source(1, 1, false, false, false), true,
+            NULL, 0, false);
+        if (map) {
+            scenario->op.op = WL_PLAN_OP_MAP;
+            scenario->op.project_count = 1;
+            scenario->filter.start = wl_columnar_filter_map_attempt_start;
+        }
+        join_activation_frame = scenario->filter.frame;
+        join_activation_seen = false;
+        wl_columnar_filter_test_attempt_checkpoint = join_activation_hook;
+        wl_columnar_filter_test_run(scenario);
+        wl_columnar_filter_test_attempt_checkpoint = NULL;
+        CHECK(join_activation_seen && scenario->filter.done &&
+            !scenario->filter.status.semantic_result);
+        (void)wl_columnar_filter_test_complete(scenario);
+        join_activation_frame = NULL;
+        free(scenario);
+    }
+}
+
 int
 main(void)
 {
@@ -3342,6 +3653,8 @@ main(void)
     wl_columnar_filter_test_map_allocations();
     wl_columnar_filter_test_map_error_priority();
     wl_columnar_filter_test_map_ungoverned();
+    for (unsigned mode = 0; mode < 4; ++mode) join_workspace_fixture(mode);
+    join_activation_fixtures();
     printf(
         "numeric FILTER: semantic, literal, FIFO, retention, authority and fault witnesses passed\n");
     return 0;
