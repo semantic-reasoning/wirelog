@@ -582,12 +582,20 @@ void (*wl_columnar_memory_governor_test_before_total_cas)(
 void (*wl_columnar_memory_governor_test_after_total_cas)(
     wl_evaluation_control_t *,
     wl_columnar_memory_governor_t *, bool, bool);
+void (*wl_columnar_memory_governor_test_admitted)(
+    wl_columnar_memory_governor_t *, uint64_t);
 #define WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(c, r, p) do { \
             if (wl_columnar_memory_governor_test_checkpoint) \
             wl_columnar_memory_governor_test_checkpoint(c, r, p); \
 } while (0)
+/* Every admission that raised @g's reserved total to @total (#1370 d5). */
+#define WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(g, total) do { \
+            if (wl_columnar_memory_governor_test_admitted) \
+            wl_columnar_memory_governor_test_admitted(g, total); \
+} while (0)
 #else
 #define WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(c, r, p) ((void)0)
+#define WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(g, total) ((void)0)
 #endif
 
 static int
@@ -942,8 +950,10 @@ wl_columnar_memory_governor_admit(wl_columnar_memory_governor_t *governor,
         bool admitted =
             wl_columnar_memory_governor_strong(&governor->reserved_bytes,
                 &old, desired);
-        if (admitted && !overflow)
+        if (admitted && !overflow) {
             *credited = true;
+            WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(governor, desired);
+        }
 #if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
         if (wl_columnar_memory_governor_test_after_total_cas)
             wl_columnar_memory_governor_test_after_total_cas(control, governor,
@@ -1535,8 +1545,10 @@ wl_columnar_memory_governor_attempt_admit(
             return rc;
         bool admitted = wl_columnar_memory_governor_strong(
             &governor->reserved_bytes, &old, desired);
-        if (admitted && !overflow)
+        if (admitted && !overflow) {
             *credited = true;
+            WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(governor, desired);
+        }
 #if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
         if (wl_columnar_memory_governor_test_after_total_cas)
             wl_columnar_memory_governor_test_after_total_cas(control,
@@ -1951,8 +1963,10 @@ reserve_internal(wl_columnar_memory_governor_t *governor,
         }
         if (atomic_compare_exchange_weak_explicit(
                 &governor->reserved_bytes, &old, next,
-                memory_order_relaxed, memory_order_relaxed))
+                memory_order_relaxed, memory_order_relaxed)) {
+            WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(governor, next);
             break;
+        }
     }
     atomic_store_explicit(&reservation->state,
         WL_COLUMNAR_MEMORY_RESERVATION_RESERVED, memory_order_release);
@@ -2130,10 +2144,12 @@ reserve_replacement_overlap(wl_columnar_memory_governor_t *governor,
             return WL_COLUMNAR_MEMORY_ADMISSION_DENIED;
         if (atomic_compare_exchange_weak_explicit(
                 &governor->reserved_bytes, &old, next,
-                memory_order_relaxed, memory_order_relaxed))
+                memory_order_relaxed, memory_order_relaxed)) {
+            WL_COLUMNAR_MEMORY_GOVERNOR_TEST_ADMITTED(governor, next);
             return governor->mode == WL_COLUMNAR_MEMORY_MODE_ADVISORY
                 ? WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY
                 : WL_COLUMNAR_MEMORY_ADMISSION_OK;
+        }
     }
 }
 

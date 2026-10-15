@@ -602,6 +602,14 @@ col_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont)
     return p ? p->batch->capacity : 0;
 }
 
+uint64_t
+col_join_batch_descriptor_bytes(const wl_columnar_continuation_t *cont)
+{
+    const col_join_batch_producer_t *p = producer_of(cont);
+    return p && p->descriptor_reservation.governor
+           ? p->descriptor_reservation.bytes : 0;
+}
+
 bool
 col_join_batch_cursor_get(const wl_columnar_continuation_t *cont,
     col_join_batch_cursor_t *out)

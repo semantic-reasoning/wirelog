@@ -376,6 +376,37 @@ index_right(wl_col_session_t *sess, const char *name, const col_rel_t *right,
     return rc;
 }
 
+static const col_diff_join_batch_producer_t *
+diff_producer_of(const wl_columnar_continuation_t *cont)
+{
+    const col_diff_join_batch_producer_t *p =
+        (const col_diff_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(cont);
+    return p && p->batch && p->left ? p : NULL;
+}
+
+uint32_t
+col_diff_join_batch_rows_per_batch(const wl_columnar_continuation_t *cont)
+{
+    const col_diff_join_batch_producer_t *p = diff_producer_of(cont);
+    return p ? p->rows_per_batch : 0;
+}
+
+uint32_t
+col_diff_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont)
+{
+    const col_diff_join_batch_producer_t *p = diff_producer_of(cont);
+    return p ? p->batch->capacity : 0;
+}
+
+uint64_t
+col_diff_join_batch_descriptor_bytes(const wl_columnar_continuation_t *cont)
+{
+    const col_diff_join_batch_producer_t *p = diff_producer_of(cont);
+    return p && p->descriptor_reservation.governor
+           ? p->descriptor_reservation.bytes : 0;
+}
+
 int
 col_diff_join_batch_producer_create(wl_col_session_t *sess,
     const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,

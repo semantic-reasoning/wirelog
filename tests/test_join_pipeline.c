@@ -1,6 +1,7 @@
 /* Conservative pipeline preflight for Issue #1475; expression MAPs #1777. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/columnar/diff_join_batch.h"
 #include "../wirelog/columnar/join_pipeline.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
@@ -4118,6 +4119,494 @@ test_bounded_join_budget_denials_reported(void)
         "budget denial", UINT64_C(1) << 24, 2, true, true, ENOMEM, false);
 }
 
+/* ---- #1370 d5: the per-producer memory bound of MEMORY.md section 10a ---
+ *
+ * Guards, not fail-first tests: each run records the governor's high-water
+ * total through wl_columnar_memory_governor_test_admitted and compares it
+ * with the section 10a terms, computed at runtime from the code under test:
+ *   - D, the producer's descriptor admission (its accessor);
+ *   - S_end and S_peak, a relation created exactly as the producer creates
+ *     its scratch, measured on its own governor after creation and at its
+ *     high-water mark; S = S_end - P(64), and S_peak - S_end is the column
+ *     type transient at create;
+ *   - P(n) = col_rel_retained_bytes_for(scratch, n), and R = ncols * 8;
+ *   - the scratch and output capacities, replayed from the documented
+ *     growth rules.
+ * The sessions are single-threaded while the hook is set. */
+static uint64_t d5_high;
+static wl_columnar_memory_governor_t *d5_watch;
+
+static void
+d5_admitted(wl_columnar_memory_governor_t *governor, uint64_t total)
+{
+    if (governor == d5_watch && total > d5_high)
+        d5_high = total;
+}
+
+static void
+d5_watch_governor(wl_columnar_memory_governor_ref_t *governor)
+{
+    d5_watch = governor ? wl_columnar_memory_governor_ref_get(governor) : NULL;
+    d5_high = governor ? a1_reserved(governor) : 0;
+    wl_columnar_memory_governor_test_admitted = governor ? d5_admitted : NULL;
+}
+
+/* A sink that keeps nothing: the producer's reservations are the only ones
+ * the run makes. */
+static wl_columnar_continuation_status_t
+d5_sink_ok(void *context, const wl_columnar_continuation_batch_t *batch)
+{
+    (void)context;
+    (void)batch;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static wl_columnar_continuation_status_t
+d5_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
+{
+    (void)context;
+    (void)bytes;
+    (void)rows;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static wl_columnar_continuation_status_t
+d5_sink_commit(void *context, bool *committed)
+{
+    (void)context;
+    if (committed)
+        *committed = true;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static void
+d5_sink_abort(void *context)
+{
+    (void)context;
+}
+
+static bool
+d5_drain(wl_columnar_continuation_t *cont,
+    wl_columnar_continuation_sink_t *sink)
+{
+    for (;;) {
+        wl_columnar_continuation_status_t status
+            = wl_columnar_continuation_publish(cont, sink);
+        if (status == WL_COLUMNAR_CONTINUATION_DONE)
+            return true;
+        if (status != WL_COLUMNAR_CONTINUATION_OK)
+            return false;
+    }
+}
+
+typedef struct {
+    wl_col_session_t *sess;
+    wl_columnar_memory_governor_ref_t *governor;
+    col_rel_t *left;
+    wl_plan_op_t join;
+    uint32_t lk;
+    uint32_t rk;
+} d5_fixture_t;
+
+/* left(k, v) = {(0, 10)}, optionally timestamped, against right(k, r) with
+ * @fanout rows of k = 0 and its primary arrangement, then an enforcing
+ * governor with an ample budget attached to the session. */
+static bool
+d5_fixture_init(d5_fixture_t *f, uint32_t fanout, bool timestamped)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const char *const right_names[] = { "k", "r" };
+    static const int64_t left_rows[] = { 0, 10 };
+    int64_t *right_rows = calloc(2u * fanout, sizeof(*right_rows));
+    col_rel_t *right = NULL;
+    bool ok;
+
+    memset(f, 0, sizeof(*f));
+    f->sess = pipeline_session();
+    f->governor = a1_governor(UINT64_C(1) << 28);
+    f->left = pipeline_relation("left", left_names, 2, left_rows, 1);
+    ok = right_rows && f->sess && f->governor && f->left
+        && (!timestamped || col_rel_enable_timestamps(f->left) == 0);
+    for (uint32_t i = 0; ok && i < fanout; i++)
+        right_rows[2u * i + 1u] = i;
+    if (ok)
+        right = pipeline_relation("right", right_names, 2, right_rows,
+                fanout);
+    ok = ok && right && session_add_rel(f->sess, right) == 0;
+    if (!ok)
+        col_rel_destroy(right);
+    ok = ok && col_session_get_arrangement(&f->sess->base, "right",
+            (const uint32_t[]){ 0 }, 1) != NULL;
+    free(right_rows);
+    a1_join(&f->join, "right", WL_DELTA_AUTO);
+    if (ok)
+        f->sess->memory_governor = f->governor;
+    return ok;
+}
+
+static void
+d5_fixture_fini(d5_fixture_t *f)
+{
+    d5_watch_governor(NULL);
+    col_rel_destroy(f->left);
+    if (f->sess) {
+        /* pipeline_session_destroy does not free differential
+         * arrangements; the differential guards leave one behind. */
+        col_session_free_diff_arrangements(f->sess);
+        f->sess->memory_governor = NULL;
+    }
+    pipeline_session_destroy(f->sess);
+    if (f->governor)
+        wl_columnar_memory_governor_ref_release(f->governor);
+    memset(f, 0, sizeof(*f));
+}
+
+/* The scratch relation's terms, from a relation created exactly as the
+ * producer creates its scratch (@name, the output width, COL_REL_INIT_CAP,
+ * the timestamp flag, the join's column types) on its own governor.  The
+ * relation is kept for P(n). */
+typedef struct {
+    col_rel_t *rel;
+    wl_columnar_memory_governor_ref_t *governor;
+    uint64_t s_end;
+    uint64_t s_peak;
+    uint64_t r;
+} d5_scratch_t;
+
+static bool
+d5_scratch_init(d5_scratch_t *s, const d5_fixture_t *f, const char *name,
+    bool timestamped)
+{
+    col_rel_t *right = session_find_rel(f->sess, "right");
+    uint32_t ocols = right ? col_join_output_width(f->left, right, &f->join)
+        : 0;
+    bool ok;
+
+    memset(s, 0, sizeof(*s));
+    s->governor = a1_governor(UINT64_C(1) << 28);
+    if (!s->governor || !right)
+        return false;
+    d5_watch_governor(s->governor);
+    ok = wl_columnar_relation_new_auto_governed(name, ocols,
+            COL_REL_INIT_CAP, timestamped, s->governor, &s->rel) == 0
+        && col_join_set_output_types(s->rel, f->left, right, &f->join) == 0
+        && (!timestamped || s->rel->timestamps
+        || col_rel_enable_timestamps(s->rel) == 0);
+    s->s_peak = d5_high;
+    s->s_end = a1_reserved(s->governor);
+    d5_watch_governor(NULL);
+    s->r = (uint64_t)ocols * sizeof(int64_t);
+    return ok;
+}
+
+static void
+d5_scratch_fini(d5_scratch_t *s)
+{
+    col_rel_destroy(s->rel);
+    if (s->governor)
+        wl_columnar_memory_governor_ref_release(s->governor);
+    memset(s, 0, sizeof(*s));
+}
+
+static uint64_t
+d5_p(const col_rel_t *rel, uint32_t rows)
+{
+    uint64_t bytes = 0;
+    return col_rel_retained_bytes_for(rel, rows, &bytes) ? bytes : 0;
+}
+
+/* Replay the scratch rule from COL_REL_INIT_CAP up to @limit rows:
+ * cap < rpb / 2 ? 2 * cap : rpb.  Returns the final capacity and stores the
+ * largest P(old) + P(new) + R of any step in *@transient (0 if none). */
+static uint32_t
+d5_replay_scratch(const d5_scratch_t *s, uint32_t rpb, uint32_t limit,
+    uint64_t *transient)
+{
+    uint32_t cap = COL_REL_INIT_CAP;
+
+    *transient = 0;
+    while (cap < limit && cap < rpb) {
+        uint32_t next = cap < rpb / 2u ? cap * 2u : rpb;
+        uint64_t t = d5_p(s->rel, cap) + d5_p(s->rel, next) + s->r;
+        if (t > *transient)
+            *transient = t;
+        cap = next;
+    }
+    return cap;
+}
+
+typedef struct {
+    uint64_t base;
+    uint64_t create_peak;
+    uint64_t after_create;
+    uint64_t run_peak;
+    uint64_t end;
+    uint64_t descriptor;
+    uint32_t rpb;
+    uint32_t scratch_cap;
+} d5_run_t;
+
+/* Create a producer (@diff selects col_diff_join_batch_producer_create)
+ * with batch bytes for @rpb rows of @s, drain it into a sink that keeps
+ * nothing, and record the governor totals. */
+static bool
+d5_run_producer(d5_fixture_t *f, const d5_scratch_t *s, bool diff,
+    uint32_t rpb, d5_run_t *run)
+{
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink = { 0 };
+    uint64_t batch_bytes = (uint64_t)rpb * d5_p(s->rel, 1);
+    int rc;
+
+    memset(run, 0, sizeof(*run));
+    sink.begin = d5_sink_ok;
+    sink.reserve = d5_sink_reserve;
+    sink.append = d5_sink_ok;
+    sink.commit = d5_sink_commit;
+    sink.abort = d5_sink_abort;
+    run->base = a1_reserved(f->governor);
+    d5_watch_governor(f->governor);
+    rc = diff ? col_diff_join_batch_producer_create(f->sess, &f->join,
+            f->left, false, &f->lk, &f->rk, 1, batch_bytes, &cont)
+        : col_join_batch_producer_create(f->sess, &f->join, f->left, false,
+            &f->lk, &f->rk, 1, (uint32_t)batch_bytes, &cont);
+    run->create_peak = d5_high;
+    run->after_create = a1_reserved(f->governor);
+    if (rc != 0) {
+        d5_watch_governor(NULL);
+        return false;
+    }
+    run->descriptor = diff ? col_diff_join_batch_descriptor_bytes(cont)
+        : col_join_batch_descriptor_bytes(cont);
+    run->rpb = diff ? col_diff_join_batch_rows_per_batch(cont)
+        : col_join_batch_rows_per_batch(cont);
+    d5_high = run->after_create;
+    if (!d5_drain(cont, &sink)) {
+        d5_watch_governor(NULL);
+        wl_columnar_continuation_destroy(cont);
+        return false;
+    }
+    run->run_peak = d5_high;
+    run->end = a1_reserved(f->governor);
+    run->scratch_cap = diff ? col_diff_join_batch_scratch_capacity(cont)
+        : col_join_batch_scratch_capacity(cont);
+    d5_watch_governor(NULL);
+    wl_columnar_continuation_destroy(cont);
+    return true;
+}
+
+/* The section 10a equalities for one producer run. */
+static bool
+d5_producer_equalities(const char *what, const d5_run_t *run,
+    const d5_scratch_t *s, uint32_t rpb, uint32_t fanout, bool check_create)
+{
+    uint64_t p64 = d5_p(s->rel, COL_REL_INIT_CAP);
+    uint64_t steady = s->s_end - p64; /* S */
+    uint64_t transient;
+    uint32_t cap = d5_replay_scratch(s, rpb, fanout, &transient);
+    uint64_t want_peak = transient
+        ? run->descriptor + steady + transient : run->after_create - run->base;
+    bool ok = run->descriptor > 0 && run->rpb == rpb
+        && (!check_create || run->create_peak - run->base
+        == run->descriptor + s->s_peak)
+        && run->after_create - run->base == run->descriptor + s->s_end
+        && run->run_peak - run->base == want_peak
+        && run->end - run->base == run->descriptor + steady + d5_p(s->rel, cap)
+        && run->scratch_cap == cap;
+
+    if (!ok)
+        fprintf(stderr, "  %s: D=%llu S_end=%llu S_peak=%llu P64=%llu "
+            "base=%llu create_peak=%llu after_create=%llu run_peak=%llu "
+            "(want %llu) end=%llu cap=%u (want %u) rpb=%u\n", what,
+            (unsigned long long)run->descriptor,
+            (unsigned long long)s->s_end, (unsigned long long)s->s_peak,
+            (unsigned long long)p64, (unsigned long long)run->base,
+            (unsigned long long)run->create_peak,
+            (unsigned long long)run->after_create,
+            (unsigned long long)run->run_peak,
+            (unsigned long long)(run->base + want_peak),
+            (unsigned long long)run->end, run->scratch_cap, cap, run->rpb);
+    return ok;
+}
+
+#define D5_FANOUT 4096u
+
+/* G1 (rpb 100 and 1000, untimestamped and timestamped left) and G2 (rpb 7,
+ * the 64-row floor): the non-differential producer. */
+static void
+test_producer_bound_nondiff(void)
+{
+    static const uint32_t rpbs[] = { 100u, 1000u, 7u };
+
+    for (int timestamped = 0; timestamped < 2; timestamped++) {
+        for (size_t i = 0; i < sizeof(rpbs) / sizeof(rpbs[0]); i++) {
+            d5_fixture_t f;
+            d5_scratch_t s;
+            d5_run_t run;
+            char what[96];
+            bool ok;
+
+            snprintf(what, sizeof(what), "G%s non-differential producer "
+                "bound, rpb %u%s", rpbs[i] < COL_REL_INIT_CAP ? "2" : "1",
+                rpbs[i], timestamped ? ", timestamped left" : "");
+            ok = d5_fixture_init(&f, D5_FANOUT, timestamped != 0)
+                && d5_scratch_init(&s, &f, "$join_batch", timestamped != 0);
+            ok = ok && d5_run_producer(&f, &s, false, rpbs[i], &run)
+                && d5_producer_equalities(what, &run, &s, rpbs[i],
+                    D5_FANOUT, true);
+            CHECK(ok, what);
+            d5_scratch_fini(&s);
+            d5_fixture_fini(&f);
+        }
+    }
+}
+
+/* G3: the non-differential producer into a relation sink, rpb 100.  The
+ * run peak is checked as an upper bound (the larger of the producer's and
+ * the output's growth transients, each with the other's footprint); the
+ * output's growth rule is pinned by its final capacity, which for
+ * D5_SINK_ROWS (between 1024 and 2048) is 2048 under doubling but 4096 under
+ * a 4x rule. */
+#define D5_SINK_ROWS 1500u
+
+static void
+test_producer_bound_relation_sink(void)
+{
+    const uint32_t rpb = 100u;
+    d5_fixture_t f;
+    d5_scratch_t s;
+    col_rel_t *out = NULL;
+    col_join_batch_relation_sink_t sctx;
+    wl_columnar_continuation_sink_t sink;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t base = 0;
+    uint64_t attached = 0;
+    uint64_t peak = 0;
+    uint64_t end = 0;
+    uint64_t descriptor = 0;
+    uint32_t out_cap0 = 0;
+    bool ok = d5_fixture_init(&f, D5_SINK_ROWS, false)
+        && d5_scratch_init(&s, &f, "$join_batch", false);
+    col_rel_t *right = ok ? session_find_rel(f.sess, "right") : NULL;
+
+    ok = ok && right;
+    if (ok) {
+        out = col_rel_new_auto("out", col_join_output_width(f.left, right,
+                &f.join));
+        ok = out && col_join_set_output_types(out, f.left, right, &f.join)
+            == 0;
+    }
+    if (ok) {
+        base = a1_reserved(f.governor);
+        ok = col_join_batch_relation_sink_init(&sctx, &sink, f.sess, out)
+            == 0;
+        attached = a1_reserved(f.governor) - base;
+        out_cap0 = out->capacity;
+    }
+    if (ok) {
+        d5_watch_governor(f.governor);
+        ok = col_join_batch_producer_create(f.sess, &f.join, f.left, false,
+                &f.lk, &f.rk, 1, (uint32_t)(rpb * d5_p(s.rel, 1)),
+                &cont) == 0;
+        descriptor = ok ? col_join_batch_descriptor_bytes(cont) : 0;
+        ok = ok && d5_drain(cont, &sink);
+        peak = d5_high;
+        end = a1_reserved(f.governor);
+        d5_watch_governor(NULL);
+    }
+    if (ok) {
+        uint64_t steady = s.s_end - d5_p(s.rel, COL_REL_INIT_CAP);
+        uint64_t transient;
+        uint32_t cap = d5_replay_scratch(&s, rpb, D5_SINK_ROWS, &transient);
+        uint64_t o_fixed = attached - d5_p(out, out_cap0);
+        uint64_t out_transient = 0;
+        uint32_t out_cap = out_cap0;
+        uint64_t rows = 0;
+        uint64_t producer_steady = descriptor + steady + d5_p(s.rel, cap);
+        uint64_t bound;
+
+        /* Replay the sink: new = max(2 * old, need) whenever a batch of
+         * rpb rows (the last one shorter) does not fit. */
+        while (rows < D5_SINK_ROWS) {
+            uint64_t batch = D5_SINK_ROWS - rows < rpb
+                ? D5_SINK_ROWS - rows : rpb;
+            uint64_t need = rows + batch;
+            if (need > out_cap) {
+                uint32_t next = 2u * out_cap > need ? 2u * out_cap
+                    : (uint32_t)need;
+                uint64_t t = d5_p(out, out_cap) + d5_p(out, next) + s.r;
+                if (t > out_transient)
+                    out_transient = t;
+                out_cap = next;
+            }
+            rows = need;
+        }
+        bound = descriptor + steady + transient + o_fixed
+            + d5_p(out, out_cap0);
+        if (producer_steady + o_fixed + out_transient > bound)
+            bound = producer_steady + o_fixed + out_transient;
+        ok = descriptor > 0 && out->nrows == D5_SINK_ROWS
+            && out->capacity == out_cap && peak - base <= bound
+            && end - base == producer_steady + o_fixed
+            + d5_p(out, out->capacity);
+        if (!ok)
+            fprintf(stderr, "  G3: D=%llu peak=%llu bound=%llu end=%llu "
+                "out_cap=%u (want %u) O=%llu\n",
+                (unsigned long long)descriptor,
+                (unsigned long long)(peak - base),
+                (unsigned long long)bound, (unsigned long long)(end - base),
+                out->capacity, out_cap, (unsigned long long)o_fixed);
+    }
+    CHECK(ok, "G3 producer and relation sink stay within the bound");
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(out);
+    d5_scratch_fini(&s);
+    d5_fixture_fini(&f);
+}
+
+/* G4 and G5: the differential producer, isolated from the right relation's
+ * arrangement by a first create that indexes and commits it. */
+static void
+test_producer_bound_diff(void)
+{
+    const uint32_t rpb = 100u;
+    d5_fixture_t f;
+    d5_scratch_t s;
+    d5_run_t first;
+    d5_run_t run;
+    uint64_t before = 0;
+    uint64_t arrangement = 0;
+    bool ok = d5_fixture_init(&f, D5_FANOUT, false)
+        && d5_scratch_init(&s, &f, "$diff_join_batch", false);
+
+    if (ok) {
+        before = a1_reserved(f.governor);
+        ok = d5_run_producer(&f, &s, true, rpb, &first);
+        arrangement = a1_reserved(f.governor) - before;
+    }
+    ok = ok && arrangement > 0 && d5_run_producer(&f, &s, true, rpb, &run);
+    CHECK(ok && d5_producer_equalities("G4 differential producer bound",
+        &run, &s, rpb, D5_FANOUT, false),
+        "G4 differential producer bound, rpb 100");
+    /* G5: the second create deep-copies the committed arrangement while
+     * the governor still holds it; there is no new row, so the copy's hash
+     * table does not grow. */
+    if (ok && (run.create_peak - run.base < arrangement
+        || run.create_peak - run.base
+        > run.descriptor + arrangement + s.s_peak))
+        fprintf(stderr, "  G5: create peak %llu, arrangement %llu, D %llu, "
+            "S_peak %llu\n", (unsigned long long)(run.create_peak - run.base),
+            (unsigned long long)arrangement,
+            (unsigned long long)run.descriptor, (unsigned long long)s.s_peak);
+    CHECK(ok && run.create_peak - run.base >= arrangement
+        && run.create_peak - run.base
+        <= run.descriptor + arrangement + s.s_peak,
+        "G5 a later differential create holds the arrangement twice");
+    d5_scratch_fini(&s);
+    d5_fixture_fini(&f);
+}
+
 int
 main(void)
 {
@@ -4157,6 +4646,9 @@ main(void)
     test_emit_rejects_set_for_other_keys();
     test_stage_census();
     test_bounded_join_budget_denials_reported();
+    test_producer_bound_nondiff();
+    test_producer_bound_relation_sink();
+    test_producer_bound_diff();
     test_semijoin_pass_through_borrowed_variable();
     test_semijoin_pass_through_drops_segments();
     test_semijoin_keep_all_stage_unchanged();
