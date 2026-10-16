@@ -134,16 +134,16 @@ parity(const program_t *p, const int64_t *row, uint32_t ncols,
     int64_t expected = 123;
     wl_columnar_expr_compiled_t *raw = wl_columnar_expr_compile(p->bytes,
             p->size, NULL);
-    int semantic;
+    CHECK(raw);
+    int semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
     if (float_variable) {
-        CHECK(raw == NULL); /* Real existing producer refuses VAR_FLOAT. */
-        semantic = wl_columnar_expr_eval_run(p->bytes, p->size, row, ncols,
-                &expected, NULL);
-    } else {
-        CHECK(raw != NULL);
-        semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
-        wl_columnar_expr_compiled_free(raw);
+        int64_t interpreted = 123;
+        int interpreted_error = wl_columnar_expr_eval_run(p->bytes, p->size,
+                row, ncols, &interpreted, NULL);
+        CHECK((semantic != 0) == (interpreted_error != 0));
+        if (!semantic) CHECK(expected == interpreted);
     }
+    wl_columnar_expr_compiled_free(raw);
     if (semantic)
         expected = 0;
     uint64_t cost = compile_cost(p, false);
@@ -805,7 +805,18 @@ attempt_program_support(void)
                 "col123456789");
             wl_columnar_expr_compiled_t *raw =
                 wl_columnar_expr_compile(p.bytes, p.size, NULL);
-            CHECK((raw == NULL) == (floating != 0));
+            CHECK(raw);
+            wirelog_column_type_t type = WIRELOG_TYPE_BOOL;
+            CHECK(wl_columnar_expr_compiled_result_type(raw, NULL, 0, &type));
+            CHECK(type == (floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+            int64_t value = 41, interpreted = 41;
+            int raw_error = wl_columnar_expr_eval_compiled(raw, NULL, 0,
+                    &value);
+            int interpreter_error = wl_columnar_expr_eval_run(p.bytes,
+                    p.size, NULL, 0, &interpreted, NULL);
+            CHECK((raw_error != 0) == (floating != 0));
+            CHECK((raw_error != 0) == (interpreter_error != 0));
+            if (!raw_error) CHECK(value == 0 && interpreted == 0);
             wl_columnar_expr_compiled_free(raw);
             wl_evaluation_control_t *c = attempt_begin(0);
             wl_columnar_expr_attempt_numeric_t *x =
@@ -1265,16 +1276,16 @@ eval_attempt_parity(const program_t *p, const int64_t *row, uint32_t ncols,
     int64_t expected = 123;
     wl_columnar_expr_compiled_t *raw =
         wl_columnar_expr_compile(p->bytes, p->size, NULL);
-    int semantic;
+    CHECK(raw);
+    int semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
     if (float_variable) {
-        CHECK(!raw);
-        semantic = wl_columnar_expr_eval_run(p->bytes, p->size, row, ncols,
-                &expected, NULL);
-    } else {
-        CHECK(raw);
-        semantic = wl_columnar_expr_eval_compiled(raw, row, ncols, &expected);
-        wl_columnar_expr_compiled_free(raw);
+        int64_t interpreted = 123;
+        int interpreted_error = wl_columnar_expr_eval_run(p->bytes, p->size,
+                row, ncols, &interpreted, NULL);
+        CHECK((semantic != 0) == (interpreted_error != 0));
+        if (!semantic) CHECK(expected == interpreted);
     }
+    wl_columnar_expr_compiled_free(raw);
     if (semantic) expected = 0;
     for (unsigned governed = 0; governed < 2; governed++) {
         wl_columnar_memory_governor_ref_t *g =
@@ -1664,6 +1675,185 @@ eval_attempt_lifecycle(void)
     CHECK(!eval_control && !wl_columnar_expr_test_checkpoint);
 }
 
+/* Independent schema and payload oracles, including accepted legacy stack
+ * shapes where the last decoded opcode does not supply the returned value. */
+static void
+result_schema_case(const program_t *p, const wirelog_column_type_t *types,
+    const int64_t *row, uint32_t ncols, wirelog_column_type_t expected_type,
+    int64_t expected_value)
+{
+    wl_columnar_expr_compiled_t *raw = wl_columnar_expr_compile(p->bytes,
+            p->size, NULL);
+    CHECK(raw);
+    wirelog_column_type_t type = WIRELOG_TYPE_STRING;
+    CHECK(wl_columnar_expr_compiled_result_type(raw, types, ncols, &type));
+    CHECK(type == expected_type);
+    int64_t value = 41;
+    CHECK(!wl_columnar_expr_eval_compiled(raw, row, ncols, &value));
+    CHECK(value == expected_value);
+    wl_columnar_expr_compiled_free(raw);
+    wl_columnar_expr_attempt_numeric_t *numeric = eval_attempt_prepare(p,
+            NULL);
+    for (unsigned replay = 0; replay < 3; ++replay) {
+        wl_evaluation_control_t *c = control(replay ? 128 : 127);
+        type = WIRELOG_TYPE_STRING;
+        bool supported = false;
+        int rc = wl_columnar_expr_result_type_attempt_controlled(numeric,
+                types, ncols, &type, &supported, c,
+                wl_evaluation_control_active_attempt_id(c));
+        if (!replay) {
+            CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(type == WIRELOG_TYPE_STRING && !supported);
+            CHECK(finish(c, rc) == 0);
+        } else {
+            CHECK(!rc && supported && type == expected_type);
+            CHECK(finish(c, 0) == 128);
+        }
+    }
+    wl_evaluation_control_t *c = control(0);
+    bool failed = true;
+    CHECK(!wl_columnar_expr_eval_attempt_controlled(numeric, row, ncols,
+        &value, &failed, c, wl_evaluation_control_active_attempt_id(c)));
+    CHECK(!failed && value == expected_value);
+    (void)finish(c, 0);
+    wl_columnar_expr_attempt_numeric_free(numeric);
+}
+
+static void
+result_schema(void)
+{
+    const wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT64, WIRELOG_TYPE_UINT32,
+        WIRELOG_TYPE_UINT64, WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_STRING,
+        WIRELOG_TYPE_BOOL,
+    };
+    int64_t row[] = {7, -3, 9, 11, 0, 13, 1};
+    row[4] = bits(-2.5);
+    for (unsigned i = 0; i < 7; ++i) {
+        program_t p = {0}; char name[8];
+        snprintf(name, sizeof(name), "col%u", i);
+        variable(&p, WL_PLAN_EXPR_VAR, name);
+        result_schema_case(&p, types, row, 7, types[i], row[i]);
+        result_schema_case(&p, NULL, row, 7, WIRELOG_TYPE_INT64, row[i]);
+    }
+    program_t p = {0}; variable(&p, WL_PLAN_EXPR_VAR, "col99");
+    result_schema_case(&p, types, row, 7, WIRELOG_TYPE_INT64, 0);
+    result_schema_case(&p, types, NULL, 0, WIRELOG_TYPE_INT64, 0);
+    p = (program_t){0}; variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col4");
+    result_schema_case(&p, types, row, 7, WIRELOG_TYPE_FLOAT, bits(-2.5));
+    result_schema_case(&p, NULL, row, 7, WIRELOG_TYPE_FLOAT, bits(-2.5));
+    p = (program_t){0};
+    constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(-2.0));
+    constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(0.5));
+    op(&p, WL_PLAN_EXPR_ARITH_FLOAT_ADD);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_FLOAT, bits(-1.5));
+    op(&p, WL_PLAN_EXPR_AGG_SUM); /* Final opcode is an ignored no-op. */
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_FLOAT, bits(-1.5));
+    constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(0.0));
+    op(&p, WL_PLAN_EXPR_CMP_FLOAT_LT);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_BOOL, 1);
+    p = (program_t){0}; op(&p, WL_PLAN_EXPR_ARITH_ADD);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_INT64, 0);
+    p = (program_t){0}; op(&p, WL_PLAN_EXPR_ARITH_BNOT);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_INT64, -1);
+    p = (program_t){0}; op(&p, WL_PLAN_EXPR_AGG_COUNT);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_INT64, 0);
+    p = (program_t){0}; constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(-0.0));
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 27);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_INT64, 27);
+    p = (program_t){0};
+    for (unsigned i = 0; i < 63; ++i)
+        constant(&p, WL_PLAN_EXPR_CONST_INT, i);
+    constant(&p, WL_PLAN_EXPR_CONST_FLOAT, bits(-2.5));
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 999); /* Dropped full-stack push. */
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_FLOAT, bits(-2.5));
+    op(&p, WL_PLAN_EXPR_ARITH_BNOT);
+    result_schema_case(&p, NULL, NULL, 0, WIRELOG_TYPE_INT64, ~bits(-2.5));
+    wirelog_column_type_t untouched = WIRELOG_TYPE_BOOL;
+    CHECK(!wl_columnar_expr_compiled_result_type(NULL, NULL, 0, &untouched));
+    CHECK(untouched == WIRELOG_TYPE_BOOL);
+    p = (program_t){0}; constant(&p, WL_PLAN_EXPR_CONST_INT, 1);
+    wl_columnar_expr_attempt_numeric_t *numeric = eval_attempt_prepare(&p,
+            NULL);
+    wl_evaluation_control_t *c = control(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    bool supported = false;
+    CHECK(wl_columnar_expr_result_type_attempt_controlled(numeric, NULL, 0,
+        &untouched, &supported, c, id + 1) == EINVAL);
+    CHECK(untouched == WIRELOG_TYPE_BOOL && !supported);
+    CHECK(!wl_evaluation_control_finish(c, &owner_key, 0, 0));
+    CHECK(!wl_evaluation_control_reset(c));
+    CHECK(!wl_evaluation_control_begin(c, &owner_key));
+    CHECK(wl_columnar_expr_result_type_attempt_controlled(numeric, NULL, 0,
+        &untouched, &supported, c, id) == EINVAL);
+    CHECK(untouched == WIRELOG_TYPE_BOOL && !supported);
+    CHECK(finish(c, 0) == 0);
+    c = control(0);
+    cancel_phase = 23; cancel_progress = 0; cancel_failure = false;
+    wl_columnar_expr_test_checkpoint = checkpoint;
+    int stopped = wl_columnar_expr_result_type_attempt_controlled(numeric,
+            NULL, 0, &untouched, &supported, c,
+            wl_evaluation_control_active_attempt_id(c));
+    CHECK(stopped == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(untouched == WIRELOG_TYPE_BOOL && !supported);
+    CHECK(finish(c, stopped) == 128);
+    wl_columnar_expr_test_checkpoint = NULL; cancel_phase = 0;
+    wl_columnar_expr_attempt_numeric_free(numeric);
+}
+
+static void
+raw_float_variable_decoding(void)
+{
+    program_t p = {0}; variable(&p, WL_PLAN_EXPR_VAR_FLOAT, "col0");
+    uint32_t pos = 0, column = 91;
+    CHECK(!wl_columnar_expr_parse_var_col(p.bytes, p.size, &pos, &column));
+    CHECK(pos == 0 && column == 91); /* Preserve the integer FILTER matcher. */
+    for (uint32_t cut = 0; cut < p.size; ++cut)
+        CHECK(!wl_columnar_expr_compile(p.bytes, cut, NULL));
+    const char *bad_names[] = {"xol0", "col-1", "col", "col1234567890"};
+    for (unsigned i = 0; i < 4; ++i) {
+        program_t bad = {0};
+        variable(&bad, WL_PLAN_EXPR_VAR_FLOAT, bad_names[i]);
+        CHECK(!wl_columnar_expr_compile(bad.bytes, bad.size, NULL));
+    }
+    const double values[] = {-2.5, -0.0, 0.0, INFINITY, -INFINITY, NAN};
+    for (unsigned i = 0; i < 6; ++i) {
+        int64_t row = bits(values[i]);
+        parity(&p, &row, 1, true, 1, 1);
+        eval_attempt_parity(&p, &row, 1, true, 1, 1);
+    }
+    parity(&p, NULL, 0, true, 1, 0);
+    eval_attempt_parity(&p, NULL, 0, true, 1, 0);
+    wirelog_column_type_t inconsistent = WIRELOG_TYPE_INT32;
+    int64_t finite = bits(-2.5);
+    result_schema_case(&p, &inconsistent, &finite, 1, WIRELOG_TYPE_FLOAT,
+        finite);
+
+    /* A FLOAT load followed by an integer comparison must still validate the
+     * load. Broadening the shared parser would bypass this in the raw matcher. */
+    constant(&p, WL_PLAN_EXPR_CONST_INT, 0);
+    op(&p, WL_PLAN_EXPR_CMP_GT);
+    for (unsigned i = 3; i < 6; ++i) {
+        wl_col_session_t session = {0};
+        eval_stack_t stack = {0};
+        col_rel_t *input = col_rel_new_auto("$float_guard", 1);
+        int64_t row = bits(values[i]), ignored = 1;
+        CHECK(input && !col_rel_append_row(input, &row));
+        CHECK(wl_columnar_expr_eval_run(p.bytes, p.size, &row, 1, &ignored,
+            NULL) != 0);
+        CHECK(!eval_stack_push(&stack, input, true));
+        wl_plan_op_t filter = {.op = WL_PLAN_OP_FILTER,
+                               .filter_expr = {.data = p.bytes,
+                                               .size = p.size}};
+        /* FILTER treats expression failure as a rejected row. The integer
+        * fast path would instead accept positive Inf/NaN payload bits. */
+        CHECK(!wl_columnar_filter_op(&filter, &stack, &session));
+        CHECK(stack.top == 1 && stack.items[0].owned &&
+            stack.items[0].rel->nrows == 0);
+        CHECK(!eval_stack_drain(&stack));
+    }
+}
+
 int
 main(void)
 {
@@ -1676,6 +1866,8 @@ main(void)
     wl_columnar_expr_test_checkpoint = NULL;
     attempt_compile_lifecycle();
     eval_attempt_lifecycle();
+    result_schema();
+    raw_float_variable_decoding();
     puts("numeric lifecycle: PASS");
     return 0;
 }
