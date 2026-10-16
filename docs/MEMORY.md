@@ -1226,13 +1226,16 @@ eligible keyed join run the resumable sub-batch producer in
 `wirelog/columnar/join_batch.c` instead of the one-shot probe loop.
 Eligible means: `key_count > 0`, a persistent primary arrangement on the
 right relation, no right-side delta, no right filter expression, and a
-coordinator or single session (TDD workers are excluded, so the shared
-row counter never applies).  Every other shape falls back to the one-shot
-join; the session records the fallback count and last reason and logs one
-`JOIN` warning per reason.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless
-the bytes knob is set) turns a fallback into an `ENOTSUP` failure, which is
-the explicit bounded-mode result for unsupported shapes.  Differential
-keyed joins have the separate producer described below.
+coordinator or single session (TDD workers are excluded, so the shared row
+counter never applies).  Every other shape falls back to the one-shot join;
+the session records the fallback count and last reason and logs one `JOIN`
+warning per reason.  A worker session starts with its own count and reason
+cleared, and its teardown folds them into the coordinator (#1382), so a
+coordinator's count includes what its workers recorded once they are
+destroyed.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes knob is
+set) turns a fallback into an `ENOTSUP` failure, which is the explicit
+bounded-mode result for unsupported shapes.  Differential keyed joins have
+the separate producer described below.
 
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the

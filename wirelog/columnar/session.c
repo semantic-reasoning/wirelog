@@ -10,6 +10,7 @@
 
 #include "columnar/compound_side.h"
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
 
 #include "../wirelog-internal.h"
@@ -3865,6 +3866,11 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->coordinator = coordinator;
     out_worker->teardown_started = false;
     out_worker->teardown_reported = false;
+    /* A worker's bounded-join fallbacks are its own until teardown folds
+     * them into the coordinator (#1382); the warned mask stays inherited
+     * so a reason the coordinator already warned about is not repeated. */
+    out_worker->join_batch_fallback_count = 0;
+    out_worker->join_batch_last_reason = 0;
     out_worker->memory_governor = coordinator->memory_governor;
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
     out_worker->extension_expr_status = 0;
@@ -4167,6 +4173,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (!worker->teardown_reported) {
         col_session_mem_sample(worker);
         col_session_mem_note_worker(worker->coordinator, worker);
+        col_join_batch_fold_worker(worker->coordinator, worker);
         worker->teardown_reported = true;
     }
     if (worker->mem_report_level >= 2) {

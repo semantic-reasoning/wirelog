@@ -99,6 +99,24 @@ col_join_batch_record_fallback(wl_col_session_t *sess,
             col_join_batch_eligibility_name(reason));
 }
 
+void
+col_join_batch_fold_worker(wl_col_session_t *coordinator,
+    const wl_col_session_t *worker)
+{
+    uint32_t count;
+
+    if (!coordinator || !worker)
+        return;
+    coordinator->join_batch_warned_reasons |= worker->join_batch_warned_reasons;
+    count = worker->join_batch_fallback_count;
+    if (count == 0)
+        return;
+    coordinator->join_batch_fallback_count
+        = count > UINT32_MAX - coordinator->join_batch_fallback_count
+        ? UINT32_MAX : coordinator->join_batch_fallback_count + count;
+    coordinator->join_batch_last_reason = worker->join_batch_last_reason;
+}
+
 /* ---- producer ---------------------------------------------------------- */
 
 typedef struct {

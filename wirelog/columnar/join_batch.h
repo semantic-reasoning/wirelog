@@ -56,6 +56,16 @@ void
 col_join_batch_record_fallback(wl_col_session_t *sess,
     col_join_batch_eligibility_t reason);
 
+/* Fold the fallbacks @worker recorded into @coordinator (#1382): adds the
+ * count (saturating), takes the worker's last reason when it recorded any,
+ * and merges the warned-reasons mask, so workers created later do not warn
+ * again about a reason already warned about (workers of the same round may
+ * each warn once).  Called once per worker, on the coordinator's thread,
+ * when the worker's teardown is reported. */
+void
+col_join_batch_fold_worker(wl_col_session_t *coordinator,
+    const wl_col_session_t *worker);
+
 /* Producer position: the first UNEXAMINED candidate pair.  rr == UINT32_MAX
  * means "probe left row lr from its bucket head"; it is never stored for an
  * exhausted chain, so resuming can neither skip nor repeat a match. */
