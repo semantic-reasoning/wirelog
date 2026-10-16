@@ -39,6 +39,8 @@ typedef enum {
     COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE = 7,  /* batch budget < one row */
     COL_JOIN_BATCH_EXCLUDED_PIPELINE = 8,       /* downstream not consumable */
     COL_JOIN_BATCH_EXCLUDED_MATERIALIZED = 9,   /* differential, materialized */
+    COL_JOIN_BATCH_EXCLUDED_LFTJ = 10,          /* LFTJ is never bounded */
+    COL_JOIN_BATCH_REASON_COUNT                 /* not a reason */
 } col_join_batch_eligibility_t;
 
 col_join_batch_eligibility_t
