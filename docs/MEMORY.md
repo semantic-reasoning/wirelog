@@ -3054,3 +3054,55 @@ owned-input FINISH retry preserves the published output and uses fresh funding.
 Fixture setup, reports and generic arbitrary-width frame destruction are external
 work. This interface does not activate complete UNION queries, recursive
 consolidation or default cooperative evaluation.
+
+### Ordinary JOIN fragments in the numeric driver (#1821)
+
+The internal numeric continuation accepts an initial nonrecursive
+`VARIABLE -> JOIN/FILTER/MAP` fragment, or a prebound numeric input with a
+`JOIN/FILTER/MAP` tail. The source opcode scan finishes before source
+publication; the tail scan finishes before the first child. Each child uses
+the original numeric record, frame, session,
+native owner, operation control and saved attempt ID. JOIN rejects a different
+control or successor ID before admission or mutation. The standalone NULL-owner
+entry still supports its raw NULL-control route.
+
+Generated tests select the contiguous supported prefix and explicitly exclude
+the terminal `CONSOLIDATE`. This interface does not activate the default public
+evaluator or implement complete relation, stratum or recursive evaluation.
+Existing JOIN shape and scalar-session restrictions still apply. A later child
+failure retains the preceding committed intermediate; the fragment is not a
+single rollback transaction. Protocol consumption, child retirement, ACK and
+advance remain separate funded host actions.
+
+The actual fund helper has10 logical slots after its host poll, and its caller
+adds3. CHILD/ACK routing, pending stores and direct caller/engine returns give
+the production driver a19-slot cleanup caller, replacing the earlier16-slot
+domain. READY has19 slots after its real FORWARD poll and remains inside the
+existing32-slot forward caller. The owned entry's first refusal is at most222
+with that conservative32 allowance; successful initialization remains211.
+New owner/control predicates precede ENTRY. They do not extend the later
+COLUMN256, typed-constructor253 or B2 validation252 error-return intervals.
+
+Replacing16 by19 once in caller-composed cleanup bounds gives FINISH252,
+JOIN batch NEW241, right SOURCE169, scratch107 and JOIN_DECIDE240, all within
+the256 quantum. No cleanup body, resource owner, fee or phase was added.
+The 84 payments of 192 retain their 5376-current/10752-future partition: two 128
+future shares for each of 42 first-retirement capacities cover even 252, and
+unused shares are forfeited. Source-End and unary first-finish interiors retain
+their separate original funding. A retained retry requires a new host grant.
+
+The numeric function's pre-HOST prefix is61 slots. The test host's choice
+between step and consume adds2 before that poll, so its largest whole action
+is financed by63+252=315 within HOST384. The real host poll separates these
+intervals; neither315 nor384 is a polling quantum. Other hosts must account for
+their own routing and return work. Allocator and callback latency retain the
+existing exclusions.
+
+Integrated fixtures verify no-output collision cancellation and attempt
+turnover in the first and second JOIN, independently specified first-JOIN
+work limits, distinct allocation/governor/shape/output-cap failures, and real
+scratch credit refusal after physical disposal. Poor host grants preserve
+pending results and retained ownership. Original cleanup drains across a new
+operation attempt without charging it. Chained delta/projection tests inspect
+both committed JOINs before a MAP can clear their delta markers and compare
+the identical fragment against raw tuple-bag results.

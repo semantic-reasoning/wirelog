@@ -358,7 +358,14 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
  * session admission remain unchanged. Host grants pay dispatch and retry work;
  * child work continues to use its original operation attempt and own grants.
  * HOST includes read-only validation before admission as well as current
- * dispatch/retirement; its fee is distinct from the 256-slot poll quantum. */
+ * dispatch/retirement; its fee is distinct from the 256-slot poll quantum.
+ * The fund helper has10 post-poll slots, plus caller rc/guard3. Direct-return
+ * CHILD/ACK routing and its outer result/return give caller19; READY has19
+ * after its real FORWARD poll, within JOIN's total forward caller32. Replacing
+ * the older cleanup caller16 gives FINISH249-16+19=252, within256 and the two
+ * prepaid128 shares. Numeric validation before HOST is61; the fixture's engine
+ * selection adds2 before that poll, financing63+252=315 within384. These are
+ * logical source slots under MEMORY.md's exclusions, not elapsed time. */
 enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK = 384,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_FORWARD_WORK = 128
