@@ -582,7 +582,8 @@ wl_columnar_eval_plan_numeric_source_step(
         wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
         bool supported = record->cursor == record->source_begin
             ? kind == WL_PLAN_OP_VARIABLE
-            : kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP;
+            : kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP
+            || kind == WL_PLAN_OP_JOIN;
         if (!supported) {
             record->semantic_result = ENOTSUP;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
@@ -783,7 +784,8 @@ wl_columnar_eval_plan_numeric_attempt_step(
         rc = wl_columnar_eval_plan_numeric_forward(record);
         if (!rc) {
             wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
-            if (kind != WL_PLAN_OP_FILTER && kind != WL_PLAN_OP_MAP)
+            if (kind != WL_PLAN_OP_FILTER && kind != WL_PLAN_OP_MAP
+                && kind != WL_PLAN_OP_JOIN)
                 rc = ENOTSUP;
         }
         if (rc) {
@@ -803,15 +805,27 @@ wl_columnar_eval_plan_numeric_attempt_step(
         }
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
-        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_FILTER)
+        switch (record->plan->ops[record->cursor].op) {
+        case WL_PLAN_OP_FILTER:
             return wl_columnar_filter_op_attempt_start_owned(
                 &record->plan->ops[record->cursor], record->frame,
                 record->session, record->control, record->attempt_id,
                 &record->child_status, record);
-        return wl_columnar_filter_map_attempt_start_owned(
-            &record->plan->ops[record->cursor], record->frame,
-            record->session, record->control, record->attempt_id,
-            &record->child_status, record);
+        case WL_PLAN_OP_MAP:
+            return wl_columnar_filter_map_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_JOIN:
+            return wl_columnar_join_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        default:
+            record->semantic_result = ENOTSUP;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+            return 0;
+        }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;

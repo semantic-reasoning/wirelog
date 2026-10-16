@@ -309,7 +309,7 @@ test_boundaries(void)
     wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
     for (unsigned bad = 0; bad < 3; ++bad) {
         fixture_t f; fixture_init(&f, 1, 7, 0);
-        ops[bad].op = WL_PLAN_OP_JOIN;
+        ops[bad].op = WL_PLAN_OP_CONCAT;
         fixture_begin(&f, &plan, 0, 3); run(&f);
         CHECK(f.record.semantic_result == ENOTSUP && !f.record.completed);
         CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel
@@ -984,6 +984,211 @@ test_source_generated(void)
     }
 }
 
+/* JOIN hash chains may enumerate a bag in a different order. Match complete
+ * tuples, including their timestamps, once each; row-count parity alone would
+ * miss a duplicate-key loss or a wrong intermediate column. */
+static void
+same_join_bag(const col_rel_t *a, const col_rel_t *b)
+{
+    CHECK(a && b && a->nrows == b->nrows && a->ncols == b->ncols);
+    CHECK(a->has_graph_column == b->has_graph_column);
+    CHECK(a->graph_col_idx == b->graph_col_idx);
+    CHECK(a->declared_ncols == b->declared_ncols);
+    CHECK((a->timestamps != NULL) == (b->timestamps != NULL));
+    CHECK((a->column_types != NULL) == (b->column_types != NULL));
+    for (uint32_t c = 0; c < a->ncols; ++c) {
+        CHECK(!strcmp(a->col_names[c], b->col_names[c]));
+        if (a->column_types) CHECK(a->column_types[c] == b->column_types[c]);
+    }
+    bool *used = calloc(b->nrows ? b->nrows : 1, sizeof(*used));
+    CHECK(used);
+    for (uint32_t r = 0; r < a->nrows; ++r) {
+        uint32_t match = b->nrows;
+        for (uint32_t s = 0; s < b->nrows; ++s) {
+            if (used[s]) continue;
+            bool equal = true;
+            for (uint32_t c = 0; c < a->ncols; ++c)
+                equal = equal && wl_columnar_value_equal(a, c,
+                        col_rel_get(a, r, c), b, c, col_rel_get(b, s, c));
+            if (a->timestamps)
+                equal = equal &&
+                    a->timestamps[r].stratum == b->timestamps[s].stratum
+                    && a->timestamps[r].worker == b->timestamps[s].worker
+                    && a->timestamps[r]._reserved == b->timestamps[s]._reserved
+                    && a->timestamps[r].iteration == b->timestamps[s].iteration
+                    && a->timestamps[r].multiplicity ==
+                    b->timestamps[s].multiplicity;
+            if (equal) {
+                match = s; break;
+            }
+        }
+        CHECK(match < b->nrows); used[match] = true;
+    }
+    free(used);
+}
+
+static void
+join_raw_parity(fixture_t *f, const wl_plan_relation_t *fragment, bool prebound)
+{
+    wl_col_session_t raw = {0};
+    wl_mem_ledger_init(&raw.mem_ledger, 0);
+    raw.delta_seeded = f->session.delta_seeded;
+    raw.nrels = f->session.nrels; raw.rel_cap = raw.nrels;
+    raw.rels = calloc(raw.nrels ? raw.nrels : 1, sizeof(*raw.rels));
+    CHECK(raw.rels);
+    for (uint32_t i = 0; i < raw.nrels; ++i)
+        if (f->session.rels[i])
+            CHECK(!col_rel_deep_copy(f->session.rels[i], &raw.rels[i], NULL));
+    eval_stack_t stack = {0};
+    if (prebound) CHECK(!eval_stack_push(&stack, raw.rels[0], false));
+    for (uint32_t i = prebound ? 1 : 0; i < fragment->op_count; ++i) {
+        const wl_plan_op_t *op = &fragment->ops[i];
+        int rc;
+        switch (op->op) {
+        case WL_PLAN_OP_VARIABLE: rc = col_op_variable(op, &stack, &raw); break;
+        case WL_PLAN_OP_JOIN: rc = col_op_join(op, &stack, &raw); break;
+        case WL_PLAN_OP_FILTER: rc = wl_columnar_filter_op(op, &stack, &raw);
+            break;
+        case WL_PLAN_OP_MAP: rc = col_op_map(op, &stack, &raw); break;
+        default: abort();
+        }
+        CHECK(!rc);
+    }
+    eval_stack_t *actual = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(actual->top == 1 && stack.top == 1);
+    same_join_bag(actual->items[0].rel, stack.items[0].rel);
+    CHECK(actual->items[0].is_delta == stack.items[0].is_delta);
+    CHECK(!eval_stack_drain(&stack));
+    /* Raw JOIN may cache an arrangement; it is session-owned, not output-owned. */
+    for (uint32_t i = 0; i < raw.arr_count; ++i) {
+        CHECK(!raw.arr_entries[i].pin_count);
+        free(raw.arr_entries[i].rel_name); free(raw.arr_entries[i].key_cols);
+        arr_free_contents(&raw.arr_entries[i].arr);
+        col_arr_detach_memory_governor(&raw.arr_entries[i].arr);
+    }
+    free(raw.arr_entries); session_rel_free_hash(&raw);
+    for (uint32_t i = 0; i < raw.nrels; ++i) col_rel_destroy(raw.rels[i]);
+    free(raw.rels);
+    CHECK(!f->session.rel_hash_nbuckets && !f->session.arr_count);
+}
+
+static col_rel_t *
+join_float(col_rel_t *original)
+{
+    col_rel_t *rel = source_new(original->ncols, 0);
+    CHECK(!wl_columnar_relation_rename_checked(rel, original->name));
+    wirelog_column_type_t *types = calloc(rel->ncols, sizeof(*types));
+    int64_t *values = calloc(rel->ncols, sizeof(*values));
+    CHECK(types && values);
+    for (uint32_t c = 0; c < rel->ncols; ++c) types[c] = WIRELOG_TYPE_FLOAT;
+    CHECK(!col_rel_set_column_types(rel, types, rel->ncols));
+    free(types);
+    for (uint32_t r = 0; r < original->nrows; ++r) {
+        for (uint32_t c = 0; c < rel->ncols; ++c)
+            values[c] = wl_columnar_float_to_bits((double)(r + c));
+        CHECK(!col_rel_append_row(rel, values));
+    }
+    free(values); col_rel_destroy(original);
+    return rel;
+}
+
+static void
+test_generated_join_fragments(void)
+{
+    for (unsigned shape = 0; shape < 3; ++shape)
+        for (unsigned floating = 0; floating < 2; ++floating) {
+            const char *type = floating ? "float" : "int64";
+            const char *threshold = floating ? "2.0" : "2";
+            char text[1024];
+            if (!shape)
+                snprintf(text, sizeof(text),
+                    ".decl input(x: %s)\n.decl right(y: %s)\n"
+                    ".decl output(z: %s)\n"
+                    "output(x+y) :- input(x), right(y), x+y>%s.\n", type, type,
+                    type, threshold);
+            else if (shape == 1)
+                snprintf(text, sizeof(text),
+                    ".decl input(k: %s,x: %s)\n.decl right(k: %s,y: %s)\n"
+                    ".decl output(z: %s)\n"
+                    "output(x+y) :- input(k,x), right(k,y), x+y>%s.\n",
+                    type, type, type, type, type, threshold);
+            else
+                snprintf(text, sizeof(text),
+                    ".decl input(k: %s,x: %s)\n.decl right(k: %s,y: %s)\n"
+                    ".decl third(y: %s,z: %s)\n.decl output(z: %s)\n"
+                    "output(x+y+z) :- input(k,x), right(k,y), third(y,z), x+y+z>%s.\n",
+                    type, type, type, type, type, type, type, threshold);
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(text, &error);
+            wl_plan_t *plan = NULL;
+            CHECK(program && !wl_plan_from_program(program, &plan));
+            const wl_plan_relation_t *rp = NULL;
+            for (uint32_t s = 0; s < plan->stratum_count; ++s)
+                for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+                    if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                        rp = &plan->strata[s].relations[r];
+            CHECK(rp && rp->ops[0].op == WL_PLAN_OP_VARIABLE);
+            uint32_t end = 1, joins = 0, filters = 0, maps = 0;
+            while (end < rp->op_count) {
+                wl_plan_op_type_t kind = rp->ops[end].op;
+                if (kind == WL_PLAN_OP_JOIN) {
+                    ++joins;
+                    CHECK((rp->ops[end].key_count != 0) == (shape != 0));
+                } else if (kind == WL_PLAN_OP_FILTER) ++filters;
+                else if (kind == WL_PLAN_OP_MAP) ++maps;
+                else break;
+                ++end;
+            }
+            CHECK(joins == (shape == 2 ? 2u : 1u) && filters && maps);
+            /* Execute this contiguous prefix only. CONSOLIDATE belongs to the
+             * remaining generated relation, outside this interface. */
+            CHECK(end < rp->op_count &&
+                rp->ops[end].op == WL_PLAN_OP_CONSOLIDATE);
+            wl_plan_relation_t fragment = {.ops = rp->ops, .op_count = end};
+            for (unsigned prebound = 0; prebound < 2; ++prebound)
+                for (unsigned empty = 0; empty < 3; ++empty) {
+                    fixture_t f;
+                    uint32_t width = shape ? 2 : 1;
+                    if (prebound) fixture_init(&f, width, empty == 1 ? 0 : 7,
+                            0);
+                    else source_fixture(&f, width, empty == 1 ? 0 : 7, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(f.input,
+                        rp->ops[0].relation_name));
+                    col_rel_t *right = source_new(width, empty == 2 ? 0 : 5);
+                    col_rel_t *third = source_new(width, 3);
+                    CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                    CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+                    if (floating) {
+                        f.input = join_float(f.input);
+                        right = join_float(right); third = join_float(third);
+                        if (prebound)
+                            wl_columnar_eval_stack_cleanup_stack(
+                                f.frame)->items[0].rel = f.input;
+                    }
+                    col_rel_t *registry[] = {f.input, right, third};
+                    CHECK(!col_rel_enable_timestamps(f.input));
+                    for (uint32_t r = 0; r < f.input->nrows; ++r) {
+                        f.input->timestamps[r].iteration = r;
+                        f.input->timestamps[r].multiplicity = r % 2 ? -3 : 5;
+                    }
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 3;
+                        fixture_begin(&f, &fragment, 1, end);
+                    } else source_begin(&f, &fragment, registry, 3);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == end - 1);
+                    CHECK(f.record.source_installed == !prebound);
+                    join_raw_parity(&f, &fragment, prebound != 0);
+                    if (empty) CHECK(!wl_columnar_eval_stack_cleanup_stack(
+                                f.frame)->items[0].rel->nrows);
+                    fixture_close(&f); col_rel_destroy(right);
+                    col_rel_destroy(third);
+                }
+            wl_plan_free(plan); wirelog_program_free(program);
+        }
+}
+
 static void
 test_source_delta_modes(void)
 {
@@ -1273,7 +1478,7 @@ test_source_unsupported(void)
     }
     for (unsigned bad = 0; bad < 3; ++bad) {
         wl_plan_op_t invalid[] = {ops[0], ops[1], ops[1]};
-        invalid[bad].op = WL_PLAN_OP_JOIN;
+        invalid[bad].op = WL_PLAN_OP_CONCAT;
         wl_plan_relation_t unsupported = {.ops = invalid, .op_count = 3};
         fixture_t f; source_fixture(&f, 1, 7, 0);
         col_rel_t *registry[] = {f.input};
@@ -1512,6 +1717,7 @@ main(void)
 {
     test_owned_join_entry();
     test_owned_join_successor();
+    test_generated_join_fragments();
     test_generated(false); test_generated(true); test_boundaries();
     test_authority();
     test_intermediate_stop(); test_literal_prefixes(); test_retained_input();
