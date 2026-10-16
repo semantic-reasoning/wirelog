@@ -2588,6 +2588,27 @@ session_snapshot_insert_admitted(const wl_plan_t *plan, uint64_t mask)
     return true;
 }
 
+/* #1382: does a stratum in @mask hold a JOIN?  The insertion binder admits
+ * JOIN, SEMIJOIN, MAP and FILTER and refuses LFTJ and K-Fusion (they carry
+ * opaque_data), and only a JOIN would be a bounded-mode candidate. */
+static bool
+session_snapshot_insert_joins(const wl_plan_t *plan, uint64_t mask)
+{
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        if (!col_affected_mask_contains(mask, si))
+            continue;
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        for (uint32_t ri = 0; sp->bodies && ri < sp->relation_count; ri++) {
+            const wl_plan_body_t *body = &sp->bodies[ri];
+            for (uint32_t o = 0; body->ops && o < body->op_count; o++) {
+                if (body->ops[o].op == WL_PLAN_OP_JOIN)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 /* Issue #2119: calls of session_snapshot_insert() that returned 0, counted
  * by the snapshotting thread.  A later cutoff, compaction or emit failure in
@@ -2620,6 +2641,18 @@ session_snapshot_insert(wl_session_t *session, const wl_plan_t *plan)
         || !session_snapshot_delta_safe(plan, mask)
         || !session_snapshot_insert_admitted(plan, mask))
         return ENOTSUP;
+    /* The insertion rounds run on a worker clone with bounded join batching
+     * turned off (insert_clone_prepare).  Under WIRELOG_JOIN_BATCH_BYTES
+     * that is a fallback for a stratum with a JOIN: recorded, or refused in
+     * strict mode before anything is mutated, so the snapshot is evaluated
+     * in full instead (#1382). */
+    if (sess->join_batch_bytes > 0
+        && session_snapshot_insert_joins(plan, mask)) {
+        if (sess->join_batch_strict)
+            return ENOTSUP;
+        col_join_batch_record_fallback(sess,
+            COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE);
+    }
 
     uint32_t capacity = 1;
     for (uint32_t si = 0; si < plan->stratum_count; si++) {

@@ -56,6 +56,7 @@ col_join_batch_eligibility_name(col_join_batch_eligibility_t reason)
     case COL_JOIN_BATCH_EXCLUDED_PIPELINE: return "pipeline-not-consumable";
     case COL_JOIN_BATCH_EXCLUDED_MATERIALIZED: return "materialized";
     case COL_JOIN_BATCH_EXCLUDED_LFTJ: return "lftj";
+    case COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE: return "insert-route";
     default: return "unknown";
     }
 }

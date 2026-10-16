@@ -1232,10 +1232,15 @@ the session records the fallback count and last reason and logs one `JOIN`
 warning per reason.  A worker session starts with its own count and reason
 cleared, and its teardown folds them into the coordinator (#1382), so a
 coordinator's count includes what its workers recorded once they are
-destroyed.  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes knob is
-set) turns a fallback into an `ENOTSUP` failure, which is the explicit
-bounded-mode result for unsupported shapes.  Differential keyed joins have
-the separate producer described below.
+destroyed.  The snapshot route for an incremental insert (#2114) runs its
+joins on a worker clone with the knob turned off; when a stratum it reaches
+has a JOIN, a snapshot that attempts the route records `insert-route`
+without strict mode; strict mode, recording nothing, refuses the route
+before it mutates anything, so the snapshot is evaluated in full (#1382).
+`WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes knob is set) turns
+a fallback into an `ENOTSUP` failure, which is the explicit bounded-mode
+result for unsupported shapes.  Differential keyed joins have the separate
+producer described below.
 
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the
