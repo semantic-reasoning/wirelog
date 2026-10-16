@@ -1040,6 +1040,80 @@ test_expression_pipeline_failures_roll_back(void)
     pipeline_session_destroy(sess);
 }
 
+/* #1382: two mid-stream sink failures on one governed session, the second
+ * on the retry, then a clean run.  Each failure publishes nothing, puts the
+ * left input back and leaves the governor's reserved bytes at the warmed
+ * baseline; the clean run equals the one-shot oracle. */
+static void
+test_pipeline_midstream_fault_retry_baseline(void)
+{
+    wl_plan_expr_buffer_t exprs[] = {
+        { pl_sum, sizeof(pl_sum) }, { pl_scaled, sizeof(pl_scaled) },
+    };
+    wl_columnar_memory_resolution_t resolution = { 0 };
+    wl_columnar_memory_governor_ref_t *ref = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    wl_col_session_t *sess = expr_pipeline_session();
+    uint64_t baseline = 0;
+    pl_plan_t p;
+    pl_run_t want;
+    pl_run_t run;
+
+    CHECK(sess != NULL, "pipeline fault-retry fixture");
+    if (!sess)
+        return;
+    pl_plan_init(&p, exprs, 2);
+    pl_observe_reset();
+    want = pl_run(sess, &p.plan, 0);
+    CHECK(want.rc == 0, "pipeline fault-retry oracle");
+    resolution.budget_bytes = UINT64_C(1) << 26;
+    resolution.usable_bytes = resolution.budget_bytes;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    ref = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(ref != NULL, "pipeline fault-retry governor");
+    if (!ref) {
+        free(want.rows);
+        pipeline_session_destroy(sess);
+        return;
+    }
+    governor = wl_columnar_memory_governor_ref_get(ref);
+    sess->memory_governor = ref;
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+
+    /* run 0 warms up, runs 1 and 2 fail at MAP calls 5 and 2, run 3 is
+     * clean */
+    for (int r = 0; r < 4; r++) {
+        uint32_t fail_at = r == 1 ? 5u : r == 2 ? 2u : 0u;
+
+        pl_observe_reset();
+        pl_fail_map_call = fail_at;
+        run = pl_run(sess, &p.plan, sess->join_batch_bytes);
+        if (fail_at) {
+            CHECK(run.rc == ENOMEM && pl_map_calls == fail_at,
+                "mid-stream MAP failure stops at the chosen batch");
+            CHECK(run.stack_top == 1 && run.restored_left_rows == PL_KEYS,
+                "a failed run publishes nothing and restores the left");
+        } else {
+            CHECK(run.rc == 0 && pl_same_rows(&run, &want),
+                "warm-up and clean runs match the one-shot oracle");
+        }
+        free(run.rows);
+        if (r == 0)
+            baseline = wl_columnar_memory_reserved(governor);
+        else
+            CHECK(wl_columnar_memory_reserved(governor) == baseline,
+                "reserved bytes return to the warmed baseline");
+    }
+    pl_observe_reset();
+    wl_columnar_ops_test_before_map_dispose = NULL;
+    sess->memory_governor = NULL;
+    wl_columnar_memory_governor_ref_release(ref);
+    free(want.rows);
+    pipeline_session_destroy(sess);
+}
+
 static void
 test_expression_pipeline_budget_sweep(void)
 {
@@ -4618,6 +4692,7 @@ main(void)
     test_expression_pipeline_matches_oracle();
     test_pipeline_shared_row_accounting();
     test_expression_pipeline_failures_roll_back();
+    test_pipeline_midstream_fault_retry_baseline();
     test_expression_pipeline_budget_sweep();
     test_excluded_map_is_diagnosed();
     test_pipeline_right_selection_matches_join();
