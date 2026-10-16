@@ -126,6 +126,7 @@ typedef struct {
     wl_col_session_t *sess;
     col_rel_t *out;
     uint32_t pending_begin; /* out->nrows when the current batch began */
+    int error; /* EOVERFLOW: the batch would pass UINT32_MAX rows */
     bool begun;
 } col_join_batch_relation_sink_t;
 
@@ -156,9 +157,13 @@ col_join_batch_relation_sink_init(col_join_batch_relation_sink_t *ctx,
  * Returns 0 when the producer reports completion; EOVERFLOW when the legacy
  * row cap (WIRELOG_JOIN_OUTPUT_LIMIT) is reached after a committed batch,
  * in which case the cap may be overshot by at most rows_per_batch - 1;
- * ENOMEM on admission denial or sink failure; EAGAIN when the inputs went
- * stale; ENOTSUP or EINVAL for contract errors; EIO when a commit was
- * reported ambiguous.  The continuation is cancelled on every error. */
+ * EOVERFLOW when a batch would take @out past UINT32_MAX rows; ENOSPC when
+ * the governor denies the growth of @out or, for the differential
+ * producer, its scratch; ENOMEM on any other sink, commit or allocation
+ * failure; EAGAIN when the inputs went stale; ENOTSUP or EINVAL for
+ * contract errors; EIO when a commit was reported ambiguous.  An error
+ * from col_join_batch_relation_sink_init is returned unchanged.  The
+ * continuation is cancelled on every error. */
 int
 col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
     wl_col_session_t *sess, col_rel_t *out);

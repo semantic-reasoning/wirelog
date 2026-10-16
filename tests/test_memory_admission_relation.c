@@ -4448,7 +4448,8 @@ exercise_growth_boundary(col_rel_t *rel, unsigned boundary, bool *denied)
 {
     int64_t row = 91;
     if (boundary == 4)
-        return wl_columnar_join_pipeline_test_reserve(rel, rel->capacity + 1u);
+        return wl_columnar_join_pipeline_test_reserve(rel, rel->capacity + 1u,
+                   NULL);
     if (boundary == 0)
         return col_rel_reserve_capacity_admitted(rel, rel->capacity + 1u,
                    denied);

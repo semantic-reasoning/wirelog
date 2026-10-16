@@ -841,7 +841,8 @@ extern void (*wl_columnar_relation_test_rebind_before_publication)(
 extern void (*wl_columnar_relation_test_after_retired_storage_free)(
     const col_rel_t *);
 wl_columnar_continuation_status_t
-wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows);
+wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows,
+    int *error_out);
 void wl_columnar_relation_test_fail_next_prepare_resize(void);
 void wl_columnar_relation_test_fail_next_reservation_commit(void);
 void wl_columnar_relation_test_fail_next_metadata_alloc(void);

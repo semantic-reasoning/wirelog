@@ -1497,12 +1497,17 @@ producers' scratch relations and their column types (`$join_batch` for the
 non-differential join and the consumed pipeline, `$diff_join_batch` for the
 differential join), the consumed pipeline's output attachment and growth,
 the operator's and the differential join's output growth, the differential
-output's column types, and the differential arrangement's hash-table growth.
-A failure that no governor denied, such as a resize-preparation failure of
-the output, stays `ENOMEM` and is not reported as a denial.  The
-differential arrangement's creation and copy reservations in the same
-transaction still return `ENOMEM` when denied; the check is already true for
-them.
+output's column types, and the differential arrangement's hash-table
+growth.  A failure that no governor denied, such as a resize-preparation
+failure of the output, stays `ENOMEM` and is not reported as a denial.  A
+batch that would take the output of any of these paths past `UINT32_MAX`
+rows fails before any growth is requested and returns `EOVERFLOW`, which is
+not a denial either (#1382).  The consumed pipeline counts the batch before
+its FILTER and MAP tail, so the check is conservative there.  An `EOVERFLOW`
+returned by the output's capacity reservation itself is still reported as
+`ENOMEM`.  The differential arrangement's creation and copy reservations in
+the same transaction still return `ENOMEM` when denied; the check is already
+true for them.
 
 LFTJ is outside bounded mode.  `WIRELOG_JOIN_BATCH_BYTES` and
 `WIRELOG_JOIN_BATCH_STRICT` do not apply to `col_op_lftj`: it builds the
