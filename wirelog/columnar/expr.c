@@ -1354,12 +1354,12 @@ wl_columnar_expr_eval_i64(const uint8_t *buf, uint32_t size, const int64_t *row,
  * VAR encoding: [0x01][name_len:u16 LE][name:u8*name_len]
  * where name is "colN" (N is the decimal column index).
  */
-bool
-wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
-    uint32_t *col_out)
+static bool
+wl_columnar_expr_parse_var_col_tag(const uint8_t *buf, uint32_t size,
+    uint32_t *pos, uint32_t *col_out, uint8_t tag)
 {
     uint32_t i = *pos;
-    if (i >= size || buf[i] != (uint8_t)WL_PLAN_EXPR_VAR)
+    if (i >= size || buf[i] != tag)
         return false;
     i++; /* consume opcode */
     if (i + 2 > size)
@@ -1389,6 +1389,16 @@ wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
     return true;
 }
 
+/* The raw FILTER integer matcher relies on this VAR-only contract. Numeric
+ * compilation explicitly selects VAR_FLOAT in the private parser instead. */
+bool
+wl_columnar_expr_parse_var_col(const uint8_t *buf, uint32_t size, uint32_t *pos,
+    uint32_t *col_out)
+{
+    return wl_columnar_expr_parse_var_col_tag(buf, size, pos, col_out,
+               WL_PLAN_EXPR_VAR);
+}
+
 /* ======================================================================== */
 /* Pre-compiled expression evaluator                                        */
 /* ======================================================================== */
@@ -1407,9 +1417,110 @@ typedef struct {
     int64_t larg;
 } expr_instr_t;
 
+/* The evaluators cap pushes, zero-fill underflow, and ignore aggregate tags.
+ * Track the instruction that really supplies the returned top, rather than
+ * assuming the final decoded instruction supplies it. All other instructions
+ * accepted by these compilers are binary pop/pop/push operations. Keep this
+ * grammar in sync with both compilers when adding an opcode. No payload is
+ * evaluated, and no stack-sized scratch or second traversal is required. */
+static void
+wl_columnar_expr_result_producer(uint8_t op, uint32_t index, uint32_t *depth,
+    uint32_t *producer)
+{
+    switch ((wl_plan_expr_tag_t)op) {
+    case WL_PLAN_EXPR_AGG_COUNT:
+    case WL_PLAN_EXPR_AGG_SUM:
+    case WL_PLAN_EXPR_AGG_MIN:
+    case WL_PLAN_EXPR_AGG_MAX:
+        return;
+    case WL_PLAN_EXPR_VAR:
+    case WL_PLAN_EXPR_VAR_FLOAT:
+    case WL_PLAN_EXPR_CONST_INT:
+    case WL_PLAN_EXPR_CONST_FLOAT:
+    case WL_PLAN_EXPR_BOOL:
+        break;
+    case WL_PLAN_EXPR_ARITH_BNOT:
+        if (*depth) --*depth;
+        break;
+    default:
+        *depth = *depth > 1 ? *depth - 2 : 0;
+        break;
+    }
+    if (*depth < COL_FILTER_STACK) {
+        ++*depth;
+        *producer = index;
+    }
+}
+
+static bool
+wl_columnar_expr_result_type(const expr_instr_t *instructions,
+    uint32_t producer, const wirelog_column_type_t *source_types,
+    uint32_t ncols, wirelog_column_type_t *type)
+{
+    wirelog_column_type_t result = WIRELOG_TYPE_INT64;
+    if (producer != UINT32_MAX) {
+        const expr_instr_t *in = &instructions[producer];
+        switch ((wl_plan_expr_tag_t)in->op) {
+        case WL_PLAN_EXPR_VAR:
+            if (source_types && in->iarg < ncols)
+                result = source_types[in->iarg];
+            break;
+        case WL_PLAN_EXPR_VAR_FLOAT:
+        case WL_PLAN_EXPR_CONST_FLOAT:
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+            result = WIRELOG_TYPE_FLOAT;
+            break;
+        case WL_PLAN_EXPR_BOOL:
+        case WL_PLAN_EXPR_CMP_EQ:
+        case WL_PLAN_EXPR_CMP_NEQ:
+        case WL_PLAN_EXPR_CMP_LT:
+        case WL_PLAN_EXPR_CMP_GT:
+        case WL_PLAN_EXPR_CMP_LTE:
+        case WL_PLAN_EXPR_CMP_GTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+        case WL_PLAN_EXPR_CMP_STR_EQ:
+        case WL_PLAN_EXPR_CMP_STR_NEQ:
+        case WL_PLAN_EXPR_CMP_STR_LT:
+        case WL_PLAN_EXPR_CMP_STR_GT:
+        case WL_PLAN_EXPR_CMP_STR_LTE:
+        case WL_PLAN_EXPR_CMP_STR_GTE:
+            result = WIRELOG_TYPE_BOOL;
+            break;
+        case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_ARITH_ADD:
+        case WL_PLAN_EXPR_ARITH_SUB:
+        case WL_PLAN_EXPR_ARITH_MUL:
+        case WL_PLAN_EXPR_ARITH_DIV:
+        case WL_PLAN_EXPR_ARITH_MOD:
+        case WL_PLAN_EXPR_ARITH_BAND:
+        case WL_PLAN_EXPR_ARITH_BOR:
+        case WL_PLAN_EXPR_ARITH_BXOR:
+        case WL_PLAN_EXPR_ARITH_SHL:
+        case WL_PLAN_EXPR_ARITH_SHR:
+        case WL_PLAN_EXPR_ARITH_BNOT:
+            break;
+        default:
+            return false;
+        }
+    }
+    if (result < WIRELOG_TYPE_INT32 || result > WIRELOG_TYPE_BOOL)
+        return false;
+    *type = result;
+    return true;
+}
+
 struct wl_columnar_expr_compiled {
     expr_instr_t *instrs;
     uint32_t ninstr;
+    uint32_t result_producer;
     /* Issue #966: fixed for the whole expression, so it is resolved once here
      * rather than passed to the per-row evaluator.  Borrowed -- wl_plan_t
      * documents its intern as outliving the plan, which outlives any compiled
@@ -1754,6 +1865,7 @@ fail:
 struct wl_columnar_expr_attempt_numeric {
     expr_instr_t *instrs;
     uint32_t ninstr;
+    uint32_t result_producer;
     wl_columnar_memory_governor_ref_t *governor_ref;
     bool credit_held;
     bool committed;
@@ -1793,8 +1905,12 @@ wl_columnar_expr_test_attempt_numeric_instruction_size(void)
  * SETUP locals5+init10+math23+pin7+T29+route8+C13+F96=191;
  * RESERVE T29+child12+get3+route3+status4+marker1+verdict8+T29+
  * route8+C13+F100=210; ALLOC2+branch2+fields5+init10+verdict3+
- * T29+route8+nextsetup5+C13+F100=177;
- * STORE3+T29+loop3+C13+F100=148;
+ * T29+route8+nextsetup6+C13+F100+cache-init1=179;
+ * STORE3+producer20+T29+loop3+C13+F100=168;
+ * producer20 bounds switch/routing, capped depth/saturating pops, accepted
+ * push/cache stores and complete helper return. No instruction scan is hidden
+ * in the result query. The cached uint32 follows ninstr in both opaque owners;
+ * allocation and reservation continue to use the actual sizeof on each ABI.
  * MOVE branch2+move40+failure2+markers4+T29+held2+C13+F100=192;
  * COMMIT T29+child12+route3+check6+C13+F100=163;
  * EXTERNAL T29+F100+outputs2+return1=132 (alternative outcomes).
@@ -1847,8 +1963,8 @@ typedef char wl_columnar_expr_attempt_full_regions_funded_t[
         && UINT64_C(150) <= WL_COLUMNAR_EXPR_ATTEMPT_PASS_WORK
         && UINT64_C(191) <= WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK
         && UINT64_C(210) <= WL_COLUMNAR_EXPR_ATTEMPT_RESERVE_CALL_WORK
-        && UINT64_C(177) <= WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK
-        && UINT64_C(148) <= WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK
+        && UINT64_C(179) <= WL_COLUMNAR_EXPR_ATTEMPT_ALLOC_WORK
+        && UINT64_C(168) <= WL_COLUMNAR_EXPR_ATTEMPT_STORE_WORK
         && UINT64_C(192) <= WL_COLUMNAR_EXPR_ATTEMPT_MOVE_WORK
         && UINT64_C(163) <= WL_COLUMNAR_EXPR_ATTEMPT_COMMIT_CALL_WORK
         && UINT64_C(132) <= WL_COLUMNAR_EXPR_ATTEMPT_EXTERNAL_WORK) ? 1 : -1];
@@ -2132,6 +2248,7 @@ wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
     if (owner) {
         owner->instrs = NULL;
         owner->ninstr = count;
+        owner->result_producer = UINT32_MAX;
         owner->governor_ref = NULL;
         owner->credit_held = false;
         owner->committed = false;
@@ -2162,6 +2279,7 @@ wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
         rc = verdict;
         goto fail;
     }
+    uint32_t result_depth = 0;
     pos = 0;
     for (uint32_t i = 0; i < count; i++) {
         rc = wl_columnar_expr_attempt_charge(control, attempt_id,
@@ -2182,6 +2300,8 @@ wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
         owner->instrs[i].op = instruction.op;
         owner->instrs[i].iarg = instruction.iarg;
         owner->instrs[i].larg = instruction.larg;
+        wl_columnar_expr_result_producer(instruction.op, i, &result_depth,
+            &owner->result_producer);
         rc = wl_columnar_expr_attempt_tail(control, attempt_id, 17, i);
         if (rc)
             goto fail;
@@ -2237,6 +2357,29 @@ fail:
     if (rc == ENOTSUP)
         return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
     return rc;
+}
+
+/* Fixed schema lookup: the producer was resolved during paid compilation.
+ * Guard/debit precedes every borrowed program/schema read; publication waits
+ * for the original-ID cutoff. No values, callbacks or ownership are touched. */
+int
+wl_columnar_expr_result_type_attempt_controlled(
+    const wl_columnar_expr_attempt_numeric_t *program,
+    const wirelog_column_type_t *source_types, uint32_t ncols,
+    wirelog_column_type_t *type, bool *supported,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    int rc = wl_columnar_expr_attempt_charge(control, attempt_id, 128);
+    if (rc) return rc;
+    if (!program || !type || !supported) return EINVAL;
+    wirelog_column_type_t result = WIRELOG_TYPE_INT64;
+    bool known = wl_columnar_expr_result_type(program->instrs,
+            program->result_producer, source_types, ncols, &result);
+    rc = wl_columnar_expr_attempt_tail(control, attempt_id, 23, ncols);
+    if (rc) return rc;
+    if (known) *type = result;
+    *supported = known;
+    return 0;
 }
 
 /* Caller-attempt numeric evaluation: conservative logical source accounting.
@@ -2648,7 +2791,8 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
         case WL_PLAN_EXPR_VAR: {
             uint32_t pos = i;
             uint32_t col = 0;
-            if (!wl_columnar_expr_parse_var_col(buf, size, &pos, &col))
+            if (!wl_columnar_expr_parse_var_col_tag(buf, size, &pos, &col,
+                tag))
                 return NULL;
             i = pos;
             break;
@@ -2656,7 +2800,8 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
         case WL_PLAN_EXPR_VAR_FLOAT: {
             uint32_t pos = i;
             uint32_t col = 0;
-            if (!wl_columnar_expr_parse_var_col(buf, size, &pos, &col))
+            if (!wl_columnar_expr_parse_var_col_tag(buf, size, &pos, &col,
+                tag))
                 return NULL;
             i = pos;
             break;
@@ -2800,6 +2945,7 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
         return NULL;
     }
     c->ninstr = ninstr;
+    c->result_producer = UINT32_MAX;
     c->intern = intern;
     c->reservation = reservation;
     if (error_out)
@@ -2807,6 +2953,7 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
 
     /* Pass 2: fill instruction array. */
     uint32_t j = 0;
+    uint32_t result_depth = 0;
     i = 0;
     while (i < size && j < ninstr) {
         expr_instr_t *instr = &c->instrs[j++];
@@ -2816,13 +2963,15 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
         switch ((wl_plan_expr_tag_t)buf[i]) {
         case WL_PLAN_EXPR_VAR: {
             uint32_t pos = i;
-            wl_columnar_expr_parse_var_col(buf, size, &pos, &instr->iarg);
+            wl_columnar_expr_parse_var_col_tag(buf, size, &pos, &instr->iarg,
+                instr->op);
             i = pos;
             break;
         }
         case WL_PLAN_EXPR_VAR_FLOAT: {
             uint32_t pos = i;
-            wl_columnar_expr_parse_var_col(buf, size, &pos, &instr->iarg);
+            wl_columnar_expr_parse_var_col_tag(buf, size, &pos, &instr->iarg,
+                instr->op);
             i = pos;
             break;
         }
@@ -2844,6 +2993,8 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
             i++; /* operator: consume opcode byte only */
             break;
         }
+        wl_columnar_expr_result_producer(instr->op, j - 1, &result_depth,
+            &c->result_producer);
     }
     return c;
 }
@@ -2854,6 +3005,15 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
 {
     return wl_columnar_expr_compile_governed(buf, size, intern, NULL, NULL,
                NULL);
+}
+
+bool
+wl_columnar_expr_compiled_result_type(const wl_columnar_expr_compiled_t *c,
+    const wirelog_column_type_t *source_types, uint32_t ncols,
+    wirelog_column_type_t *type)
+{
+    return c && type && wl_columnar_expr_result_type(c->instrs,
+               c->result_producer, source_types, ncols, type);
 }
 
 /*

@@ -4439,6 +4439,21 @@ int wl_columnar_expr_compile_attempt_controlled(const uint8_t *, uint32_t,
 void wl_columnar_expr_attempt_numeric_free(
     wl_columnar_expr_attempt_numeric_t *);
 
+/* Constant-time result schema, without evaluation or callbacks. The immutable
+ * program caches the actual returned producer during compilation, including
+ * legacy capped pushes, zero-filled underflow and aggregate no-ops. Plain VAR
+ * preserves an in-range source physical type; absent/out-of-range is INT64.
+ * Explicit VAR_FLOAT is FLOAT. source_types, when nonNULL, has ncols entries.
+ * Outputs are exclusive/disjoint from borrowed inputs/control and each other.
+ * Original-ID admission/cutoff precedes publication; nonzero rc changes no
+ * output. On success supported=false leaves type untouched. Phase23 is the
+ * final schema cutoff. No allocation, ownership or governor operation occurs. */
+int wl_columnar_expr_result_type_attempt_controlled(
+    const wl_columnar_expr_attempt_numeric_t *program,
+    const wirelog_column_type_t *source_types, uint32_t ncols,
+    wirelog_column_type_t *type, bool *supported,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+
 /* Caller-attempt evaluator for genuine immutable numeric owners above.
  * Program and row stay live/immutable; outputs are exclusive, disjoint from
  * each other, program/instructions, row and control. NULL control, inactive
@@ -4482,6 +4497,12 @@ wl_columnar_expr_compile_governed(const uint8_t *buf, uint32_t size,
     wl_col_session_t *sess, int *error_out);
 void
 wl_columnar_expr_compiled_free(wl_columnar_expr_compiled_t *c);
+/* Same schema rules as the attempt query; false leaves type untouched.
+ * Interpreter-only expression families have no compiled owner to query. */
+bool wl_columnar_expr_compiled_result_type(
+    const wl_columnar_expr_compiled_t *c,
+    const wirelog_column_type_t *source_types, uint32_t ncols,
+    wirelog_column_type_t *type);
 int
 wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
     const int64_t *row, uint32_t ncols, int64_t *out_val);
