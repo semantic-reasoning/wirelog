@@ -3219,28 +3219,6 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         goto done;
     /* Pre-admit this owner's first retirement before its live marker.
      * Skipped/failed owner acquisition leaves this named paid slack unused. */
-    for (unsigned retire = 0; retire < 1; ++retire) {
-        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
-                WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_RETIRE_WORK);
-        if (rc) goto done;
-        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 21, retire);
-        if (rc) goto done;
-    }
-    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
-            WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
-    if (rc)
-        goto done;
-    rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
-        "$map", output_width, ctx->governor ? rows : COL_REL_INIT_CAP,
-        ctx->governor, out_slot, control, attempt_id);
-    /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
-    ctx->output = *out_slot;
-    ctx->private_output = *out_slot;
-    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
-    if (rc)
-        goto done;
-    /* Pre-admit this owner's first retirement before its live marker.
-     * Skipped/failed owner acquisition leaves this named paid slack unused. */
     for (unsigned retire = 0; retire < 2; ++retire) {
         rc = wl_columnar_filter_attempt_charge(control, attempt_id,
                 WL_COLUMNAR_FILTER_ATTEMPT_SCRATCH_RETIRE_WORK);
@@ -3342,6 +3320,64 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
         if (rc)
             goto done;
     }
+    /* The output region of already-owned int64 scratch temporarily holds
+     * type codes. The constructor consumes them synchronously before any row
+     * overwrites this region. Source metadata stays under its original lease. */
+    for (uint32_t column = 0; column < output_width; ++column) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 110, column);
+        if (rc) goto done;
+        wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+        wl_columnar_expr_attempt_numeric_t *program =
+            ctx->table.programs[column];
+        if (program) {
+            bool supported = false;
+            rc = wl_columnar_expr_result_type_attempt_controlled(program,
+                    ctx->source.types, width, &type, &supported, control,
+                    attempt_id);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc) goto done;
+            if (!supported) {
+                rc = ENOTSUP; goto done;
+            }
+        } else {
+            uint32_t source_column = op->project_indices
+                ? op->project_indices[column] : column;
+            if (ctx->source.types && source_column < width)
+                type = ctx->source.types[source_column];
+        }
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_MAP_FORWARD_WORK);
+        if (rc) goto done;
+        ctx->values[(size_t)width + column] = type;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 111, column);
+        if (rc) goto done;
+    }
+    /* Pre-admit this owner's first retirement before its live marker.
+     * Skipped/failed owner acquisition leaves this named paid slack unused. */
+    for (unsigned retire = 0; retire < 1; ++retire) {
+        rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_FILTER_ATTEMPT_OUTPUT_RETIRE_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_filter_attempt_tail(control, attempt_id, 21, retire);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_filter_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_FILTER_ATTEMPT_NEWLIKE_WORK);
+    if (rc)
+        goto done;
+    rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+        "$map", output_width, ctx->governor ? rows : COL_REL_INIT_CAP,
+        output_width ? ctx->values + width : NULL,
+        ctx->governor, out_slot, control, attempt_id);
+    /* Original frame slot ownership bookkeeping precedes stale-ID arbitration. */
+    ctx->output = *out_slot;
+    ctx->private_output = *out_slot;
+    rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+    if (rc)
+        goto done;
     rc = wl_columnar_filter_attempt_charge(control, attempt_id,
             WL_COLUMNAR_FILTER_ATTEMPT_BATCH_INIT_WORK);
     if (rc)

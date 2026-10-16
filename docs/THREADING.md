@@ -1728,3 +1728,22 @@ through ACK. Generic frame disposal remains an external host operation.
 |--------|--------|-----------|----------|---------|
 | `filter.c:wl_columnar_filter_consolidate_attempt_start_owned` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the private original scratch token owner before reservation; no concurrent publication |
 | `filter.c:wl_columnar_filter_consolidate_attempt_start_owned#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition and bind the original token identity before callbacks |
+
+
+### Numeric MAP schema borrowing
+
+Numeric MAP reads projection types under its original scalar-source lease.
+Compiled programs cache the actual returned producer, and the attempt schema
+query admits fixed work and checks the immutable original attempt ID before
+reading borrowed metadata and before publishing its result. Neither query
+executes a callback or owns another resource. Keep program/source storage
+immutable and alive and query outputs disjoint for the entire call.
+
+The controlled operator temporarily writes int64 type codes into its existing
+output-value scratch. Its synchronous constructor validates and converts these
+codes into independent native relation metadata; no recipe or scratch pointer
+survives constructor return. Original scratch/table/output markers and prepaid
+retirement remain responsible for every partial prefix. The type schema is
+installed before the first append and is not repaired from a populated row.
+Raw MAP's native temporary is likewise released before expression callbacks;
+the existing raw source-access and callback contracts still apply.

@@ -1257,13 +1257,12 @@ consolidated_values(fixture_t *f, uint32_t rows, int64_t first, int64_t step,
         !stack->items[0].is_delta);
     col_rel_t *rel = stack->items[0].rel;
     CHECK(rel->ncols == 1 && rel->nrows == rows && !rel->timestamps);
+    CHECK(rel->column_types && rel->column_types[0] ==
+        (floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
     CHECK(rel->sorted_nrows == rows && rel->run_count == (rows != 0));
     if (rows) CHECK(rel->run_ends[0] == rows);
     for (uint32_t row = 0; row < rows; ++row) {
         int64_t expected = first + row * step;
-        /* MAP's private raw-compatible result can have no type metadata.
-         * The generated declaration defines this literal payload oracle;
-         * independent raw parity separately verifies all actual metadata. */
         if (floating)
             CHECK(wl_columnar_float_from_bits(rel->columns[0][row]) ==
                 (double)expected);
@@ -2952,9 +2951,128 @@ test_consolidate_shape_refusals(void)
         }
 }
 
+/* Full generated bodies, independent literal order/types and a separate raw
+ * session. The last variant composes another FILTER/MAP after a generated MAP. */
+static void
+test_generated_map_float_schema(void)
+{
+    const char *queries[] = {
+        ".decl input(x:float)\n.decl output(y:float)\noutput(x) :- input(x).\n",
+        ".decl input(x:float)\n.decl output(y:float)\noutput(x+0.0) :- input(x).\n",
+        ".decl input(k:int64,x:float)\n.decl right(k:int64,y:float)\n"
+        ".decl output(z:float)\noutput(x+y) :- input(k,x),right(k,y).\n",
+        ".decl input(x:float)\n.decl output(y:float,n:int64)\noutput(x+0.0,7) :- input(x).\n",
+        ".decl input(x:float)\n.decl output(y:float)\noutput(x+0.0) :- input(x).\n",
+    };
+    const double inputs[] = {-1.0, -3.0, -3.0, -0.0, 0.0, 2.0};
+    const double expected[] = {-3.0, -1.0, 0.0, 2.0};
+    for (unsigned shape = 0; shape < 5; ++shape) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[shape],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const wl_plan_relation_t *rp = NULL;
+        for (uint32_t s = 0; s < plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+                if (!strcmp(plan->strata[s].relations[r].name,
+                    "output")) rp = &plan->strata[s].relations[r];
+        CHECK(rp && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
+            rp->ops[rp->op_count-1].op == WL_PLAN_OP_CONSOLIDATE);
+        uint8_t predicate[17] = {WL_PLAN_EXPR_VAR_FLOAT, 4, 0, 'c', 'o', 'l',
+                                 '0', WL_PLAN_EXPR_CONST_FLOAT};
+        uint8_t mapped[17]; memcpy(mapped, predicate, sizeof(mapped));
+        int64_t threshold = wl_columnar_float_to_bits(-4.0),
+            zero = wl_columnar_float_to_bits(0.0);
+        memcpy(predicate + 8, &threshold, 8);
+        predicate[16] = WL_PLAN_EXPR_CMP_FLOAT_GT;
+        memcpy(mapped + 8, &zero, 8); mapped[16] = WL_PLAN_EXPR_ARITH_FLOAT_ADD;
+        wl_plan_expr_buffer_t expression = {mapped, sizeof(mapped)};
+        wl_plan_op_t ops[16]; wl_plan_relation_t composed = *rp;
+        if (shape == 4) {
+            CHECK(rp->op_count + 2 <= 16);
+            for (uint32_t i = 0; i + 1 < rp->op_count; ++i) ops[i] = rp->ops[i];
+            ops[rp->op_count-1] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                                 .filter_expr = {predicate,
+                                                                 sizeof(
+                                                                     predicate)}};
+            ops[rp->op_count] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                               .project_count = 1,
+                                               .map_exprs = &expression,
+                                               .map_expr_count = 1};
+            ops[rp->op_count+1] = rp->ops[rp->op_count-1];
+            composed.ops = ops; composed.op_count += 2; rp = &composed;
+        }
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned empty = 0; empty < 2; ++empty)
+                for (unsigned governed = 0; governed < 2; ++governed) {
+                    fixture_t f;
+                    uint32_t width = shape == 2 ? 2 : 1;
+                    if (prebound) fixture_init(&f, width, 0, 0);
+                    else source_fixture(&f, width, 0, 0);
+                    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                                     WIRELOG_TYPE_FLOAT};
+                    if (width == 1) types[0] = WIRELOG_TYPE_FLOAT;
+                    CHECK(!col_rel_set_column_types(f.input, types, width));
+                    for (unsigned i = 0; !empty && i < 6; ++i) {
+                        int64_t values[] = {1,
+                                            wl_columnar_float_to_bits(
+                                                inputs[i])};
+                        if (width == 1) values[0] = values[1];
+                        CHECK(!col_rel_append_row(f.input, values));
+                    }
+                    if (!empty) f.input->columns[width-
+                            1][3] = wl_columnar_float_to_bits(-0.0);
+                    col_rel_t *right = source_new(2, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                    wirelog_column_type_t right_types[] = {WIRELOG_TYPE_INT64,
+                                                           WIRELOG_TYPE_FLOAT};
+                    CHECK(!col_rel_set_column_types(right, right_types, 2));
+                    int64_t right_values[] = {1,
+                                              wl_columnar_float_to_bits(0.0)};
+                    CHECK(!col_rel_append_row(right, right_values));
+                    col_rel_t *registry[] = {f.input, right};
+                    wl_columnar_memory_governor_ref_t *governor =
+                        governed ? join_governor(&f, 1u << 20) : NULL;
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 2;
+                        fixture_begin(&f, rp, 1, rp->op_count);
+                    } else source_begin(&f, rp, registry, 2);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == rp->op_count - 1);
+                    join_raw_parity(&f, rp, prebound != 0);
+                    col_rel_t *result =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    CHECK(result->nrows == (empty ? 0u : 4u) &&
+                        result->column_types);
+                    CHECK(result->ncols == (shape == 3 ? 2u : 1u));
+                    CHECK(result->column_types[0] == WIRELOG_TYPE_FLOAT);
+                    if (shape ==
+                        3) CHECK(result->column_types[1] == WIRELOG_TYPE_INT64);
+                    CHECK(result->sorted_nrows == result->nrows &&
+                        result->run_count == (empty ? 0u : 1u));
+                    for (uint32_t r = 0; r < result->nrows; ++r) {
+                        CHECK(result->columns[0][r] ==
+                            wl_columnar_float_to_bits(expected[r]));
+                        if (shape == 3) CHECK(result->columns[1][r] == 7);
+                    }
+                    fixture_close(&f); col_rel_destroy(right);
+                    if (governor) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(governor)));
+                        wl_columnar_memory_governor_ref_release(governor);
+                    }
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
 int
 main(void)
 {
+    test_generated_map_float_schema();
     test_complete_unary_plans(); test_consolidate_composition();
     test_consolidate_literal_limits();
     test_consolidate_stops(); test_consolidate_retained_successor();
