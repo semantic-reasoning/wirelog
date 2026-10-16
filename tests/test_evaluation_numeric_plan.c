@@ -1190,6 +1190,568 @@ test_generated_join_fragments(void)
 }
 
 static void
+join_until_ready(fixture_t *f, uint32_t cursor)
+{
+    unsigned turns = 0;
+    while (f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_READY
+        || f->record.cursor != cursor) {
+        CHECK(++turns < 100000);
+        CHECK(f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+typedef struct {
+    col_rel_t *identity, *contents;
+    bool owned, is_delta;
+} join_snapshot_t;
+
+static join_snapshot_t
+join_snapshot(fixture_t *f)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == 1);
+    eval_entry_t *entry = &stack->items[0];
+    CHECK(entry->kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+        && !entry->continuation && !entry->seg_boundaries && !entry->seg_count);
+    join_snapshot_t snapshot = {.identity = entry->rel, .owned = entry->owned,
+                                .is_delta = entry->is_delta};
+    CHECK(!col_rel_deep_copy(entry->rel, &snapshot.contents, NULL));
+    return snapshot;
+}
+
+static void
+join_snapshot_check(fixture_t *f, const join_snapshot_t *snapshot)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == 1);
+    eval_entry_t *entry = &stack->items[0];
+    CHECK(entry->rel == snapshot->identity && entry->owned == snapshot->owned
+        && entry->is_delta == snapshot->is_delta);
+    CHECK(entry->kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+        && !entry->continuation && !entry->seg_boundaries && !entry->seg_count);
+    same_join_bag(entry->rel, snapshot->contents);
+}
+
+static wl_columnar_memory_governor_ref_t *
+join_governor(fixture_t *f, uint64_t budget)
+{
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = budget, .usable_bytes = budget,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV, .status = WL_COLUMNAR_MEMORY_OK
+    };
+    f->session.memory_governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f->session.memory_governor);
+    return f->session.memory_governor;
+}
+
+/* All mutable observers and fault setup are outside engine_dispatch. The
+ * driver still invokes exactly one child action/consume per funded turn. */
+static fixture_t *join_fault_fixture;
+static uint32_t join_fault_cursor;
+static unsigned join_fault_calls;
+static bool join_fault_restart;
+
+static void
+join_collision_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    fixture_t *f = join_fault_fixture;
+    if (phase != 30 || f->record.cursor != join_fault_cursor ||
+        join_fault_calls)
+        return;
+    ++join_fault_calls;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &ctx,
+        &f->record));
+    CHECK(ctx->output && !ctx->output->nrows && control == f->operation);
+    if (join_fault_restart) {
+        CHECK(!wl_evaluation_control_finish(control, &f->operation_owner, 0,
+            0));
+        CHECK(!wl_evaluation_control_begin(control, &f->operation_owner));
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static int64_t
+join_collision(col_rel_t *rel)
+{
+    uint32_t bucket = wl_columnar_hash_value(2166136261u, rel, 0, 0) & 15u;
+    int64_t value = 1;
+    while ((wl_columnar_hash_value(2166136261u, rel, 0, value) & 15u) != bucket)
+        ++value;
+    CHECK(value && (wl_columnar_hash_value(2166136261u, rel, 0,
+        value) & 15u) == bucket);
+    return value;
+}
+
+static void
+test_join_no_output_stops(void)
+{
+    const char *key = "col0";
+    for (unsigned target = 0; target < 2; ++target)
+        for (unsigned restart = 0; restart < 2; ++restart) {
+            fixture_t f; fixture_init(&f, 1, 3, 0);
+            int64_t collision = join_collision(f.input);
+            for (uint32_t r = 0; r < f.input->nrows; ++r)
+                f.input->columns[0][r] = collision;
+            col_rel_t *right = source_new(1, 1), *third = source_new(1, 5);
+            CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+            CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+            for (uint32_t r = 0; r < third->nrows;
+                ++r) third->columns[0][r] = 0;
+            col_rel_t *registry[] = {right, third};
+            f.session.rels = registry; f.session.nrels = 2;
+            wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "right",
+                                   .delta_mode = WL_DELTA_FORCE_FULL},
+                                  {.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "third",
+                                   .delta_mode = WL_DELTA_FORCE_FULL,
+                                   .key_count = 1,
+                                   .left_keys = &key, .right_keys = &key},
+                                  {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+            if (!target) ops[0] = ops[1];
+            wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
+            fixture_begin(&f, &plan, 0, 3); join_until_ready(&f, target);
+            join_snapshot_t snapshot = join_snapshot(&f);
+            join_fault_fixture = &f; join_fault_cursor = target;
+            join_fault_calls = 0; join_fault_restart = restart != 0;
+            wl_columnar_join_test_attempt_checkpoint = join_collision_stop;
+            run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+            CHECK(join_fault_calls == 1 && f.record.completed == target
+                && f.record.cursor == target);
+            CHECK(f.record.semantic_result ==
+                (restart ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(!f.session.memory_budget_denied);
+            join_snapshot_check(&f, &snapshot);
+            col_rel_destroy(snapshot.contents);
+            uint64_t active =
+                wl_evaluation_control_active_attempt_id(f.operation);
+            int result = restart ? 0 : f.record.semantic_result;
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                result, 0) == result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report));
+            CHECK(report.attempt_id == active);
+            if (restart) CHECK(!report.consumed && active != f.operation_id);
+            fixture_close(&f); col_rel_destroy(right); col_rel_destroy(third);
+        }
+}
+
+/* Independent published noTS typed width2 "$join" construction schedule,
+ * also used by the standalone collision test. No measured hook fee oracle. */
+static uint64_t
+join_constructor_two(void)
+{
+    return 512u + 2u * 128u + 192u + 6u * 96u
+           + 6u * 96u + 96u + 2u * 96u + 3u * 96u + 128u
+           + 2u * (96u + 96u + 192u + 3u * 96u)
+           + 96u + 160u + 112u + 224u * ((sizeof(col_rel_t) + 7u) / 8u)
+           + 5u * 96u + 112u + 224u + 80u + 112u + 96u + 2u * 160u
+           + 112u + 192u + 2u * 112u
+           + 112u + 192u + 2u * (96u + 96u + 192u + 112u + 224u)
+           + 112u + 2u * 96u + 96u + 112u + 224u + 112u + 192u
+           + 2u * (128u + 112u + 96u + 224u + 96u + 96u + 192u + 112u + 224u)
+           + 3u * 128u + 220u;
+}
+
+static void
+join_no_output_probe(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != 30) return;
+    fixture_t *f = join_fault_fixture;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(control == f->operation);
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &ctx,
+        &f->record));
+    CHECK(ctx->output && !ctx->output->nrows);
+    ++join_fault_calls;
+}
+
+static void
+test_join_literal_limits(void)
+{
+#ifndef _MSC_VER
+    /* Two opcode preflights256 + READY128, then the published standalone
+     * width1 left3/right5 forced-full collision schedule H. */
+    const uint64_t prefix = 384u + 28476u + join_constructor_two();
+    /* First candidate128 + comparison parent192 + first key128 ends at7296.
+     * Next candidate adds128, then its comparison parent192. */
+    const uint64_t boundaries[] = {7296, 7424, 7616};
+    const uint64_t predecessors[] = {7168, 7296, 7424};
+    const char *key = "col0";
+    for (unsigned b = 0; b < 3; ++b)
+        for (unsigned minus = 0; minus < 2; ++minus) {
+            fixture_t f; fixture_init(&f, 1, 3, prefix + boundaries[b] - minus);
+            CHECK(!wl_columnar_relation_rename_checked(f.input, "left"));
+            col_rel_t *right = source_new(1, 5);
+            CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+            int64_t collision = join_collision(f.input);
+            for (uint32_t r = 0; r < f.input->nrows;
+                ++r) f.input->columns[0][r] = collision;
+            for (uint32_t r = 0; r < right->nrows;
+                ++r) right->columns[0][r] = 0;
+            col_rel_t *registry[] = {right}; f.session.rels = registry;
+            f.session.nrels = 1;
+            wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "right",
+                                   .delta_mode = WL_DELTA_FORCE_FULL,
+                                   .key_count = 1,
+                                   .left_keys = &key, .right_keys = &key},
+                                  {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+            wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+            fixture_begin(&f, &plan, 0, 2);
+            join_fault_fixture = &f; join_fault_calls = 0;
+            wl_columnar_join_test_attempt_checkpoint = join_no_output_probe;
+            run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+            CHECK((join_fault_calls != 0) == !(b == 0 && minus));
+            CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && !f.record.completed && !f.record.cursor &&
+                !f.session.memory_budget_denied);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.input);
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                f.record.semantic_result, 0) == f.record.semantic_result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report));
+            CHECK(report.attempt_id == f.operation_id &&
+                report.consumed == prefix
+                + (minus ? predecessors[b] : boundaries[b]));
+            fixture_close(&f); col_rel_destroy(right);
+        }
+#endif
+}
+
+static void
+test_join_later_failures(void)
+{
+    const char *key = "col0";
+    for (unsigned target = 0; target < 2; ++target)
+        for (unsigned fault = 0; fault < 4; ++fault) {
+            fixture_t f; fixture_init(&f, 1, 2, 0);
+            col_rel_t *right = source_new(1, 1), *third = source_new(1, 3);
+            CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+            CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+            col_rel_t *registry[] = {right, third}; f.session.rels = registry;
+            f.session.nrels = 2;
+            wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "right",
+                                   .delta_mode = WL_DELTA_FORCE_FULL},
+                                  {.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "third",
+                                   .delta_mode = WL_DELTA_FORCE_FULL},
+                                  {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+            if (fault == 0) {
+                ops[target].key_count = 1; ops[target].left_keys = &key;
+                ops[target].right_keys = &key;
+            }
+            if (fault == 2) ops[target].materialized = true;
+            if (fault == 3) f.session.join_output_limit = target ? 3 : 1;
+            wl_columnar_memory_governor_ref_t *governor = fault ==
+                1 ? join_governor(&f, 1u << 20) : NULL;
+            wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
+            fixture_begin(&f, &plan, 0, 3); join_until_ready(&f, target);
+            join_snapshot_t snapshot = join_snapshot(&f);
+            wl_columnar_memory_reservation_t peer;
+            wl_columnar_memory_reservation_init(&peer);
+            uint64_t baseline =
+                governor ?
+                wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                        governor)) : 0;
+            if (governor) {
+                CHECK(baseline + 1 < (1u << 20));
+                CHECK(wl_columnar_memory_reserve(
+                        wl_columnar_memory_governor_ref_get(governor),
+                        (1u << 20) - baseline - 1, &peer));
+            }
+            if (fault == 0) wl_columnar_join_test_attempt_fail_allocation = 0;
+            engine_dispatch(&f); ++f.witnesses;
+            wl_columnar_join_test_attempt_fail_allocation = -1;
+            run(&f);
+            const int errors[] = {ENOMEM, ENOSPC, ENOTSUP, EOVERFLOW};
+            CHECK(f.record.semantic_result == errors[fault]
+                && f.record.completed == target && f.record.cursor == target);
+            CHECK(f.session.memory_budget_denied == (fault == 1));
+            join_snapshot_check(&f, &snapshot);
+            col_rel_destroy(snapshot.contents);
+            if (governor) CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)) ==
+                    (1u << 20) - 1);
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                errors[fault], 0) == errors[fault]);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation,
+                &report) && report.attempt_id == f.operation_id);
+            fixture_close(&f);
+            if (governor) {
+                CHECK(wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)) ==
+                    peer.bytes);
+                CHECK(wl_columnar_memory_rollback(&peer));
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+            col_rel_destroy(right); col_rel_destroy(third);
+        }
+    fixture_t f; fixture_init(&f, 1, 3, 0);
+    wl_plan_op_t join = {.op = WL_PLAN_OP_JOIN, .right_relation = "unused"};
+    wl_plan_relation_t plan = {.ops = &join, .op_count = 1};
+    fixture_begin(&f, &plan, 0, 1);
+    CHECK(!wl_evaluation_control_charge(f.operation, UINT64_MAX - 64));
+    run(&f);
+    CHECK(f.record.semantic_result == EOVERFLOW && !f.record.completed &&
+        !f.session.memory_budget_denied);
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+        EOVERFLOW, 0) == EOVERFLOW);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation,
+        &report) && report.consumed == UINT64_MAX - 64);
+    fixture_close(&f);
+}
+
+/* A refused host grant never consumes a pending child result or a retirement
+ * step. A grant384 admits exactly one existing FIFO engine action. */
+static void
+join_host_boundary(fixture_t *f, wl_columnar_filter_context_t *ctx)
+{
+    wl_columnar_eval_plan_numeric_phase_t phase = f->record.phase;
+    CHECK(phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING ||
+        phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD);
+    wl_columnar_filter_stage_t stage = ctx->stage;
+    uint32_t cursor = ctx->join_retirement_cursor;
+    wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[cursor];
+    uint64_t bytes = scratch->credit.bytes;
+    wl_columnar_memory_governor_ref_t *ref = scratch->governor;
+    join_snapshot_t snapshot = join_snapshot(f);
+    for (unsigned allowance = 383; allowance <= 384; ++allowance) {
+        int owner = 0;
+        wl_evaluation_control_t *host = control_new(allowance, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(host);
+        if (allowance == 384) {
+            wl_evaluation_control_t *saved = f->funding;
+            uint64_t saved_id = f->funding_id;
+            f->funding = host; f->funding_id = id;
+            engine_dispatch(f); ++f->witnesses;
+            f->funding = saved; f->funding_id = saved_id;
+        }
+        wl_columnar_eval_plan_numeric_phase_t before = f->record.phase;
+        wl_columnar_filter_stage_t before_stage = ctx->stage;
+        int rc = before == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+            ? wl_columnar_eval_plan_numeric_consume_result(&f->record,
+                f->pending_protocol, host, id)
+            : wl_columnar_eval_plan_numeric_attempt_step(&f->record, host, id);
+        CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT &&
+            f->record.phase == before && ctx->stage == before_stage);
+        if (allowance == 383)
+            CHECK(f->record.phase == phase && ctx->stage == stage
+                && ctx->join_retirement_cursor == cursor && scratch->admitted
+                && scratch->committed && scratch->ref_held &&
+                scratch->governor == ref
+                && !scratch->physical && !scratch->allocated &&
+                scratch->credit.bytes == bytes);
+        join_snapshot_check(f, &snapshot);
+        CHECK(wl_evaluation_control_finish(host, &owner, 0,
+            0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(host,
+            &report) && report.consumed == (allowance == 383 ? 0u : 384u));
+        CHECK(!wl_evaluation_control_detach(host, &owner));
+        wl_evaluation_control_release(host);
+    }
+    col_rel_destroy(snapshot.contents);
+}
+
+static void
+test_join_retained_successor(void)
+{
+    fixture_t f; fixture_init(&f, 1, 2, 0);
+    col_rel_t *right = source_new(1, 1), *third = source_new(1, 3);
+    CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+    CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+    col_rel_t *registry[] = {right, third}; f.session.rels = registry;
+    f.session.nrels = 2;
+    wl_columnar_memory_governor_ref_t *governor = join_governor(&f, 1u << 20);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            governor), 128, &peer));
+    const char *key = "col0";
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_JOIN, .right_relation = "right",
+                           .delta_mode = WL_DELTA_FORCE_FULL},
+                          {.op = WL_PLAN_OP_JOIN, .right_relation = "third",
+                           .delta_mode = WL_DELTA_FORCE_FULL,
+                           .key_count = 1, .left_keys = &key,
+                           .right_keys = &key},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1}};
+    wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
+    fixture_begin(&f, &plan, 0, 3); join_until_ready(&f, 1);
+    join_snapshot_t snapshot = join_snapshot(&f);
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+        &f.record));
+    unsigned turns = 0;
+    while (f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT ||
+        ctx->join_retirement_cursor != 0){
+        CHECK(++turns < 10000 &&
+            f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        engine_dispatch(&f); ++f.witnesses;
+    }
+    wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[0];
+    CHECK(scratch->initialized && scratch->admitted && scratch->committed &&
+        scratch->ref_held
+        && scratch->governor == governor && !scratch->physical &&
+        !scratch->allocated);
+    uint64_t bytes = scratch->credit.bytes;
+    uint64_t reserved =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor));
+    CHECK(bytes && reserved > bytes + peer.bytes && ctx->pin_owned);
+    wl_columnar_memory_governor_test_refuse_next_release();
+    engine_dispatch(&f); ++f.witnesses;
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        && f.record.child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+        && ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT
+        && scratch->admitted && scratch->ref_held &&
+        scratch->credit.bytes == bytes);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == reserved);
+    join_snapshot_check(&f, &snapshot);
+    join_host_boundary(&f, ctx); /* pending consume; one grant reaches CHILD */
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD &&
+        ctx->pin_owned);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    uint64_t next = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(next != f.operation_id);
+    join_host_boundary(&f, ctx); /* genuine CREDIT retry, then park PENDING */
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_REFERENCE &&
+        !scratch->admitted
+        && scratch->ref_held && scratch->governor == governor &&
+        ctx->pin_owned);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == reserved - bytes);
+    run(&f);
+    CHECK(f.record.semantic_result == EINVAL && f.record.completed == 1 &&
+        f.record.cursor == 1
+        && !ctx->join_initialized && !ctx->pin_owned &&
+        !f.session.memory_budget_denied);
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i)
+        CHECK(!ctx->join_scratch[i].physical && !ctx->join_scratch[i].allocated
+            && !ctx->join_scratch[i].admitted &&
+            !ctx->join_scratch[i].ref_held);
+    join_snapshot_check(&f, &snapshot); col_rel_destroy(snapshot.contents);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation,
+        &report) && report.attempt_id == next && !report.consumed);
+    fixture_close(&f);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == peer.bytes);
+    CHECK(wl_columnar_memory_rollback(&peer));
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    col_rel_destroy(right); col_rel_destroy(third);
+}
+
+static void
+test_join_chained_delta(void)
+{
+    uint32_t projection[] = {0};
+    for (unsigned projected = 0; projected < 4; ++projected) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        col_rel_t *delta = source_new(1, 2), *right = source_new(1, 3),
+            *rd = source_new(1, 1);
+        col_rel_t *third = source_new(1, 4), *td = source_new(1, 1);
+        CHECK(!wl_columnar_relation_rename_checked(delta, "$d$input"));
+        CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+        CHECK(!wl_columnar_relation_rename_checked(rd, "$d$right"));
+        CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+        CHECK(!wl_columnar_relation_rename_checked(td, "$d$third"));
+        col_rel_t *registry[] = {f.input, delta, right, rd, third, td};
+        wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                               .relation_name = "input"},
+                              {.op = WL_PLAN_OP_JOIN,
+                               .right_relation = "right"},
+                              {.op = WL_PLAN_OP_JOIN,
+                               .right_relation = "third"}};
+        for (unsigned j = 0; j < 2; ++j)
+            if (projected & (1u << j)) {
+                ops[j + 1].project_count = 1;
+                ops[j + 1].project_indices = projection;
+            }
+        wl_plan_relation_t fragment = {.ops = ops, .op_count = 3};
+        source_begin(&f, &fragment, registry, 6); join_until_ready(&f, 2);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(f.record.completed == 1 && f.record.source_selected == delta);
+        CHECK(stack->items[0].rel->nrows == 6 &&
+            stack->items[0].is_delta == !(projected & 1));
+        run(&f);
+        CHECK(!f.record.semantic_result && f.record.completed == 2);
+        CHECK(stack->items[0].rel->nrows == (projected & 1 ? 6u : 24u));
+        CHECK(stack->items[0].is_delta == !(projected & 2));
+        join_raw_parity(&f, &fragment, false);
+        fixture_close(&f); col_rel_destroy(delta); col_rel_destroy(right);
+        col_rel_destroy(rd);
+        col_rel_destroy(third); col_rel_destroy(td);
+    }
+    /* Explicit selected-right boundaries: override a delta left, force full,
+     * absent/empty delta with and without seed, ordinary empty, missing full. */
+    const struct { unsigned mode; bool seeded; unsigned full_rows, delta_kind;
+                   uint32_t rows; bool is_delta; } cases[] = {
+        {WL_DELTA_FORCE_DELTA, false, 3, 2, 2, true},
+        {WL_DELTA_FORCE_FULL, false, 3, 2, 6, true},
+        {WL_DELTA_FORCE_DELTA, false, 3, 0, 6, true},
+        {WL_DELTA_FORCE_DELTA, true, 3, 0, 0, false},
+        {WL_DELTA_FORCE_DELTA, false, 3, 1, 6, true},
+        {WL_DELTA_FORCE_DELTA, true, 3, 1, 0, false},
+        {WL_DELTA_FORCE_FULL, true, 0, 0, 0, true},
+        {WL_DELTA_AUTO, false, 3, 3, 0, false}
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        fixture_t f; source_fixture(&f, 1, 7, 0);
+        f.session.delta_seeded = cases[i].seeded;
+        col_rel_t *delta = source_new(1, 2),
+            *right = source_new(1, cases[i].full_rows);
+        col_rel_t *rd = source_new(1, cases[i].delta_kind == 2 ? 1 : 0),
+            *third = source_new(1, 4);
+        CHECK(!wl_columnar_relation_rename_checked(delta, "$d$input"));
+        CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+        CHECK(!wl_columnar_relation_rename_checked(rd, "$d$right"));
+        CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+        col_rel_t *registry[] = {f.input, delta,
+                                 cases[i].delta_kind == 3 ? NULL : right,
+                                 cases[i].delta_kind ? rd : NULL, third};
+        wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                               .relation_name = "input"},
+                              {.op = WL_PLAN_OP_JOIN, .right_relation = "right",
+                               .delta_mode = cases[i].mode},
+                              {.op = WL_PLAN_OP_JOIN, .right_relation = "third",
+                               .delta_mode = WL_DELTA_FORCE_FULL}};
+        wl_plan_relation_t fragment = {.ops = ops, .op_count = 3};
+        source_begin(&f, &fragment, registry, 5); join_until_ready(&f, 2);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack->items[0].rel->nrows == cases[i].rows &&
+            stack->items[0].is_delta == cases[i].is_delta);
+        run(&f); CHECK(!f.record.semantic_result && f.record.completed == 2);
+        CHECK(stack->items[0].rel->nrows == 4 * cases[i].rows &&
+            stack->items[0].is_delta == cases[i].is_delta);
+        join_raw_parity(&f, &fragment, false); fixture_close(&f);
+        col_rel_destroy(delta); col_rel_destroy(right); col_rel_destroy(rd);
+        col_rel_destroy(third);
+    }
+}
+
+static void
 test_source_delta_modes(void)
 {
     const unsigned modes[] = {WL_DELTA_AUTO, WL_DELTA_FORCE_FULL,
@@ -1718,6 +2280,11 @@ main(void)
     test_owned_join_entry();
     test_owned_join_successor();
     test_generated_join_fragments();
+    test_join_no_output_stops();
+    test_join_literal_limits();
+    test_join_later_failures();
+    test_join_retained_successor();
+    test_join_chained_delta();
     test_generated(false); test_generated(true); test_boundaries();
     test_authority();
     test_intermediate_stop(); test_literal_prefixes(); test_retained_input();
