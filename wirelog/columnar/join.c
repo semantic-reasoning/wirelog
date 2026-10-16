@@ -4384,10 +4384,27 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     wl_evaluation_control_t *control, uint64_t id,
     wl_columnar_filter_status_t *status)
 {
+    return wl_columnar_join_op_attempt_start_owned(op, frame, session, control,
+               id, status, NULL);
+}
+
+int
+wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
     if (!op || !status) return EINVAL;
+    if (owner && !control) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack(frame, session, &stack);
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
     if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control || record->attempt_id != id)
+            return EINVAL;
+    }
     if (!control) {
         int result = col_op_join(op, stack, session);
         status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
@@ -4398,7 +4415,7 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_guard(control, id);
     if (rc) return rc;
     wl_columnar_filter_context_t *ctx = NULL;
-    rc = wl_columnar_eval_stack_filter_context(frame, &ctx);
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     /* Refused first admission has no live context or resource ownership. */
     rc = wl_columnar_join_attempt_charge(control, id,
@@ -4472,7 +4489,7 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_tail(control, id, 3, 0);
     if (rc) goto done;
     rc = wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
-            control, id, NULL);
+            control, id, owner);
     if (rc) goto done;
     ctx->unary_started = true;
     rc = wl_columnar_join_attempt_return(control, id, rc);
@@ -4482,13 +4499,13 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_eval_stack_unary_input(frame, &left);
+    rc = wl_columnar_eval_stack_unary_input_owned(frame, &left, owner);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
-    rc = wl_columnar_eval_stack_unary_output(frame, &out_slot);
+    rc = wl_columnar_eval_stack_unary_output_owned(frame, &out_slot, owner);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_charge(control, id,

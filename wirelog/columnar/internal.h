@@ -5623,6 +5623,13 @@ void wl_columnar_filter_attempt_batch_init(
 int wl_columnar_join_op_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+/* Original numeric-record authority through all frame getters. A live owner
+ * requires its original operation control and saved ID; only the NULL owner may
+ * delegate to raw JOIN. Shared step/ACK retain the same original owner. */
+int wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_join_test_attempt_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);

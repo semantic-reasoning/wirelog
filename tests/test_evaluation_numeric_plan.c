@@ -412,6 +412,190 @@ wrong_thread(void *data)
     return NULL;
 }
 
+typedef struct {
+    fixture_t *fixture;
+    const wl_plan_op_t *op;
+} owned_join_thread_t;
+
+static owned_join_thread_t *owned_join_active;
+static unsigned owned_join_reentries;
+
+static void
+owned_join_reentry(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != 1) return;
+    fixture_t *f = owned_join_active->fixture;
+    CHECK(control == f->operation);
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &context,
+        &f->record));
+    CHECK(context->busy && context->stage == WL_COLUMNAR_FILTER_STAGE_RUNNING);
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_join_op_attempt_start_owned(owned_join_active->op,
+        f->frame, &f->session, f->operation, f->operation_id, &status,
+        &f->record) == EBUSY);
+    CHECK(status.semantic_result == 119);
+    ++owned_join_reentries;
+}
+
+static void *
+owned_join_wrong_thread(void *data)
+{
+    owned_join_thread_t *call = data;
+    fixture_t *f = call->fixture;
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_join_op_attempt_start_owned(call->op, f->frame,
+        &f->session, f->operation, f->operation_id, &status,
+        &f->record) == EINVAL);
+    CHECK(status.semantic_result == 119);
+    return NULL;
+}
+
+/* Each actual owning invocation has a distinct host grant and returns before
+ * the fixture schedules another. Assertions and teardown are external work. */
+static int
+owned_join_action(fixture_t *f, const wl_plan_op_t *op,
+    wl_columnar_filter_status_t *status, unsigned action)
+{
+    if (wl_evaluation_control_active_attempt_id(f->funding) != f->funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(f->funding, 384);
+    if (rc) return rc;
+    if (!action)
+        return wl_columnar_join_op_attempt_start_owned(op, f->frame,
+                   &f->session, f->operation, f->operation_id, status,
+                   &f->record);
+    if (action == 1)
+        return wl_columnar_filter_op_attempt_step_owned(f->frame, status,
+                   &f->record);
+    return wl_columnar_filter_op_attempt_ack_owned(f->frame, &f->record);
+}
+
+static void
+test_owned_join_entry(void)
+{
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_relation_t plan = {.ops = &map, .op_count = 1};
+    wl_plan_op_t join = {.op = WL_PLAN_OP_JOIN, .right_relation = "input",
+                         .delta_mode = WL_DELTA_FORCE_FULL};
+    fixture_t f; fixture_init(&f, 1, 7, 0); fixture_begin(&f, &plan, 0, 1);
+    col_rel_t *right = source_new(1, 3);
+    col_rel_t *registry[] = {right};
+    f.session.rels = registry; f.session.nrels = 1;
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_join_op_attempt_start(&join, f.frame, &f.session,
+        f.operation, f.operation_id, &status) == EBUSY);
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        NULL, 0, &status, &f.record) == EINVAL);
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        f.operation, f.operation_id + 1, &status, &f.record) == EINVAL);
+    int alien_owner = 0;
+    wl_evaluation_control_t *alien = control_new(0, &alien_owner);
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        alien, wl_evaluation_control_active_attempt_id(alien), &status,
+        &f.record) == EINVAL);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_finish(alien, &alien_owner, 0, 0));
+    CHECK(!wl_evaluation_control_report(alien, &report) && !report.consumed);
+    CHECK(!wl_evaluation_control_detach(alien, &alien_owner));
+    wl_evaluation_control_release(alien);
+    wl_columnar_eval_plan_numeric_attempt_t copy = f.record;
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        f.operation, f.operation_id, &status, &copy) == EBUSY);
+    wl_col_session_t foreign = {0};
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &foreign,
+        f.operation, f.operation_id, &status, &f.record) == EINVAL);
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session, &nested));
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        f.operation, f.operation_id, &status, &f.record) == EBUSY);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    owned_join_thread_t call = {&f, &join};
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, owned_join_wrong_thread, &call));
+    CHECK(!wl_thread_join(&thread));
+    CHECK(status.semantic_result == 119);
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &context,
+        &f.record));
+    CHECK(context->stage == WL_COLUMNAR_FILTER_STAGE_INERT && !context->busy
+        && !context->pin_owned && !context->source_initialized
+        && !context->join_initialized);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        f.input);
+
+    owned_join_active = &call; owned_join_reentries = 0;
+    wl_columnar_join_test_attempt_checkpoint = owned_join_reentry;
+    CHECK(!owned_join_action(&f, &join, &status, 0));
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    owned_join_active = NULL;
+    CHECK(owned_join_reentries == 1);
+    wl_columnar_filter_status_t sentinel = {.semantic_result = 119};
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        f.operation, f.operation_id, &sentinel, &f.record) == EBUSY);
+    CHECK(sentinel.semantic_result == 119);
+    unsigned turns = 0;
+    while (status.progress != WL_COLUMNAR_FILTER_PROGRESS_DONE) {
+        CHECK(++turns < 10000);
+        CHECK(!owned_join_action(&f, &join, &status, 1));
+    }
+    CHECK(!status.semantic_result && status.committed);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].owned);
+    col_rel_t *result = stack->items[0].rel;
+    CHECK(result->ncols == 2 && result->nrows == 21);
+    for (int64_t x = 0; x < 7; ++x)
+        for (int64_t y = 0; y < 3; ++y) {
+            unsigned matches = 0;
+            for (uint32_t r = 0; r < result->nrows; ++r)
+                matches += result->columns[0][r] == x
+                    && result->columns[1][r] == y;
+            CHECK(matches == 1);
+        }
+    CHECK(!owned_join_action(&f, &join, &status, 2));
+    /* The owning record can still execute its original MAP after JOIN ACK. */
+    run(&f); CHECK(!f.record.semantic_result && f.record.completed == 1);
+    fixture_close(&f); col_rel_destroy(right);
+}
+
+static void
+test_owned_join_successor(void)
+{
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_relation_t plan = {.ops = &map, .op_count = 1};
+    wl_plan_op_t join = {.op = WL_PLAN_OP_JOIN, .right_relation = "input"};
+    fixture_t f; fixture_init(&f, 1, 7, 0); fixture_begin(&f, &plan, 0, 1);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation,
+        &report) && !report.consumed);
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    uint64_t next = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(next != f.operation_id);
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_join_op_attempt_start_owned(&join, f.frame, &f.session,
+        f.operation, next, &status, &f.record) == EINVAL);
+    CHECK(status.semantic_result == 119);
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &context,
+        &f.record));
+    CHECK(context->stage == WL_COLUMNAR_FILTER_STAGE_INERT && !context->busy
+        && !context->pin_owned && !context->source_initialized
+        && !context->join_initialized);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        f.input);
+    /* Retire the original record through its stale-ID refusal, never execute
+     * its MAP using the successor's allowance. */
+    run(&f);
+    CHECK(f.record.semantic_result == EINVAL && !f.record.completed);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_report(f.operation, &report));
+    CHECK(report.attempt_id == next && !report.consumed);
+    fixture_close(&f);
+}
+
 static void
 test_intermediate_stop(void)
 {
@@ -1326,6 +1510,8 @@ test_source_host_boundaries(void)
 int
 main(void)
 {
+    test_owned_join_entry();
+    test_owned_join_successor();
     test_generated(false); test_generated(true); test_boundaries();
     test_authority();
     test_intermediate_stop(); test_literal_prefixes(); test_retained_input();
