@@ -52,6 +52,9 @@ wl_test_unsetenv_(const char *name)
 #define wl_test_getpid getpid
 #endif
 
+/* Defined under WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS in testlib_prod. */
+extern void wl_columnar_diff_join_batch_test_fail_allocation_at(uint32_t n);
+
 static int tests_run;
 static int tests_passed;
 static int tests_failed;
@@ -2983,6 +2986,184 @@ test_operator_delta_and_filtered_fallbacks(void)
         FAIL("operator fallback matrix");
 }
 
+/* Differential counterpart of run_excluded_operator_case (#1382).  The
+ * oracle is the ordinary one-shot join of the same shape with the knob off
+ * and no materialization, so a cached result cannot stand in for it.  The
+ * strict run must refuse with no net change to the session's reserved
+ * bytes. */
+static bool
+run_excluded_diff_case(fixture_t *f, wl_plan_op_t *op, uint64_t knob,
+    col_join_batch_eligibility_t reason, uint32_t expected_rows,
+    const char *label)
+{
+    eval_stack_t stack;
+    eval_entry_t result;
+    wl_plan_op_t oracle_op = *op;
+    col_rel_t *oracle = NULL;
+    uint64_t reserved;
+    int rc;
+    bool ok = true;
+
+    f->sess->join_batch_bytes = knob;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f->left, false);
+    rc = col_op_join_diff(op, &stack, f->sess);
+    if (rc != 0 || stack.top == 0) {
+        printf("(%s: non-strict rc %d) ", label, rc);
+        ok = false;
+        eval_stack_drain(&stack);
+    } else {
+        result = eval_stack_pop(&stack);
+        oracle_op.materialized = false;
+        oracle = run_oracle(f->sess, f->left, &oracle_op);
+        if (!oracle || oracle->nrows != expected_rows
+            || !same_rows(oracle, result.rel)
+            || f->sess->join_batch_fallback_count != 1u
+            || f->sess->join_batch_last_reason != reason) {
+            printf("(%s: result/count/reason %u/%u) ", label,
+                f->sess->join_batch_fallback_count,
+                (unsigned)f->sess->join_batch_last_reason);
+            ok = false;
+        }
+        if (oracle)
+            col_rel_destroy(oracle);
+        if (result.owned)
+            col_rel_destroy(result.rel);
+        eval_stack_drain(&stack);
+    }
+
+    /* A cached materialized result would be copied before the bounded-mode
+     * decision is reached. */
+    col_mat_cache_clear(&f->sess->mat_cache);
+    f->sess->join_batch_strict = true;
+    reserved = reserved_of(f->sess);
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f->left, false);
+    rc = col_op_join_diff(op, &stack, f->sess);
+    if (rc != ENOTSUP || stack.top != 0
+        || f->sess->join_batch_fallback_count != 1u
+        || reserved_of(f->sess) != reserved) {
+        printf("(%s: strict rc %d) ", label, rc);
+        ok = false;
+        if (stack.top > 0) {
+            result = eval_stack_pop(&stack);
+            if (result.owned)
+                col_rel_destroy(result.rel);
+        }
+    }
+    eval_stack_drain(&stack);
+    f->sess->join_batch_strict = false;
+    f->sess->join_batch_bytes = 0;
+    return ok;
+}
+
+/* #1382: the differential join records the reason for every shape it keeps
+ * on the one-shot path, as the ordinary join does, and refuses it under
+ * WIRELOG_JOIN_BATCH_STRICT.  Before, cross, delta-right, filtered-right and
+ * materialized fell through silently and ran one-shot even when strict. */
+static void
+test_diff_operator_exclusions_recorded_and_strict(void)
+{
+    const int64_t keys[] = { 0, 1, 1, 0 };
+    bool ok = true;
+
+    TEST("differential join records and strict-refuses excluded shapes");
+    for (int c = 0; c < 5 && ok; c++) {
+        fixture_t f;
+        wl_plan_op_t op;
+        col_rel_t *delta = NULL;
+
+        if (!fixture_init(&f, 1u << 24, keys, 4, 2, 2)) {
+            FAIL("fixture");
+            fixture_fini(&f);
+            return;
+        }
+        init_join_op(&op, f.lkeys, f.rkeys);
+        switch (c) {
+        case 0:
+            op.key_count = 0;
+            op.left_keys = NULL;
+            op.right_keys = NULL;
+            ok = run_excluded_diff_case(&f, &op, 9u * 32u,
+                    COL_JOIN_BATCH_EXCLUDED_CROSS, 16u, "cross");
+            break;
+        case 1:
+            delta = make_right_named("$d$right", 2, 1);
+            if (!delta || session_add_rel(f.sess, delta) != 0) {
+                if (delta)
+                    col_rel_destroy(delta);
+                ok = false;
+                break;
+            }
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            ok = run_excluded_diff_case(&f, &op, 9u * 32u,
+                    COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT, 4u, "delta-right");
+            break;
+        case 2:
+            op.right_filter_expr.data = right_filter_bytes;
+            op.right_filter_expr.size = sizeof(right_filter_bytes);
+            ok = run_excluded_diff_case(&f, &op, 9u * 32u,
+                    COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT, 4u,
+                    "filtered-right");
+            break;
+        case 3:
+            op.materialized = true;
+            ok = run_excluded_diff_case(&f, &op, 9u * 32u,
+                    COL_JOIN_BATCH_EXCLUDED_MATERIALIZED, 8u, "materialized");
+            break;
+        default:
+            /* An eligible shape whose batch budget is below one 32-byte
+             * output row. */
+            ok = run_excluded_diff_case(&f, &op, 8u,
+                    COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE, 8u,
+                    "row-too-large");
+            break;
+        }
+        fixture_fini(&f);
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("differential exclusion matrix");
+}
+
+/* Only a create ENOTSUP is a recorded fallback: any other create failure is
+ * returned as the operator's error and records nothing. */
+static void
+test_diff_operator_create_failure_records_nothing(void)
+{
+    const int64_t keys[] = { 0, 1 };
+    fixture_t f;
+    wl_plan_op_t op;
+    eval_stack_t stack;
+    int rc;
+
+    TEST("differential create failure is returned, not recorded");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 2)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    init_join_op(&op, f.lkeys, f.rkeys);
+    f.sess->join_batch_bytes = 9u * 32u;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, f.left, false);
+    wl_columnar_diff_join_batch_test_fail_allocation_at(1u);
+    rc = col_op_join_diff(&op, &stack, f.sess);
+    wl_columnar_diff_join_batch_test_fail_allocation_at(0u);
+    if (stack.top > 0) {
+        eval_entry_t result = eval_stack_pop(&stack);
+        if (result.owned)
+            col_rel_destroy(result.rel);
+    }
+    eval_stack_drain(&stack);
+    if (rc != ENOMEM || f.sess->join_batch_fallback_count != 0u)
+        FAIL("create failure was recorded or masked");
+    else
+        PASS();
+    fixture_fini(&f);
+}
+
 static void
 test_eligibility_ordering(void)
 {
@@ -4146,6 +4327,8 @@ main(void)
     test_operator_dispatch_and_eligibility();
     test_operator_no_arrangement_probe_failure();
     test_operator_delta_and_filtered_fallbacks();
+    test_diff_operator_exclusions_recorded_and_strict();
+    test_diff_operator_create_failure_records_nothing();
     test_eligibility_ordering();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();

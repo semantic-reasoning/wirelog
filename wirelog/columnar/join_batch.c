@@ -54,6 +54,7 @@ col_join_batch_eligibility_name(col_join_batch_eligibility_t reason)
     case COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT: return "no-arrangement";
     case COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE: return "row-too-large";
     case COL_JOIN_BATCH_EXCLUDED_PIPELINE: return "pipeline-not-consumable";
+    case COL_JOIN_BATCH_EXCLUDED_MATERIALIZED: return "materialized";
     default: return "unknown";
     }
 }

@@ -3377,8 +3377,15 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * generation lease.  Like the one-shot $join_diff below, its output
      * carries no timestamps (Issue #2173).  Materialized results remain on
      * the one-shot path until their cache transaction can be made
-     * operation-atomic. */
-    if (sess->join_batch_bytes > 0 && sess->coordinator) {
+     * operation-atomic.  Excluded shapes are decided by the same check as
+     * the ordinary join, then materialized; each falls back to the one-shot
+     * join with its reason recorded, or fails with ENOTSUP in strict mode
+     * (#1382). */
+    col_join_batch_eligibility_t batch_elig = col_join_batch_eligibility(sess,
+            kc, used_right_delta, op->right_filter_expr.size != 0);
+    if (batch_elig == COL_JOIN_BATCH_ELIGIBLE && op->materialized)
+        batch_elig = COL_JOIN_BATCH_EXCLUDED_MATERIALIZED;
+    if (sess->join_batch_bytes > 0 && batch_elig != COL_JOIN_BATCH_ELIGIBLE) {
         if (sess->join_batch_strict) {
             wl_columnar_join_key_scratch_free(&key_scratch, &lk);
             wl_columnar_join_key_scratch_free(&key_scratch, &rk);
@@ -3386,12 +3393,9 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 col_rel_destroy(right_filtered);
             return wl_columnar_join_dispose_left(stack, &left_e, ENOTSUP);
         }
-        col_join_batch_record_fallback(sess,
-            COL_JOIN_BATCH_EXCLUDED_WORKER);
+        col_join_batch_record_fallback(sess, batch_elig);
     }
-    if (sess->join_batch_bytes > 0 && !sess->coordinator && kc > 0
-        && !used_right_delta
-        && op->right_filter_expr.size == 0 && !op->materialized) {
+    if (batch_elig == COL_JOIN_BATCH_ELIGIBLE) {
         wl_columnar_continuation_t *cont = NULL;
         col_rel_t *bounded_out = NULL;
         int bounded_rc = wl_columnar_join_new_output(sess, left, right,
@@ -3400,9 +3404,16 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (bounded_rc == 0)
             bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
                     col_join_set_output_types(bounded_out, left, right, op));
-        if (bounded_rc == 0)
+        if (bounded_rc == 0) {
             bounded_rc = col_diff_join_batch_producer_create(sess, op, left,
                     left_e.is_delta, lk, rk, kc, sess->join_batch_bytes, &cont);
+            /* As in the ordinary join, a create ENOTSUP is recorded as
+             * row-too-large: one output row does not fit the batch
+             * budget. */
+            if (bounded_rc == ENOTSUP && !sess->join_batch_strict)
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE);
+        }
         if (bounded_rc == 0) {
             bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
                     col_join_batch_run_to_relation(cont, sess, bounded_out));
