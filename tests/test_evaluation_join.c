@@ -1637,6 +1637,24 @@ probe_retained_credit(void)
     }
 }
 
+/* #1382: the controlled route is not a bounded JOIN, so while
+ * WIRELOG_JOIN_BATCH_BYTES is set (join_batch_bytes != 0) it finishes with
+ * ENOTSUP, commits nothing and leaves the left input on the stack.  It
+ * records no fallback reason; recording one belongs to #1821. */
+static void
+batch_knob_refused_case(void)
+{
+    fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+    f.session.join_batch_bytes = 224;
+    run(&f);
+    CHECK(f.status.semantic_result == ENOTSUP && !f.status.committed);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel == f.left);
+    CHECK(!f.session.join_batch_fallback_count);
+    f.session.join_batch_bytes = 0;
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -1650,7 +1668,7 @@ main(void)
     retained_case(); governor_cases(); publication_case(); interrupt_cases();
     keyed_cases(); key_grammar_cases(); key_empty_and_type_cases();
     key_interrupt_cases(); key_governor_cases(); key_literal_prefixes();
-    hash_literal_prefixes();
+    hash_literal_prefixes(); batch_knob_refused_case();
     puts("ordinary cross/keyed JOIN raw parity and work-limit cleanup passed");
     return 0;
 }

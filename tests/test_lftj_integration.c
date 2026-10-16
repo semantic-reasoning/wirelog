@@ -11,6 +11,9 @@
  *   4. 4-way join via session API produces correct results
  *   5. No false positive: IDB relations are not rewritten as LFTJ
  */
+#ifndef _WIN32
+#define _DEFAULT_SOURCE 1
+#endif
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
@@ -26,6 +29,8 @@
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 
+#include "../wirelog/columnar/join_batch.h"
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -33,6 +38,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define setenv wl_test_setenv_
+#define unsetenv wl_test_unsetenv_
+#endif
 
 /* ----------------------------------------------------------------
  * Test framework
@@ -318,6 +341,101 @@ test_3way_join_result(void)
 
     ASSERT(out_count == 1, "expected exactly 1 output tuple");
     ASSERT(found_expected, "expected out(1,10,100,1000) not found");
+    PASS();
+}
+
+/* #1382: LFTJ is never bounded.  With WIRELOG_JOIN_BATCH_BYTES set, the
+ * 3-way chain above still produces exactly out(1,10,100,1000) and records
+ * the `lftj` fallback; under WIRELOG_JOIN_BATCH_STRICT the snapshot is
+ * refused with ENOTSUP and the session still destroys cleanly.  The knob is
+ * read at session creation. */
+static void
+test_lftj_bounded_mode_recorded_and_strict(void)
+{
+    const char *src = ".decl r1(x: int32, a: int32)\n"
+        ".decl r2(x: int32, b: int32)\n"
+        ".decl r3(x: int32, c: int32)\n"
+        ".decl out(x: int32, a: int32, b: int32, c: int32)\n"
+        "r1(1, 10). r1(2, 20). r1(3, 30).\n"
+        "r2(1, 100). r2(2, 200). r2(4, 400).\n"
+        "r3(1, 1000). r3(3, 3000). r3(5, 5000).\n"
+        "out(x, a, b, c) :- r1(x, a), r2(x, b), r3(x, c).\n";
+    bool ok = true;
+    char saved_bytes[64] = "";
+    char saved_strict[64] = "";
+    bool had_bytes = false;
+    bool had_strict = false;
+    const char *v;
+
+    TEST("LFTJ records its bounded-mode fallback and strict refuses it");
+    /* The gates export these variables; restore them for later tests. */
+    v = getenv("WIRELOG_JOIN_BATCH_BYTES");
+    if (v) {
+        had_bytes = true;
+        snprintf(saved_bytes, sizeof(saved_bytes), "%s", v);
+    }
+    v = getenv("WIRELOG_JOIN_BATCH_STRICT");
+    if (v) {
+        had_strict = true;
+        snprintf(saved_strict, sizeof(saved_strict), "%s", v);
+    }
+    for (int strict = 0; strict < 2 && ok; strict++) {
+        wirelog_program_t *prog = NULL;
+        wl_plan_t *plan = NULL;
+        wl_session_t *sess = NULL;
+        collect_t coll;
+        int rc;
+
+        setenv("WIRELOG_JOIN_BATCH_BYTES", "224", 1);
+        if (strict)
+            setenv("WIRELOG_JOIN_BATCH_STRICT", "1", 1);
+        else
+            unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+        if (make_plan_no_opt(src, &plan, &prog) != 0
+            || count_lftj_ops(plan) == 0
+            || wl_session_create(wl_backend_columnar(), plan, 1, &sess) != 0
+            || wl_session_load_facts(sess, prog) != 0) {
+            ok = false;
+        } else {
+            memset(&coll, 0, sizeof(coll));
+            rc = wl_session_snapshot(sess, collect_cb, &coll);
+            if (!strict) {
+                uint32_t out_count = 0;
+                bool found = false;
+                for (uint32_t i = 0; i < coll.count; i++) {
+                    if (coll.ncols[i] != 4)
+                        continue;
+                    out_count++;
+                    found = found || (coll.rows[i][0] == 1
+                        && coll.rows[i][1] == 10 && coll.rows[i][2] == 100
+                        && coll.rows[i][3] == 1000);
+                }
+                ok = rc == 0 && !coll.oom && out_count == 1 && found
+                    && COL_SESSION(sess)->join_batch_fallback_count >= 1u
+                    && COL_SESSION(sess)->join_batch_last_reason
+                    == COL_JOIN_BATCH_EXCLUDED_LFTJ;
+            } else {
+                ok = rc == ENOTSUP;
+            }
+            if (!ok)
+                printf("(strict=%d rc=%d count=%u reason=%u) ", strict, rc,
+                    COL_SESSION(sess)->join_batch_fallback_count,
+                    (unsigned)COL_SESSION(sess)->join_batch_last_reason);
+        }
+        if (sess)
+            wl_session_destroy(sess);
+        wl_plan_free(plan);
+        wirelog_program_free(prog);
+    }
+    if (had_bytes)
+        setenv("WIRELOG_JOIN_BATCH_BYTES", saved_bytes, 1);
+    else
+        unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    if (had_strict)
+        setenv("WIRELOG_JOIN_BATCH_STRICT", saved_strict, 1);
+    else
+        unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    ASSERT(ok, "LFTJ bounded-mode record or strict refusal");
     PASS();
 }
 
@@ -1143,6 +1261,7 @@ main(void)
     test_plan_has_lftj();
     test_plan_no_lftj_for_binary();
     test_3way_join_result();
+    test_lftj_bounded_mode_recorded_and_strict();
     test_float_join_result();
     test_4way_join_result();
     test_idb_not_rewritten();

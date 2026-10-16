@@ -33,6 +33,7 @@
 #endif
 
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
 
@@ -1336,6 +1337,14 @@ col_op_lftj(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     uint32_t k = meta->k;
     if (k < 2u || !meta->rel_names || !meta->key_cols)
         return EINVAL;
+    /* LFTJ is never bounded (#1382): it builds its whole output in one
+     * append batch.  Record that under WIRELOG_JOIN_BATCH_BYTES, or refuse
+     * under strict mode before anything is reserved or read. */
+    if (sess->join_batch_bytes > 0) {
+        if (sess->join_batch_strict)
+            return ENOTSUP;
+        col_join_batch_record_fallback(sess, COL_JOIN_BATCH_EXCLUDED_LFTJ);
+    }
 
     uint64_t lftj_scratch_bytes = 0;
     uint64_t bytes = 0;

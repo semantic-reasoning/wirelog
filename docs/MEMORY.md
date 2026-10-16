@@ -1522,24 +1522,25 @@ returned by the output's capacity reservation itself is still reported as
 the same transaction still return `ENOMEM` when denied; the check is already
 true for them.
 
-LFTJ is outside bounded mode.  `WIRELOG_JOIN_BATCH_BYTES` and
-`WIRELOG_JOIN_BATCH_STRICT` do not apply to `col_op_lftj`: it builds the
-whole `$lftj` output in one append batch before publishing it, and strict
-mode does not refuse it.  The planner forms LFTJ only from a chain of at
-least three EDB relations joined on one shared `col<N>` key
-(`lftj_chain_len` in `exec_plan_gen.c`).  When the session has a memory
-governor, `col_op_lftj` reserves its staging before allocating, including
-`nrows * ncols * 8` bytes per input for the input copy it makes when no
-sorted arrangement can be pinned, and the `$lftj` output's growth is
-admitted by that governor; a denial returns `ENOSPC` and sets
-`memory_budget_denied` (`test_lftj_integration`).  Without a session
-governor neither that input copy nor the output is admitted, even when the
-inputs carry a governor; that remains #1978 work.  When this paragraph
-was written (#1370), the knob-on test suite ran LFTJ 10 times with at most
-3 output rows, and none of the ten `bench_flowlog` programs nor DOOP
-planned an LFTJ.  These counts describe the repository's workloads, not a
-bound: an EDB-only star join on one key multiplies its inputs' per-key
-fanouts.
+LFTJ is outside bounded mode: `col_op_lftj` builds the whole `$lftj` output
+in one append batch before publishing it.  Since #1382, with
+`WIRELOG_JOIN_BATCH_BYTES` set and without strict mode it records the
+`lftj` fallback each time it runs; under `WIRELOG_JOIN_BATCH_STRICT` it
+returns `ENOTSUP`, recording nothing, before it reserves memory or reads
+its inputs.  The planner forms LFTJ only from a chain of at least three EDB
+relations joined on one shared `col<N>` key (`lftj_chain_len` in
+`exec_plan_gen.c`).  When the session has a memory governor, `col_op_lftj`
+reserves its staging before allocating, including `nrows * ncols * 8` bytes
+per input for the input copy it makes when no sorted arrangement can be
+pinned, and the `$lftj` output's growth is admitted by that governor; a
+denial returns `ENOSPC` and sets `memory_budget_denied`
+(`test_lftj_integration`).  Without a session governor neither that input
+copy nor the output is admitted, even when the inputs carry a governor;
+that remains #1978 work.  When this paragraph was written (#1370), the
+knob-on test suite ran LFTJ 10 times with at most 3 output rows, and none
+of the ten `bench_flowlog` programs nor DOOP planned an LFTJ.  These counts
+describe the repository's workloads, not a bound: an EDB-only star join on
+one key multiplies its inputs' per-key fanouts.
 
 Cross joins and the ephemeral hash path also stay one-shot.  On the
 non-differential path outside worker sessions, a join with no key columns

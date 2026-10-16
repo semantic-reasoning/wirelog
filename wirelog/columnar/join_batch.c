@@ -55,22 +55,34 @@ col_join_batch_eligibility_name(col_join_batch_eligibility_t reason)
     case COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE: return "row-too-large";
     case COL_JOIN_BATCH_EXCLUDED_PIPELINE: return "pipeline-not-consumable";
     case COL_JOIN_BATCH_EXCLUDED_MATERIALIZED: return "materialized";
+    case COL_JOIN_BATCH_EXCLUDED_LFTJ: return "lftj";
     default: return "unknown";
     }
 }
+
+/* Each reason owns one bit of the session's warned-reasons mask.  MSVC in
+ * its default C mode has no _Static_assert; use the typedef-array check
+ * eval_plan.c uses there. */
+#if defined(_MSC_VER)
+typedef char col_join_batch_reason_bits_check_
+    [(COL_JOIN_BATCH_REASON_COUNT <= 16) ? 1 : -1];
+#else
+_Static_assert(COL_JOIN_BATCH_REASON_COUNT <= 16,
+    "join_batch_warned_reasons has one bit per reason");
+#endif
 
 void
 col_join_batch_record_fallback(wl_col_session_t *sess,
     col_join_batch_eligibility_t reason)
 {
-    uint8_t bit;
+    uint16_t bit;
 
     if (!sess || reason == COL_JOIN_BATCH_ELIGIBLE
         || reason == COL_JOIN_BATCH_EXCLUDED_OFF)
         return;
     sess->join_batch_fallback_count++;
     sess->join_batch_last_reason = (uint8_t)reason;
-    bit = (uint8_t)(1u << ((unsigned)reason & 7u));
+    bit = (uint16_t)(1u << ((unsigned)reason & 15u));
     if (sess->join_batch_warned_reasons & bit)
         return;
     sess->join_batch_warned_reasons |= bit;

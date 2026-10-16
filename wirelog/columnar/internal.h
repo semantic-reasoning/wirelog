@@ -2235,7 +2235,7 @@ typedef struct wl_col_session_t {
     bool join_batch_strict;
     uint32_t join_batch_fallback_count;
     uint8_t join_batch_last_reason;
-    uint8_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
+    uint16_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
      * number needed to decide whether dividing the row cap by W is right:

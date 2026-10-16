@@ -3164,6 +3164,50 @@ test_diff_operator_create_failure_records_nothing(void)
     fixture_fini(&f);
 }
 
+/* Every recordable reason warns once, on its own bit of the session's
+ * warned-reasons mask (#1382).  Under the former 8-bit "& 7" mask, LFTJ
+ * (10) shared CROSS's bit (2), so a session that recorded a cross join
+ * never warned about LFTJ. */
+static void
+test_join_batch_reason_mask_distinct(void)
+{
+    wl_col_session_t *sess = make_session(1u << 24);
+    bool ok = sess != NULL;
+
+    TEST("each fallback reason warns on its own mask bit");
+    if (!ok) {
+        FAIL("session");
+        return;
+    }
+    sess->join_batch_bytes = 224;
+    for (unsigned r = COL_JOIN_BATCH_EXCLUDED_CROSS;
+        ok && r < COL_JOIN_BATCH_REASON_COUNT; r++) {
+        unsigned before = sess->join_batch_warned_reasons;
+        unsigned added;
+
+        col_join_batch_record_fallback(sess,
+            (col_join_batch_eligibility_t)r);
+        added = sess->join_batch_warned_reasons & ~before;
+        /* exactly one new bit per reason */
+        if (added == 0 || (added & (added - 1u)) != 0) {
+            printf("(reason %u added mask 0x%x) ", r, added);
+            ok = false;
+        }
+    }
+    /* Recording a reason a second time adds no bit. */
+    if (ok) {
+        unsigned before = sess->join_batch_warned_reasons;
+        col_join_batch_record_fallback(sess, COL_JOIN_BATCH_EXCLUDED_LFTJ);
+        ok = sess->join_batch_warned_reasons == before
+            && sess->join_batch_last_reason == COL_JOIN_BATCH_EXCLUDED_LFTJ;
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("reasons share a warned-reasons bit");
+    destroy_session(sess);
+}
+
 static void
 test_eligibility_ordering(void)
 {
@@ -4329,6 +4373,7 @@ main(void)
     test_operator_delta_and_filtered_fallbacks();
     test_diff_operator_exclusions_recorded_and_strict();
     test_diff_operator_create_failure_records_nothing();
+    test_join_batch_reason_mask_distinct();
     test_eligibility_ordering();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
