@@ -335,7 +335,11 @@ active is refused before evaluation, and so is a run the memory governor
 denies. `wl_columnar_eval_tdd_insert_stratum()` runs the instances on one
 worker clone with those session flags cleared, since a clone copies them
 from the coordinator; a session's bounded join batching, strict mode
-included, is therefore off for these runs.
+included, is therefore off for these runs.  With `WIRELOG_JOIN_BATCH_BYTES`
+set and without strict mode, a snapshot that attempts this route through a
+stratum with a JOIN records the `insert-route` fallback; under
+`WIRELOG_JOIN_BATCH_STRICT` the route is refused, recording nothing, before
+anything is mutated, and the snapshot is evaluated in full instead (#1382).
 
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned

@@ -30,6 +30,7 @@
 #endif
 
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_facts.h"
@@ -50,7 +51,14 @@ wl_test_setenv_(const char *name, const char *value, int overwrite)
     return _putenv_s(name, value ? value : "");
 }
 
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
 #  define setenv wl_test_setenv_
+#  define unsetenv wl_test_unsetenv_
 #endif
 
 static int tests_run = 0;
@@ -308,6 +316,90 @@ done:
     }
 }
 
+/* #1382: the insert route runs a reached stratum's joins on a worker clone
+ * with bounded join batching turned off.  With WIRELOG_JOIN_BATCH_BYTES set
+ * it records insert-route on the session; under WIRELOG_JOIN_BATCH_STRICT it
+ * refuses before changing anything, and the snapshot is re-evaluated in full
+ * instead.  Either way the rows are exact.  A reached stratum without a
+ * JOIN records nothing.  @strict selects the mode; the knobs are read when
+ * the session is created. */
+static void
+run_join_batch_case(bool join, bool strict, uint32_t workers)
+{
+    static const case_t keyed = {
+        "keyed join of the inserted relation", false,
+        ".decl e(x: int64)\n.decl s(x: int64, y: int64)\n"
+        ".decl m(x: int64, y: int64)\n"
+        "s(7, 70). s(8, 80). s(9, 90).\n"
+        "m(x, y) :- e(x), s(x, y).\n",
+        "m", { { 7, 70 }, { 8, 80 }, { 9, 90 } }, 3, 0, true
+    };
+    case_t c = join ? keyed : CASES[1];
+    wirelog_error_t err;
+    wirelog_program_t *prog = NULL;
+    wl_plan_t *plan = NULL;
+    wl_session_t *s = NULL;
+    const char *why = NULL;
+    uint32_t route0;
+    uint8_t want_reason = 0;
+
+    c.route = !(join && strict);
+    if (join && !strict)
+        want_reason = COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE;
+    tests_run++;
+    printf("  [%d] bounded mode, %s, %s (%u worker%s)", tests_run,
+        join ? "join" : "no join", strict ? "strict" : "recorded", workers,
+        workers == 1 ? "" : "s");
+    setenv("WIRELOG_JOIN_BATCH_BYTES", "224", 1);
+    if (strict)
+        setenv("WIRELOG_JOIN_BATCH_STRICT", "1", 1);
+    else
+        unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    prog = wirelog_parse_string(c.program, &err);
+    if (!prog || (plan_fixture_hold(prog),
+        wl_plan_from_program(prog, &plan) != 0)
+        || wl_session_create(wl_backend_columnar(), plan, workers, &s) != 0
+        || wl_session_load_facts(s, prog) != 0
+        || add(s, &c, 7, false) != 0 || add(s, &c, 8, false) != 0
+        || wl_session_snapshot(s, collect, &(rows_t){ .relation = "" })
+        != 0) {
+        why = "setup";
+        goto done;
+    }
+    /* Only the incremental snapshot below is under test. */
+    COL_SESSION(s)->join_batch_fallback_count = 0;
+    COL_SESSION(s)->join_batch_last_reason = 0;
+    route0 = wl_columnar_session_test_insert_route_taken;
+    if (add(s, &c, 9, true) != 0) {
+        why = "incremental insert";
+        goto done;
+    }
+    if ((why = expect(s, &c, "snapshot")) != NULL
+        || (why = expect_route(&c, route0, "snapshot")) != NULL)
+        goto done;
+    if (COL_SESSION(s)->join_batch_last_reason != want_reason
+        || (want_reason && !COL_SESSION(s)->join_batch_fallback_count)) {
+        snprintf(message, sizeof(message), "reason %u count %u, want %u",
+            (unsigned)COL_SESSION(s)->join_batch_last_reason,
+            COL_SESSION(s)->join_batch_fallback_count, (unsigned)want_reason);
+        why = message;
+    }
+done:
+    if (s)
+        wl_session_destroy(s);
+    if (plan)
+        wl_plan_free(plan);
+    unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    if (why) {
+        printf(" ... FAIL: %s\n", why);
+        tests_failed++;
+    } else {
+        printf(" ... PASS\n");
+        tests_passed++;
+    }
+}
+
 int
 main(void)
 {
@@ -322,6 +414,13 @@ main(void)
     for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++)
         for (uint32_t i = 0; i < sizeof(CASES) / sizeof(CASES[0]); i++)
             run_case(&CASES[i], workers[w]);
+    /* The bounded-mode cases set and clear the join-batch knobs, so they
+     * run last and the cases above see the environment they were given. */
+    for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++) {
+        run_join_batch_case(true, false, workers[w]);
+        run_join_batch_case(true, true, workers[w]);
+        run_join_batch_case(false, false, workers[w]);
+    }
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;
