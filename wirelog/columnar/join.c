@@ -1371,6 +1371,16 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
+    /* A nonempty nullary left has no key column to probe. Empty left inputs
+     * and nullary cross joins remain valid; match the bounded producer's
+     * EINVAL before a cached result or one-shot probe can bypass validation. */
+    if (op->key_count > 0 && left_e.rel->ncols == 0
+        && left_e.rel->nrows > 0) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
+    }
+
     /* Materialization cache: reuse previous join result when available.
      * Works with both stable (borrowed) and worker-owned relations since
      * the cache key is based on content hash, not ownership. This enables

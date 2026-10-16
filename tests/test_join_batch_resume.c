@@ -3263,12 +3263,13 @@ test_operator_empty_left_nothing_to_bound(void)
             ok = false;
         }
     }
-    {
-        /* A zero-column left that holds a row names no key column; the
-         * producer still refuses it. */
+    for (int run = 0; run < 3; run++) {
+        /* A zero-column left that holds a row names no key column;
+         * reject it in one-shot, bounded and strict bounded modes. */
         uint32_t ncols;
         uint32_t nrows;
-        int rc = empty_left_join(sess, zero_col_rows, 4u * 32u, false,
+        int rc = empty_left_join(sess, zero_col_rows,
+                run == 0 ? 0u : 4u * 32u, run == 2,
                 &ncols, &nrows);
         if (rc != EINVAL) {
             printf("(zero-column left with a row: rc=%d) ", rc);
@@ -3298,6 +3299,130 @@ out:
     if (right)
         col_rel_destroy(right);
     destroy_session(sess);
+}
+
+static void
+test_nonempty_nullary_left_cleanup(void)
+{
+    const char *names[] = { "k", "r" };
+    const char *keys[] = { "k" };
+    const int64_t row[] = { 0, 1 };
+    static uint8_t keep[] = { WL_PLAN_EXPR_BOOL, 1 };
+    static uint8_t reject[] = { WL_PLAN_EXPR_BOOL, 0 };
+
+    /* Twelve plain cases cover both probe shapes, ownership modes and all
+     * batching modes. Three delta-filter cases exercise the owned filtered
+     * fallback (including an empty effective right), without a cache.
+     * Then cover existing-empty, missing and forced-empty right operands. */
+    for (unsigned c = 0; c < 19; c++) {
+        bool filtered = c >= 12 && c < 15;
+        bool empty_right = c == 14;
+        bool early_empty = c >= 17;
+        bool owned = c >= 12 ? c == 13 : (c % 2) != 0;
+        unsigned mode = c >= 12 ? 0 : (c / 2) % 3;
+        unsigned width = c >= 12 ? (c == 15 ? 1 : 2) : 1 + c / 6;
+        wl_col_session_t *sess = make_session(1u << 24);
+        col_rel_t *right = make_rel("right", width, names);
+        col_rel_t *delta = NULL;
+        col_rel_t *left = col_rel_new_auto("left", 0);
+        col_rel_t *valid = NULL;
+        col_rel_t *result = NULL;
+        eval_stack_t stack;
+        wl_plan_op_t op;
+        bool ok = false;
+
+        TEST("nullary keyed refusal preserves ownership and session reuse");
+        eval_stack_init(&stack);
+        if (!sess || !right || !left
+            || col_rel_append_row(right, row) != 0
+            || col_rel_append_row(left, row) != 0
+            || register_relation(sess, &right, "right") != 0)
+            goto cleanup;
+        init_join_op(&op, keys, keys);
+        if (filtered) {
+            delta = make_right_named("$d$right", 1, 1);
+            if (!delta || register_relation(sess, &delta, "$d$right") != 0)
+                goto cleanup;
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            op.right_filter_expr = (wl_plan_expr_buffer_t){
+                empty_right ? reject : keep, sizeof(keep)
+            };
+        }
+        if (c == 15 || c == 16) {
+            right = make_rel("right", width, names);
+            if (!right || register_relation(sess, &right, "right") != 0)
+                goto cleanup;
+        }
+        if (c == 17)
+            op.right_relation = "missing";
+        if (c == 18) {
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            sess->delta_seeded = true;
+        }
+        if (!col_session_get_arrangement(&sess->base, "right", KEY0, 1))
+            goto cleanup;
+        const col_arr_entry_t *entry = find_entry(sess, "right");
+        uint32_t pins = entry->pin_count;
+        uint64_t reserved = reserved_of(sess);
+        sess->join_batch_bytes = mode == 0 ? 0 : 128;
+        sess->join_batch_strict = mode == 2;
+        if (eval_stack_push(&stack, left, owned) != 0)
+            goto cleanup;
+        if (owned)
+            left = NULL; /* The stack/operator owns the original. */
+        int rc = col_op_join(&op, &stack, sess);
+        if (early_empty) {
+            ok = rc == 0 && stack.top == 1
+                && stack.items[0].rel->nrows == 0;
+            (void)eval_stack_drain(&stack);
+        } else {
+            ok = rc == EINVAL && stack.top == 0;
+        }
+        ok = ok && reserved_of(sess) == reserved
+            && entry->pin_count == pins && !entry->rebuild_deferred;
+        if (left)
+            ok = ok && left->ncols == 0 && left->nrows == 1
+                && left->columns == NULL;
+
+        /* The same session still handles a valid keyed join. */
+        init_join_op(&op, keys, keys);
+        sess->delta_seeded = false;
+        valid = make_left(row, 1);
+        if (!valid) {
+            ok = false;
+            goto cleanup;
+        }
+        result = run_oracle(sess, valid, &op);
+        uint32_t want_rows = c == 15 || c == 16 ? 0 : 1;
+        ok = ok && result && result->nrows == want_rows;
+        col_rel_destroy(result);
+        result = NULL;
+        /* A nonempty nullary relation is valid for a cross join. */
+        if (!left) {
+            left = col_rel_new_auto("left", 0);
+            if (!left || col_rel_append_row(left, row) != 0) {
+                ok = false;
+                goto cleanup;
+            }
+        }
+        op.key_count = 0;
+        sess->join_batch_strict = false;
+        result = run_oracle(sess, left, &op);
+        ok = ok && result && result->nrows == want_rows
+            && result->ncols == width;
+cleanup:
+        (void)eval_stack_drain(&stack);
+        col_rel_destroy(result);
+        col_rel_destroy(valid);
+        col_rel_destroy(left);
+        col_rel_destroy(delta);
+        col_rel_destroy(right);
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("refusal, cleanup, empty-right or valid reuse mismatch");
+    }
 }
 
 static void
@@ -3898,6 +4023,7 @@ main(void)
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
     test_operator_empty_left_nothing_to_bound();
+    test_nonempty_nullary_left_cleanup();
     test_join_batch_eligibility_order();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
