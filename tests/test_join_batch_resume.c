@@ -924,6 +924,385 @@ test_pipeline_reserve_overflow_is_typed(void)
     fixture_fini(&f);
 }
 
+/* ---- independent oracles and fault/reuse evidence (#1382) ------------- */
+
+/* Nested-loop oracle over the inputs' own cells: every (l, r) pair whose
+ * column-0 keys are equal yields (l0, l1, r0, r1).  It reads the inputs
+ * through col_rel_get only, so it shares no code with any join path, and
+ * compares the expected rows with @out as sorted multisets. */
+static bool
+nested_loop_equal(const col_rel_t *left, const col_rel_t *right,
+    const col_rel_t *out)
+{
+    uint64_t n = 0;
+    int64_t *want;
+    int64_t *got;
+    bool equal;
+
+    if (!left || !right || !out || out->ncols != 4)
+        return false;
+    for (uint32_t l = 0; l < left->nrows; l++)
+        for (uint32_t r = 0; r < right->nrows; r++)
+            if (col_rel_get(left, l, 0) == col_rel_get(right, r, 0))
+                n++;
+    if (n != out->nrows)
+        return false;
+    want = (int64_t *)calloc((size_t)n * 4u + 4u, sizeof(int64_t));
+    got = (int64_t *)calloc((size_t)n * 4u + 4u, sizeof(int64_t));
+    if (!want || !got) {
+        free(want);
+        free(got);
+        return false;
+    }
+    n = 0;
+    for (uint32_t l = 0; l < left->nrows; l++)
+        for (uint32_t r = 0; r < right->nrows; r++) {
+            if (col_rel_get(left, l, 0) != col_rel_get(right, r, 0))
+                continue;
+            want[n * 4u + 0u] = col_rel_get(left, l, 0);
+            want[n * 4u + 1u] = col_rel_get(left, l, 1);
+            want[n * 4u + 2u] = col_rel_get(right, r, 0);
+            want[n * 4u + 3u] = col_rel_get(right, r, 1);
+            n++;
+        }
+    for (uint32_t i = 0; i < out->nrows; i++)
+        for (uint32_t c = 0; c < 4u; c++)
+            got[(size_t)i * 4u + c] = col_rel_get(out, i, c);
+    qsort(want, (size_t)n, 4u * sizeof(int64_t), row_cmp);
+    qsort(got, (size_t)n, 4u * sizeof(int64_t), row_cmp);
+    equal = memcmp(want, got, (size_t)n * 4u * sizeof(int64_t)) == 0;
+    free(want);
+    free(got);
+    return equal;
+}
+
+/* Run the differential operator once over @f's left input.  Returns its rc;
+ * on success *@out receives the owned result (NULL if not owned). */
+static int
+run_diff_operator(fixture_t *f, col_rel_t *left, bool owned,
+    col_rel_t **out)
+{
+    eval_stack_t stack;
+    eval_entry_t result;
+    int rc;
+
+    *out = NULL;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, owned);
+    rc = col_op_join_diff(&f->op, &stack, f->sess);
+    if (rc == 0 && stack.top > 0) {
+        result = eval_stack_pop(&stack);
+        free(result.seg_boundaries);
+        if (result.owned)
+            *out = result.rel;
+    }
+    eval_stack_drain(&stack);
+    return rc;
+}
+
+/* A writer on @rel is granted only when no reader holds it.  The check is
+ * validated first: with a reader deliberately held it must be refused. */
+static bool
+no_reader_holds(const col_rel_t *rel)
+{
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(rel, &writer);
+
+    if (rc != 0)
+        return false;
+    return wl_columnar_source_access_writer_release(&writer) == 0;
+}
+
+static bool
+held_reader_is_observed(const col_rel_t *rel)
+{
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool observed;
+
+    if (col_rel_source_reader_acquire(rel, &reader) != 0)
+        return false;
+    observed = !no_reader_holds(rel);
+    return col_rel_source_reader_release(&reader) == 0 && observed;
+}
+
+/* High-fanout keys checked against the nested-loop oracle rather than the
+ * one-shot join: two left rows on key 1 and one on key 2, 300 right rows
+ * per key, so 900 output rows in 7-row batches. */
+static void
+test_high_fanout_independent_oracle(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 1, 1, 2 };
+    wl_columnar_continuation_t *cont = NULL;
+    col_join_batch_cursor_t cur;
+    int rc;
+
+    TEST("high-fanout bounded join equals a nested-loop oracle");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 3, 300)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 7u * 32u, &cont) != 0) {
+        FAIL("fixture or producer");
+        if (cont)
+            wl_columnar_continuation_destroy(cont);
+        fixture_fini(&f);
+        return;
+    }
+    rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+    if (rc != 0 || f.out->nrows != 900u
+        || !nested_loop_equal(f.left, f.right, f.out))
+        FAIL("result differs from the nested-loop oracle");
+    else if (!col_join_batch_cursor_get(cont, &cur) || cur.sequence < 100u)
+        FAIL("the result was not produced in many batches");
+    else
+        PASS();
+    wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* The differential operator under the knob takes its bounded producer
+ * ($join_diff_batch) and equals the same nested-loop oracle. */
+static void
+test_diff_operator_high_fanout_independent_oracle(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 1, 1, 2 };
+    col_rel_t *out = NULL;
+    int rc;
+
+    TEST("bounded differential join equals a nested-loop oracle");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 3, 300)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.sess->join_batch_bytes = 7u * 32u;
+    rc = run_diff_operator(&f, f.left, false, &out);
+    if (rc != 0 || !out || !out->name
+        || strcmp(out->name, "$join_diff_batch") != 0)
+        FAIL("the bounded differential producer did not run");
+    else if (f.sess->join_batch_fallback_count != 0
+        || !nested_loop_equal(f.left, f.right, out))
+        FAIL("result differs from the nested-loop oracle");
+    else
+        PASS();
+    if (out)
+        col_rel_destroy(out);
+    fixture_fini(&f);
+}
+
+/* An empty left input and an owned left input on the bounded differential
+ * path: exact results, no fallback, and (under ASan) the owned input is
+ * released exactly once. */
+static void
+test_diff_operator_empty_and_owned_left(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 1, 1, 2 };
+    col_rel_t *empty = NULL;
+    col_rel_t *owned = NULL;
+    col_rel_t *out = NULL;
+    bool ok = true;
+
+    TEST("bounded differential join over empty and owned left inputs");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 3, 4)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.sess->join_batch_bytes = 7u * 32u;
+    empty = make_left(keys, 0);
+    if (!empty || run_diff_operator(&f, empty, false, &out) != 0
+        || (out && out->nrows != 0)) {
+        printf("(empty left) ");
+        ok = false;
+    }
+    if (out)
+        col_rel_destroy(out);
+    out = NULL;
+    if (ok && (col_rel_deep_copy(f.left, &owned, NULL) != 0
+        || run_diff_operator(&f, owned, true, &out) != 0
+        || !out || !nested_loop_equal(f.left, f.right, out))) {
+        printf("(owned left) ");
+        ok = false;
+    }
+    if (ok && f.sess->join_batch_fallback_count != 0) {
+        printf("(fallback recorded) ");
+        ok = false;
+    }
+    if (out)
+        col_rel_destroy(out);
+    if (empty)
+        col_rel_destroy(empty);
+    if (ok)
+        PASS();
+    else
+        FAIL("empty or owned left");
+    fixture_fini(&f);
+}
+
+/* Three runs of the bounded differential operator on one governed session:
+ * a fault after committed batches (output growth fails mid-stream), a
+ * fault at create on the retry, and a clean run.  After each failure the
+ * session's reserved bytes are back at the warmed baseline and neither input
+ * is still held by a reader; the clean run equals the nested-loop oracle. */
+static void
+test_diff_operator_fault_retry_restores_baseline(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 1, 1, 2 };
+    col_rel_t *out = NULL;
+    uint64_t baseline;
+    int rc;
+    bool ok = true;
+
+    TEST("differential faults mid-stream and on retry restore the baseline");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 3, 300)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.sess->join_batch_bytes = 7u * 32u;
+    /* Warm-up: build the differential arrangement once. */
+    if (run_diff_operator(&f, f.left, false, &out) != 0 || !out) {
+        FAIL("warm-up run");
+        fixture_fini(&f);
+        return;
+    }
+    col_rel_destroy(out);
+    out = NULL;
+    baseline = reserved_of(f.sess);
+    if (!held_reader_is_observed(f.right)
+        || !held_reader_is_observed(f.left)) {
+        FAIL("a held reader is not observable through writer acquisition");
+        fixture_fini(&f);
+        return;
+    }
+
+    /* Run 1: the output fills its 64-row capacity, then its growth fails.
+     * The session's output high-water mark shows the nine 7-row batches
+     * (63 rows) committed before the fault. */
+    f.sess->join_output_peak = 0;
+    wl_columnar_relation_test_fail_next_prepare_resize();
+    rc = run_diff_operator(&f, f.left, false, &out);
+    wl_columnar_relation_test_fail_prepare_resize = false;
+    if (rc == 0 || out || f.sess->join_output_peak != 63u
+        || reserved_of(f.sess) != baseline
+        || !no_reader_holds(f.right) || !no_reader_holds(f.left)) {
+        printf("(mid-stream fault rc=%d) ", rc);
+        ok = false;
+    }
+    if (out)
+        col_rel_destroy(out);
+    out = NULL;
+
+    /* Run 2: the retry fails again, at the producer's first allocation. */
+    wl_columnar_diff_join_batch_test_fail_allocation_at(1u);
+    rc = run_diff_operator(&f, f.left, false, &out);
+    wl_columnar_diff_join_batch_test_fail_allocation_at(0u);
+    if (ok && (rc == 0 || out || reserved_of(f.sess) != baseline
+        || !no_reader_holds(f.right) || !no_reader_holds(f.left))) {
+        printf("(retry fault rc=%d) ", rc);
+        ok = false;
+    }
+    if (out)
+        col_rel_destroy(out);
+    out = NULL;
+
+    /* Run 3: clean. */
+    rc = run_diff_operator(&f, f.left, false, &out);
+    if (ok && (rc != 0 || !out || !nested_loop_equal(f.left, f.right, out))) {
+        printf("(clean run rc=%d) ", rc);
+        ok = false;
+    }
+    if (out)
+        col_rel_destroy(out);
+    if (ok && reserved_of(f.sess) != baseline) {
+        printf("(reserved after clean run) ");
+        ok = false;
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("fault, retry or reuse");
+    fixture_fini(&f);
+}
+
+/* Operator-level counterpart for the ordinary join: after a warm-up run, a
+ * mid-stream output growth fault (after the nine 7-row batches that fill the
+ * 64-row output), a second fault on the retry, then a clean run, all on one
+ * session.  Reserved bytes return to the warmed baseline after each
+ * failure. */
+static void
+test_operator_fault_during_retry(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 1, 1, 2 };
+    eval_stack_t stack;
+    eval_entry_t result;
+    col_rel_t *out = NULL;
+    uint64_t baseline = 0;
+    int rc;
+    bool ok = true;
+
+    TEST("ordinary join faults twice, then reuses the session exactly");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 3, 300)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.sess->join_batch_bytes = 7u * 32u;
+    /* run 0 warms up, runs 1 and 2 fault, run 3 is clean */
+    for (int run = 0; run < 4 && ok; run++) {
+        bool fault = run == 1 || run == 2;
+
+        f.sess->join_output_peak = 0;
+        if (fault)
+            wl_columnar_relation_test_fail_next_prepare_resize();
+        eval_stack_init(&stack);
+        eval_stack_push(&stack, f.left, false);
+        rc = col_op_join(&f.op, &stack, f.sess);
+        wl_columnar_relation_test_fail_prepare_resize = false;
+        out = NULL;
+        if (rc == 0 && stack.top > 0) {
+            result = eval_stack_pop(&stack);
+            free(result.seg_boundaries);
+            if (result.owned)
+                out = result.rel;
+        }
+        eval_stack_drain(&stack);
+        if (fault) {
+            if (rc == 0 || out || f.sess->join_output_peak != 63u) {
+                printf("(run %d rc=%d peak=%" PRIu64 ") ", run, rc,
+                    (uint64_t)f.sess->join_output_peak);
+                ok = false;
+            }
+        } else if (rc != 0 || !out
+            || !nested_loop_equal(f.left, f.right, out)) {
+            printf("(run %d rc=%d) ", run, rc);
+            ok = false;
+        }
+        /* The warm-up ran the bounded producer, not a recorded fallback. */
+        if (run == 0 && (f.sess->join_batch_fallback_count != 0 || !out
+            || f.sess->join_output_peak != 900u)) {
+            printf("(warm-up was not bounded) ");
+            ok = false;
+        }
+        if (out)
+            col_rel_destroy(out);
+        if (run == 0)
+            baseline = reserved_of(f.sess);
+        else if (ok && reserved_of(f.sess) != baseline) {
+            printf("(run %d reserved) ", run);
+            ok = false;
+        }
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("fault, retry or reuse");
+    fixture_fini(&f);
+}
+
 /* (5) Mutating either input between batches makes the cursor stale and
  * leaves the output untouched. */
 static void
@@ -4374,6 +4753,11 @@ main(void)
     test_diff_operator_exclusions_recorded_and_strict();
     test_diff_operator_create_failure_records_nothing();
     test_join_batch_reason_mask_distinct();
+    test_high_fanout_independent_oracle();
+    test_diff_operator_high_fanout_independent_oracle();
+    test_diff_operator_empty_and_owned_left();
+    test_diff_operator_fault_retry_restores_baseline();
+    test_operator_fault_during_retry();
     test_eligibility_ordering();
     test_producer_empty_right_single_lease();
     test_operator_empty_right_and_row_too_large();
