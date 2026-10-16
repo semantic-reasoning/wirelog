@@ -1237,10 +1237,16 @@ joins on a worker clone with the knob turned off; when a stratum it reaches
 has a JOIN, a snapshot that attempts the route records `insert-route`
 without strict mode; strict mode, recording nothing, refuses the route
 before it mutates anything, so the snapshot is evaluated in full (#1382).
-`WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes knob is set) turns
-a fallback into an `ENOTSUP` failure, which is the explicit bounded-mode
-result for unsupported shapes.  Differential keyed joins have the separate
-producer described below.
+With the knob set, K-Fusion also evaluates its branches serially on the
+calling session instead of on parallel branch sessions (#1382); a branch
+session has no coordinator, so its joins would otherwise run the bounded
+producer concurrently and record nothing on the session.  The legacy row
+cap (`WIRELOG_JOIN_OUTPUT_LIMIT`) is then checked against each join's own
+output, as at one worker, instead of the counter a parallel branch set
+shares (#959).  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes
+knob is set) turns a fallback into an `ENOTSUP` failure, which is the
+explicit bounded-mode result for unsupported shapes.  Differential keyed
+joins have the separate producer described below.
 
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the
