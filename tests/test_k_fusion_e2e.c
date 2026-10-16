@@ -16,6 +16,9 @@
  *   5. Larger graph K=2 correctness (5-node chain)
  *   6. Convergence: K=2 produces no duplicate tuples
  */
+#ifndef _WIN32
+#define _DEFAULT_SOURCE 1
+#endif
 
 #include "../wirelog/columnar/columnar_nanoarrow.h"
 #include "../wirelog/columnar/internal.h"
@@ -32,6 +35,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+static int
+wl_test_setenv_(const char *name, const char *value, int overwrite)
+{
+    (void)overwrite;
+    return _putenv_s(name, (value && *value) ? value : "1");
+}
+
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define setenv wl_test_setenv_
+#define unsetenv wl_test_unsetenv_
+#endif
+
+/* Defined under WL_SESSION_TEST_HOOKS in testlib_prod. */
+extern void (*wl_columnar_kfusion_test_clone)(wl_col_session_t *parent,
+    wl_col_session_t *child, bool before);
 
 /* ----------------------------------------------------------------
  * Test framework (matches wirelog convention)
@@ -569,6 +594,103 @@ test_k2_multiworker_threshold_serial_semantics(void)
 }
 
 /* ================================================================
+ * #1382: with WIRELOG_JOIN_BATCH_BYTES set, K-Fusion runs its branches
+ * serially on the calling session.  Parallel branch sessions are shallow
+ * copies with no coordinator, so before this they passed bounded-join
+ * eligibility and ran the bounded producer concurrently, outside the
+ * per-session accounting the knob is defined by.  A K=4 rule at four
+ * workers clones branches deterministically with the knob off, and must
+ * clone none with it on; the closure is the same either way.
+ * ================================================================ */
+static unsigned kfusion_clones;
+
+static void
+count_kfusion_clone(wl_col_session_t *parent, wl_col_session_t *child,
+    bool before)
+{
+    (void)parent;
+    (void)child;
+    if (before)
+        kfusion_clones++;
+}
+
+struct pair_ctx {
+    uint32_t count;
+    uint32_t mismatches;
+};
+
+/* r(a, b) holds exactly for 0 <= a < b <= 12 with (b - a) % 3 == 1: the
+ * 1-, 4-, 7- and 10-step paths of the chain e(i, i + 1). */
+static void
+check_pair_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    struct pair_ctx *ctx = (struct pair_ctx *)user_data;
+    if (!relation || strcmp(relation, "r") != 0 || ncols != 2)
+        return;
+    ctx->count++;
+    if (!(row[0] >= 0 && row[0] < row[1] && row[1] <= 12
+        && (row[1] - row[0]) % 3 == 1))
+        ctx->mismatches++;
+}
+
+static void
+test_k4_join_batch_knob_runs_branches_serially(void)
+{
+    TEST("K=4 W=4 with the join-batch knob clones no branch session");
+
+    const char *src = ".decl e(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "e(0, 1). e(1, 2). e(2, 3). e(3, 4). e(4, 5). e(5, 6).\n"
+        "e(6, 7). e(7, 8). e(8, 9). e(9, 10). e(10, 11). e(11, 12).\n"
+        "r(x, y) :- e(x, y).\n"
+        "r(a, f) :- r(a, b), r(b, c), r(c, d), r(d, f).\n";
+    unsigned clones[2] = { 0, 0 };
+    struct pair_ctx pairs[2];
+    int rcs[2] = { -1, -1 };
+
+    memset(pairs, 0, sizeof(pairs));
+    wl_columnar_kfusion_test_clone = count_kfusion_clone;
+    for (int knob = 0; knob < 2; knob++) {
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(src, &err);
+        wl_plan_t *plan = NULL;
+        wl_session_t *sess = NULL;
+
+        if (knob)
+            setenv("WIRELOG_JOIN_BATCH_BYTES", "224", 1);
+        else
+            unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+        unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+        kfusion_clones = 0;
+        if (prog && wl_plan_from_program(prog, &plan) == 0
+            && wl_session_create(wl_backend_columnar(), plan, 4, &sess) == 0
+            && wl_session_load_facts(sess, prog) == 0)
+            rcs[knob] = wl_session_snapshot(sess, check_pair_cb,
+                    &pairs[knob]);
+        clones[knob] = kfusion_clones;
+        if (sess)
+            wl_session_destroy(sess);
+        if (plan)
+            wl_plan_free(plan);
+        if (prog)
+            wirelog_program_free(prog);
+    }
+    wl_columnar_kfusion_test_clone = NULL;
+    unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    if (rcs[0] != 0 || rcs[1] != 0)
+        printf("(rc %d/%d) ", rcs[0], rcs[1]);
+    printf("(clones off=%u on=%u) ", clones[0], clones[1]);
+    ASSERT(rcs[0] == 0 && rcs[1] == 0, "snapshot failed");
+    ASSERT(pairs[0].count == 30 && pairs[0].mismatches == 0
+        && pairs[1].count == 30 && pairs[1].mismatches == 0,
+        "closure differs from the 30 expected pairs");
+    ASSERT(clones[0] > 0, "the knob-off run cloned no branch session");
+    ASSERT(clones[1] == 0, "a branch session was cloned with the knob on");
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -588,6 +710,7 @@ main(void)
     test_k2_multi_rule_union_unique_contributions();
     test_k2_all_inactive_branches_preserve_target_schema();
     test_k2_multiworker_threshold_serial_semantics();
+    test_k4_join_batch_knob_runs_branches_serially();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

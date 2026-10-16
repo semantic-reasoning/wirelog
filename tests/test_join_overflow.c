@@ -222,7 +222,7 @@ test_retry_after_join_overflow(void)
         rc = wl_session_load_facts(sess, prog);
     if (rc == 0)
         rc = wl_session_snapshot(sess, count_result_tuple_cb,
-            &result_count);
+                &result_count);
     if (rc != EOVERFLOW || result_count != 0) {
         if (sess)
             wl_session_destroy(sess);
@@ -316,8 +316,16 @@ test_k_fusion_worker_limit_overflow(void)
     const char *src = ".decl r(x: int32, y: int32)\n"
         "r(1, 1). r(1, 2). r(2, 1). r(2, 2).\n"
         "r(a, e) :- r(a, b), r(b, c), r(c, d), r(d, e).\n";
+    /* With WIRELOG_JOIN_BATCH_BYTES set (join_overflow_batched), K-Fusion
+     * runs its branches serially on the calling session (#1382).  The cap
+     * is then checked against each join's own output, as at one worker,
+     * instead of the counter a parallel branch set shares (#959), and no
+     * single join here reaches 64 rows; a cap one of them exceeds keeps
+     * the overflow path covered. */
+    const char *knob = getenv("WIRELOG_JOIN_BATCH_BYTES");
+    const char *limit = knob && *knob ? "16" : "64";
 
-    int rc = run_snapshot_with_limit(src, 8, "64", false);
+    int rc = run_snapshot_with_limit(src, 8, limit, false);
     if (rc != EOVERFLOW) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected EOVERFLOW, got %d", rc);

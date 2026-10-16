@@ -782,8 +782,13 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
      * machinery when there's only one thread — pure overhead otherwise.
      * TDD workers already run under the distributed stratum workqueue; running
      * nested K-fusion workers inside them oversubscribes execution and divides
-     * join_output_limit a second time. */
+     * join_output_limit a second time.  With WIRELOG_JOIN_BATCH_BYTES set the
+     * branches also run serially (#1382): a branch session is a shallow copy
+     * without a coordinator, so its joins would pass bounded-join
+     * eligibility and run the producer concurrently, outside the
+     * per-session bound and the fallback record the knob is defined by. */
     if (sess->tdd_subpass_active || sess->coordinator
+        || sess->join_batch_bytes > 0
         || (sess->wq == NULL && sess->num_workers <= 1))
         return col_op_k_fusion_serial(op, stack, sess);
 
