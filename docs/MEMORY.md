@@ -1316,7 +1316,9 @@ complete under that scope (#2182).
 When the pipeline does not consume a JOIN, the reason decides what is
 recorded.  These rules apply to non-differential evaluation only: the
 pipeline is not attempted while differential operators are active, so a
-strict differential `JOIN -> REDUCE` still runs.
+strict differential `JOIN -> REDUCE` is not refused as
+`pipeline-not-consumable`; its JOIN follows the differential join's own
+bounded-mode rules below, which refuse its excluded shapes.
 
 - For a keyed JOIN without a right filter that is not materialized, in a
   session that is not a worker session, the pipeline first applies the
@@ -1485,9 +1487,20 @@ multiplies input multiplicities.  (Until #2173 each batch carried the signed
 product `left * right`, which failed the join with `EINVAL` on overflow.)
 Stale input, generation changes, overflow, cancellation, or failed admission
 discard the output relation and release the differential pin exactly once.
-Materialized/cache joins and delta-right, filtered, cross, worker, and other
-unsupported shapes remain on their existing one-shot paths until their
-publication contracts are bounded.
+Materialized/cache joins and delta-right, filtered, cross and worker shapes
+remain on their existing one-shot paths until their publication contracts
+are bounded.  Since #1382 the differential join decides them with the same
+eligibility check as the ordinary join and then excludes materialized joins.
+Without strict mode each records its reason (`worker-session`, `cross-join`,
+`delta-right`, `filtered-right` or `materialized`, and `row-too-large` when
+create refuses a batch budget below one output row or a zero-width output);
+under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP` instead of running
+one-shot and records nothing.  A materialized join
+whose result is already cached is copied from the cache before this
+decision, so it is neither recorded nor refused.  Under strict mode a
+differential evaluation therefore fails as soon as one of its joins reads a
+delta on the right or filters the right relation; it is a diagnostic
+setting.
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
@@ -1536,16 +1549,16 @@ keyed join whose persistent arrangement is unavailable runs the ephemeral
 hash probe and records `no-arrangement`; under `WIRELOG_JOIN_BATCH_STRICT`
 both return `ENOTSUP`.  The differential bounded path requires a key
 column, so outside worker sessions a differential cross join runs as
-one-shot `$join_diff`; nothing is recorded and strict mode does not refuse
-it.  In a worker session either kind of join that reaches the JOIN
-operator's bounded-mode decision records `worker-session` instead, and
-strict mode refuses it there.  When this paragraph was written (#1370), the
-knob-on test suite ran 613 cross joins with at most 6,400 output rows, the
-ten `bench_flowlog` programs one (100 rows), and DOOP 16 before its run
-stopped (10,792 rows in total), and no workload recorded the
-`no-arrangement` fallback.  These counts describe the repository's
-workloads, not a bound: a cross join's output is the product of its
-inputs' row counts.
+one-shot `$join_diff`; since #1382 it records `cross-join` and strict mode
+refuses it, as on the non-differential path.  In a worker session either
+kind of join that reaches the JOIN operator's bounded-mode decision records
+`worker-session` instead, and strict mode refuses it there.  When this
+paragraph was written (#1370), the knob-on test suite ran 613 cross joins
+with at most 6,400 output rows, the ten `bench_flowlog` programs one (100
+rows), and DOOP 16 before its run stopped (10,792 rows in total), and no
+workload recorded the `no-arrangement` fallback.  These counts describe the
+repository's workloads, not a bound: a cross join's output is the product
+of its inputs' row counts.
 
 When this paragraph was written (#1370), bounded mode was checked by two gates
 over the test suite without its tidy, abi, perf and bench suites.  The knob-on
