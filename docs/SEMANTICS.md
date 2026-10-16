@@ -907,3 +907,31 @@ the last was wrong about consequence, because `col_session_emit_snapshot`
 iterates `row < r->nrows` and never mentions the field. The row above therefore
 names the one consequence that was read out of the observer's own condition,
 and a new claim about this field belongs in a test before it belongs here.
+
+
+### Numeric MAP result schemas
+
+A MAP whose every result lane is a numeric compiled expression or a physical
+projection installs its schema before producing rows, including empty inputs.
+Plain variables and projections preserve the selected physical type; missing
+metadata or out-of-range zero-fill is INT64. Explicit FLOAT loads/constants
+and FLOAT arithmetic produce FLOAT, comparisons and BOOL literals produce
+BOOL, and integer arithmetic produces INT64. The cached producer follows the
+existing permissive expression stack rules: ignored full-stack pushes and
+aggregate no-ops do not replace the actual result producer.
+
+Raw interpreter-only expression families retain the legacy whole-output
+untyped schema when any lane is unresolved. This includes mixed numeric/addon
+results; they do not acquire a fabricated partial schema. Numeric schema
+resolution invokes no callbacks. Existing extension invocation/admission rules
+remain in force, and controlled MAP still refuses unsupported expression
+families instead of falling back to raw evaluation.
+
+Following CONSOLIDATE uses actual FLOAT metadata for numeric ordering and
+zero equality. Typed MAP append rejects a nonfinite copied FLOAT value with
+`EINVAL`; a nonfinite FLOAT load or arithmetic expression failure gives MAP
+`ERANGE`. Omitting the invalid source lane does not introduce a whole-source
+finite scan. FILTER continues to reject a row on expression failure, rather
+than returning MAP's expression error. These rules cover the documented
+private scalar plans, not public/default activation or the remaining #1821
+operator families.

@@ -3575,6 +3575,15 @@ int wl_columnar_relation_new_typed_operator_attempt_controlled(
     const char *, uint32_t, const wirelog_column_type_t *,
     wl_columnar_memory_governor_ref_t *, col_rel_t **,
     wl_evaluation_control_t *, uint64_t);
+/* Same original-attempt/private ownership contract, explicit capacity. Codes
+ * are immutable int64 scalar type enums (including valid INT32=0), checked
+ * before native conversion. Borrowed only until synchronous return; output
+ * owns independent native types/Arrow metadata. NULL codes allowed at width0.
+ * No int64 scratch is aliased through an enum pointer. */
+int wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+    const char *, uint32_t, uint32_t, const int64_t *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     wl_columnar_relation_append_batch_t *, const int64_t *,
     wl_evaluation_control_t *, uint64_t);

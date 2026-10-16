@@ -11061,6 +11061,7 @@ typedef struct {
 typedef struct {
     const char *const *names;
     const wirelog_column_type_t *types;
+    const int64_t *type_codes; /* operator-only, mutually exclusive with types */
     bool has_graph_column;
     uint32_t graph_col_idx;
     uint32_t declared_ncols;
@@ -11838,9 +11839,9 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
         &storage_owner->source_access, &reader, control);
     if (rc != 0)
         goto done;
-    /* S40 fixed inventory (success <=38): map pairing3, enum1 (invalid3
+    /* S40 fixed inventory (success <=39): map pairing3, enum1 (invalid3
      * exits), enabled graph2, unsupported compound5, schema1, identities4,
-     * source generation predicates4, owner bindings3, snapshots9, TS/type
+     * source generation predicates4, owner bindings3, snapshots10, TS/type
      * decisions3 and result/dispatch3. No width walk or deep map validation.
      * Alias own storage generation is independent of its saved owner epoch. */
     rc = wl_evaluation_control_charge(control, 40);
@@ -11882,6 +11883,7 @@ wl_columnar_relation_new_like_governed_checked_mode_controlled(const char *name,
         timestamps = preserve_timestamps && src->timestamps != NULL;
         recipe.names = (const char *const *)src->col_names;
         recipe.types = src->column_types;
+        recipe.type_codes = NULL;
         recipe.has_graph_column = src->has_graph_column;
         recipe.graph_col_idx = src->graph_col_idx;
         recipe.declared_ncols = src->declared_ncols;
@@ -12205,6 +12207,7 @@ wl_columnar_relation_constructor_attempt_source_acquire(const col_rel_t *src,
     source->owner = NULL;
     source->recipe.names = NULL;
     source->recipe.types = NULL;
+    source->recipe.type_codes = NULL;
     source->recipe.has_graph_column = false;
     source->recipe.graph_col_idx = 0;
     source->recipe.declared_ncols = 0;
@@ -12295,6 +12298,7 @@ wl_columnar_relation_constructor_attempt_source_acquire(const col_rel_t *src,
         source->output_timestamps = preserve_timestamps && src->timestamps;
         source->recipe.names = (const char *const *)src->col_names;
         source->recipe.types = src->column_types;
+        source->recipe.type_codes = NULL;
         source->recipe.has_graph_column = src->has_graph_column;
         source->recipe.graph_col_idx = src->graph_col_idx;
         source->recipe.declared_ncols = src->declared_ncols;
@@ -13169,7 +13173,7 @@ wl_columnar_relation_constructor_attempt_build_operator(const char *name,
     rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
     if (rc) goto done;
-    bool typed = recipe->types != NULL;
+    bool typed = recipe->types != NULL || recipe->type_codes != NULL;
     type_bytes = 0;
     rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
             WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
@@ -13397,7 +13401,9 @@ wl_columnar_relation_constructor_attempt_build_operator(const char *name,
                     attempt_id,
                     WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
             if (rc != 0) goto done;
-            ctx.types[c] = recipe->types[c];
+            ctx.types[c] = recipe->type_codes
+                ? (wirelog_column_type_t)recipe->type_codes[c]
+                : recipe->types[c];
             rc = wl_columnar_relation_constructor_attempt_tail(control,
                     attempt_id,
                     WL_COLUMNAR_RELATION_CONSTRUCTOR_ATTEMPT_SMALL_SETUP_WORK);
@@ -13643,8 +13649,8 @@ wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
  * ENTRY: bootstrap20 + validity8 + tail21 + assignment1 + decisions8 +
  * next charge12 + refusal/returns4 =74 <=80. Bootstrap includes both public
  * dispatch and return; an initial refusal consumes0 and permits only this
- * bounded scaffold and the single outNULL store. PREPARE: seven recipe stores
- * + local1 + tail21 + result2 + next charge12 + refusal4 =47 <=64.
+ * bounded scaffold and the single outNULL store. PREPARE: eight recipe stores
+ * + local1 + tail21 + result2 + next charge12 + refusal4 =48 <=64.
  * BUILD_CALL: tail21 + result2 + child charge12 + refusal3 + caller14 =52.
  * EXTERNAL: tail21 + assignment1 + conditions6 + store1 + cleanup decisions6
  * + returns2 =37. Success and cleanup alternatives are safely overcounted.
@@ -13717,6 +13723,7 @@ wl_columnar_relation_constructor_auto_attempt(
     wl_columnar_relation_constructor_recipe_t recipe;
     recipe.names = NULL;
     recipe.types = NULL;
+    recipe.type_codes = NULL;
     recipe.has_graph_column = false;
     recipe.graph_col_idx = 0;
     recipe.declared_ncols = 0;
@@ -13782,6 +13789,7 @@ wl_columnar_relation_new_auto_operator_attempt_controlled(
     wl_columnar_relation_constructor_recipe_t recipe;
     recipe.names = NULL;
     recipe.types = NULL;
+    recipe.type_codes = NULL;
     recipe.has_graph_column = false;
     recipe.graph_col_idx = 0;
     recipe.declared_ncols = 0;
@@ -13859,6 +13867,7 @@ wl_columnar_relation_new_typed_operator_attempt_controlled(
     wl_columnar_relation_constructor_recipe_t recipe;
     recipe.names = NULL;
     recipe.types = types;
+    recipe.type_codes = NULL;
     recipe.has_graph_column = false;
     recipe.graph_col_idx = 0;
     recipe.declared_ncols = 0;
@@ -13879,6 +13888,88 @@ wl_columnar_relation_new_typed_operator_attempt_controlled(
         return rc;
     rc = wl_columnar_relation_constructor_attempt_build_operator(name, ncols,
             COL_REL_INIT_CAP, false, governor, &recipe, &local,
+            control, attempt_id);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0)
+        abort();
+    return rc;
+}
+
+/* MAP keeps int64 codes in its existing value scratch. Validate before cast;
+ * only this synchronous operator recipe reads them. Keep the native entry
+ * above at its original call depth/capacity: another wrapper would extend
+ * tight nested constructor refusal/return intervals. */
+int
+wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    const int64_t *type_codes,
+    wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Only this fixed output normalization is a bootstrap exception.
+     * The exclusive writable slot must contain no live owned result. */
+    if (out)
+        *out = NULL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    bool valid = out && name && (!ncols || type_codes);
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc > 0 || valid) {
+        if (rc)
+            return rc;
+    } else
+        return EINVAL;
+    for (uint32_t c = 0; c < ncols; ++c) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id,
+                WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (rc) return rc;
+        bool scalar = type_codes[c] >= WIRELOG_TYPE_INT32 &&
+            type_codes[c] <= WIRELOG_TYPE_BOOL;
+        int tail = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (tail > 0 || scalar) {
+            if (tail) return tail;
+        } else return EINVAL;
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = NULL;
+    recipe.types = NULL;
+    recipe.type_codes = type_codes;
+    recipe.has_graph_column = false;
+    recipe.graph_col_idx = 0;
+    recipe.declared_ncols = 0;
+    recipe.view_generation = 2u + (type_codes != NULL);
+    recipe.storage_generation = 1;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name, ncols,
+            initial_capacity, false, governor, &recipe, &local,
             control, attempt_id);
     if (!rc)
         rc = wl_columnar_relation_constructor_attempt_charge(control,
@@ -14402,6 +14493,7 @@ wl_columnar_relation_scalar_source_new_like_attempt_controlled(
     if (rc) return rc;
     wl_columnar_relation_constructor_recipe_t recipe;
     recipe.names = source->names; recipe.types = source->types;
+    recipe.type_codes = NULL;
     recipe.has_graph_column = source->has_graph_column;
     recipe.graph_col_idx = source->graph_col_idx;
     recipe.declared_ncols = source->declared_ncols;
@@ -14456,6 +14548,7 @@ wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
     if (rc) return rc;
     wl_columnar_relation_constructor_recipe_t recipe;
     recipe.names = source->names; recipe.types = source->types;
+    recipe.type_codes = NULL;
     recipe.has_graph_column = source->has_graph_column;
     recipe.graph_col_idx = source->graph_col_idx;
     recipe.declared_ncols = source->declared_ncols;

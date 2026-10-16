@@ -3134,16 +3134,52 @@ integer/FLOAT and empty cases are covered. Direct CONSOLIDATE->MAP->CONSOLIDATE
 compositions include nullary and widths 1/17/129. These are complete operator
 results in a private frame; they are not published session query results.
 
-Both raw `col_op_map` and controlled MAP currently construct untyped private
-result lanes, including computed FLOAT payloads. The generated FLOAT fixtures
-interpret those payloads using the query declaration and compare actual type
-metadata separately against raw execution. Their positive sums and constant
-`1.0` results do not prove numerical ordering, signed-zero deduplication or
-nonfinite validation for arbitrary untyped computed FLOAT results. CONSOLIDATE
-uses the actual input lane metadata. Propagating/auditing computed MAP types and
-qualifying negative FLOATs, both zeros and nonfinite cases remains a dependency
-before public/default activation; this increment preserves existing raw MAP
-metadata behavior.
+Numeric MAP now installs a complete known result schema before its first row.
+The compiled expression caches the actual result producer during its existing
+second pass, preserving capped pushes, zero-filled underflow and aggregate
+no-ops. Schema lookup performs no expression evaluation, instruction scan or
+extension callback. Plain variables/projections preserve source physical types
+(and out-of-range zero-fill remains INT64); explicit FLOAT operations produce
+FLOAT, comparisons/BOOL produce BOOL and integer arithmetic produces INT64.
+The private raw FLOAT-variable decoder also retains the VAR-only exported
+parser used by the integer FILTER shortcut.
+
+Raw MAP reserves its temporary native type vector in the existing scratch
+admission, keeps full governed row-capacity admission before callbacks, and
+uses the existing metadata setter only on the empty private output. A raw
+interpreter-only expression lane retains the legacy untyped schema for the
+whole output; mixed numeric/addon/string fallback results are not covered by
+the numeric FLOAT ordering guarantee. The temporary vector is freed before
+row evaluation. Pool/arena output ownership remains available without a
+governor.
+
+Controlled MAP admits scratch and its program table before constructing the
+output. The existing output-values region temporarily stores int64 type codes;
+the capacity-preserving operator constructor validates each code before
+conversion and copies native metadata into the owned relation. No enum pointer
+aliases the int64 scratch and no recipe pointer escapes. Every other recipe
+initializes the new optional code pointer to NULL. The constructor-source
+recipe grows by one pointer; no live MAP context owner is added. Native typed
+constructor callers retain their original capacity and call depth.
+
+The 36 B2 retirement payments remain immediately after program-table
+preparation, before type resolution/output construction. Later failures can
+leave these admitted grants unused; they do not claim executed-work telemetry.
+Output retirement is paid before publication, and the frame slot is captured
+before original-ID arbitration. Compilation/table errors therefore precede
+output-constructor errors in this controlled path; simultaneous-failure tests
+assert that the later constructor is not entered. Raw initialization order
+continues to admit its output before compilation. New raw compiled FLOAT
+owners and type metadata can introduce ordinary allocation/admission errors
+before row evaluation, including zero-row results.
+
+Complete generated unary and keyed-JOIN bodies now verify negative FLOAT
+ordering, duplicate negatives, canonical zero and empty schemas, including
+mixed integer/FLOAT outputs and MAP->FILTER->MAP composition. Typed append
+rejects a copied NaN/Inf FLOAT lane with EINVAL; an expression reading an
+invalid FLOAT still gives MAP ERANGE. A genuinely omitted invalid source lane
+is not scanned or rejected. These private results remain separate from
+public/default activation and the remaining operator/configuration inventory.
 
 The fourth READY switch case preserves the 19-slot production caller; no new
 loop, child-consumption action or cleanup phase is added. The two opcode scans
@@ -3188,7 +3224,7 @@ The remaining activation boundary is explicit:
 | Initial scalar CONSOLIDATE | Supported as a child, including terminal and repeated composition |
 | CONCAT/UNION, SEMIJOIN/ANTIJOIN, REDUCE, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
-| Computed MAP type propagation and arbitrary FLOAT ordering/deduplication | Further metadata audit and negative/zero/nonfinite qualification required |
+| Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
 | Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
 
 Unsupported opcodes fail the complete preflight before source publication or the

@@ -238,6 +238,40 @@ wl_columnar_ops_reject_null_session(eval_stack_t *stack)
     return eval_stack_pop_relation(stack, &discarded);
 }
 
+/* Complete schema only: an interpreter-only lane retains the legacy whole
+ * untyped output. Resolve without running any expression/callback, then install
+ * on the still-empty private output using normal governed metadata ownership.
+ * The temporary native vector is covered by the caller's scratch admission. */
+static int
+wl_columnar_ops_map_set_types(const wl_plan_op_t *op, const col_rel_t *input,
+    col_rel_t *out, wl_columnar_expr_compiled_t *const *programs,
+    uint32_t program_count)
+{
+    uint32_t count = op->project_count;
+    if (!count) return 0;
+    wirelog_column_type_t *types = malloc((size_t)count * sizeof(*types));
+    if (!types) return ENOMEM;
+    bool known = true;
+    for (uint32_t c = 0; c < count; ++c) {
+        if (op->map_exprs && c < op->map_expr_count &&
+            op->map_exprs[c].data && op->map_exprs[c].size) {
+            known = c < program_count && programs &&
+                wl_columnar_expr_compiled_result_type(programs[c],
+                    input->column_types, input->ncols, &types[c]);
+        } else {
+            uint32_t column = op->project_indices ? op->project_indices[c] : c;
+            types[c] = input->column_types && column < input->ncols
+                ? input->column_types[column] : WIRELOG_TYPE_INT64;
+            known = types[c] >= WIRELOG_TYPE_INT32 &&
+                types[c] <= WIRELOG_TYPE_BOOL;
+        }
+        if (!known) break;
+    }
+    int rc = known ? col_rel_set_column_types(out, types, count) : 0;
+    free(types);
+    return rc;
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
@@ -263,6 +297,11 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
             &map_bytes)
         && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
             &map_scratch_bytes);
+    map_sized = map_sized
+        && wl_columnar_memory_size_mul(pc, sizeof(wirelog_column_type_t),
+            &map_bytes)
+        && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
+            &map_scratch_bytes);
     if (op->map_exprs && op->map_expr_count > 0)
         map_sized = map_sized
             && wl_columnar_memory_size_mul(pc,
@@ -275,7 +314,7 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 &map_bytes)
             && wl_columnar_memory_size_add(map_scratch_bytes, map_bytes,
                 &map_scratch_bytes);
-    if (!map_sized)
+    if (!map_sized || map_scratch_bytes > SIZE_MAX)
         return wl_columnar_ops_dispose_entry(stack, &e, EOVERFLOW);
     wl_ops_scratch_t map_scratch;
     int map_scratch_rc = wl_ops_scratch_reserve(&map_scratch,
@@ -348,6 +387,18 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
                 }
             }
         }
+    }
+
+    int schema_rc = wl_columnar_ops_map_set_types(op, e.rel, out, ce_map,
+            ce_map_count);
+    if (schema_rc) {
+        for (uint32_t c = 0; c < ce_map_count; ++c)
+            wl_columnar_expr_compiled_free(ce_map[c]);
+        free((void *)ce_map);
+        free(tmp);
+        col_rel_destroy(out);
+        WL_MAP_RELEASE_SCRATCH();
+        return wl_columnar_ops_admission_failure(stack, &e, sess, schema_rc);
     }
 
     /* Row scratch, hoisted out of the loop: initialising it per row would

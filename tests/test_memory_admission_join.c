@@ -449,8 +449,10 @@ test_map_admission(unsigned governor_mode, bool owned, uint32_t nrows,
         ? relation_charge(input) : 0;
     wl_columnar_memory_governor_t *governor =
         wl_columnar_memory_governor_ref_get(expected);
-    /* Measure the checked constructor independently of MAP, including its
-     * transient metadata peak; MAP scratch overlaps that whole operation. */
+    /* Calibrate constructor plus known-schema installation independently of
+     * MAP. The empty setter temporarily retains both metadata versions, and
+     * MAP scratch overlaps the whole transaction. Unresolved callbacks and
+     * nullary outputs keep the original untyped constructor transaction. */
     uint64_t low = baseline, high = baseline + (UINT64_C(1) << 20);
     while (low < high) {
         uint64_t mid = low + (high - low) / 2;
@@ -458,7 +460,11 @@ test_map_admission(unsigned governor_mode, bool owned, uint32_t nrows,
             memory_order_release);
         int rc = wl_columnar_relation_new_auto_governed("$map", pc, nrows,
                 false, expected, &probe);
-        MAP_CHECK(rc == 0 || rc == ENOSPC, "constructor peak calibration");
+        if (!rc && pc && !callback) {
+            wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+            rc = col_rel_set_column_types(probe, &type, pc);
+        }
+        MAP_CHECK(rc == 0 || rc == ENOSPC, "output/schema peak calibration");
         col_rel_destroy(probe);
         probe = NULL;
         MAP_CHECK(reserved_for(expected) == baseline, "probe charge released");
@@ -468,6 +474,7 @@ test_map_admission(unsigned governor_mode, bool owned, uint32_t nrows,
             low = mid + 1;
     }
     uint64_t scratch = sizeof(int64_t)
+        + pc * sizeof(wirelog_column_type_t)
         + (callback ? pc * sizeof(wl_columnar_expr_compiled_t *) : 0);
     uint64_t limit = high + scratch;
     map_admission_callback_calls = 0;
@@ -525,6 +532,9 @@ test_map_admission(unsigned governor_mode, bool owned, uint32_t nrows,
         && !out->arena_owned && out->capacity == nrows && out->nrows == nrows
         && out->ncols == pc && !out->timestamps && stack.items[1].owned,
         "governed complete output shape");
+    MAP_CHECK(pc && !callback
+        ? out->column_types && out->column_types[0] == WIRELOG_TYPE_INT64
+        : !out->column_types, "known versus unresolved output schema");
     MAP_CHECK(reserved_for(expected) == baseline - (owned ? input_charge : 0)
         + relation_charge(out) && sess->delta_pool->slot_used == 0
         && sess->eval_arena->used == 0,
@@ -553,7 +563,8 @@ cleanup:
     }
     wirelog_extension_snapshot_release(snapshot);
     if (registry) {
-        (void)wirelog_extension_unregister(registry, "test.map");
+        if (wirelog_extension_unregister(registry, "test.map") != 0 && !failure)
+            failure = "callback unregister refused";
         if (wirelog_extension_registry_destroy(registry) != 0 && !failure)
             failure = "callback registry cleanup refused";
     }

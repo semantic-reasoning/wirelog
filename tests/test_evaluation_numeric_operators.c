@@ -2442,6 +2442,7 @@ wl_columnar_filter_test_nonfinite(wl_columnar_filter_test_program_t *program,
     wl_columnar_filter_test_run(scenario);
     CHECK(scenario->filter.done);
     int controlled_result = scenario->filter.status.execution_result;
+    if (map) CHECK(raw_result == (referenced ? ERANGE : EINVAL));
     if (raw_result != controlled_result) {
         fprintf(stderr,
             "nonfinite raw route discrepancy referenced=%d raw=%d controlled=%d\n",
@@ -2707,8 +2708,8 @@ wl_columnar_filter_test_map_case(uint32_t width, uint32_t rows,
         CHECK(scenario->filter.status.committed && stack->top == 1);
         wl_columnar_filter_test_equal(stack->items[0].rel,
             raw_stack.items[0].rel);
-        CHECK(!stack->items[0].rel->column_types &&
-            !stack->items[0].rel->timestamps);
+        CHECK((stack->items[0].rel->column_types != NULL) == (outputs != 0));
+        CHECK(!stack->items[0].rel->timestamps);
         CHECK(eval_stack_dispose_entry(&raw_stack, &raw_stack.items[0]) == 0);
         CHECK(!wl_columnar_filter_test_reserved(raw_session));
         wl_columnar_memory_governor_ref_release(raw_session->memory_governor);
@@ -2735,6 +2736,234 @@ wl_columnar_filter_test_map_case(uint32_t width, uint32_t rows,
     CHECK(report.result == expected);
     free(scenario); free(indices); free(expressions); free(programs);
     return report;
+}
+
+static void
+map_schema_types(bool computed, uint32_t rows)
+{
+    const wirelog_column_type_t source_types[] = {
+        WIRELOG_TYPE_INT32, WIRELOG_TYPE_INT64, WIRELOG_TYPE_UINT32,
+        WIRELOG_TYPE_UINT64, WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_STRING,
+        WIRELOG_TYPE_BOOL,
+    };
+    uint32_t indices[] = {4, 0, 2, 3, 5, 6, 4, 99};
+    const wirelog_column_type_t projected[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT32, WIRELOG_TYPE_UINT32,
+        WIRELOG_TYPE_UINT64, WIRELOG_TYPE_STRING, WIRELOG_TYPE_BOOL,
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64,
+    };
+    const wirelog_column_type_t calculated[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_BOOL, WIRELOG_TYPE_INT64,
+        WIRELOG_TYPE_STRING,
+    };
+    wl_columnar_filter_test_program_t programs[4] = {{0}};
+    wl_plan_expr_buffer_t expressions[4] = {{0}};
+    for (unsigned c = 0; c < 2; ++c) {
+        wl_columnar_filter_test_variable(&programs[c], WL_PLAN_EXPR_VAR_FLOAT,
+            4);
+        wl_columnar_filter_test_constant(&programs[c], WL_PLAN_EXPR_CONST_FLOAT,
+            wl_columnar_float_to_bits(0.0));
+        wl_columnar_filter_test_opcode(&programs[c], c
+            ? WL_PLAN_EXPR_CMP_FLOAT_LT : WL_PLAN_EXPR_ARITH_FLOAT_ADD);
+    }
+    wl_columnar_filter_test_variable(&programs[2], WL_PLAN_EXPR_VAR, 0);
+    wl_columnar_filter_test_constant(&programs[2], WL_PLAN_EXPR_CONST_INT, 1);
+    wl_columnar_filter_test_opcode(&programs[2], WL_PLAN_EXPR_ARITH_ADD);
+    wl_columnar_filter_test_variable(&programs[3], WL_PLAN_EXPR_VAR, 5);
+    for (unsigned c = 0; c < 4; ++c)
+        expressions[c] = (wl_plan_expr_buffer_t){programs[c].bytes,
+                                                 programs[c].size};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = computed ? 4 : 8,
+                       .project_indices = computed ? NULL : indices,
+                       .map_exprs = computed ? expressions : NULL,
+                       .map_expr_count = computed ? 4 : 0};
+    col_rel_t *input = wl_columnar_filter_test_source(7, 0, false, false,
+            false);
+    CHECK(!col_rel_set_column_types(input, source_types, 7));
+    for (uint32_t r = 0; r < rows; ++r) {
+        int64_t values[] = {7 + r, -3, 9, 11, 0, 17, r % 2};
+        values[4] = wl_columnar_float_to_bits((double)r - 1.0);
+        CHECK(!col_rel_append_row(input, values));
+    }
+    if (rows > 1) input->columns[4][1] = wl_columnar_float_to_bits(-0.0);
+    col_rel_t *raw_input = NULL;
+    CHECK(!col_rel_deep_copy(input, &raw_input, NULL));
+    wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
+    CHECK(scenario);
+    wl_columnar_filter_test_prepare(scenario, input, true, NULL, 0, false);
+    scenario->op = op;
+    scenario->filter.start = wl_columnar_filter_map_attempt_start;
+    wl_columnar_filter_test_map_run(scenario);
+    CHECK(scenario->filter.done && !scenario->filter.status.execution_result);
+    eval_stack_t *actual =
+        wl_columnar_eval_stack_cleanup_stack(scenario->filter.frame);
+    CHECK(actual->top == 1 && actual->items[0].rel->nrows == rows);
+    col_rel_t *result = actual->items[0].rel;
+    CHECK(result->column_types && result->ncols == op.project_count);
+    for (uint32_t c = 0; c < result->ncols; ++c)
+        CHECK(result->column_types[c] ==
+            (computed ? calculated[c] : projected[c]));
+    for (uint32_t r = 0; r < rows; ++r) {
+        CHECK(result->columns[0][r] ==
+            wl_columnar_float_to_bits((double)r - 1.0));
+        if (computed) {
+            CHECK(result->columns[1][r] == (r == 0));
+            CHECK(result->columns[2][r] == 8 + r &&
+                result->columns[3][r] == 17);
+        } else {
+            CHECK(result->columns[1][r] == 7 + r && result->columns[2][r] == 9);
+            CHECK(result->columns[3][r] == 11 && result->columns[4][r] == 17);
+            CHECK(result->columns[5][r] == r % 2 && result->columns[7][r] == 0);
+            CHECK(result->columns[6][r] == result->columns[0][r]);
+        }
+    }
+    wl_col_session_t *raw_session = wl_columnar_filter_test_session();
+    eval_stack_t raw = {0}; CHECK(!eval_stack_push(&raw, raw_input, true));
+    CHECK(!col_op_map(&op, &raw, raw_session));
+    wl_columnar_filter_test_equal(result, raw.items[0].rel);
+    CHECK(!eval_stack_drain(&raw) &&
+        !wl_columnar_filter_test_reserved(raw_session));
+    wl_columnar_memory_governor_ref_release(raw_session->memory_governor);
+    free(raw_session);
+    wl_columnar_filter_test_complete(scenario); free(scenario);
+}
+
+static void
+map_omitted_nonfinite(void)
+{
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_columnar_filter_test_scenario_t *scenario = calloc(1, sizeof(*scenario));
+    CHECK(scenario);
+    wl_columnar_filter_test_map_prepare(scenario, 2, 3, true, false, &op, 0);
+    scenario->input->columns[1][2] = wl_columnar_float_to_bits(NAN);
+    wl_columnar_filter_test_map_run(scenario);
+    CHECK(scenario->filter.done && !scenario->filter.status.execution_result);
+    col_rel_t *result =
+        wl_columnar_eval_stack_cleanup_stack(
+        scenario->filter.frame)->items[0].rel;
+    CHECK(result->column_types &&
+        result->column_types[0] == WIRELOG_TYPE_INT64);
+    CHECK(result->nrows == 3);
+    for (uint32_t r = 0; r < 3;
+        ++r) CHECK(result->columns[0][r] == (int64_t)r - 3);
+    wl_col_session_t *session = wl_columnar_filter_test_session();
+    col_rel_t *input = wl_columnar_filter_test_source(2, 3, true, false, false);
+    input->columns[1][2] = wl_columnar_float_to_bits(NAN);
+    eval_stack_t raw = {0}; CHECK(!eval_stack_push(&raw, input, true));
+    CHECK(!col_op_map(&op, &raw, session));
+    wl_columnar_filter_test_equal(result, raw.items[0].rel);
+    CHECK(!eval_stack_drain(&raw) &&
+        !wl_columnar_filter_test_reserved(session));
+    wl_columnar_memory_governor_ref_release(session->memory_governor);
+    free(session);
+    wl_columnar_filter_test_complete(scenario); free(scenario);
+}
+
+static int
+map_schema_callback(const wirelog_extension_value_t *arguments, uint32_t count,
+    wirelog_extension_value_t *result, void *context)
+{
+    (void)arguments; CHECK(count == 0); ++*(unsigned *)context;
+    result->type = WIRELOG_EXTENSION_VALUE_INT64;
+    result->size = sizeof(int64_t);
+    result->as.int64_value = 29;
+    return 0;
+}
+
+static void
+map_unresolved_schema(void)
+{
+    unsigned calls = 0;
+    wirelog_extension_registry_t *registry =
+        wirelog_extension_registry_create();
+    CHECK(registry);
+    wirelog_extension_descriptor_t descriptor = {
+        .abi_version = WIRELOG_EXTENSION_ABI_VERSION,
+        .size = sizeof(descriptor),
+        .name = "schema", .arity = 0,
+        .result_type = WIRELOG_EXTENSION_VALUE_INT64,
+        .invoke = map_schema_callback, .user_data = &calls,
+    };
+    CHECK(!wirelog_extension_register(registry, &descriptor));
+    wirelog_extension_snapshot_t *snapshot =
+        wirelog_extension_snapshot_acquire(registry);
+    CHECK(snapshot);
+    wl_columnar_filter_test_program_t numeric = {0};
+    wl_columnar_filter_test_constant(&numeric, WL_PLAN_EXPR_CONST_FLOAT,
+        wl_columnar_float_to_bits(-2.5));
+    uint8_t callback[] = {WL_PLAN_EXPR_EXTENSION_CALL, 6, 0, 's', 'c', 'h', 'e',
+                          'm', 'a', 0, 0, 0, 0};
+    wl_plan_expr_buffer_t expressions[] = {{numeric.bytes, numeric.size},
+                                           {callback, sizeof(callback)}};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                       .map_exprs = expressions, .map_expr_count = 2};
+    wl_col_session_t *session = wl_columnar_filter_test_session();
+    session->base.extension_snapshot = snapshot;
+    eval_stack_t stack = {0};
+    CHECK(!eval_stack_push(&stack,
+        wl_columnar_filter_test_source(1, 3, false, false, false), true));
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            session->memory_governor),
+        16u * 1024u * 1024u - 1u, &peer));
+    CHECK(col_op_map(&op, &stack,
+        session) == ENOSPC && !calls && stack.top == 1);
+    CHECK(wl_columnar_memory_rollback(&peer));
+    session->memory_budget_denied = false;
+    CHECK(!col_op_map(&op, &stack, session));
+    CHECK(calls == 3 && stack.top == 1 && stack.items[0].rel->nrows == 3);
+    CHECK(!stack.items[0].rel->column_types); /* Whole legacy fallback, not fabricated partial types. */
+    for (uint32_t r = 0; r < 3; ++r) {
+        CHECK(stack.items[0].rel->columns[0][r] ==
+            wl_columnar_float_to_bits(-2.5));
+        CHECK(stack.items[0].rel->columns[1][r] == 29);
+    }
+    CHECK(!eval_stack_drain(&stack) &&
+        !wl_columnar_filter_test_reserved(session));
+    session->base.extension_snapshot = NULL;
+    wl_columnar_memory_governor_ref_release(session->memory_governor);
+    free(session);
+    wirelog_extension_snapshot_release(snapshot);
+    CHECK(!wirelog_extension_unregister(registry, "schema"));
+    CHECK(!wirelog_extension_registry_destroy(registry));
+}
+
+static void
+map_codes_constructor(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = wl_columnar_filter_test_control(0,
+            &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    int64_t codes[] = {WIRELOG_TYPE_INT32, WIRELOG_TYPE_FLOAT,
+                       WIRELOG_TYPE_BOOL};
+    col_rel_t *out = NULL;
+    CHECK(!wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+            "$map", 3, 129,
+            codes, NULL, &out, control, id));
+    CHECK(out && out->capacity == 129 && out->column_types);
+    for (unsigned c = 0; c < 3; ++c) CHECK(out->column_types[c] == codes[c]);
+    codes[1] = WIRELOG_TYPE_STRING; /* Output metadata must not borrow scratch. */
+    CHECK(out->column_types[1] == WIRELOG_TYPE_FLOAT); col_rel_destroy(out);
+    out = NULL;
+    const int64_t invalid[] = {-1, INT64_MAX, (int64_t)WIRELOG_TYPE_BOOL + 1};
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+                "$map", 1, 0,
+                &invalid[i], NULL, &out, control, id) == EINVAL && !out);
+    }
+    CHECK(!wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+            "$map", 0, 0,
+            NULL, NULL, &out, control, id));
+    CHECK(out && !out->ncols && out->capacity == 0); col_rel_destroy(out);
+    out = NULL;
+    CHECK(wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+            "$map", 3, 1,
+            codes, NULL, &out, control, id + 1) == EINVAL && !out);
+    CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
 }
 
 static void
@@ -2896,11 +3125,16 @@ wl_columnar_filter_test_map_literal_auto(const char *name, uint32_t width,
                                                                 AUTO_R(84); \
                                                                 AUTO_R(29); \
                                    } } while (0)
-    AUTO_R(128); AUTO_R(128); AUTO_R(128); AUTO_R(192);
+    AUTO_R(128);
+    for (uint32_t c = 0; c < width; ++c) AUTO_R(128);
+    AUTO_R(128); AUTO_R(128); AUTO_R(192);
     uint64_t name_bytes = strlen(name) + 1;
     for (uint64_t i = 0; i < name_bytes; i++) AUTO_R(96);
     for (unsigned i = 0; i < 6; i++) AUTO_R(96);
-    AUTO_R(96); /* no type bytes */
+    AUTO_R(96); /* typed decision */
+    if (width) {
+        AUTO_R(96); AUTO_R(96);
+    }
     AUTO_R(96); AUTO_R(96); AUTO_R(96);
     if (governed) AUTO_R(96); /* scratch payload */
     AUTO_R(128);
@@ -2925,11 +3159,16 @@ wl_columnar_filter_test_map_literal_auto(const char *name, uint32_t width,
                 4u + wl_columnar_filter_test_digits(i));
         }
     }
+    if (width) {
+        AUTO_A(112);
+        for (uint32_t c = 0; c < width; ++c) AUTO_R(96);
+    }
     AUTO_R(96); AUTO_A(112); wl_columnar_filter_test_map_literal_bytes(s, 3);
     if (width) {
         AUTO_A(112); AUTO_POINTERS();
         for (uint32_t i = 0; i < width; i++) {
             AUTO_A(128); AUTO_A(112);
+            AUTO_R(96); /* Typed Arrow format selection before byte copy. */
             wl_columnar_filter_test_map_literal_bytes(s, 2);
             wl_columnar_filter_test_map_literal_name(s, i); AUTO_A(112);
             wl_columnar_filter_test_map_literal_bytes(s,
@@ -3040,7 +3279,7 @@ wl_columnar_filter_test_map_literal_compile(
 #undef L
 }
 
-/* Independent ordered fee schedule for generated untyped MAP results. Geometry
+/* Independent ordered fee schedule for known typed MAP results. Geometry
  * and expression bytecode are fixture inputs; no measured total or production
  * fee enum is used to construct the oracle. */
 static wl_columnar_filter_test_literal_t
@@ -3058,8 +3297,7 @@ wl_columnar_filter_test_map_literal(uint32_t width, uint32_t rows,
     L(192); L(192); L(256); L(192); L(256);
     L(96); L(144); L(224); L(96); L(144);
     L(224); L(192); R(224, (width + 7u) / 8u);
-    L(192); L(128); L(192); L(192); L(192); L(192);
-    wl_columnar_filter_test_map_literal_auto("$map", outputs, true, &literal);
+    L(192); L(128); L(192); L(192);
     R(192, 2); L(192);
     if ((uint64_t)width + outputs > 16) {
         L(192); wl_columnar_filter_test_literal_reserve(&literal);
@@ -3077,7 +3315,15 @@ wl_columnar_filter_test_map_literal(uint32_t width, uint32_t rows,
             wl_columnar_filter_test_map_literal_compile(&literal, program);
         }
     }
-    R(192, 36); L(192); L(192); L(170);
+    R(192, 36);
+    for (uint32_t c = 0; c < outputs; ++c) {
+        L(192);
+        if (program && c == 0) L(128);
+        L(192);
+    }
+    L(192); L(192);
+    wl_columnar_filter_test_map_literal_auto("$map", outputs, true, &literal);
+    L(192); L(192); L(170);
     wl_columnar_filter_test_literal_single(&literal);
     for (uint32_t row = 0; row < rows; ++row) {
         L(128); L(192); L(128); R(224, (width + 7u) / 8u);
@@ -3201,6 +3447,41 @@ wl_columnar_filter_test_map_error_priority(void)
         wl_columnar_filter_test_trace_end();
         wl_columnar_filter_test_complete(scenario);
         free(scenario);
+    }
+}
+
+/* Compilation/table errors now precede output construction. Simultaneous
+* injected failures prove the later constructor is not entered at all. */
+static void
+map_schema_error_precedence(void)
+{
+    wl_columnar_filter_test_program_t program = {0};
+    wl_columnar_filter_test_constant(&program, WL_PLAN_EXPR_CONST_INT, 1);
+    wl_plan_expr_buffer_t expression = {program.bytes, program.size};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                       .map_exprs = &expression, .map_expr_count = 1};
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        wl_columnar_filter_test_scenario_t *scenario = calloc(1,
+                sizeof(*scenario));
+        CHECK(scenario);
+        wl_columnar_filter_test_map_prepare(scenario, 1, 1, false, false, &op,
+            0);
+        eval_entry_t original =
+            wl_columnar_eval_stack_cleanup_stack(
+            scenario->filter.frame)->items[0];
+        wl_columnar_relation_test_constructor_fail_allocation = 1;
+        wl_columnar_expr_test_fail_allocation = 0;
+        if (mode) wl_columnar_filter_test_attempt_fail_allocation = 0;
+        wl_columnar_filter_test_map_run(scenario);
+        CHECK(scenario->filter.done &&
+            scenario->filter.status.execution_result == ENOMEM);
+        CHECK(wl_columnar_relation_test_constructor_fail_allocation == 1);
+        CHECK(wl_columnar_expr_test_fail_allocation == (mode ? 0 : -1));
+        wl_columnar_filter_test_map_original(scenario, &original);
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        wl_columnar_expr_test_fail_allocation = -1;
+        wl_columnar_filter_test_attempt_fail_allocation = -1;
+        wl_columnar_filter_test_complete(scenario); free(scenario);
     }
 }
 
@@ -3678,6 +3959,12 @@ main(void)
     wl_columnar_filter_test_faults(1, 1, true, &yes, true);
     wl_columnar_filter_test_faults(17, 133, true, &yes, false);
     wl_columnar_filter_test_allocations(&yes);
+    for (unsigned computed = 0; computed < 2; ++computed) {
+        map_schema_types(computed != 0, 0);
+        map_schema_types(computed != 0, 3);
+    }
+    map_omitted_nonfinite(); map_unresolved_schema(); map_codes_constructor();
+    map_schema_error_precedence();
     const uint32_t map_widths[] = {0, 1, 17, 37, 129};
     for (unsigned i = 0; i < 5; ++i) {
         uint32_t width = map_widths[i];
