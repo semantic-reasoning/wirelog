@@ -596,6 +596,169 @@ test_owned_join_successor(void)
     fixture_close(&f);
 }
 
+/* The host pays each separate owning action; status checks and scheduling are
+ * external. This direct return has the same caller envelope as owned JOIN. */
+static int
+owned_consolidate_action(fixture_t *f, const wl_plan_op_t *op,
+    wl_columnar_filter_status_t *status, unsigned action)
+{
+    if (wl_evaluation_control_active_attempt_id(f->funding) != f->funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(f->funding, 384);
+    if (rc) return rc;
+    if (!action)
+        return wl_columnar_filter_consolidate_attempt_start_owned(op,
+                   f->frame, &f->session, f->operation, f->operation_id,
+                   status, &f->record);
+    if (action == 1)
+        return wl_columnar_filter_op_attempt_step_owned(f->frame, status,
+                   &f->record);
+    return wl_columnar_filter_op_attempt_ack_owned(f->frame, &f->record);
+}
+
+static void
+consolidate_sentinel(const wl_columnar_filter_status_t *status)
+{
+    CHECK(status->progress == WL_COLUMNAR_FILTER_PROGRESS_NOT_STARTED
+        && !status->execution_result && !status->cleanup_result
+        && status->semantic_result == 119 && !status->committed);
+}
+
+static void *
+owned_consolidate_wrong_thread(void *data)
+{
+    fixture_t *f = data;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f->frame,
+        &f->session, f->operation, f->operation_id, &status,
+        &f->record) == EINVAL);
+    consolidate_sentinel(&status);
+    return NULL;
+}
+
+static fixture_t *consolidate_active;
+static unsigned consolidate_reentries;
+
+static void
+consolidate_reentry(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)control; (void)progress;
+    if (phase != 1) return;
+    fixture_t *f = consolidate_active;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f->frame,
+        &f->session, f->operation, f->operation_id, &status,
+        &f->record) == EBUSY);
+    consolidate_sentinel(&status); ++consolidate_reentries;
+}
+
+static void
+test_owned_consolidate_entry(void)
+{
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_relation_t plan = {.ops = &map, .op_count = 1};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    fixture_t f; fixture_init(&f, 1, 7, 0); fixture_begin(&f, &plan, 0, 1);
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_filter_consolidate_attempt_start(&op, f.frame,
+        &f.session, f.operation, f.operation_id, &status) == EBUSY);
+    consolidate_sentinel(&status);
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, NULL, 0, &status, &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, f.operation, f.operation_id + 1, &status,
+        &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    int alien_owner = 0;
+    wl_evaluation_control_t *alien = control_new(0, &alien_owner);
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, alien, wl_evaluation_control_active_attempt_id(alien),
+        &status, &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    CHECK(!wl_evaluation_control_finish(alien, &alien_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(alien, &report) && !report.consumed);
+    CHECK(!wl_evaluation_control_detach(alien, &alien_owner));
+    wl_evaluation_control_release(alien);
+    wl_columnar_eval_plan_numeric_attempt_t copy = f.record;
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, f.operation, f.operation_id, &status, &copy) == EBUSY);
+    consolidate_sentinel(&status);
+    wl_col_session_t foreign = {0};
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &foreign, f.operation, f.operation_id, &status, &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session, &nested));
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, f.operation, f.operation_id, &status, &f.record) == EBUSY);
+    consolidate_sentinel(&status);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, owned_consolidate_wrong_thread, &f));
+    CHECK(!wl_thread_join(&thread));
+    wl_columnar_filter_context_t *context = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &context,
+        &f.record));
+    CHECK(context->stage == WL_COLUMNAR_FILTER_STAGE_INERT
+        && !context->pin_owned && !context->source_initialized);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        f.input);
+    consolidate_active = &f; consolidate_reentries = 0;
+    wl_columnar_filter_test_attempt_checkpoint = consolidate_reentry;
+    CHECK(!owned_consolidate_action(&f, &op, &status, 0));
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    consolidate_active = NULL; CHECK(consolidate_reentries == 1);
+    unsigned turns = 0;
+    while (status.progress != WL_COLUMNAR_FILTER_PROGRESS_DONE) {
+        CHECK(++turns < 10000);
+        CHECK(!owned_consolidate_action(&f, &op, &status, 1));
+    }
+    CHECK(status.committed && !status.semantic_result);
+    col_rel_t *result = wl_columnar_eval_stack_cleanup_stack(
+        f.frame)->items[0].rel;
+    CHECK(result != f.input && result->nrows == 7 && result->sorted_nrows == 7);
+    for (uint32_t row = 0; row < 7; ++row)
+        CHECK(result->columns[0][row] == row);
+    CHECK(!owned_consolidate_action(&f, &op, &status, 2));
+    run(&f); CHECK(!f.record.semantic_result && f.record.completed == 1);
+    compare_raw(&f, &plan, 0, 1); fixture_close(&f);
+}
+
+static void
+test_owned_consolidate_successor(void)
+{
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_relation_t plan = {.ops = &map, .op_count = 1};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    fixture_t f; fixture_init(&f, 1, 7, 0); fixture_begin(&f, &plan, 0, 1);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && !report.consumed && report.attempt_id == f.operation_id);
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    uint64_t next = wl_evaluation_control_active_attempt_id(f.operation);
+    wl_columnar_filter_status_t status = {.semantic_result = 119};
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, f.operation, next, &status, &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    CHECK(wl_columnar_filter_consolidate_attempt_start_owned(&op, f.frame,
+        &f.session, f.operation, f.operation_id, &status,
+        &f.record) == EINVAL);
+    consolidate_sentinel(&status);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        f.input);
+    run(&f); CHECK(f.record.semantic_result == EINVAL && !f.record.completed);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && !report.consumed && report.attempt_id == next);
+    fixture_close(&f);
+}
+
 static void
 test_intermediate_stop(void)
 {
@@ -2277,6 +2440,7 @@ test_source_host_boundaries(void)
 int
 main(void)
 {
+    test_owned_consolidate_entry(); test_owned_consolidate_successor();
     test_owned_join_entry();
     test_owned_join_successor();
     test_generated_join_fragments();

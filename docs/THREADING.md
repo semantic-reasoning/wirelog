@@ -1726,5 +1726,5 @@ through ACK. Generic frame disposal remains an external host operation.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
-| `filter.c:wl_columnar_filter_consolidate_attempt_start` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the private original scratch token owner before reservation; no concurrent publication |
-| `filter.c:wl_columnar_filter_consolidate_attempt_start#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition and bind the original token identity before callbacks |
+| `filter.c:wl_columnar_filter_consolidate_attempt_start_owned` | `ctx->credit.owner_bits` | `atomic_init` | original inert initialization | Initialize the private original scratch token owner before reservation; no concurrent publication |
+| `filter.c:wl_columnar_filter_consolidate_attempt_start_owned#2` | `ctx->credit.state` | `atomic_init` | original inert initialization | Establish EMPTY before acquisition and bind the original token identity before callbacks |

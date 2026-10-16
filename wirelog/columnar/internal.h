@@ -5650,6 +5650,13 @@ int wl_columnar_eval_stack_filter_finish(
 int wl_columnar_filter_consolidate_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+/* Original numeric owner, operation control and saved active attempt ID are
+ * required together. Protocol rejection preserves status and frame state.
+ * NULL owner retains the standalone raw/controlled compatibility route. */
+int wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *);
 
 int wl_columnar_filter_op_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
