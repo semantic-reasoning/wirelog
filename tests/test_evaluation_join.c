@@ -911,9 +911,25 @@ key_interrupt_cases(void)
     fixture_close(&partial);
 }
 
+static void
+standalone_raw_case(void)
+{
+    fixture_t f; fixture_init(&f, 2, 3, 5, 0);
+    CHECK(!wl_columnar_join_op_attempt_start(&f.op, f.frame, &f.session,
+        NULL, 0, &f.status));
+    CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
+    CHECK(!f.status.semantic_result && f.status.committed);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 15
+        && stack->items[0].rel->ncols == 4);
+    f.phase = 3;
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
+    standalone_raw_case();
     parity_cases(); generated_case(false); generated_case(true); limit_cases();
     funding_case();
     retained_case(); governor_cases(); publication_case(); interrupt_cases();
