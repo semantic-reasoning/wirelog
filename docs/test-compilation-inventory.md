@@ -150,6 +150,7 @@ testlib_prod = static_library(
 | test_io_ctx | defines `WIRELOG_BUILDING`; `WIRELOG_BUILDING` plugin build; dep subset `threads_dep` |
 | test_io_dispatch | defines `TEST_DISPATCH_PRESENT, ` WIRELOG_BUILDING`; `WIRELOG_BUILDING` plugin build; dep subset `threads_dep` |
 | test_ir | `b_lto=false`; dep subset `threads_dep` |
+| test_join_batch_program_ | defines `WL_SESSION_TEST_HOOKS=1`; the `nofusion` configuration adds `ENABLE_K_FUSION=0` |
 | test_join_hash_probe | dep subset `(none)` |
 | test_join_right_filter_cleanup | `b_lto=false` + `-Wl,--wrap=calloc` on Linux (#1720 allocation-failure coverage) |
 | test_jpp | `b_lto=false`; dep subset `threads_dep` |
