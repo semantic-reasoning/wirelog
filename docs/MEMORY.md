@@ -1480,41 +1480,41 @@ Ownership and admission:
   heuristic of the one-shot loop is not consulted per row in bounded mode;
   admission is the bound.
 
-Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when bounded
-mode is enabled for a normal keyed join.  Its scratch grows lazily by the same
-rule as the non-differential producer, and the per-producer bound above
-applies to it with its own descriptor; its scratch is never timestamped.  Its
-create also runs the right relation's differential arrangement transaction in
-`index_right`.  Once an earlier create has committed that arrangement,
-`index_right` deep-copies it on every create, even when no row is new, and
-grows the copy's hash table when new rows need it; until that transaction
-commits, the governor holds the arrangement twice.  The arrangement belongs to
-the session and outlives the producer, so this transaction is outside the
-per-producer bound; it ends, committed or aborted, before the first batch.
-The right relation is incrementally indexed in a differential transaction
-before the continuation starts; that cache transaction is committed before a
-differential generation/source pin is held for the continuation.  Since #2173
-the bounded differential join publishes the one-shot `$join_diff` contract:
-its scratch and its `$join_diff_batch` output carry no timestamps, and the
-producer reads neither input's timestamp column, so it neither reads nor
-multiplies input multiplicities.  (Until #2173 each batch carried the signed
-product `left * right`, which failed the join with `EINVAL` on overflow.)
-Stale input, generation changes, overflow, cancellation, or failed admission
+Differential keyed joins use `wirelog/columnar/diff_join_batch.c` when
+bounded mode is enabled for a normal keyed join.  Its scratch grows lazily
+by the same rule as the non-differential producer, and the per-producer
+bound above applies to it with its own descriptor; its scratch is never
+timestamped.  Its create also runs the right relation's differential
+arrangement transaction in `index_right`.  Once an earlier create has
+committed that arrangement, `index_right` deep-copies it on every create,
+even when no row is new, and grows the copy's hash table when new rows need
+it; until that transaction commits, the governor holds the arrangement
+twice.  The arrangement belongs to the session and outlives the producer, so
+this transaction is outside the per-producer bound; it ends, committed or
+aborted, before the first batch.  The right relation is incrementally
+indexed in a differential transaction before the continuation starts; that
+cache transaction is committed before a differential generation/source pin
+is held for the continuation.  Since #2173 the bounded differential join
+publishes the one-shot `$join_diff` contract: its scratch and its
+`$join_diff_batch` output carry no timestamps, and the producer reads
+neither input's timestamp column, so it neither reads nor multiplies input
+multiplicities.  (Until #2173 each batch carried the signed product
+`left * right`, which failed the join with `EINVAL` on overflow.)  Stale
+input, generation changes, overflow, cancellation, or failed admission
 discard the output relation and release the differential pin exactly once.
 Materialized/cache joins and delta-right, filtered, cross and worker shapes
 remain on their existing one-shot paths until their publication contracts
 are bounded.  Since #1382 the differential join decides them with the same
-eligibility check as the ordinary join and then excludes materialized joins.
-Without strict mode each records its reason (`worker-session`, `cross-join`,
-`delta-right`, `filtered-right` or `materialized`, and `row-too-large` when
-create refuses a batch budget below one output row or a zero-width output);
-under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP` instead of running
-one-shot and records nothing.  A materialized join
-whose result is already cached is copied from the cache before this
-decision, so it is neither recorded nor refused.  Under strict mode a
-differential evaluation therefore fails as soon as one of its joins reads a
-delta on the right or filters the right relation; it is a diagnostic
-setting.
+eligibility check as the ordinary join and then excludes materialized
+joins.  Without strict mode each records its reason (`worker-session`,
+`cross-join`, `delta-right`, `filtered-right` or `materialized`, and
+`row-too-large` when create refuses a batch budget below one output row or a
+zero-width output); under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP`
+instead of running one-shot and records nothing.  A materialized join whose
+result is already cached is copied from the cache before this decision, so
+it is neither recorded nor refused.  Under strict mode a differential
+evaluation therefore fails as soon as one of its joins reads a delta on the
+right or filters the right relation; it is a diagnostic setting.
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
@@ -1616,6 +1616,107 @@ any JOIN dispatch, and the run stopped at a single large CONSOLIDATE scratch
 request.  CSPA's smallest passing `WIRELOG_MEMORY_BUDGET` among those probed
 was the same with the knob off and at 1 MiB, consistent with its pressure
 being the JOIN outputs, which the relation sink still materializes.
+
+### Scope of bounded JOIN mode (#1382)
+
+What `WIRELOG_JOIN_BATCH_BYTES` bounds is each producer's own working set:
+the per-producer bound above, plus the output growth the governor admits
+batch by batch.  The output relation itself is still materialized in full,
+and the differential arrangement transaction and a consumed pipeline's tail
+transients are outside the knob.  Each JOIN operator publishes one relation;
+publishing its batches downstream one at a time (bounded exchange) is #1383,
+after #1373.  The non-differential producer holds no source reader on its
+inputs, which is safe only because it is drained synchronously before the
+operator returns; that must change before #1383 publishes batches
+asynchronously.
+
+Where bounded mode runs, as the program-level test
+`test_join_batch_program_{default,nofusion}` measures it in both planner
+builds at one and four workers:
+
+- strata whose inputs are below the parallel thresholds are evaluated on the
+  calling session, where joins of an eligible shape run bounded (the
+  two-hop and closure programs succeed under strict mode; the K = 4
+  recursive rule records its excluded shapes);
+- a snapshot after an incremental insert takes the insert route (#2114),
+  whose worker clones run with the knob off, and records `insert-route`;
+  strict mode refuses the route and the full re-evaluation is bounded;
+- a recursive stratum on TDD workers and a non-recursive stratum split
+  across workers (reached in that test by forcing
+  `WIRELOG_TDD_MIN_ROWS_PER_WORKER` and
+  `WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER` to 1) run their joins one-shot
+  inside the workers, recorded as `worker-session` and folded into the
+  coordinator's count; strict mode returns `ENOTSUP`;
+- K-Fusion runs its branches serially on the calling session, so no branch
+  session exists while the knob is set.
+
+So bounded JOIN is not available inside workers: no worker runs the
+producer, which is also why no worker can emit more than one payload into
+the one-payload-per-worker transport.  Enabling it there is a follow-up
+issue (a name-free arrangement lease, or a producer-owned hash over the
+slot-resolved right input, for the insert and bound runs; worker arrangement
+caches and folding for full-path TDD workers).  Which route a given
+production workload takes depends on its data sizes and is not claimed here.
+
+The shapes bounded mode excludes record these reasons, and each is refused
+under `WIRELOG_JOIN_BATCH_STRICT`: `cross-join`, `delta-right`,
+`filtered-right`, `worker-session`, `no-arrangement`, `row-too-large`,
+`pipeline-not-consumable`, `materialized` (differential path; a cached
+result is copied before the decision and is neither recorded nor refused),
+`lftj` and `insert-route`.  A controlled attempt on the JOIN route of #1821
+refuses the knob with `ENOTSUP` without recording a reason; the numeric plan
+driver that dispatches it is not yet reached from session evaluation.
+Strict mode therefore refuses incremental differential programs whose joins
+read a right delta, LFTJ chains, and recursive multi-way rules (whose joins
+feed joins and read right deltas); it is a diagnostic setting.
+
+The bounded paths report failures as typed errors:
+- a governor denial is `ENOSPC` with `wl_columnar_session_budget_denied()`
+  set, except a denial of the differential arrangement's creation or copy
+  reservation in the differential producer's create, which returns `ENOMEM`
+  with the flag set (above); the JOIN does not reclaim and retry on a
+  denial, and cancelling a running join from the host is #1821;
+- a batch that would take the output past `UINT32_MAX` rows is `EOVERFLOW`;
+  an `EOVERFLOW` from the output's capacity reservation itself is still
+  `ENOMEM`, and an overflow in the differential scratch's retained-bytes
+  arithmetic is reported as a budget denial (`ENOSPC`);
+- `col_join_batch_run_to_relation` returns `EAGAIN` for stale inputs and
+  `EIO` for an ambiguous commit, and the legacy row cap is `EOVERFLOW`.
+
+The tests pin, on one session, a fault after committed batches, a second
+fault on the retried operator run, and an exact clean run, with reserved
+bytes back at the warmed baseline in each
+(`test_diff_operator_fault_retry_restores_baseline`,
+`test_operator_fault_during_retry`, and for the consumed pipeline
+`test_pipeline_midstream_fault_retry_baseline`); the differential test also
+checks that both inputs' readers are released, and the pipeline test that
+the left input is put back on the stack; through the session API, reuse is
+shown after the row-cap `EOVERFLOW`.  A second fault on a batch retried
+inside one continuation is not separately tested, and faults while a
+producer is suspended are covered by input mutation, eviction and
+cancellation (`test_suspended_producer_survives_eviction`,
+`test_stale_inputs_are_rejected`, `test_stale_by_arrangement_rebuild`,
+`test_lease_released_on_every_path`), not by an allocation fault.
+
+With the knob set and more than one worker, the legacy row cap
+(`WIRELOG_JOIN_OUTPUT_LIMIT`) for a K-Fusion rule is checked against each
+join's own output, as at one worker, rather than the counter a parallel
+branch set shares (#959).
+
+When this section was written (#1382), with the #1382 changes on main
+`c2ca4fb8`, the full release suite passed (466 tests, tidy and abi included,
+14 skipped); the knob-on gate (`WIRELOG_JOIN_BATCH_BYTES=224`,
+`MALLOC_PERTURB_=165`) reported no failing test (335); ASan/UBSan over the
+whole suite, with the knob off and at 224, and TSan (`-Dthreads=posix`)
+reported no failure and no sanitizer report; and the 72-test oracle matrix
+(knob off, 224 and 65536, each with `MALLOC_PERTURB_` 0 and 165) ran 68
+tests without a failure in every cell, the other four being data- or
+environment-gated skips.  The strict gate's list grew from 47 names,
+measured on main `284dc96a` before #1382, to 66: 15 tests whose differential
+joins read a right delta (now recorded and refused), `lftj_integration` and
+`symbol_aggregates` (LFTJ), and `2d_frontier_skip` and
+`multi_stratum_rule_frontier`, which assert the frontier state the insert
+route leaves and fail once strict mode replaces it with a full evaluation.
 
 ## 10b. Plain STEP completion recovery (#1713)
 
