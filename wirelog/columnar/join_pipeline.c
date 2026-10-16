@@ -266,13 +266,19 @@ pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
 
     (void)bytes;
     wl_columnar_continuation_status_t status;
+    uint64_t need;
 
     if (!sink || !sink->begun || !sink->out)
         return WL_COLUMNAR_CONTINUATION_INVALID;
+    need = (uint64_t)sink->out->nrows + rows;
+    /* A representation limit, not a memory failure (#1382). */
+    if (need > UINT32_MAX) {
+        sink->error = EOVERFLOW;
+        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    }
     /* Same growth rule as the relation sink (Issue #2173): double first,
      * exact on a budget denial. */
-    status = col_join_batch_sink_grow(sink->out,
-            (uint64_t)sink->out->nrows + rows);
+    status = col_join_batch_sink_grow(sink->out, need);
     /* The publish loop destroys the output on failure, so a denied growth
      * is reported through the sink's error as a budget denial (#2185). */
     if (status == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED)
@@ -283,10 +289,15 @@ pipeline_sink_reserve(void *context, uint64_t bytes, uint32_t rows)
 
 #ifdef WL_TEST_RELATION_RESIZE_HOOK
 wl_columnar_continuation_status_t
-wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows)
+wl_columnar_join_pipeline_test_reserve(col_rel_t *out, uint32_t rows,
+    int *error_out)
 {
     wl_join_pipeline_sink_t sink = { .out = out, .begun = true };
-    return pipeline_sink_reserve(&sink, 0, rows);
+    wl_columnar_continuation_status_t status
+        = pipeline_sink_reserve(&sink, 0, rows);
+    if (error_out)
+        *error_out = sink.error;
+    return status;
 }
 #endif
 

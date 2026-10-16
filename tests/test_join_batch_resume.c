@@ -797,6 +797,130 @@ out:
     fixture_fini(&f);
 }
 
+/* Representation overflow is not a memory failure: a batch that would take
+ * the output past UINT32_MAX rows fails in the sink with EOVERFLOW recorded,
+ * before any output capacity is requested, and leaves no visible change.  The
+ * output's row count is faked; no row is appended while it is. */
+static void
+test_sink_reserve_overflow_is_typed(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    col_join_batch_cursor_t cur;
+    uint32_t cap;
+    wl_columnar_continuation_status_t st;
+
+    TEST("sink reserve past UINT32_MAX rows is EOVERFLOW, not a denial");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 100)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+        KEY0, 1, 80u * 32u, &cont) != 0
+        || col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        != 0) {
+        FAIL("create or sink init");
+        fixture_fini(&f);
+        return;
+    }
+    cap = f.out->capacity;
+    f.out->nrows = UINT32_MAX - 2u;
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_SINK_FAILURE
+        || sctx.error != EOVERFLOW || f.out->nrows != UINT32_MAX - 2u
+        || f.out->capacity != cap || f.out->memory_budget_denial_pending
+        || !col_join_batch_cursor_get(cont, &cur) || cur.sequence != 0u) {
+        f.out->nrows = 0;
+        FAIL("overflow was not a typed, side-effect-free sink failure");
+        goto out;
+    }
+    /* The recorded error belongs to the failed batch only. */
+    f.out->nrows = 0;
+    st = wl_columnar_continuation_publish(cont, &sink);
+    if (st != WL_COLUMNAR_CONTINUATION_OK || sctx.error != 0
+        || f.out->nrows != 80u)
+        FAIL("the next batch did not publish with the error cleared");
+    else
+        PASS();
+out:
+    wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* The overflow reaches the caller of col_join_batch_run_to_relation as
+ * EOVERFLOW (it was ENOMEM) and is not reported as a budget denial. */
+static void
+test_run_to_relation_overflow_returns_eoverflow(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    uint32_t cap;
+    int rc;
+
+    TEST("run_to_relation returns EOVERFLOW for row-count overflow");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 100)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    if (col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+        KEY0, 1, 80u * 32u, &cont) != 0) {
+        FAIL("create");
+        fixture_fini(&f);
+        return;
+    }
+    cap = f.out->capacity;
+    f.out->nrows = UINT32_MAX - 2u;
+    rc = col_join_batch_run_to_relation(cont, f.sess, f.out);
+    f.out->nrows = 0;
+    if (rc != EOVERFLOW) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "rc %d, want EOVERFLOW", rc);
+        FAIL(msg);
+    } else if (f.sess->memory_budget_denied
+        || f.out->memory_budget_denial_pending || f.out->capacity != cap) {
+        FAIL("overflow was reported as a budget denial or grew the output");
+    } else {
+        PASS();
+    }
+    wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+}
+
+/* The pipeline sink records the same EOVERFLOW in its error, the field the
+ * pipeline returns as its operator errno on a sink failure. */
+static void
+test_pipeline_reserve_overflow_is_typed(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    int err = 0;
+    uint32_t cap;
+    wl_columnar_continuation_status_t st;
+
+    TEST("pipeline sink reserve past UINT32_MAX rows records EOVERFLOW");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 1)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    cap = f.out->capacity;
+    f.out->nrows = UINT32_MAX - 2u;
+    st = wl_columnar_join_pipeline_test_reserve(f.out, 8u, &err);
+    f.out->nrows = 0;
+    if (st != WL_COLUMNAR_CONTINUATION_SINK_FAILURE || err != EOVERFLOW
+        || f.out->capacity != cap)
+        FAIL("pipeline overflow was not a typed sink failure");
+    else
+        PASS();
+    fixture_fini(&f);
+}
+
 /* (5) Mutating either input between batches makes the cursor stale and
  * leaves the output untouched. */
 static void
@@ -3997,6 +4121,9 @@ main(void)
     test_boundaries_collision_and_last_match();
     test_boundary_mid_chain();
     test_sink_failure_before_and_after_commit();
+    test_sink_reserve_overflow_is_typed();
+    test_run_to_relation_overflow_returns_eoverflow();
+    test_pipeline_reserve_overflow_is_typed();
     test_stale_inputs_are_rejected();
     test_true_cross_key_collision_resumes();
     test_suspended_producer_survives_eviction();

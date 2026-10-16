@@ -679,6 +679,8 @@ sink_begin(void *context, const wl_columnar_continuation_batch_t *batch)
     col_join_batch_relation_sink_t *s =
         (col_join_batch_relation_sink_t *)context;
 
+    if (s)
+        s->error = 0;
     if (!s || !s->out || !batch || batch->rows == 0 || !batch->payload)
         return WL_COLUMNAR_CONTINUATION_INVALID;
     s->pending_begin = s->out->nrows;
@@ -697,8 +699,11 @@ sink_reserve(void *context, uint64_t bytes, uint32_t rows)
     if (!s || !s->begun || !s->out)
         return WL_COLUMNAR_CONTINUATION_INVALID;
     need = (uint64_t)s->out->nrows + rows;
-    if (need > UINT32_MAX)
+    if (need > UINT32_MAX) {
+        /* A representation limit, not a memory failure (#1382). */
+        s->error = EOVERFLOW;
         return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    }
     /* Capacity the relation already owns is admitted by the sink_init
     * invariant, so a batch that fits needs no governor round trip; this
     * is what makes a retry after a failed append reservation-free. */
@@ -843,6 +848,8 @@ col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
             rc = ENOSPC;
             break;
         case WL_COLUMNAR_CONTINUATION_SINK_FAILURE:
+            rc = ctx.error != 0 ? ctx.error : ENOMEM;
+            break;
         case WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE:
         case WL_COLUMNAR_CONTINUATION_ALLOCATION_FAILURE:
             rc = ENOMEM;
