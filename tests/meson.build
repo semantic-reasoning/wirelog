@@ -2474,6 +2474,26 @@ foreach configuration : ['default', 'nofusion']
        suite: 'semantics', timeout: 120)
 endforeach
 
+# Issue #1382: bounded JOIN through the public session API, with the planner
+# and evaluator compiled in both K-Fusion configurations.
+foreach configuration : ['default', 'nofusion']
+  jbp_args = ['-DWL_SESSION_TEST_HOOKS=1']
+  if configuration == 'nofusion'
+    jbp_args += ['-DENABLE_K_FUSION=0']
+  endif
+  jbp_test = executable(
+    'test_join_batch_program_' + configuration,
+    files('test_join_batch_program.c'),
+    parser_src, ir_src, optimizer_src, backend_src, io_src,
+    arena_src, thread_src, workqueue_src,
+    c_args: jbp_args,
+    include_directories: [wirelog_inc, wirelog_src_inc],
+    dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  )
+  test('join_batch_program_' + configuration, jbp_test,
+       suite: 'semantics', timeout: 120)
+endforeach
+
 # Issue #978: average() was never implemented -- col_op_reduce() had no AVG
 # arm, so each group kept the first operand the scan happened to reach.  The
 # legacy int64 executor has no float lane to return a mean in, so it is
