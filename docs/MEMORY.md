@@ -2687,10 +2687,12 @@ validated 64-bit Linux ABI; other ABIs use their actual structure size.
 ### Cooperative numeric plan segments
 
 The internal `wl_columnar_eval_plan_numeric_attempt_*` interface composes a
-nonempty `[begin, end)` slice of FILTER/MAP operators from a relation plan.
+nonempty `[begin, end)` slice of scalar operators from a relation plan.
+The JOIN and CONSOLIDATE extensions below define the supported operator set.
 The caller explicitly supplies one input relation in an original active cleanup
-frame. This does not execute VARIABLE lookup, delta selection, consolidation,
-recursive dispatch or session publication. Public session control admission and
+frame. The source-bound extension below adds VARIABLE lookup and initial delta
+selection. This interface does not perform recursive dispatch or session
+publication. Public session control admission and
 ordinary `col_eval_relation_plan()` behavior are unchanged.
 
 A segment holds one original operation-control reference and immutable attempt
@@ -2776,7 +2778,8 @@ child retirement allowances are not spent a second time.
 ### Initial source-bound numeric fragments (#1821)
 
 `wl_columnar_eval_plan_numeric_source_attempt_begin` extends the internal
-numeric segment protocol to one leading VARIABLE followed by FILTER/MAP.
+numeric segment protocol to one leading VARIABLE followed by scalar children;
+the JOIN and CONSOLIDATE extensions below define the supported tails.
 It claims an empty original cleanup frame and preserves that owner through
 lookup, construction, execution and final ACK. The containing stratum must be
 nonrecursive: this is a caller precondition because relation plans do not
@@ -3066,9 +3069,10 @@ native owner, operation control and saved attempt ID. JOIN rejects a different
 control or successor ID before admission or mutation. The standalone NULL-owner
 entry still supports its raw NULL-control route.
 
-Generated tests select the contiguous supported prefix and explicitly exclude
-the terminal `CONSOLIDATE`. This interface does not activate the default public
-evaluator or implement complete relation, stratum or recursive evaluation.
+Generated tests cover both the JOIN prefix and complete supported single-body
+operator arrays through terminal `CONSOLIDATE`, as described below. This
+interface does not activate the default public evaluator or perform session
+publication, stratum or recursive evaluation.
 Existing JOIN shape and scalar-session restrictions still apply. A later child
 failure retains the preceding committed intermediate; the fragment is not a
 single rollback transaction. Protocol consumption, child retirement, ACK and
@@ -3106,3 +3110,87 @@ pending results and retained ownership. Original cleanup drains across a new
 operation attempt without charging it. Chained delta/projection tests inspect
 both committed JOINs before a MAP can clear their delta markers and compare
 the identical fragment against raw tuple-bag results.
+
+
+### Complete initial scalar operator plans through CONSOLIDATE (#1821)
+
+Both numeric opcode scans accept CONSOLIDATE, and READY calls
+`wl_columnar_filter_consolidate_attempt_start_owned` directly with the original
+record, frame, session, operation control and saved active ID. This route uses
+all five original-owner frame getters and the common owned step/ACK lifecycle.
+The standalone NULL-owner wrapper preserves raw NULL-control compatibility.
+CONSOLIDATE retains its existing no-delta/no-timestamp/finite-FLOAT and initial
+serial restrictions; accepting the opcode does not widen its input domain.
+A failed later child preserves the preceding committed intermediate.
+
+The parser/generator fixtures now also execute the entire original operator
+array for supported single-body queries, including the terminal CONSOLIDATE.
+Independent sessions with cloned sources run `col_eval_relation_plan` as the raw
+reference. Literal oracles additionally require the sorted distinct results:
+cross JOIN yields values `3..10`, keyed JOIN yields `4/6/8/10`, chained JOIN
+yields `4/7`,
+and a constant head reduces nonempty unary input to one tuple. Source/prebound,
+integer/FLOAT and empty cases are covered. Direct CONSOLIDATE->MAP->CONSOLIDATE
+compositions include nullary and widths 1/17/129. These are complete operator
+results in a private frame; they are not published session query results.
+
+Both raw `col_op_map` and controlled MAP currently construct untyped private
+result lanes, including computed FLOAT payloads. The generated FLOAT fixtures
+interpret those payloads using the query declaration and compare actual type
+metadata separately against raw execution. Their positive sums and constant
+`1.0` results do not prove numerical ordering, signed-zero deduplication or
+nonfinite validation for arbitrary untyped computed FLOAT results. CONSOLIDATE
+uses the actual input lane metadata. Propagating/auditing computed MAP types and
+qualifying negative FLOATs, both zeros and nonfinite cases remains a dependency
+before public/default activation; this increment preserves existing raw MAP
+metadata behavior.
+
+The fourth READY switch case preserves the 19-slot production caller; no new
+loop, child-consumption action or cleanup phase is added. The two opcode scans
+add one constant predicate per visited opcode. The source scan finishes before
+source publication; the tail scan finishes before the first child.
+Owned CONSOLIDATE's conservative entry-refusal ceiling is `209 - 8 + 19 = 220` within
+quantum 256. Its final sorted-stamp continuation is `38 + 19 = 57` within the helper's
+64-slot caller allowance. The new identity/control checks precede ENTRY and do
+not extend the existing COLUMN 256, constructor 253 or B2 validation 252 tails.
+Common owned cleanup retains FINISH 252. The actual FIFO driver remains unchanged:
+its pre-HOST prefix 63 plus 252 is financed within HOST 384 across the real host
+poll. HOST 384 remains distinct from the 256 polling quantum and is not a latency
+bound.
+
+CONSOLIDATE uses its own 53 admissions of 192: 10 common lifecycle, 7 named owner
+supplements and 36 B2 payments, partitioned into 3392 current and 6784 future work.
+These are not the ordinary JOIN's 84 payments. SCRATCH_SIZE reserves 64 for a
+refused first B2 prepayment; original source-End and unary first-FINISH interiors
+retain their own original funding. Partial common prepayment can leave only
+fixed context/control activation: its bounded unpaid no-child bootstrap exception
+remains explicit. A retained retry always needs fresh host funding; old future
+shares are never reused and the successor operation is not cleanup funding.
+Allocator, reference, callback and generic arbitrary-width disposal exclusions
+remain those of the existing source model.
+
+Integrated fixtures interrupt real finite scan, compare, index/merge/pass and
+duplicate-rejection work, including generated JOIN results with 57 identical
+intermediate tuples. They retain the exact preceding owned result, distinguish
+work/cancel/stale-attempt/allocation/quota/unsupported-shape outcomes, and verify
+literal admission boundaries. Real scratch-credit refusal occurs after physical
+disposal while original credit/reference/source ownership remains reachable;
+peer credit survives. HOST 383 refuses pending consumption/retry, while 384 pays
+one action. An external reader can retain an owned-input FINISH after committed
+sorted output. Cleanup across operation turnover leaves successor consumption 0;
+a fresh record on the same stable source then produces the canonical result.
+
+The remaining activation boundary is explicit:
+
+| Operator/dispatch family | Controlled status in this interface |
+|---|---|
+| Initial VARIABLE, numeric FILTER/MAP, ordinary scalar JOIN | Supported in the documented source/prebound domain |
+| Initial scalar CONSOLIDATE | Supported as a child, including terminal and repeated composition |
+| CONCAT/UNION, SEMIJOIN/ANTIJOIN, REDUCE, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
+| Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
+| Computed MAP type propagation and arbitrary FLOAT ordering/deduplication | Further metadata audit and negative/zero/nonfinite qualification required |
+| Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
+
+Unsupported opcodes fail the complete preflight before source publication or the
+first child; supported opcodes with unsupported input shapes fail at that child.
+There is no controlled-to-raw fallback. This increment does not complete #1821.

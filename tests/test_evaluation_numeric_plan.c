@@ -4,6 +4,7 @@
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1204,19 +1205,11 @@ join_raw_parity(fixture_t *f, const wl_plan_relation_t *fragment, bool prebound)
             CHECK(!col_rel_deep_copy(f->session.rels[i], &raw.rels[i], NULL));
     eval_stack_t stack = {0};
     if (prebound) CHECK(!eval_stack_push(&stack, raw.rels[0], false));
-    for (uint32_t i = prebound ? 1 : 0; i < fragment->op_count; ++i) {
-        const wl_plan_op_t *op = &fragment->ops[i];
-        int rc;
-        switch (op->op) {
-        case WL_PLAN_OP_VARIABLE: rc = col_op_variable(op, &stack, &raw); break;
-        case WL_PLAN_OP_JOIN: rc = col_op_join(op, &stack, &raw); break;
-        case WL_PLAN_OP_FILTER: rc = wl_columnar_filter_op(op, &stack, &raw);
-            break;
-        case WL_PLAN_OP_MAP: rc = col_op_map(op, &stack, &raw); break;
-        default: abort();
-        }
-        CHECK(!rc);
+    wl_plan_relation_t tail = *fragment;
+    if (prebound && tail.ops[0].op == WL_PLAN_OP_VARIABLE) {
+        ++tail.ops; --tail.op_count;
     }
+    CHECK(!col_eval_relation_plan(&tail, &stack, &raw));
     eval_stack_t *actual = wl_columnar_eval_stack_cleanup_stack(f->frame);
     CHECK(actual->top == 1 && stack.top == 1);
     same_join_bag(actual->items[0].rel, stack.items[0].rel);
@@ -1256,7 +1249,30 @@ join_float(col_rel_t *original)
 }
 
 static void
-test_generated_join_fragments(void)
+consolidated_values(fixture_t *f, uint32_t rows, int64_t first, int64_t step,
+    bool floating)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == 1 && stack->items[0].owned &&
+        !stack->items[0].is_delta);
+    col_rel_t *rel = stack->items[0].rel;
+    CHECK(rel->ncols == 1 && rel->nrows == rows && !rel->timestamps);
+    CHECK(rel->sorted_nrows == rows && rel->run_count == (rows != 0));
+    if (rows) CHECK(rel->run_ends[0] == rows);
+    for (uint32_t row = 0; row < rows; ++row) {
+        int64_t expected = first + row * step;
+        /* MAP's private raw-compatible result can have no type metadata.
+         * The generated declaration defines this literal payload oracle;
+         * independent raw parity separately verifies all actual metadata. */
+        if (floating)
+            CHECK(wl_columnar_float_from_bits(rel->columns[0][row]) ==
+                (double)expected);
+        else CHECK(rel->columns[0][row] == expected);
+    }
+}
+
+static void
+test_generated_join_fragments(bool complete)
 {
     for (unsigned shape = 0; shape < 3; ++shape)
         for (unsigned floating = 0; floating < 2; ++floating) {
@@ -1303,11 +1319,11 @@ test_generated_join_fragments(void)
                 ++end;
             }
             CHECK(joins == (shape == 2 ? 2u : 1u) && filters && maps);
-            /* Execute this contiguous prefix only. CONSOLIDATE belongs to the
-             * remaining generated relation, outside this interface. */
-            CHECK(end < rp->op_count &&
+            CHECK(end + 1 == rp->op_count &&
                 rp->ops[end].op == WL_PLAN_OP_CONSOLIDATE);
-            wl_plan_relation_t fragment = {.ops = rp->ops, .op_count = end};
+            if (complete) ++end;
+            wl_plan_relation_t fragment = *rp;
+            fragment.op_count = end;
             for (unsigned prebound = 0; prebound < 2; ++prebound)
                 for (unsigned empty = 0; empty < 3; ++empty) {
                     fixture_t f;
@@ -1329,10 +1345,13 @@ test_generated_join_fragments(void)
                                 f.frame)->items[0].rel = f.input;
                     }
                     col_rel_t *registry[] = {f.input, right, third};
-                    CHECK(!col_rel_enable_timestamps(f.input));
-                    for (uint32_t r = 0; r < f.input->nrows; ++r) {
-                        f.input->timestamps[r].iteration = r;
-                        f.input->timestamps[r].multiplicity = r % 2 ? -3 : 5;
+                    if (!complete) {
+                        CHECK(!col_rel_enable_timestamps(f.input));
+                        for (uint32_t r = 0; r < f.input->nrows; ++r) {
+                            f.input->timestamps[r].iteration = r;
+                            f.input->timestamps[r].multiplicity = r %
+                                2 ? -3 : 5;
+                        }
                     }
                     if (prebound) {
                         f.session.rels = registry; f.session.nrels = 3;
@@ -1343,6 +1362,12 @@ test_generated_join_fragments(void)
                         f.record.completed == end - 1);
                     CHECK(f.record.source_installed == !prebound);
                     join_raw_parity(&f, &fragment, prebound != 0);
+                    if (complete) {
+                        const uint32_t counts[] = {8, 4, 2};
+                        const int64_t first[] = {3, 4, 4}, step[] = {1, 2, 3};
+                        consolidated_values(&f, empty ? 0 : counts[shape],
+                            first[shape], step[shape], floating != 0);
+                    }
                     if (empty) CHECK(!wl_columnar_eval_stack_cleanup_stack(
                                 f.frame)->items[0].rel->nrows);
                     fixture_close(&f); col_rel_destroy(right);
@@ -2201,18 +2226,22 @@ test_source_unsupported(void)
         col_rel_t *registry[] = {f.input}; source_begin(&f, &rp, registry, 1);
         run(&f); CHECK(!f.record.semantic_result); fixture_close(&f);
     }
-    for (unsigned bad = 0; bad < 3; ++bad) {
-        wl_plan_op_t invalid[] = {ops[0], ops[1], ops[1]};
-        invalid[bad].op = WL_PLAN_OP_CONCAT;
-        wl_plan_relation_t unsupported = {.ops = invalid, .op_count = 3};
-        fixture_t f; source_fixture(&f, 1, 7, 0);
-        col_rel_t *registry[] = {f.input};
-        source_begin(&f, &unsupported, registry, 1);
-        run(&f); CHECK(f.record.semantic_result == ENOTSUP);
-        CHECK(!f.record.source_slot && !f.record.source_byte
-            && !f.record.source_installed && !f.session.rel_hash_nbuckets);
-        fixture_close(&f);
-    }
+    const wl_plan_op_type_t unsupported_kinds[] = {WL_PLAN_OP_CONCAT,
+                                                   WL_PLAN_OP_LFTJ,
+                                                   WL_PLAN_OP_REDUCE};
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned bad = 0; bad < 3; ++bad) {
+            wl_plan_op_t invalid[] = {ops[0], ops[1], ops[1]};
+            invalid[bad].op = unsupported_kinds[kind];
+            wl_plan_relation_t unsupported = {.ops = invalid, .op_count = 3};
+            fixture_t f; source_fixture(&f, 1, 7, 0);
+            col_rel_t *registry[] = {f.input};
+            source_begin(&f, &unsupported, registry, 1);
+            run(&f); CHECK(f.record.semantic_result == ENOTSUP);
+            CHECK(!f.record.source_slot && !f.record.source_byte
+                && !f.record.source_installed && !f.session.rel_hash_nbuckets);
+            fixture_close(&f);
+        }
     for (unsigned missing = 0; missing < 2; ++missing) {
         fixture_t f; source_fixture(&f, 1, 7, 0);
         ops[0].relation_name = missing ? NULL : "input";
@@ -2437,13 +2466,506 @@ test_source_host_boundaries(void)
     }
 }
 
+static void
+test_complete_unary_plans(void)
+{
+    const uint32_t row_counts[] = {0, 1, 33};
+    for (unsigned floating = 0; floating < 2; ++floating) {
+        const char *text = floating
+            ? ".decl input(x: float)\n.decl output(y: float)\n"
+            "output(1.0) :- input(x), x >= 0.0.\n"
+            : ".decl input(x: int64)\n.decl output(y: int64)\n"
+            "output(1) :- input(x), x >= 0.\n";
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        const wl_plan_relation_t *rp = NULL;
+        for (uint32_t s = 0; s < plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+                if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                    rp = &plan->strata[s].relations[r];
+        CHECK(rp && rp->op_count >= 4 && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+            && rp->ops[rp->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE);
+        unsigned filters = 0, maps = 0;
+        for (uint32_t i = 1; i + 1 < rp->op_count; ++i) {
+            filters += rp->ops[i].op == WL_PLAN_OP_FILTER;
+            maps += rp->ops[i].op == WL_PLAN_OP_MAP;
+        }
+        CHECK(filters && maps);
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned n = 0; n < 3; ++n)
+                for (unsigned pattern = 0; pattern < 3; ++pattern) {
+                    fixture_t f;
+                    uint32_t rows = row_counts[n];
+                    if (prebound) fixture_init(&f, 1, rows, 0);
+                    else source_fixture(&f, 1, rows, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(f.input,
+                        rp->ops[0].relation_name));
+                    if (floating) {
+                        f.input = join_float(f.input);
+                        if (prebound) wl_columnar_eval_stack_cleanup_stack(
+                                f.frame)->items[0].rel = f.input;
+                    }
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        int64_t value = pattern == 0 ? rows - row - 1
+                            : pattern == 1 ? row % 7 : 0;
+                        f.input->columns[0][row] = floating
+                            ? wl_columnar_float_to_bits(value ? (double)value
+                                : row % 2 ? -0.0 : 0.0) : value;
+                    }
+                    col_rel_t *registry[] = {f.input};
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 1;
+                        fixture_begin(&f, rp, 1, rp->op_count);
+                    } else source_begin(&f, rp, registry, 1);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == rp->op_count - 1);
+                    consolidated_values(&f, rows != 0, 1, 0, floating != 0);
+                    join_raw_parity(&f, rp, prebound != 0);
+                    fixture_close(&f);
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_consolidate_composition(void)
+{
+    const uint32_t widths[] = {0, 1, 17, 129};
+    for (unsigned w = 0; w < 4; ++w) {
+        fixture_t f; fixture_init(&f, widths[w], 33, 0);
+        for (uint32_t c = 0; c < widths[w]; ++c)
+            for (uint32_t row = 0; row < 33; ++row)
+                f.input->columns[c][row] = row % 7 + c;
+        col_rel_t *registry[] = {f.input};
+        f.session.rels = registry; f.session.nrels = 1;
+        wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_CONSOLIDATE},
+                              {.op = WL_PLAN_OP_MAP,
+                               .project_count = widths[w]},
+                              {.op = WL_PLAN_OP_CONSOLIDATE}};
+        wl_plan_relation_t plan = {.ops = ops, .op_count = 3};
+        fixture_begin(&f, &plan, 0, 3); run(&f);
+        CHECK(!f.record.semantic_result && f.record.completed == 3);
+        col_rel_t *result = wl_columnar_eval_stack_cleanup_stack(
+            f.frame)->items[0].rel;
+        uint32_t count = widths[w] ? 7 : 1;
+        CHECK(result->ncols == widths[w] && result->nrows == count
+            && result->sorted_nrows == count && result->run_count == 1
+            && result->run_ends[0] == count);
+        for (uint32_t c = 0; c < widths[w]; ++c)
+            for (uint32_t row = 0; row < count; ++row)
+                CHECK(result->columns[c][row] == row + c);
+        join_raw_parity(&f, &plan, true); fixture_close(&f);
+    }
+}
+
+static void
+test_consolidate_literal_limits(void)
+{
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+    /* Independent admission schedule, no runtime hook totals: preflight128,
+     * READY128, ENTRY224, ten lifecycle192, INIT192. Refused admissions do not
+     * debit; partial bootstrap cleanup does not charge the next attempt. */
+    const uint64_t limits[] = {1, 127, 128, 255, 256, 479, 480, 671, 672,
+                               2399, 2400, 2591, 2592};
+    const uint64_t consumed[] = {0, 0, 128, 128, 256, 256, 480, 480, 672,
+                                 2208, 2400, 2400, 2592};
+    for (unsigned repeat = 0; repeat < 2; ++repeat)
+        for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
+            fixture_t f; fixture_init(&f, 1, 3, limits[i]);
+            fixture_begin(&f, &plan, 0, 1); run(&f);
+            CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && !f.record.completed);
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel
+                == f.input && !f.session.memory_budget_denied);
+            CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+                f.record.semantic_result, 0) == f.record.semantic_result);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.operation, &report)
+                && report.attempt_id == f.operation_id
+                && report.consumed == consumed[i]);
+            fixture_close(&f);
+        }
+}
+
+static fixture_t *consolidate_stop_fixture;
+static unsigned consolidate_stop_phase;
+static bool consolidate_stop_hit, consolidate_stop_restart;
+
+static void
+consolidate_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (consolidate_stop_hit || phase != consolidate_stop_phase
+        || progress != (phase == 206 ? 1u : phase == 207 ? 7u : 0u)) return;
+    fixture_t *f = consolidate_stop_fixture;
+    CHECK(control == f->operation && f->record.cursor + 1 == f->record.end
+        && f->record.completed == f->record.cursor - f->record.begin);
+    consolidate_stop_hit = true;
+    if (consolidate_stop_restart) {
+        CHECK(!wl_evaluation_control_finish(control, &f->operation_owner, 0,
+            0));
+        CHECK(!wl_evaluation_control_begin(control, &f->operation_owner));
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_consolidate_stops(void)
+{
+    /* Phase207 position7 has emitted just one tuple on this all-equal input.
+     * Finite scan, comparisons and merge/index work need no output to poll. */
+    const unsigned phases[] = {200, 201, 202, 203, 204, 205, 206, 207};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_MAP, .project_count = 1},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+    for (unsigned restart = 0; restart < 2; ++restart)
+        for (unsigned k = 0; k < sizeof(phases) / sizeof(phases[0]); ++k) {
+            fixture_t f; fixture_init(&f, 1, 19, 0);
+            for (uint32_t row = 0; row < 19; ++row)
+                f.input->columns[0][row] = 0;
+            fixture_begin(&f, &plan, 0, 2); join_until_ready(&f, 1);
+            join_snapshot_t before = join_snapshot(&f);
+            CHECK(before.owned && before.identity != f.input);
+            consolidate_stop_fixture = &f; consolidate_stop_phase = phases[k];
+            consolidate_stop_restart = restart != 0;
+            consolidate_stop_hit = false;
+            wl_columnar_filter_test_attempt_checkpoint = consolidate_stop;
+            run(&f); wl_columnar_filter_test_attempt_checkpoint = NULL;
+            consolidate_stop_fixture = NULL;
+            CHECK(consolidate_stop_hit && f.record.completed == 1
+                && f.record.cursor == 1 && f.record.semantic_result ==
+                (restart ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED)
+                && !f.session.memory_budget_denied);
+            join_snapshot_check(&f, &before); col_rel_destroy(before.contents);
+            if (restart) {
+                uint64_t next =
+                    wl_evaluation_control_active_attempt_id(f.operation);
+                CHECK(next != f.operation_id);
+                CHECK(!wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, 0, 0));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.operation, &report)
+                    && report.attempt_id == next && !report.consumed);
+            }
+            fixture_close(&f);
+        }
+}
+
+static void
+test_complete_join_consolidate_stops(void)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl input(x: int64)\n.decl right(y: int64)\n"
+        ".decl output(z: int64)\n"
+        "output(x) :- input(x), right(y), y >= 0.\n", &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *rp = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                rp = &plan->strata[s].relations[r];
+    CHECK(rp && rp->ops[0].op == WL_PLAN_OP_VARIABLE
+        && rp->ops[rp->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE);
+    bool joined = false;
+    for (uint32_t i = 1; i + 1 < rp->op_count; ++i)
+        joined = joined || rp->ops[i].op == WL_PLAN_OP_JOIN;
+    CHECK(joined);
+    for (unsigned restart = 0; restart < 2; ++restart)
+        for (unsigned duplicate = 0; duplicate < 2; ++duplicate) {
+            fixture_t f; source_fixture(&f, 1, 19, 0);
+            for (uint32_t row = 0; row < 19; ++row)
+                f.input->columns[0][row] = 0;
+            CHECK(!wl_columnar_relation_rename_checked(f.input,
+                rp->ops[0].relation_name));
+            col_rel_t *right = source_new(1, 3);
+            CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+            col_rel_t *registry[] = {f.input, right};
+            source_begin(&f, rp, registry, 2);
+            join_until_ready(&f, rp->op_count - 1);
+            join_snapshot_t before = join_snapshot(&f);
+            CHECK(before.owned && before.identity->nrows == 57);
+            consolidate_stop_fixture = &f;
+            consolidate_stop_phase = duplicate ? 207 : 200;
+            consolidate_stop_restart = restart != 0;
+            consolidate_stop_hit = false;
+            wl_columnar_filter_test_attempt_checkpoint = consolidate_stop;
+            run(&f); wl_columnar_filter_test_attempt_checkpoint = NULL;
+            consolidate_stop_fixture = NULL;
+            CHECK(consolidate_stop_hit && f.record.completed == rp->op_count - 2
+                && f.record.cursor == rp->op_count - 1
+                && f.record.semantic_result == (restart ? EINVAL
+                : WL_EVALUATION_CONTROL_CANCELLED));
+            join_snapshot_check(&f, &before); col_rel_destroy(before.contents);
+            if (restart) {
+                uint64_t next =
+                    wl_evaluation_control_active_attempt_id(f.operation);
+                CHECK(!wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, 0, 0));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.operation, &report)
+                    && report.attempt_id == next && !report.consumed);
+            }
+            fixture_close(&f); col_rel_destroy(right);
+        }
+    wl_plan_free(plan); wirelog_program_free(program);
+}
+
+/* Exact384 funds one real engine action. A refused383 grant or a second action
+ * against the spent384 grant leaves the original pending/retirement unchanged. */
+static void
+consolidate_host_boundary(fixture_t *f, wl_columnar_filter_context_t *ctx)
+{
+    for (unsigned allowance = 383; allowance <= 384; ++allowance) {
+        int owner = 0;
+        wl_evaluation_control_t *host = control_new(allowance, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(host);
+        if (allowance == 384) {
+            wl_evaluation_control_t *saved = f->funding;
+            uint64_t saved_id = f->funding_id;
+            f->funding = host; f->funding_id = id;
+            engine_dispatch(f); ++f->witnesses;
+            f->funding = saved; f->funding_id = saved_id;
+        }
+        wl_columnar_eval_plan_numeric_phase_t phase = f->record.phase;
+        wl_columnar_filter_stage_t stage = ctx->stage;
+        uint64_t bytes = ctx->credit.bytes;
+        bool admitted = ctx->admitted, held = ctx->ref_held;
+        int result = f->record.semantic_result;
+        int rc = phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+            ? wl_columnar_eval_plan_numeric_consume_result(&f->record,
+                f->pending_protocol, host, id)
+            : wl_columnar_eval_plan_numeric_attempt_step(&f->record, host, id);
+        CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && f->record.phase == phase && ctx->stage == stage
+            && ctx->credit.bytes == bytes && ctx->admitted == admitted
+            && ctx->ref_held == held && f->record.semantic_result == result);
+        CHECK(wl_evaluation_control_finish(host, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(host, &report)
+            && report.consumed == (allowance == 383 ? 0u : 384u));
+        CHECK(!wl_evaluation_control_detach(host, &owner));
+        wl_evaluation_control_release(host);
+    }
+}
+
+static void
+test_consolidate_retained_successor(void)
+{
+    fixture_t f; fixture_init(&f, 1, 19, 0);
+    for (uint32_t row = 0; row < 19; ++row) f.input->columns[0][row] = row % 7;
+    wl_columnar_memory_governor_ref_t *governor = join_governor(&f, 1u << 20);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            governor), 128, &peer));
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_MAP, .project_count = 1},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+    fixture_begin(&f, &plan, 0, 2); join_until_ready(&f, 1);
+    join_snapshot_t before = join_snapshot(&f);
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+        &f.record));
+    unsigned turns = 0;
+    while (f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_CREDIT) {
+        CHECK(++turns < 10000 &&
+            f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        engine_dispatch(&f); ++f.witnesses;
+    }
+    CHECK(ctx->admitted && ctx->credit_committed && ctx->ref_held
+        && ctx->governor == governor && !ctx->heap
+        && ctx->values == ctx->inline_values && ctx->pin_owned);
+    CHECK(ctx->output && ctx->output->nrows == 7
+        && ctx->output->sorted_nrows == 7);
+    uint64_t bytes = ctx->credit.bytes;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+    CHECK(bytes && reserved > bytes + peer.bytes);
+    wl_columnar_memory_governor_test_refuse_next_release();
+    engine_dispatch(&f); ++f.witnesses;
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        && f.record.child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+        && ctx->stage == WL_COLUMNAR_FILTER_STAGE_CREDIT
+        && ctx->admitted && ctx->credit_committed && ctx->ref_held
+        && ctx->credit.bytes == bytes);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == reserved);
+    join_snapshot_check(&f, &before);
+    consolidate_host_boundary(&f, ctx);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    uint64_t next = wl_evaluation_control_active_attempt_id(f.operation);
+    consolidate_host_boundary(&f, ctx);
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_REFERENCE && !ctx->admitted
+        && ctx->ref_held && ctx->pin_owned);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == reserved - bytes);
+    run(&f);
+    CHECK(f.record.semantic_result == EINVAL && f.record.completed == 1
+        && !ctx->pin_owned && !ctx->source_initialized
+        && !ctx->batch_initialized && !f.session.memory_budget_denied);
+    join_snapshot_check(&f, &before); col_rel_destroy(before.contents);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.attempt_id == next && !report.consumed);
+    /* Keep the exact original borrowed source, then recover on a fresh record
+     * after old ACK/cleanup. Peer credit is unrelated and survives disposal. */
+    col_rel_t *stable = f.input; f.input = NULL; fixture_close(&f);
+    CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)) == peer.bytes);
+    CHECK(wl_columnar_memory_rollback(&peer));
+    fixture_t retry; fixture_init(&retry, 1, 0, 0);
+    col_rel_destroy(retry.input); retry.input = stable;
+    wl_columnar_eval_stack_cleanup_stack(retry.frame)->items[0].rel = stable;
+    retry.session.memory_governor = governor;
+    col_rel_t *registry[] = {stable}; retry.session.rels = registry;
+    retry.session.nrels = 1;
+    fixture_begin(&retry, &plan, 0, 2); run(&retry);
+    CHECK(!retry.record.semantic_result && retry.record.completed == 2);
+    consolidated_values(&retry, 7, 0, 1, false);
+    join_raw_parity(&retry, &plan, true); fixture_close(&retry);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_consolidate_retained_input(void)
+{
+    fixture_t f; fixture_init(&f, 1, 19, 0);
+    for (uint32_t row = 0; row < 19; ++row) f.input->columns[0][row] = row % 7;
+    col_rel_t *registry[] = {f.input}; f.session.rels = registry;
+    f.session.nrels = 1;
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_MAP, .project_count = 1},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+    fixture_begin(&f, &plan, 0, 2); join_until_ready(&f, 1);
+    col_rel_t *held =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(held != f.input && held->nrows == 19);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(held, &reader));
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+        &f.record));
+    unsigned turns = 0;
+    while (f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || f.record.child_status.progress !=
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH) {
+        CHECK(++turns < 10000 &&
+            f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        engine_dispatch(&f); ++f.witnesses;
+    }
+    CHECK(f.record.child_status.committed && held->nrows == 19);
+    consolidated_values(&f, 7, 0, 1, false);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+    consolidate_host_boundary(&f, ctx);
+    CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_FINISH
+        && f.record.child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    CHECK(!col_rel_source_reader_release(&reader));
+    run(&f); CHECK(!f.record.semantic_result && f.record.completed == 2);
+    consolidated_values(&f, 7, 0, 1, false);
+    join_raw_parity(&f, &plan, true); fixture_close(&f);
+}
+
+static void
+test_consolidate_later_failures(void)
+{
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_MAP, .project_count = 1},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+    for (unsigned fault = 0; fault < 2; ++fault) {
+        fixture_t f; fixture_init(&f, 1, 19, 0);
+        wl_columnar_memory_governor_ref_t *governor = join_governor(&f,
+                1u << 20);
+        fixture_begin(&f, &plan, 0, 2); join_until_ready(&f, 1);
+        join_snapshot_t before = join_snapshot(&f);
+        wl_columnar_memory_reservation_t peer;
+        wl_columnar_memory_reservation_init(&peer);
+        uint64_t baseline = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor));
+        CHECK(baseline && baseline + 1 < (1u << 20));
+        if (fault) CHECK(wl_columnar_memory_reserve(
+                    wl_columnar_memory_governor_ref_get(governor),
+                    (1u << 20) - baseline - 1, &peer));
+        else wl_columnar_filter_test_attempt_fail_allocation = 0;
+        engine_dispatch(&f); ++f.witnesses;
+        wl_columnar_filter_test_attempt_fail_allocation = -1;
+        run(&f);
+        CHECK(f.record.semantic_result == (fault ? ENOSPC : ENOMEM)
+            && f.record.completed == 1 && f.record.cursor == 1
+            && f.session.memory_budget_denied == (fault != 0));
+        join_snapshot_check(&f, &before); col_rel_destroy(before.contents);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) == baseline + (fault ? peer.bytes : 0));
+        fixture_close(&f);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)) == (fault ? peer.bytes : 0));
+        if (fault) CHECK(wl_columnar_memory_rollback(&peer));
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+static void
+test_consolidate_shape_refusals(void)
+{
+    wl_plan_op_t op = {.op = WL_PLAN_OP_CONSOLIDATE};
+    wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+    for (unsigned shape = 0; shape < 4; ++shape)
+        for (uint32_t rows = shape < 2 ? 0 : 1; rows <= 1; ++rows) {
+            fixture_t f; fixture_init(&f, 1, rows, 0);
+            if (!shape) CHECK(!col_rel_enable_timestamps(f.input));
+            if (shape == 1) wl_columnar_eval_stack_cleanup_stack(
+                    f.frame)->items[0].is_delta = true;
+            if (shape >= 2) {
+                f.input = join_float(f.input);
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel =
+                    f.input;
+                f.input->columns[0][0] = wl_columnar_float_to_bits(
+                    shape == 2 ? INFINITY : NAN);
+            }
+            uint64_t generation = f.input->storage_generation;
+            int64_t bits = rows ? f.input->columns[0][0] : 0;
+            fixture_begin(&f, &plan, 0, 1); run(&f);
+            CHECK(f.record.semantic_result == (shape < 2 ? ENOTSUP : EINVAL)
+                && !f.record.completed && !f.session.memory_budget_denied);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(stack->top == 1 && stack->items[0].rel == f.input
+                && stack->items[0].is_delta == (shape == 1)
+                && f.input->storage_generation == generation);
+            if (rows) CHECK(f.input->columns[0][0] == bits);
+            fixture_close(&f);
+        }
+}
+
 int
 main(void)
 {
+    test_complete_unary_plans(); test_consolidate_composition();
+    test_consolidate_literal_limits();
+    test_consolidate_stops(); test_consolidate_retained_successor();
+    test_complete_join_consolidate_stops();
+    test_consolidate_retained_input(); test_consolidate_later_failures();
+    test_consolidate_shape_refusals();
     test_owned_consolidate_entry(); test_owned_consolidate_successor();
     test_owned_join_entry();
     test_owned_join_successor();
-    test_generated_join_fragments();
+    test_generated_join_fragments(false);
+    test_generated_join_fragments(true);
     test_join_no_output_stops();
     test_join_literal_limits();
     test_join_later_failures();
