@@ -5671,11 +5671,12 @@ extern void (*wl_columnar_filter_test_attempt_checkpoint)(
 extern int wl_columnar_filter_test_attempt_fail_allocation;
 #endif
 
-/* Original-address numeric plan segments. This internal host-driven interface
- * does not activate public session evaluation controls. The host binds one
- * private input entry and keeps plan/frame/session storage live until ACK.
- * Every action needs a distinct live host funding control. Never spin on a
- * child return: consume its protocol result on a later host dispatch. */
+/* Original-address JOIN/FILTER/MAP numeric plan segments. This internal
+* host-driven interface does not activate public session evaluation controls.
+* The host binds one
+* private input entry and keeps plan/frame/session storage live until ACK.
+* Every action needs a distinct live host funding control. Never spin on a
+* child return: consume its protocol result on a later host dispatch. */
 typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT = 0,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT,
@@ -5744,7 +5745,7 @@ int wl_columnar_eval_plan_numeric_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
-/* Initial ordinary VARIABLE + FILTER/MAP fragment. Keep registry, names,
+/* Initial ordinary VARIABLE + JOIN/FILTER/MAP fragment. Keep registry, names,
  * descriptors and source contents immutable and live through ACK. Unknown
  * delta modes use AUTO as in the raw VARIABLE operator. The containing
  * stratum must be nonrecursive (a caller precondition; relation plans do not
