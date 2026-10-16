@@ -976,6 +976,53 @@ nested_loop_equal(const col_rel_t *left, const col_rel_t *right,
     return equal;
 }
 
+/* Projected counterpart of nested_loop_equal for a projection of
+ * (left column 1, right column 1), the shape test_projected_output uses. */
+static bool
+nested_loop_projected_equal(const col_rel_t *left, const col_rel_t *right,
+    const col_rel_t *out)
+{
+    uint64_t n = 0;
+    int64_t *want;
+    int64_t *got;
+    bool equal;
+
+    if (!left || !right || !out || out->ncols != 2)
+        return false;
+    for (uint32_t l = 0; l < left->nrows; l++)
+        for (uint32_t r = 0; r < right->nrows; r++)
+            if (col_rel_get(left, l, 0) == col_rel_get(right, r, 0))
+                n++;
+    if (n != out->nrows)
+        return false;
+    want = (int64_t *)calloc((size_t)n * 4u + 4u, sizeof(int64_t));
+    got = (int64_t *)calloc((size_t)n * 4u + 4u, sizeof(int64_t));
+    if (!want || !got) {
+        free(want);
+        free(got);
+        return false;
+    }
+    n = 0;
+    for (uint32_t l = 0; l < left->nrows; l++)
+        for (uint32_t r = 0; r < right->nrows; r++) {
+            if (col_rel_get(left, l, 0) != col_rel_get(right, r, 0))
+                continue;
+            want[n * 4u + 0u] = col_rel_get(left, l, 1);
+            want[n * 4u + 1u] = col_rel_get(right, r, 1);
+            n++;
+        }
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        got[(size_t)i * 4u + 0u] = col_rel_get(out, i, 0);
+        got[(size_t)i * 4u + 1u] = col_rel_get(out, i, 1);
+    }
+    qsort(want, (size_t)n, 4u * sizeof(int64_t), row_cmp);
+    qsort(got, (size_t)n, 4u * sizeof(int64_t), row_cmp);
+    equal = memcmp(want, got, (size_t)n * 4u * sizeof(int64_t)) == 0;
+    free(want);
+    free(got);
+    return equal;
+}
+
 /* Run the differential operator once over @f's left input.  Returns its rc;
  * on success *@out receives the owned result (NULL if not owned). */
 static int
@@ -1137,6 +1184,123 @@ test_diff_operator_empty_and_owned_left(void)
         PASS();
     else
         FAIL("empty or owned left");
+    fixture_fini(&f);
+}
+
+/* #1382: a projected differential join under the knob takes the bounded
+ * producer and equals a nested-loop oracle over the projected columns. */
+static void
+test_diff_operator_projected_independent_oracle(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 1 };
+    uint32_t project[] = { 1, 3 };
+    col_rel_t *out = NULL;
+    int rc;
+
+    TEST("projected bounded differential join equals a nested-loop oracle");
+    if (!fixture_init(&f, 1u << 24, keys, 3, 2, 30)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.op.project_indices = project;
+    f.op.project_count = 2;
+    f.sess->join_batch_bytes = 7u * 16u;
+    rc = run_diff_operator(&f, f.left, false, &out);
+    if (rc != 0 || !out || !out->name
+        || strcmp(out->name, "$join_diff_batch") != 0)
+        FAIL("the bounded differential producer did not run");
+    else if (f.sess->join_batch_fallback_count != 0 || out->nrows != 90u
+        || !nested_loop_projected_equal(f.left, f.right, out))
+        FAIL("projected result differs from the nested-loop oracle");
+    else
+        PASS();
+    if (out)
+        col_rel_destroy(out);
+    fixture_fini(&f);
+}
+
+/* #1382: an empty left delta under the knob, for the ordinary and the
+ * differential operator: an empty result, no recorded fallback, and the
+ * session's reserved bytes unchanged once the result is gone. */
+static void
+test_operator_empty_left_delta(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    col_rel_t *delta = NULL;
+    bool ok = true;
+
+    TEST("bounded operators over an empty left delta");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 30)) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    f.sess->join_batch_bytes = 7u * 32u;
+    delta = make_left(keys, 0);
+    /* Warm-up: build the session's persistent and differential
+     * arrangements, which the session keeps, before measuring. */
+    for (int diff = 0; diff < 2; diff++) {
+        eval_stack_t stack;
+        eval_entry_t result;
+
+        eval_stack_init(&stack);
+        eval_stack_push(&stack, f.left, false);
+        if ((diff ? col_op_join_diff(&f.op, &stack, f.sess)
+            : col_op_join(&f.op, &stack, f.sess)) != 0 || stack.top == 0) {
+            ok = false;
+        } else {
+            result = eval_stack_pop(&stack);
+            free(result.seg_boundaries);
+            if (result.owned)
+                col_rel_destroy(result.rel);
+        }
+        eval_stack_drain(&stack);
+    }
+    if (!ok)
+        printf("(warm-up) ");
+    for (int diff = 0; diff < 2 && ok && delta; diff++) {
+        eval_stack_t stack;
+        eval_entry_t result;
+        uint64_t reserved = reserved_of(f.sess);
+        col_rel_t *out = NULL;
+        int rc;
+
+        eval_stack_init(&stack);
+        eval_stack_push_delta(&stack, delta, false, true);
+        rc = diff ? col_op_join_diff(&f.op, &stack, f.sess)
+                  : col_op_join(&f.op, &stack, f.sess);
+        if (rc == 0 && stack.top > 0) {
+            result = eval_stack_pop(&stack);
+            free(result.seg_boundaries);
+            if (result.owned)
+                out = result.rel;
+            else if (result.rel && result.rel->nrows != 0)
+                rc = EINVAL;
+        }
+        eval_stack_drain(&stack);
+        if (rc != 0 || (out && out->nrows != 0)
+            || f.sess->join_batch_fallback_count != 0) {
+            printf("(%s rc=%d) ", diff ? "differential" : "ordinary", rc);
+            ok = false;
+        }
+        if (out)
+            col_rel_destroy(out);
+        if (ok && reserved_of(f.sess) != reserved) {
+            printf("(%s reserved) ", diff ? "differential" : "ordinary");
+            ok = false;
+        }
+    }
+    if (!delta)
+        ok = false;
+    if (delta)
+        col_rel_destroy(delta);
+    if (ok)
+        PASS();
+    else
+        FAIL("empty left delta");
     fixture_fini(&f);
 }
 
@@ -2553,6 +2717,8 @@ test_projected_output(void)
     oracle = run_oracle(f.sess, f.left, &f.op);
     if (rc != 0 || !oracle || !same_rows(oracle, out2) || out2->nrows != 90u)
         FAIL("projected result differs from the one-shot oracle");
+    else if (!nested_loop_projected_equal(f.left, f.right, out2))
+        FAIL("projected result differs from the nested-loop oracle");
     else
         PASS();
 out:
@@ -4756,6 +4922,8 @@ main(void)
     test_high_fanout_independent_oracle();
     test_diff_operator_high_fanout_independent_oracle();
     test_diff_operator_empty_and_owned_left();
+    test_diff_operator_projected_independent_oracle();
+    test_operator_empty_left_delta();
     test_diff_operator_fault_retry_restores_baseline();
     test_operator_fault_during_retry();
     test_eligibility_ordering();
