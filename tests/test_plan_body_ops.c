@@ -390,9 +390,65 @@ test_existence_bodies(void)
     }
 }
 
+/* COUNT describes its input domain separately from integer cardinalities,
+ * including when the backend clones a lowered aggregate after a join rewrite. */
+static void
+test_count_result_domains(void)
+{
+    const char *sources[] = {
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:int64)\n"
+        "output(g,count(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl b(g:int64)\n.decl c(g:int64)\n"
+        ".decl output(g:int64,n:int64)\n"
+        "output(g,count(v)) :- input(g,v),b(g),c(g).\n"
+    };
+    for (unsigned rewritten = 0; rewritten < 2; ++rewritten) {
+        ++tests_run;
+        printf("  COUNT operand/result domains, rewrite=%u", rewritten);
+        wl_plan_t *plan = build(sources[rewritten]);
+        if (!plan) {
+            FAIL("COUNT plan generation failed"); continue;
+        }
+        uint32_t si, ri;
+        const char *why = NULL;
+        if (!find_relation(plan, "output", &si, &ri)) why = "output missing";
+        else {
+            const wl_plan_relation_t *rp = &plan->strata[si].relations[ri];
+            const wl_plan_body_t *body = &plan->strata[si].bodies[ri];
+            if (!body->op_count || body->ops[0].op != WL_PLAN_OP_VARIABLE ||
+                body->ops[body->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+                why = "full preserved body missing";
+            for (unsigned variant = 0; variant < 2; ++variant) {
+                const wl_plan_op_t *ops = variant ? rp->ops : body->ops;
+                uint32_t count = variant ? rp->op_count : body->op_count;
+                unsigned reductions = 0;
+                for (uint32_t i = 0; i < count; ++i)
+                    if (ops[i].op == WL_PLAN_OP_REDUCE) {
+                        ++reductions;
+                        if (ops[i].agg_fn != WIRELOG_AGG_COUNT ||
+                            ops[i].agg_operand_type !=
+                            WL_PLAN_AGG_OPERAND_FLOAT ||
+                            ops[i].agg_result_type !=
+                            WL_PLAN_AGG_OPERAND_SCALAR)
+                            why = "COUNT operand/result descriptor changed";
+                    }
+                if (reductions != 1) why = "actual COUNT missing";
+            }
+            if (rewritten && !has_op(rp->ops, rp->op_count, WL_PLAN_OP_LFTJ))
+                why = "join clone path not reached";
+        }
+        wl_plan_free(plan);
+        if (why) {
+            FAIL(why); continue;
+        }
+        ++tests_passed; printf(" ... PASS\n");
+    }
+}
+
 int
 main(void)
 {
+    test_count_result_domains();
     test_existence_bodies();
     printf("test_plan_body_ops (Issue #2114)\n");
     test_shape_a();

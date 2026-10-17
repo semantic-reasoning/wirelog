@@ -687,7 +687,9 @@ col_op_reduce(const wl_plan_op_t *op, eval_stack_t *stack,
         return wl_columnar_ops_admission_failure(stack, &e, sess, output_rc);
     }
 
-    bool float_agg = op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
+    /* COUNT's operand is ignored; cardinalities are always integer lanes. */
+    bool float_agg = op->agg_fn != WIRELOG_AGG_COUNT
+        && op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
     if (ocols > 0) {
         wirelog_column_type_t *types = (wirelog_column_type_t *)malloc(
             (size_t)ocols * sizeof(*types));

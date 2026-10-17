@@ -545,8 +545,8 @@ typedef struct {
      * other operator, and on a REDUCE whose operand type could not be
      * established. */
     wl_plan_agg_operand_t agg_operand_type;
-    /* REDUCE only: result domain.  FLOAT is binary64; other numeric
-     * aggregates retain the legacy int64 lane. */
+    /* REDUCE only: result domain. COUNT is always SCALAR regardless of its
+     * operand. FLOAT is binary64; other numeric results use an int64 lane. */
     wl_plan_agg_operand_t agg_result_type;
 } wl_plan_op_t;
 
