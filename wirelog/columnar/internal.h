@@ -6100,6 +6100,7 @@ typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_CREDIT,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK,
@@ -6109,6 +6110,71 @@ typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
 } wl_columnar_eval_serial_framed_phase_t;
+
+/* Original-address journal for a single fresh registry head. Array images
+ * borrow descriptors until the fixed publication cutoff; they never own them. */
+typedef enum {
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_INERT = 0,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HOLE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_SIZE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_COPY,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_COMPARE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_INSERT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_SLOT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_BYTE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_LINK,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_VALIDATE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_MOVE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CHECK_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CHECK_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CUTOFF,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE_MOVE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_WAIT_ACK,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_CREDIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_CREDIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_PROOF,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_DRAINED
+} wl_columnar_session_hash_registry_phase_t;
+
+typedef struct wl_columnar_session_hash_registry_attempt {
+    struct wl_columnar_session_hash_registry_attempt *identity;
+    struct wl_columnar_eval_serial_framed_attempt *parent;
+    wl_columnar_session_hash_registry_image_t image;
+    wl_columnar_memory_reservation_t retired_rels, retired_hash;
+    /* Nonowning original-address pair, authenticated in the preceding cell.
+     * Exclusive serialized parent authority keeps it stable through retry. */
+    wl_columnar_memory_reservation_t *reverse_source, *reverse_destination;
+    uint64_t rel_bytes, expected_bytes, hash_bytes;
+    uint64_t old_rel_bytes, old_hash_bytes, name_hash;
+    uint32_t slot, byte, first_hole, cursor, move;
+    wl_columnar_session_hash_registry_phase_t phase;
+    /* 0=not moved, 1=explicit no-credit skip, 2=real original-address move. */
+    uint8_t journal[4];
+    bool credit_rels, credit_expected, credit_hash;
+    bool old_credit_rels, old_credit_hash;
+    bool committed, drained;
+} wl_columnar_session_hash_registry_attempt_t;
 
 typedef struct wl_columnar_eval_serial_framed_attempt {
     struct wl_columnar_eval_serial_framed_attempt *identity;
@@ -6144,6 +6210,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool source_initialized, batch_initialized, batch_done;
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven;
+    wl_columnar_session_hash_registry_attempt_t publication;
 } wl_columnar_eval_serial_framed_attempt_t;
 
 typedef struct {
@@ -6185,6 +6252,20 @@ int wl_columnar_eval_serial_framed_attempt_step(
 int wl_columnar_eval_serial_framed_consume_result(
     wl_columnar_eval_serial_framed_attempt_t *, int,
     wl_evaluation_control_t *, uint64_t);
+/* Private caller contract: only the parent dispatcher calls these after its
+ * fresh HOST admission. Each call executes one direct cell, never Aconsume. */
+int wl_columnar_session_hash_registry_attempt_begin(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_session_hash_registry_attempt_step(
+    wl_columnar_eval_serial_framed_attempt_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern int wl_columnar_session_hash_test_registry_allocation;
+extern int (*wl_columnar_session_hash_test_registry_move)(
+    wl_columnar_eval_serial_framed_attempt_t *, unsigned, bool);
+#endif
+int wl_columnar_eval_serial_framed_attempt_publish(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_eval_serial_framed_attempt_discard(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);

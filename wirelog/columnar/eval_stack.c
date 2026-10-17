@@ -2540,6 +2540,7 @@ wl_columnar_eval_stack_framed_close_proof(
         || ctx->candidate || ctx->candidate_owned || ctx->pending_funding
         || ctx->scratch.allocated || ctx->scratch.admitted
         || ctx->scratch.ref_held || ctx->input.rel
+        || (ctx->publication.identity && !ctx->publication.drained)
         || ctx->cursor != COL_STACK_MAX+1)
         return EBUSY;
     if (frame->governor && (frame->reservation.identity != &frame->reservation

@@ -3553,5 +3553,18 @@ credit. Physical workspace disposal precedes credit refund and reference release
 A retained reader leaves the original entry or candidate reachable in the active
 frame. Stack-slot disposal and later inert-slot proof have separate first-work
 capacities, and a separate close-proof action precedes final parent ACK plus
-mandatory empty-frame close. This bridge does not yet transfer the candidate to
-the session registry, and does not change the final frame-credit invariant.
+mandatory empty-frame close. Materialization ends with a READY candidate before
+the optional registry publication described below. The final frame-credit
+invariant also applies to that publication path.
+
+Private fresh-head publication separately owns four offside physical allocations
+(registry, expected-content snapshot, hash heads and chains) and three RESERVED
+credits. Admission outputs are consumed only after rc0; a nonzero controlled
+reserve has already restored its prior token. Physical storage retires before
+its credit. Four original-address moves transfer old credits into a journal and
+new credits into the session; pre-cutoff failures reverse the completed prefix.
+The candidate payload stays COMMITTED at its descriptor. Old arrays/credits
+retire only after real child ACK. Original session token histories are limited
+to canonical EMPTY/positive RESERVED, plus untouched noGov all-zero tokens;
+RELEASED histories and governed all-zero destinations return ENOTSUP before new
+publication owners. No token bytes are copied or reset to manufacture a refund.

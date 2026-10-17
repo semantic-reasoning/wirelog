@@ -1124,3 +1124,15 @@ parent ACK and known-empty frame close form one final mandatory action. The
 existing physical-free/credit/reference invariant remains in force. Generic
 cleanup cannot close a live parent. Public STEP/SNAPSHOT control gates remain
 unchanged.
+
+The private framed result can be published as one absent head. A separately
+prepared registry fills the first hole or appends and builds exact FNV1a hash
+chains without whole-image copies or string scans in one action. The final
+saved-original-ID checkpoint precedes a fixed callback-free pointer cutoff.
+Commit is sticky: later cleanup resumes without rerunning the body or testing
+head absence again. Before cutoff every completed credit move is reversed on
+failure and the old registry remains authoritative. Publication currently
+supports canonical EMPTY/positive RESERVED old tokens, and genuinely noGov
+all-zero tokens without writes; a RELEASED old-token history is unsupported.
+This internal publication protocol still does not enable public STEP/SNAPSHOT,
+whole-stratum controlled evaluation, or existing-head append/reevaluation.

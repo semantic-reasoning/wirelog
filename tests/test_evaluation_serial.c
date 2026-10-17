@@ -624,12 +624,552 @@ test_bootstrap_limits(void)
     }
 }
 
+/* Publication fixtures own real heap arrays and actual RESERVED credits.
+ * Preparation happens before parent begin; no live registry/token is copied. */
+static uint64_t
+registry_prepare(fixture_t *f, unsigned count, bool hole, bool built,
+    bool zero_tokens)
+{
+    CHECK(!f->ctx->identity && count && count <= 3);
+    if (!zero_tokens) {
+        wl_columnar_memory_reservation_init(&f->session.rels_reservation);
+        wl_columnar_memory_reservation_init(&f->session.rel_hash_reservation);
+    } else if (f->session.memory_governor) {
+        wl_columnar_memory_reservation_init(&f->session.rels_reservation);
+    }
+    f->session.rels = calloc(count, sizeof(*f->session.rels));
+    CHECK(f->session.rels);
+    f->session.nrels = count; f->session.rel_cap = count;
+    for (unsigned i = 0; i < count; ++i)
+        if (!(hole && i == 1)) f->session.rels[i] = f->inputs[i];
+    if (f->session.memory_governor) {
+        CHECK(wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(f->session.memory_governor),
+                count * sizeof(*f->session.rels), &f->session.rels_reservation)
+            == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+    }
+    if (built) CHECK(!session_rel_build_hash(&f->session));
+    if (!f->session.memory_governor) return 0;
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f->session.memory_governor));
+    CHECK(reserved >= f->session.cleanup_reserved_bytes);
+    return reserved - f->session.cleanup_reserved_bytes;
+}
+
+static void
+registry_destroy(fixture_t *f)
+{
+    for (uint32_t i = 0; i < f->session.nrels; ++i) {
+        col_rel_t *rel = f->session.rels[i];
+        if (rel && rel != f->inputs[0] && rel != f->inputs[1]
+            && rel != f->inputs[2]) CHECK(!col_rel_destroy_checked(rel));
+    }
+    free((void *)f->session.rels); f->session.rels = NULL;
+    if (atomic_load_explicit(&f->session.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        CHECK(wl_columnar_memory_rollback(&f->session.rels_reservation));
+    session_rel_free_hash(&f->session);
+    f->session.nrels = f->session.rel_cap = 0;
+}
+
+static int
+host_publish(fixture_t *f, grant_t *grant)
+{
+    int rc = wl_columnar_eval_serial_framed_attempt_publish(f->ctx,
+            grant->control, grant->id);
+    grant->finish_status = wl_evaluation_control_finish(grant->control,
+            &grant->owner, 0, 0);
+    return rc;
+}
+
+static void
+publish(fixture_t *f)
+{
+    grant_t *grant = grant_begin(f, 0);
+    CHECK(!host_publish(f, grant) && !grant->finish_status);
+}
+
+static int
+close_published(fixture_t *f, bool expected_committed)
+{
+    CHECK(f->ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE);
+    grant_t *grant = grant_begin(f, 0);
+    int result = EINVAL; bool committed = !expected_committed;
+    CHECK(!host_close(f, grant, &result, &committed));
+    CHECK(!grant->finish_status && committed == expected_committed);
+    f->frame = NULL; f->ctx = NULL;
+    CHECK(!f->session.cleanup_active && !f->session.cleanup_pending
+        && !f->session.cleanup_active_count &&
+        !f->session.cleanup_reserved_bytes);
+    return result;
+}
+
+static void
+until_image(fixture_t *f, wl_columnar_session_hash_registry_phase_t phase)
+{
+    unsigned turns = 0;
+    while (!(f->ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE
+        && f->ctx->publication.phase == phase)) {
+        CHECK(++turns < 200000 &&
+            f->ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE);
+        turn(f);
+    }
+}
+
+static void
+test_publication_shapes(void)
+{
+    const unsigned widths[] = {0, 1, 17, 129};
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t plan = {.name = "output", .ops = ops, .op_count = 2};
+    for (unsigned w = 0; w < 4; ++w)
+        for (unsigned flags = 0; flags < 32; ++flags) {
+            bool governed = flags & 1, built = flags & 2, hole = flags & 4;
+            if (governed && (flags & 16)) continue;
+            fixture_t f; fixture_init(&f, widths[w], flags & 8 ? 0 : 4,
+                false, governed, 0);
+            registry_prepare(&f, hole ? 3 : 1, hole, built,
+                !governed && !(flags & 16));
+            col_rel_t **old = f.session.rels;
+            uint32_t old_count = f.session.nrels;
+            begin(&f, &plan); run(&f); compare_raw(&f, &plan);
+            col_rel_t *candidate = f.ctx->candidate;
+            CHECK(candidate && !session_rel_hash_lookup(&f.session, "output"));
+            publish(&f);
+            until(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE);
+            CHECK(f.ctx->committed && !f.ctx->candidate_owned &&
+                !f.ctx->candidate);
+            CHECK(session_rel_hash_lookup(&f.session, "output") == candidate);
+            CHECK(f.session.nrels == old_count + !hole);
+            CHECK(f.session.rels[hole ? 1 : old_count] == candidate);
+            CHECK(f.ctx->child.identity == &f.ctx->child
+                && f.ctx->child.source_registry == old
+                && f.ctx->publication.image.expected_rels == old);
+            CHECK(session_rel_hash_lookup(&f.session, "a") == f.inputs[0]);
+            if (hole) CHECK(session_rel_hash_lookup(&f.session,
+                    "c") == f.inputs[2]);
+            until(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF);
+            CHECK(!f.ctx->child.identity && !f.ctx->child_bound
+                && f.ctx->publication.image.expected_rels == old);
+            turn(&f); /* Post-ACK redirect; old storage remains until its own turn. */
+            CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE
+                && f.ctx->publication.image.expected_rels == old);
+            grant_t *poor = grant_begin(&f, 383);
+            CHECK(host_step(&f, poor,
+                false) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(poor->finish_status == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && f.ctx->publication.image.expected_rels == old);
+            run(&f);
+            CHECK(f.ctx->publication.drained &&
+                !f.ctx->publication.image.expected_rels);
+            CHECK(session_rel_hash_lookup(&f.session, "output") == candidate);
+            CHECK(!close_published(&f, true));
+            if (!governed) {
+                CHECK(f.session.rels_reservation.identity == ((flags & 16)
+                    ? &f.session.rels_reservation : NULL));
+                CHECK(f.session.rel_hash_reservation.identity == ((flags & 16)
+                    ? &f.session.rel_hash_reservation : NULL));
+            }
+            registry_destroy(&f); fixture_destroy(&f);
+        }
+    /* Exact raw collision chains and a name that requires many byte turns. */
+    fixture_t f; fixture_init(&f, 1, 4, true, true, 0);
+    free(f.inputs[1]->name); f.inputs[1]->name = strdup("q");
+    free(f.inputs[2]->name); f.inputs[2]->name = strdup("Q");
+    CHECK(f.inputs[1]->name && f.inputs[2]->name);
+    registry_prepare(&f, 3, false, true, false);
+    char name[300]; memset(name, 'x', sizeof(name)-1); name[sizeof(name)-1] = 0;
+    plan.name = name; begin(&f, &plan); run(&f); compare_raw(&f, &plan);
+    col_rel_t *candidate = f.ctx->candidate;
+    publish(&f); run(&f); CHECK(!close_published(&f, true));
+    CHECK(session_rel_hash_lookup(&f.session, name) == candidate
+        && session_rel_hash_lookup(&f.session, "a") == f.inputs[0]
+        && session_rel_hash_lookup(&f.session, "q") == f.inputs[1]
+        && session_rel_hash_lookup(&f.session, "Q") == f.inputs[2]);
+    registry_destroy(&f); fixture_destroy(&f);
+}
+
+typedef struct {
+    const void *identity;
+    wl_columnar_memory_governor_t *governor;
+    uint64_t bytes, replacement, owner, state;
+    uint8_t transition;
+} registry_token_snapshot_t;
+
+static registry_token_snapshot_t
+registry_token_snapshot(const wl_columnar_memory_reservation_t *token)
+{
+    return (registry_token_snapshot_t){token->identity, token->governor,
+                                       token->bytes, token->replacement_bytes,
+                                       atomic_load_explicit(&token->owner_bits,
+                                           memory_order_acquire),
+                                       atomic_load_explicit(&token->state,
+                                           memory_order_acquire),
+                                       token->transition_kind};
+}
+
+static void
+registry_token_matches(const wl_columnar_memory_reservation_t *token,
+    registry_token_snapshot_t saved)
+{
+    registry_token_snapshot_t now = registry_token_snapshot(token);
+    CHECK(now.identity == saved.identity && now.governor == saved.governor
+        && now.bytes == saved.bytes && now.replacement == saved.replacement
+        && now.owner == saved.owner && now.state == saved.state
+        && now.transition == saved.transition);
+}
+
+static fixture_t *registry_fault_fixture;
+static unsigned registry_stop_move, registry_reserve_phase;
+static bool registry_turnover, registry_reverse_refusal, registry_late_admit;
+static bool registry_reserve_final_tail;
+static wl_columnar_session_hash_registry_phase_t registry_stop_phase;
+
+static void
+registry_stop_original(wl_evaluation_control_t *control)
+{
+    if (registry_turnover) {
+        fixture_t *f = registry_fault_fixture;
+        CHECK(control == f->operation);
+        CHECK(!wl_evaluation_control_finish(control, &f->owner, 0, 0));
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_begin(control, &f->owner));
+        CHECK(wl_evaluation_control_active_attempt_id(control) != f->id);
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+registry_checkpoint(wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!registry_fault_fixture || ctx != registry_fault_fixture->ctx) return;
+    bool move = registry_stop_move && ctx->publication.phase ==
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_MOVE &&
+        ctx->publication.move == registry_stop_move;
+    bool admit = registry_late_admit && ctx->publication.phase ==
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_R &&
+        ctx->publication.credit_rels;
+    bool allocation = registry_stop_phase &&
+        ctx->publication.phase == registry_stop_phase;
+    if (!move && !admit && !allocation) return;
+    registry_stop_move = 0; registry_late_admit = false;
+    registry_stop_phase = WL_COLUMNAR_SESSION_HASH_REGISTRY_INERT;
+    registry_stop_original(ctx->control);
+}
+
+static int
+registry_refuse_reverse(wl_columnar_eval_serial_framed_attempt_t *ctx,
+    unsigned index, bool reverse)
+{
+    (void)ctx; (void)index;
+    if (reverse && registry_reverse_refusal) {
+        registry_reverse_refusal = false; return EBUSY;
+    }
+    return 0;
+}
+
+static void
+registry_reserve_checkpoint(wl_evaluation_control_t *control,
+    wl_columnar_memory_reservation_t *token, unsigned phase)
+{
+    if (registry_fault_fixture && phase == registry_reserve_phase
+        && token ==
+        &registry_fault_fixture->ctx->publication.image.rels_reservation){
+        registry_reserve_phase = 0;
+        registry_stop_original(control);
+    }
+}
+
+static void
+registry_reserve_work_checkpoint(wl_evaluation_control_t *control,
+    uint64_t work)
+{
+    (void)work;
+    if (registry_fault_fixture && registry_reserve_final_tail
+        && atomic_load_explicit(
+            &registry_fault_fixture->ctx->publication.image.rels_reservation.
+            state,
+            memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) {
+        registry_reserve_final_tail = false;
+        registry_stop_original(control);
+    }
+}
+
+static void
+registry_clear_hooks(void)
+{
+    registry_fault_fixture = NULL;
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    wl_columnar_session_hash_test_registry_move = NULL;
+    wl_columnar_memory_governor_test_checkpoint = NULL;
+    wl_columnar_memory_governor_test_work_checkpoint = NULL;
+    registry_reserve_final_tail = false;
+    registry_stop_phase = WL_COLUMNAR_SESSION_HASH_REGISTRY_INERT;
+    registry_stop_move = registry_reserve_phase = 0;
+    registry_turnover = registry_reverse_refusal = registry_late_admit = false;
+}
+
+static void
+test_publication_reverse(void)
+{
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t plan = {.name = "output", .ops = ops, .op_count = 2};
+    for (unsigned move = 1; move <= 4; ++move)
+        for (unsigned turnover = 0; turnover < 2; ++turnover) {
+            fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+            uint64_t baseline = registry_prepare(&f, 3, false, true, false);
+            col_rel_t **old = f.session.rels;
+            uint32_t *head = f.session.rel_hash_head,
+                *next = f.session.rel_hash_next;
+            registry_token_snapshot_t r =
+                registry_token_snapshot(&f.session.rels_reservation);
+            registry_token_snapshot_t h =
+                registry_token_snapshot(&f.session.rel_hash_reservation);
+            begin(&f, &plan); run(&f);
+            registry_fault_fixture = &f; registry_stop_move = move;
+            registry_turnover = turnover; registry_reverse_refusal = true;
+            wl_columnar_eval_serial_test_framed_checkpoint =
+                registry_checkpoint;
+            wl_columnar_session_hash_test_registry_move =
+                registry_refuse_reverse;
+            publish(&f);
+            until_image(&f, WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE);
+            int expected = turnover ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(f.ctx->primary_result == expected);
+            unsigned turns = 0;
+            while (!f.ctx->cleanup_result) {
+                CHECK(++turns < 10); turn(&f);
+            }
+            CHECK(f.ctx->cleanup_result == EBUSY && f.ctx->publication.identity
+                && f.ctx->publication.image.rels &&
+                f.ctx->primary_result == expected);
+            registry_clear_hooks(); run(&f);
+            CHECK(close_published(&f, false) == expected);
+            CHECK(f.session.rels == old && f.session.rel_hash_head == head
+                && f.session.rel_hash_next == next && f.session.nrels == 3);
+            registry_token_matches(&f.session.rels_reservation, r);
+            registry_token_matches(&f.session.rel_hash_reservation, h);
+            CHECK(!session_rel_hash_lookup(&f.session, "output"));
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(
+                        f.session.memory_governor)) == baseline);
+            if (turnover) {
+                CHECK(!wl_evaluation_control_finish(f.operation, &f.owner, 0,
+                    0));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.operation,
+                    &report) && !report.consumed);
+            }
+            registry_destroy(&f); fixture_destroy(&f);
+        }
+}
+
+static void
+test_publication_failures(void)
+{
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t plan = {.name = "output", .ops = ops, .op_count = 2};
+    /* Discover the reached allocation sites until the first complete attempt. */
+    for (int ordinal = 0; ; ++ordinal) {
+        fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+        uint64_t baseline = registry_prepare(&f, 1, false, false, false);
+        begin(&f, &plan); run(&f);
+        wl_columnar_session_hash_test_registry_allocation = ordinal;
+        publish(&f); run(&f);
+        wl_columnar_session_hash_test_registry_allocation = -1;
+        bool committed = f.ctx->committed;
+        CHECK(close_published(&f, committed) == (committed ? 0 : ENOMEM));
+        if (!committed) CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(
+                        f.session.memory_governor)) == baseline);
+        registry_destroy(&f); fixture_destroy(&f);
+        if (committed) {
+            CHECK(ordinal == 4); break;
+        }
+    }
+    const wl_columnar_session_hash_registry_phase_t phases[] = {
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_R,
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_E,
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_H
+    };
+    for (unsigned i = 0; i < 3; ++i) {
+        fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+        uint64_t baseline = registry_prepare(&f, 1, false, false, false);
+        begin(&f, &plan); run(&f); publish(&f); until_image(&f, phases[i]);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(f.session.memory_governor);
+        uint64_t available = atomic_load_explicit(&g->usable_bytes,
+                memory_order_acquire) - wl_columnar_memory_reserved(g);
+        wl_columnar_memory_reservation_t peer;
+        wl_columnar_memory_reservation_init(&peer);
+        CHECK(wl_columnar_memory_reserve_checked(g, available, &peer)
+            == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        run(&f); CHECK(close_published(&f, false) == ENOSPC);
+        CHECK(f.session.memory_budget_denied &&
+            wl_columnar_memory_rollback(&peer));
+        CHECK(wl_columnar_memory_reserved(g) == baseline);
+        registry_destroy(&f); fixture_destroy(&f);
+    }
+    const unsigned hooks[] = {WL_COLUMNAR_MEMORY_GOVERNOR_CLAIMED,
+                              WL_COLUMNAR_MEMORY_GOVERNOR_ADMITTED,
+                              WL_COLUMNAR_MEMORY_GOVERNOR_RESERVED};
+    for (unsigned i = 0; i < 5; ++i)
+        for (unsigned turnover = 0; turnover < 2; ++turnover) {
+            fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+            uint64_t baseline = registry_prepare(&f, 1, false, false, false);
+            begin(&f, &plan); run(&f); publish(&f);
+            until_image(&f, WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_R);
+            registry_fault_fixture = &f; registry_turnover = turnover;
+            if (i < 3) {
+                registry_reserve_phase = hooks[i];
+                wl_columnar_memory_governor_test_checkpoint =
+                    registry_reserve_checkpoint;
+            } else if (i == 3) {
+                registry_reserve_final_tail = true;
+                wl_columnar_memory_governor_test_work_checkpoint =
+                    registry_reserve_work_checkpoint;
+            } else {
+                registry_late_admit = true;
+                wl_columnar_eval_serial_test_framed_checkpoint =
+                    registry_checkpoint;
+            }
+            turn(&f);
+            CHECK(f.ctx->publication.phase ==
+                WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE);
+            CHECK(f.ctx->publication.credit_rels == (i == 4));
+            registry_clear_hooks(); run(&f);
+            CHECK(close_published(&f,
+                false) ==
+                (turnover ? EINVAL : WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(
+                        f.session.memory_governor)) == baseline);
+            if (turnover) {
+                CHECK(!wl_evaluation_control_finish(f.operation, &f.owner, 0,
+                    0));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.operation,
+                    &report) && !report.consumed);
+            }
+            registry_destroy(&f); fixture_destroy(&f);
+        }
+    const wl_columnar_session_hash_registry_phase_t after_allocations[] = {
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_E,
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_H,
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_NEXT,
+        WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_R
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+        uint64_t baseline = registry_prepare(&f, 1, false, false, false);
+        begin(&f, &plan); run(&f);
+        registry_fault_fixture = &f; registry_stop_phase = after_allocations[i];
+        wl_columnar_eval_serial_test_framed_checkpoint = registry_checkpoint;
+        publish(&f); until_image(&f, WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE);
+        CHECK(f.ctx->publication.image.rels);
+        if (i > 0) CHECK(f.ctx->publication.image.expected_rel_contents);
+        if (i > 1) CHECK(f.ctx->publication.image.hash_head);
+        if (i > 2) CHECK(f.ctx->publication.image.hash_next);
+        registry_clear_hooks(); run(&f);
+        CHECK(close_published(&f, false) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                f.session.memory_governor)) == baseline);
+        registry_destroy(&f); fixture_destroy(&f);
+    }
+    /* Original all-zero destinations remain unsupported with new governor credit. */
+    {
+        fixture_t f; fixture_init(&f, 1, 4, false, true, 0);
+        registry_prepare(&f, 1, false, false, true);
+        registry_token_snapshot_t saved =
+            registry_token_snapshot(&f.session.rel_hash_reservation);
+        CHECK(!saved.identity);
+        begin(&f, &plan); run(&f); publish(&f);
+        CHECK(!f.ctx->publication.identity && f.ctx->primary_result == ENOTSUP);
+        run(&f); CHECK(close_published(&f, false) == ENOTSUP);
+        registry_token_matches(&f.session.rel_hash_reservation, saved);
+        registry_destroy(&f); fixture_destroy(&f);
+    }
+    /* The genuine A result can have an empty private name; publication
+     * enforces the raw registry's stricter nonempty head-name contract. */
+    plan.name = "";
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        fixture_t f; fixture_init(&f, 1, 4, false, governed, 0);
+        registry_prepare(&f, 1, false, true, !governed);
+        registry_token_snapshot_t r =
+            registry_token_snapshot(&f.session.rels_reservation);
+        registry_token_snapshot_t h =
+            registry_token_snapshot(&f.session.rel_hash_reservation);
+        col_rel_t **old = f.session.rels;
+        begin(&f, &plan); run(&f);
+        CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY
+            && f.ctx->candidate && !f.ctx->candidate->name[0]);
+        publish(&f);
+        CHECK(!f.ctx->publication.identity && !f.ctx->publication.image.rels
+            && !f.ctx->publication.image.rels_reservation.identity
+            && !f.ctx->publication.image.hash_reservation.identity
+            && f.ctx->primary_result == EINVAL);
+        registry_token_matches(&f.session.rels_reservation, r);
+        registry_token_matches(&f.session.rel_hash_reservation, h);
+        run(&f); CHECK(close_published(&f, false) == EINVAL);
+        CHECK(f.session.rels == old && f.session.nrels == 1);
+        registry_token_matches(&f.session.rels_reservation, r);
+        registry_token_matches(&f.session.rel_hash_reservation, h);
+        registry_destroy(&f); fixture_destroy(&f);
+    }
+    plan.name = "output";
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        fixture_t f; fixture_init(&f, 1, 4, false, governed, 0);
+        registry_prepare(&f, 1, false, true, false);
+        /* A real released token, without fabricated state or live-token copy. */
+        wl_columnar_memory_governor_ref_t *temporary = NULL;
+        if (governed) session_rel_free_hash(&f.session);
+        else {
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = 1024, .usable_bytes = 1024,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+                .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+                .status = WL_COLUMNAR_MEMORY_OK
+            };
+            temporary = wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(temporary && wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(temporary), 1,
+                    &f.session.rel_hash_reservation) ==
+                WL_COLUMNAR_MEMORY_ADMISSION_OK);
+            CHECK(wl_columnar_memory_rollback(&f.session.rel_hash_reservation));
+        }
+        registry_token_snapshot_t saved =
+            registry_token_snapshot(&f.session.rel_hash_reservation);
+        col_rel_t **old = f.session.rels;
+        begin(&f, &plan); run(&f); publish(&f);
+        CHECK(!f.ctx->publication.identity && f.ctx->primary_result == ENOTSUP);
+        registry_token_matches(&f.session.rel_hash_reservation, saved);
+        run(&f); CHECK(close_published(&f, false) == ENOTSUP);
+        CHECK(f.session.rels == old);
+        registry_token_matches(&f.session.rel_hash_reservation, saved);
+        registry_destroy(&f); fixture_destroy(&f);
+        if (temporary) wl_columnar_memory_governor_ref_release(temporary);
+    }
+}
+
 int
 main(void)
 {
     test_shapes(); test_generated_union(); test_refusal_and_identity();
     test_failures(); test_retained_and_consume_refusal();
     test_growth_quota_and_retry(); test_bootstrap_limits();
-    puts("evaluation_serial: real result bridge, named copy and drain passed");
+    test_publication_shapes(); test_publication_reverse();
+    test_publication_failures();
+    puts("evaluation_serial: real result bridge, publication and drain passed");
     return 0;
 }

@@ -486,6 +486,8 @@ wl_columnar_eval_serial_framed_attempt_step(
         return 0;
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY:
         return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE:
+        return wl_columnar_session_hash_registry_attempt_step(ctx);
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT:
         if (ctx->candidate) {
             rc = col_rel_destroy_checked(ctx->candidate);
@@ -515,6 +517,14 @@ wl_columnar_eval_serial_framed_attempt_step(
         return wl_columnar_eval_plan_numeric_composed_attempt_ack(&ctx->child,
                    funding, funding_id);
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF:
+        /* This state is reached only after genuine child ACK (or no child).
+         * The committed image still owns the old source registry until now. */
+        if (ctx->publication.identity && ctx->publication.committed
+            && !ctx->publication.drained) {
+            if (ctx->child_bound || ctx->child.identity) return EBUSY;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE;
+            return 0;
+        }
         if (ctx->cursor == COL_STACK_MAX+1) {
             ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE;
             return 0;
@@ -638,6 +648,26 @@ wl_columnar_eval_serial_framed_consume_result(
         ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END; break;
     default:
         return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_publish(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY) return EBUSY;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    rc = wl_columnar_session_hash_registry_attempt_begin(ctx);
+    if (ctx->publication.identity) {
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE;
+    } else if (rc) {
+        if (!ctx->primary_result) ctx->primary_result = rc;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT;
     }
     return 0;
 }
