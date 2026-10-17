@@ -4788,10 +4788,14 @@ retraction_rel_name(const char *rel, char *buf, size_t sz);
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     uint32_t iteration);
-/* Ordinary serial and TDD rules share admitted persistent ownership. */
+typedef struct wl_columnar_eval_serial_framed_host_request
+    wl_columnar_eval_serial_framed_host_request_t;
+/* Raw synchronous calls pass NULL request. Controlled calls require the aware
+ * one-action host contract defined after the framed parent below. */
 int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
-    wl_col_session_t *sess, bool recursive);
+    wl_col_session_t *sess, bool recursive,
+    const wl_columnar_eval_serial_framed_host_request_t *request);
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
@@ -6218,6 +6222,56 @@ typedef struct {
     int execution_result, cleanup_result;
     bool ready, retained, committed;
 } wl_columnar_eval_serial_framed_status_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+} wl_columnar_eval_serial_framed_host_action_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+} wl_columnar_eval_serial_framed_host_reply_kind_t;
+
+typedef struct {
+    wl_columnar_eval_serial_framed_host_reply_kind_t kind;
+    int execution_result;
+    bool committed;
+    wl_columnar_eval_serial_framed_status_t status;
+} wl_columnar_eval_serial_framed_host_reply_t;
+
+/* Exclusive serialized/native internal host only. Session, actual immutable
+ * plan, original operation and all inputs remain live through true TERMINAL.
+ * Request/reply are disjoint external objects; neither address is retained.
+ * Each call performs ONE action, then returns before host finish(funding,0,0).
+ * The host owns two or more stable grants/owner keys; never reset a pending
+ * grant. Keep the latest nonSTATUS tuple across STATUS. A refused CONSUME
+ * retains its old tuple; only successful consume releases that borrowed grant.
+ * int is protocol only. Semantic fields are valid only for TERMINAL; status
+ * only for STATUS and rc0. MORE/BOOTSTRAP_RECEIPT rc0 is never logical success.
+ * A bootstrap receipt with no durable parent proves only its completed grant:
+ * exact association to this rp/session/original generation/native owner and
+ * no synthesis/replay is a trusted caller precondition, not runtime authority.
+ * The host begins original once using base.operation_admission, keeps it live
+ * across progress, and finishes it only after TERMINAL if savedID still owns
+ * that generation. A stopped/old parent may clean up without touching successor.
+ * Public and whole-stratum STEP/SNAPSHOT are separately gated. */
+struct wl_columnar_eval_serial_framed_host_request {
+    wl_evaluation_control_t *funding;
+    uint64_t funding_id;
+    wl_evaluation_control_t *operation;
+    uint64_t operation_id;
+    wl_columnar_eval_serial_framed_host_action_t action;
+    bool previous_valid;
+    wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
+    int previous_protocol;
+    wl_evaluation_control_t *previous_funding;
+    uint64_t previous_funding_id;
+    wl_columnar_eval_serial_framed_host_reply_t *reply;
+};
 
 int wl_columnar_eval_stack_framed_context(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,

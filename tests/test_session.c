@@ -15558,7 +15558,7 @@ test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
     if (denial) {
         for (unsigned attempt = 0; attempt < 2; attempt++) {
             int rc = wl_columnar_eval_serial_framed_relation(&output, sess,
-                    false);
+                    false, NULL);
             idb_restore_budget(sess);
             CLONE_CHECK(rc == (denial == 1 ? ENOSPC : ENOMEM)
                 && !session_find_rel(sess, "output")
@@ -15575,7 +15575,7 @@ test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
             "source writer");
         writer_held = true;
         CLONE_CHECK(wl_columnar_eval_serial_framed_relation(&output, sess,
-            false) == EBUSY
+            false, NULL) == EBUSY
             && !session_find_rel(sess,
             "output") && reserved_on(ref) == baseline,
             "source writer refuses metadata snapshot");
@@ -15586,7 +15586,7 @@ test_serial_borrowed_clone_admission(uint32_t workers, unsigned denial,
     }
     int rc
         = workers == 1
-        ? wl_columnar_eval_serial_framed_relation(&output, sess, false)
+        ? wl_columnar_eval_serial_framed_relation(&output, sess, false, NULL)
         : wl_session_step(session);
     wl_columnar_eval_serial_test_after_plan = NULL;
     CLONE_CHECK(rc == 0 && atomic_load_explicit(&serial_clone_bad_result,

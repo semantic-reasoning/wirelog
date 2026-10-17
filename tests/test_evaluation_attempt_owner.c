@@ -1,33 +1,6 @@
-/*
- * test_evaluation_attempt_owner.c - the evaluation attempt boundary must use
- * the owner key the control was attached with, and must observe a cancellation
- * that is already pending before it runs anything.
- *
- * Issue #1821, repairing two defects in the #1820 remainder rather than all of
- * it: #1820's checkpoints, its retry-equivalence test and its MAX_ITERATIONS
- * audit are still absent.
- *
- * wirelog/session.c attaches the control to the session's operation admission
- * and wirelog/session.h documents that admission as the owner key, but both
- * columnar attempt wrappers -- step and snapshot -- passed the session itself.
- * wl_evaluation_control_begin rejects a mismatched owner with EINVAL, so every
- * controlled attempt failed before it started.  Fixing only that would have
- * made things worse: begin returns 0 when cancellation is already pending, and
- * neither begin nor finish reads that flag, so a cancelled attempt would have
- * run in full and been reported as a clean success.  charge(0) is the only
- * reader, so the wrappers poll it before doing any work.
- *
- * Both defects were invisible because wl_session_step and wl_session_snapshot
- * short-circuit to ENOTSUP whenever a control is attached, so nothing reached
- * the wrappers.  This test reaches them through the backend vtable, which is
- * deliberate and single-threaded only: a direct vtable call skips
- * wl_session_operation_begin/_end, so it is invisible to the admission drain
- * and must not be copied into a threaded fixture.
- *
- * Copyright (C) CleverPlant
- * Licensed under LGPL-3.0
- */
-
+/* #1821: whole-session gates plus real admission-key control ownership.
+ * Actual controlled relation publication is covered by evaluation_serial. */
+#include "evaluation_guard_fixture.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/evaluation_control.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -95,110 +68,84 @@ main(void)
 {
     int failed = 0;
     wl_plan_t *plan = build_plan();
-    failed += expect("plan builds", plan != NULL);
-    if (!plan)
-        return 1;
+    if (!plan) return 1;
+    static const int64_t edges[] = {1, 2, 2, 3};
+    wl_session_t *raw = NULL;
+    failed += expect("raw session creates",
+            !wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    if (!raw) return 1;
+    failed += expect("raw facts insert",
+            !wl_session_insert(raw, "edge", edges, 2, 2));
+    struct emitted live = {0};
+    failed += expect("raw snapshot succeeds",
+            !wl_session_snapshot(raw, count_tuple, &live));
+    failed += expect("raw snapshot is nonempty", live.count > 0);
+    wl_session_destroy(raw);
 
     wl_evaluation_control_t *control = NULL;
-    int rc = wl_evaluation_control_create(0, &control); /* 0 = unlimited */
-    failed += expect("control creates", rc == 0 && control != NULL);
-    if (rc != 0 || !control) {
-        wl_plan_free(plan);
-        return 1;
-    }
-
-    wl_session_options_t options;
-    wl_session_options_init(&options);
+    if (wl_evaluation_control_create(0, &control)) return 1;
+    wl_session_options_t options; wl_session_options_init(&options);
     options.evaluation_control = control;
-
     wl_session_t *base = NULL;
-    rc = wl_session_create_with_options(wl_backend_columnar(), plan, 1,
-            &options, &base);
-    failed += expect("controlled columnar session creates",
-            rc == 0 && base != NULL);
-    if (rc != 0 || !base) {
-        wl_evaluation_control_release(control);
-        wl_plan_free(plan);
-        return 1;
+    if (wl_session_create_with_options(wl_backend_columnar(), plan, 1, &options,
+        &base)) return 1;
+    failed += expect("controlled facts insert",
+            !wl_session_insert(base, "edge", edges, 2, 2));
+    wl_col_session_t *sess = (wl_col_session_t *)base;
+    const void *owner = base->operation_admission;
+    failed += expect("real admission owner exists", owner != NULL);
+    failed += expect("wrong owner cannot begin",
+            wl_evaluation_control_begin(control, base) == EINVAL);
+    for (unsigned phase = 0; phase < 3; ++phase) {
+        if (phase == 1) {
+            failed += expect("admission owner begins",
+                    !wl_evaluation_control_begin(control, owner));
+            wl_evaluation_control_request_cancel(control);
+        }
+        if (phase == 2) {
+            failed += expect("gates did not poll pending cancellation",
+                    !wl_evaluation_control_finish(control, owner, 0, 0));
+            wl_evaluation_control_report_t untouched;
+            failed += expect("gates consumed no original work",
+                    !wl_evaluation_control_report(control, &untouched)
+                    && untouched.attempt_id == 1 && !untouched.consumed
+                    && untouched.stop_reason == WL_EVALUATION_CONTROL_NONE &&
+                    !untouched.result);
+            failed +=
+                expect("next original begins without clearing cancellation",
+                    !wl_evaluation_control_begin(control, owner));
+            failed += expect("charge observes cancellation",
+                    wl_evaluation_control_charge(control,
+                    0) == WL_EVALUATION_CONTROL_CANCELLED);
+            failed += expect("wrong owner cannot finish",
+                    wl_evaluation_control_finish(control, base, 0,
+                    0) == EINVAL);
+            failed += expect("admission owner finishes",
+                    wl_evaluation_control_finish(control, owner, 0,
+                    0) == WL_EVALUATION_CONTROL_CANCELLED);
+        }
+        uint64_t before = wl_test_evaluation_guard_state(sess);
+        struct emitted blocked = {0};
+        failed += expect("public step gated", wl_session_step(base) == ENOTSUP);
+        failed += expect("public snapshot gated",
+                wl_session_snapshot(base, count_tuple, &blocked) == ENOTSUP);
+        failed += expect("backend step gated",
+                base->backend->session_step(base) == ENOTSUP);
+        failed += expect("backend snapshot gated",
+                base->backend->session_snapshot(base, count_tuple,
+                &blocked) == ENOTSUP);
+        failed += expect("gate preserves all observed state and report",
+                before == wl_test_evaluation_guard_state(sess));
+        failed += expect("gate emits no tuples", !blocked.count);
     }
-
-    /* The owner key the control was actually attached with. */
-    failed += expect("session holds the admission the control is keyed to",
-            base->operation_admission != NULL);
-
-    /*
-     * Both public entry points refuse while a control is attached
-     * (wirelog/session.c, "#1820-#1822 replace after complete enforcement").
-     * These are tripwires, not false-pass guards: when later work lifts the
-     * gate they fail, which is the signal to re-route this test through the
-     * public API instead of the vtable.
-     */
-    failed += expect("public step stays gated while a control is attached",
-            wl_session_step(base) == ENOTSUP);
-    failed += expect("public snapshot stays gated while a control is attached",
-            wl_session_snapshot(base, NULL, NULL) == ENOTSUP);
-
-    /* No attempt has completed yet, so there is no report to read. */
     wl_evaluation_control_report_t report;
-    failed += expect("no attempt is recorded before the wrapper runs",
-            wl_evaluation_control_report(control, &report) == ENOENT);
-
-    /*
-     * Facts, so a snapshot below emits something and "emitted nothing" can
-     * fail.  Without them every emission count would be zero either way.
-     */
-    static const int64_t edges[] = { 1, 2, 2, 3 };
-    failed += expect("edge facts insert",
-            wl_session_insert(base, "edge", edges, 2, 2) == 0);
-
-    /*
-     * Reaching the backend vtable directly is the only route to the wrappers
-     * while the gate stands.  What is under test is the boundary, not whatever
-     * this plan returns, so the assertions read the control, not the rc.
-     */
-    (void)base->backend->session_step(base);
-    int report_rc = wl_evaluation_control_report(control, &report);
-    failed += expect("the step boundary accepted its own owner key",
-            report_rc == 0);
-    failed += expect("exactly one attempt completed",
-            report_rc == 0 && report.attempt_id == 1);
-
-    /* The snapshot wrapper carries the same fix and needs its own coverage. */
-    struct emitted live = { 0 };
-    (void)base->backend->session_snapshot(base, count_tuple, &live);
-    report_rc = wl_evaluation_control_report(control, &report);
-    failed += expect("the snapshot boundary accepted its own owner key",
-            report_rc == 0 && report.attempt_id == 2);
-    failed += expect("an uncancelled snapshot emits tuples",
-            live.count > 0);
-
-    /*
-     * Pre-cancellation.  begin still returns 0, so only the charge(0) poll can
-     * catch this.  A wrapper without the poll runs the whole operation and
-     * reports success, which is what these three assertions exist to catch.
-     */
-    wl_evaluation_control_request_cancel(control);
-    struct emitted after_cancel = { 0 };
-    int snap_rc = base->backend->session_snapshot(base, count_tuple,
-            &after_cancel);
-    failed += expect("a pre-cancelled snapshot reports cancellation",
-            snap_rc == WL_EVALUATION_CONTROL_CANCELLED);
-    failed += expect("a pre-cancelled snapshot emits nothing",
-            after_cancel.count == 0);
-    report_rc = wl_evaluation_control_report(control, &report);
-    failed += expect("the cancelled attempt is recorded as cancelled",
-            report_rc == 0
-            && report.attempt_id == 3
+    failed += expect("exact lower-control owner/cancel report",
+            !wl_evaluation_control_report(control, &report)
+            && report.attempt_id == 2 && report.consumed == 0
+            && !report.execution_status && !report.cleanup_status
             && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED
             && report.result == WL_EVALUATION_CONTROL_CANCELLED);
-
-    /* Cancellation stays latched for the next attempt. */
-    failed += expect("a step after cancellation is refused too",
-            base->backend->session_step(base)
-            == WL_EVALUATION_CONTROL_CANCELLED);
-
-    wl_session_destroy(base);
-    wl_evaluation_control_release(control);
+    wl_session_destroy(base); wl_evaluation_control_release(control);
     wl_plan_free(plan);
-    return failed == 0 ? 0 : 1;
+    return failed ? 1 : 0;
 }
