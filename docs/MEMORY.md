@@ -3222,7 +3222,8 @@ The remaining activation boundary is explicit:
 |---|---|
 | Initial VARIABLE, numeric FILTER/MAP, ordinary scalar JOIN | Supported in the documented source/prebound domain |
 | Initial scalar CONSOLIDATE | Supported as a child, including terminal and repeated composition |
-| CONCAT/UNION, SEMIJOIN/ANTIJOIN, REDUCE, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
+| Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
+| CONCAT/UNION, REDUCE, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
 | Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
@@ -3238,8 +3239,10 @@ The private `wl_columnar_join_probe_op_attempt_start[_owned]` component adds
 bounded SEMIJOIN and ANTIJOIN using the original unary replacement, two held
 scalar sources, three JOIN scratch records and B2 batch/drain. It creates no
 new live context owner or binary transaction. The ordinary JOIN entry and its
-delta selection/output-limit policy remain separate. This component is not yet
-admitted by the private numeric plan driver or public/default dispatch.
+delta selection/output-limit policy remain separate. Both numeric preflights
+admit these opcodes, and READY dispatch directly invokes the original owned
+probe entry; pending consumption, one-step retirement and ACK keep the same
+record/frame/control. Public/default dispatch remains outside this interface.
 
 A named full right registry relation is required. A missing right returns
 ENOTSUP with the original left entry uncommitted; this explicitly differs from
@@ -3273,3 +3276,14 @@ Additional materialization can fail admission where raw passthrough succeeds,
 and copied invalid FLOAT payloads retain typed append validation rather than
 inherit an invalid-input passthrough promise. Missing-right and unsupported
 shapes never silently execute raw under a nonNULL control.
+
+Integrated tests execute complete preserved lowered bodies, through terminal
+CONSOLIDATE, from actual SIP-created SEMIJOIN and parsed negation ANTIJOIN.
+Literal sorted FLOAT results and independent raw cloned sessions cover source
+and prebound input, empty operands, duplicates, multi-key negation and enforcing
+governors. Explicit MAP -> probe -> probe -> MAP -> CONSOLIDATE compositions
+cover all four probe combinations. Stops and allocation/quota/unsupported
+failures at either probe retain the exact preceding owned result and prevent
+later children from starting. Retained scratch credit uses real pending/child
+HOST383/384 retries; operation turnover consumes no successor allowance, and
+a fresh original record on the same stable source recovers canonical results.

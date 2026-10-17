@@ -959,5 +959,8 @@ Controlled materialization and raw keep-all shortcuts agree on valid admitted
 logical results; physical identity, relation name, retained sort cache and
 exact allocation thresholds may differ. Invalid manually corrupted FLOAT
 payloads are outside that equivalence: typed copying still rejects them.
-The component remains private and opt-in, with numeric-plan admission and
-public/default/session scheduling separate from its standalone/owned entry.
+The component remains private and opt-in. Both source and prebound numeric
+plans admit these opcodes and invoke their original owned entry directly.
+Complete generated SIP/negation bodies and composed MAP/probe chains retain
+terminal CONSOLIDATE semantics, including sorted distinct FLOAT output.
+Public/default/session scheduling remains separate from this interface.

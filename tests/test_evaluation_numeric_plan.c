@@ -1,6 +1,7 @@
 /* #1821 production numeric plan composition, original authority and host turns. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 #include <errno.h>
@@ -1755,7 +1756,7 @@ join_host_boundary(fixture_t *f, wl_columnar_filter_context_t *ctx)
 }
 
 static void
-test_join_retained_successor(void)
+test_join_retained_successor(wl_plan_op_type_t kind)
 {
     fixture_t f; fixture_init(&f, 1, 2, 0);
     col_rel_t *right = source_new(1, 1), *third = source_new(1, 3);
@@ -1771,7 +1772,7 @@ test_join_retained_successor(void)
     const char *key = "col0";
     wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_JOIN, .right_relation = "right",
                            .delta_mode = WL_DELTA_FORCE_FULL},
-                          {.op = WL_PLAN_OP_JOIN, .right_relation = "third",
+                          {.op = kind, .right_relation = "third",
                            .delta_mode = WL_DELTA_FORCE_FULL,
                            .key_count = 1, .left_keys = &key,
                            .right_keys = &key},
@@ -1840,6 +1841,8 @@ test_join_retained_successor(void)
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(f.operation,
         &report) && report.attempt_id == next && !report.consumed);
+    col_rel_t *stable = f.input;
+    if (kind != WL_PLAN_OP_JOIN) f.input = NULL;
     fixture_close(&f);
     CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
             governor)) == peer.bytes);
@@ -1847,6 +1850,24 @@ test_join_retained_successor(void)
     CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
             governor)));
     wl_columnar_memory_governor_ref_release(governor);
+    if (kind != WL_PLAN_OP_JOIN) {
+        fixture_t retry; fixture_init(&retry, 1, 0, 0);
+        col_rel_destroy(retry.input); retry.input = stable;
+        wl_columnar_eval_stack_cleanup_stack(retry.frame)->items[0].rel =
+            stable;
+        col_rel_t *retry_registry[] = {stable, right, third};
+        retry.session.rels = retry_registry; retry.session.nrels = 3;
+        fixture_begin(&retry, &plan, 0, 3); run(&retry);
+        CHECK(!retry.record.semantic_result && retry.record.completed == 3);
+        join_raw_parity(&retry, &plan, true);
+        col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(retry.frame)->items[0].rel;
+        CHECK(out->ncols == 1 &&
+            out->nrows == (kind == WL_PLAN_OP_SEMIJOIN ? 2u : 0u));
+        for (uint32_t r = 0; r < out->nrows;
+            ++r) CHECK(out->columns[0][r] == r);
+        fixture_close(&retry);
+    }
     col_rel_destroy(right); col_rel_destroy(third);
 }
 
@@ -3069,9 +3090,365 @@ test_generated_map_float_schema(void)
     }
 }
 
+/* The actual lowered bodies precede backend LFTJ/exchange rewrites. Both
+ * generators and their expression/key tables retain ownership of these ops. */
+static wl_plan_relation_t
+probe_generated_body(const wl_plan_t *plan)
+{
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            if (!strcmp(plan->strata[s].relations[r].name, "output")) {
+                wl_plan_relation_t body = plan->strata[s].relations[r];
+                CHECK(plan->strata[s].bodies);
+                body.ops = plan->strata[s].bodies[r].ops;
+                body.op_count = plan->strata[s].bodies[r].op_count;
+                return body;
+            }
+    CHECK(false);
+    return (wl_plan_relation_t){0};
+}
+
+static void
+probe_literal_result(fixture_t *f, const double *values, uint32_t count)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == 1 && stack->items[0].owned &&
+        !stack->items[0].is_delta);
+    col_rel_t *out = stack->items[0].rel;
+    CHECK(out->ncols == 1 && out->nrows == count && !out->timestamps &&
+        !out->has_graph_column && out->column_types &&
+        out->column_types[0] == WIRELOG_TYPE_FLOAT &&
+        !strcmp(out->col_names[0], "col0"));
+    CHECK(out->sorted_nrows == count && out->run_count == (count != 0));
+    if (count) CHECK(out->run_ends[0] == count);
+    for (uint32_t r = 0; r < count; ++r)
+        CHECK(out->columns[0][r] == wl_columnar_float_to_bits(values[r]));
+}
+
+static void
+test_generated_probe_plans(void)
+{
+    const char *queries[] = {
+        ".decl input(k:int64,x:float)\n.decl mid(k:int64,y:float)\n"
+        ".decl right(y:float,z:float)\n.decl output(v:float)\n"
+        "output(x+z) :- input(k,x),mid(k,y),right(y,z).\n",
+        ".decl input(k:float,n:int64,x:float)\n"
+        ".decl right(k:float,n:int64)\n.decl output(v:float)\n"
+        "output(x+0.0) :- input(k,n,x),!right(k,n).\n"
+    };
+    const double expected[2][2] = {{-5.0, 3.0}, {-1.0, 4.0}};
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[anti],
+                &error);
+        CHECK(program);
+        if (!anti) {
+            wl_sip_stats_t stats = {0};
+            CHECK(!wl_sip_apply(program,
+                &stats) && stats.semijoins_inserted == 1);
+        }
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        CHECK(body.op_count > 3 && body.ops[0].op == WL_PLAN_OP_VARIABLE &&
+            body.ops[body.op_count - 1].op == WL_PLAN_OP_CONSOLIDATE);
+        unsigned probes = 0, maps = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            if (body.ops[i].op ==
+                (anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN)){
+                ++probes;
+                CHECK(body.ops[i].key_count == (anti ? 2u : 1u) &&
+                    !body.ops[i].right_filter_expr.size);
+            }
+            maps += body.ops[i].op == WL_PLAN_OP_MAP;
+        }
+        CHECK(probes == 1 && maps);
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned empty = 0; empty < 3; ++empty)
+                for (unsigned governed = 0; governed < 2; ++governed) {
+                    fixture_t f;
+                    uint32_t width = anti ? 3 : 2;
+                    if (prebound) fixture_init(&f, width, 0, 0);
+                    else source_fixture(&f, width, 0, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(f.input,
+                        body.ops[0].relation_name));
+                    wirelog_column_type_t input_types[] = {WIRELOG_TYPE_INT64,
+                                                           WIRELOG_TYPE_FLOAT,
+                                                           WIRELOG_TYPE_FLOAT};
+                    if (anti) {
+                        input_types[0] = WIRELOG_TYPE_FLOAT;
+                        input_types[1] = WIRELOG_TYPE_INT64;
+                    }
+                    CHECK(!col_rel_set_column_types(f.input, input_types,
+                        width));
+                    const int64_t semi_keys[] = {1, 1, 2, 3};
+                    const double payloads[] = {-3.0, -3.0, -1.0, 2.0, 4.0};
+                    const double anti_keys[] = {-0.0, 0.0, 1.0, 2.0, 3.0};
+                    for (uint32_t r = 0; empty != 1 && r < (anti ? 5u : 4u);
+                        ++r){
+                        int64_t values[] = {semi_keys[r < 4 ? r : 0],
+                                            wl_columnar_float_to_bits(
+                                                payloads[r]), 0};
+                        if (anti) {
+                            values[0] = wl_columnar_float_to_bits(anti_keys[r]);
+                            values[1] = r < 3 ? 1 : (int64_t)r - 1;
+                            values[2] = wl_columnar_float_to_bits(payloads[r]);
+                        }
+                        CHECK(!col_rel_append_row(f.input, values));
+                    }
+                    if (anti && f.input->nrows)
+                        f.input->columns[0][0] =
+                            wl_columnar_float_to_bits(-0.0);
+                    col_rel_t *mid = source_new(2, 0),
+                        *right = source_new(2, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(mid, "mid"));
+                    CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                    wirelog_column_type_t mid_types[] = {WIRELOG_TYPE_INT64,
+                                                         WIRELOG_TYPE_FLOAT};
+                    wirelog_column_type_t right_types[] = {WIRELOG_TYPE_FLOAT,
+                                                           anti ?
+                                                           WIRELOG_TYPE_INT64 :
+                                                           WIRELOG_TYPE_FLOAT};
+                    CHECK(!col_rel_set_column_types(mid, mid_types, 2));
+                    CHECK(!col_rel_set_column_types(right, right_types, 2));
+                    for (uint32_t r = 0; r < 4; ++r) {
+                        int64_t values[] = {semi_keys[r],
+                                            wl_columnar_float_to_bits(r <
+                                                2 ? 0.0 : (double)r - 1)};
+                        CHECK(!col_rel_append_row(mid, values));
+                    }
+                    for (uint32_t r = 0; empty != 2 && r < 3; ++r) {
+                        int64_t values[] = {wl_columnar_float_to_bits(r <
+                                                2 ? 0.0 : 2.0),
+                                            anti ? (r <
+                                            2 ? 1 : 2) :
+                                            wl_columnar_float_to_bits(r <
+                                                2 ? -2.0 : 1.0)};
+                        CHECK(!col_rel_append_row(right, values));
+                    }
+                    col_rel_t *registry[] = {f.input, mid, right};
+                    wl_columnar_memory_governor_ref_t *governor = governed
+                        ? join_governor(&f, 1u << 20) : NULL;
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 3;
+                        fixture_begin(&f, &body, 1, body.op_count);
+                    } else source_begin(&f, &body, registry, 3);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == body.op_count - 1);
+                    CHECK(f.record.source_installed == !prebound);
+                    join_raw_parity(&f, &body, prebound != 0);
+                    /* Empty right keeps ANTI's distinct input payloads. */
+                    const double anti_all[] = {-3.0, -1.0, 2.0, 4.0};
+                    probe_literal_result(&f,
+                        anti && empty == 2 ? anti_all : expected[anti],
+                        empty == 1 || (!anti && empty == 2) ? 0 : anti &&
+                        empty == 2 ? 4 : 2);
+                    fixture_close(&f); col_rel_destroy(mid);
+                    col_rel_destroy(right);
+                    if (governor) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(governor)));
+                        wl_columnar_memory_governor_ref_release(governor);
+                    }
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_composed_probe_plans(void)
+{
+    const char *key = "col0";
+    uint32_t projection = 0;
+    uint8_t add[17] = {WL_PLAN_EXPR_VAR_FLOAT, 4, 0, 'c', 'o', 'l', '0',
+                       WL_PLAN_EXPR_CONST_FLOAT};
+    int64_t one = wl_columnar_float_to_bits(1.0);
+    memcpy(add + 8, &one, 8); add[16] = WL_PLAN_EXPR_ARITH_FLOAT_ADD;
+    wl_plan_expr_buffer_t expression = {add, sizeof(add)};
+    const double inputs[] = {-3.0, -3.0, -1.0, 0.0, 2.0, 4.0};
+    for (unsigned first = 0; first < 2; ++first)
+        for (unsigned second = 0; second < 2; ++second)
+            for (unsigned prebound = 0; prebound < 2; ++prebound) {
+                fixture_t f;
+                if (prebound) fixture_init(&f, 1, 0, 0);
+                else source_fixture(&f, 1, 0, 0);
+                wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+                CHECK(!col_rel_set_column_types(f.input, &type, 1));
+                for (unsigned r = 0; r < 6; ++r) {
+                    int64_t value = wl_columnar_float_to_bits(inputs[r]);
+                    CHECK(!col_rel_append_row(f.input, &value));
+                }
+                col_rel_t *right = source_new(1, 0), *third = source_new(1, 0);
+                CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+                CHECK(!col_rel_set_column_types(right, &type, 1));
+                CHECK(!col_rel_set_column_types(third, &type, 1));
+                for (unsigned r = 0; r < 2; ++r) {
+                    int64_t a = wl_columnar_float_to_bits(r ? 0.0 : -3.0),
+                        b = wl_columnar_float_to_bits(r ? 4.0 : 0.0);
+                    CHECK(!col_rel_append_row(right, &a));
+                    CHECK(!col_rel_append_row(third, &b));
+                }
+                wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                                       .relation_name = "input"},
+                                      {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                                       .project_indices = &projection},
+                                      {.op =
+                                           first ? WL_PLAN_OP_ANTIJOIN :
+                                           WL_PLAN_OP_SEMIJOIN,
+                                       .right_relation = "right",
+                                       .key_count = 1, .left_keys = &key,
+                                       .right_keys = &key},
+                                      {.op =
+                                           second ? WL_PLAN_OP_ANTIJOIN :
+                                           WL_PLAN_OP_SEMIJOIN,
+                                       .right_relation = "third",
+                                       .key_count = 1, .left_keys = &key,
+                                       .right_keys = &key},
+                                      {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                                       .map_exprs = &expression,
+                                       .map_expr_count = 1},
+                                      {.op = WL_PLAN_OP_CONSOLIDATE}};
+                wl_plan_relation_t plan = {.ops = ops, .op_count = 6};
+                col_rel_t *registry[] = {f.input, right, third};
+                if (prebound) {
+                    f.session.rels = registry; f.session.nrels = 3;
+                    fixture_begin(&f, &plan, 1, 6);
+                } else source_begin(&f, &plan, registry, 3);
+                run(&f);
+                CHECK(!f.record.semantic_result && f.record.completed == 5);
+                join_raw_parity(&f, &plan, prebound != 0);
+                const double expected[4][2] = {{1.0, 0.0}, {-2.0, 0.0},
+                                               {5.0, 0.0}, {0.0, 3.0}};
+                probe_literal_result(&f, expected[first * 2 + second],
+                    first && second ? 2 : 1);
+                fixture_close(&f); col_rel_destroy(right);
+                col_rel_destroy(third);
+            }
+}
+
+static uint32_t probe_plan_private_rows;
+
+static void
+probe_plan_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    fixture_t *f = join_fault_fixture;
+    if (phase != 30 || f->record.cursor != join_fault_cursor ||
+        join_fault_calls)
+        return;
+    ++join_fault_calls;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &ctx,
+        &f->record));
+    CHECK(ctx->output && ctx->output->nrows == probe_plan_private_rows &&
+        control == f->operation);
+    if (join_fault_restart) {
+        CHECK(!wl_evaluation_control_finish(control, &f->operation_owner, 0,
+            0));
+        CHECK(!wl_evaluation_control_begin(control, &f->operation_owner));
+    } else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_probe_plan_failures(void)
+{
+    const char *key = "col0";
+    uint32_t projection = 0;
+    for (unsigned anti = 0; anti < 2; ++anti)
+        for (unsigned target = 1; target < 3; ++target)
+            for (unsigned fault = 0; fault < 5; ++fault) {
+                fixture_t f; fixture_init(&f, 1, 5, 0);
+                col_rel_t *right = source_new(1, 3), *third = source_new(1, 2);
+                CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                CHECK(!wl_columnar_relation_rename_checked(third, "third"));
+                if (anti) for (uint32_t r = 0; r < 3;
+                        ++r) right->columns[0][r] += 2;
+                wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_MAP, .project_count = 1,
+                                       .project_indices = &projection},
+                                      {.op =
+                                           anti ? WL_PLAN_OP_ANTIJOIN :
+                                           WL_PLAN_OP_SEMIJOIN,
+                                       .right_relation = "right",
+                                       .key_count = 1, .left_keys = &key,
+                                       .right_keys = &key},
+                                      {.op =
+                                           anti ? WL_PLAN_OP_ANTIJOIN :
+                                           WL_PLAN_OP_SEMIJOIN,
+                                       .right_relation = "third",
+                                       .key_count = 1, .left_keys = &key,
+                                       .right_keys = &key},
+                                      {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                                       .project_indices = &projection},
+                                      {.op = WL_PLAN_OP_CONSOLIDATE}};
+                if (!fault) ops[target].right_relation = "missing";
+                wl_plan_relation_t plan = {.ops = ops, .op_count = 5};
+                col_rel_t *registry[] = {f.input, right, third};
+                f.session.rels = registry; f.session.nrels = 3;
+                wl_columnar_memory_governor_ref_t *governor = fault == 4
+                    ? join_governor(&f, 1u << 20) : NULL;
+                fixture_begin(&f, &plan, 0, 5); join_until_ready(&f, target);
+                join_snapshot_t snapshot = join_snapshot(&f);
+                CHECK(snapshot.owned);
+                wl_columnar_memory_reservation_t peer;
+                wl_columnar_memory_reservation_init(&peer);
+                uint64_t baseline = governor ? wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)) : 0;
+                if (governor) {
+                    CHECK(baseline + 1 < (1u << 20));
+                    CHECK(wl_columnar_memory_reserve(
+                            wl_columnar_memory_governor_ref_get(governor),
+                            (1u << 20) - baseline - 1, &peer));
+                }
+                if (fault ==
+                    1) wl_columnar_join_test_attempt_fail_allocation = 0;
+                if (fault == 2 || fault == 3) {
+                    join_fault_fixture = &f; join_fault_cursor = target;
+                    join_fault_calls = 0; join_fault_restart = fault == 3;
+                    /* ANTI's first two unmatched rows have private output
+                     * before its first matching candidate. No row is public. */
+                    probe_plan_private_rows = anti && target == 1 ? 2 : 0;
+                    wl_columnar_join_test_attempt_checkpoint = probe_plan_stop;
+                }
+                engine_dispatch(&f); ++f.witnesses;
+                wl_columnar_join_test_attempt_fail_allocation = -1;
+                run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
+                const int errors[] = {ENOTSUP, ENOMEM,
+                                      WL_EVALUATION_CONTROL_CANCELLED, EINVAL,
+                                      ENOSPC};
+                CHECK(f.record.semantic_result == errors[fault] &&
+                    f.record.completed == target &&
+                    f.record.cursor == target &&
+                    f.session.memory_budget_denied == (fault == 4));
+                if (fault == 2 || fault == 3) CHECK(join_fault_calls == 1);
+                join_snapshot_check(&f, &snapshot);
+                col_rel_destroy(snapshot.contents);
+                if (fault == 3) {
+                    CHECK(!wl_evaluation_control_finish(f.operation,
+                        &f.operation_owner, 0, 0));
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(f.operation,
+                        &report) && !report.consumed);
+                }
+                fixture_close(&f);
+                if (governor) {
+                    CHECK(wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(governor)) ==
+                        peer.bytes);
+                    CHECK(wl_columnar_memory_rollback(&peer));
+                    wl_columnar_memory_governor_ref_release(governor);
+                }
+                col_rel_destroy(right); col_rel_destroy(third);
+            }
+}
+
 int
 main(void)
 {
+    test_generated_probe_plans(); test_composed_probe_plans();
+    test_probe_plan_failures();
     test_generated_map_float_schema();
     test_complete_unary_plans(); test_consolidate_composition();
     test_consolidate_literal_limits();
@@ -3087,7 +3464,9 @@ main(void)
     test_join_no_output_stops();
     test_join_literal_limits();
     test_join_later_failures();
-    test_join_retained_successor();
+    test_join_retained_successor(WL_PLAN_OP_JOIN);
+    test_join_retained_successor(WL_PLAN_OP_SEMIJOIN);
+    test_join_retained_successor(WL_PLAN_OP_ANTIJOIN);
     test_join_chained_delta();
     test_generated(false); test_generated(true); test_boundaries();
     test_authority();
