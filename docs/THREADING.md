@@ -1747,3 +1747,20 @@ retirement remain responsible for every partial prefix. The type schema is
 installed before the first append and is not repaired from a populated row.
 Raw MAP's native temporary is likewise released before expression callbacks;
 the existing raw source-access and callback contracts still apply.
+
+
+### Scalar existence-join ownership
+
+The private SEMIJOIN/ANTIJOIN entry authenticates the same original unary
+frame, session, native thread, operation control and saved attempt ID as JOIN.
+Owned NULL-control bypass is refused. Held left/right scalar readers and the
+three original JOIN scratch records stay discoverable until the shared B2,
+source, physical, credit, reference, decision and unary cleanup completes.
+No probe set or recipe authority is copied or transferred to a successor.
+
+SEMI's type/row scratch is private; ANTI's synchronous held-source constructor
+copies names/types/graph into independently owned output metadata. No source
+or scratch pointer escapes. A credit release refusal after physical disposal
+retains the original token/reference; later retries require fresh host funding
+and never access a successor evaluation allowance. Output remains private until
+the existing original JOIN decision commits its non-delta replacement.

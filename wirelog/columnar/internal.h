@@ -5650,6 +5650,20 @@ void wl_columnar_filter_attempt_batch_init(
  * canonical caller; operation control pays forward/first-retirement work.
  * NULL control delegates raw JOIN. Step/ACK use the shared filter protocol.
  * Generic frame/pending cleanup remains a separate external host action. */
+/* Bounded scalar SEMIJOIN/ANTIJOIN. Existing named right is required;
+ * missing right is ENOTSUP (unlike raw repush). NoTS/compound/right-filter,
+ * differential/TDD/batch/parallel paths are outside this private domain.
+ * SEMI projects only left lanes with canonical typed colN output; ANTI keeps
+ * left names/type presence/graph. Results are materialized, non-delta and
+ * ignore ordinary JOIN output limit/delta selection. Same original owned
+ * frame/source/three-scratch/batch cleanup and separate HOST funding apply. */
+int wl_columnar_join_probe_op_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+int wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *owner);
 int wl_columnar_join_op_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
