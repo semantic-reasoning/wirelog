@@ -311,6 +311,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     wl_columnar_filter_context_t filter;
     const void *numeric_plan_owner;
     wl_columnar_eval_stack_binary_context_t binary;
+    wl_columnar_merge_concat_context_t concat;
 };
 
 int
@@ -2155,5 +2156,20 @@ wl_columnar_eval_stack_binary_ack_owned(
     ctx->alias_rejected = false;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
     wl_evaluation_control_release(control);
+    return 0;
+}
+
+/* Same original frame/owner admission, independent of old unary context. The
+ * embedded context is borrowed; this getter transfers no authority. */
+int
+wl_columnar_eval_stack_concat_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_merge_concat_context_t **out, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (!out || !wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session->cleanup_active != frame) return EINVAL;
+    *out = &frame->concat;
     return 0;
 }

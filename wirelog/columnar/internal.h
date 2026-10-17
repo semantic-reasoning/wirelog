@@ -3671,6 +3671,14 @@ int wl_columnar_relation_scalar_source_new_like_attempt_controlled(
 int wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const char *name,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
+/* Both original held sources stay protected through synchronous construction.
+ * selected_types is NULL or original immutable native lanes from held left or
+ * right of identical width. Names/graph/declared width always come from left. */
+int
+wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *, const char *,
+    wl_columnar_memory_governor_ref_t *, const wirelog_column_type_t *,
+    col_rel_t **);
 /* Original controlled HELD batch, same original control/ID, private self-owned
  * destination distinct from descriptor/owner, matching width, stable values.
  * Preserve selected TS fields and signed multiplicity exactly; noTS performs
@@ -5579,6 +5587,63 @@ typedef struct {
 } wl_columnar_join_scratch_t;
 
 #define WL_COLUMNAR_JOIN_SCRATCH_COUNT 3u
+
+/* Dedicated two-input CONCAT continuation. Original storage never moves;
+ * A binary transaction owns candidate/retired entries and the control pin. */
+typedef struct wl_columnar_merge_concat_context {
+    struct wl_columnar_merge_concat_context *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    const void *numeric_owner;
+    unsigned phase;
+    int execution_result, cleanup_result;
+    col_rel_t *private_output; /* Borrow only; erased before binary disposal. */
+    bool committed, busy;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    bool source_initialized[2], batch_initialized;
+    wl_columnar_relation_scalar_source_t sources[2];
+    wl_columnar_relation_append_batch_t batch;
+    wl_columnar_relation_private_batch_drain_t drain;
+    wl_columnar_join_scratch_t scratch;
+} wl_columnar_merge_concat_context_t;
+
+int wl_columnar_eval_stack_concat_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_merge_concat_context_t **, const void *);
+/* All start/step/retry/ACK actions use a fresh independent HOST768 allowance.
+ * The wrapper admits384; binary finish/ACK separately admits384 when used.
+ * Inputs and plan/session/governors remain immutable/live until ACK. Scalar,
+ * equal-width, noTS, ordinary serial materialization only. NULL control/raw
+ * compatibility requires NULL numeric owner. Output is flat/non-delta; input
+ * segment arrays remain owned by the binary transaction through disposal. */
+int wl_columnar_merge_concat_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    wl_evaluation_control_t *, uint64_t, const void *);
+int wl_columnar_merge_concat_attempt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    wl_evaluation_control_t *, uint64_t, const void *);
+int wl_columnar_merge_concat_attempt_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, const void *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_merge_test_concat_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+extern int wl_columnar_merge_test_concat_fail_allocation;
+#endif
 
 typedef struct wl_columnar_filter_context {
     struct wl_columnar_filter_context *identity;

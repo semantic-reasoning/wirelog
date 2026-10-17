@@ -2695,3 +2695,621 @@ finish:
     }
     return rc;
 }
+
+/* --- Private original-attempt scalar CONCAT (#1821) --- */
+enum {
+    WL_COLUMNAR_MERGE_CONCAT_WORK = 192,
+    WL_COLUMNAR_MERGE_CONCAT_CELL = 128,
+    /* Each payment partitions128 current +64 future. Bootstrap prepays
+     * distinct BINARY parent and ACK/reset first capacities (2*256).
+     * Then batch18 + sources2 + scratch4 + DECIDE1 =25*256, before any
+     * resource owner. A binary candidate/retired/pin/ACK ledger is separate. */
+    WL_COLUMNAR_MERGE_CONCAT_RESET_PAYMENTS = 8,
+    WL_COLUMNAR_MERGE_CONCAT_RESOURCE_PAYMENTS = 100,
+    WL_COLUMNAR_MERGE_CONCAT_HOST = 384,
+    WL_COLUMNAR_MERGE_CONCAT_RUNNING = 1,
+    WL_COLUMNAR_MERGE_CONCAT_BATCH,
+    WL_COLUMNAR_MERGE_CONCAT_LEFT,
+    WL_COLUMNAR_MERGE_CONCAT_RIGHT,
+    WL_COLUMNAR_MERGE_CONCAT_PHYSICAL,
+    WL_COLUMNAR_MERGE_CONCAT_CREDIT,
+    WL_COLUMNAR_MERGE_CONCAT_REFERENCE,
+    WL_COLUMNAR_MERGE_CONCAT_CLEAR,
+    WL_COLUMNAR_MERGE_CONCAT_DECIDE,
+    WL_COLUMNAR_MERGE_CONCAT_BINARY,
+    WL_COLUMNAR_MERGE_CONCAT_DONE
+};
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_merge_test_concat_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+int wl_columnar_merge_test_concat_fail_allocation = -1;
+#endif
+
+static int
+wl_columnar_merge_concat_charge(wl_evaluation_control_t *control, uint64_t id,
+    uint64_t work)
+{
+    if (!control || !id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    return wl_evaluation_control_charge(control, work);
+}
+
+static int
+wl_columnar_merge_concat_tail(wl_evaluation_control_t *control, uint64_t id,
+    unsigned phase, uint64_t progress)
+{
+    if (!control || !id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_merge_test_concat_checkpoint)
+        wl_columnar_merge_test_concat_checkpoint(control, phase, progress);
+#else
+    (void)phase; (void)progress;
+#endif
+    return wl_columnar_merge_concat_charge(control, id, 0);
+}
+
+static int
+wl_columnar_merge_concat_return(wl_evaluation_control_t *control, uint64_t id,
+    int result)
+{
+    int tail = wl_columnar_merge_concat_charge(control, id, 0);
+    return tail > 0 ? tail : result ? result : tail;
+}
+
+static int
+wl_columnar_merge_concat_fund(wl_evaluation_control_t *control,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (funding == control) return EINVAL;
+    return wl_columnar_merge_concat_charge(funding, funding_id,
+               WL_COLUMNAR_MERGE_CONCAT_HOST);
+}
+
+static bool
+wl_columnar_merge_concat_thread(const wl_columnar_merge_concat_context_t *ctx)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return ctx->thread_valid && thrd_equal(ctx->owner_thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return ctx->thread_valid && ctx->owner_thread == GetCurrentThreadId();
+#else
+    return ctx->thread_valid && pthread_equal(ctx->owner_thread,
+               pthread_self());
+#endif
+}
+
+static int
+wl_columnar_merge_concat_valid(wl_columnar_merge_concat_context_t *ctx,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    if (ctx->identity != ctx || ctx->frame != frame || !ctx->session
+        || !ctx->control || !ctx->attempt_id || !ctx->phase
+        || ctx->numeric_owner != owner || !wl_columnar_merge_concat_thread(ctx))
+        return EINVAL;
+    return ctx->busy ? EBUSY : 0;
+}
+
+static void
+wl_columnar_merge_concat_status(const wl_columnar_merge_concat_context_t *ctx,
+    wl_columnar_filter_status_t *status)
+{
+    status->progress = ctx->phase == WL_COLUMNAR_MERGE_CONCAT_DONE
+        ? WL_COLUMNAR_FILTER_PROGRESS_DONE : ctx->cleanup_result
+        ? WL_COLUMNAR_FILTER_PROGRESS_RETAINED :
+        WL_COLUMNAR_FILTER_PROGRESS_YIELD;
+    status->execution_result = ctx->execution_result;
+    status->cleanup_result = ctx->cleanup_result;
+    status->semantic_result = ctx->execution_result
+        ? ctx->execution_result : ctx->cleanup_result;
+    status->committed = ctx->committed;
+}
+
+/* Each variable row/lane visit has its own admission, including non-FLOAT.
+* Left scan precedes right compatibility, as raw left-then-right append. */
+static int
+wl_columnar_merge_concat_finite(wl_columnar_relation_scalar_source_t *source,
+    wl_evaluation_control_t *control, uint64_t id, unsigned side)
+{
+    for (uint32_t row = 0; row < source->nrows; ++row) {
+        int rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_CELL);
+        if (rc) return rc;
+        for (uint32_t c = 0; c < source->width; ++c) {
+            rc = wl_columnar_merge_concat_charge(control, id,
+                    WL_COLUMNAR_MERGE_CONCAT_CELL);
+            if (rc) return rc;
+            bool valid = !source->types ||
+                source->types[c] != WIRELOG_TYPE_FLOAT
+                || wl_columnar_float_bits_valid(source->columns[c][row]);
+            rc = wl_columnar_merge_concat_tail(control, id, 10 + side, c);
+            if (rc > 0 || valid) {
+                if (rc) return rc;
+            } else return EINVAL;
+        }
+        rc = wl_columnar_merge_concat_tail(control, id, 12 + side, row);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_merge_concat_scratch(wl_columnar_join_scratch_t *scratch,
+    uint64_t bytes, wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_init(&scratch->credit);
+    scratch->initialized = true;
+    rc = wl_columnar_merge_concat_tail(control, id, 20, bytes);
+    if (rc) return rc;
+    if (governor) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) return rc;
+        scratch->governor = governor;
+        wl_columnar_memory_governor_ref_retain(governor);
+        scratch->ref_held = true;
+        rc = wl_columnar_merge_concat_tail(control, id, 21, bytes);
+        if (rc) return rc;
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(governor), bytes,
+            &scratch->credit, &status, control, id);
+        if (rc) return rc;
+        scratch->admitted = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+        rc = wl_columnar_merge_concat_tail(control, id, 27, bytes);
+        if (rc) return rc;
+        int admission = scratch->admitted ? 0
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+        rc = wl_columnar_merge_concat_return(control, id, admission);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    bool fail = wl_columnar_merge_test_concat_fail_allocation == 0;
+    if (wl_columnar_merge_test_concat_fail_allocation > 0)
+        --wl_columnar_merge_test_concat_fail_allocation;
+    scratch->physical = fail ? NULL : malloc((size_t)bytes);
+#else
+    scratch->physical = malloc((size_t)bytes);
+#endif
+    scratch->allocated = scratch->physical != NULL;
+    rc = wl_columnar_merge_concat_tail(control, id, 22, bytes);
+    if (rc > 0 || scratch->allocated) {
+        if (rc) return rc;
+    } else return ENOMEM;
+    if (scratch->admitted) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_merge_concat_tail(control, id, 23, bytes);
+        if (rc) return rc;
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &scratch->credit, scratch->physical, &scratch->committed, control,
+            id);
+        rc = wl_columnar_merge_concat_return(control, id, rc);
+    }
+    return rc;
+}
+
+int
+wl_columnar_merge_concat_attempt_start(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, wl_evaluation_control_t *funding,
+    uint64_t funding_id)
+{
+    return wl_columnar_merge_concat_attempt_start_owned(op, frame, session,
+               control, id, status, funding, funding_id, NULL);
+}
+
+int
+wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, wl_evaluation_control_t *funding,
+    uint64_t funding_id, const void *owner)
+{
+    if (!op || !status || (owner && !control)) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session,
+            &stack, owner);
+    if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control ||
+            record->attempt_id != id) return EINVAL;
+    }
+    rc = wl_columnar_merge_concat_fund(control, funding, funding_id);
+    if (rc) return rc;
+    if (!control) {
+        int result = op->op == WL_PLAN_OP_CONCAT ? col_op_concat(stack, session)
+            : EINVAL;
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = result; status->semantic_result = result;
+        status->cleanup_result = 0; status->committed = result == 0;
+        return 0;
+    }
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_concat_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    if (ctx->identity || ctx->phase) return EBUSY;
+    for (unsigned i = 0; i < WL_COLUMNAR_MERGE_CONCAT_RESET_PAYMENTS; ++i) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto inert;
+        rc = wl_columnar_merge_concat_tail(control, id, 1, i);
+        if (rc) goto inert;
+    }
+    rc = wl_columnar_eval_stack_binary_begin_owned(frame, session, control, id,
+            owner);
+    if (rc) goto inert;
+    /* Only fixed context ownership is published here. Its first reset share
+     * was admitted before binary_begin; all resource markers are still false. */
+    ctx->identity = ctx; ctx->frame = frame; ctx->session = session;
+    ctx->control = control; ctx->attempt_id = id; ctx->numeric_owner = owner;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->committed = false; ctx->busy = true; ctx->private_output = NULL;
+    ctx->source_initialized[0] = false; ctx->source_initialized[1] = false;
+    ctx->batch_initialized = false;
+    ctx->scratch.initialized = false; ctx->scratch.allocated = false;
+    ctx->scratch.admitted = false; ctx->scratch.committed = false;
+    ctx->scratch.ref_held = false; ctx->scratch.physical = NULL;
+    ctx->scratch.governor = NULL;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true; ctx->phase = WL_COLUMNAR_MERGE_CONCAT_RUNNING;
+    rc = wl_columnar_merge_concat_return(control, id, 0);
+    if (rc) goto done;
+    for (unsigned i = 0; i < WL_COLUMNAR_MERGE_CONCAT_RESOURCE_PAYMENTS; ++i) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_merge_concat_tail(control, id, 2, i);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    bool supported = op->op == WL_PLAN_OP_CONCAT && !op->materialized
+        && !session->current_iteration && !session->diff_operators_active
+        && !session->retraction_seeded && !session->retraction_right_pass
+        && !session->tdd_input_run && !session->tdd_subpass_active
+        && !session->tdd_outbound_only_active && !session->join_batch_bytes
+        && !session->join_output_shared_count && !session->coordinator
+        && session->num_workers <= 1;
+    rc = wl_columnar_merge_concat_tail(control, id, 3, 0);
+    if (rc > 0 || supported) {
+        if (rc) goto done;
+    } else {
+        rc = ENOTSUP; goto done;
+    }
+    const col_rel_t *inputs[2] = { NULL, NULL };
+    const eval_entry_t *entries[2] = { NULL, NULL };
+    col_rel_t **out_slot = NULL;
+    for (unsigned side = 0; side < 2; ++side) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_eval_stack_binary_input_owned(frame, side,
+                &entries[side], owner);
+        rc = wl_columnar_merge_concat_return(control, id, rc);
+        if (rc) goto done;
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto done;
+        inputs[side] = entries[side]->rel;
+        rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->sources[side], &ctx->source_initialized[side], control, id);
+        rc = wl_columnar_merge_concat_return(control, id, rc);
+        if (rc) goto done;
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->sources[side], inputs[side], false);
+        rc = wl_columnar_merge_concat_return(control, id, rc);
+        if (rc) goto done;
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_WORK);
+        if (rc) goto done;
+        bool no_ts = !ctx->sources[side].timestamps;
+        rc = wl_columnar_merge_concat_tail(control, id, 4, side);
+        if (rc > 0 || no_ts) {
+            if (rc) goto done;
+        } else {
+            rc = ENOTSUP; goto done;
+        }
+    }
+    wl_columnar_relation_scalar_source_t *left = &ctx->sources[0];
+    wl_columnar_relation_scalar_source_t *right = &ctx->sources[1];
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    bool widths = left->width == right->width;
+    rc = wl_columnar_merge_concat_tail(control, id, 5, left->width);
+    if (rc > 0 || widths) {
+        if (rc) goto done;
+    } else {
+        rc = EINVAL; goto done;
+    }
+    rc = wl_columnar_merge_concat_finite(left, control, id, 0);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    for (uint32_t c = 0; right->nrows && c < left->width; ++c) {
+        rc = wl_columnar_merge_concat_charge(control, id,
+                WL_COLUMNAR_MERGE_CONCAT_CELL);
+        if (rc) goto done;
+        wirelog_column_type_t a =
+            left->types ? left->types[c] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t b =
+            right->types ? right->types[c] : WIRELOG_TYPE_INT64;
+        bool compatible = a == b ||
+            (a != WIRELOG_TYPE_FLOAT && b != WIRELOG_TYPE_FLOAT);
+        rc = wl_columnar_merge_concat_tail(control, id, 6, c);
+        if (rc > 0 || compatible) {
+            if (rc) goto done;
+        } else {
+            rc = EINVAL; goto done;
+        }
+    }
+    rc = wl_columnar_merge_concat_finite(right, control, id, 1);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    uint64_t bytes = 0;
+    bool sized = right->nrows <= UINT32_MAX - left->nrows
+        && wl_columnar_memory_size_mul(left->width ? left->width : 1,
+            sizeof(int64_t), &bytes) && bytes <= SIZE_MAX;
+    rc = wl_columnar_merge_concat_tail(control, id, 7, bytes);
+    if (rc > 0 || sized) {
+        if (rc) goto done;
+    } else {
+        rc = EOVERFLOW; goto done;
+    }
+    wl_columnar_memory_governor_ref_t *governor = session->memory_governor
+        ? session->memory_governor : inputs[0]->memory_governor
+        ? inputs[0]->memory_governor : inputs[1]->memory_governor;
+    rc = wl_columnar_merge_concat_scratch(&ctx->scratch, bytes, governor,
+            control, id);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_binary_output_owned(frame, &out_slot, owner);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    const wirelog_column_type_t *types = left->types ? left->types
+        : right->nrows ? right->types : NULL;
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    rc =
+        wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled
+        (
+        left, "$concat", governor, types, out_slot);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    ctx->private_output = *out_slot;
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    wl_columnar_filter_attempt_batch_init(&ctx->batch);
+    wl_columnar_relation_private_batch_drain_init(&ctx->drain);
+    ctx->batch_initialized = true;
+    rc = wl_columnar_merge_concat_tail(control, id, 24, 0);
+    if (rc) goto done;
+    rc = wl_columnar_merge_concat_charge(control, id,
+            WL_COLUMNAR_MERGE_CONCAT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+            *out_slot, control);
+    rc = wl_columnar_merge_concat_return(control, id, rc);
+    if (rc) goto done;
+    for (unsigned side = 0; side < 2; ++side) {
+        for (uint32_t row = 0; row < ctx->sources[side].nrows; ++row) {
+            rc = wl_columnar_merge_concat_charge(control, id,
+                    WL_COLUMNAR_MERGE_CONCAT_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                &ctx->sources[side], row, ctx->scratch.physical, left->width);
+            rc = wl_columnar_merge_concat_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_merge_concat_charge(control, id,
+                    WL_COLUMNAR_MERGE_CONCAT_WORK);
+            if (rc) goto done;
+            rc =
+                wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                (
+                &ctx->batch, ctx->scratch.physical, control, id);
+            rc = wl_columnar_merge_concat_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_merge_concat_tail(control, id, 25 + side, row);
+            if (rc) goto done;
+        }
+    }
+done:
+    if (rc == ENOMEM && ctx->private_output
+        && ctx->private_output->memory_budget_denial_pending) rc = ENOSPC;
+    if (rc == ENOSPC) session->memory_budget_denied = true;
+    ctx->execution_result = rc; ctx->busy = false;
+    /* A partial resource-prepayment prefix owns only the fully prefunded
+     * fixed context and A transaction. Do not enter any unpaid empty stages. */
+    bool resources = ctx->source_initialized[0] || ctx->source_initialized[1]
+        || ctx->batch_initialized || ctx->scratch.initialized;
+    ctx->phase = resources ? WL_COLUMNAR_MERGE_CONCAT_BATCH
+        : WL_COLUMNAR_MERGE_CONCAT_BINARY;
+    wl_columnar_merge_concat_status(ctx, status);
+    return 0;
+inert:
+    status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+    status->execution_result = rc; status->semantic_result = rc;
+    status->cleanup_result = 0; status->committed = false;
+    return 0;
+}
+
+int
+wl_columnar_merge_concat_attempt_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status, wl_evaluation_control_t *funding,
+    uint64_t funding_id, const void *owner)
+{
+    if (!status) return EINVAL;
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_concat_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    rc = wl_columnar_merge_concat_valid(ctx, frame, owner);
+    if (rc) return rc;
+    rc = wl_columnar_merge_concat_fund(ctx->control, funding, funding_id);
+    if (rc) return rc;
+    ctx->busy = true;
+    switch (ctx->phase) {
+    case WL_COLUMNAR_MERGE_CONCAT_BATCH:
+        if (ctx->batch_initialized) {
+            bool done = false;
+            rc = wl_columnar_relation_private_batch_drain_step(&ctx->drain,
+                    &ctx->batch, ctx->execution_result, &done);
+            if (rc) {
+                ctx->cleanup_result = rc; break;
+            }
+            ctx->cleanup_result = 0;
+            if (!done) break;
+            ctx->batch_initialized = false;
+        }
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_LEFT;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_LEFT:
+    case WL_COLUMNAR_MERGE_CONCAT_RIGHT: {
+        unsigned side = ctx->phase == WL_COLUMNAR_MERGE_CONCAT_LEFT ? 0 : 1;
+        if (ctx->source_initialized[side]) {
+            (void)wl_columnar_relation_scalar_source_end(&ctx->sources[side],
+                ctx->execution_result);
+            if (ctx->sources[side].phase !=
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+                abort();
+            ctx->source_initialized[side] = false;
+        }
+        ++ctx->phase;
+        break;
+    }
+    case WL_COLUMNAR_MERGE_CONCAT_PHYSICAL:
+        if (ctx->scratch.allocated) {
+            void *physical = ctx->scratch.physical;
+            ctx->scratch.physical = NULL; ctx->scratch.allocated = false;
+            free(physical);
+        }
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_CREDIT;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_CREDIT:
+        if (ctx->scratch.admitted) {
+            bool released = ctx->scratch.committed
+                ? wl_columnar_memory_release(&ctx->scratch.credit)
+                : wl_columnar_memory_rollback(&ctx->scratch.credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL; break;
+            }
+            ctx->scratch.admitted = false;
+        }
+        ctx->cleanup_result = 0;
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_REFERENCE;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_REFERENCE:
+        if (ctx->scratch.ref_held) {
+            wl_columnar_memory_governor_ref_t *governor = ctx->scratch.governor;
+            ctx->scratch.governor = NULL; ctx->scratch.ref_held = false;
+            wl_columnar_memory_governor_ref_release(governor);
+        }
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_CLEAR;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_CLEAR:
+        ctx->scratch.initialized = false; ctx->scratch.committed = false;
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_DECIDE;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_DECIDE:
+        if (!ctx->execution_result) {
+            rc = wl_columnar_merge_concat_charge(ctx->control, ctx->attempt_id,
+                    0);
+            if (!rc) rc = wl_columnar_eval_stack_binary_commit_owned(frame,
+                        &ctx->committed, owner);
+            ctx->execution_result = rc;
+        }
+        ctx->private_output = NULL;
+        ctx->phase = WL_COLUMNAR_MERGE_CONCAT_BINARY;
+        break;
+    case WL_COLUMNAR_MERGE_CONCAT_BINARY: {
+        /* Child status is consumed on this later host action; no further
+         * child or disposal occurs after its return in this dispatch. */
+        wl_columnar_filter_status_t child;
+        ctx->busy = false;
+        rc = wl_columnar_eval_stack_binary_finish_owned(frame,
+                ctx->execution_result, &child, funding, funding_id, owner);
+        if (rc) return rc;
+        ctx->cleanup_result = child.cleanup_result;
+        if (!ctx->execution_result) ctx->execution_result =
+                child.execution_result;
+        if (child.semantic_result && !child.cleanup_result)
+            ctx->execution_result = child.semantic_result;
+        if (child.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE)
+            ctx->phase = WL_COLUMNAR_MERGE_CONCAT_DONE;
+        *status = child;
+        return 0;
+    }
+    case WL_COLUMNAR_MERGE_CONCAT_DONE:
+        break;
+    default:
+        ctx->busy = false;
+        return EBUSY;
+    }
+    ctx->busy = false;
+    wl_columnar_merge_concat_status(ctx, status);
+    return 0;
+}
+
+int
+wl_columnar_merge_concat_attempt_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *funding, uint64_t funding_id, const void *owner)
+{
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_concat_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    if (!ctx->identity && !ctx->phase) {
+        /* The getter already authenticated the original numeric owner. Even
+         * an inert ACK must not debit that operation or its successor. */
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        return wl_columnar_merge_concat_fund(record ? record->control : NULL,
+                   funding, funding_id);
+    }
+    rc = wl_columnar_merge_concat_valid(ctx, frame, owner);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_MERGE_CONCAT_DONE) return EBUSY;
+    rc = wl_columnar_merge_concat_fund(ctx->control, funding, funding_id);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_binary_ack_owned(frame, funding, funding_id,
+            owner);
+    if (rc) return rc;
+    ctx->identity = NULL; ctx->frame = NULL; ctx->session = NULL;
+    ctx->control = NULL; ctx->attempt_id = 0; ctx->numeric_owner = NULL;
+    ctx->phase = 0; ctx->busy = false; ctx->committed = false;
+    ctx->thread_valid = false; ctx->execution_result = 0;
+    ctx->cleanup_result = 0;
+    return 0;
+}
