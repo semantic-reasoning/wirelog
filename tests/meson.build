@@ -6497,3 +6497,15 @@ test_evaluation_consolidate_exe = executable(
 )
 test('evaluation_consolidate', test_evaluation_consolidate_exe,
      suite: ['unit', 'tsan'], timeout: 600)
+
+# Full backend fixture: retain source-unique production hooks in one archive.
+test_evaluation_serial_exe = executable(
+  'test_evaluation_serial', files('test_evaluation_serial.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_serial', test_evaluation_serial_exe,
+     suite: ['unit', 'tsan'], timeout: 120)

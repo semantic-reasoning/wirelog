@@ -1103,3 +1103,24 @@ Cancellation or saved-ID turnover stops subsequent forward work; cleanup and ACK
 use independent funding and cannot debit the original control or its successor.
 Default/public session dispatch, recursive K-copy CONCAT, weighted/differential,
 TDD, batch/pipeline, parallel, LFTJ and fused evaluation remain outside this route.
+
+The private fresh-head bridge starts on an empty cleanup frame and a named,
+terminal CONSOLIDATE body. Its original frame-embedded parent exists before the
+original embedded composed child begins. It rejects an already registered head;
+this admission does not implement existing-head append or dirty reevaluation.
+The child's genuine DONE result remains owned by the original stack entry while
+an independent protected scalar source, named constructor, B2 writer and governed
+workspace copy its ordered scalar rows. Sorted, unique, flat, untimestamped
+results preserve schema, type, graph and declared-width metadata. Empty results
+have zero cached runs. Only the completed candidate reaches READY; this private
+bridge alone does not publish it to the session registry.
+
+On failure, bounded B2/source/workspace/candidate retirement retains the original
+parent and cleanup frame. One original stack/result slot is disposed per action;
+a reader refusal preserves that slot and its ownership. Inert placeholders keep
+the actual child runtime depth until genuine child ACK. A bounded spare-slot
+proof then permits top-zero normalization. After all recoverable owners drain,
+parent ACK and known-empty frame close form one final mandatory action. The
+existing physical-free/credit/reference invariant remains in force. Generic
+cleanup cannot close a live parent. Public STEP/SNAPSHOT control gates remain
+unchanged.

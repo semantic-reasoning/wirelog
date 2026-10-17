@@ -6073,4 +6073,136 @@ int wl_columnar_eval_stack_composed_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
 
+/* Durable fresh-head evaluation. The parent and its embedded child live at
+ * their original addresses in the cleanup frame, starting before child begin.
+ * Only an initially empty frame and a terminal CONSOLIDATE body are admitted.
+ * This internal protocol does not activate public STEP/SNAPSHOT. */
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_VALIDATE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_PREPARE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_PHYSICAL,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_CREDIT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLOSE_PROOF,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+} wl_columnar_eval_serial_framed_phase_t;
+
+typedef struct wl_columnar_eval_serial_framed_attempt {
+    struct wl_columnar_eval_serial_framed_attempt *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_eval_plan_numeric_attempt_t child;
+    wl_columnar_relation_scalar_source_t source;
+    wl_columnar_relation_append_batch_t batch;
+    wl_columnar_relation_private_batch_drain_t drain;
+    wl_columnar_join_scratch_t scratch;
+    col_rel_t *candidate;
+    /* Nonowning snapshot; only the original stack entry owns this relation. */
+    eval_entry_t input;
+    /* The host keeps this completed grant alive and unchanged until consume.
+     * It finishes with execution_status/cleanup_status0 so its report denotes
+     * host disposition, independently of the child's returned protocol. */
+    wl_evaluation_control_t *pending_funding;
+    uint64_t pending_funding_id;
+    wl_columnar_eval_serial_framed_phase_t phase, pending_action;
+    uint32_t registry_slot, name_byte, row, cursor;
+    int primary_result, cleanup_result, inner_protocol;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, pin_owned, child_bound, gate_owned;
+    bool source_initialized, batch_initialized, batch_done;
+    bool candidate_owned, materialized, committed, pending_inner_consume;
+    bool close_proven;
+} wl_columnar_eval_serial_framed_attempt_t;
+
+typedef struct {
+    wl_columnar_eval_serial_framed_phase_t phase;
+    int execution_result, cleanup_result;
+    bool ready, retained, committed;
+} wl_columnar_eval_serial_framed_status_t;
+
+int wl_columnar_eval_stack_framed_context(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_serial_framed_attempt_t **);
+int wl_columnar_eval_stack_framed_fresh(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_claim(
+    wl_columnar_eval_serial_framed_attempt_t *, bool);
+int wl_columnar_eval_stack_framed_dispose_slot(
+    wl_columnar_eval_serial_framed_attempt_t *, uint32_t);
+int wl_columnar_eval_stack_framed_prove_slot(
+    wl_columnar_eval_serial_framed_attempt_t *, uint32_t);
+int wl_columnar_eval_stack_framed_release_gate(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_normalize(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_close_proof(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_close_ready(
+    wl_columnar_eval_serial_framed_attempt_t *);
+bool wl_columnar_eval_serial_framed_owner_valid(
+    const wl_columnar_eval_serial_framed_attempt_t *,
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_serial_framed_attempt_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_serial_framed_attempt_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_serial_framed_consume_result(
+    wl_columnar_eval_serial_framed_attempt_t *, int,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_serial_framed_attempt_discard(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_serial_framed_attempt_status(
+    wl_columnar_eval_serial_framed_attempt_t *,
+    wl_columnar_eval_serial_framed_status_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* DONE has no remaining resource owner except parent pin and empty frame.
+ * After admission ACK and mandatory empty-frame close form one action. No
+ * callback/poll/admission/host return intervenes; ctx is freed on success.
+ * Final physical/credit/ref release retains the existing invariant contract. */
+int wl_columnar_eval_serial_framed_attempt_close(
+    wl_columnar_eval_serial_framed_attempt_t *, int *, bool *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *);
+extern int wl_columnar_eval_serial_test_framed_fail_allocation;
+#endif
+
 #endif /* WL_COLUMNAR_INTERNAL_H */

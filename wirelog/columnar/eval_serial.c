@@ -23,6 +23,683 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Fresh-head continuation. Child calls return directly to the real host;
+ * the completed grant remains borrowed until a later funded consume checks
+ * its completed report. No report is inferred from a child's numeric errno.
+ * Source accounting and first-capacity obligations are qualified against the
+ * complete frozen implementation, including callers, before activation. */
+enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK = 384,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BOOTSTRAP = 392,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_PAYMENT = 192,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK = 256,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CELL = 128
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_serial_test_framed_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_serial_test_framed_fail_allocation = -1;
+#endif
+
+static bool
+wl_columnar_eval_serial_framed_thread(
+    const wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!ctx->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(ctx->owner_thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return ctx->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(ctx->owner_thread, pthread_self());
+#endif
+}
+
+bool
+wl_columnar_eval_serial_framed_owner_valid(
+    const wl_columnar_eval_serial_framed_attempt_t *ctx,
+    const wl_columnar_eval_stack_cleanup_frame_t *frame)
+{
+    return ctx && ctx->identity == ctx && ctx->frame == frame
+           && ctx->session && ctx->control && ctx->attempt_id
+           && ctx->pin_owned && ctx->plan && ctx->phase
+           && ctx->phase <= WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+           && wl_columnar_eval_serial_framed_thread(ctx);
+}
+
+static int
+wl_columnar_eval_serial_framed_validate(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!ctx || !wl_columnar_eval_serial_framed_owner_valid(ctx, ctx->frame))
+        return EINVAL;
+    wl_columnar_eval_serial_framed_attempt_t *original = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(ctx->frame, ctx->session,
+            &original);
+    return rc ? rc : original == ctx ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_eval_serial_framed_fund(wl_evaluation_control_t *funding,
+    uint64_t id, const wl_evaluation_control_t *operation)
+{
+    if (!funding || funding == operation || !id
+        || wl_evaluation_control_active_attempt_id(funding) != id)
+        return EINVAL;
+    return wl_evaluation_control_charge(funding,
+               WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK);
+}
+
+static int
+wl_columnar_eval_serial_framed_charge(wl_evaluation_control_t *control,
+    uint64_t id, uint64_t work)
+{
+    if (!control || !id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, work);
+    if (rc) return rc;
+    return wl_evaluation_control_active_attempt_id(control) == id ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_eval_serial_framed_tail(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_serial_test_framed_checkpoint)
+        wl_columnar_eval_serial_test_framed_checkpoint(ctx);
+#endif
+    return wl_columnar_eval_serial_framed_charge(ctx->control,
+               ctx->attempt_id, 0);
+}
+
+static void
+wl_columnar_eval_serial_framed_fail(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int result)
+{
+    if (!ctx->primary_result) ctx->primary_result = result;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END;
+}
+
+static void
+wl_columnar_eval_serial_framed_pending(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_columnar_eval_serial_framed_phase_t action,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    ctx->pending_action = action;
+    ctx->pending_funding = funding;
+    ctx->pending_funding_id = id;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
+    uint64_t id, wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!frame || !session || !plan || !plan->name || !plan->ops
+        || !plan->op_count || !control || !id) return EINVAL;
+    if (plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
+        return ENOTSUP;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    int rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_framed_fresh(frame, ctx);
+    if (rc) return rc;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, control);
+    if (rc) return rc;
+    /* 392*192 = current50176 + future25088 = 98 named256 capacities:
+     * stack/result disposal33, later inert proof33, B2drain18, workspace4,
+     * candidate1, pin1, finalreset/emptyclose1, gate1, childACKparent1,
+     * normalization1, sourceclear1, completedgrant borrow1, outcome latch1,
+     * closeproof1.
+     * All finish before the parent pin/marker; unused shares are forfeited. */
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_SERIAL_FRAMED_BOOTSTRAP; ++i) {
+        rc = wl_columnar_eval_serial_framed_charge(control, id,
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_PAYMENT);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_eval_serial_framed_charge(control, id,
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    /* The entire frame, including the embedded child, was already zeroed
+     * before publication by the original frame allocator. */
+    ctx->frame = frame; ctx->session = session; ctx->plan = plan;
+    ctx->control = control; ctx->attempt_id = id; ctx->pin_owned = true;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP;
+    ctx->identity = ctx;
+    return 0;
+}
+
+static int
+wl_columnar_eval_serial_framed_lookup(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    int rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+            ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_CELL);
+    if (rc) return rc;
+    if (ctx->registry_slot == ctx->session->nrels) {
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN;
+        return 0;
+    }
+    if (!ctx->session->rels || ctx->registry_slot > ctx->session->nrels)
+        return EINVAL;
+    col_rel_t *rel = ctx->session->rels[ctx->registry_slot];
+    if (!rel || !rel->name) {
+        ++ctx->registry_slot; ctx->name_byte = 0;
+        return 0;
+    }
+    unsigned char a = (unsigned char)rel->name[ctx->name_byte];
+    unsigned char b = (unsigned char)ctx->plan->name[ctx->name_byte];
+    rc = wl_columnar_eval_serial_framed_tail(ctx);
+    if (rc) return rc;
+    if (a != b) {
+        ++ctx->registry_slot; ctx->name_byte = 0;
+    } else if (!a) return ENOTSUP;
+    else if (ctx->name_byte == UINT32_MAX) return EOVERFLOW;
+    else ++ctx->name_byte;
+    return 0;
+}
+
+static int
+wl_columnar_eval_serial_framed_scratch(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    wl_columnar_join_scratch_t *scratch = &ctx->scratch;
+    int rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+            ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+    if (rc) return rc;
+    uint64_t bytes = 0;
+    if (!wl_columnar_memory_size_mul(ctx->source.width ? ctx->source.width : 1,
+        sizeof(int64_t), &bytes) || bytes > SIZE_MAX) return EOVERFLOW;
+    wl_columnar_memory_reservation_init(&scratch->credit);
+    scratch->initialized = true;
+    wl_columnar_memory_governor_ref_t *governor = ctx->session->memory_governor
+        ? ctx->session->memory_governor : ctx->input.rel->memory_governor;
+    rc = wl_columnar_eval_serial_framed_tail(ctx);
+    if (rc) return rc;
+    if (governor) {
+        rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+                ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+        if (rc) return rc;
+        scratch->governor = governor;
+        wl_columnar_memory_governor_ref_retain(governor);
+        scratch->ref_held = true;
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(governor), bytes,
+            &scratch->credit, &status, ctx->control, ctx->attempt_id);
+        if (rc) return rc;
+        scratch->admitted = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+        rc = wl_columnar_eval_serial_framed_tail(ctx);
+        if (rc) return rc;
+        if (!scratch->admitted) return status ==
+                   WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+    }
+    rc = wl_columnar_eval_serial_framed_charge(ctx->control, ctx->attempt_id,
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    bool fail = wl_columnar_eval_serial_test_framed_fail_allocation == 0;
+    if (wl_columnar_eval_serial_test_framed_fail_allocation > 0)
+        --wl_columnar_eval_serial_test_framed_fail_allocation;
+    scratch->physical = fail ? NULL : malloc((size_t)bytes);
+#else
+    scratch->physical = malloc((size_t)bytes);
+#endif
+    scratch->allocated = scratch->physical != NULL;
+    rc = wl_columnar_eval_serial_framed_tail(ctx);
+    if (rc) return rc;
+    if (!scratch->allocated) return ENOMEM;
+    if (scratch->admitted) {
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &scratch->credit, scratch->physical, &scratch->committed,
+            ctx->control, ctx->attempt_id);
+        if (rc) return rc;
+    }
+    return wl_columnar_eval_serial_framed_tail(ctx);
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_step(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc) return rc;
+    if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) return EBUSY;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    switch (ctx->phase) {
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP:
+        rc = wl_columnar_eval_serial_framed_lookup(ctx);
+        if (rc) {
+            if (!ctx->primary_result) ctx->primary_result = rc;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_eval_plan_numeric_composed_attempt_begin(
+            &ctx->child, ctx->plan, 0, ctx->plan->op_count, ctx->frame,
+            ctx->session, 0, ctx->control, ctx->attempt_id, funding,
+            funding_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD:
+        if (ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE) {
+            if (!ctx->primary_result)
+                ctx->primary_result = ctx->child.semantic_result;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+            return 0;
+        }
+        ctx->pending_inner_consume = ctx->child.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        if (ctx->pending_inner_consume)
+            return wl_columnar_eval_plan_numeric_composed_consume_result(
+                &ctx->child, ctx->inner_protocol, funding, funding_id);
+        return wl_columnar_eval_plan_numeric_composed_attempt_step(
+            &ctx->child, funding, funding_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM: {
+        bool materialize = !ctx->primary_result;
+        if (materialize) {
+            rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+                    ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+            if (rc) {
+                ctx->primary_result = rc;
+                return 0;
+            }
+        }
+        rc = wl_columnar_eval_stack_framed_claim(ctx, materialize);
+        if (rc) {
+            if (!ctx->primary_result) ctx->primary_result = rc;
+            ctx->cleanup_result = rc;
+            return 0;
+        }
+        ctx->cleanup_result = 0;
+        ctx->phase = materialize ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT
+            : WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &ctx->source, &ctx->source_initialized, ctx->control,
+            ctx->attempt_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &ctx->source, ctx->input.rel, false);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_VALIDATE: {
+        rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+                ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_CELL);
+        if (rc) {
+            wl_columnar_eval_serial_framed_fail(ctx, rc);
+            return 0;
+        }
+        const col_rel_t *rel = ctx->source.descriptor;
+        bool canonical = rel && !rel->timestamps
+            && rel->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+            && rel->sorted_nrows == rel->nrows
+            && rel->run_count == (rel->nrows != 0)
+            && (!rel->nrows || rel->run_ends[0] == rel->nrows);
+        rc = wl_columnar_eval_serial_framed_tail(ctx);
+        if (rc || !canonical) {
+            wl_columnar_eval_serial_framed_fail(ctx, rc ? rc : ENOTSUP);
+            return 0;
+        }
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW:
+        ctx->candidate_owned = true;
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+                (&ctx->source, ctx->plan->name, ctx->session->memory_governor
+                ? ctx->session->memory_governor :
+                ctx->input.rel->memory_governor,
+                &ctx->candidate);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_eval_serial_framed_scratch(ctx);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_PREPARE:
+        rc = wl_columnar_eval_serial_framed_charge(ctx->control,
+                ctx->attempt_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK);
+        if (rc) {
+            wl_columnar_eval_serial_framed_fail(ctx, rc);
+            return 0;
+        }
+        wl_columnar_filter_attempt_batch_init(&ctx->batch);
+        wl_columnar_relation_private_batch_drain_init(&ctx->drain);
+        ctx->batch_initialized = true;
+        rc = wl_columnar_eval_serial_framed_tail(ctx);
+        if (rc) wl_columnar_eval_serial_framed_fail(ctx, rc);
+        else ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+                   ctx->candidate, ctx->control);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER:
+        if (ctx->row == ctx->source.nrows) {
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED;
+            return 0;
+        }
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_scalar_source_gather_attempt_controlled(
+            &ctx->source, ctx->row, ctx->scratch.physical, ctx->source.width);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return
+            wl_columnar_relation_append_batch_selected_source_row_operator_controlled
+                (&ctx->batch, &ctx->source, ctx->row, ctx->scratch.physical,
+                ctx->source.width);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED:
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_append_batch_mark_sorted_operator_controlled
+               (
+            &ctx->batch, ctx->control, ctx->attempt_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END:
+        if (!ctx->batch_initialized) {
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END;
+            return 0;
+        }
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_private_batch_drain_step(&ctx->drain,
+                   &ctx->batch, ctx->primary_result, &ctx->batch_done);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END:
+        if (!ctx->source_initialized) {
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN;
+            return 0;
+        }
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_relation_scalar_source_end(&ctx->source,
+                   ctx->primary_result);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN:
+        if (ctx->cursor == COL_STACK_MAX+1) {
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_PHYSICAL;
+            return 0;
+        }
+        rc = wl_columnar_eval_stack_framed_dispose_slot(ctx, ctx->cursor);
+        ctx->cleanup_result = rc;
+        if (!rc) ++ctx->cursor;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_PHYSICAL:
+        if (ctx->scratch.allocated) {
+            void *physical = ctx->scratch.physical;
+            ctx->scratch.physical = NULL; ctx->scratch.allocated = false;
+            free(physical);
+        }
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_CREDIT;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_CREDIT:
+        if (ctx->scratch.admitted) {
+            bool released = ctx->scratch.committed
+                ? wl_columnar_memory_release(&ctx->scratch.credit)
+                : wl_columnar_memory_rollback(&ctx->scratch.credit);
+            if (!released) {
+                ctx->cleanup_result = EINVAL;
+                return 0;
+            }
+            ctx->scratch.admitted = false;
+        }
+        ctx->cleanup_result = 0;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE:
+        if (ctx->scratch.ref_held) {
+            wl_columnar_memory_governor_ref_release(ctx->scratch.governor);
+            ctx->scratch.ref_held = false; ctx->scratch.governor = NULL;
+        }
+        ctx->phase = ctx->materialized && !ctx->primary_result
+            ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY
+            : WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY:
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT:
+        if (ctx->candidate) {
+            rc = col_rel_destroy_checked(ctx->candidate);
+            if (rc) {
+                ctx->cleanup_result = rc;
+                return 0;
+            }
+            ctx->candidate = NULL;
+        }
+        ctx->candidate_owned = false; ctx->materialized = false;
+        ctx->cleanup_result = 0;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE:
+        rc = wl_columnar_eval_stack_framed_release_gate(ctx);
+        ctx->cleanup_result = rc;
+        if (!rc) ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK:
+        if (!ctx->child_bound) {
+            ctx->cursor = 0;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF;
+            return 0;
+        }
+        wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
+            funding_id);
+        return wl_columnar_eval_plan_numeric_composed_attempt_ack(&ctx->child,
+                   funding, funding_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF:
+        if (ctx->cursor == COL_STACK_MAX+1) {
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE;
+            return 0;
+        }
+        rc = wl_columnar_eval_stack_framed_prove_slot(ctx, ctx->cursor);
+        ctx->cleanup_result = rc;
+        if (!rc) ++ctx->cursor;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE:
+        rc = wl_columnar_eval_stack_framed_normalize(ctx);
+        ctx->cleanup_result = rc;
+        if (!rc) ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLOSE_PROOF;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLOSE_PROOF:
+        rc = wl_columnar_eval_stack_framed_close_proof(ctx);
+        ctx->cleanup_result = rc;
+        if (!rc) {
+            ctx->close_proven = true;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE:
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
+int
+wl_columnar_eval_serial_framed_consume_result(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int child_protocol,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        || !ctx->pending_funding || ctx->pending_funding == funding
+        || wl_evaluation_control_active_attempt_id(ctx->pending_funding))
+        return EBUSY;
+    wl_evaluation_control_report_t report;
+    rc = wl_evaluation_control_report(ctx->pending_funding, &report);
+    if (rc || report.attempt_id != ctx->pending_funding_id
+        || report.cleanup_status || (report.execution_status
+        && report.execution_status != EOVERFLOW)) return EINVAL;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    wl_columnar_eval_serial_framed_phase_t action = ctx->pending_action;
+    ctx->pending_funding = NULL; ctx->pending_funding_id = 0;
+    ctx->phase = action;
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD) {
+        /* A failed funded Cconsume has not consumed the prior child result.
+         * Preserve that result and retry the genuine pending child. */
+        if (!ctx->pending_inner_consume) ctx->inner_protocol = child_protocol;
+        return 0;
+    }
+    if (report.result) return 0; /* Exact host disposition, fresh retry. */
+    switch (action) {
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
+        ctx->child_bound = ctx->child.identity == &ctx->child;
+        if (child_protocol) {
+            if (!ctx->primary_result) ctx->primary_result = child_protocol;
+            ctx->phase = ctx->child_bound ?
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+                : WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+        } else if (!ctx->child_bound) {
+            ctx->primary_result = EINVAL;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+        } else ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK:
+        if (child_protocol) {
+            ctx->cleanup_result = child_protocol;
+            return 0;
+        }
+        ctx->child_bound = false; ctx->cleanup_result = 0;
+        ctx->cursor = 0;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END:
+        ctx->cleanup_result = child_protocol;
+        if (!child_protocol && ctx->batch_done) {
+            ctx->batch_initialized = false;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END;
+        }
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END:
+        if (ctx->source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+            ctx->source_initialized = false; ctx->cleanup_result = 0;
+            ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN;
+        } else ctx->cleanup_result = child_protocol ? child_protocol : EBUSY;
+        return 0;
+    default:
+        break;
+    }
+    if (child_protocol) {
+        if (child_protocol == ENOMEM && ctx->candidate
+            && ctx->candidate->memory_budget_denial_pending)
+            child_protocol = ENOSPC;
+        if (child_protocol == ENOSPC) ctx->session->memory_budget_denied = true;
+        wl_columnar_eval_serial_framed_fail(ctx, child_protocol);
+        return 0;
+    }
+    switch (action) {
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_VALIDATE; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_PREPARE; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND:
+        ++ctx->row;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER; break;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED:
+        ctx->materialized = true;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END; break;
+    default:
+        return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_discard(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY) return EBUSY;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    ctx->materialized = false;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT;
+    return 0;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_status(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_columnar_eval_serial_framed_status_t *out,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc || !out) return rc ? rc : EINVAL;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    out->phase = ctx->phase; out->execution_result = ctx->primary_result;
+    out->cleanup_result = ctx->cleanup_result;
+    out->ready = ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY;
+    out->retained = ctx->cleanup_result != 0; out->committed = ctx->committed;
+    return 0;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_close(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, int *result, bool *committed,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    if (rc || !result || !committed) return rc ? rc : EINVAL;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) return EBUSY;
+    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_framed_close_ready(ctx);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = ctx->control;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    *result = ctx->primary_result; *committed = ctx->committed;
+    ctx->identity = NULL; ctx->control = NULL; ctx->pin_owned = false;
+    ctx->thread_valid = false;
+    ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
+    wl_evaluation_control_release(control);
+    /* Every entry and resource was drained before ACK. This known-empty
+     * close retains the existing mandatory physical/credit/ref invariant. */
+    rc = wl_columnar_eval_stack_cleanup_finish(&frame);
+    if (rc) abort();
+    return 0;
+}
+
 /* Distributed (TDD) stratum evaluation is implemented in columnar/eval.c. */
 static col_frontier_t
 col_frontier_compute(const col_rel_t *rel);

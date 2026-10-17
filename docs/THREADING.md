@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **170**).
+match the script's count (currently **333**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -1571,7 +1571,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains 332 call sites.
+The complete current atomic-source inventory contains 333 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1851,3 +1851,39 @@ outside this contract. Normal cancellation may latch. This permits a separate
 composed funding helper with precharge ID validation and direct charge return,
 while every original-operation saved-ID check remains. Host funding cleanup in
 the actual adapter completes before its real return, not inside an omitted poll.
+
+### Private fresh-head result bridge
+
+The fresh-head parent and its composed child are distinct original records in
+the same cleanup frame. Native thread, session, LIFO frame, plan, original
+control and saved generation stay fixed from parent activation through close.
+New cold numeric claims admit only that embedded child during its genuine begin;
+foreign claims remain refused before child binding and after child ACK. The
+existing hot operator getters retain their current authority predicates.
+
+Each action returns to the actual host before result consumption on a later
+freshly funded action. The host keeps two independent grant controls and stable
+owner keys alive across those returns. A pending child borrows its completed
+grant until consume checks the actual completed report and saved generation;
+finish uses execution_status/cleanup_status zero, so host disposition is distinct
+from the child's protocol. Never reset, rebegin, detach or release that grant
+before consume clears the borrow. A failed funded inner consume preserves the
+previous genuine child protocol for retry. Original attempt turnover never
+charges the successor for old cleanup. Parent-owned candidate, reader, writer,
+workspace, credit and control flags are recorded before a fallible poll.
+
+After recoverable disposal, genuine child ACK and bounded spare-slot proof,
+final parent ACK plus known-empty frame close run without a callback, poll,
+new admission or host return between marker release and physical frame close.
+The final action captures the result before freeing the embedded record and
+never reads it afterward. Final frame-credit invariant violations retain the
+existing fail-stop contract, rather than a recoverable freed-frame claim.
+
+
+The private fresh-head close proof observes its original frame credit under the
+serialized parent lifetime before sealing an empty frame. This adds one source
+site to the prior 332-site inventory; it does not publish relation payload.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `eval_stack.c:wl_columnar_eval_stack_framed_close_proof` | `frame->reservation.state` | `atomic_load_explicit` | acquire | Verify the original committed frame credit before the marker-live close seal; original token and native/LIFO authority remain exclusively serialized |
