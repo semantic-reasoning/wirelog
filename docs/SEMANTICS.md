@@ -1023,3 +1023,27 @@ entry and stops later operators. Earlier successful operators are not undone;
 a canonical full-plan retry uses the stable original registry and a new record
 after real cleanup and numeric ACK. This does not activate public/default
 session scheduling or complete issue #1821.
+
+### Original two-entry replacement
+
+The private binary transaction snapshots the complete top two relation entries,
+including each input's segment-array ownership, while keeping lower entries
+unchanged. Its candidate is a flat owned, non-delta relation. Commit compares
+both original entries and checks candidate collisions before the last saved-ID
+poll; the subsequent fixed publication moves both originals into independent
+retired slots and replaces the pair with one result. Failure before that cutoff
+preserves both originals. Each retired input is disposed in its own host action;
+a reader may retain either input after successful publication without changing
+the committed output. Abort similarly disposes only the private candidate.
+
+A borrowed relation still owns its segment array. Duplicate non-NULL segment
+pointers between either input and another stack entry are rejected independently
+of relation storage aliases. Two borrowed references to the same source with
+independent segment arrays remain valid. Overlapping source storage involving an
+owned stack entry is excluded. No segment-array contents need traversal for this
+pointer-ownership check.
+
+The sibling numeric stack-begin claims an exact caller-supplied nonempty depth,
+validates every entry with paid steps and binds the real original plan record.
+It adds ownership authority, not CONCAT opcode or UNION grammar admission.
+The existing top-one and initially-empty begin APIs retain their contracts.

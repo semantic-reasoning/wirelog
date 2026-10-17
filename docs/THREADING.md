@@ -1776,3 +1776,36 @@ funded retry. An external reader can retain disposal of an owned input after
 publication without publishing the result again. Each child start, cleanup
 step, retry and ACK requires its own distinct live HOST384 grant. This funding
 allowance does not enlarge the engine's 256-slot polling quantum.
+
+### Binary replacement exclusion and retirement
+
+The original frame contains a separate binary owner with native-thread identity,
+control reference, immutable saved attempt ID, two complete snapshots, two
+retired entries and one candidate. While live, it uses the old unary ACTIVE
+phase solely as an exclusion gate; old unary thread validity, control and entry
+bindings stay inert. Existing unary begin/input/output/commit/finish/reset and
+operator/source entry validators cannot mutate this frame. Generic frame
+cleanup remains blocked through binary ACK. This introduces no extra predicate
+in the saturated old unary/source getters.
+
+Harmless context/raw-pointer accessors and inert FILTER ACK may still succeed.
+Trusted callers serialize frame use and must not mutate escaped raw pointers
+while a transaction owns it. Such pointers do not transfer authority. Binary
+methods authenticate their own original address, native thread, frame/session,
+LIFO position and numeric record owner. Each finish or ACK validates a distinct
+live host funding control and saved ID, then admits 384 before any mutation.
+It never debits a successor operation to retire an old attempt. Host admission
+is financing, distinct from the 256 maximum source-work interval.
+
+Binary begin admits twenty payments of192 before activation, partitioned into
+128 current and64 future each: five named first capacities of256 for candidate,
+left input, right input, pin release and reset/ACK. A partial payment prefix
+creates no owner. Repeated retained attempts use fresh independent host funding;
+first capacities are not replenished or reused. Abort sanitation examines at
+most four stack pointers per action. Both original entries and input metadata
+remain owned until their individual disposal succeeds; only then does ACK clear
+the exclusive gate. The opaque frame grows by its actual binary context size;
+allocation credit and controlled 16-byte zeroing use the actual sizeof, including
+on other ABIs. Generic arbitrary-width physical disposal retains its existing
+cooperative exclusion and is a separate primitive boundary, not a new latency
+promise.

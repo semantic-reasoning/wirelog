@@ -969,3 +969,50 @@ wl_columnar_eval_plan_numeric_attempt_ack(
     wl_evaluation_control_release(control);
     return 0;
 }
+
+/* Separate genuine multi-entry claim; existing entry contracts are unchanged. */
+int
+wl_columnar_eval_plan_numeric_stack_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t expected_depth,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!record || record->identity || record->phase || !plan || !plan->ops
+        || begin >= end || end > plan->op_count || !frame || !session
+        || !control || !id || !expected_depth
+        || expected_depth > COL_STACK_MAX) return EINVAL;
+    int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
+    if (rc) return rc;
+    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    record->identity = record; record->frame = frame;
+    record->session = session; record->plan = plan;
+    record->control = control; record->attempt_id = id;
+    record->begin = begin; record->end = end; record->cursor = begin;
+    record->source_mode = false;
+    record->completed = 0; record->semantic_result = 0;
+    record->protocol_result = 0;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PREFLIGHT;
+#if defined(WL_HAVE_C11_THREADS)
+    record->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    record->owner_thread = GetCurrentThreadId();
+#else
+    record->owner_thread = pthread_self();
+#endif
+    record->thread_valid = true;
+    rc = wl_columnar_eval_stack_numeric_stack_claim(frame, session, record,
+            expected_depth, control, id);
+    if (rc) {
+        record->control = NULL; record->identity = NULL;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+        record->thread_valid = false; record->frame = NULL;
+        record->session = NULL; record->plan = NULL;
+        wl_evaluation_control_release(control);
+    }
+    return rc;
+}
