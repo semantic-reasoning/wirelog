@@ -98,6 +98,36 @@ static const char *const PROGRAM =
     "r(y) :- r(x), edge(x, y).\n";
 
 static void
+test_float_seed_easy_contract(uint32_t workers)
+{
+    static const char *src =
+        ".decl s(x: float)\n.decl r(x: float)\n"
+        "r(0.0).\ns(1.0).\nr(y) :- s(y).\n";
+    wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
+    wirelog_easy_session_t *s = NULL;
+    closure_t c = { 0 };
+    bool ok;
+
+    tests_run++;
+    printf("  [%d] float seed evaluates; legacy snapshot refuses (%u workers)",
+        tests_run, workers);
+    opts.num_workers = workers;
+    ok = wirelog_easy_open_opts(src, &opts, &s) == WIRELOG_OK
+        && wirelog_easy_step(s) == WIRELOG_OK
+        && wirelog_easy_snapshot(s, "r", collect, &c) == WIRELOG_ERR_EXEC
+        && c.count == 0;
+    if (s)
+        wirelog_easy_close(s);
+    if (ok) {
+        tests_passed++;
+        printf(" ... PASS\n");
+    } else {
+        tests_failed++;
+        printf(" ... FAIL\n");
+    }
+}
+
+static void
 test_seeded_closure(mode_t_ mode, uint32_t workers)
 {
     wirelog_easy_open_opts_t opts = WIRELOG_EASY_OPEN_OPTS_INIT;
@@ -161,7 +191,7 @@ main(void)
 {
     static const uint32_t workers[] = { 1, 2, 4 };
 
-    printf("test_easy_recursive_seed_workers (Issue #2105)\n");
+    printf("test_easy_recursive_seed_workers (Issues #2105, #2109)\n");
     if (setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0) {
         printf("setenv failed\n");
         return 1;
@@ -169,6 +199,8 @@ main(void)
     for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++)
         for (int m = MODE_PLAIN_STEP; m <= MODE_CALLBACK_STEP; m++)
             test_seeded_closure((mode_t_)m, workers[w]);
+    for (uint32_t w = 0; w < sizeof(workers) / sizeof(workers[0]); w++)
+        test_float_seed_easy_contract(workers[w]);
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;

@@ -462,6 +462,118 @@ struct typed_snapshot_state {
     uint64_t lane;
 };
 
+/* #2109: a seeded FLOAT head needs typed MAP output when derived rows are
+ * merged into it. The easy facade intentionally has no float snapshot;
+ * use the supported typed API to check values and physical lane metadata. */
+typedef struct {
+    uint32_t seen[2];
+    bool invalid;
+} seeded_float_snapshot_t;
+
+static void
+capture_seeded_float(const char *relation, const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *user_data)
+{
+    seeded_float_snapshot_t *st = user_data;
+    if (strcmp(relation, "r") != 0)
+        return;
+    if (!row || row->logical_ncols != 1 || row->physical_nlanes != 1
+        || row->physical_stride != 1 || !row->types || !row->physical_types
+        || !row->lane_offsets || !row->lanes
+        || row->types[0] != WIRELOG_TYPE_FLOAT
+        || row->physical_types[0] != WIRELOG_TYPE_FLOAT
+        || row->lane_offsets[0] != 0 || diff != 1) {
+        st->invalid = true;
+        return;
+    }
+    double value;
+    memcpy(&value, row->lanes, sizeof(value));
+    for (uint32_t i = 0; i < 2; i++) {
+        if (value == (double)i) {
+            st->seen[i]++;
+            return;
+        }
+    }
+    st->invalid = true;
+}
+
+static int
+test_typed_float_seed(uint32_t workers, unsigned mode)
+{
+    static const char *plain =
+        ".decl s(x: float)\n.decl r(x: float)\n"
+        "r(0.0).\ns(1.0).\nr(y) :- s(y).\n";
+    wirelog_program_t *prog = parse_or_die(plain, "T-float-seed");
+    wirelog_session_t *session = NULL;
+    const char *why = "create";
+    int failed = 1;
+
+    if (!prog)
+        return 1;
+    if (wirelog_session_create(prog, WIRELOG_BACKEND_DEFAULT, workers,
+        &session) != WIRELOG_OK)
+        goto done;
+    /* Each mode uses a fresh session: plain step, snapshot-only, and a step
+     * with a typed delta observer (which may select serial execution). */
+    if (mode == 2 && wirelog_session_set_typed_delta_cb(session,
+        ignore_typed_tuple, NULL) != WIRELOG_OK) {
+        why = "typed callback registration";
+        goto done;
+    }
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        if (mode != 1 && wirelog_session_step(session) != WIRELOG_OK) {
+            why = "step";
+            goto done;
+        }
+        seeded_float_snapshot_t st = { 0 };
+        if (wirelog_session_snapshot_typed(session, capture_seeded_float,
+            &st) != WIRELOG_OK || st.invalid) {
+            why = "typed snapshot or lane metadata";
+            goto done;
+        }
+        for (uint32_t i = 0; i < 2; i++) {
+            if (st.seen[i] != 1) {
+                why = "seed/derived value missing or duplicated";
+                goto done;
+            }
+        }
+    }
+    failed = 0;
+done:
+    if (failed)
+        fprintf(stderr, "T-float-seed workers=%u mode=%u: %s\n",
+            workers, mode, why);
+    if (session)
+        wirelog_session_destroy(session);
+    wirelog_program_free(prog);
+    return failed;
+}
+
+static int
+test_typed_float_seeds(void)
+{
+    int failures = 0;
+    /* Request the existing small-input TDD threshold, without claiming that
+     * a configured worker count proves a particular parallel route. */
+    const char *old = getenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    char *saved = old ? strdup(old) : NULL;
+    if (old && !saved)
+        return 1;
+    if (setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1) != 0) {
+        free(saved);
+        return 1;
+    }
+    for (uint32_t workers = 1; workers <= 4; workers *= 2)
+        for (unsigned mode = 0; mode < 3; mode++)
+            failures += test_typed_float_seed(workers, mode);
+    if (saved)
+        setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved, 1);
+    else
+        unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    free(saved);
+    return failures;
+}
+
 static void
 capture_typed_tuple(const char *relation, const wirelog_typed_row_v1_t *row,
     int32_t diff, void *user_data)
@@ -3122,6 +3234,7 @@ main(void)
     failures += test_bulk_insert_error_mapping();
     failures += test_bulk_incremental_remove_budget_mapping();
     failures += test_typed_float_ingress();
+    failures += test_typed_float_seeds();
     if (failures == 0)
         printf("test_wirelog_advanced: OK\n");
     else
