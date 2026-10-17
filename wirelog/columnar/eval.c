@@ -7100,11 +7100,19 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         const char *dname = sp->relations[ri].delta_name;
         col_rel_t *coord_rel = session_find_rel(coord,
                 sp->relations[ri].name);
-        uint32_t ncols_ri = coord_rel ? coord_rel->ncols : 0;
         for (uint32_t w = 0; w < W; w++) {
-            col_rel_t *slot = col_rel_new_auto(dname, ncols_ri);
-            if (!slot) {
-                rc = tdd_cleanup_preserve_error(coord, ENOMEM);
+            col_rel_t *slot = NULL;
+            /* Owner exchange uses this slot as the schema prototype for
+            * subsequent deltas, including the first typed partition. */
+            if (coord_rel) {
+                rc = eval_relation_new_like_checked(coord, dname, coord_rel,
+                        NULL, &slot);
+            } else {
+                slot = col_rel_new_auto(dname, 0);
+                rc = slot ? 0 : ENOMEM;
+            }
+            if (rc != 0) {
+                rc = tdd_cleanup_preserve_error(coord, rc);
                 tdd_free_saved_coord_idb(sp, owner_fallback_saved);
                 tdd_free_saved_coord_idb(sp, global_read_saved);
                 coord->tdd_total_ns += now_ns() - tdd_total_t0;

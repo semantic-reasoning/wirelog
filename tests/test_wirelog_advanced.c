@@ -462,11 +462,15 @@ struct typed_snapshot_state {
     uint64_t lane;
 };
 
-/* #2109: a seeded FLOAT head needs typed MAP output when derived rows are
+/* #2109 / #2204: a seeded FLOAT head needs typed MAP output when derived rows are
  * merged into it. The easy facade intentionally has no float snapshot;
  * use the supported typed API to check values and physical lane metadata. */
+#define SEEDED_FLOAT_END 8u
+
 typedef struct {
-    uint32_t seen[2];
+    uint32_t end;
+    bool fractional;
+    uint32_t seen[SEEDED_FLOAT_END + 1];
     bool invalid;
 } seeded_float_snapshot_t;
 
@@ -488,8 +492,8 @@ capture_seeded_float(const char *relation, const wirelog_typed_row_v1_t *row,
     }
     double value;
     memcpy(&value, row->lanes, sizeof(value));
-    for (uint32_t i = 0; i < 2; i++) {
-        if (value == (double)i) {
+    for (uint32_t i = 0; i <= st->end; i++) {
+        if (value == (st->fractional ? -(double)i / 2.0 : (double)i)) {
             st->seen[i]++;
             return;
         }
@@ -498,12 +502,17 @@ capture_seeded_float(const char *relation, const wirelog_typed_row_v1_t *row,
 }
 
 static int
-test_typed_float_seed(uint32_t workers, unsigned mode)
+test_typed_float_seed(bool recursive, bool fractional, uint32_t workers,
+    unsigned mode)
 {
     static const char *plain =
         ".decl s(x: float)\n.decl r(x: float)\n"
         "r(0.0).\ns(1.0).\nr(y) :- s(y).\n";
-    wirelog_program_t *prog = parse_or_die(plain, "T-float-seed");
+    static const char *closure =
+        ".decl edge(a: float, b: float)\n.decl r(x: float)\n"
+        "r(0.0).\nr(y) :- r(x), edge(x, y).\n";
+    wirelog_program_t *prog = parse_or_die(recursive ? closure : plain,
+            "T-float-seed");
     wirelog_session_t *session = NULL;
     const char *why = "create";
     int failed = 1;
@@ -520,18 +529,43 @@ test_typed_float_seed(uint32_t workers, unsigned mode)
         why = "typed callback registration";
         goto done;
     }
+    if (recursive) {
+        uint32_t types[] = { WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_FLOAT };
+        uint32_t offsets[] = { 0, 1 };
+        uint64_t lanes[2];
+        wirelog_typed_row_v1_t row = {
+            sizeof(row), 1, 0, 2, 2, 2, types, offsets, types, lanes
+        };
+        wirelog_typed_error_v1_t error = {
+            sizeof(error), WIRELOG_TYPED_ERROR_NONE, UINT32_MAX, UINT32_MAX,
+            NULL, 0
+        };
+        for (uint32_t i = 0; i < SEEDED_FLOAT_END; i++) {
+            double scale = fractional ? -0.5 : 1.0;
+            double values[] = { scale * i, scale * (i + 1) };
+            memcpy(lanes, values, sizeof(lanes));
+            if (wirelog_session_insert_typed(session, "edge", &row, 1,
+                &error) != WIRELOG_OK) {
+                why = "typed edge insertion";
+                goto done;
+            }
+        }
+    }
     for (unsigned repeat = 0; repeat < 2; repeat++) {
         if (mode != 1 && wirelog_session_step(session) != WIRELOG_OK) {
             why = "step";
             goto done;
         }
-        seeded_float_snapshot_t st = { 0 };
+        seeded_float_snapshot_t st = {
+            .end = recursive ? SEEDED_FLOAT_END : 1,
+            .fractional = fractional
+        };
         if (wirelog_session_snapshot_typed(session, capture_seeded_float,
             &st) != WIRELOG_OK || st.invalid) {
             why = "typed snapshot or lane metadata";
             goto done;
         }
-        for (uint32_t i = 0; i < 2; i++) {
+        for (uint32_t i = 0; i <= st.end; i++) {
             if (st.seen[i] != 1) {
                 why = "seed/derived value missing or duplicated";
                 goto done;
@@ -541,8 +575,9 @@ test_typed_float_seed(uint32_t workers, unsigned mode)
     failed = 0;
 done:
     if (failed)
-        fprintf(stderr, "T-float-seed workers=%u mode=%u: %s\n",
-            workers, mode, why);
+        fprintf(stderr,
+            "T-float-seed recursive=%d fractional=%d workers=%u mode=%u: %s\n",
+            recursive, fractional, workers, mode, why);
     if (session)
         wirelog_session_destroy(session);
     wirelog_program_free(prog);
@@ -565,7 +600,9 @@ test_typed_float_seeds(void)
     }
     for (uint32_t workers = 1; workers <= 4; workers *= 2)
         for (unsigned mode = 0; mode < 3; mode++)
-            failures += test_typed_float_seed(workers, mode);
+            for (unsigned variant = 0; variant < 3; variant++)
+                failures += test_typed_float_seed(variant != 0, variant == 2,
+                        workers, mode);
     if (saved)
         setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved, 1);
     else
