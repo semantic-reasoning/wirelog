@@ -19471,3 +19471,71 @@ fail:
         return EINVAL;
     return rc;
 }
+
+/* Direct selected-native-schema sibling, preserving original source identity. */
+int
+wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled(
+    wl_columnar_relation_scalar_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor,
+    const wirelog_column_type_t *selected_types, col_rel_t **out)
+{
+    if (out) *out = NULL;
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    wl_evaluation_control_t *const control = source->control;
+    const uint64_t id = source->attempt_id;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (rc) return rc;
+    bool valid = name && out;
+    int tail = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
+    if (tail > 0 || valid) {
+        if (tail) return tail;
+    } else return EINVAL;
+    for (uint32_t c = 0; selected_types && c < source->width; ++c) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (rc) return rc;
+        bool scalar = selected_types[c] >= WIRELOG_TYPE_INT32
+            && selected_types[c] <= WIRELOG_TYPE_BOOL;
+        int end = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (end > 0 || scalar) {
+            if (end) return end;
+        } else return EINVAL;
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = source->names; recipe.types = selected_types;
+    recipe.type_codes = NULL;
+    recipe.has_graph_column = source->has_graph_column;
+    recipe.graph_col_idx = source->graph_col_idx;
+    recipe.declared_ncols = source->declared_ncols;
+    recipe.view_generation = 2u + (selected_types != NULL);
+    bool ts = source->preserve_timestamps && source->timestamps;
+    recipe.storage_generation = 1u + ts;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name,
+            source->width,
+            COL_REL_INIT_CAP, ts, governor, &recipe, &local, control, id);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0) abort();
+    return rc;
+}

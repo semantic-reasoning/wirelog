@@ -1809,3 +1809,16 @@ allocation credit and controlled 16-byte zeroing use the actual sizeof, includin
 on other ABIs. Generic arbitrary-width physical disposal retains its existing
 cooperative exclusion and is a separate primitive boundary, not a new latency
 promise.
+
+The private CONCAT continuation has separate original frame-embedded storage,
+two protected scalar sources, B2/drain and a governed row workspace. The binary
+transaction pins its original control through ACK. Hosts serialize original
+frame/record/native ownership and keep op/session/registry/descriptors/backing
+and governor configuration immutable and live through ACK. Every start, step,
+retry and ACK needs a fresh independent HOST allowance of at least768. The
+CONCAT wrapper admits384; binary retirement/ACK separately admits384 when used.
+Status consumption and subsequent ACK occur on later host actions. Original
+operation turnover never pays cleanup from a successor attempt. Scratch physical
+disposal precedes original credit and governor reference release. The existing
+binary gate remains active through both source ends, B2 drain, candidate/input
+retirement and ACK. No FILTER context is cast or reused by CONCAT.

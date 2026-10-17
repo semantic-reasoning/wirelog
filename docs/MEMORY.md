@@ -3357,7 +3357,9 @@ The remaining activation boundary is explicit:
 | Initial VARIABLE, numeric FILTER/MAP, ordinary scalar JOIN | Supported in the documented source/prebound domain |
 | Initial scalar CONSOLIDATE | Supported as a child, including terminal and repeated composition |
 | Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
-| CONCAT/UNION, REDUCE, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
+| Initial scalar REDUCE | Supported in the documented scalar numeric child domain |
+| CONCAT | Supported as a directly driven two-input scalar child; UNION composition still pending |
+| UNION, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
 | Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
@@ -3477,3 +3479,26 @@ forging an entry, owner or phase. REDUCE adds no numeric record field or new
 cleanup capacity. Full generated/composed tests compare literal typed results
 and independently cloned raw execution; raw empty CONS run-cache conventions
 are not imported into controlled empty results.
+
+### Private controlled CONCAT ownership
+
+CONCAT adds a dedicated frame-embedded continuation with two original scalar
+source records, a private B2 writer/drain and one row workspace. The actual
+frame `sizeof` controls admission and paid16-byte zeroing; this changes frame
+size and does not introduce a fixed ABI-size promise. The workspace reserves
+`max(width,1)*sizeof(int64_t)` against the selected governor; it retires physical
+storage before its own credit and governor reference, before publication. Both
+source ends and writer drain precede binary decision/input destruction. Candidate
+and both retired entries remain owned by the binary transaction.
+
+Eight192 payments split128 current/64 future before binary activation reserve
+separate256 first capacities for the BINARY parent and ACK/reset. Another100
+payments of192 reserve25 first capacities: B2 drain18, source ends2, workspace
+physical/credit/reference/clear4, and DECIDE1. If no resource was initialized,
+including a partial payment prefix, start returns directly to BINARY and skips
+unpaid empty stages. The binary
+transaction's five capacities remain separate. Every host retry/action has new
+independent funding; no stopped/successor operation is debited for retirement.
+The primitive allocator/control/ref and physical arbitrary-width relation
+destruction exclusions retain the existing cooperative scope. This child
+implements no default/session publication or full #1821 activation.

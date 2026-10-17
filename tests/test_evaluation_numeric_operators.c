@@ -5529,9 +5529,703 @@ binary_test_turnover(void)
     binary_fixture_close(&f, false);
 }
 
+/* CONCAT's actual host adapter returns directly from one child. Status is
+ * consumed in a later action; each action gets a newly begun funding owner. */
+typedef struct {
+    binary_fixture_t binary;
+    unsigned phase, child_calls, consumes;
+    bool pending;
+} concat_fixture_t;
+
+static col_rel_t *
+concat_source(uint32_t width, uint32_t rows, int type, unsigned side)
+{
+    col_rel_t *rel = wl_columnar_filter_test_source(width, 0, false, false,
+            true);
+    if (type >= 0 && width) {
+        wirelog_column_type_t *types = malloc(width * sizeof(*types));
+        CHECK(types);
+        for (uint32_t c = 0; c < width;
+            ++c) types[c] = (wirelog_column_type_t)type;
+        CHECK(!col_rel_set_column_types(rel, types, width)); free(types);
+    }
+    int64_t *values = malloc((width ? width : 1) * sizeof(*values));
+    CHECK(values);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t c = 0; c < width; ++c) {
+            int64_t value = (int64_t)row - 3 + 20 * side + 11 * c;
+            values[c] = type == WIRELOG_TYPE_FLOAT
+                ? wl_columnar_float_to_bits(!row && !c ? -0.0 : (double)value)
+                : value;
+        }
+        CHECK(!col_rel_append_row(rel, values));
+    }
+    free(values);
+    /* Legacy valid -0 source bits deliberately survive until controlled copy. */
+    if (width && rows && type == WIRELOG_TYPE_FLOAT)
+        rel->columns[0][0] = (int64_t)UINT64_C(0x8000000000000000);
+    if (width && !side) {
+        rel->has_graph_column = true; rel->graph_col_idx = width - 1;
+        rel->declared_ncols = width + 2;
+    }
+    return rel;
+}
+
+static void
+concat_fixture_init(concat_fixture_t *f, uint32_t width, uint32_t left_rows,
+    uint32_t right_rows, int left_type, int right_type, bool owned, bool bound,
+    uint64_t limit)
+{
+    memset(f, 0, sizeof(*f));
+    binary_fixture_t *b = &f->binary;
+    binary_fixture_init(b, 3, owned, false, limit);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(b->frame);
+    for (unsigned side = 0; side < 2; ++side) {
+        unsigned i = side + 1;
+        col_rel_destroy(b->inputs[i]);
+        b->inputs[i] = concat_source(width, side ? right_rows : left_rows,
+                side ? right_type : left_type, side);
+        stack->items[i].rel = b->inputs[i];
+        stack->items[i].seg_boundaries[1] = side ? right_rows : left_rows;
+        b->before[i] = stack->items[i];
+    }
+    if (bound) {
+        b->bound = true;
+        CHECK(!wl_columnar_eval_plan_numeric_stack_attempt_begin(&b->record,
+            &b->plan, 0, 1, b->frame, b->session, 3, b->operation,
+            b->operation_id, b->funding, b->funding_id));
+    }
+}
+
+static int
+concat_engine_dispatch(concat_fixture_t *f, wl_evaluation_control_t *funding,
+    uint64_t id)
+{
+    binary_fixture_t *b = &f->binary;
+    if (wl_evaluation_control_active_attempt_id(funding) != id) return EINVAL;
+    int rc = wl_evaluation_control_charge(funding, 384);
+    if (rc) return rc;
+    if (f->pending) {
+        ++f->consumes; f->pending = false;
+        f->phase = f->phase == 2 ? 3
+            : b->status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE ? 2 : 1;
+        return 0;
+    }
+    f->pending = true; ++f->child_calls;
+    if (!f->phase)
+        return wl_columnar_merge_concat_attempt_start_owned(&b->op, b->frame,
+                   b->session, b->operation, b->operation_id, &b->status,
+                   funding, id, binary_owner(b));
+    if (f->phase == 1)
+        return wl_columnar_merge_concat_attempt_step_owned(b->frame, &b->status,
+                   funding, id, binary_owner(b));
+    return wl_columnar_merge_concat_attempt_ack_owned(b->frame, funding, id,
+               binary_owner(b));
+}
+
+static int
+concat_host_turn(concat_fixture_t *f)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = wl_columnar_filter_test_control(0,
+            &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    int rc = concat_engine_dispatch(f, funding, id);
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static void
+concat_run(concat_fixture_t *f)
+{
+    for (unsigned turns = 0; f->phase != 3; ++turns)
+        CHECK(turns < 1000 && !concat_host_turn(f));
+    CHECK(f->child_calls == f->consumes);
+}
+
+static void
+concat_literal_result(concat_fixture_t *f, uint32_t width, uint32_t left_rows,
+    uint32_t right_rows, int left_type, int right_type)
+{
+    binary_fixture_t *b = &f->binary;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(b->frame);
+    CHECK(stack->top == 2 && binary_test_entry_equal(&stack->items[0],
+        &b->before[0]));
+    eval_entry_t *entry = &stack->items[1];
+    col_rel_t *out = entry->rel;
+    CHECK(entry->owned && !entry->is_delta && !entry->seg_boundaries &&
+        !entry->seg_count);
+    CHECK(out && !strcmp(out->name,
+        "$concat") && out->schema_ok && !out->timestamps);
+    CHECK(out->ncols == width && out->nrows == left_rows + right_rows);
+    CHECK(out->has_graph_column == (width != 0));
+    if (width) CHECK(out->graph_col_idx == width - 1 &&
+            out->declared_ncols == width + 2);
+    int type = left_type >= 0 ? left_type : right_rows ? right_type : -1;
+    CHECK((out->column_types != NULL) == (width && type >= 0));
+    for (uint32_t c = 0; c < width; ++c) {
+        char name[96]; snprintf(name, sizeof(name),
+            "long_column_%u_with_several_eight_byte_chunks", c);
+        CHECK(!strcmp(out->col_names[c], name));
+        if (type >=
+            0) CHECK(out->column_types[c] == (wirelog_column_type_t)type);
+        for (unsigned side = 0; side < 2; ++side)
+            for (uint32_t row = 0; row < (side ? right_rows : left_rows);
+                ++row){
+                int64_t expected = (int64_t)row - 3 + 20 * side + 11 * c;
+                if (type == WIRELOG_TYPE_FLOAT)
+                    expected = wl_columnar_float_to_bits(!row &&
+                            !c ? 0.0 : (double)expected);
+                CHECK(out->columns[c][(side ? left_rows : 0) + row] ==
+                    expected);
+            }
+    }
+}
+
+static void
+concat_parity_case(uint32_t width, uint32_t left_rows, uint32_t right_rows,
+    int left_type, int right_type, bool owned, bool bound)
+{
+    concat_fixture_t f;
+    concat_fixture_init(&f, width, left_rows, right_rows, left_type, right_type,
+        owned, bound, 0);
+    /* Independent relations and raw operator; no controlled result as oracle. */
+    col_rel_t *a = concat_source(width, left_rows, left_type, 0);
+    col_rel_t *b = concat_source(width, right_rows, right_type, 1);
+    eval_stack_t raw = {0};
+    CHECK(!eval_stack_push(&raw, a, false) && !eval_stack_push(&raw, b, false));
+    int expected = col_op_concat(&raw, f.binary.session);
+    concat_run(&f);
+    CHECK(f.binary.status.semantic_result == expected);
+    if (!expected) {
+        CHECK(f.binary.status.committed && !f.binary.status.cleanup_result);
+        concat_literal_result(&f, width, left_rows, right_rows, left_type,
+            right_type);
+        CHECK(raw.top == 1);
+        wl_columnar_filter_test_equal(wl_columnar_eval_stack_cleanup_stack(
+                f.binary.frame)->items[1].rel, raw.items[0].rel);
+    } else {
+        CHECK(!f.binary.status.committed);
+        binary_assert_originals(&f.binary);
+    }
+    CHECK(!eval_stack_drain(&raw));
+    col_rel_destroy(a); col_rel_destroy(b);
+    binary_fixture_close(&f.binary, !expected);
+}
+
+static void
+concat_literal_matrix(void)
+{
+    const uint32_t widths[] = { 0, 1, 17, 129 };
+    for (unsigned w = 0; w < 4; ++w)
+        for (unsigned empty = 0; empty < 4; ++empty)
+            for (unsigned owned = 0; owned < 2; ++owned)
+                for (unsigned bound = 0; bound < 2; ++bound)
+                    concat_parity_case(widths[w], empty & 1 ? 0 : 3,
+                        empty & 2 ? 0 : 2, -1, -1, owned, bound);
+    for (int left = -1; left <= WIRELOG_TYPE_BOOL; ++left)
+        for (int right = -1; right <= WIRELOG_TYPE_BOOL; ++right)
+            for (unsigned empty = 0; empty < 4; ++empty)
+                concat_parity_case(1, empty & 1 ? 0 : 3, empty & 2 ? 0 : 2,
+                    left, right, (left + 1) % 2, (right + 1) % 2);
+}
+
+static unsigned concat_stop_phase;
+static bool concat_stop_hit;
+static void
+concat_cancel_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase == concat_stop_phase && !concat_stop_hit) {
+        concat_stop_hit = true; wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+concat_stop_and_failure(void)
+{
+    const unsigned phases[] = {1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 20, 21, 22,
+                               23, 24, 25, 26, 27};
+    for (unsigned i = 0; i < sizeof(phases)/sizeof(phases[0]); ++i) {
+        concat_fixture_t f; concat_fixture_init(&f, 129, 3, 2,
+            WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_FLOAT, true, true, 0);
+        concat_stop_phase = phases[i]; concat_stop_hit = false;
+        wl_columnar_merge_test_concat_checkpoint = concat_cancel_checkpoint;
+        concat_run(&f); wl_columnar_merge_test_concat_checkpoint = NULL;
+        CHECK(concat_stop_hit && !f.binary.status.committed &&
+            f.binary.status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+        binary_assert_originals(&f.binary);
+        binary_fixture_close(&f.binary, false);
+    }
+    for (unsigned side = 0; side < 2; ++side)
+        for (unsigned invalid = 0; invalid < 2; ++invalid) {
+            concat_fixture_t f; concat_fixture_init(&f, 1, 3, 2,
+                WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_FLOAT, true, false, 0);
+            f.binary.inputs[side + 1]->columns[0][1] = (int64_t)(invalid
+                ? UINT64_C(0x7ff8000000000001) : UINT64_C(0xfff0000000000000));
+            concat_run(&f);
+            CHECK(f.binary.status.semantic_result == EINVAL &&
+                !f.binary.status.committed);
+            binary_assert_originals(&f.binary);
+            binary_fixture_close(&f.binary, false);
+        }
+    /* Named source schedule: bootstrap8*192=1536; Adepth3 begin5632
+     * reaches7168 (last192 starts6976); resource100*192 reaches26368
+     * (last192 starts26176). Each pair brackets an actual admission. */
+    const uint64_t limits[] = {191, 192, 1535, 1536, 1791, 1792, 7167, 7168,
+                               7359, 7360, 26367, 26368};
+    const uint64_t consumed[] = {0, 192, 1344, 1536, 1536, 1792, 6976, 7168,
+                                 7168, 7360, 26176, 26368};
+    for (unsigned i = 0; i < sizeof(limits)/sizeof(limits[0]); ++i) {
+        concat_fixture_t f;
+        concat_fixture_init(&f, 17, 3, 2, -1, -1, false, false, limits[i]);
+        concat_run(&f);
+        CHECK(!f.binary.status.committed &&
+            f.binary.status.semantic_result ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        binary_assert_originals(&f.binary);
+        CHECK(wl_evaluation_control_finish(f.binary.operation,
+            &f.binary.operation_owner,
+            0, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.binary.operation, &report));
+        CHECK(report.attempt_id == f.binary.operation_id &&
+            report.consumed == consumed[i]);
+        binary_fixture_close(&f.binary, false);
+    }
+    concat_fixture_t f;
+    concat_fixture_init(&f, 17, 3, 2, -1, -1, true, true, 0);
+    wl_columnar_merge_test_concat_fail_allocation = 0;
+    concat_run(&f); wl_columnar_merge_test_concat_fail_allocation = -1;
+    CHECK(!f.binary.status.committed &&
+        f.binary.status.semantic_result == ENOMEM);
+    binary_assert_originals(&f.binary); binary_fixture_close(&f.binary, false);
+}
+
+static void
+concat_retained_and_turnover(void)
+{
+    for (unsigned mask = 1; mask < 4; ++mask) {
+        concat_fixture_t f;
+        concat_fixture_init(&f, 17, 3, 2, -1, -1, true, true, 0);
+        wl_columnar_source_access_reader_t readers[2] = {{0}, {0}};
+        for (unsigned side = 0; side < 2; ++side)
+            if (mask & (1u <<
+                side)) CHECK(!wl_columnar_source_access_reader_acquire(
+                        &f.binary.inputs[side + 1]->source_access,
+                        &readers[side]));
+        unsigned released = 0;
+        col_rel_t *published = NULL;
+        for (unsigned turns = 0; f.phase != 3; ++turns) {
+            CHECK(turns < 1000 && !concat_host_turn(&f));
+            if (f.binary.status.progress !=
+                WL_COLUMNAR_FILTER_PROGRESS_RETAINED) continue;
+            CHECK(f.binary.status.committed &&
+                f.binary.status.semantic_result == EBUSY);
+            col_rel_t *out =
+                wl_columnar_eval_stack_cleanup_stack(
+                f.binary.frame)->items[1].rel;
+            CHECK(!published || published == out); published = out;
+            if (f.pending) continue;
+            for (unsigned side = 0; side < 2; ++side)
+                if ((mask & (1u << side)) && !(released & (1u << side))) {
+                    CHECK(!wl_columnar_source_access_reader_release(
+                            &readers[side]));
+                    released |= 1u << side; break;
+                }
+        }
+        CHECK(released == mask && !f.binary.status.semantic_result);
+        concat_literal_result(&f, 17, 3, 2, -1, -1);
+        binary_fixture_close(&f.binary, true);
+    }
+    concat_fixture_t f;
+    concat_fixture_init(&f, 17, 3, 2, -1, -1, false, false, 0);
+    CHECK(!concat_host_turn(&f));
+    CHECK(!wl_evaluation_control_finish(f.binary.operation,
+        &f.binary.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(f.binary.operation));
+    CHECK(!wl_evaluation_control_begin(f.binary.operation,
+        &f.binary.operation_owner));
+    concat_run(&f);
+    CHECK(!f.binary.status.committed &&
+        f.binary.status.semantic_result == EINVAL);
+    binary_assert_originals(&f.binary);
+    CHECK(!wl_evaluation_control_finish(f.binary.operation,
+        &f.binary.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.binary.operation,
+        &report) && !report.consumed);
+    binary_fixture_close(&f.binary, false);
+}
+
+static void
+concat_resource_and_compatibility(void)
+{
+    /* Same borrowed descriptor twice, with independently owned segment arrays. */
+    concat_fixture_t same;
+    concat_fixture_init(&same, 1, 3, 3, -1, -1, false, false, 0);
+    eval_stack_t *stack =
+        wl_columnar_eval_stack_cleanup_stack(same.binary.frame);
+    col_rel_destroy(same.binary.inputs[2]);
+    same.binary.inputs[2] = same.binary.inputs[1];
+    stack->items[2].rel = same.binary.inputs[1];
+    same.binary.before[2] = stack->items[2];
+    concat_run(&same);
+    CHECK(!same.binary.status.semantic_result && same.binary.status.committed);
+    col_rel_t *out = stack->items[1].rel;
+    CHECK(out->nrows == 6);
+    for (unsigned row = 0; row < 6;
+        ++row) CHECK(out->columns[0][row] == (int64_t)(row % 3) - 3);
+    /* Frame entries have retired both arrays; only one borrowed descriptor. */
+    same.binary.inputs[2] = NULL;
+    binary_fixture_close(&same.binary, true);
+
+    concat_fixture_t f;
+    concat_fixture_init(&f, 17, 3, 2, -1, -1, true, true, 0);
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_concat_context_owned(f.binary.frame, &ctx,
+        binary_owner(&f.binary)));
+    while (ctx->phase != 6 || f.pending) CHECK(!concat_host_turn(&f));
+    CHECK(ctx->scratch.admitted && ctx->scratch.ref_held &&
+        !ctx->scratch.physical);
+    uint64_t reserved = wl_columnar_filter_test_reserved(f.binary.session);
+    uint64_t bytes = ctx->scratch.credit.bytes;
+    wl_columnar_memory_governor_test_refuse_next_release();
+    CHECK(!concat_host_turn(&f));
+    CHECK(f.binary.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED &&
+        ctx->scratch.admitted && ctx->scratch.credit.bytes == bytes &&
+        wl_columnar_filter_test_reserved(f.binary.session) == reserved);
+    CHECK(!concat_host_turn(&f)); /* consume retained status */
+    wl_columnar_filter_status_t sentinel = f.binary.status;
+    int host_owner;
+    wl_evaluation_control_t *host = wl_columnar_filter_test_control(383,
+            &host_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(host);
+    CHECK(wl_columnar_merge_concat_attempt_step_owned(f.binary.frame,
+        &f.binary.status,
+        host, id, binary_owner(&f.binary)) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!memcmp(&sentinel, &f.binary.status,
+        sizeof(sentinel)) && ctx->scratch.admitted);
+    CHECK(wl_evaluation_control_finish(host, &host_owner, 0,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_detach(host, &host_owner));
+    wl_evaluation_control_release(host);
+    concat_run(&f);
+    CHECK(!f.binary.status.semantic_result && f.binary.status.committed);
+    binary_fixture_close(&f.binary, true);
+
+    /* Discover reached allocation sites only, then fail every site. Fees are
+    * independent source-written literals above, never measured from this. */
+    unsigned counts[2];
+    concat_fixture_t probe;
+    concat_fixture_init(&probe, 17, 70, 71, -1, -1, true, false, 0);
+    wl_columnar_relation_test_constructor_fail_allocation = UINT32_MAX;
+    wl_columnar_relation_test_growth_fail_allocation = UINT32_MAX;
+    concat_run(&probe);
+    counts[0] = UINT32_MAX -
+        wl_columnar_relation_test_constructor_fail_allocation;
+    counts[1] = UINT32_MAX - wl_columnar_relation_test_growth_fail_allocation;
+    wl_columnar_relation_test_constructor_fail_allocation = 0;
+    wl_columnar_relation_test_growth_fail_allocation = 0;
+    CHECK(counts[0] && counts[1] && probe.binary.status.committed);
+    binary_fixture_close(&probe.binary, true);
+    for (unsigned family = 0; family < 2; ++family)
+        for (unsigned ordinal = 1; ordinal <= counts[family]; ++ordinal) {
+            concat_fixture_t a;
+            concat_fixture_init(&a, 17, 70, 71, -1, -1, true, false, 0);
+            if (!family) wl_columnar_relation_test_constructor_fail_allocation =
+                    ordinal;
+            else wl_columnar_relation_test_growth_fail_allocation = ordinal;
+            concat_run(&a);
+            wl_columnar_relation_test_constructor_fail_allocation = 0;
+            wl_columnar_relation_test_growth_fail_allocation = 0;
+            CHECK(!a.binary.status.committed &&
+                a.binary.status.semantic_result == ENOMEM);
+            binary_assert_originals(&a.binary);
+            binary_fixture_close(&a.binary, false);
+        }
+    /* Unsupported scalar dispatch domains remain explicit and preserve inputs. */
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        concat_fixture_t a;
+        concat_fixture_init(&a, 1, 3, 2, -1, -1, false, false, 0);
+        if (!mode) a.binary.session->current_iteration = 1;
+        else if (mode ==
+            1) CHECK(!col_rel_enable_timestamps(a.binary.inputs[1]));
+        else a.binary.op.materialized = true;
+        concat_run(&a);
+        CHECK(!a.binary.status.committed &&
+            a.binary.status.semantic_result == ENOTSUP);
+        binary_assert_originals(&a.binary);
+        binary_fixture_close(&a.binary, false);
+    }
+    /* NULL operation control retains actual raw two-entry/K-copy behavior. */
+    concat_fixture_t raw;
+    concat_fixture_init(&raw, 1, 3, 2, -1, -1, false, false, 0);
+    CHECK(!wl_columnar_merge_concat_attempt_start(&raw.binary.op,
+        raw.binary.frame,
+        raw.binary.session, NULL, 0, &raw.binary.status, raw.binary.funding,
+        raw.binary.funding_id));
+    CHECK(raw.binary.status.committed &&
+        raw.binary.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
+    stack = wl_columnar_eval_stack_cleanup_stack(raw.binary.frame);
+    CHECK(stack->top == 2 && stack->items[1].seg_count == 2);
+    binary_fixture_close(&raw.binary, true);
+}
+
+static void
+concat_raw_single_marker(void)
+{
+    binary_fixture_t f; binary_fixture_init(&f, 1, false, false, 0);
+    CHECK(!wl_columnar_merge_concat_attempt_start(&f.op, f.frame, f.session,
+        NULL, 0, &f.status, f.funding, f.funding_id));
+    CHECK(!f.status.semantic_result &&
+        f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
+    binary_assert_originals(&f); binary_fixture_close(&f, true);
+}
+
+static wl_col_session_t *concat_quota_session;
+static wl_columnar_memory_reservation_t *concat_quota_peer;
+static bool concat_quota_hit;
+static void
+concat_quota_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t row)
+{
+    (void)control;
+    if (phase != 25 || row != 63 || concat_quota_hit) return;
+    concat_quota_hit = true;
+    uint64_t reserved = wl_columnar_filter_test_reserved(concat_quota_session);
+    CHECK(reserved < 16u * 1024u * 1024u);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            concat_quota_session->memory_governor),
+        16u * 1024u * 1024u - reserved, concat_quota_peer));
+}
+
+static void
+concat_quota_retry(void)
+{
+    concat_fixture_t f;
+    concat_fixture_init(&f, 17, 70, 71, -1, -1, false, false, 0);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    concat_quota_peer = &peer; concat_quota_session = f.binary.session;
+    concat_quota_hit = false;
+    wl_columnar_merge_test_concat_checkpoint = concat_quota_checkpoint;
+    concat_run(&f); wl_columnar_merge_test_concat_checkpoint = NULL;
+    CHECK(concat_quota_hit && f.binary.status.semantic_result == ENOSPC &&
+        !f.binary.status.committed && f.binary.session->memory_budget_denied);
+    binary_assert_originals(&f.binary);
+    CHECK(wl_columnar_filter_test_reserved(f.binary.session) ==
+        f.binary.session->cleanup_reserved_bytes + peer.bytes);
+    CHECK(wl_columnar_memory_release(&peer));
+    CHECK(wl_evaluation_control_finish(f.binary.operation,
+        &f.binary.operation_owner,
+        ENOSPC, 0) == ENOSPC);
+    CHECK(!wl_evaluation_control_reset(f.binary.operation));
+    CHECK(!wl_evaluation_control_begin(f.binary.operation,
+        &f.binary.operation_owner));
+    f.binary.operation_id =
+        wl_evaluation_control_active_attempt_id(f.binary.operation);
+    f.binary.session->memory_budget_denied = false;
+    f.phase = 0; f.pending = false; f.child_calls = f.consumes = 0;
+    concat_run(&f);
+    CHECK(!f.binary.status.semantic_result && f.binary.status.committed);
+    concat_literal_result(&f, 17, 70, 71, -1, -1);
+    binary_fixture_close(&f.binary, true);
+    concat_quota_session = NULL; concat_quota_peer = NULL;
+}
+
+static void
+concat_nested_host_funding(void)
+{
+    concat_fixture_t f;
+    concat_fixture_init(&f, 17, 3, 2, -1, -1, true, true, 0);
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_concat_context_owned(f.binary.frame, &ctx,
+        binary_owner(&f.binary)));
+    /* Actual engine refuses before pending/counters/status mutation. */
+    int host_owner;
+    wl_evaluation_control_t *host = wl_columnar_filter_test_control(383,
+            &host_owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(host);
+    CHECK(concat_engine_dispatch(&f, host,
+        id) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!f.pending && !f.child_calls && !ctx->identity);
+    CHECK(wl_evaluation_control_finish(host, &host_owner, 0,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_detach(host, &host_owner));
+    wl_evaluation_control_release(host);
+    while (ctx->phase != 10 || f.pending) CHECK(!concat_host_turn(&f));
+    for (unsigned action = 0; action < 2; ++action) {
+        if (action) {
+            while (ctx->phase != 11 || f.pending) CHECK(!concat_host_turn(&f));
+        }
+        for (unsigned grant = 767; grant <= 768; ++grant) {
+            wl_columnar_filter_status_t before = f.binary.status;
+            host = wl_columnar_filter_test_control(grant, &host_owner);
+            id = wl_evaluation_control_active_attempt_id(host);
+            int rc =
+                action ?
+                wl_columnar_merge_concat_attempt_ack_owned(f.binary.frame,
+                    host, id, binary_owner(&f.binary))
+                : wl_columnar_merge_concat_attempt_step_owned(f.binary.frame,
+                    &f.binary.status, host, id, binary_owner(&f.binary));
+            CHECK(rc == (grant == 767 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+            if (grant == 767) CHECK(!memcmp(&before, &f.binary.status,
+                    sizeof(before)));
+            CHECK(wl_evaluation_control_finish(host, &host_owner, 0, 0) ==
+                (grant == 767 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(host,
+                &report) && report.attempt_id == id &&
+                report.consumed == (grant == 767 ? 384u : 768u));
+            CHECK(!wl_evaluation_control_detach(host, &host_owner));
+            wl_evaluation_control_release(host);
+        }
+    }
+    /* Direct acknowledged child is complete; no second fixture ACK. */
+    CHECK(!ctx->identity && !ctx->phase);
+    binary_fixture_close(&f.binary, true);
+}
+
+static concat_fixture_t *concat_turnover_fixture;
+static bool concat_turnover_hit;
+static void
+concat_reserve_turnover(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t bytes)
+{
+    (void)bytes;
+    if (phase != 27 || concat_turnover_hit) return;
+    concat_turnover_hit = true;
+    binary_fixture_t *b = &concat_turnover_fixture->binary;
+    CHECK(control == b->operation);
+    CHECK(!wl_evaluation_control_finish(control, &b->operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_begin(control, &b->operation_owner));
+}
+
+static void *
+concat_foreign_thread(void *arg)
+{
+    concat_fixture_t *f = arg;
+    wl_columnar_filter_status_t sentinel = {.semantic_result = 919};
+    CHECK(wl_columnar_merge_concat_attempt_step_owned(f->binary.frame,
+        &sentinel, f->binary.funding, f->binary.funding_id,
+        binary_owner(&f->binary)) != 0 && sentinel.semantic_result == 919);
+    CHECK(wl_columnar_merge_concat_attempt_ack_owned(f->binary.frame,
+        f->binary.funding, f->binary.funding_id,
+        binary_owner(&f->binary)) != 0);
+    return NULL;
+}
+
+static void
+concat_authority_and_reserve_stop(void)
+{
+    for (unsigned bound = 0; bound < 2; ++bound) {
+        concat_fixture_t f;
+        concat_fixture_init(&f, 17, 3, 2, -1, -1, true, bound, 0);
+        CHECK(!concat_host_turn(&f));
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, concat_foreign_thread, &f));
+        CHECK(!wl_thread_join(&thread));
+        wl_columnar_eval_stack_cleanup_frame_t *inner = NULL;
+        CHECK(!wl_columnar_eval_stack_cleanup_begin(f.binary.session, &inner));
+        wl_columnar_filter_status_t sentinel = {.semantic_result = 919};
+        CHECK(wl_columnar_merge_concat_attempt_step_owned(f.binary.frame,
+            &sentinel, f.binary.funding, f.binary.funding_id,
+            binary_owner(&f.binary)) != 0 && sentinel.semantic_result == 919);
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&inner));
+        concat_run(&f);
+        CHECK(f.binary.status.committed && !f.binary.status.semantic_result);
+        binary_fixture_close(&f.binary, true);
+    }
+    concat_fixture_t f;
+    concat_fixture_init(&f, 129, 3, 2, -1, -1, true, false, 0);
+    concat_turnover_fixture = &f; concat_turnover_hit = false;
+    wl_columnar_merge_test_concat_checkpoint = concat_reserve_turnover;
+    concat_run(&f); wl_columnar_merge_test_concat_checkpoint = NULL;
+    CHECK(concat_turnover_hit && !f.binary.status.committed &&
+        f.binary.status.semantic_result == EINVAL);
+    binary_assert_originals(&f.binary);
+    CHECK(wl_columnar_filter_test_reserved(f.binary.session) ==
+        f.binary.session->cleanup_reserved_bytes);
+    CHECK(!wl_evaluation_control_finish(f.binary.operation,
+        &f.binary.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.binary.operation, &report) &&
+        report.attempt_id == f.binary.operation_id + 1 && !report.consumed);
+    binary_fixture_close(&f.binary, false);
+    concat_turnover_fixture = NULL;
+}
+
+static void
+concat_inert_ack_funding(void)
+{
+    /* Genuine source owner claims an empty frame without operation debit.
+     * No source forward action occurs and no numeric phase is forged. */
+    binary_fixture_t f; binary_fixture_init(&f, 0, false, false, 0);
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "unused"},
+        {.op = WL_PLAN_OP_MAP}
+    };
+    f.plan.ops = ops; f.plan.op_count = 2;
+    CHECK(!wl_columnar_eval_plan_numeric_source_attempt_begin(&f.record,
+        &f.plan, 0, 2, f.frame, f.session, f.operation, f.operation_id,
+        f.funding, f.funding_id));
+    f.bound = true;
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_concat_context_owned(f.frame, &ctx,
+        &f.record));
+    for (unsigned generation = 0; generation < 2; ++generation) {
+        uint64_t id = wl_evaluation_control_active_attempt_id(f.operation);
+        CHECK(id == f.operation_id + generation);
+        CHECK(wl_columnar_merge_concat_attempt_ack_owned(f.frame,
+            f.operation, id, &f.record) == EINVAL);
+        CHECK(!ctx->identity && !ctx->phase &&
+            f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_PREFLIGHT &&
+            !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+        CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0,
+            0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report) &&
+            report.attempt_id == id && !report.consumed);
+        if (!generation) {
+            CHECK(!wl_evaluation_control_reset(f.operation));
+            CHECK(!wl_evaluation_control_begin(f.operation,
+                &f.operation_owner));
+        }
+    }
+    for (unsigned grant = 383; grant <= 384; ++grant) {
+        int host_owner;
+        wl_evaluation_control_t *host = wl_columnar_filter_test_control(grant,
+                &host_owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(host);
+        CHECK(wl_columnar_merge_concat_attempt_ack_owned(f.frame, host, id,
+            &f.record) ==
+            (grant == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(!ctx->identity && !ctx->phase);
+        CHECK(wl_evaluation_control_finish(host, &host_owner, 0, 0) ==
+            (grant == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(host,
+            &report) && report.attempt_id == id &&
+            report.consumed == (grant == 383 ? 0u : 384u));
+        CHECK(!wl_evaluation_control_detach(host, &host_owner));
+        wl_evaluation_control_release(host);
+    }
+    binary_fixture_close(&f, false);
+}
+
 int
 main(void)
 {
+    concat_inert_ack_funding();
+    concat_raw_single_marker(); concat_authority_and_reserve_stop();
+    concat_quota_retry(); concat_nested_host_funding();
+    concat_literal_matrix(); concat_stop_and_failure();
+    concat_retained_and_turnover(); concat_resource_and_compatibility();
     test_binary_replacement(); binary_test_native_and_lifo();
     binary_test_turnover();
     reduce_literal_matrix(); reduce_error_order(); reduce_stop_matrix();
