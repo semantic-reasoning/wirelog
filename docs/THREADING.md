@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **333**).
+match the script's count (currently **337**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -1571,7 +1571,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains 333 call sites.
+The complete current atomic-source inventory contains 337 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1861,7 +1861,7 @@ New cold numeric claims admit only that embedded child during its genuine begin;
 foreign claims remain refused before child binding and after child ACK. The
 existing hot operator getters retain their current authority predicates.
 
-Each action returns to the actual host before result consumption on a later
+Child calls return to the actual host before result consumption on a later
 freshly funded action. The host keeps two independent grant controls and stable
 owner keys alive across those returns. A pending child borrows its completed
 grant until consume checks the actual completed report and saved generation;
@@ -1887,3 +1887,18 @@ site to the prior 332-site inventory; it does not publish relation payload.
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
 | `eval_stack.c:wl_columnar_eval_stack_framed_close_proof` | `frame->reservation.state` | `atomic_load_explicit` | acquire | Verify the original committed frame credit before the marker-live close seal; original token and native/LIFO authority remain exclusively serialized |
+| `session_hash.c:wl_columnar_session_hash_registry_token` | `token->state` | `atomic_load_explicit` | acquire | Admit only original-address RESERVED or canonical EMPTY tokens before private publication owners; noGov all-zero remains untouched |
+| `session_hash.c:wl_columnar_session_hash_registry_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Reject leased/transition credit before a reversible journal move |
+| `session_hash.c:wl_columnar_session_hash_registry_inert` | `token->state` | `atomic_load_explicit` | acquire | Prove one private or retired token inert before the image drain seal |
+| `session_hash.c:wl_columnar_session_hash_registry_inert#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify no lease remains while the original parent marker still protects retirement |
+
+The private fresh-head publisher creates registry/hash arrays offside, one slot
+or name byte per action. Its original-address four-move journal reverses before
+private arrays are discarded. Old arrays and their moved RESERVED credits remain
+live until the genuine embedded child ACK clears its registry borrow. A separate
+image proof seals every private/retired owner before the parent close proof.
+Each image action uses the parent-admitted HOST; it has no nested grant or new
+Aconsume case. Cleanup never debits the original operation or its successor.
+Old tokens must be canonical self-EMPTY or positive RESERVED; RELEASED history
+and governed all-zero destinations are explicitly unsupported before B ownership.
+Genuine noGov all-zero originals are skipped without initialization or writes.
