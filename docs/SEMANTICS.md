@@ -988,8 +988,8 @@ The opt-in REDUCE child accepts materialized scalar input in an initial serial,
 nonrecursive attempt. COUNT ignores its operand and returns INT64; numeric
 SUM/MIN/MAX support integer and FLOAT operands, and average requires FLOAT.
 STRING ordering and interpreter-only aggregate expressions are excluded. A NULL
-control delegates to the raw reducer. The numeric plan driver does not yet admit
-this opcode at this implementation boundary.
+control delegates to the raw reducer. The private numeric plan driver admits this opcode in both source-bound
+and prebound segments, using the original numeric record for child authority.
 
 A protected source reader remains held while bounded hash slots and dense group
 records accumulate values in first-seen group order. Each input row evaluates
@@ -1013,3 +1013,13 @@ This private accumulator has different allocation peaks and work fees from
 raw incremental output updates. COUNT skips irrelevant expression compilation;
 raw COUNT can still fail during unused expression compilation. Only admitted
 semantic results are compared; resource failure precedence is not promised.
+
+Complete private numeric aggregate plans execute the original preserved body,
+from initial VARIABLE through numeric operators, REDUCE and terminal
+CONSOLIDATE. Both opcode preflights admit REDUCE; its own domain checks still
+exclude STRING ordering, interpreter-only expressions and recursive/weighted
+configurations. A failure preserves the immediately preceding original stack
+entry and stops later operators. Earlier successful operators are not undone;
+a canonical full-plan retry uses the stable original registry and a new record
+after real cleanup and numeric ACK. This does not activate public/default
+session scheduling or complete issue #1821.

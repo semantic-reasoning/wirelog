@@ -125,6 +125,26 @@ engine_dispatch(fixture_t *f)
     }
 }
 
+/* One real host action pops one job and returns to the external scheduler.
+ * Queue the engine continuation before entering the child. A final DONE
+ * sentinel drains without another engine call, result consume or grant. */
+static void
+numeric_plan_host_turn(queue_t *q, fixture_t *f)
+{
+    CHECK(q->count);
+    unsigned job = q->entries[q->head];
+    q->head = (q->head + 1) % 4; --q->count;
+    if (job == 0) {
+        if (f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE) return;
+        enqueue(q, 0);
+        engine_dispatch(f);
+        return;
+    }
+    ++f->witnesses;
+    CHECK(f->witnesses == f->calls);
+    if (f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE) enqueue(q, 1);
+}
+
 static void
 run(fixture_t *f)
 {
@@ -133,18 +153,7 @@ run(fixture_t *f)
     unsigned turns = 0;
     while (q.count) {
         CHECK(++turns < 100000);
-        unsigned job = q.entries[q.head];
-        q.head = (q.head + 1) % 4; --q.count;
-        if (job == 0) {
-            engine_dispatch(f);
-            if (f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE)
-                enqueue(&q, 0);
-        } else {
-            ++f->witnesses;
-            CHECK(f->witnesses == f->calls);
-            if (f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE)
-                enqueue(&q, 1);
-        }
+        numeric_plan_host_turn(&q, f);
     }
     CHECK(f->calls == f->witnesses && f->calls > 1);
 }
@@ -2248,7 +2257,7 @@ test_source_unsupported(void)
     }
     const wl_plan_op_type_t unsupported_kinds[] = {WL_PLAN_OP_CONCAT,
                                                    WL_PLAN_OP_LFTJ,
-                                                   WL_PLAN_OP_REDUCE};
+                                                   WL_PLAN_OP_K_FUSION};
     for (unsigned kind = 0; kind < 3; ++kind)
         for (unsigned bad = 0; bad < 3; ++bad) {
             wl_plan_op_t invalid[] = {ops[0], ops[1], ops[1]};
@@ -3444,9 +3453,364 @@ test_probe_plan_failures(void)
             }
 }
 
+static void
+test_generated_reduce_plans(void)
+{
+    const char *queries[] = {
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:int64)\noutput(g,count(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(n:int64,g:int64)\noutput(count(v),g) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:int64)\noutput(g,count(v/0.0)) :- input(g,v).\n",
+        ".decl input(g:int64,v:int64)\n.decl output(g:int64,n:int64)\noutput(g,sum(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:int64)\n.decl output(g:int64,n:int64)\noutput(g,min(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:int64)\n.decl output(g:int64,n:int64)\noutput(g,max(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:float)\noutput(g,sum(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:float)\noutput(g,min(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:float)\noutput(g,max(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:float)\noutput(g,average(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(n:int64)\noutput(count(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(n:float)\noutput(average(v)) :- input(g,v).\n"
+    };
+    const int64_t keys[] = {2, 1, 2, 1, 2, 3},
+        operands[] = {-3, 10, 5, -4, -2, 0};
+    const int64_t answers[][3] = {{2, 3, 1}, {2, 3, 1}, {2, 3, 1}, {6, 0, 0},
+                                  {-4, -3, 0}, {10, 5, 0}, {6, 0, 0},
+                                  {-4, -3, 0}, {10, 5, 0}, {3, 0, 0}};
+    for (unsigned shape = 0; shape < sizeof(queries) / sizeof(queries[0]);
+        ++shape){
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[shape],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        CHECK(body.op_count >= 3 && body.ops[0].op == WL_PLAN_OP_VARIABLE &&
+            body.ops[body.op_count-1].op == WL_PLAN_OP_CONSOLIDATE);
+        unsigned reductions = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i)
+            if (body.ops[i].op == WL_PLAN_OP_REDUCE) {
+                ++reductions;
+                if (shape < 3 ||
+                    shape ==
+                    10) CHECK(body.ops[i].agg_fn == WIRELOG_AGG_COUNT &&
+                        body.ops[i].agg_operand_type ==
+                        WL_PLAN_AGG_OPERAND_FLOAT &&
+                        body.ops[i].agg_result_type ==
+                        WL_PLAN_AGG_OPERAND_SCALAR);
+                else CHECK(body.ops[i].agg_result_type == (shape < 6
+                        ? WL_PLAN_AGG_OPERAND_SCALAR :
+                        WL_PLAN_AGG_OPERAND_FLOAT));
+            }
+        CHECK(reductions == 1);
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned empty = 0; empty < 2; ++empty)
+                for (unsigned governed = 0; governed < 2; ++governed) {
+                    fixture_t f;
+                    if (prebound) fixture_init(&f, 2, 0, 0);
+                    else source_fixture(&f, 2, 0, 0);
+                    bool fp = shape < 3 || shape >= 6;
+                    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                                     fp ? WIRELOG_TYPE_FLOAT :
+                                                     WIRELOG_TYPE_INT64};
+                    CHECK(!col_rel_set_column_types(f.input, types, 2));
+                    for (unsigned r = 0; !empty && r < 6; ++r) {
+                        int64_t row[] = {keys[r], fp
+                            ? wl_columnar_float_to_bits((double)operands[r]) :
+                                         operands[r]};
+                        CHECK(!col_rel_append_row(f.input, row));
+                    }
+                    if (!empty &&
+                        shape <
+                        3) f.input->columns[1][0] =
+                            wl_columnar_float_to_bits(NAN);
+                    col_rel_t *registry[] = {f.input};
+                    wl_columnar_memory_governor_ref_t *governor =
+                        governed ? join_governor(&f, 1u << 20) : NULL;
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 1;
+                        fixture_begin(&f, &body, 1, body.op_count);
+                    } else source_begin(&f, &body, registry, 1);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == body.op_count-1 &&
+                        f.record.source_installed == !prebound);
+                    join_raw_parity(&f, &body, prebound != 0);
+                    col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    uint32_t rows = empty ? 0 : shape >= 10 ? 1 : 3;
+                    CHECK(out->nrows == rows &&
+                        out->ncols == (shape >= 10 ? 1u : 2u));
+                    CHECK(out->sorted_nrows == rows &&
+                        out->run_count == (rows != 0));
+                    CHECK(!out->timestamps && !out->has_graph_column);
+                    unsigned agg = shape == 1 || shape >= 10 ? 0 : 1;
+                    CHECK(out->column_types[agg] == (shape >= 6 && shape != 10
+                        ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+                    if (rows) CHECK(out->run_ends[0] == rows);
+                    for (unsigned r = 0; r < rows; ++r) {
+                        int64_t expected = shape < 10 ? answers[shape][r]
+                            : shape == 10 ? 6 : 1;
+                        if (shape == 1) {
+                            const int64_t counts[] = {1, 2, 3},
+                                groupkeys[] = {3, 1, 2};
+                            expected = counts[r];
+                            CHECK(out->columns[1][r] == groupkeys[r]);
+                        } else if (shape <
+                            10) CHECK(out->columns[0][r] == (int64_t)r+1);
+                        if (shape >= 6 &&
+                            shape !=
+                            10) expected =
+                                wl_columnar_float_to_bits((double)expected);
+                        CHECK(out->columns[agg][r] == expected);
+                    }
+                    fixture_close(&f);
+                    if (governor) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(governor)));
+                        wl_columnar_memory_governor_ref_release(governor);
+                    }
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_composed_reduce_plans(void)
+{
+    uint8_t yes[] = {WL_PLAN_EXPR_BOOL, 1};
+    uint8_t aggregate[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'};
+    uint32_t identity[] = {0, 1}, first[] = {0};
+    const char *key = "col0";
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned empty = 0; empty < 2; ++empty) {
+                fixture_t f;
+                if (prebound) fixture_init(&f, 2, 0, 0);
+                else source_fixture(&f, 2, 0, 0);
+                const int64_t keys[] = {2, 1, 2, 1, 2, 3},
+                    values[] = {-3, 10, 5, -4, -2, 0};
+                for (unsigned r = 0; !empty && r < 6; ++r) {
+                    int64_t row[] = {keys[r], values[r]};
+                    CHECK(!col_rel_append_row(f.input, row));
+                }
+                col_rel_t *right = source_new(2, 0);
+                CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                for (unsigned r = 0; r < 3; ++r) {
+                    int64_t row[] = {r < 2 ? 1 : 2, 9};
+                    CHECK(!col_rel_append_row(right, row));
+                }
+                col_rel_t *registry[] = {f.input, right};
+                wl_plan_op_t ops[] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "input"},
+                    {.op = WL_PLAN_OP_FILTER,
+                     .filter_expr = {yes, sizeof(yes)}},
+                    {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                     .project_indices = identity},
+                    {.op = kind == 0 ? WL_PLAN_OP_JOIN : kind ==
+                         1 ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN,
+                     .right_relation = "right", .key_count = 1,
+                     .left_keys = &key, .right_keys = &key},
+                    {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                     .project_indices = identity},
+                    {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1,
+                     .aggregate_index = 1,
+                     .agg_fn = WIRELOG_AGG_SUM,
+                     .agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR},
+                    {.op = WL_PLAN_OP_FILTER,
+                     .filter_expr = {yes, sizeof(yes)}},
+                    {.op = WL_PLAN_OP_REDUCE, .aggregate_index = 0,
+                     .agg_fn = WIRELOG_AGG_SUM,
+                     .agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR,
+                     .agg_expr = {aggregate, sizeof(aggregate)}},
+                    {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                     .project_indices = first},
+                    {.op = WL_PLAN_OP_CONSOLIDATE}
+                };
+                wl_plan_relation_t plan = {.ops = ops, .op_count = 10};
+                if (prebound) {
+                    f.session.rels = registry; f.session.nrels = 2;
+                    fixture_begin(&f, &plan, 1, 10);
+                } else source_begin(&f, &plan, registry, 2);
+                run(&f);
+                CHECK(!f.record.semantic_result && f.record.completed == 9);
+                join_raw_parity(&f, &plan, prebound != 0);
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                CHECK(stack->top == 1 && stack->items[0].owned &&
+                    !stack->items[0].is_delta);
+                col_rel_t *out = stack->items[0].rel;
+                CHECK(out->ncols == 1 && out->nrows == (empty ? 0u : 1u) &&
+                    out->column_types[0] == WIRELOG_TYPE_INT64);
+                if (!empty) CHECK(out->columns[0][0] ==
+                        (kind == 0 ? 12 : kind == 1 ? 6 : 0));
+                CHECK(out->sorted_nrows == out->nrows &&
+                    out->run_count == (empty ? 0u : 1u));
+                fixture_close(&f); col_rel_destroy(right);
+            }
+}
+
+static fixture_t *reduce_plan_observer;
+static col_rel_t *reduce_prior_entry;
+static unsigned reduce_plan_fault;
+static void
+reduce_plan_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase == 1) {
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(reduce_plan_observer->frame);
+        CHECK(stack->top == 1 && stack->items[0].owned &&
+            !stack->items[0].is_delta);
+        reduce_prior_entry = stack->items[0].rel;
+    }
+    if (phase == 40 &&
+        reduce_plan_fault == 2) wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_reduce_later_failure(void)
+{
+    uint32_t identity[] = {0, 1};
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        fixture_t f; fixture_init(&f, 2, fault == 2 ? 600 : 3, 0);
+        for (uint32_t r = 0; r < f.input->nrows; ++r) {
+            f.input->columns[0][r] = 0;
+            f.input->columns[1][r] = fault ==
+                0 ? (r == 0 ? INT64_MAX : r == 1 ? 1 : -1) : 1;
+        }
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_MAP, .project_count = 2,
+             .project_indices = identity},
+            {.op = WL_PLAN_OP_REDUCE, .group_by_count = 1, .aggregate_index = 1,
+             .agg_fn = WIRELOG_AGG_SUM,
+             .agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR},
+            {.op = WL_PLAN_OP_MAP, .project_count = 2,
+             .project_indices = identity},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        wl_plan_relation_t plan = {.ops = ops, .op_count = 4};
+        reduce_plan_observer = &f; reduce_prior_entry = NULL;
+        reduce_plan_fault = fault;
+        wl_columnar_ops_test_reduce_attempt_checkpoint = reduce_plan_checkpoint;
+        if (fault == 1)wl_columnar_ops_test_reduce_attempt_fail_allocation = 0;
+        fixture_begin(&f, &plan, 0, 4); run(&f);
+        wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+        wl_columnar_ops_test_reduce_attempt_fail_allocation = -1;
+        CHECK(f.record.semantic_result ==
+            (fault == 0 ? ERANGE : fault ==
+            1 ? ENOMEM : WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(f.record.completed == 1 && f.record.cursor == 1 &&
+            reduce_prior_entry);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack->top == 1 && stack->items[0].owned &&
+            stack->items[0].rel == reduce_prior_entry &&
+            !stack->items[0].is_delta);
+        CHECK(reduce_prior_entry->nrows == f.input->nrows &&
+            reduce_prior_entry->ncols == 2);
+        for (uint32_t r = 0; r < f.input->nrows; ++r) {
+            CHECK(reduce_prior_entry->columns[0][r] == f.input->columns[0][r]);
+            CHECK(reduce_prior_entry->columns[1][r] == f.input->columns[1][r]);
+        }
+        fixture_close(&f);
+    }
+    reduce_plan_observer = NULL; reduce_prior_entry = NULL;
+}
+
+static void
+test_generated_reduce_join_bodies(void)
+{
+    const char *queries[] = {
+        ".decl input(g:int64,v:int64)\n.decl right(g:int64,w:int64)\n.decl output(g:int64,n:int64)\noutput(g,sum(v+w)) :- input(g,v),right(g,w).\n",
+        ".decl input(g:int64,v:int64)\n.decl right(g:int64)\n.decl output(g:int64,n:int64)\noutput(g,sum(v)) :- input(g,v),right(g).\n",
+        ".decl input(g:int64,v:int64)\n.decl right(g:int64)\n.decl output(g:int64,n:int64)\noutput(g,sum(v)) :- input(g,v),!right(g).\n"
+    };
+    const int64_t keys[] = {2, 1, 2, 1, 2, 3},
+        values[] = {-3, 10, 5, -4, -2, 0};
+    for (unsigned shape = 0; shape < 3; ++shape) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[shape],
+                &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        CHECK(body.ops[0].op == WL_PLAN_OP_VARIABLE &&
+            body.ops[body.op_count-1].op == WL_PLAN_OP_CONSOLIDATE);
+        unsigned joins = 0, reductions = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            if (body.ops[i].op == WL_PLAN_OP_JOIN ||
+                body.ops[i].op == WL_PLAN_OP_SEMIJOIN ||
+                body.ops[i].op == WL_PLAN_OP_ANTIJOIN) ++joins;
+            if (body.ops[i].op == WL_PLAN_OP_REDUCE) {
+                ++reductions;
+                CHECK(body.ops[i].agg_fn == WIRELOG_AGG_SUM &&
+                    body.ops[i].agg_result_type == WL_PLAN_AGG_OPERAND_SCALAR);
+            }
+        }
+        CHECK(joins && reductions == 1);
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned empty = 0; empty < 3; ++empty)
+                for (unsigned governed = 0; governed < 2; ++governed) {
+                    fixture_t f;
+                    if (prebound) fixture_init(&f, 2, 0, 0);
+                    else source_fixture(&f, 2, 0, 0);
+                    for (unsigned r = 0; empty != 1 && r < 6; ++r) {
+                        int64_t row[] = {keys[r], values[r]};
+                        CHECK(!col_rel_append_row(f.input, row));
+                    }
+                    col_rel_t *right = source_new(shape ? 1 : 2, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                    for (unsigned r = 0; empty != 2 && r < 2; ++r) {
+                        int64_t row[] = {r+1, r+1};
+                        CHECK(!col_rel_append_row(right, row));
+                    }
+                    col_rel_t *registry[] = {f.input, right};
+                    wl_columnar_memory_governor_ref_t *governor =
+                        governed ? join_governor(&f, 1u<<20) : NULL;
+                    if (prebound) {
+                        f.session.rels = registry; f.session.nrels = 2;
+                        fixture_begin(&f, &body, 1, body.op_count);
+                    }else source_begin(&f, &body, registry, 2);
+                    run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == body.op_count-1);
+                    join_raw_parity(&f, &body, prebound != 0);
+                    col_rel_t *out =
+                        wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel;
+                    unsigned rows = empty == 1 ||
+                        (empty == 2 &&
+                        shape != 2) ? 0u : shape ==
+                        2 ? (empty == 2 ? 3u : 1u) : 2u;
+                    CHECK(out->ncols == 2 && out->nrows == rows &&
+                        out->column_types[0] == WIRELOG_TYPE_INT64 &&
+                        out->column_types[1] == WIRELOG_TYPE_INT64);
+                    for (unsigned r = 0; r < rows; ++r) {
+                        int64_t key = shape == 2 &&
+                            empty != 2 ? 3 : (int64_t)r+1;
+                        int64_t value = shape == 0 ? (r ? 6 : 8) : key ==
+                            1 ? 6 : 0;
+                        CHECK(out->columns[0][r] == key &&
+                            out->columns[1][r] == value);
+                    }
+                    CHECK(out->sorted_nrows == rows &&
+                        out->run_count == (rows != 0));
+                    fixture_close(&f); col_rel_destroy(right);
+                    if (governor) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(governor)));
+                        wl_columnar_memory_governor_ref_release(governor);
+                    }
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
 int
 main(void)
 {
+    test_generated_reduce_plans(); test_composed_reduce_plans();
+    test_reduce_later_failure(); test_generated_reduce_join_bodies();
     test_generated_probe_plans(); test_composed_probe_plans();
     test_probe_plan_failures();
     test_generated_map_float_schema();
