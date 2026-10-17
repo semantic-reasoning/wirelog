@@ -5898,4 +5898,42 @@ int wl_columnar_eval_stack_filter_context_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
     const void *);
 
+/* Original two-entry replacement. The frame and original plan/record stay
+* live and serialized through ACK. Finish and ACK each admit fresh384 from
+* independent host funding; old operation cancellation never pays cleanup.
+* Inputs and output borrows are setup/forward calls, not cleanup authority.
+* A NULL owner denotes a standalone unbound frame. No raw-pointer mutation
+* is permitted during the exclusive gate. Output is flat and non-delta. */
+int wl_columnar_eval_stack_binary_begin_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, const void *);
+int wl_columnar_eval_stack_binary_input_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, unsigned, const eval_entry_t **,
+    const void *);
+int wl_columnar_eval_stack_binary_output_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***, const void *);
+int wl_columnar_eval_stack_binary_commit_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
+int wl_columnar_eval_stack_binary_finish_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, int,
+    wl_columnar_filter_status_t *,
+    wl_evaluation_control_t *, uint64_t, const void *);
+int wl_columnar_eval_stack_binary_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_evaluation_control_t *,
+    uint64_t, const void *);
+int wl_columnar_eval_stack_numeric_stack_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *, const void *,
+    uint32_t, wl_evaluation_control_t *, uint64_t);
+/* Exact nonempty stack authority, not UNION grammar admission. The complete
+ * configured stack/plan must precede begin; old top1/empty APIs retain scope. */
+int wl_columnar_eval_plan_numeric_stack_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_stack_test_binary_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+#endif
+
 #endif /* WL_COLUMNAR_INTERNAL_H */

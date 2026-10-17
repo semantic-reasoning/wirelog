@@ -258,6 +258,27 @@ typedef char wl_columnar_eval_stack_unary_zero_defaults_t[
         (WL_COLUMNAR_EVAL_STACK_UNARY_IDLE == 0
         && WL_COLUMNAR_EVAL_ENTRY_RELATION == 0) ? 1 : -1];
 
+/* Dedicated binary owner; old unary state is only an exclusion gate. */
+typedef struct wl_columnar_eval_stack_binary_context {
+    struct wl_columnar_eval_stack_binary_context *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    eval_entry_t snapshot[2], retired[2], output;
+    uint32_t top, cursor;
+    unsigned phase;
+    int execution_result, cleanup_result;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, pin_owned, committed, result_saved, alias_rejected;
+} wl_columnar_eval_stack_binary_context_t;
+
 struct wl_columnar_eval_stack_cleanup_frame {
     wl_col_session_t *session;
     wl_columnar_eval_stack_cleanup_frame_t *next;
@@ -289,6 +310,7 @@ struct wl_columnar_eval_stack_cleanup_frame {
     bool unary_alias_rejected;
     wl_columnar_filter_context_t filter;
     const void *numeric_plan_owner;
+    wl_columnar_eval_stack_binary_context_t binary;
 };
 
 int
@@ -1717,4 +1739,421 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
         }
     }
     return result;
+}
+
+/* Binary replacement has its own original owner. The old ACTIVE phase is
+ * only an exclusion gate; old unary bindings stay inert, including thread. */
+#define WL_COLUMNAR_EVAL_STACK_BINARY_ENTRY_WORK 256u
+#define WL_COLUMNAR_EVAL_STACK_BINARY_WORK 192u
+#define WL_COLUMNAR_EVAL_STACK_BINARY_CELL_WORK 128u
+#define WL_COLUMNAR_EVAL_STACK_BINARY_HOST_WORK 384u
+#define WL_COLUMNAR_EVAL_STACK_BINARY_RETIRE_PAYMENTS 20u
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_binary_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+#endif
+
+static int
+wl_columnar_eval_stack_binary_tail(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_eval_stack_attempt_guard(control, id);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_binary_checkpoint)
+        wl_columnar_eval_stack_test_binary_checkpoint(control, phase, progress);
+#else
+    (void)phase; (void)progress;
+#endif
+    return wl_columnar_eval_stack_attempt_charge(control, id, 0);
+}
+
+static bool
+wl_columnar_eval_stack_binary_thread(
+    const wl_columnar_eval_stack_binary_context_t *ctx)
+{
+    if (!ctx->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(ctx->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return ctx->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(ctx->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_eval_stack_binary_validate(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    wl_columnar_eval_stack_binary_context_t *ctx = &frame->binary;
+    if (ctx->identity != ctx || ctx->frame != frame
+        || ctx->session != frame->session
+        || frame->session->cleanup_active != frame || !ctx->control
+        || !ctx->attempt_id || !ctx->pin_owned || !ctx->phase
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        || frame->unary_thread_valid
+        || !wl_columnar_eval_stack_binary_thread(ctx)) return EINVAL;
+    return 0;
+}
+
+static int
+wl_columnar_eval_stack_binary_fund(
+    wl_columnar_eval_stack_binary_context_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!funding || funding == ctx->control || !id
+        || wl_evaluation_control_active_attempt_id(funding) != id)
+        return EINVAL;
+    return wl_evaluation_control_charge(funding,
+               WL_COLUMNAR_EVAL_STACK_BINARY_HOST_WORK);
+}
+
+static bool
+wl_columnar_eval_stack_binary_entry_matches(const eval_entry_t *a,
+    const eval_entry_t *b)
+{
+    return a->rel == b->rel && a->owned == b->owned
+           && a->is_delta == b->is_delta
+           && a->seg_boundaries == b->seg_boundaries
+           && a->seg_count == b->seg_count && a->kind == b->kind
+           && a->continuation == b->continuation;
+}
+
+int
+wl_columnar_eval_stack_numeric_stack_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    const void *owner, uint32_t expected_depth,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!expected_depth || expected_depth > COL_STACK_MAX || !owner
+        || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
+        return EINVAL;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (record->control != control || record->attempt_id != id) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_ENTRY_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_operator_stack(frame, session, &stack);
+    if (rc) return rc;
+    if (stack->top != expected_depth) return EINVAL;
+    for (uint32_t i = 0; i < expected_depth; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, id,
+                WL_COLUMNAR_EVAL_STACK_BINARY_CELL_WORK);
+        if (rc) return rc;
+        const eval_entry_t *entry = &stack->items[i];
+        int verdict = entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || !entry->rel || entry->continuation ? ENOTSUP : 0;
+        rc = wl_columnar_eval_stack_binary_tail(control, id, 1, i);
+        if (rc) return rc;
+        if (verdict) return verdict;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_binary_tail(control, id, 2, expected_depth);
+    if (rc) return rc;
+    frame->numeric_plan_owner = owner;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_binary_begin_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control || record->attempt_id != id)
+            return EINVAL;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_ENTRY_WORK);
+    if (rc) return rc;
+    eval_stack_t *stack = NULL;
+    rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+    if (rc) return rc;
+    wl_columnar_eval_stack_binary_context_t *ctx = &frame->binary;
+    if (ctx->phase || ctx->identity || ctx->pin_owned || ctx->control
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->retired[0])
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->retired[1]))
+        return EBUSY;
+    if (stack->top < 2) return ENOTSUP;
+    uint32_t top = stack->top;
+    for (uint32_t side = 0; side < 2; ++side) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, id,
+                WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+        if (rc) return rc;
+        const eval_entry_t *input = &stack->items[top - 2 + side];
+        if (input->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || !input->rel
+            || input->continuation) return ENOTSUP;
+        for (uint32_t i = 0; i < top; ++i) {
+            rc = wl_columnar_eval_stack_attempt_charge(control, id,
+                    WL_COLUMNAR_EVAL_STACK_BINARY_CELL_WORK);
+            if (rc) return rc;
+            const eval_entry_t *other = &stack->items[i];
+            if (other->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+                || !other->rel || other->continuation) return ENOTSUP;
+            bool duplicate = i != top - 2 + side
+                && input->seg_boundaries
+                && input->seg_boundaries == other->seg_boundaries;
+            bool relation_alias = false;
+            if (i != top - 2 + side && other->rel
+                && (input->owned || other->owned)) {
+                const col_rel_t *left_owner = input->rel->storage_owner
+                    ? input->rel->storage_owner : input->rel;
+                const col_rel_t *right_owner = other->rel->storage_owner
+                    ? other->rel->storage_owner : other->rel;
+                relation_alias = left_owner == right_owner;
+            }
+            rc = wl_columnar_eval_stack_binary_tail(control, id, 3,
+                    (uint64_t)side * COL_STACK_MAX + i);
+            if (rc) return rc;
+            if (duplicate || relation_alias) return ENOTSUP;
+        }
+    }
+    /* Five distinct first capacities: candidate, left, right, pin release,
+     * reset/ACK. Four192 payments each partition128 current +64 future.
+     * No owning activation exists on a partial payment prefix. */
+    for (unsigned i = 0;
+        i < WL_COLUMNAR_EVAL_STACK_BINARY_RETIRE_PAYMENTS; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(control, id,
+                WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_binary_tail(control, id, 4, i);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(control, id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_binary_tail(control, id, 5, top);
+    if (rc) {
+        wl_evaluation_control_release(control); return rc;
+    }
+    ctx->identity = ctx; ctx->frame = frame; ctx->session = session;
+    ctx->control = control; ctx->attempt_id = id; ctx->top = top;
+    ctx->phase = 1; ctx->cursor = 0;
+    ctx->committed = false; ctx->result_saved = false;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->alias_rejected = false; ctx->pin_owned = true;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true;
+    wl_columnar_eval_stack_unary_entry_copy(&ctx->snapshot[0],
+        &stack->items[top - 2]);
+    wl_columnar_eval_stack_unary_entry_copy(&ctx->snapshot[1],
+        &stack->items[top - 1]);
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_binary_input_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, unsigned side,
+    const eval_entry_t **out, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_binary_validate(frame, owner);
+    if (rc) return rc;
+    if (!out || side > 1 || frame->binary.phase != 1
+        || frame->binary.committed) return EINVAL;
+    rc = wl_columnar_eval_stack_attempt_guard(frame->binary.control,
+            frame->binary.attempt_id);
+    if (rc) return rc;
+    *out = &frame->binary.snapshot[side];
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_binary_output_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t ***out,
+    const void *owner)
+{
+    int rc = wl_columnar_eval_stack_binary_validate(frame, owner);
+    if (rc) return rc;
+    if (!out || frame->binary.phase != 1 || frame->binary.committed
+        || frame->binary.output.rel)
+        return EINVAL;
+    rc = wl_columnar_eval_stack_attempt_guard(frame->binary.control,
+            frame->binary.attempt_id);
+    if (rc) return rc;
+    frame->binary.output.owned = true;
+    *out = &frame->binary.output.rel;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_binary_commit_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
+    const void *owner)
+{
+    int rc = wl_columnar_eval_stack_binary_validate(frame, owner);
+    if (rc) return rc;
+    if (!committed || frame->binary.phase != 1 || frame->binary.committed)
+        return EINVAL;
+    *committed = false;
+    wl_columnar_eval_stack_binary_context_t *ctx = &frame->binary;
+    rc = wl_columnar_eval_stack_attempt_charge(ctx->control, ctx->attempt_id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+    if (rc) return rc;
+    if (!ctx->output.rel || !ctx->output.owned || ctx->output.is_delta
+        || ctx->output.seg_boundaries || ctx->output.seg_count
+        || ctx->output.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || ctx->output.continuation || ctx->top < 2
+        || ctx->top > COL_STACK_MAX || frame->stack.top != ctx->top)
+        return EINVAL;
+    for (uint32_t i = 0; i < ctx->top; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(ctx->control,
+                ctx->attempt_id, WL_COLUMNAR_EVAL_STACK_BINARY_CELL_WORK);
+        if (rc) return rc;
+        bool alias = ctx->output.rel == frame->stack.items[i].rel;
+        const col_rel_t *candidate_owner = ctx->output.rel->storage_owner
+            ? ctx->output.rel->storage_owner : ctx->output.rel;
+        const col_rel_t *input = frame->stack.items[i].rel;
+        const col_rel_t *input_owner = input->storage_owner
+            ? input->storage_owner : input;
+        bool storage_alias = candidate_owner == input_owner;
+        if (alias) {
+            wl_columnar_eval_stack_unary_entry_clear(&ctx->output);
+            ctx->alias_rejected = true;
+        }
+        rc = wl_columnar_eval_stack_binary_tail(ctx->control,
+                ctx->attempt_id, 6, i);
+        if (rc) return rc;
+        if (alias) return EINVAL;
+        if (storage_alias) return ENOTSUP;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(ctx->control, ctx->attempt_id,
+            WL_COLUMNAR_EVAL_STACK_BINARY_WORK);
+    if (rc) return rc;
+    bool matches = wl_columnar_eval_stack_binary_entry_matches(
+        &frame->stack.items[ctx->top - 2], &ctx->snapshot[0])
+        && wl_columnar_eval_stack_binary_entry_matches(
+        &frame->stack.items[ctx->top - 1], &ctx->snapshot[1]);
+    rc = wl_columnar_eval_stack_binary_tail(ctx->control, ctx->attempt_id,
+            7, ctx->top);
+    if (rc) return rc;
+    if (!matches) return EINVAL;
+    wl_columnar_eval_stack_unary_entry_copy(&ctx->retired[0],
+        &ctx->snapshot[0]);
+    wl_columnar_eval_stack_unary_entry_copy(&ctx->retired[1],
+        &ctx->snapshot[1]);
+    wl_columnar_eval_stack_unary_entry_copy(
+        &frame->stack.items[ctx->top - 2], &ctx->output);
+    wl_columnar_eval_stack_unary_entry_clear(
+        &frame->stack.items[ctx->top - 1]);
+    wl_columnar_eval_stack_unary_entry_clear(&ctx->output);
+    frame->stack.top = ctx->top - 1;
+    ctx->committed = true;
+    *committed = true;
+    return 0;
+}
+
+static void
+wl_columnar_eval_stack_binary_status(
+    const wl_columnar_eval_stack_binary_context_t *ctx,
+    wl_columnar_filter_status_t *status)
+{
+    status->progress = ctx->phase == 3 ? WL_COLUMNAR_FILTER_PROGRESS_DONE
+        : ctx->cleanup_result ? WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+        : WL_COLUMNAR_FILTER_PROGRESS_YIELD;
+    status->execution_result = ctx->execution_result;
+    status->cleanup_result = ctx->cleanup_result;
+    status->semantic_result = ctx->execution_result ? ctx->execution_result
+        : ctx->alias_rejected ? EINVAL : ctx->cleanup_result;
+    status->committed = ctx->committed;
+}
+
+int
+wl_columnar_eval_stack_binary_finish_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int result,
+    wl_columnar_filter_status_t *status, wl_evaluation_control_t *funding,
+    uint64_t funding_id, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_binary_validate(frame, owner);
+    if (rc) return rc;
+    if (!status) return EINVAL;
+    wl_columnar_eval_stack_binary_context_t *ctx = &frame->binary;
+    rc = wl_columnar_eval_stack_binary_fund(ctx, funding, funding_id);
+    if (rc) return rc;
+    if (!ctx->result_saved) {
+        ctx->execution_result = result;
+        ctx->result_saved = true; ctx->phase = 2;
+    }
+    if (ctx->phase == 3) {
+        wl_columnar_eval_stack_binary_status(ctx, status); return 0;
+    }
+    eval_entry_t *entry = ctx->committed
+        ? &ctx->retired[ctx->cursor] : &ctx->output;
+    /* Abort sanitation is a bounded action of at most four pointer slots;
+     * even a never-committed alias must not destroy an original input. */
+    if (!ctx->committed && entry->rel && ctx->cursor < frame->stack.top) {
+        for (unsigned n = 0; n < 4 && ctx->cursor < frame->stack.top; ++n) {
+            bool alias = entry->rel == frame->stack.items[ctx->cursor].rel;
+            ++ctx->cursor;
+            if (alias) {
+                wl_columnar_eval_stack_unary_entry_clear(entry);
+                ctx->alias_rejected = true;
+                ctx->phase = 3;
+                break;
+            }
+        }
+        wl_columnar_eval_stack_binary_status(ctx, status);
+        return 0;
+    }
+    rc = eval_entry_dispose(entry);
+    ctx->cleanup_result = rc;
+    if (!rc) {
+        wl_columnar_eval_stack_unary_entry_clear(entry);
+        if (!ctx->committed || ++ctx->cursor == 2) ctx->phase = 3;
+    }
+    wl_columnar_eval_stack_binary_status(ctx, status);
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_binary_ack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_evaluation_control_t *funding, uint64_t funding_id, const void *owner)
+{
+    int rc = wl_columnar_eval_stack_binary_validate(frame, owner);
+    if (rc) return rc;
+    wl_columnar_eval_stack_binary_context_t *ctx = &frame->binary;
+    if (ctx->phase != 3
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->retired[0])
+        || !wl_columnar_eval_stack_unary_entry_inert(&ctx->retired[1]))
+        return EBUSY;
+    rc = wl_columnar_eval_stack_binary_fund(ctx, funding, funding_id);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = ctx->control;
+    wl_columnar_eval_stack_unary_entry_clear(&ctx->snapshot[0]);
+    wl_columnar_eval_stack_unary_entry_clear(&ctx->snapshot[1]);
+    ctx->identity = NULL; ctx->frame = NULL; ctx->session = NULL;
+    ctx->control = NULL; ctx->attempt_id = 0; ctx->top = 0;
+    ctx->phase = 0; ctx->cursor = 0; ctx->thread_valid = false;
+    ctx->pin_owned = false; ctx->committed = false; ctx->result_saved = false;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->alias_rejected = false;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    wl_evaluation_control_release(control);
+    return 0;
 }

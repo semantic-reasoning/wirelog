@@ -8,6 +8,7 @@
 #include "../wirelog/thread.h"
 #include <errno.h>
 #include <math.h>
+#include "../wirelog/thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5013,9 +5014,526 @@ reduce_engine_host_refusal(void)
     reduce_fixture_close(&f, false);
 }
 
+/* Binary authority/transaction fixtures. Each finish/ACK enters one actual
+* host action and returns before the external scheduler inspects status. */
+typedef struct {
+    wl_col_session_t *session;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_evaluation_control_t *operation, *funding;
+    uint64_t operation_id, funding_id;
+    int operation_owner, funding_owner;
+    wl_columnar_eval_plan_numeric_attempt_t record;
+    wl_plan_op_t op;
+    wl_plan_relation_t plan;
+    wl_columnar_filter_status_t status;
+    col_rel_t *inputs[COL_STACK_MAX];
+    eval_entry_t before[COL_STACK_MAX];
+    unsigned depth;
+    bool owned, bound;
+    int execution_result;
+} binary_fixture_t;
+
+static bool
+binary_test_entry_equal(const eval_entry_t *a, const eval_entry_t *b)
+{
+    return a->rel == b->rel && a->owned == b->owned
+           && a->is_delta == b->is_delta && a->seg_count == b->seg_count
+           && a->seg_boundaries == b->seg_boundaries && a->kind == b->kind
+           && a->continuation == b->continuation;
+}
+
+static void
+binary_fixture_init(binary_fixture_t *f, unsigned depth, bool owned,
+    bool bound, uint64_t limit)
+{
+    memset(f, 0, sizeof(*f));
+    f->session = wl_columnar_filter_test_session();
+    f->operation = wl_columnar_filter_test_control(limit, &f->operation_owner);
+    f->funding = wl_columnar_filter_test_control(0, &f->funding_owner);
+    f->operation_id = wl_evaluation_control_active_attempt_id(f->operation);
+    f->funding_id = wl_evaluation_control_active_attempt_id(f->funding);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(f->session, &f->frame));
+    CHECK(f->session->cleanup_reserved_bytes &&
+        wl_columnar_filter_test_reserved(f->session) ==
+        f->session->cleanup_reserved_bytes);
+    f->depth = depth; f->owned = owned; f->bound = bound;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    for (unsigned i = 0; i < depth; ++i) {
+        f->inputs[i] = wl_columnar_filter_test_source(1, 3, false, false,
+                false);
+        CHECK(!eval_stack_push(stack, f->inputs[i], owned && i + 2 >= depth));
+        eval_entry_t *entry = &stack->items[i];
+        entry->is_delta = i % 2 != 0;
+        entry->seg_boundaries = malloc(2 * sizeof(uint32_t));
+        CHECK(entry->seg_boundaries);
+        entry->seg_count = 1; entry->seg_boundaries[0] = 0;
+        entry->seg_boundaries[1] = 3; f->before[i] = *entry;
+    }
+    f->op.op = WL_PLAN_OP_CONCAT;
+    f->plan.ops = &f->op; f->plan.op_count = 1;
+    wl_columnar_eval_plan_numeric_attempt_init(&f->record);
+    if (bound) CHECK(!wl_columnar_eval_plan_numeric_stack_attempt_begin(
+                &f->record, &f->plan, 0, 1, f->frame, f->session, depth,
+                f->operation, f->operation_id, f->funding, f->funding_id));
+}
+
+static const void *
+binary_owner(binary_fixture_t *f)
+{
+    return f->bound ? &f->record : NULL;
+}
+
+static int
+binary_host_finish(binary_fixture_t *f)
+{
+    return wl_columnar_eval_stack_binary_finish_owned(f->frame,
+               f->execution_result, &f->status, f->funding, f->funding_id,
+               binary_owner(f));
+}
+
+static int
+binary_host_ack(binary_fixture_t *f)
+{
+    return wl_columnar_eval_stack_binary_ack_owned(f->frame,
+               f->funding, f->funding_id, binary_owner(f));
+}
+
+static int
+binary_record_turn(binary_fixture_t *f)
+{
+    return wl_columnar_eval_plan_numeric_attempt_step(&f->record, f->funding,
+               f->funding_id);
+}
+
+static void
+binary_run(binary_fixture_t *f)
+{
+    unsigned witnesses = 0;
+    do {
+        ++witnesses;
+        CHECK(witnesses < 1000);
+        CHECK(!binary_host_finish(f));
+    } while (f->status.progress != WL_COLUMNAR_FILTER_PROGRESS_DONE);
+    CHECK(!binary_host_ack(f));
+}
+
+static void
+binary_fixture_close(binary_fixture_t *f, bool committed)
+{
+    (void)committed;
+    if (f->bound) {
+        /* CONCAT remains unsupported in this ownership prerequisite. Retire
+         * the genuine record through actual stopped preflight, never forge
+         * a phase or clear the owner through a borrowed pointer. */
+        wl_evaluation_control_request_cancel(f->operation);
+        for (unsigned turns = 0;
+            f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE; ++turns){
+            CHECK(turns < 100 && !binary_record_turn(f));
+        }
+        CHECK(!wl_columnar_eval_plan_numeric_attempt_ack(&f->record,
+            f->funding, f->funding_id));
+    }
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    for (unsigned i = 0; i < f->depth; ++i)
+        if (!f->owned || i + 2 < f->depth)
+            col_rel_destroy(f->inputs[i]);
+    CHECK(!f->session->cleanup_reserved_bytes &&
+        !wl_columnar_filter_test_reserved(f->session));
+    if (wl_evaluation_control_active_attempt_id(f->operation))
+        (void)wl_evaluation_control_finish(f->operation, &f->operation_owner,
+            f->execution_result, 0);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->operation);
+    wl_evaluation_control_release(f->funding);
+    wl_columnar_memory_governor_ref_release(f->session->memory_governor);
+    free(f->session);
+}
+
+static void
+binary_assert_originals(binary_fixture_t *f)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == f->depth);
+    for (unsigned i = 0; i < f->depth; ++i)
+        CHECK(binary_test_entry_equal(&stack->items[i], &f->before[i]));
+}
+
+static void
+binary_test_transactions(void)
+{
+    for (unsigned bound = 0; bound < 2; ++bound)
+        for (unsigned owned = 0; owned < 2; ++owned)
+            for (unsigned publish = 0; publish < 2; ++publish)
+                for (unsigned depth = 2; depth <= 3; ++depth) {
+                    binary_fixture_t f;
+                    binary_fixture_init(&f, depth, owned, bound, 0);
+                    CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame,
+                        f.session, f.operation, f.operation_id,
+                        binary_owner(&f)));
+                    for (unsigned side = 0; side < 2; ++side) {
+                        const eval_entry_t *entry = NULL;
+                        CHECK(!wl_columnar_eval_stack_binary_input_owned(
+                                f.frame, side, &entry, binary_owner(&f)));
+                        CHECK(binary_test_entry_equal(entry,
+                            &f.before[depth - 2 + side]));
+                    }
+                    col_rel_t **slot = NULL;
+                    CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame,
+                        &slot, binary_owner(&f)));
+                    col_rel_t *candidate = wl_columnar_filter_test_source(1,
+                            2, false, false, false);
+                    *slot = candidate;
+                    if (publish) {
+                        bool committed = false;
+                        CHECK(!wl_columnar_eval_stack_binary_commit_owned(
+                                f.frame, &committed,
+                                binary_owner(&f)) && committed);
+                        eval_stack_t *stack =
+                            wl_columnar_eval_stack_cleanup_stack(f.frame);
+                        CHECK(stack->top == depth - 1);
+                        CHECK(stack->items[depth - 2].rel == candidate &&
+                            stack->items[depth - 2].owned &&
+                            !stack->items[depth - 2].is_delta &&
+                            !stack->items[depth - 2].seg_boundaries &&
+                            !stack->items[depth - 2].seg_count);
+                        for (unsigned i = 0; i + 2 < depth; ++i)
+                            CHECK(binary_test_entry_equal(&stack->items[i],
+                                &f.before[i]));
+                        CHECK(wl_columnar_eval_stack_binary_output_owned(
+                                f.frame, &slot, binary_owner(&f)) == EINVAL);
+                    } else {
+                        f.execution_result = ERANGE;
+                        binary_assert_originals(&f);
+                    }
+                    binary_run(&f);
+                    CHECK(f.status.committed == (publish != 0));
+                    CHECK(f.status.execution_result == (publish ? 0 : ERANGE));
+                    CHECK(f.status.semantic_result == (publish ? 0 : ERANGE));
+                    if (!publish) binary_assert_originals(&f);
+                    binary_fixture_close(&f, publish);
+                }
+}
+
+static void
+binary_test_gate(void)
+{
+    for (unsigned bound = 0; bound < 2; ++bound) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, false, bound, 0);
+        CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+            f.operation, f.operation_id, binary_owner(&f)));
+        const col_rel_t *input = NULL; col_rel_t **output = NULL;
+        bool committed = false;
+        CHECK(wl_columnar_eval_stack_unary_begin_attempt_owned(f.frame,
+            f.operation, f.operation_id, binary_owner(&f)) == EBUSY);
+        CHECK(wl_columnar_eval_stack_unary_input_owned(f.frame, &input,
+            binary_owner(&f)) != 0);
+        CHECK(wl_columnar_eval_stack_unary_output_owned(f.frame, &output,
+            binary_owner(&f)) != 0);
+        CHECK(wl_columnar_eval_stack_unary_commit_attempt_owned(f.frame,
+            &committed, binary_owner(&f)) != 0 && !committed);
+        CHECK(wl_columnar_eval_stack_unary_finish(f.frame, 0) != 0);
+        CHECK(wl_columnar_eval_stack_unary_reset_owned(f.frame,
+            binary_owner(&f)) != 0);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+        eval_stack_t *stack = NULL;
+        CHECK(wl_columnar_eval_stack_operator_stack_owned(f.frame, f.session,
+            &stack, binary_owner(&f)) == EBUSY);
+        wl_columnar_filter_context_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+            binary_owner(&f)) && ctx);
+        CHECK(!wl_columnar_filter_op_attempt_ack_owned(f.frame,
+            binary_owner(&f)));
+        CHECK(wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+            f.operation, f.operation_id, binary_owner(&f)) != 0);
+        binary_assert_originals(&f);
+        binary_run(&f); binary_fixture_close(&f, false);
+    }
+}
+
+static unsigned binary_cancel_phase;
+static void
+binary_cancel_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase == binary_cancel_phase)
+        wl_evaluation_control_request_cancel(control);
+}
+
+static void
+binary_test_cutoff_and_limits(void)
+{
+    /* Literal source-written schedules, independent of production constants:
+     * begin=256+192+2*(192+2*128)+20*192+192=5376.
+     * commit=192+2*128+192=640. No runtime hook derives these fees. */
+    const uint64_t limits[] = {255, 256, 5375, 5376, 6015, 6016};
+    const uint64_t consumed[] = {0, 256, 5184, 5376, 5824, 6016};
+    for (unsigned i = 0; i < 6; ++i) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, false, false, limits[i]);
+        int rc = wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+                f.operation, f.operation_id, NULL);
+        bool began = i >= 3, committed = false;
+        CHECK(rc == (began ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
+        if (began) {
+            if (i >= 4) {
+                col_rel_t **slot = NULL;
+                CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame,
+                    &slot, NULL));
+                *slot = wl_columnar_filter_test_source(1, 1, false, false,
+                        false);
+                rc = wl_columnar_eval_stack_binary_commit_owned(f.frame,
+                        &committed, NULL);
+                CHECK(rc == (i == 5 ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
+                CHECK(committed == (i == 5));
+            }
+            f.execution_result = rc;
+            binary_run(&f);
+        }
+        if (!committed) binary_assert_originals(&f);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            rc, 0) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.attempt_id == f.operation_id &&
+            report.consumed == consumed[i]);
+        binary_fixture_close(&f, committed);
+    }
+    for (unsigned phase = 3; phase <= 7; ++phase) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, false, false, 0);
+        binary_cancel_phase = phase;
+        wl_columnar_eval_stack_test_binary_checkpoint =
+            binary_cancel_checkpoint;
+        int rc = wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+                f.operation, f.operation_id, NULL);
+        if (phase < 6) CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED);
+        else {
+            CHECK(!rc); col_rel_t **slot = NULL;
+            CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame,
+                &slot, NULL));
+            *slot = wl_columnar_filter_test_source(1, 1, false, false, false);
+            bool committed = false;
+            rc = wl_columnar_eval_stack_binary_commit_owned(f.frame,
+                    &committed, NULL);
+            CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && !committed);
+            wl_columnar_eval_stack_test_binary_checkpoint = NULL;
+            f.execution_result = rc; binary_run(&f);
+        }
+        wl_columnar_eval_stack_test_binary_checkpoint = NULL;
+        binary_assert_originals(&f); binary_fixture_close(&f, false);
+    }
+}
+
+static void
+binary_test_aliases(void)
+{
+    for (unsigned shared = 0; shared < 3; ++shared) {
+        binary_fixture_t f; binary_fixture_init(&f, 3, false, false, 0);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        if (shared == 0 || shared == 1) {
+            free(stack->items[2].seg_boundaries);
+            stack->items[2].seg_boundaries =
+                stack->items[shared].seg_boundaries;
+            f.before[2] = stack->items[2];
+        } else {
+            col_rel_destroy(f.inputs[2]); f.inputs[2] = NULL;
+            stack->items[2].rel = stack->items[1].rel;
+            f.before[2] = stack->items[2];
+        }
+        int rc = wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+                f.operation, f.operation_id, NULL);
+        if (shared < 2) {
+            CHECK(rc == ENOTSUP); binary_assert_originals(&f);
+            stack->items[2].seg_boundaries = NULL;
+        } else {
+            CHECK(!rc); binary_run(&f); binary_assert_originals(&f);
+        }
+        binary_fixture_close(&f, false);
+    }
+    for (unsigned commit = 0; commit < 2; ++commit) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, false, false, 0);
+        CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+            f.operation, f.operation_id, NULL));
+        col_rel_t **slot = NULL;
+        CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame, &slot,
+            NULL));
+        *slot = f.inputs[0];
+        if (commit) {
+            bool published = false;
+            CHECK(wl_columnar_eval_stack_binary_commit_owned(f.frame,
+                &published, NULL) == EINVAL && !published);
+        }
+        binary_run(&f);
+        CHECK(f.status.semantic_result == EINVAL && !f.status.committed);
+        binary_assert_originals(&f); binary_fixture_close(&f, false);
+    }
+}
+
+static void
+binary_test_retained(void)
+{
+    for (unsigned mask = 1; mask < 4; ++mask) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, true, true, 0);
+        wl_columnar_source_access_reader_t readers[2] = {{0}, {0}};
+        for (unsigned i = 0; i < 2; ++i)
+            if (mask & (1u <<
+                i)) CHECK(!wl_columnar_source_access_reader_acquire(
+                        &f.inputs[i]->source_access, &readers[i]));
+        CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+            f.operation, f.operation_id, binary_owner(&f)));
+        col_rel_t **slot = NULL;
+        CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame, &slot,
+            binary_owner(&f)));
+        col_rel_t *out = wl_columnar_filter_test_source(1, 1, false, false,
+                false);
+        *slot = out; bool committed = false;
+        CHECK(!wl_columnar_eval_stack_binary_commit_owned(f.frame, &committed,
+            binary_owner(&f)) && committed);
+        uint64_t generation = out->storage_generation;
+        for (unsigned i = 0; i < 2; ++i) {
+            CHECK(!binary_host_finish(&f));
+            if (mask & (1u << i)) {
+                CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+                    && f.status.cleanup_result == EBUSY &&
+                    f.status.semantic_result == EBUSY && f.status.committed);
+                CHECK(!binary_host_finish(&f));
+                CHECK(f.status.progress ==
+                    WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+                CHECK(out->storage_generation == generation &&
+                    wl_columnar_eval_stack_cleanup_stack(
+                        f.frame)->items[0].rel == out);
+                CHECK(!wl_columnar_source_access_reader_release(&readers[i]));
+                CHECK(!binary_host_finish(&f));
+            }
+        }
+        CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE &&
+            !f.status.semantic_result && !f.status.cleanup_result);
+        CHECK(!binary_host_ack(&f));
+        binary_fixture_close(&f, true);
+    }
+}
+
+static void
+binary_test_claim_and_host(void)
+{
+    const unsigned depths[] = {1, 2, 3, COL_STACK_MAX};
+    for (unsigned i = 0; i < 4; ++i) {
+        binary_fixture_t f; binary_fixture_init(&f, depths[i], false, false, 0);
+        const unsigned bad[] = {0, COL_STACK_MAX + 1, depths[i] == 1 ? 2 : 1};
+        for (unsigned j = 0; j < 3; ++j) {
+            CHECK(wl_columnar_eval_plan_numeric_stack_attempt_begin(&f.record,
+                &f.plan, 0, 1, f.frame, f.session, bad[j], f.operation,
+                f.operation_id, f.funding, f.funding_id) == EINVAL);
+            CHECK(!f.record.identity && !f.record.control);
+            binary_assert_originals(&f);
+        }
+        CHECK(!wl_columnar_eval_plan_numeric_stack_attempt_begin(&f.record,
+            &f.plan, 0, 1, f.frame, f.session, depths[i], f.operation,
+            f.operation_id, f.funding, f.funding_id));
+        f.bound = true; binary_fixture_close(&f, false);
+    }
+    binary_fixture_t f; binary_fixture_init(&f, 2, false, true, 0);
+    wl_columnar_eval_plan_numeric_attempt_t copy = f.record;
+    CHECK(wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+        f.operation, f.operation_id, &copy) != 0);
+    CHECK(wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+        f.funding, f.funding_id, &f.record) == EINVAL);
+    CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+        f.operation, f.operation_id, &f.record));
+    wl_evaluation_control_t *saved = f.funding;
+    uint64_t saved_id = f.funding_id;
+    for (unsigned allowance = 383; allowance <= 384; ++allowance) {
+        int owner;
+        f.funding = wl_columnar_filter_test_control(allowance, &owner);
+        f.funding_id = wl_evaluation_control_active_attempt_id(f.funding);
+        memset(&f.status, 0x5a, sizeof(f.status));
+        wl_columnar_filter_status_t sentinel = f.status;
+        CHECK(binary_host_finish(&f) == (allowance == 383
+                ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (allowance == 383) CHECK(!memcmp(&sentinel, &f.status,
+                sizeof(sentinel)));
+        else CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
+        CHECK(wl_evaluation_control_finish(f.funding, &owner, 0, 0) ==
+            (allowance == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.funding, &report) &&
+            report.consumed == (allowance == 383 ? 0u : 384u));
+        CHECK(!wl_evaluation_control_detach(f.funding, &owner));
+        wl_evaluation_control_release(f.funding);
+    }
+    f.funding = saved; f.funding_id = saved_id;
+    CHECK(!binary_host_ack(&f)); binary_fixture_close(&f, false);
+}
+
+static void
+test_binary_replacement(void)
+{
+    binary_test_transactions(); binary_test_gate();
+    binary_test_cutoff_and_limits(); binary_test_aliases();
+    binary_test_retained(); binary_test_claim_and_host();
+}
+
+static void *
+binary_foreign_thread(void *arg)
+{
+    binary_fixture_t *f = arg;
+    const eval_entry_t *input = NULL;
+    CHECK(wl_columnar_eval_stack_binary_input_owned(f->frame, 0, &input,
+        binary_owner(f)) != 0 && !input);
+    CHECK(binary_host_finish(f) != 0);
+    CHECK(binary_host_ack(f) != 0);
+    return NULL;
+}
+
+static void
+binary_test_native_and_lifo(void)
+{
+    for (unsigned bound = 0; bound < 2; ++bound) {
+        binary_fixture_t f; binary_fixture_init(&f, 2, false, bound, 0);
+        CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+            f.operation, f.operation_id, binary_owner(&f)));
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, binary_foreign_thread, &f));
+        CHECK(!wl_thread_join(&thread));
+        binary_assert_originals(&f);
+        wl_columnar_eval_stack_cleanup_frame_t *inner = NULL;
+        CHECK(!wl_columnar_eval_stack_cleanup_begin(f.session, &inner));
+        CHECK(binary_host_finish(&f) != 0);
+        CHECK(binary_host_ack(&f) != 0);
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&inner));
+        binary_assert_originals(&f); binary_run(&f);
+        binary_fixture_close(&f, false);
+    }
+}
+
+static void
+binary_test_turnover(void)
+{
+    binary_fixture_t f; binary_fixture_init(&f, 2, false, true, 0);
+    CHECK(!wl_columnar_eval_stack_binary_begin_owned(f.frame, f.session,
+        f.operation, f.operation_id, binary_owner(&f)));
+    col_rel_t **slot = NULL;
+    CHECK(!wl_columnar_eval_stack_binary_output_owned(f.frame, &slot,
+        binary_owner(&f)));
+    *slot = wl_columnar_filter_test_source(1, 1, false, false, false);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    binary_run(&f);
+    binary_assert_originals(&f);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report));
+    CHECK(report.attempt_id == f.operation_id + 1 && !report.consumed);
+    binary_fixture_close(&f, false);
+}
+
 int
 main(void)
 {
+    test_binary_replacement(); binary_test_native_and_lifo();
+    binary_test_turnover();
     reduce_literal_matrix(); reduce_error_order(); reduce_stop_matrix();
     reduce_collisions(); reduce_owned_authority();
     reduce_allocation_and_domains(); reduce_retained_resources();
