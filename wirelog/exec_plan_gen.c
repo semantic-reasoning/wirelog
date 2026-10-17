@@ -2027,11 +2027,12 @@ translate_ir_node(const wirelog_ir_node_t *node, op_list_t *ops,
              */
             op->agg_operand_type = agg_operand_from_coltype(
                 expr_result_type(node->agg_expr, &agg_ctx));
-            op->agg_result_type = op->agg_operand_type;
             col_ctx_free(&agg_ctx);
             if (agg_rc != 0)
                 return -1;
         }
+        op->agg_result_type = op->agg_fn == WIRELOG_AGG_COUNT
+            ? WL_PLAN_AGG_OPERAND_SCALAR : op->agg_operand_type;
 
         /*
          * Say so once, here, when an ordering aggregate cannot be typed --

@@ -3,6 +3,8 @@
  * witness the scheduling boundary; an inline while(YIELD) cannot reuse this
  * per-dispatch contract. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/wirelog.h"
 #include "../wirelog/thread.h"
 #include <errno.h>
 #include <math.h>
@@ -3899,9 +3901,188 @@ admission_cases(void)
     admission_scenario = NULL;
 }
 
+/* COUNT returns cardinalities even when its ignored operand is FLOAT. The
+ * operand payloads are deliberately unrelated to the expected counts. */
+static col_rel_t *
+raw_count_input(bool grouped, bool empty, unsigned poison)
+{
+    col_rel_t *input = wl_columnar_filter_test_source(grouped ? 2 : 1, 0,
+            false, false, false);
+    input->has_graph_column = false; input->graph_col_idx = 0;
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT};
+    CHECK(!col_rel_set_column_types(input, grouped ? types : types + 1,
+        grouped ? 2 : 1));
+    const int64_t keys[] = {2, 1, 2, 1, 2};
+    const double values[] = {-7.5, 2.0, 100.0, -4.0, 9.0};
+    for (unsigned r = 0; !empty && r < 5; ++r) {
+        int64_t row[] = {keys[r], wl_columnar_float_to_bits(values[r])};
+        CHECK(!col_rel_append_row(input, grouped ? row : row + 1));
+    }
+    if (!empty && poison)
+        input->columns[grouped ? 1 : 0][0] = wl_columnar_float_to_bits(
+            poison == 1 ? NAN : INFINITY);
+    return input;
+}
+
+static void
+raw_count_result_domains(void)
+{
+    wl_columnar_filter_test_program_t ignored = {0};
+    wl_columnar_filter_test_constant(&ignored, WL_PLAN_EXPR_CONST_FLOAT,
+        wl_columnar_float_to_bits(1.0));
+    wl_columnar_filter_test_constant(&ignored, WL_PLAN_EXPR_CONST_FLOAT,
+        wl_columnar_float_to_bits(0.0));
+    wl_columnar_filter_test_opcode(&ignored, WL_PLAN_EXPR_ARITH_FLOAT_DIV);
+    const wl_plan_agg_operand_t domains[] = {WL_PLAN_AGG_OPERAND_UNKNOWN,
+                                             WL_PLAN_AGG_OPERAND_SCALAR,
+                                             WL_PLAN_AGG_OPERAND_STRING,
+                                             WL_PLAN_AGG_OPERAND_FLOAT};
+    for (unsigned grouped = 0; grouped < 2; ++grouped)
+        for (unsigned empty = 0; empty < 2; ++empty)
+            for (unsigned poison = 0; poison < 3; ++poison)
+                for (unsigned computed = 0; computed < 2; ++computed)
+                    for (unsigned d = 0; d < 4; ++d)
+                        for (unsigned placement = 0; placement < 3;
+                            ++placement){
+                            col_rel_t *input = raw_count_input(grouped != 0,
+                                    empty != 0, poison);
+                            wl_col_session_t *session =
+                                wl_columnar_filter_test_session();
+                            wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE,
+                                               .agg_fn = WIRELOG_AGG_COUNT,
+                                               .agg_operand_type = domains[d],
+                                               .group_by_count = grouped,
+                                               .aggregate_index = placement ==
+                                                   2 ? 99 : placement};
+                            if (computed) op.agg_expr =
+                                    (wl_plan_expr_buffer_t){ignored.bytes,
+                                                            ignored.size};
+                            eval_stack_t stack = {0};
+                            CHECK(!eval_stack_push(&stack, input, false));
+                            CHECK(!col_op_reduce(&op, &stack, session));
+                            CHECK(stack.top == 1 && stack.items[0].owned);
+                            col_rel_t *out = stack.items[0].rel;
+                            uint32_t agg = op.aggregate_index <
+                                grouped + 1 ? op.aggregate_index : grouped;
+                            CHECK(out->ncols == grouped + 1 &&
+                                out->nrows == (empty ? 0u : grouped ? 2u : 1u));
+                            CHECK(out->column_types &&
+                                out->column_types[agg] == WIRELOG_TYPE_INT64 &&
+                                !out->timestamps && !out->has_graph_column);
+                            for (uint32_t c = 0; c < out->ncols; ++c) {
+                                char name[16];
+                                snprintf(name, sizeof(name), "col%u", c);
+                                CHECK(!strcmp(out->col_names[c], name));
+                            }
+                            if (!empty) {
+                                CHECK(out->columns[agg][0] ==
+                                    (grouped ? 3 : 5));
+                                if (grouped) {
+                                    CHECK(out->columns[agg][1] == 2);
+                                    CHECK(out->columns[1 - agg][0] == 2 &&
+                                        out->columns[1 - agg][1] == 1);
+                                }
+                            }
+                            CHECK(!eval_stack_drain(&stack));
+                            col_rel_destroy(input);
+                            CHECK(!wl_columnar_filter_test_reserved(session));
+                            wl_columnar_memory_governor_ref_release(
+                                session->memory_governor); free(session);
+                        }
+    /* Ignoring the value never permits an invalid selected FLOAT group key. */
+    col_rel_t *float_key = wl_columnar_filter_test_source(2, 0, false, false,
+            false);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_FLOAT};
+    CHECK(!col_rel_set_column_types(float_key, types, 2));
+    int64_t row[] = {wl_columnar_float_to_bits(1.0),
+                     wl_columnar_float_to_bits(-7.5)};
+    CHECK(!col_rel_append_row(float_key, row));
+    float_key->columns[0][0] = wl_columnar_float_to_bits(NAN);
+    wl_col_session_t session = {0}; wl_mem_ledger_init(&session.mem_ledger, 0);
+    eval_stack_t stack = {0}; CHECK(!eval_stack_push(&stack, float_key, false));
+    wl_plan_op_t op = {.op = WL_PLAN_OP_REDUCE, .agg_fn = WIRELOG_AGG_COUNT,
+                       .agg_operand_type = WL_PLAN_AGG_OPERAND_FLOAT,
+                       .group_by_count = 1, .aggregate_index = 1};
+    CHECK(col_op_reduce(&op, &stack, &session) == EINVAL && !stack.top);
+    col_rel_destroy(float_key);
+}
+
+static void
+raw_count_generated_bodies(void)
+{
+    const char *queries[] = {
+        ".decl input(v:float)\n.decl output(n:int64)\noutput(count(v)) :- input(v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(g:int64,n:int64)\noutput(g,count(v)) :- input(g,v).\n",
+        ".decl input(g:int64,v:float)\n.decl output(n:int64,g:int64)\noutput(count(v),g) :- input(g,v).\n",
+        ".decl input(v:float)\n.decl output(n:int64)\noutput(count(v/0.0)) :- input(v).\n"
+    };
+    for (unsigned shape = 0; shape < 4; ++shape) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(queries[shape],
+                &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = {0};
+        for (uint32_t s = 0; s < plan->stratum_count; ++s)
+            for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+                if (!strcmp(plan->strata[s].relations[r].name, "output")) {
+                    body = plan->strata[s].relations[r];
+                    body.ops = plan->strata[s].bodies[r].ops;
+                    body.op_count = plan->strata[s].bodies[r].op_count;
+                }
+        CHECK(body.op_count >= 3 && body.ops[0].op == WL_PLAN_OP_VARIABLE &&
+            body.ops[body.op_count - 1].op == WL_PLAN_OP_CONSOLIDATE);
+        unsigned reductions = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i)
+            if (body.ops[i].op == WL_PLAN_OP_REDUCE) {
+                ++reductions;
+                CHECK(body.ops[i].agg_fn == WIRELOG_AGG_COUNT &&
+                    body.ops[i].agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT &&
+                    body.ops[i].agg_result_type == WL_PLAN_AGG_OPERAND_SCALAR);
+            }
+        CHECK(reductions == 1);
+        bool grouped = shape == 1 || shape == 2;
+        for (unsigned empty = 0; empty < 2; ++empty)
+            for (unsigned poison = 0; poison < 3; ++poison) {
+                col_rel_t *input = raw_count_input(grouped, empty != 0, poison);
+                CHECK(!wl_columnar_relation_rename_checked(input,
+                    body.ops[0].relation_name));
+                wl_col_session_t session = {0};
+                wl_mem_ledger_init(&session.mem_ledger, 0);
+                col_rel_t *registry[] = {input}; session.rels = registry;
+                session.nrels = 1;
+                eval_stack_t stack = {0};
+                CHECK(!col_eval_relation_plan(&body, &stack, &session));
+                CHECK(stack.top == 1 && stack.items[0].owned &&
+                    !stack.items[0].is_delta);
+                col_rel_t *out = stack.items[0].rel;
+                CHECK(out->nrows == (empty ? 0u : grouped ? 2u : 1u) &&
+                    out->ncols == (grouped ? 2u : 1u));
+                /* The raw owned <=1-row CONS path stamps one run even
+                 * for an empty relation; this is not controlled CONS's cache. */
+                CHECK(out->column_types && out->sorted_nrows == out->nrows &&
+                    out->run_count == 1 && out->run_ends[0] == out->nrows);
+                for (uint32_t c = 0; c < out->ncols;
+                    ++c) CHECK(out->column_types[c] == WIRELOG_TYPE_INT64);
+                for (uint32_t r = 0; r < out->nrows; ++r) {
+                    if (!grouped) CHECK(out->columns[0][r] == 5);
+                    else {
+                        uint32_t agg = shape == 2 ? 0 : 1;
+                        CHECK(out->columns[agg][r] == (int64_t)r + 2 &&
+                            out->columns[1 - agg][r] == (int64_t)r + 1);
+                    }
+                }
+                CHECK(!eval_stack_drain(&stack));
+                session_rel_free_hash(&session); col_rel_destroy(input);
+            }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
 int
 main(void)
 {
+    raw_count_result_domains(); raw_count_generated_bodies();
     printf(
         "numeric FILTER ABI descriptor=%zu frame=%zu program_owner=%zu instruction=%zu timestamp=%zu\n",
         sizeof(col_rel_t), wl_columnar_eval_stack_test_frame_size(),

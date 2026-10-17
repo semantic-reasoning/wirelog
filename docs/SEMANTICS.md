@@ -964,3 +964,20 @@ plans admit these opcodes and invoke their original owned entry directly.
 Complete generated SIP/negation bodies and composed MAP/probe chains retain
 terminal CONSOLIDATE semantics, including sorted distinct FLOAT output.
 Public/default/session scheduling remains separate from this interface.
+
+
+### COUNT operand and result domains
+
+COUNT returns an INT64 cardinality for each nonempty input group, including
+when the ignored operand is FLOAT or STRING. Its plan keeps the actual operand
+domain separately; the COUNT result domain is always SCALAR. FLOAT payloads
+do not initialize a count, and nonfinite ignored operand values or an ignored
+numeric division-by-zero expression do not affect cardinality. Selected FLOAT
+group keys still undergo normal typed validation. Empty input yields no groups,
+including an ungrouped COUNT; no synthetic zero row is introduced.
+
+Raw REDUCE retains its existing expression preparation and memory admission
+order even for COUNT: unused expression compilation may still fail for resource
+reasons. This contract does not promise unchanged allocation peaks or a bypass
+of source, output and scratch admission. Other aggregate functions retain their
+existing numeric operand and result domains.
