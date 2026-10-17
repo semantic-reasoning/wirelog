@@ -5743,7 +5743,7 @@ extern void (*wl_columnar_filter_test_attempt_checkpoint)(
 extern int wl_columnar_filter_test_attempt_fail_allocation;
 #endif
 
-/* Original-address JOIN/FILTER/MAP/CONSOLIDATE numeric plan segments. This internal
+/* Original-address JOIN/probe/FILTER/MAP/REDUCE/CONSOLIDATE numeric plan segments. This internal
  * host-driven interface does not activate public session evaluation controls.
  * The host binds one
  * private input entry and keeps plan/frame/session storage live until ACK.
@@ -5817,7 +5817,7 @@ int wl_columnar_eval_plan_numeric_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
-/* Initial ordinary VARIABLE + JOIN/FILTER/MAP/CONSOLIDATE fragment. Keep registry, names,
+/* Initial VARIABLE + JOIN/probe/FILTER/MAP/REDUCE/CONSOLIDATE fragment. Keep registry, names,
  * descriptors and source contents immutable and live through ACK. Unknown
  * delta modes use AUTO as in the raw VARIABLE operator. The containing
  * stratum must be nonrecursive (a caller precondition; relation plans do not

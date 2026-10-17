@@ -3317,7 +3317,7 @@ record clearing. Program retirement follows all three scratch records, then
 source End and the original unary decision. A refusal retains the original
 record and requires a fresh separately funded host retry; no successor control
 pays for old cleanup. Public/default evaluation still uses raw REDUCE, and both
-private numeric-plan preflights still reject REDUCE at this boundary.
+private numeric-plan preflights admit REDUCE through its original owned child.
 
 REDUCE pays128 per scalar cell and192 for the existing-group numeric update,
 whose FLOAT comparison/arithmetic dispatch is larger than an ordinary key
@@ -3333,3 +3333,13 @@ part of a new external host turn. Child START/STEP/ACK selection uses compatible
 readonly callbacks selected before HOST admission, with no cast or owner
 transfer. Exact work-limit fixtures pin ENTRY191/192; deeper hash/update/emit
 stops use deterministic cancellation, not an unimplemented deep budget matrix.
+
+The numeric driver directly dispatches REDUCE through the same genuine owner
+record used by the other numeric children. Its PENDING result is consumed on
+a later separately funded turn; cleanup, retained retry and ACK retain their
+original action boundaries. Source-bound plans keep the complete preserved
+VARIABLE-through-CONSOLIDATE body. Prebound plans start after VARIABLE, without
+forging an entry, owner or phase. REDUCE adds no numeric record field or new
+cleanup capacity. Full generated/composed tests compare literal typed results
+and independently cloned raw execution; raw empty CONS run-cache conventions
+are not imported into controlled empty results.

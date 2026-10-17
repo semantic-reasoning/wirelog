@@ -591,7 +591,8 @@ wl_columnar_eval_plan_numeric_source_step(
             ? kind == WL_PLAN_OP_VARIABLE
             : kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP
             || kind == WL_PLAN_OP_JOIN || kind == WL_PLAN_OP_SEMIJOIN
-            || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_CONSOLIDATE;
+            || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_CONSOLIDATE
+            || kind == WL_PLAN_OP_REDUCE;
         if (!supported) {
             record->semantic_result = ENOTSUP;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
@@ -795,7 +796,7 @@ wl_columnar_eval_plan_numeric_attempt_step(
             if (kind != WL_PLAN_OP_FILTER && kind != WL_PLAN_OP_MAP
                 && kind != WL_PLAN_OP_JOIN && kind != WL_PLAN_OP_SEMIJOIN
                 && kind != WL_PLAN_OP_ANTIJOIN &&
-                kind != WL_PLAN_OP_CONSOLIDATE)
+                kind != WL_PLAN_OP_CONSOLIDATE && kind != WL_PLAN_OP_REDUCE)
                 rc = ENOTSUP;
         }
         if (rc) {
@@ -834,6 +835,11 @@ wl_columnar_eval_plan_numeric_attempt_step(
         case WL_PLAN_OP_SEMIJOIN:
         case WL_PLAN_OP_ANTIJOIN:
             return wl_columnar_join_probe_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_REDUCE:
+            return wl_columnar_ops_reduce_attempt_start_owned(
                 &record->plan->ops[record->cursor], record->frame,
                 record->session, record->control, record->attempt_id,
                 &record->child_status, record);
