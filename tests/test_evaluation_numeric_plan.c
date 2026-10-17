@@ -3806,9 +3806,970 @@ test_generated_reduce_join_bodies(void)
     }
 }
 
+/* Whole UNION bodies use a separate host action. The external FIFO records
+ * the protocol only after this function returned; no child-result loop or
+ * assertion is hidden inside the live child caller suffix. */
+static int
+composed_host_turn(fixture_t *f, bool ack)
+{
+    /* This local grant stays exclusive and active until this action ends. */
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(0, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    int rc = ack ? wl_columnar_eval_plan_numeric_composed_attempt_ack(
+        &f->record, funding, id)
+        : f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        ? wl_columnar_eval_plan_numeric_composed_consume_result(&f->record,
+            f->pending_protocol, funding, id)
+        : wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+            funding, id);
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static void
+composed_action(fixture_t *f)
+{
+    f->pending_protocol = composed_host_turn(f, false);
+    CHECK(!f->pending_protocol ||
+        f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+}
+
+static void
+composed_run(fixture_t *f)
+{
+    queue_t q = {{0}, 0, 0};
+    enqueue(&q, 0); enqueue(&q, 1);
+    unsigned turns = 0, calls = 0, witnesses = 0;
+    while (q.count) {
+        CHECK(++turns < 100000);
+        unsigned job = q.entries[q.head];
+        q.head = (q.head + 1) % 4; --q.count;
+        if (!job) {
+            if (f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+                continue;
+            enqueue(&q, 0); ++calls;
+            CHECK(calls == witnesses + 1);
+            composed_action(f);
+        } else {
+            ++witnesses; CHECK(witnesses == calls);
+            if (f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+                enqueue(&q, 1);
+        }
+    }
+    CHECK(calls == witnesses && calls);
+}
+
+static void
+composed_until(fixture_t *f, wl_columnar_eval_plan_numeric_phase_t phase,
+    uint32_t cursor)
+{
+    for (unsigned turns = 0; f->record.phase != phase
+        || f->record.cursor != cursor; ++turns) {
+        CHECK(turns < 100000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(f);
+    }
+}
+
+static void
+composed_begin(fixture_t *f, const wl_plan_relation_t *plan,
+    col_rel_t **registry, uint32_t count, uint32_t depth)
+{
+    f->session.rels = registry; f->session.nrels = count;
+    f->session.rel_cap = count;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(&f->record,
+        plan, 0, plan->op_count, f->frame, &f->session, depth, f->operation,
+        f->operation_id, f->funding, f->funding_id));
+}
+
+static void
+composed_close(fixture_t *f)
+{
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+    int result = f->record.semantic_result;
+    CHECK(!composed_host_turn(f, true));
+    CHECK(!f->record.composed_mode && !f->record.identity);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(!f->session.cleanup_active_count &&
+        !f->session.cleanup_reserved_bytes);
+    uint64_t active = wl_evaluation_control_active_attempt_id(f->operation);
+    if (active && active != f->operation_id) result = 0;
+    if (active) CHECK(wl_evaluation_control_finish(f->operation,
+            &f->operation_owner, result, 0) == result);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->operation);
+    wl_evaluation_control_release(f->funding);
+    col_rel_destroy(f->input);
+}
+
+static wl_columnar_memory_governor_ref_t *
+composed_governor(fixture_t *f)
+{
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    wl_columnar_memory_governor_ref_t *governor = join_governor(f, 1u << 24);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &f->frame));
+    return governor;
+}
+
+/* Retire the genuine original record before resetting its operation. The
+ * immutable registry descriptors survive both frames and the canonical retry. */
+static void
+composed_retry_frame(fixture_t *f)
+{
+    int result = f->record.semantic_result;
+    CHECK(!composed_host_turn(f, true));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    uint64_t active = wl_evaluation_control_active_attempt_id(f->operation);
+    if (active && active != f->operation_id) result = 0;
+    if (active) CHECK(wl_evaluation_control_finish(f->operation,
+            &f->operation_owner, result, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->operation, &report));
+    if (report.attempt_id != f->operation_id) CHECK(!report.consumed);
+    CHECK(!wl_evaluation_control_reset(f->operation));
+    CHECK(!wl_evaluation_control_begin(f->operation, &f->operation_owner));
+    f->operation_id = wl_evaluation_control_active_attempt_id(f->operation);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->funding);
+    f->funding = control_new(0, &f->funding_owner);
+    f->funding_id = wl_evaluation_control_active_attempt_id(f->funding);
+    wl_columnar_eval_plan_numeric_attempt_init(&f->record);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &f->frame));
+    f->pending_protocol = 0;
+}
+
+static col_rel_t *
+composed_source(const char *name, uint32_t width, const double *values,
+    uint32_t rows, bool floating)
+{
+    col_rel_t *rel = source_new(width, 0);
+    CHECK(!wl_columnar_relation_rename_checked(rel, name));
+    wirelog_column_type_t *types = calloc(width ? width : 1, sizeof(*types));
+    int64_t *row = calloc(width ? width : 1, sizeof(*row));
+    CHECK(types && row);
+    for (uint32_t c = 0; c < width; ++c)
+        types[c] = floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+    if (width) CHECK(!col_rel_set_column_types(rel, types, width));
+    for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t c = 0; c < width; ++c)
+            row[c] = floating ? wl_columnar_float_to_bits(values[r] + c)
+                : (int64_t)values[r] + c;
+        CHECK(!col_rel_append_row(rel, row));
+    }
+    if (floating && width && rows && signbit(values[0]) && values[0] == 0.0)
+        rel->columns[0][0] = (int64_t)UINT64_C(0x8000000000000000);
+    free(types); free(row);
+    return rel;
+}
+
+static void
+composed_fixture(fixture_t *f, col_rel_t *input, uint64_t limit)
+{
+    source_fixture(f, input->ncols, 0, limit);
+    col_rel_destroy(f->input); f->input = input;
+}
+
+static void
+composed_literal(fixture_t *f, const double *values, uint32_t rows,
+    uint32_t width, bool floating)
+{
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack->top == 1 && stack->items[0].owned &&
+        !stack->items[0].is_delta && !stack->items[0].seg_boundaries &&
+        !stack->items[0].seg_count);
+    col_rel_t *out = stack->items[0].rel;
+    CHECK(out->nrows == rows && out->ncols == width && !out->timestamps);
+    CHECK(out->sorted_nrows == rows && out->run_count == (rows != 0));
+    if (rows) CHECK(out->run_ends[0] == rows);
+    for (uint32_t c = 0; c < width; ++c) {
+        CHECK(out->column_types && out->column_types[c] ==
+            (floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+        char name[32]; snprintf(name, sizeof(name), "col%u", c);
+        CHECK(!strcmp(out->col_names[c], name));
+        for (uint32_t r = 0; r < rows; ++r)
+            CHECK(out->columns[c][r] == (floating
+                ? wl_columnar_float_to_bits(values[r] + c)
+                : (int64_t)values[r] + c));
+    }
+}
+
+/* Cloned raw session and full original body, including CONCAT and final
+ * consolidation; never substitute individual per-rule relations. */
+static void
+composed_raw_parity(fixture_t *f, const wl_plan_relation_t *body,
+    uint32_t initial_depth)
+{
+    wl_col_session_t raw = {0};
+    wl_mem_ledger_init(&raw.mem_ledger, 0);
+    raw.nrels = f->session.nrels; raw.rel_cap = raw.nrels;
+    raw.rels = calloc(raw.nrels ? raw.nrels : 1, sizeof(*raw.rels));
+    CHECK(raw.rels);
+    for (uint32_t i = 0; i < raw.nrels; ++i)
+        CHECK(!col_rel_deep_copy(f->session.rels[i], &raw.rels[i], NULL));
+    eval_stack_t stack = {0};
+    for (uint32_t i = 0; i < initial_depth; ++i)
+        CHECK(!eval_stack_push(&stack, raw.rels[i], false));
+    CHECK(!col_eval_relation_plan(body, &stack, &raw));
+    eval_stack_t *actual = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(actual->top == 1 && stack.top == 1);
+    same_relation(actual->items[0].rel, stack.items[0].rel);
+    CHECK(actual->items[0].is_delta == stack.items[0].is_delta);
+    /* Raw empty CONS may keep a one-run cache; controlled empty cache is
+     * explicitly0 and checked against its literal contract above. */
+    if (actual->items[0].rel->nrows) {
+        CHECK(actual->items[0].rel->sorted_nrows ==
+            stack.items[0].rel->sorted_nrows);
+        CHECK(actual->items[0].rel->run_count == stack.items[0].rel->run_count);
+    }
+    CHECK(!eval_stack_drain(&stack));
+    for (uint32_t i = 0; i < raw.arr_count; ++i) {
+        CHECK(!raw.arr_entries[i].pin_count);
+        free(raw.arr_entries[i].rel_name); free(raw.arr_entries[i].key_cols);
+        arr_free_contents(&raw.arr_entries[i].arr);
+        col_arr_detach_memory_governor(&raw.arr_entries[i].arr);
+    }
+    free(raw.arr_entries); session_rel_free_hash(&raw);
+    for (uint32_t i = 0; i < raw.nrels; ++i) col_rel_destroy(raw.rels[i]);
+    free(raw.rels);
+    CHECK(!f->session.rel_hash_nbuckets && !f->session.arr_count);
+}
+
+static void
+test_composed_generated_union(void)
+{
+    const double ints_a[] = {3, 1, 3, -2}, ints_b[] = {1, 4, 0};
+    const double floats_a[] = {-0.0, -2.5, 1.5, 1.5};
+    const double floats_b[] = {0.0, 4.5, -2.5}, floats_c[] = {7, 4.5, -3};
+    const double int_values[] = {-2, 0, 1, 3, 4};
+    const double float_values[] = {-3, -2.5, 0.0, 1.5, 4.5, 7};
+    const unsigned int_masks[] = {1, 2, 3, 1, 2};
+    const unsigned float_masks[] = {4, 3, 3, 1, 6, 4};
+    for (unsigned floating = 0; floating < 2; ++floating) {
+        const char *text = floating
+            ? ".decl a(x:float)\n.decl b(x:float)\n.decl c(x:float)\n"
+            ".decl output(x:float)\noutput(x):-a(x).\n"
+            "output(x):-b(x).\noutput(x):-c(x).\n"
+            : ".decl a(x:int64)\n.decl b(x:int64)\n.decl output(x:int64)\n"
+            "output(x):-a(x).\noutput(x):-b(x).\n";
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        unsigned variables = 0, concats = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            variables += body.ops[i].op == WL_PLAN_OP_VARIABLE;
+            concats += body.ops[i].op == WL_PLAN_OP_CONCAT;
+        }
+        CHECK(variables == (floating ? 3u : 2u) && concats + 1 == variables);
+        CHECK(body.ops[body.op_count-1].op == WL_PLAN_OP_CONSOLIDATE);
+        for (unsigned empty = 0; empty < (1u << variables); ++empty)
+            for (unsigned governed = 0; governed < 2; ++governed)
+                for (unsigned prebound = 0; prebound < 2; ++prebound) {
+                    col_rel_t *a = composed_source("a", 1,
+                            floating ? floats_a : ints_a, empty & 1 ? 0 : 4,
+                            floating);
+                    col_rel_t *b = composed_source("b", 1,
+                            floating ? floats_b : ints_b, empty & 2 ? 0 : 3,
+                            floating);
+                    col_rel_t *c = composed_source("c", 1, floats_c,
+                            empty & 4 ? 0 : 3, floating);
+                    fixture_t f; composed_fixture(&f, a, 0);
+                    wl_columnar_memory_governor_ref_t *governor = governed
+                        ? composed_governor(&f) : NULL;
+                    col_rel_t *registry[] = {a, b, c};
+                    wl_plan_relation_t slice = body;
+                    if (prebound) {
+                        CHECK(body.ops[0].op == WL_PLAN_OP_VARIABLE);
+                        CHECK(!eval_stack_push(
+                                wl_columnar_eval_stack_cleanup_stack(
+                                    f.frame), a, false));
+                        ++slice.ops; --slice.op_count;
+                    }
+                    composed_begin(&f, &slice, registry, variables, prebound);
+                    composed_run(&f);
+                    CHECK(!f.record.semantic_result &&
+                        f.record.completed == slice.op_count &&
+                        f.record.runtime_depth == 1);
+                    double expected[6]; uint32_t count = 0;
+                    for (unsigned i = 0; i < (floating ? 6u : 5u); ++i)
+                        if ((floating ? float_masks[i] : int_masks[i]) & ~empty)
+                            expected[count++] =
+                                floating ? float_values[i] : int_values[i];
+                    composed_literal(&f, expected, count, 1, floating);
+                    composed_raw_parity(&f, &slice, prebound);
+                    composed_close(&f); col_rel_destroy(b); col_rel_destroy(c);
+                    if (governor) {
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(governor)));
+                        wl_columnar_memory_governor_ref_release(governor);
+                    }
+                }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_composed_nested_and_wide(void)
+{
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0}, cv[] = {7, 4, -3};
+    const double expected[] = {-3, -2, 0, 1, 3, 4, 7};
+    const uint32_t widths[] = {0, 1, 17, 129};
+    for (unsigned w = 0; w < 4; ++w)
+        for (unsigned prebound = 0; prebound < 2; ++prebound)
+            for (unsigned governed = 0; governed < 2; ++governed) {
+                col_rel_t *a = composed_source("a", widths[w], av, 4, false);
+                col_rel_t *b = composed_source("b", widths[w], bv, 3, false);
+                col_rel_t *c = composed_source("c", widths[w], cv, 3, false);
+                fixture_t f; composed_fixture(&f, a, 0);
+                wl_columnar_memory_governor_ref_t *governor = governed
+                    ? composed_governor(&f) : NULL;
+                wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                                       .relation_name = "a"},
+                                      {.op = WL_PLAN_OP_VARIABLE,
+                                       .relation_name = "b"},
+                                      {.op = WL_PLAN_OP_VARIABLE,
+                                       .relation_name = "c"},
+                                      {.op = WL_PLAN_OP_CONCAT},
+                                      {.op = WL_PLAN_OP_CONCAT},
+                                      {.op = WL_PLAN_OP_CONSOLIDATE},
+                                      {.op = WL_PLAN_OP_CONSOLIDATE}};
+                wl_plan_relation_t body = {.ops = ops + (prebound ? 3 : 0),
+                                           .op_count = prebound ? 4 : 7};
+                col_rel_t *registry[] = {a, b, c};
+                if (prebound) {
+                    eval_stack_t *stack =
+                        wl_columnar_eval_stack_cleanup_stack(f.frame);
+                    for (unsigned i = 0; i < 3; ++i)
+                        CHECK(!eval_stack_push(stack, registry[i], false));
+                }
+                composed_begin(&f, &body, registry, 3, prebound ? 3 : 0);
+                composed_run(&f);
+                CHECK(!f.record.semantic_result &&
+                    f.record.completed == body.op_count);
+                composed_literal(&f, expected, widths[w] ? 7 : 1, widths[w],
+                    false);
+                composed_raw_parity(&f, &body, prebound ? 3 : 0);
+                composed_close(&f); col_rel_destroy(b); col_rel_destroy(c);
+                if (governor) {
+                    CHECK(!wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(governor)));
+                    wl_columnar_memory_governor_ref_release(governor);
+                }
+            }
+}
+
+static void
+test_composed_branch_children(void)
+{
+    const char *rules[] = {
+        "output(x+1):-a(x),x>=0.\noutput(x+1):-b(x),x>=0.\n",
+        "output(x+y):-a(x),right(y).\noutput(x+y):-b(x),right(y).\n",
+        "output(x):-a(x),right(x),mid(x).\n"
+        "output(x):-b(x),right(x),mid(x).\n",
+        "output(x):-a(x),!right(x).\noutput(x):-b(x),!right(x).\n",
+        "output(sum(x)):-a(x).\noutput(sum(x)):-b(x).\n"
+    };
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0};
+    const double literals[][10] = {{1, 2, 4, 5},
+                                   {-2, -1, 0, 1, 2, 3, 4, 5, 7, 8},
+                                   {0, 1, 4}, {-2, 3}, {5}};
+    const unsigned counts[] = {4, 10, 3, 2, 1};
+    for (unsigned shape = 0; shape < 5; ++shape) {
+        char text[1024];
+        snprintf(text, sizeof(text), ".decl a(x:int64)\n.decl b(x:int64)\n"
+            ".decl right(y:int64)\n.decl mid(z:int64)\n"
+            ".decl output(x:int64)\n%s", rules[shape]);
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(text, &error);
+        CHECK(program);
+        if (shape == 2) {
+            wl_sip_stats_t stats = {0}; CHECK(!wl_sip_apply(program, &stats));
+            CHECK(stats.semijoins_inserted == 2);
+        }
+        wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
+        wl_plan_relation_t body = probe_generated_body(plan);
+        unsigned variables = 0, concats = 0, selected = 0;
+        for (uint32_t i = 0; i < body.op_count; ++i) {
+            variables += body.ops[i].op == WL_PLAN_OP_VARIABLE;
+            concats += body.ops[i].op == WL_PLAN_OP_CONCAT;
+            selected += body.ops[i].op == (shape == 0 ? WL_PLAN_OP_FILTER
+                : shape == 1 ? WL_PLAN_OP_JOIN : shape ==
+                2 ? WL_PLAN_OP_SEMIJOIN
+                : shape == 3 ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_REDUCE);
+        }
+        CHECK(variables == 2 && concats == 1 && selected == 2);
+        CHECK(body.ops[body.op_count-1].op == WL_PLAN_OP_CONSOLIDATE);
+        for (unsigned governed = 0; governed < 2; ++governed) {
+            col_rel_t *a = composed_source("a", 1, av, 4, false);
+            col_rel_t *b = composed_source("b", 1, bv, 3, false);
+            col_rel_t *right = composed_source("right", 1, bv, 3, false);
+            col_rel_t *mid = composed_source("mid", 1, bv, 3, false);
+            fixture_t f; composed_fixture(&f, a, 0);
+            wl_columnar_memory_governor_ref_t *governor = governed
+                ? composed_governor(&f) : NULL;
+            col_rel_t *registry[] = {a, b, right, mid};
+            composed_begin(&f, &body, registry, 4, 0); composed_run(&f);
+            CHECK(!f.record.semantic_result &&
+                f.record.completed == body.op_count);
+            composed_literal(&f, literals[shape], counts[shape], 1, false);
+            composed_raw_parity(&f, &body, 0);
+            composed_close(&f); col_rel_destroy(b); col_rel_destroy(right);
+            col_rel_destroy(mid);
+            if (governor) {
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+        }
+        wl_plan_free(plan); wirelog_program_free(program);
+    }
+}
+
+static void
+test_composed_grammar(void)
+{
+    const double av[] = {3, 1, 3, -2};
+    for (unsigned shape = 0; shape < 4; ++shape) {
+        wl_plan_op_t ops[33] = {0};
+        unsigned count = shape == 3 ? 33 : 2;
+        for (unsigned i = 0; i < count; ++i) {
+            ops[i].op = WL_PLAN_OP_VARIABLE; ops[i].relation_name = "a";
+        }
+        if (!shape) ops[1].op = (wl_plan_op_type_t)999;
+        if (shape == 1) ops[1].op = WL_PLAN_OP_CONCAT;
+        wl_plan_relation_t body = {.ops = ops, .op_count = count};
+        fixture_t f;
+        composed_fixture(&f, composed_source("a", 1, av, 4, false), 0);
+        col_rel_t *registry[] = {f.input};
+        composed_begin(&f, &body, registry, 1, 0); composed_run(&f);
+        CHECK(f.record.semantic_result == (!shape ? ENOTSUP
+            : shape == 3 ? ENOBUFS : EINVAL));
+        CHECK(!f.record.completed && !f.record.runtime_depth
+            && !f.record.source_initialized && !f.record.source_full
+            && !f.record.source_selected && !f.record.source_output);
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+        composed_close(&f);
+    }
+}
+
+static void
+test_composed_later_failure_and_retry(void)
+{
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0};
+    wl_plan_op_t missing_ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                                   .relation_name = "a"},
+                                  {.op = WL_PLAN_OP_MAP, .project_count = 1},
+                                  {.op = WL_PLAN_OP_VARIABLE,
+                                   .relation_name = "missing"},
+                                  {.op = WL_PLAN_OP_CONCAT},
+                                  {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t missing = {.ops = missing_ops, .op_count = 5};
+    fixture_t f; composed_fixture(&f, composed_source("a", 1, av, 4, false), 0);
+    col_rel_t *registry[] = {f.input};
+    composed_begin(&f, &missing, registry, 1, 0);
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 2);
+    join_snapshot_t snapshot = join_snapshot(&f);
+    CHECK(snapshot.owned);
+    composed_run(&f);
+    CHECK(f.record.semantic_result == ENOENT && f.record.completed == 2);
+    join_snapshot_check(&f, &snapshot); col_rel_destroy(snapshot.contents);
+    composed_close(&f);
+
+    /* Stop at a later, actually owned empty-source candidate; retain it
+     * through refusal, then complete cleanup after cancellation with fresh
+     * host grants. Original lower entry never becomes candidate cleanup. */
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    for (unsigned fault = 0; fault < 4; ++fault) {
+        col_rel_t *a = composed_source("a", 1, av, 4, false);
+        col_rel_t *b = composed_source("b", 1, bv, 3, false);
+        composed_fixture(&f, a, 0);
+        wl_columnar_memory_governor_ref_t *governor = composed_governor(&f);
+        col_rel_t *sources[] = {a, b};
+        composed_begin(&f, &body, sources, 2, 0);
+        const wl_columnar_eval_plan_numeric_phase_t stops[] = {
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD,
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+        };
+        composed_until(&f, stops[fault], 1);
+        snapshot = join_snapshot(&f);
+        wl_columnar_source_access_reader_t reader = {0};
+        col_rel_t *candidate =
+            wl_columnar_eval_stack_cleanup_result(f.frame)->rel;
+        if (fault == 3) {
+            CHECK(candidate && !col_rel_source_reader_acquire(candidate,
+                &reader));
+        }
+        wl_evaluation_control_request_cancel(f.operation);
+        if (fault == 3) {
+            composed_until(&f,
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT, 1);
+            composed_action(&f);
+            CHECK(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                && f.record.protocol_result == EBUSY
+                && wl_columnar_eval_stack_cleanup_result(f.frame)->rel ==
+                candidate);
+            CHECK(!col_rel_source_reader_release(&reader));
+        }
+        composed_run(&f);
+        CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+            && f.record.completed == 1 && f.record.runtime_depth == 1);
+        join_snapshot_check(&f, &snapshot); col_rel_destroy(snapshot.contents);
+        CHECK(!wl_columnar_eval_stack_cleanup_result(f.frame)->rel
+            && !f.record.source_initialized && !f.record.source_slot_borrowed);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            f.record.semantic_result, 0) == f.record.semantic_result);
+        CHECK(!wl_evaluation_control_reset(f.operation));
+        CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+        uint64_t successor =
+            wl_evaluation_control_active_attempt_id(f.operation);
+        /* ACK's funding exclusion applies to the same pointer's successor. */
+        CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f.record,
+            f.operation, successor) == EINVAL);
+        composed_retry_frame(&f);
+        composed_begin(&f, &body, sources, 2, 0); composed_run(&f);
+        const double expected[] = {-2, 1, 3};
+        CHECK(!f.record.semantic_result && f.record.completed == 4);
+        composed_literal(&f, expected, 3, 1, false);
+        composed_raw_parity(&f, &body, 0);
+        composed_close(&f); col_rel_destroy(b);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+static void
+test_composed_source_allocation_failures(void)
+{
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    uint32_t reached = 0;
+    for (uint32_t ordinal = 0; !ordinal || ordinal <= reached; ++ordinal) {
+        col_rel_t *a = composed_source("a", 17, av, 4, false);
+        col_rel_t *b = composed_source("b", 17, bv, 3, false);
+        fixture_t f; composed_fixture(&f, a, 0);
+        wl_columnar_memory_governor_ref_t *governor = composed_governor(&f);
+        col_rel_t *registry[] = {a, b};
+        composed_begin(&f, &body, registry, 2, 0);
+        composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW, 1);
+        join_snapshot_t snapshot = join_snapshot(&f);
+        wl_columnar_relation_test_constructor_fail_allocation =
+            ordinal ? ordinal : UINT32_MAX;
+        composed_action(&f);
+        if (!ordinal) reached = UINT32_MAX -
+                wl_columnar_relation_test_constructor_fail_allocation;
+        wl_columnar_relation_test_constructor_fail_allocation = 0;
+        CHECK(reached);
+        composed_run(&f);
+        CHECK(f.record.semantic_result == (ordinal ? ENOMEM : 0));
+        if (ordinal) {
+            CHECK(f.record.completed == 1 && !f.session.memory_budget_denied);
+            join_snapshot_check(&f, &snapshot);
+            CHECK(!wl_columnar_eval_stack_cleanup_result(f.frame)->rel);
+        }
+        col_rel_destroy(snapshot.contents); composed_close(&f);
+        col_rel_destroy(b);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+static void
+test_composed_later_concat_failure(void)
+{
+    const double av[] = {-0.0, -2.5, 1.5, 1.5}, bv[] = {0, 4.5, -2.5};
+    const double cv[] = {7, 4.5, -3};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b"},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "c"},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 6};
+    for (unsigned invalid = 0; invalid < 2; ++invalid) {
+        col_rel_t *a = composed_source("a", 1, av, 4, true);
+        col_rel_t *b = composed_source("b", 1, bv, 3, true);
+        col_rel_t *c = composed_source("c", 1, cv, 3, true);
+        c->columns[0][1] = wl_columnar_float_to_bits(invalid ? NAN : INFINITY);
+        fixture_t f; composed_fixture(&f, a, 0);
+        wl_columnar_memory_governor_ref_t *governor = composed_governor(&f);
+        col_rel_t *registry[] = {a, b, c};
+        composed_begin(&f, &body, registry, 3, 0);
+        composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 3);
+        join_snapshot_t snapshot = join_snapshot(&f); CHECK(snapshot.owned);
+        composed_run(&f);
+        CHECK(f.record.semantic_result == EINVAL && f.record.completed == 4);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack->top == 2 && stack->items[0].rel == snapshot.identity
+            && stack->items[0].owned && stack->items[1].rel == c &&
+            !stack->items[1].owned);
+        same_relation(stack->items[0].rel, snapshot.contents);
+        col_rel_destroy(snapshot.contents);
+        /* Keep both borrowed registry descriptors alive across failed-frame
+         * teardown and a genuine reset/new frame, repairing only bad c cell. */
+        composed_retry_frame(&f);
+        c->columns[0][1] = wl_columnar_float_to_bits(4.5);
+        composed_begin(&f, &body, registry, 3, 0); composed_run(&f);
+        const double expected[] = {-3, -2.5, 0, 1.5, 4.5, 7};
+        CHECK(!f.record.semantic_result && f.record.completed == 6);
+        composed_literal(&f, expected, 6, 1, true);
+        composed_raw_parity(&f, &body, 0); composed_close(&f);
+        col_rel_destroy(b); col_rel_destroy(c);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
+static void
+test_composed_retained_and_turnover(void)
+{
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0}, cv[] = {7, 4, -3};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_CONCAT}, {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 3};
+    for (unsigned mask = 1; mask < 4; ++mask)
+        for (unsigned turnover = 0; turnover < 2; ++turnover) {
+            col_rel_t *a = composed_source("a", 1, av, 4, false);
+            col_rel_t *b = composed_source("b", 1, bv, 3, false);
+            col_rel_t *c = composed_source("c", 1, cv, 3, false);
+            fixture_t f; composed_fixture(&f, a, 0);
+            wl_columnar_memory_governor_ref_t *governor = composed_governor(&f);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            col_rel_t *registry[] = {a, b, c};
+            for (unsigned i = 0; i < 3;
+                ++i) CHECK(!eval_stack_push(stack, registry[i], true));
+            composed_begin(&f, &body, NULL, 0, 3);
+            wl_columnar_source_access_reader_t readers[2] = {{0}};
+            for (unsigned i = 0; i < 2; ++i)
+                if (mask & (1u <<
+                    i)) CHECK(!col_rel_source_reader_acquire(registry[i+1],
+                        &readers[i]));
+            for (unsigned turns = 0; !(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD &&
+                f.record.child_status.progress ==
+                WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+                ++turns){
+                CHECK(turns < 100000); composed_action(&f);
+            }
+            CHECK(stack->top == 2 && stack->items[0].rel == a &&
+                stack->items[0].owned);
+            col_rel_t *published = stack->items[1].rel;
+            CHECK(published && published->nrows == 6 &&
+                f.record.child_status.committed);
+            if (turnover) {
+                CHECK(!wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, 0, 0));
+                CHECK(!wl_evaluation_control_reset(f.operation));
+                CHECK(!wl_evaluation_control_begin(f.operation,
+                    &f.operation_owner));
+            }
+            for (unsigned retry = 0; retry < 3; ++retry) {
+                composed_action(&f); CHECK(stack->items[1].rel == published);
+            }
+            for (unsigned i = 0; i < 2; ++i)
+                if (mask & (1u <<
+                    i)) CHECK(!col_rel_source_reader_release(&readers[i]));
+            composed_run(&f);
+            CHECK(f.record.semantic_result == (turnover ? EINVAL : 0));
+            CHECK(f.record.completed == (turnover ? 1u : 3u));
+            if (turnover) {
+                CHECK(stack->top == 2 && stack->items[0].rel == a &&
+                    stack->items[1].rel == published);
+                CHECK(!wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, 0, 0));
+                wl_evaluation_control_report_t report;
+                CHECK(!wl_evaluation_control_report(f.operation, &report));
+                CHECK(report.attempt_id != f.operation_id && !report.consumed);
+            } else {
+                const double expected[] = {-3, -2, 0, 1, 3, 4, 7};
+                composed_literal(&f, expected, 7, 1, false);
+            }
+            f.input = NULL; composed_close(&f);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+        }
+}
+
+static void *
+composed_wrong_thread(void *data)
+{
+    fixture_t *f = data;
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+        f->funding, f->funding_id) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f->record,
+        f->funding, f->funding_id) == EINVAL);
+    return NULL;
+}
+
+static void
+test_composed_authority_and_host_funding(void)
+{
+    const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b"},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    fixture_t f; composed_fixture(&f, composed_source("a", 1, av, 4, false), 0);
+    col_rel_t *b = composed_source("b", 1, bv, 3, false);
+    col_rel_t *registry[] = {f.input, b};
+    composed_begin(&f, &body, registry, 2, 0);
+    wl_columnar_eval_plan_numeric_attempt_t copied = f.record;
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&copied,
+        f.funding, f.funding_id) == EINVAL);
+    wl_thread_t thread;
+    CHECK(!wl_thread_create(&thread, composed_wrong_thread, &f));
+    CHECK(!wl_thread_join(&thread));
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session, &nested));
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+        f.funding, f.funding_id) == EBUSY);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    CHECK(wl_columnar_eval_plan_numeric_attempt_step(&f.record,
+        f.funding, f.funding_id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_consume_result(&f.record, 0,
+        f.funding, f.funding_id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_attempt_ack(&f.record,
+        f.funding, f.funding_id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+        f.operation, f.operation_id) == EINVAL);
+    int wrong_owner = 0;
+    wl_evaluation_control_t *wrong = control_new(0, &wrong_owner);
+    uint64_t wrong_id = wl_evaluation_control_active_attempt_id(wrong);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+        wrong, wrong_id + 1) == EINVAL);
+    CHECK(!wl_evaluation_control_finish(wrong, &wrong_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(wrong));
+    CHECK(!wl_evaluation_control_begin(wrong, &wrong_owner));
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+        wrong, wrong_id) == EINVAL);
+    uint64_t current_wrong_id = wl_evaluation_control_active_attempt_id(wrong);
+    CHECK(!wl_evaluation_control_finish(wrong, &wrong_owner, 0, 0));
+    wl_evaluation_control_report_t wrong_report;
+    CHECK(!wl_evaluation_control_report(wrong, &wrong_report));
+    CHECK(wrong_report.attempt_id == current_wrong_id &&
+        !wrong_report.consumed);
+    CHECK(!wl_evaluation_control_detach(wrong, &wrong_owner));
+    wl_evaluation_control_release(wrong);
+    wl_columnar_eval_plan_numeric_attempt_t before;
+    memcpy(&before, &f.record, sizeof(before));
+    int owner = 0; wl_evaluation_control_t *poor = control_new(383, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(poor);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record, poor,
+        id)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!memcmp(&before, &f.record, sizeof(before)));
+    CHECK(wl_evaluation_control_finish(poor, &owner, 0,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(poor, &report));
+    CHECK(report.attempt_id == id && !report.consumed);
+    CHECK(!wl_evaluation_control_detach(poor, &owner));
+    wl_evaluation_control_release(poor);
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD, 2);
+    /* Reach real BINARY retirement naturally; no fabricated phase. */
+    wl_columnar_merge_concat_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_concat_context_owned(f.frame, &ctx,
+        &f.record));
+    for (unsigned turns = 0; ctx->phase != 10 /* original BINARY phase, merge.c */
+        || f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD;
+        ++turns){
+        CHECK(turns < 100000); composed_action(&f);
+    }
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD);
+    const uint64_t limits[] = {384, 767, 768, 1151, 1152};
+    const uint64_t consumed[] = {384, 384, 768, 768, 1152};
+    for (unsigned i = 0; i < 5; ++i) {
+        poor = control_new(limits[i], &owner);
+        id = wl_evaluation_control_active_attempt_id(poor);
+        wl_columnar_filter_status_t status;
+        memcpy(&status, &f.record.child_status, sizeof(status));
+        int rc = wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+                poor, id);
+        CHECK(rc == (i < 4 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+        if (i < 4) CHECK(!memcmp(&status, &f.record.child_status,
+                sizeof(status)));
+        CHECK(wl_evaluation_control_finish(poor, &owner, 0, 0) == rc);
+        CHECK(!wl_evaluation_control_report(poor, &report));
+        CHECK(report.attempt_id == id && report.consumed == consumed[i]);
+        CHECK(!wl_evaluation_control_detach(poor, &owner));
+        wl_evaluation_control_release(poor);
+        f.pending_protocol = rc;
+        composed_action(&f); /* Different fresh host action consumes protocol. */
+        CHECK(f.record.runtime_depth == 2 && f.record.completed == 2);
+    }
+    composed_run(&f); CHECK(!f.record.semantic_result);
+    CHECK(f.record.completed == 4);
+    composed_close(&f); col_rel_destroy(b);
+}
+
+static void
+test_composed_begin_limits(void)
+{
+    const uint64_t limits[] = {191, 192, 1535, 1536, 1791, 1792, 2047, 2048};
+    const uint64_t consumed[] = {0, 192, 1344, 1536, 1536, 1792, 1792, 2048};
+    const double av[] = {3, 1, 3, -2};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"};
+    wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+    for (unsigned i = 0; i < 8; ++i) {
+        fixture_t f;
+        composed_fixture(&f, composed_source("a", 1, av, 4, false), limits[i]);
+        col_rel_t *registry[] = {f.input}; f.session.rels = registry;
+        f.session.nrels = 1;
+        int rc = wl_columnar_eval_plan_numeric_composed_attempt_begin(&f.record,
+                &body, 0, 1, f.frame, &f.session, 0, f.operation,
+                f.operation_id,
+                f.funding, f.funding_id);
+        if (i == 7) {
+            CHECK(!rc); composed_run(&f);
+            CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && !f.record.completed && !f.record.runtime_depth);
+            CHECK(!composed_host_turn(&f, true));
+        } else CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT &&
+                !f.record.identity);
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&f.frame));
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            WL_EVALUATION_CONTROL_WORK_LIMIT,
+            0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.attempt_id == f.operation_id &&
+            report.consumed == consumed[i]);
+        CHECK(!wl_evaluation_control_finish(f.funding, &f.funding_owner, 0, 0));
+        CHECK(!wl_evaluation_control_detach(f.operation, &f.operation_owner));
+        CHECK(!wl_evaluation_control_detach(f.funding, &f.funding_owner));
+        wl_evaluation_control_release(f.operation);
+        wl_evaluation_control_release(f.funding);
+        col_rel_destroy(f.input);
+    }
+}
+
+static void
+test_composed_domain_and_repeated_source(void)
+{
+    const double values[] = {3, 1, 3, -2};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+                          {.op = WL_PLAN_OP_CONCAT},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    for (unsigned domain = 0; domain < 11; ++domain) {
+        fixture_t f;
+        composed_fixture(&f, composed_source("a", 1, values, 4, false), 0);
+        col_rel_t *registry[] = {f.input}; f.session.rels = registry;
+        f.session.nrels = 1;
+        if (domain == 0) f.session.current_iteration = 1;
+        if (domain == 1) f.session.retraction_seeded = true;
+        if (domain == 2) f.session.retraction_right_pass = true;
+        if (domain == 3) f.session.tdd_input_run = (void *)&f;
+        if (domain == 4) f.session.tdd_subpass_active = true;
+        if (domain == 5) f.session.tdd_outbound_only_active = true;
+        if (domain == 6) f.session.diff_operators_active = true;
+        if (domain == 7) f.session.join_batch_bytes = 1;
+        atomic_uint_fast64_t shared_count = 0;
+        if (domain == 8) f.session.join_output_shared_count = &shared_count;
+        if (domain == 9) f.session.coordinator = (void *)&f;
+        if (domain == 10) f.session.num_workers = 2;
+        CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin(&f.record,
+            &body, 0, 4, f.frame, &f.session, 0, f.operation, f.operation_id,
+            f.funding, f.funding_id) == ENOTSUP);
+        CHECK(!f.record.identity &&
+            !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+        CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0,
+            0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.attempt_id == f.operation_id && !report.consumed);
+        CHECK(!wl_evaluation_control_reset(f.operation));
+        CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+        f.operation_id = wl_evaluation_control_active_attempt_id(f.operation);
+        f.session.current_iteration = 0; f.session.retraction_seeded = false;
+        f.session.retraction_right_pass = false; f.session.tdd_input_run = NULL;
+        f.session.tdd_subpass_active = false;
+        f.session.tdd_outbound_only_active = false;
+        f.session.diff_operators_active = false; f.session.join_batch_bytes = 0;
+        f.session.join_output_shared_count = 0; f.session.coordinator = NULL;
+        f.session.num_workers = 0;
+        composed_begin(&f, &body, registry, 1, 0); composed_run(&f);
+        const double expected[] = {-2, 1, 3};
+        CHECK(!f.record.semantic_result && f.record.completed == 4);
+        composed_literal(&f, expected, 3, 1, false);
+        composed_raw_parity(&f, &body, 0); composed_close(&f);
+    }
+    /* A full depth32 claim must release without addressing items[32] when
+     * the complete grammar leaves depth32 instead of its required depth1. */
+    fixture_t full;
+    composed_fixture(&full, composed_source("a", 1, values, 4, false), 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(full.frame);
+    for (unsigned i = 0; i < COL_STACK_MAX;
+        ++i) CHECK(!eval_stack_push(stack, full.input, false));
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 1};
+    wl_plan_relation_t invalid = {.ops = &map, .op_count = 1};
+    composed_begin(&full, &invalid, NULL, 0, COL_STACK_MAX);
+    composed_run(&full);
+    CHECK(full.record.semantic_result == EINVAL && !full.record.completed
+        && stack->top == COL_STACK_MAX);
+    for (unsigned i = 0; i < COL_STACK_MAX;
+        ++i) CHECK(stack->items[i].rel == full.input && !stack->items[i].owned);
+    composed_close(&full);
+
+    for (unsigned prebound = 0; prebound < 2; ++prebound) {
+        fixture_t f;
+        composed_fixture(&f, composed_source("a", 1, values, 4, false), 0);
+        CHECK(!col_rel_enable_timestamps(f.input));
+        wl_plan_op_t ts_ops[] = {{.op = WL_PLAN_OP_VARIABLE,
+                                  .relation_name = "a",
+                                  .delta_mode = WL_DELTA_FORCE_EMPTY},
+                                 {.op = WL_PLAN_OP_CONSOLIDATE}};
+        wl_plan_relation_t ts_body = {.ops = ts_ops + prebound,
+                                      .op_count = 2-prebound};
+        col_rel_t *registry[] = {f.input};
+        if (prebound) CHECK(!eval_stack_push(
+                    wl_columnar_eval_stack_cleanup_stack(f.frame), f.input,
+                    false));
+        composed_begin(&f, &ts_body, registry, 1, prebound); composed_run(&f);
+        CHECK(f.record.semantic_result == ENOTSUP && !f.record.completed
+            && !f.record.source_slot_borrowed && !f.record.source_initialized);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->top == prebound);
+        composed_close(&f);
+    }
+}
+
 int
 main(void)
 {
+    test_composed_domain_and_repeated_source();
+    test_composed_generated_union(); test_composed_nested_and_wide();
+    test_composed_branch_children(); test_composed_grammar();
+    test_composed_later_failure_and_retry();
+    test_composed_source_allocation_failures();
+    test_composed_later_concat_failure(); test_composed_retained_and_turnover();
+    test_composed_authority_and_host_funding(); test_composed_begin_limits();
     test_generated_reduce_plans(); test_composed_reduce_plans();
     test_reduce_later_failure(); test_generated_reduce_join_bodies();
     test_generated_probe_plans(); test_composed_probe_plans();

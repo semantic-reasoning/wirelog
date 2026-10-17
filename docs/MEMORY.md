@@ -3358,8 +3358,8 @@ The remaining activation boundary is explicit:
 | Initial scalar CONSOLIDATE | Supported as a child, including terminal and repeated composition |
 | Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
 | Initial scalar REDUCE | Supported in the documented scalar numeric child domain |
-| CONCAT | Supported as a directly driven two-input scalar child; UNION composition still pending |
-| UNION, LFTJ/fused alternatives | Further implementation and path-specific qualification required |
+| Initial scalar CONCAT/UNION | Supported as a two-input child and complete private composed numeric body through terminal CONSOLIDATE |
+| LFTJ/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
 | Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
@@ -3502,3 +3502,45 @@ independent funding; no stopped/successor operation is debited for retirement.
 The primitive allocator/control/ref and physical arbitrary-width relation
 destruction exclusions retain the existing cooperative scope. This child
 implements no default/session publication or full #1821 activation.
+
+
+### Private complete UNION composition
+
+The composed numeric record retains its original address/control pin through
+its separate DONE/ACK. Its appended depth/mode fields use actual `sizeof`;
+the cleanup frame does not gain another resource context in this step. Eight
+192 payments (128 current/64 future) precede the record pin, reserving distinct
+256 first capacities for pin retirement and record reset/ACK. A later private
+empty-source candidate prepays another four192 payments for its own first256
+retirement capacity before exposing its result slot. Partial prefixes expose no
+candidate; retries never renew a first capacity. The actual-width physical
+relation destructor and existing allocator/control/reference primitive exclusions
+retain their documented cooperative scope.
+
+Each composed action admits parent HOST384. A nested CONCAT binary finish/ACK
+also admits B384 and A384, for a maximum1152 from the same fresh independent
+funding attempt; other CONCAT actions use768. Source-candidate abort has its own
+384 admission after read-only validation, for768 with its parent. Consume/status
+and record ACK use384. These are financing sums, not a larger polling quantum.
+A parent383 refusal leaves all parent mutable state unchanged; a deeper refusal
+may consume already admitted parent work and leave PENDING, consumed on a new
+host action without semantic/depth/completion promotion. No live-budget peek,
+refund, successor debit or transferable reservation is used.
+
+The original complete parsed two/three-rule UNION bodies, nested three-entry
+CONCATs and repeated CONSOLIDATE are exercised, with literal sorted typed sets
+and independently cloned raw full-body execution. Empty branches, FLOAT signed
+zeros, widths0/1/17/129, branch MAP/FILTER/JOIN/probes/REDUCE, grammar failures,
+later source/candidate/CONCAT failures, reader retention, native/LIFO/identity
+checks, literal entry/HOST boundaries and genuine stable-registry retries are
+separate witnesses. Controlled empty CONS cache remains zero-runs even where raw
+empty CONS keeps a one-run cache. This private route does not complete #1821's
+public/default and optional/recursive evaluation coverage.
+
+The composed HOST grant is fresh and exclusively owned by the complete host
+action: its control pointer, active generation and lifetime cannot finish,
+reset, begin or transfer during that action. Cancellation may latch normally.
+The dedicated composed funding helper validates its ID before directly charging;
+this leaves the actual live host return suffix within the existing unary child
+caller allowance. Original operation identity is separate and keeps all saved-ID
+checks, including turnover. The legacy numeric funding helper is unchanged.

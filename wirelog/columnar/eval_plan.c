@@ -1016,3 +1016,642 @@ wl_columnar_eval_plan_numeric_stack_attempt_begin(
     }
     return rc;
 }
+
+/* Full initial scalar composition is a sibling protocol. Distinct phases
+ * prevent legacy consume/ACK from interpreting a later source push as the
+ * old initial-empty-source transaction. Each child returns to the real host;
+ * its result is consumed on a different, independently funded action. */
+static int
+wl_columnar_eval_plan_composed_charge(wl_evaluation_control_t *control,
+    uint64_t id, uint64_t work)
+{
+    if (!control || !id ||
+        wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(control, work);
+    if (rc) return rc;
+    return wl_evaluation_control_active_attempt_id(control) == id ? 0 : EINVAL;
+}
+
+/* The fresh funding generation belongs exclusively to this host action.
+ * It cannot finish/reset/begin/transfer during the action. Original operation
+ * identity remains mutable and retains every saved-ID check below. */
+static int
+wl_columnar_eval_plan_composed_fund(wl_evaluation_control_t *funding,
+    uint64_t id, const wl_evaluation_control_t *operation)
+{
+    if (!funding || funding == operation || !id
+        || wl_evaluation_control_active_attempt_id(funding) != id)
+        return EINVAL;
+    return wl_evaluation_control_charge(funding,
+               WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+}
+
+static int
+wl_columnar_eval_plan_composed_validate(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    int rc = wl_columnar_eval_plan_numeric_validate(record);
+    if (rc) return rc;
+    if (!record->composed_mode || record->runtime_depth > COL_STACK_MAX
+        || record->preflight_depth > COL_STACK_MAX
+        || record->phase < WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
+        || record->phase > WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+        return EINVAL;
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!record || record->identity || record->phase || !plan || !plan->ops
+        || begin >= end || end > plan->op_count || !frame || !session
+        || !control || !id || initial_depth > COL_STACK_MAX
+        || (session->nrels && !session->rels)) return EINVAL;
+    if (session->current_iteration || session->retraction_seeded
+        || session->retraction_right_pass || session->tdd_input_run
+        || session->tdd_subpass_active || session->tdd_outbound_only_active
+        || session->diff_operators_active || session->join_batch_bytes
+        || session->join_output_shared_count || session->coordinator
+        || session->num_workers > 1) return ENOTSUP;
+    int rc = wl_columnar_eval_plan_composed_fund(funding, funding_id, control);
+    if (rc) return rc;
+    /* Two independently named first256 capacities: original pin retirement
+     * and composed record reset/ACK. No parent ownership on a partial prefix. */
+    for (unsigned i = 0; i < 8; ++i) {
+        rc = wl_columnar_eval_plan_composed_charge(control, id, 192);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_eval_plan_composed_charge(control, id, 256);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    record->identity = record; record->frame = frame;
+    record->session = session; record->plan = plan;
+    record->control = control; record->attempt_id = id;
+    record->begin = begin; record->end = end; record->cursor = begin;
+    record->completed = 0; record->semantic_result = 0;
+    record->protocol_result = 0;
+    record->source_mode = true; record->source_installed = false;
+    record->source_empty = false; record->source_is_delta = false;
+    record->source_initialized = false; record->source_slot_borrowed = false;
+    record->source_registry = session->rels;
+    record->source_count = session->nrels;
+    record->source_slot = 0; record->source_byte = 0;
+    record->source_begin = begin;
+    record->source_full = NULL; record->source_delta = NULL;
+    record->source_selected = NULL; record->source_output = NULL;
+    record->composed_mode = true;
+    record->preflight_depth = initial_depth;
+    record->runtime_depth = initial_depth;
+    record->phase = initial_depth ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT;
+#if defined(WL_HAVE_C11_THREADS)
+    record->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    record->owner_thread = GetCurrentThreadId();
+#else
+    record->owner_thread = pthread_self();
+#endif
+    record->thread_valid = true;
+    rc = initial_depth
+        ? wl_columnar_eval_stack_numeric_stack_claim(frame, session, record,
+            initial_depth, control, id)
+        : wl_columnar_eval_stack_composed_source_claim(frame, session, record);
+    if (rc) {
+        record->control = NULL; record->identity = NULL;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+        record->thread_valid = false; record->frame = NULL;
+        record->session = NULL; record->plan = NULL;
+        record->source_registry = NULL; record->source_mode = false;
+        record->composed_mode = false;
+        record->preflight_depth = 0; record->runtime_depth = 0;
+        wl_evaluation_control_release(control);
+    }
+    return rc;
+}
+
+static void
+wl_columnar_eval_plan_composed_source_lookup(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    bool delta = record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA;
+    if (record->source_slot == record->source_count) {
+        if (!delta) {
+            record->semantic_result = ENOENT;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT;
+        }
+        return;
+    }
+    col_rel_t *candidate = record->source_registry[record->source_slot];
+    if (!candidate || !candidate->name) {
+        ++record->source_slot;
+        record->source_byte = 0;
+        return;
+    }
+    const char *name = record->plan->ops[record->source_begin].relation_name;
+    size_t byte = record->source_byte;
+    char wanted;
+    if (!delta) wanted = name[byte];
+    else if (byte < 3) wanted = "$d$"[byte];
+    else if (byte == 255) wanted = '\0';
+    else wanted = name[byte - 3];
+    char actual = candidate->name[byte];
+    if (actual != wanted) {
+        ++record->source_slot;
+        record->source_byte = 0;
+    } else if (actual) {
+        ++record->source_byte;
+    } else if (delta) {
+        record->source_delta = candidate;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT;
+    } else {
+        record->source_full = candidate;
+        record->source_slot = 0; record->source_byte = 0;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA;
+    }
+}
+
+static void
+wl_columnar_eval_plan_composed_source_select(
+    wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    const wl_plan_op_t *op = &record->plan->ops[record->source_begin];
+    col_rel_t *full = record->source_full, *delta = record->source_delta;
+    record->source_selected = full;
+    if (op->delta_mode == WL_DELTA_FORCE_EMPTY) {
+        record->source_empty = true;
+    } else if (op->delta_mode == WL_DELTA_FORCE_DELTA) {
+        if (delta && delta->nrows) {
+            record->source_selected = delta;
+            record->source_is_delta = true;
+        } else if (record->session->delta_seeded) {
+            record->source_empty = true;
+            record->source_is_delta = true;
+        }
+    } else if (op->delta_mode != WL_DELTA_FORCE_FULL && delta
+        && delta->nrows && delta->nrows < full->nrows) {
+        /* Includes FORCE_EMPTY_AFTER_SEED and unknown modes at iteration0,
+         * matching the raw VARIABLE fallback to AUTO. */
+        record->source_selected = delta;
+        record->source_is_delta = true;
+    }
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT;
+}
+
+static int
+wl_columnar_eval_plan_composed_source_step(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
+        rc = record->phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+            ? wl_columnar_eval_plan_composed_charge(record->control,
+                record->attempt_id, 256)
+            : wl_columnar_eval_plan_numeric_forward(record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = record->source_initialized
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+                : record->source_slot_borrowed
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
+        if (!record->plan->ops[record->source_begin].relation_name) {
+            record->semantic_result = ENOENT;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+    /* fall through */
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
+        wl_columnar_eval_plan_composed_source_lookup(record);
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
+        wl_columnar_eval_plan_composed_source_select(record);
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_relation_scalar_source_init_attempt_controlled(
+            &record->source, &record->source_initialized,
+            record->control, record->attempt_id);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &record->source, record->source_selected, !record->source_empty);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT:
+        rc = wl_columnar_eval_stack_composed_source_output(record->frame,
+                record->session, record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        } else record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &record->source,
+            record->source_is_delta ? "$empty_delta" : "$empty_skip",
+            record->session->memory_governor ? record->session->memory_governor
+                : record->source_selected->memory_governor,
+            record->source_output);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_relation_scalar_source_end(&record->source,
+                   record->semantic_result);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
+        rc = wl_columnar_eval_stack_composed_source_install(record->frame,
+                record->session, record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = record->source_slot_borrowed
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+        ++record->runtime_depth; ++record->completed;
+        record->phase = ++record->cursor == record->end
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT:
+        rc = wl_columnar_eval_stack_composed_source_abort(record->frame,
+                record->session, record, funding, funding_id);
+        record->protocol_result = rc;
+        if (!rc) record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        return 0;
+    default:
+        return EBUSY;
+    }
+}
+
+static int
+wl_columnar_eval_plan_composed_source_consume(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_result)
+{
+    record->protocol_result = 0;
+    switch (record->pending_action) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT:
+        if (child_result) {
+            record->semantic_result = child_result;
+            record->phase = record->source_initialized
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+                : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else record->phase =
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
+        if (!child_result && record->source.timestamps) child_result = ENOTSUP;
+        if (child_result) {
+            record->semantic_result = child_result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        } else record->phase = record->source_empty
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
+        if (child_result ==
+            ENOSPC) record->session->memory_budget_denied = true;
+        record->semantic_result = child_result;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+        if (record->source.phase !=
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED) {
+            record->protocol_result = child_result ? child_result : EBUSY;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+            return 0;
+        }
+        if (!record->semantic_result) record->semantic_result = child_result;
+        record->source_initialized = false;
+        record->phase = record->semantic_result
+            ? record->source_slot_borrowed
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL;
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS: {
+        rc = wl_columnar_eval_plan_composed_charge(record->control,
+                record->attempt_id, 256);
+        eval_stack_t *stack = NULL;
+        if (!rc) rc = wl_columnar_eval_stack_operator_stack_owned(record->frame,
+                    record->session, &stack, record);
+        if (!rc && (record->source_slot >= record->runtime_depth
+            || record->source_slot >= COL_STACK_MAX)) rc = EINVAL;
+        if (!rc) {
+            const col_rel_t *rel = stack->items[record->source_slot].rel;
+            if (stack->top != record->runtime_depth || rel->timestamps
+                || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+                rc = ENOTSUP;
+        }
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else if (++record->source_slot == record->runtime_depth)
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT: {
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (!rc) {
+            wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
+            if (kind == WL_PLAN_OP_VARIABLE) {
+                if (record->preflight_depth == COL_STACK_MAX) rc = ENOBUFS;
+                else ++record->preflight_depth;
+            } else if (kind == WL_PLAN_OP_CONCAT) {
+                if (record->preflight_depth < 2) rc = EINVAL;
+                else --record->preflight_depth;
+            } else if (kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP
+                || kind == WL_PLAN_OP_JOIN || kind == WL_PLAN_OP_SEMIJOIN
+                || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_REDUCE
+                || kind == WL_PLAN_OP_CONSOLIDATE) {
+                if (!record->preflight_depth) rc = EINVAL;
+            } else rc = ENOTSUP;
+        }
+        if (!rc && ++record->cursor == record->end) {
+            if (record->preflight_depth != 1) rc = EINVAL;
+            else {
+                record->cursor = record->begin;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+            }
+        }
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY:
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_VARIABLE) {
+            record->source_begin = record->cursor;
+            record->source_slot = 0; record->source_byte = 0;
+            record->source_full = NULL; record->source_delta = NULL;
+            record->source_selected = NULL; record->source_output = NULL;
+            record->source_empty = false; record->source_is_delta = false;
+            record->source_initialized = false;
+            record->source_slot_borrowed = false;
+            record->source_installed = false;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL;
+            return 0;
+        }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_CONCAT) {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START;
+            return 0;
+        }
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        switch (record->plan->ops[record->cursor].op) {
+        case WL_PLAN_OP_FILTER:
+            return wl_columnar_filter_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_MAP:
+            return wl_columnar_filter_map_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_JOIN:
+            return wl_columnar_join_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_SEMIJOIN:
+        case WL_PLAN_OP_ANTIJOIN:
+            return wl_columnar_join_probe_op_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_REDUCE:
+            return wl_columnar_ops_reduce_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        case WL_PLAN_OP_CONSOLIDATE:
+            return wl_columnar_filter_consolidate_attempt_start_owned(
+                &record->plan->ops[record->cursor], record->frame,
+                record->session, record->control, record->attempt_id,
+                &record->child_status, record);
+        default:
+            record->semantic_result = ENOTSUP;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_filter_op_attempt_step_owned(record->frame,
+                   &record->child_status, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_filter_op_attempt_ack_owned(record->frame, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START:
+        rc = wl_columnar_eval_plan_numeric_forward(record);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            return 0;
+        }
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_merge_concat_attempt_start_owned(
+            &record->plan->ops[record->cursor], record->frame, record->session,
+            record->control, record->attempt_id, &record->child_status,
+            funding, funding_id, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_merge_concat_attempt_step_owned(record->frame,
+                   &record->child_status, funding, funding_id, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK:
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_merge_concat_attempt_ack_owned(record->frame,
+                   funding, funding_id, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE:
+        if (record->phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
+            && record->child_status.committed) --record->runtime_depth;
+        if (!record->semantic_result) ++record->completed;
+        record->phase = record->semantic_result ||
+            ++record->cursor == record->end
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+        return 0;
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT:
+        return wl_columnar_eval_plan_composed_source_step(record, funding,
+                   funding_id);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE:
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+        return 0;
+    default:
+        return EBUSY;
+    }
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_consume_result(
+    wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    if (record->pending_action >=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT
+        && record->pending_action <=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END)
+        return wl_columnar_eval_plan_composed_source_consume(record,
+                   child_protocol);
+    record->protocol_result = child_protocol;
+    if (child_protocol) {
+        record->phase = record->pending_action;
+        return 0;
+    }
+    if (record->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK) {
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE;
+        return 0;
+    }
+    if (record->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK) {
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE;
+        return 0;
+    }
+    bool concat = record->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START
+        || record->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD;
+    switch (record->child_status.progress) {
+    case WL_COLUMNAR_FILTER_PROGRESS_YIELD:
+    case WL_COLUMNAR_FILTER_PROGRESS_RETAINED:
+        record->phase =
+            concat ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD;
+        break;
+    case WL_COLUMNAR_FILTER_PROGRESS_DONE:
+        record->semantic_result = record->child_status.semantic_result;
+        record->phase =
+            concat ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK;
+        break;
+    default:
+        record->protocol_result = EINVAL;
+        return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_status(
+    const wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_columnar_eval_plan_numeric_status_t *status,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!status) return EINVAL;
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    status->phase = record->phase; status->completed = record->completed;
+    status->semantic_result = record->semantic_result;
+    status->protocol_result = record->protocol_result;
+    status->retained = record->protocol_result != 0
+        || ((record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        || record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD)
+        && record->child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_ack(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        || !record->control) return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_composed_source_release(record->frame,
+            record->session, record);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = record->control;
+    record->control = NULL; record->identity = NULL;
+    record->frame = NULL; record->session = NULL; record->plan = NULL;
+    record->source_registry = NULL; record->source_mode = false;
+    record->source_output = NULL; record->source_installed = false;
+    record->thread_valid = false; record->attempt_id = 0;
+    record->composed_mode = false; record->preflight_depth = 0;
+    record->runtime_depth = 0;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
+    wl_evaluation_control_release(control);
+    return 0;
+}
