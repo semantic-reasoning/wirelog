@@ -3568,3 +3568,10 @@ retire only after real child ACK. Original session token histories are limited
 to canonical EMPTY/positive RESERVED, plus untouched noGov all-zero tokens;
 RELEASED histories and governed all-zero destinations return ENOTSUP before new
 publication owners. No token bytes are copied or reset to manufacture a refund.
+
+The aware framed entry prepays a distinct first known-empty close before fresh
+frame allocation. Failed parent bootstrap physically closes that newly created
+inert frame before returning its bootstrap receipt. It never adopts a foreign
+frame or retains a phantom failed-bootstrap owner. A successful original parent
+keeps its own independent final-close capacity. The host request and reply are
+external borrowed call objects and are never retained as cleanup authority.

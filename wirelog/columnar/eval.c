@@ -2469,7 +2469,8 @@ tdd_worker_subpass_fn(void *arg)
              * remain registered until checked retirement after the barrier. */
             for (uint32_t di = 0; di < nrels; di++)
                 assert(ctx->delta_rels[di] == NULL);
-            int rc = wl_columnar_eval_serial_framed_relation(rp, sess, true);
+            int rc = wl_columnar_eval_serial_framed_relation(rp, sess, true,
+                    NULL);
             if (rc != 0) {
                 ctx->rc = rc;
                 free(snap);
@@ -8049,6 +8050,8 @@ col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
     if (!sp || !coord)
         return EINVAL;
 
+    if (coord->base.evaluation_control) return ENOTSUP;
+
     if (tdd_stratum_has_unsupported_lftj(sp))
         return col_eval_stratum(sp, coord, stratum_idx);
 
@@ -8123,6 +8126,8 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
 {
     if (!sp || !coord || !workers || num_workers == 0)
         return EINVAL;
+
+    if (coord->base.evaluation_control) return ENOTSUP;
 
     /* Step 1: Reset this stratum's progress slots for the current epoch.
      * Prevents stale convergence reports from a previous epoch blocking

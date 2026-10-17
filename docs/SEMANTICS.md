@@ -858,7 +858,7 @@ call.
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin`, `wl_columnar_eval_serial_framed_relation` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -892,8 +892,10 @@ strata" suggests: `wl_columnar_delta_events_publish` has one caller, inside
 `col_session_step_impl` -- its other caller is a retraction helper still marked
 `UNUSED`, reached only by a test hook. So the one route by which a snapshot
 streams is the plain-step drain, and that returns through the step path's own
-cutoff. What is genuinely unpolled is the fixpoint itself -- nothing in
-`eval*.c` charges -- and that is the operator-checkpoint item, not this one.
+cutoff. This describes the historical whole-session fixpoint route, whose
+controlled continuation remains unsupported. The private numeric/composed paths
+and the aware framed entry described below now charge work explicitly; they do
+not yet provide a controlled whole-session fixpoint continuation.
 
 A `retraction_seeded` left set by a stop above its commit registers nothing --
 the step path's retraction pre-seed only looks relations up -- but it keeps the
@@ -1136,3 +1138,59 @@ supports canonical EMPTY/positive RESERVED old tokens, and genuinely noGov
 all-zero tokens without writes; a RELEASED old-token history is unsupported.
 This internal publication protocol still does not enable public STEP/SNAPSHOT,
 whole-stratum controlled evaluation, or existing-head append/reevaluation.
+
+### Private aware-host relation entry
+
+`wl_columnar_eval_serial_framed_relation` keeps its synchronous raw behavior when
+both the attached control and host request are NULL. An attached control requires
+an explicit internal host request. Each such call runs one funded action and
+returns to the real host; it never drains progress in an engine loop. The host
+uses the actual immutable generated relation plan, begins the original operation
+once with `base.operation_admission`, and retains session/input/native ownership
+until terminal close. The original operation remains active across progress.
+
+The integer return is protocol status. Only `TERMINAL` makes `execution_result`
+and `committed` valid, after actual frame close. `MORE` may mean retained cleanup;
+`STATUS` is separately funded and preserves the outstanding non-status receipt.
+The host completes each fresh grant with `finish(grant, owner, 0, 0)` after the
+entry returns. It keeps a completed borrowed grant and its exact generation until
+successful consume, including when a newer consume or status action is refused.
+A failed consume does not replace that earlier receipt. A host needs at least two
+stable grants and selects one that is not borrowed, rather than blindly rotating
+when status calls intervene. Semantic success never follows from protocol zero
+alone. The final close writes external outputs before freeing the frame.
+
+Fresh bootstrap prepays an independent first known-empty-frame close before
+frame acquisition. The controlled allocator admits and zeroes the full actual
+frame. An original saved-generation zero checkpoint separates its final return
+from parent begin. Failure before parent activation closes only the frame that
+this same call just created. It returns `BOOTSTRAP_RECEIPT`, whose completed grant
+is consumed on a later host call: host refusal permits retry; a successful host
+report makes a nonzero saved protocol terminal. Without a durable parent this
+report proves its own grant generation and disposition only. Exact association
+with the same plan/session/original generation/native host, and absence of
+synthesis or replay, are trusted serialized caller requirements.
+
+An authentic existing parent resumes before any fresh lookup. Original attempt
+turnover authorizes cleanup of that old parent without charging or finishing the
+successor. READY uses the private reversible registry publisher. Once its fixed
+cutoff transfers the candidate, later progress retires old arrays and credits
+after genuine child ACK, without rerunning the body or undoing the committed
+head. An original cancellation merely requested after cutoff stays sticky for
+the next attempt; `finish(0, 0)` does not poll it.
+
+Whole serial/TDD/multiworker strata and backend STEP/SNAPSHOT now reject attached
+controls before their first mutation, queue submission, original begin or finish.
+The public gates remain. The former direct-vtable controlled tests described
+above exercised an unbounded internal route; that route is deliberately closed.
+Their raw references and test registrations remain, with this coverage migration:
+
+| Former whole controlled expectation | Replacement or remaining scope |
+|---|---|
+| STEP/SNAPSHOT wrapper accepts the admission owner and polls pre-cancellation | Direct lower control owner/report checks; actual aware entry begins the real admission owner and exercises cancellation/turnover; outer gates preserve control reports |
+| STEP observer cutoff emits nothing, retains evaluated observer, and retry delivers the same events without recomputation | Raw observer reference and untouched-state/no-callback controlled gate; aware one-head pre-cutoff reverse plus canonical retry. Whole controlled observer delivery/resume remains deferred |
+| Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence over compaction | Raw evaluating/stable references, controlled gate with unchanged registry/progress/stable/pending/report state, and a direct lower quiescent/reclaimer check. Aware one-head retained-reader and committed cleanup are separate coverage; whole controlled snapshot bookkeeping/precedence remains deferred |
+
+This is initial nonrecursive scalar one-relation publication for an aware internal
+host. It does not complete whole-session control, recursive/differential/weighted
+execution, TDD/parallel, LFTJ/K-fusion, or default/public activation under #1821.

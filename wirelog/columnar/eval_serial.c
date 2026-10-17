@@ -962,10 +962,164 @@ void (*wl_columnar_eval_serial_test_after_delta_stamp)(
     wl_col_session_t *sess, col_rel_t *source, col_rel_t *delta);
 #endif
 
+/* Cold bootstrap only; no live child is executed on this path. */
+static int
+wl_columnar_eval_serial_framed_bootstrap(const wl_plan_relation_t *rp,
+    wl_col_session_t *sess,
+    const wl_columnar_eval_serial_framed_host_request_t *request)
+{
+    /* Four192 payments reserve a distinct first256 known-empty close.
+     * Every prefix ends before any frame owner; retries forfeit unused shares. */
+    for (unsigned i = 0; i < 4; ++i) {
+        int rc = wl_columnar_eval_serial_framed_charge(request->operation,
+                request->operation_id, WL_COLUMNAR_EVAL_SERIAL_FRAMED_PAYMENT);
+        if (rc) return rc;
+    }
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    int rc = wl_columnar_eval_stack_cleanup_begin_attempt_controlled(sess,
+            &frame, request->operation, request->operation_id);
+    if (rc) return rc;
+    /* The allocator return is not a poll. Split its actual final publication
+     * tail from parent prevalidation with the original saved-ID checkpoint. */
+    rc = wl_columnar_eval_serial_framed_charge(request->operation,
+            request->operation_id, 0);
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    if (!rc) rc = wl_columnar_eval_stack_framed_context(frame, sess, &ctx);
+    if (!rc) rc = wl_columnar_eval_serial_framed_attempt_begin(frame, sess, rp,
+                request->operation, request->operation_id,
+                request->funding, request->funding_id);
+    if (ctx && ctx->identity == ctx) {
+        request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+        return rc;
+    }
+    /* Only this invocation's genuinely fresh, never-activated frame. Every
+     * entry/continuation remains inert; final physical/credit/ref is mandatory. */
+    if (wl_columnar_eval_stack_cleanup_finish(&frame)) abort();
+    return rc;
+}
+
+static int
+wl_columnar_eval_serial_framed_bootstrap_receipt(
+    const wl_columnar_eval_serial_framed_host_request_t *request)
+{
+    if (!request->previous_funding
+        || request->previous_funding == request->funding
+        || !request->previous_funding_id
+        || wl_evaluation_control_active_attempt_id(request->previous_funding))
+        return EINVAL;
+    wl_evaluation_control_report_t report;
+    int rc = wl_evaluation_control_report(request->previous_funding, &report);
+    if (rc || report.attempt_id != request->previous_funding_id
+        || report.cleanup_status || (report.execution_status
+        && report.execution_status != EOVERFLOW)) return EINVAL;
+    /* Exact association to rp/session/original generation and no replay is a
+     * trusted serialized caller precondition; the report proves only its grant. */
+    if (report.result) {
+        request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+        return 0;
+    }
+    request->reply->execution_result = request->previous_protocol
+        ? request->previous_protocol : EINVAL;
+    request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+    return 0;
+}
+
 int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
-    wl_col_session_t *sess, bool recursive)
+    wl_col_session_t *sess, bool recursive,
+    const wl_columnar_eval_serial_framed_host_request_t *request)
 {
+    if (request && request->reply) {
+        request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+        request->reply->execution_result = EINVAL;
+        request->reply->committed = false;
+        request->reply->status.phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
+        request->reply->status.execution_result = 0;
+        request->reply->status.cleanup_result = 0;
+        request->reply->status.ready = request->reply->status.retained =
+            request->reply->status.committed = false;
+    }
+    if (!rp || !sess) return EINVAL;
+    if (sess->base.evaluation_control) {
+        if (!request) return ENOTSUP;
+        if (!request->reply) return EINVAL;
+        wl_columnar_eval_serial_framed_host_reply_t *reply = request->reply;
+        if (request->operation != sess->base.evaluation_control
+            || !request->operation_id
+            || (request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS))
+            return EINVAL;
+        if (recursive) return ENOTSUP;
+        int protocol = wl_columnar_eval_serial_framed_fund(request->funding,
+                request->funding_id, request->operation);
+        if (protocol) return protocol;
+        if (sess->cleanup_active) {
+            wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+            protocol = wl_columnar_eval_stack_framed_context(
+                sess->cleanup_active, sess, &ctx);
+            if (protocol) return protocol;
+            if (!wl_columnar_eval_serial_framed_owner_valid(ctx,
+                sess->cleanup_active)) return EBUSY;
+            if (ctx->plan != rp || ctx->session != sess
+                || ctx->control != request->operation
+                || ctx->attempt_id != request->operation_id) return EINVAL;
+            /* Original may be stopped or turned over: its authenticated old
+             * parent still owns cleanup. No fresh absence lookup is allowed. */
+            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+                reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS;
+                return wl_columnar_eval_serial_framed_attempt_status(ctx,
+                           &reply->status, request->funding,
+                           request->funding_id);
+            }
+            if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) {
+                if (!request->previous_valid
+                    || request->previous_kind !=
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
+                    || request->previous_funding != ctx->pending_funding
+                    || request->previous_funding_id != ctx->pending_funding_id)
+                    return EINVAL;
+                reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+                return wl_columnar_eval_serial_framed_consume_result(ctx,
+                           request->previous_protocol, request->funding,
+                           request->funding_id);
+            }
+            reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+            if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY)
+                return wl_columnar_eval_serial_framed_attempt_publish(ctx,
+                           request->funding, request->funding_id);
+            if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) {
+                protocol = wl_columnar_eval_serial_framed_attempt_close(ctx,
+                        &reply->execution_result, &reply->committed,
+                        request->funding, request->funding_id);
+                if (!protocol)
+                    reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+                return protocol;
+            }
+            return wl_columnar_eval_serial_framed_attempt_step(ctx,
+                       request->funding, request->funding_id);
+        }
+        if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS)
+            return ENOENT;
+        if (sess->cleanup_pending) return EBUSY;
+        if (request->previous_valid && request->previous_kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT)
+            return wl_columnar_eval_serial_framed_bootstrap_receipt(request);
+        if (wl_evaluation_control_active_attempt_id(request->operation)
+            != request->operation_id) return EINVAL;
+        reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT;
+        if (sess->current_iteration
+            || sess->retraction_seeded || sess->retraction_right_pass
+            || sess->tdd_input_run || sess->tdd_subpass_active
+            || sess->tdd_outbound_only_active || sess->diff_operators_active
+            || sess->join_batch_bytes || sess->join_output_shared_count
+            || sess->coordinator || sess->num_workers > 1)
+            return ENOTSUP;
+        if (!rp->name || !rp->ops || !rp->op_count) return EINVAL;
+        if (rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+            return ENOTSUP;
+        return wl_columnar_eval_serial_framed_bootstrap(rp, sess, request);
+    }
+    if (request) return EINVAL;
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
     int rc = wl_columnar_eval_stack_cleanup_begin(sess, &frame);
     if (rc != 0)
@@ -1102,6 +1256,8 @@ int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx)
 {
+    if (!sp || !sess) return EINVAL;
+    if (sess->base.evaluation_control) return ENOTSUP;
     /* Cleared here so every exit below reports "heads not final" unless one
      * of the two completion points is reached. */
     sess->eval_stratum_heads_final = false;
@@ -1133,7 +1289,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             }
 
             int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
-                    false);
+                    false, NULL);
             if (rc != 0)
                 return rc;
         }
@@ -1492,7 +1648,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                 for (uint32_t di = 0; di < nrels; di++)
                     assert(delta_rels[di] == NULL);
                 int rc = wl_columnar_eval_serial_framed_relation(rp, sess,
-                        true);
+                        true, NULL);
                 if (rc != 0) {
                     outer_rc = rc;
                     goto stride_error;

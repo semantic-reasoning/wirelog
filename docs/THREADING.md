@@ -1902,3 +1902,15 @@ Aconsume case. Cleanup never debits the original operation or its successor.
 Old tokens must be canonical self-EMPTY or positive RESERVED; RELEASED history
 and governed all-zero destinations are explicitly unsupported before B ownership.
 Genuine noGov all-zero originals are skipped without initialization or writes.
+
+The aware framed entry performs one action on the original native host and then
+returns. It stores no request, reply or lexical owner-key pointer in the frame.
+The caller retains the session, generated plan, inputs, original operation and
+all borrowed grant controls across those returns. STATUS does not consume the
+pending grant. Original-generation checks for new bootstrap follow existing
+parent authentication; old cleanup may finish after turnover without touching
+its successor. Whole backend/stratum attached-control calls reject before their
+original begin/finish, mutations or worker dispatch, including with a live parent.
+The external FIFO fixture dispatches a separate witness job after the actual
+action job returns; this proves that fixture's queue order, not wall-time latency
+or a general scheduler fairness guarantee.
