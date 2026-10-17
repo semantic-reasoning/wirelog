@@ -5834,6 +5834,29 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
 } wl_columnar_eval_plan_numeric_phase_t;
 
@@ -5865,6 +5888,9 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     pthread_t owner_thread;
 #endif
     bool thread_valid;
+    /* Appended composition state; original record address and prefix retained. */
+    uint32_t preflight_depth, runtime_depth;
+    bool composed_mode;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
 typedef struct {
@@ -6000,5 +6026,51 @@ int wl_columnar_eval_plan_numeric_stack_attempt_begin(
 extern void (*wl_columnar_eval_stack_test_binary_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 #endif
+
+/* Complete initial, acyclic scalar bodies. initial_depth0 claims an empty
+ * source frame;1..32 claims that exact configured original stack via A.
+ * Immutable plan/registry/borrowed source storage, noTS/compound/recursive modes.
+ * Prebound owned entries retire through the controlled child transactions.
+ * Every action uses fresh independent, exclusively host-owned funding. Its
+ * control/active generation/lifetime cannot finish/reset/begin/transfer until
+ * the complete host action returns; cancellation may latch normally. Own384,
+ * nested CONCAT maximum1152 (parent+B+A). A deeper funding refusal may leave
+ * genuine PENDING; consume its protocol on a later grant without promotion.
+ * Successful completed counts every opcode, including each VARIABLE.
+ * Old step/consume/ACK cannot operate these distinct lifecycle phases. */
+int wl_columnar_eval_plan_numeric_composed_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_composed_consume_result(
+    wl_columnar_eval_plan_numeric_attempt_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_status(
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_columnar_eval_plan_numeric_status_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_ack(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_composed_source_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_output(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_install(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_abort(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_composed_source_release(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

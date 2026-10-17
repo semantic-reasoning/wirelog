@@ -856,9 +856,9 @@ call.
 | `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -1058,7 +1058,7 @@ never falls back to raw execution; the raw single-entry K-copy marker remains
 outside this controlled domain. Output is owned, flat and non-delta, with no
 K-way optimization segment array. Input segment arrays remain independent
 transaction owners. Terminal CONSOLIDATE supplies UNION set semantics when a
-composed driver is added; this operator alone does not enable UNION plans.
+new composed driver is selected; the legacy numeric segment entrypoints still reject UNION plans.
 
 Names, graph metadata and declared width come from the left. Nonempty-right
 FLOAT compatibility uses the initial left schema (untyped means INT64); integer
@@ -1070,3 +1070,36 @@ validation. Lease preparation, allocation/admission and peak-memory error
 precedence can differ from the raw pool path. Both inputs remain protected
 until construction and copying finish. Stops preserve both original entries;
 committed output survives independent reader-retained retirement of either input.
+
+### Private complete scalar UNION bodies
+
+`wl_columnar_eval_plan_numeric_composed_attempt_begin` admits a complete,
+immutable initial nonrecursive scalar body. Initial depth zero uses a genuine
+empty-frame claim; depths1..32 use the genuine expected-depth stack claim.
+Before any lookup or publication, paid abstract-depth preflight visits every
+opcode: VARIABLE adds one, CONCAT requires two and removes one, supported
+numeric children require one and preserve depth, and final depth must be one.
+Prebound inputs are checked separately for the scalar/noTS domain. Registry,
+plan and borrowed registry storage remain immutable and live through ACK.
+Prebound owned entries retire only through their controlled child transactions.
+
+Each VARIABLE independently resolves/holds its source and pushes above the
+current lower entries. Private empty outputs belong to the original frame
+result until the saved-ID-checked, callback-free push cutoff. Lower entry
+fields never change during a push. A failed later source drains its lease and
+then retires its own candidate on a separately funded action before DONE/ACK;
+its failure leaves preceding owned entries reachable for ordinary frame cleanup.
+CONCAT has dedicated child/ACK states and uses the original binary transaction.
+Successful completion counts every opcode, including VARIABLE and CONCAT,
+after its ownership transition; legacy source counts remain unchanged.
+
+Distinct composed PENDING/DONE/source states exclude legacy step/consume/ACK
+from this protocol. A child returns to the real host before a later fresh action
+consumes its result. Each funding layer admits its own work before its own
+mutation. A deeper host refusal may leave genuine parent PENDING without
+promoting stale child status, completion or runtime depth. Scalar-source calls
+use the original operation and retain their separate semantic/stop/drain rules.
+Cancellation or saved-ID turnover stops subsequent forward work; cleanup and ACK
+use independent funding and cannot debit the original control or its successor.
+Default/public session dispatch, recursive K-copy CONCAT, weighted/differential,
+TDD, batch/pipeline, parallel, LFTJ and fused evaluation remain outside this route.

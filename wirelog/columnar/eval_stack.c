@@ -2173,3 +2173,163 @@ wl_columnar_eval_stack_concat_context_owned(
     *out = &frame->concat;
     return 0;
 }
+
+/* Composition pushes a later VARIABLE above original lower entries. These
+* siblings do not broaden the legacy empty-source or top-one contracts. */
+static int
+wl_columnar_eval_stack_composed_source_frame(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner, bool prepared,
+    bool target)
+{
+    if (!frame || !sess || frame->identity != frame || frame->session != sess
+        || !owner || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame)
+        || !owner->composed_mode || owner->runtime_depth > COL_STACK_MAX)
+        return EINVAL;
+    if (frame->numeric_plan_owner != owner || sess->cleanup_active != frame
+        || frame->stack.top != owner->runtime_depth
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || frame->binary.phase || frame->concat.identity
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot)
+        || frame->unary_control || frame->unary_attempt_id
+        || frame->unary_index || frame->unary_top || frame->unary_thread_valid
+        || frame->unary_committed || frame->unary_result_saved
+        || frame->unary_alias_rejected || frame->unary_first_result
+        || frame->unary_cleanup_result)
+        return EBUSY;
+    if (target && (frame->stack.top == COL_STACK_MAX
+        || !wl_columnar_eval_stack_unary_entry_inert(
+            &frame->stack.items[frame->stack.top]))) return EBUSY;
+    if (!prepared) {
+        if (!wl_columnar_eval_stack_unary_entry_inert(&frame->result))
+            return EBUSY;
+    } else if (!frame->result.owned
+        || frame->result.is_delta != owner->source_is_delta
+        || frame->result.seg_boundaries || frame->result.seg_count
+        || frame->result.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || frame->result.continuation
+        || owner->source_output != &frame->result.rel) return EBUSY;
+    return 0;
+}
+
+/* An explicit admission separates the caller's initialization from the
+ * empty-frame claim and its rollback. No ownership before the last ID check. */
+int
+wl_columnar_eval_stack_composed_source_claim(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    if (!owner || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame)
+        || !owner->composed_mode) return EINVAL;
+    int rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+            owner->attempt_id, 256);
+    if (rc) return rc;
+    return wl_columnar_eval_stack_numeric_source_claim(frame, sess, owner);
+}
+
+int
+wl_columnar_eval_stack_composed_source_output(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            false, true);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT
+        || owner->source_slot_borrowed || owner->source_installed)
+        return EBUSY;
+    /* Four current128/future64 payments buy the candidate's own first256
+     * retirement capacity before its marker; retries use a new host grant. */
+    for (unsigned i = 0; i < 4; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 192);
+        if (rc) return rc;
+        rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+                owner->attempt_id, 0);
+        if (rc) return rc;
+    }
+    frame->result.rel = NULL; frame->result.owned = true;
+    frame->result.is_delta = owner->source_is_delta;
+    frame->result.seg_boundaries = NULL; frame->result.seg_count = 0;
+    frame->result.kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    frame->result.continuation = NULL;
+    owner->source_output = &frame->result.rel;
+    owner->source_slot_borrowed = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_source_install(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            owner && owner->source_slot_borrowed, true);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+        || owner->source_initialized || owner->source_installed
+        || owner->source_empty != owner->source_slot_borrowed) return EBUSY;
+    col_rel_t *rel = owner->source_empty ? frame->result.rel
+        : owner->source_selected;
+    if (!rel) return EINVAL;
+    rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+            owner->attempt_id, 192);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_attempt_charge(owner->control,
+            owner->attempt_id, 0);
+    if (rc) return rc;
+    /* Callback-free cutoff: all lower entries remain field-identical. */
+    eval_entry_t *entry = &frame->stack.items[frame->stack.top];
+    entry->rel = rel; entry->owned = owner->source_empty;
+    entry->is_delta = owner->source_is_delta;
+    entry->seg_boundaries = NULL; entry->seg_count = 0;
+    entry->kind = WL_COLUMNAR_EVAL_ENTRY_RELATION;
+    entry->continuation = NULL;
+    wl_columnar_eval_stack_unary_entry_clear(&frame->result);
+    ++frame->stack.top;
+    owner->source_slot_borrowed = false; owner->source_output = NULL;
+    owner->source_installed = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_source_abort(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            true, true);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        || owner->source_initialized || !owner->source_slot_borrowed)
+        return EBUSY;
+    if (!funding || funding == owner->control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(funding, 384);
+    if (rc) return rc;
+    rc = eval_entry_dispose(&frame->result);
+    if (rc) return rc;
+    wl_columnar_eval_stack_unary_entry_clear(&frame->result);
+    owner->source_slot_borrowed = false; owner->source_output = NULL;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_source_release(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
+            false, false);
+    if (rc) return rc;
+    if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        || owner->source_initialized || owner->source_slot_borrowed)
+        return EBUSY;
+    frame->numeric_plan_owner = NULL;
+    return 0;
+}

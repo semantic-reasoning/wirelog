@@ -1822,3 +1822,32 @@ operation turnover never pays cleanup from a successor attempt. Scratch physical
 disposal precedes original credit and governor reference release. The existing
 binary gate remains active through both source ends, B2 drain, candidate/input
 retirement and ACK. No FILTER context is cast or reused by CONCAT.
+
+
+### Private complete UNION host lifecycle
+
+`wl_columnar_eval_plan_numeric_composed_attempt_begin` binds the same original
+native-thread/LIFO numeric authority as the existing segments. Its distinct
+composed phases prevent legacy consume/ACK from accepting a later source push.
+The immutable registry/plan/input lifetime extends through the new ACK. Later
+VARIABLE publication occurs in
+`wl_columnar_eval_stack_composed_source_install`: a final saved-ID check precedes
+the callback-free push at the existing stack top; lower entries and segment
+owners stay untouched. Source-candidate abort and arbitrary-depth owner release
+are separate funded actions, preserving the original frame on reader refusal.
+
+CONCAT child and ACK direct returns preserve the existing child caller depth.
+The actual host adapter finishes/detaches/releases its independent funding and
+returns before the external scheduler stores a protocol result and runs the FIFO
+witness. Consume uses a new host grant. Parent PENDING may record an attempted
+child whose deeper funding was refused, without interpreting stale child status.
+Original operation turnover never authorizes a successor debit for old cleanup.
+These paths add no atomic publication site or public concurrent mutation contract;
+raw escaped frame pointers remain subject to the serialized internal caller rule.
+
+The fresh funding attempt is exclusively host-owned for the whole action;
+finish/reset/begin/transfer of its generation or lifetime during that action is
+outside this contract. Normal cancellation may latch. This permits a separate
+composed funding helper with precharge ID validation and direct charge return,
+while every original-operation saved-ID check remains. Host funding cleanup in
+the actual adapter completes before its real return, not inside an omitted poll.
