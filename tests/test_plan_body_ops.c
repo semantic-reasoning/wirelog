@@ -20,6 +20,7 @@
 
 #include "../wirelog/exec_plan.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/passes/sip.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
 
@@ -337,9 +338,62 @@ test_rewrites_still_apply(void)
     printf(" ... PASS\n");
 }
 
+/* Existence opcodes must survive in actual preserved lowered bodies even if
+ * the backend later rewrites the relation to another execution strategy. */
+static void
+test_existence_bodies(void)
+{
+    const char *sources[] = {
+        ".decl a(x:int64,y:int64)\n.decl b(y:int64,w:int64)\n"
+        ".decl c(w:int64,z:int64)\n.decl output(x:int64,z:int64)\n"
+        "output(x,z) :- a(x,y),b(y,w),c(w,z).\n",
+        ".decl a(x:int64)\n.decl b(x:int64)\n.decl output(x:int64)\n"
+        "output(x) :- a(x),!b(x).\n"
+    };
+    for (unsigned anti = 0; anti < 2; ++anti) {
+        ++tests_run;
+        printf("  preserved %s body", anti ? "ANTIJOIN" : "SIP SEMIJOIN");
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(sources[anti],
+                &error);
+        wl_plan_t *plan = NULL;
+        if (!program) {
+            FAIL("parse failed"); continue;
+        }
+        plan_fixture_hold(program);
+        if (!anti) {
+            wl_sip_stats_t stats = {0};
+            if (wl_sip_apply(program,
+                &stats) || stats.semijoins_inserted != 1) {
+                FAIL("actual SIP insertion missing"); continue;
+            }
+        }
+        if (wl_plan_from_program(program, &plan)) {
+            FAIL("lowering failed"); continue;
+        }
+        uint32_t si, ri;
+        bool valid = find_relation(plan, "output", &si, &ri);
+        if (valid) {
+            const wl_plan_body_t *body = &plan->strata[si].bodies[ri];
+            valid = body->op_count > 2 &&
+                body->ops[0].op == WL_PLAN_OP_VARIABLE &&
+                body->ops[body->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE &&
+                has_op(body->ops, body->op_count,
+                    anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN);
+        }
+        wl_plan_free(plan);
+        if (!valid) {
+            FAIL("preserved full existence body missing"); continue;
+        }
+        ++tests_passed;
+        printf(" ... PASS\n");
+    }
+}
+
 int
 main(void)
 {
+    test_existence_bodies();
     printf("test_plan_body_ops (Issue #2114)\n");
     test_shape_a();
     test_shape_b();
