@@ -4079,9 +4079,950 @@ raw_count_generated_bodies(void)
     }
 }
 
+/* The standalone and genuine numeric-owned routes use one child per host
+ * action. ACK is separately scheduled; a witness is ahead of every retry. */
+typedef struct {
+    wl_col_session_t *session;
+    col_rel_t *input;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_evaluation_control_t *operation, *funding;
+    uint64_t operation_id, funding_id;
+    int operation_owner, funding_owner;
+    wl_plan_op_t op;
+    wl_plan_relation_t plan;
+    wl_columnar_eval_plan_numeric_attempt_t record;
+    const void *owner;
+    wl_columnar_filter_status_t status;
+    unsigned phase, turns, witnesses;
+    bool claim_pending, pending;
+} reduce_fixture_t;
+
+static int
+reduce_child_action(reduce_fixture_t *f)
+{
+    if (!f->phase)
+        return wl_columnar_ops_reduce_attempt_start_owned(&f->op, f->frame,
+                   f->session, f->operation, f->operation_id, &f->status,
+                   f->owner);
+    if (f->phase == 1)
+        return wl_columnar_filter_op_attempt_step_owned(f->frame, &f->status,
+                   f->owner);
+    return wl_columnar_filter_op_attempt_ack_owned(f->frame, f->owner);
+}
+
+static int
+reduce_dispatch(reduce_fixture_t *f)
+{
+    if (wl_evaluation_control_active_attempt_id(f->funding) != f->funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(f->funding, 384);
+    return rc ? rc : reduce_child_action(f);
+}
+
+static void
+reduce_fixture_init(reduce_fixture_t *f, col_rel_t *input, bool owned,
+    uint64_t limit, bool claim)
+{
+    memset(f, 0, sizeof(*f));
+    f->session = wl_columnar_filter_test_session(); f->input = input;
+    f->operation = wl_columnar_filter_test_control(limit, &f->operation_owner);
+    f->funding = wl_columnar_filter_test_control(0, &f->funding_owner);
+    f->operation_id = wl_evaluation_control_active_attempt_id(f->operation);
+    f->funding_id = wl_evaluation_control_active_attempt_id(f->funding);
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(f->session, &f->frame));
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(f->frame),
+        input, owned));
+    f->op.op = WL_PLAN_OP_REDUCE;
+    f->plan.ops = &f->op; f->plan.op_count = 1;
+    f->claim_pending = claim;
+    wl_columnar_eval_plan_numeric_attempt_init(&f->record);
+}
+
+/* Plan descriptors are complete before genuine claim and stay immutable
+ * until numeric ACK. Claim is external setup, never inside child dispatch. */
+static void
+reduce_fixture_claim(reduce_fixture_t *f)
+{
+    CHECK(f->claim_pending && !f->owner);
+    CHECK(!wl_columnar_eval_plan_numeric_attempt_begin(&f->record, &f->plan,
+        0, 1, f->frame, f->session, f->operation, f->operation_id,
+        f->funding, f->funding_id));
+    f->owner = &f->record; f->claim_pending = false;
+}
+
+typedef int (*reduce_child_callback_t)(reduce_fixture_t *);
+
+static int
+reduce_start_child(reduce_fixture_t *f)
+{
+    return wl_columnar_ops_reduce_attempt_start_owned(&f->op, f->frame,
+               f->session, f->operation, f->operation_id, &f->status, f->owner);
+}
+
+static int
+reduce_step_child(reduce_fixture_t *f)
+{
+    return wl_columnar_filter_op_attempt_step_owned(f->frame, &f->status,
+               f->owner);
+}
+
+static int
+reduce_ack_child(reduce_fixture_t *f)
+{
+    return wl_columnar_filter_op_attempt_ack_owned(f->frame, f->owner);
+}
+
+/* Consume child status on a later, separately funded action. The direct
+ * child-return turn performs no phase/status consume or inline ACK. */
+static int
+reduce_engine_dispatch(reduce_fixture_t *f)
+{
+    /* Readonly selection precedes HOST. No status/owner mutation on refusal. */
+    reduce_child_callback_t child = !f->phase ? reduce_start_child
+        : f->phase == 1 ? reduce_step_child : reduce_ack_child;
+    if (wl_evaluation_control_active_attempt_id(f->funding) != f->funding_id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge(f->funding, 384);
+    if (rc) return rc;
+    if (!f->pending) {
+        f->pending = true;
+        return child(f);
+    }
+    f->pending = false;
+    f->phase = f->phase == 2 ? 3
+        : f->status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE ? 2 : 1;
+    return 0;
+}
+
+/* An engine callback performs one funded child or consume action and returns
+* through the existing real host_turn. Requeue suffix and that host return
+* belong to its source envelope; the next queue pop belongs to a new turn. */
+static void
+reduce_host_engine(host_queue_t *queue, host_job_t *job)
+{
+    reduce_fixture_t *f = job->data;
+    CHECK(f->turns == f->witnesses && ++f->turns < 10000);
+    CHECK(!reduce_engine_dispatch(f));
+    if (f->phase != 3) {
+        CHECK(queue->count < HOST_QUEUE_CAPACITY && !job->queued);
+        queue->jobs[(queue->head + queue->count) % HOST_QUEUE_CAPACITY] = job;
+        ++queue->count;
+        job->queued = true;
+    }
+}
+
+static void
+reduce_host_witness(host_queue_t *queue, host_job_t *job)
+{
+    reduce_fixture_t *f = job->data;
+    CHECK(++f->witnesses == f->turns);
+    if (f->phase != 3) CHECK(!host_enqueue(queue, job));
+}
+
+static void
+reduce_run(reduce_fixture_t *f)
+{
+    if (f->claim_pending) reduce_fixture_claim(f);
+    host_queue_t queue = {0};
+    host_job_t engine = {.dispatch = reduce_host_engine, .data = f};
+    host_job_t witness = {.dispatch = reduce_host_witness, .data = f};
+    CHECK(!host_enqueue(&queue, &engine));
+    CHECK(!host_enqueue(&queue, &witness));
+    while (queue.count) CHECK(!host_turn(&queue));
+    CHECK(!engine.queued && !witness.queued && f->phase == 3);
+    CHECK(f->turns == f->witnesses);
+}
+
+static void
+reduce_fixture_close(reduce_fixture_t *f, bool input_owned)
+{
+    CHECK(f->phase == 3);
+    if (f->owner) {
+        wl_evaluation_control_request_cancel(f->operation);
+        for (unsigned turns = 0;
+            f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE; ++turns) {
+            CHECK(turns < 10);
+            CHECK(!wl_columnar_eval_plan_numeric_attempt_step(&f->record,
+                f->funding, f->funding_id));
+        }
+        CHECK(!f->record.completed);
+        CHECK(!wl_columnar_eval_plan_numeric_attempt_ack(&f->record,
+            f->funding, f->funding_id));
+        f->owner = NULL;
+    }
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(!wl_columnar_filter_test_reserved(f->session));
+    int result = f->status.semantic_result;
+    if (wl_evaluation_control_active_attempt_id(f->operation)) {
+        int actual = wl_evaluation_control_finish(f->operation,
+                &f->operation_owner, result, 0);
+        CHECK(actual == result || actual == WL_EVALUATION_CONTROL_CANCELLED);
+    }
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->operation);
+    wl_evaluation_control_release(f->funding);
+    wl_columnar_memory_governor_ref_release(f->session->memory_governor);
+    free(f->session);
+    if (!input_owned) col_rel_destroy(f->input);
+}
+
+static col_rel_t *
+reduce_literal_input(bool floating, bool empty)
+{
+    col_rel_t *input = wl_columnar_filter_test_source(2, 0, true, false, false);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                     floating ? WIRELOG_TYPE_FLOAT :
+                                     WIRELOG_TYPE_INT64};
+    CHECK(!col_rel_set_column_types(input, types, 2));
+    int64_t keys[] = {2, 1, 2, 1, 2, 3};
+    int64_t operands[] = {-3, 10, 5, -4, -2, 0};
+    for (unsigned r = 0; !empty && r < 6; ++r) {
+        int64_t row[] = {keys[r], floating
+            ? wl_columnar_float_to_bits((double)operands[r]) : operands[r]};
+        CHECK(!col_rel_append_row(input, row));
+    }
+    return input;
+}
+
+static void
+reduce_literal_matrix(void)
+{
+    const wirelog_agg_fn_t functions[] = {WIRELOG_AGG_COUNT, WIRELOG_AGG_SUM,
+                                          WIRELOG_AGG_MIN, WIRELOG_AGG_MAX,
+                                          WIRELOG_AGG_AVG};
+    const int64_t answers[5][3] = {{3, 2, 1}, {0, 6, 0}, {-3, -4, 0},
+                                   {5, 10, 0}, {0, 3, 0}};
+    for (unsigned kind = 0; kind < 5; ++kind)
+        for (unsigned fp = 0; fp < 2; ++fp) {
+            if (kind == 4 && !fp) continue;
+            for (unsigned empty = 0; empty < 2; ++empty)
+                for (unsigned ai = 0; ai < 3; ++ai)
+                    for (unsigned claim = 0; claim < 2; ++claim) {
+                        col_rel_t *input = reduce_literal_input(fp != 0,
+                                empty != 0);
+                        reduce_fixture_t f;
+                        reduce_fixture_init(&f, input, false, 0, claim != 0);
+                        f.op.agg_fn = functions[kind];
+                        f.op.agg_operand_type = fp ? WL_PLAN_AGG_OPERAND_FLOAT
+                            : WL_PLAN_AGG_OPERAND_SCALAR;
+                        f.op.group_by_count = 1; f.op.aggregate_index = ai;
+                        eval_stack_t raw = {0};
+                        CHECK(!eval_stack_push(&raw, input, false));
+                        CHECK(!col_op_reduce(&f.op, &raw, f.session));
+                        reduce_run(&f);
+                        CHECK(!f.status.semantic_result && f.status.committed);
+                        eval_stack_t *stack =
+                            wl_columnar_eval_stack_cleanup_stack(f.frame);
+                        CHECK(stack->top == 1 && stack->items[0].owned &&
+                            !stack->items[0].is_delta);
+                        col_rel_t *actual = stack->items[0].rel;
+                        CHECK(actual->ncols == 2 &&
+                            actual->nrows == (empty ? 0u : 3u));
+                        CHECK(!actual->has_graph_column && !actual->timestamps);
+                        unsigned agg = ai < 2 ? ai : 1, key = 1u - agg;
+                        CHECK(actual->column_types[agg] == (fp && kind
+                            ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64));
+                        const int64_t keys[] = {2, 1, 3};
+                        for (unsigned r = 0; !empty && r < 3; ++r) {
+                            int64_t expected = fp && kind
+                                ? wl_columnar_float_to_bits(
+                                (double)answers[kind][r])
+                                : answers[kind][r];
+                            CHECK(actual->columns[key][r] == keys[r]);
+                            CHECK(actual->columns[agg][r] == expected);
+                            for (unsigned c = 0; c < 2; ++c)
+                                CHECK(actual->columns[c][r] ==
+                                    raw.items[0].rel->columns[c][r]);
+                        }
+                        CHECK(!eval_stack_drain(&raw));
+                        reduce_fixture_close(&f, false);
+                    }
+        }
+}
+
+static void
+reduce_error_order(void)
+{
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        col_rel_t *input = wl_columnar_filter_test_source(2, 0, false, false,
+                false);
+        wirelog_column_type_t types[] = {WIRELOG_TYPE_FLOAT,
+                                         WIRELOG_TYPE_INT64};
+        CHECK(!col_rel_set_column_types(input, types, 2));
+        for (unsigned r = 0; r < 3; ++r) {
+            int64_t row[] = {wl_columnar_float_to_bits(0.0),
+                             mode < 2 ? (r ? 0 : 1) : r == 1 ? INT64_MAX : 1};
+            if (mode == 1) row[1] = 0;
+            CHECK(!col_rel_append_row(input, row));
+        }
+        if (mode < 3) input->columns[0][0] = wl_columnar_float_to_bits(NAN);
+        if (mode ==
+            3) input->columns[0][2] = wl_columnar_float_to_bits(INFINITY);
+        wl_columnar_filter_test_program_t expression = {0};
+        wl_columnar_filter_test_variable(&expression, WL_PLAN_EXPR_VAR, 1);
+        wl_columnar_filter_test_variable(&expression, WL_PLAN_EXPR_VAR, 1);
+        wl_columnar_filter_test_opcode(&expression, WL_PLAN_EXPR_ARITH_DIV);
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, input, false, 0, (mode & 1u) || mode == 2);
+        f.op.agg_fn = WIRELOG_AGG_SUM;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+        f.op.group_by_count = 1; f.op.aggregate_index = 1;
+        if (mode < 2) {
+            f.op.agg_expr.data = expression.bytes;
+            f.op.agg_expr.size = expression.size;
+        }
+        eval_stack_t raw = {0}; CHECK(!eval_stack_push(&raw, input, false));
+        int expected = mode == 0 || mode == 2 ? EINVAL : ERANGE;
+        CHECK(col_op_reduce(&f.op, &raw, f.session) == expected);
+        CHECK(!eval_stack_drain(&raw));
+        reduce_run(&f);
+        CHECK(f.status.semantic_result == expected && !f.status.committed);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(stack->top == 1 && stack->items[0].rel == input &&
+            !stack->items[0].owned);
+        reduce_fixture_close(&f, false);
+    }
+}
+
+static unsigned reduce_cancel_phase;
+static bool reduce_cancel_seen;
+static wl_columnar_filter_context_t *reduce_observed_context;
+static void
+reduce_cancel_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase == reduce_cancel_phase && progress >= (phase == 47 ? 256u : 0u)) {
+        if (phase == 47) CHECK(!reduce_observed_context->output->nrows);
+        reduce_cancel_seen = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+reduce_stop_matrix(void)
+{
+    const unsigned phases[] = {1, 2, 3, 9, 10, 11, 12, 30, 31, 32, 33, 35,
+                               36, 39, 40, 41, 42, 43, 44, 45, 46, 47, 15, 48};
+    for (unsigned test = 0; test < sizeof(phases) / sizeof(phases[0]); ++test) {
+        col_rel_t *input = wl_columnar_filter_test_source(2, 600, false, false,
+                false);
+        for (unsigned r = 0; r < 600; ++r) {
+            input->columns[0][r] = 1; input->columns[1][r] = 1;
+        }
+        reduce_fixture_t f; reduce_fixture_init(&f, input, false, 0, false);
+        f.op.agg_fn = WIRELOG_AGG_SUM;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+        f.op.group_by_count = 1; f.op.aggregate_index = 1;
+        CHECK(!wl_columnar_eval_stack_filter_context(f.frame,
+            &reduce_observed_context));
+        reduce_cancel_phase = phases[test]; reduce_cancel_seen = false;
+        wl_columnar_ops_test_reduce_attempt_checkpoint =
+            reduce_cancel_checkpoint;
+        reduce_run(&f);
+        wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+        CHECK(reduce_cancel_seen && !f.status.committed &&
+            f.status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            input);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            f.status.semantic_result, 0) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!wl_evaluation_control_reset(f.operation));
+        CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+        f.operation_id = wl_evaluation_control_active_attempt_id(f.operation);
+        f.phase = 0; reduce_run(&f);
+        CHECK(!f.status.semantic_result && f.status.committed);
+        col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+        CHECK(out->nrows == 1 && out->columns[1][0] == 600);
+        reduce_fixture_close(&f, false);
+    }
+    reduce_observed_context = NULL;
+}
+
+static void
+reduce_collisions(void)
+{
+    col_rel_t *input = wl_columnar_filter_test_source(3, 96, false, false,
+            false);
+    uint64_t seed = UINT64_C(1469598103934665603),
+        prime = UINT64_C(1099511628211);
+    for (unsigned r = 0; r < 96; ++r) {
+        input->columns[0][r] = r;
+        input->columns[1][r] = (int64_t)((seed * prime) ^ ((seed ^ r) * prime));
+        input->columns[2][r] = r + 7;
+    }
+    reduce_fixture_t f; reduce_fixture_init(&f, input, false, 0, true);
+    f.op.agg_fn = WIRELOG_AGG_SUM;
+    f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+    f.op.group_by_count = 2; f.op.aggregate_index = 1;
+    reduce_run(&f); CHECK(!f.status.semantic_result && f.status.committed);
+    col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(out->nrows == 96 && out->ncols == 3);
+    for (unsigned r = 0; r < 96; ++r) {
+        CHECK(out->columns[0][r] == input->columns[0][r]);
+        CHECK(out->columns[2][r] == input->columns[1][r]);
+        CHECK(out->columns[1][r] == (int64_t)r + 7);
+    }
+    reduce_fixture_close(&f, false);
+}
+
+static void
+reduce_owned_authority(void)
+{
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0, true);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    reduce_fixture_claim(&f);
+    wl_columnar_filter_status_t status, sentinel;
+    memset(&status, 0x5a, sizeof(status));
+    memcpy(&sentinel, &status, sizeof(status));
+    CHECK(wl_columnar_ops_reduce_attempt_start_owned(&f.op, f.frame, f.session,
+        NULL, 0, &status, &f.record) == EINVAL);
+    CHECK(!memcmp(&status, &sentinel, sizeof(status)));
+    wl_columnar_eval_plan_numeric_attempt_t copy = f.record;
+    CHECK(wl_columnar_ops_reduce_attempt_start_owned(&f.op, f.frame, f.session,
+        f.operation, f.operation_id, &status, &copy) == EBUSY);
+    CHECK(!memcmp(&status, &sentinel, sizeof(status)));
+    CHECK(wl_columnar_ops_reduce_attempt_start_owned(&f.op, f.frame, f.session,
+        f.operation, f.operation_id + 1, &status, &f.record) == EINVAL);
+    CHECK(!memcmp(&status, &sentinel, sizeof(status)));
+    CHECK(wl_columnar_ops_reduce_attempt_start_owned(&f.op, f.frame, f.session,
+        f.funding, f.operation_id, &status, &f.record) == EINVAL);
+    CHECK(!memcmp(&status, &sentinel, sizeof(status)));
+    reduce_run(&f); CHECK(f.status.committed && !f.status.semantic_result);
+    reduce_fixture_close(&f, false);
+}
+
+static void
+reduce_allocation_and_domains(void)
+{
+    for (unsigned failure = 0; failure < 3; ++failure) {
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0,
+            false);
+        f.op.agg_fn = WIRELOG_AGG_SUM; f.op.group_by_count = 1;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+        wl_columnar_ops_test_reduce_attempt_fail_allocation = (int)failure;
+        reduce_run(&f);
+        wl_columnar_ops_test_reduce_attempt_fail_allocation = -1;
+        CHECK(f.status.semantic_result == ENOMEM && !f.status.committed);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            f.input);
+        reduce_fixture_close(&f, false);
+    }
+    for (unsigned mode = 0; mode < 8; ++mode) {
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, reduce_literal_input(true, false), false, 0,
+            false);
+        f.op.agg_fn = mode < 4 ? WIRELOG_AGG_COUNT : WIRELOG_AGG_MIN;
+        f.op.agg_operand_type = mode < 4 ? (wl_plan_agg_operand_t)mode
+            : WL_PLAN_AGG_OPERAND_STRING;
+        f.op.group_by_count = 1;
+        if (mode < 4) f.input->columns[1][0] = wl_columnar_float_to_bits(NAN);
+        if (mode == 5) {
+            f.op.agg_fn = WIRELOG_AGG_AVG;
+            f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+        }
+        if (mode == 6) {
+            f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.materialized = true;
+        }
+        if (mode == 7) {
+            f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = UINT32_MAX;
+        }
+        reduce_run(&f);
+        CHECK(f.status.semantic_result ==
+            (mode < 4 ? 0 : mode == 7 ? EOVERFLOW : ENOTSUP));
+        CHECK(f.status.committed == (mode < 4));
+        reduce_fixture_close(&f, false);
+    }
+}
+
+static void
+reduce_retained_resources(void)
+{
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0,
+        false);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context(f.frame, &ctx));
+    for (unsigned turns = 0;
+        ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT ||
+        ctx->join_retirement_cursor;
+        ++turns) {
+        CHECK(turns < 1000 && !reduce_dispatch(&f)); f.phase = 1;
+    }
+    wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[0];
+    CHECK(scratch->admitted && scratch->committed && scratch->ref_held &&
+        !scratch->physical);
+    uint64_t reserved = wl_columnar_filter_test_reserved(f.session);
+    uint64_t bytes = scratch->credit.bytes;
+    wl_columnar_memory_governor_test_refuse_next_release();
+    CHECK(!reduce_dispatch(&f));
+    CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    CHECK(scratch->admitted && scratch->ref_held &&
+        scratch->credit.bytes == bytes);
+    CHECK(wl_columnar_filter_test_reserved(f.session) == reserved);
+    wl_evaluation_control_t *saved = f.funding;
+    uint64_t saved_id = f.funding_id;
+    for (unsigned allowance = 383; allowance <= 384; ++allowance) {
+        int host_owner;
+        f.funding = wl_columnar_filter_test_control(allowance, &host_owner);
+        f.funding_id = wl_evaluation_control_active_attempt_id(f.funding);
+        int rc = reduce_dispatch(&f);
+        CHECK(rc == (allowance == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (allowance == 383) CHECK(scratch->admitted &&
+                ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_CREDIT);
+        CHECK(wl_evaluation_control_finish(f.funding, &host_owner, 0, 0) ==
+            (allowance == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        CHECK(!wl_evaluation_control_detach(f.funding, &host_owner));
+        wl_evaluation_control_release(f.funding);
+    }
+    f.funding = saved; f.funding_id = saved_id;
+    CHECK(!scratch->admitted && scratch->ref_held);
+    CHECK(wl_columnar_filter_test_reserved(f.session) == reserved - bytes);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    reduce_run(&f);
+    CHECK(f.status.semantic_result == EINVAL && !f.status.committed);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report) &&
+        report.attempt_id == f.operation_id + 1 && !report.consumed);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    f.operation_id = wl_evaluation_control_active_attempt_id(f.operation);
+    f.phase = 0; reduce_run(&f);
+    CHECK(f.status.committed && !f.status.semantic_result);
+    reduce_fixture_close(&f, false);
+
+    col_rel_t *input = reduce_literal_input(false, false);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!wl_columnar_source_access_reader_acquire(&input->source_access,
+        &reader));
+    reduce_fixture_init(&f, input, true, 0, false);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    for (unsigned turns = 0; ; ++turns) {
+        CHECK(turns < 1000 && !reduce_dispatch(&f)); f.phase = 1;
+        if (f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED) break;
+        CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_YIELD);
+    }
+    CHECK(f.status.committed && !f.status.execution_result &&
+        f.status.cleanup_result == EBUSY && f.status.semantic_result == EBUSY);
+    col_rel_t *published =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    uint64_t generation = published->storage_generation;
+    CHECK(!reduce_dispatch(&f));
+    CHECK(f.status.progress == WL_COLUMNAR_FILTER_PROGRESS_RETAINED &&
+        f.status.committed && !f.status.execution_result &&
+        f.status.cleanup_result == EBUSY && f.status.semantic_result == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        published &&
+        published->storage_generation == generation);
+    CHECK(!wl_columnar_source_access_reader_release(&reader));
+    reduce_run(&f);
+    CHECK(f.status.committed && !f.status.semantic_result &&
+        !f.status.cleanup_result);
+    reduce_fixture_close(&f, true);
+}
+
+static void
+reduce_shape_and_expression(void)
+{
+    for (unsigned mode = 0; mode < 7; ++mode) {
+        col_rel_t *input = mode == 0
+            ? wl_columnar_filter_test_source(0, 3, false, false, false)
+            : mode >= 4 ? wl_columnar_filter_test_source(2, 0, false, false,
+                false)
+            : reduce_literal_input(mode == 2 || mode == 3, false);
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, input, false, 0, (mode & 1u) || mode == 2);
+        f.op.agg_fn = mode == 2 ||
+            mode == 3 ? WIRELOG_AGG_SUM : WIRELOG_AGG_COUNT;
+        f.op.agg_operand_type = mode == 2 || mode == 3
+            ? WL_PLAN_AGG_OPERAND_FLOAT : WL_PLAN_AGG_OPERAND_SCALAR;
+        f.op.group_by_count = mode ? 1 : 0; f.op.aggregate_index = 1;
+        wl_columnar_filter_test_program_t expression = {0};
+        wl_columnar_filter_test_variable(&expression, WL_PLAN_EXPR_VAR_FLOAT,
+            1);
+        if (mode == 2) {
+            f.op.agg_expr.data = expression.bytes;
+            f.op.agg_expr.size = expression.size;
+        }
+        uint32_t out_of_range = 99;
+        if (mode == 3) {
+            /* Missing operand fallback is bits1, not numeric1.0. */
+            f.op.group_by_count = 2; f.op.aggregate_index = 2;
+        }
+        if (mode >= 4) {
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_FLOAT,
+                                             WIRELOG_TYPE_INT64};
+            CHECK(!col_rel_set_column_types(input, types, 2));
+            for (unsigned r = 0; r < 6; ++r) {
+                int64_t row[] = {wl_columnar_float_to_bits(0.0), r};
+                CHECK(!col_rel_append_row(input, row));
+            }
+            for (uint32_t r = 0; r < input->nrows; ++r)
+                input->columns[0][r] = wl_columnar_float_to_bits(r &
+                        1u ? -0.0 : 0.0);
+            if (mode == 5) {
+                f.op.group_by_indices = &out_of_range;
+                for (uint32_t r = 1; r < input->nrows;
+                    ++r) input->columns[0][r] = 0;
+                input->columns[0][0] = wl_columnar_float_to_bits(NAN);
+            }
+            if (mode ==
+                6) input->columns[0][0] = wl_columnar_float_to_bits(NAN);
+        }
+        reduce_run(&f);
+        CHECK(f.status.semantic_result == (mode == 6 ? EINVAL : 0));
+        if (mode != 6) {
+            col_rel_t *out =
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+            CHECK(f.status.committed);
+            if (!mode) CHECK(out->nrows == 1 && out->ncols == 1 &&
+                    out->columns[0][0] == 3);
+            if (mode == 1) CHECK(out->nrows == 3 && out->columns[1][0] == 3);
+            if (mode == 2) CHECK(out->nrows == 3 &&
+                    out->columns[1][0] == wl_columnar_float_to_bits(0.0));
+            if (mode == 3) for (uint32_t r = 0; r < out->nrows;
+                    ++r) CHECK(out->columns[2][r] == 1);
+            if (mode == 4) CHECK(out->nrows == 1 && out->columns[0][0] == 0 &&
+                    out->columns[1][0] == 6);
+            if (mode == 5) CHECK(out->nrows == 2 &&
+                    out->column_types[0] == WIRELOG_TYPE_INT64 &&
+                    out->columns[0][0] == wl_columnar_float_to_bits(NAN) &&
+                    out->columns[1][0] == 1);
+        }
+        reduce_fixture_close(&f, false);
+    }
+}
+
+static void
+reduce_wide_and_float_overflow(void)
+{
+    const uint32_t widths[] = {1, 17, 129};
+    const int64_t operands[] = {-3, 10, 5, -4, -2, 0};
+    for (unsigned test = 0; test < 3; ++test) {
+        uint32_t width = widths[test], gc = width - 1;
+        col_rel_t *input = wl_columnar_filter_test_source(width, 6, false,
+                false, false);
+        for (uint32_t r = 0; r < 6; ++r) {
+            for (uint32_t c = 0; c < gc; ++c) input->columns[c][r] = c + 7;
+            input->columns[gc][r] = operands[r];
+        }
+        reduce_fixture_t f; reduce_fixture_init(&f, input, false, 0, true);
+        f.op.agg_fn = WIRELOG_AGG_SUM;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+        f.op.group_by_count = gc; f.op.aggregate_index = gc / 2;
+        reduce_run(&f); CHECK(f.status.committed && !f.status.semantic_result);
+        col_rel_t *out =
+            wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+        CHECK(out->ncols == width && out->nrows == 1);
+        for (uint32_t c = 0; c < width; ++c) {
+            uint32_t k = c > f.op.aggregate_index ? c - 1 : c;
+            CHECK(out->column_types[c] == WIRELOG_TYPE_INT64);
+            CHECK(out->columns[c][0] ==
+                (c == f.op.aggregate_index ? 6 : (int64_t)k+7));
+        }
+        reduce_fixture_close(&f, false);
+    }
+    for (unsigned average = 0; average < 2; ++average) {
+        col_rel_t *input = reduce_literal_input(true, false);
+        for (uint32_t r = 0; r < input->nrows; ++r) {
+            input->columns[0][r] = 0;
+            input->columns[1][r] = wl_columnar_float_to_bits(r <
+                    2 ? 1.0e308 : -1.0e308);
+        }
+        reduce_fixture_t f; reduce_fixture_init(&f, input, false, 0, false);
+        f.op.agg_fn = average ? WIRELOG_AGG_AVG : WIRELOG_AGG_SUM;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_FLOAT;
+        f.op.group_by_count = 1;
+        reduce_run(&f);
+        CHECK(!f.status.committed && f.status.semantic_result == ERANGE);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            input);
+        reduce_fixture_close(&f, false);
+    }
+}
+
+static void
+reduce_group_native_types(void)
+{
+    const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT32,
+                                           WIRELOG_TYPE_INT64,
+                                           WIRELOG_TYPE_UINT32,
+                                           WIRELOG_TYPE_UINT64,
+                                           WIRELOG_TYPE_FLOAT,
+                                           WIRELOG_TYPE_STRING,
+                                           WIRELOG_TYPE_BOOL,
+                                           WIRELOG_TYPE_INT64};
+    uint32_t keys[] = {6, 4, 0, 2, 3, 5, 1, 4};
+    col_rel_t *input = wl_columnar_filter_test_source(8, 0, false, false,
+            false);
+    CHECK(!col_rel_set_column_types(input, types, 8));
+    for (unsigned r = 0; r < 2; ++r) {
+        int64_t row[] = {-7, -9, 11, 13,
+                         wl_columnar_float_to_bits(r ? -0.0 : 0.0), 19, 3, 99};
+        CHECK(!col_rel_append_row(input, row));
+    }
+    reduce_fixture_t f; reduce_fixture_init(&f, input, false, 0, true);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 8;
+    f.op.group_by_indices = keys; f.op.aggregate_index = 4;
+    reduce_run(&f); CHECK(f.status.committed && !f.status.semantic_result);
+    col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(out->ncols == 9 && out->nrows == 1);
+    for (unsigned c = 0; c < 9; ++c) {
+        if (c == 4) {
+            CHECK(out->column_types[c] == WIRELOG_TYPE_INT64 &&
+                out->columns[c][0] == 2); continue;
+        }
+        uint32_t k = c > 4 ? c-1 : c;
+        CHECK(out->column_types[c] == types[keys[k]]);
+        CHECK(out->columns[c][0] ==
+            (keys[k] == 4 ? 0 : input->columns[keys[k]][0]));
+    }
+    reduce_fixture_close(&f, false);
+}
+
+static void
+reduce_entry_limits(void)
+{
+    for (unsigned limit = 191; limit <= 192; ++limit) {
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, reduce_literal_input(false, false), false,
+            limit, false);
+        f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+        reduce_run(&f);
+        CHECK(!f.status.committed &&
+            f.status.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            f.input);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            f.status.semantic_result, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        CHECK(report.attempt_id == f.operation_id &&
+            report.consumed == (limit == 191 ? 0u : 192u));
+        reduce_fixture_close(&f, false);
+    }
+}
+
+static void
+reduce_quota_retry(void)
+{
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0,
+        false);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    uint64_t bytes = 16u*1024u*1024u-
+        wl_columnar_filter_test_reserved(f.session)-1u;
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            f.session->memory_governor), bytes, &peer));
+    reduce_run(&f);
+    CHECK(!f.status.committed && f.status.semantic_result == ENOSPC &&
+        f.session->memory_budget_denied);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+        f.input);
+    CHECK(wl_columnar_memory_rollback(&peer));
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner, ENOSPC,
+        0) == ENOSPC);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    f.operation_id = wl_evaluation_control_active_attempt_id(f.operation);
+    f.phase = 0;
+    reduce_run(&f); CHECK(f.status.committed && !f.status.semantic_result);
+    reduce_fixture_close(&f, false);
+}
+
+static void
+reduce_all_reached_allocations(void)
+{
+    unsigned counts[4] = {0};
+    wl_columnar_filter_test_program_t expression = {0};
+    wl_columnar_filter_test_variable(&expression, WL_PLAN_EXPR_VAR, 1);
+    for (unsigned pass = 0; pass < 2; ++pass)
+        for (unsigned family = 0; family < (pass ? 4u : 1u); ++family)
+            for (unsigned ordinal = 0; ordinal < (pass ? counts[family] : 1u);
+                ++ordinal){
+                col_rel_t *input = wl_columnar_filter_test_source(2, 96, false,
+                        false, false);
+                for (unsigned r = 0; r < 96; ++r) {
+                    input->columns[0][r] = r; input->columns[1][r] = 1;
+                }
+                reduce_fixture_t f;
+                reduce_fixture_init(&f, input, false, 0, true);
+                f.op.agg_fn = WIRELOG_AGG_SUM;
+                f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_SCALAR;
+                f.op.group_by_count = 1; f.op.aggregate_index = 1;
+                f.op.agg_expr.data = expression.bytes;
+                f.op.agg_expr.size = expression.size;
+                if (!pass ||
+                    family ==
+                    0) wl_columnar_relation_test_constructor_fail_allocation =
+                        pass ? ordinal+1u : UINT32_MAX;
+                if (!pass ||
+                    family ==
+                    1) wl_columnar_relation_test_growth_fail_allocation =
+                        pass ? ordinal+1u : UINT32_MAX;
+                if (!pass ||
+                    family ==
+                    2) wl_columnar_expr_test_fail_allocation =
+                        pass ? (int)ordinal : 100000;
+                if (!pass ||
+                    family ==
+                    3) wl_columnar_ops_test_reduce_attempt_fail_allocation =
+                        pass ? (int)ordinal : 100000;
+                reduce_run(&f);
+                if (!pass) {
+                    counts[0] = UINT32_MAX-
+                        wl_columnar_relation_test_constructor_fail_allocation;
+                    counts[1] = UINT32_MAX-
+                        wl_columnar_relation_test_growth_fail_allocation;
+                    counts[2] = (unsigned)(100000-
+                        wl_columnar_expr_test_fail_allocation);
+                    counts[3] = (unsigned)(100000-
+                        wl_columnar_ops_test_reduce_attempt_fail_allocation);
+                    CHECK(f.status.committed && !f.status.semantic_result);
+                } else {
+                    CHECK(!f.status.committed &&
+                        f.status.semantic_result == ENOMEM);
+                    CHECK(wl_columnar_eval_stack_cleanup_stack(
+                            f.frame)->items[0].rel == input);
+                }
+                wl_columnar_relation_test_constructor_fail_allocation = 0;
+                wl_columnar_relation_test_growth_fail_allocation = 0;
+                wl_columnar_expr_test_fail_allocation = -1;
+                wl_columnar_ops_test_reduce_attempt_fail_allocation = -1;
+                reduce_fixture_close(&f, false);
+            }
+    CHECK(counts[0] && counts[1] && counts[2] && counts[3] == 3);
+}
+
+static unsigned reduce_expression_stop_phase;
+static bool reduce_expression_stop_seen;
+static void
+reduce_expression_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    (void)progress; (void)failed;
+    if (control && phase == reduce_expression_stop_phase) {
+        reduce_expression_stop_seen = true;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+reduce_expression_stops_and_ignored_count(void)
+{
+    const unsigned phases[] = {11, 14, 15, 16, 17, 18, 20, 21, 22};
+    wl_columnar_filter_test_program_t expression = {0};
+    wl_columnar_filter_test_variable(&expression, WL_PLAN_EXPR_VAR_FLOAT, 1);
+    for (unsigned i = 0; i < 16; ++i) {
+        wl_columnar_filter_test_constant(&expression, WL_PLAN_EXPR_CONST_FLOAT,
+            wl_columnar_float_to_bits(0.0));
+        wl_columnar_filter_test_opcode(&expression,
+            WL_PLAN_EXPR_ARITH_FLOAT_ADD);
+    }
+    for (unsigned test = 0; test < sizeof(phases)/sizeof(phases[0]); ++test) {
+        reduce_fixture_t f;
+        reduce_fixture_init(&f, reduce_literal_input(true, false), false, 0,
+            true);
+        f.op.agg_fn = WIRELOG_AGG_SUM;
+        f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_FLOAT;
+        f.op.group_by_count = 1; f.op.aggregate_index = 1;
+        f.op.agg_expr.data = expression.bytes;
+        f.op.agg_expr.size = expression.size;
+        reduce_expression_stop_phase = phases[test];
+        reduce_expression_stop_seen = false;
+        wl_columnar_expr_test_checkpoint = reduce_expression_checkpoint;
+        reduce_run(&f); wl_columnar_expr_test_checkpoint = NULL;
+        CHECK(reduce_expression_stop_seen && !f.status.committed &&
+            f.status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+            f.input);
+        reduce_fixture_close(&f, false);
+    }
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(true, false), false, 0, true);
+    f.op.agg_fn = WIRELOG_AGG_COUNT;
+    f.op.agg_operand_type = WL_PLAN_AGG_OPERAND_FLOAT;
+    f.op.group_by_count = 1; f.op.aggregate_index = 1;
+    f.op.agg_expr.data = expression.bytes; f.op.agg_expr.size = expression.size;
+    f.input->columns[1][0] = wl_columnar_float_to_bits(NAN);
+    wl_columnar_expr_test_fail_allocation = 0;
+    reduce_run(&f); CHECK(wl_columnar_expr_test_fail_allocation == 0);
+    wl_columnar_expr_test_fail_allocation = -1;
+    CHECK(f.status.committed && !f.status.semantic_result);
+    col_rel_t *out =
+        wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel;
+    CHECK(out->nrows == 3 && out->columns[1][0] == 3);
+    reduce_fixture_close(&f, false);
+}
+
+static void
+reduce_engine_host_refusal(void)
+{
+    reduce_fixture_t f;
+    reduce_fixture_init(&f, reduce_literal_input(false, false), false, 0,
+        false);
+    f.op.agg_fn = WIRELOG_AGG_COUNT; f.op.group_by_count = 1;
+    f.op.aggregate_index = 1;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context(f.frame, &ctx));
+    wl_columnar_filter_status_t sentinel;
+    memset(&f.status, 0x5a, sizeof(f.status));
+    memcpy(&sentinel, &f.status, sizeof(sentinel));
+    wl_evaluation_control_t *saved = f.funding;
+    uint64_t saved_id = f.funding_id;
+    for (unsigned allowance = 383; allowance <= 384; ++allowance) {
+        int host_owner;
+        f.funding = wl_columnar_filter_test_control(allowance, &host_owner);
+        f.funding_id = wl_evaluation_control_active_attempt_id(f.funding);
+        int rc = reduce_engine_dispatch(&f);
+        CHECK(rc == (allowance == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (allowance == 383) {
+            CHECK(!f.pending && !f.phase &&
+                ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT);
+            CHECK(!memcmp(&f.status, &sentinel, sizeof(sentinel)));
+            CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel ==
+                f.input);
+        } else CHECK(f.pending && !f.phase &&
+                ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH);
+        CHECK(wl_evaluation_control_finish(f.funding, &host_owner, 0, 0) ==
+            (allowance == 383 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.funding, &report));
+        CHECK(report.attempt_id == f.funding_id &&
+            report.consumed == (allowance == 383 ? 0u : 384u));
+        CHECK(!wl_evaluation_control_detach(f.funding, &host_owner));
+        wl_evaluation_control_release(f.funding);
+    }
+    f.funding = saved; f.funding_id = saved_id;
+    reduce_run(&f);
+    CHECK(!f.status.semantic_result && f.status.committed && !f.pending);
+    CHECK(wl_columnar_eval_stack_cleanup_stack(
+            f.frame)->items[0].rel->columns[1][0] == 3);
+    reduce_fixture_close(&f, false);
+}
+
 int
 main(void)
 {
+    reduce_literal_matrix(); reduce_error_order(); reduce_stop_matrix();
+    reduce_collisions(); reduce_owned_authority();
+    reduce_allocation_and_domains(); reduce_retained_resources();
+    reduce_shape_and_expression(); reduce_wide_and_float_overflow();
+    reduce_group_native_types(); reduce_entry_limits(); reduce_quota_retry();
+    reduce_all_reached_allocations();
+    reduce_expression_stops_and_ignored_count(); reduce_engine_host_refusal();
     raw_count_result_domains(); raw_count_generated_bodies();
     printf(
         "numeric FILTER ABI descriptor=%zu frame=%zu program_owner=%zu instruction=%zu timestamp=%zu\n",

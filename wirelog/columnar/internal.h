@@ -5643,6 +5643,27 @@ int wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
 void wl_columnar_filter_attempt_batch_init(
     wl_columnar_relation_append_batch_t *);
 
+/* Initial scalar numeric REDUCE. COUNT accepts all valid operand domains;
+ * SUM/MIN/MAX accept integer/FLOAT and AVG requires FLOAT. No STRING ordering,
+ * interpreter fallback, timestamps, recursion/diff/TDD/batch/parallel. Reuses
+ * original source/program/scratch3/B2/unary owners and shared filter step/ACK.
+ * Hosts keep descriptors/backing/governors immutable/live through ACK, with
+ * a distinct fresh HOST384 grant for each start/step/retry/ACK. NULL control
+ * delegates raw REDUCE only with NULL owner. Owned control/ID must match the
+ * genuine original numeric record; no authority transfers through copies. */
+int wl_columnar_ops_reduce_attempt_start(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
+int wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
+    const void *owner);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_ops_test_reduce_attempt_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+extern int wl_columnar_ops_test_reduce_attempt_fail_allocation;
+#endif
+
 /* Controlled initial nonrecursive ordinary JOIN. Hosts keep op/session,
  * registry, descriptors, backing and governor bindings immutable/live until
  * ACK, serialize the native owner and forbid same-context reentry. Each

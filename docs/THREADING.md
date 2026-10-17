@@ -1764,3 +1764,15 @@ or scratch pointer escapes. A credit release refusal after physical disposal
 retains the original token/reference; later retries require fresh host funding
 and never access a successor evaluation allowance. Output remains private until
 the existing original JOIN decision commits its non-delta replacement.
+
+The private initial numeric REDUCE child reuses the original FILTER context,
+protected scalar source, numeric expression owner, three fixed scratch owners,
+B2 writer/drain and unary replacement. The op, grouping indices, expression,
+session, governor bindings and original owner storage remain immutable and
+alive through acknowledged DONE. The scalar reader is released before the
+unary decision. Scratch physical storage is freed before credit and its saved
+governor reference; refusal retains that exact original record for a separately
+funded retry. An external reader can retain disposal of an owned input after
+publication without publishing the result again. Each child start, cleanup
+step, retry and ACK requires its own distinct live HOST384 grant. This funding
+allowance does not enlarge the engine's 256-slot polling quantum.

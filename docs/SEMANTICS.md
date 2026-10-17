@@ -858,7 +858,7 @@ call.
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -981,3 +981,35 @@ order even for COUNT: unused expression compilation may still fail for resource
 reasons. This contract does not promise unchanged allocation peaks or a bypass
 of source, output and scratch admission. Other aggregate functions retain their
 existing numeric operand and result domains.
+
+### Private initial numeric REDUCE
+
+The opt-in REDUCE child accepts materialized scalar input in an initial serial,
+nonrecursive attempt. COUNT ignores its operand and returns INT64; numeric
+SUM/MIN/MAX support integer and FLOAT operands, and average requires FLOAT.
+STRING ordering and interpreter-only aggregate expressions are excluded. A NULL
+control delegates to the raw reducer. The numeric plan driver does not yet admit
+this opcode at this implementation boundary.
+
+A protected source reader remains held while bounded hash slots and dense group
+records accumulate values in first-seen group order. Each input row evaluates
+its operand before grouping; a newly encountered group receives head-ordered
+native FLOAT validation before insertion and before the next row. Thus an early
+bad FLOAT key wins over a later arithmetic error, while a same-row operand
+error wins over key validation. Existing-group arithmetic uses the raw ordered
+checked integer or finite FLOAT updates. Canonical signed-zero keys coalesce;
+no extra BOOL or INT32 value restrictions are introduced.
+
+Only after the scan succeeds are complete typed tuples appended to the private
+output. The existing original unary decision publishes the complete result.
+Before that decision, cancellation, work-limit, allocation or quota failure
+keeps the exact original stack entry. Empty input produces an empty relation,
+including global aggregates. Output metadata follows raw head placement and
+canonical colN names, without graph/timestamp/delta metadata. Out-of-range key
+indices retain raw column0 fallback with INT64 output metadata. The unusual
+manual FLOAT descriptor with no operand column retains literal bits1 fallback.
+
+This private accumulator has different allocation peaks and work fees from
+raw incremental output updates. COUNT skips irrelevant expression compilation;
+raw COUNT can still fail during unused expression compilation. Only admitted
+semantic results are compared; resource failure precedence is not promised.

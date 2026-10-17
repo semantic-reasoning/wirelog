@@ -1613,3 +1613,668 @@ cleanup_arrays:
 
 /* --- DIFFERENTIAL CONSOLIDATE is implemented in columnar/diff.c. */
 /* --- JOIN and ANTIJOIN are implemented in columnar/join.c. */
+
+/* --- Private initial numeric REDUCE (#1821) --- */
+
+enum {
+    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK = 192,
+    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK = 128,
+    /* Two payments per first cleanup turn:64 current +128 future per
+     * payment, as in existing B2 retirement. Named capacity: common10,
+     * batch18, fixed scratch12, right source1, JOIN decision1. Common10 is
+     * PROGRAM,BATCH,PHYSICAL,CREDIT,REFERENCE,SOURCE,CONTROL,FINISH,RESET,ACK;
+     * JOIN bypasses common BATCH and ordinary DECIDE; BATCH shares are unused.
+     * Child prepaid
+     * interiors are distinct; unused named capacity is never refunded. */
+    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_RETIRE_PAYMENTS = 84
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_ops_test_reduce_attempt_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+int wl_columnar_ops_test_reduce_attempt_fail_allocation = -1;
+#endif
+
+static int
+wl_columnar_ops_reduce_attempt_guard(wl_evaluation_control_t *control,
+    uint64_t id)
+{
+    return !control || !id
+           || wl_evaluation_control_active_attempt_id(control) != id
+        ? EINVAL : 0;
+}
+
+static int
+wl_columnar_ops_reduce_attempt_charge(wl_evaluation_control_t *control,
+    uint64_t id, uint64_t work)
+{
+    int rc = wl_columnar_ops_reduce_attempt_guard(control, id);
+    return rc ? rc : wl_evaluation_control_charge(control, work);
+}
+
+static int
+wl_columnar_ops_reduce_attempt_tail(wl_evaluation_control_t *control,
+    uint64_t id, unsigned phase, uint64_t progress)
+{
+    int rc = wl_columnar_ops_reduce_attempt_guard(control, id);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_reduce_attempt_checkpoint)
+        wl_columnar_ops_test_reduce_attempt_checkpoint(control, phase,
+            progress);
+#else
+    (void)phase; (void)progress;
+#endif
+    return wl_columnar_ops_reduce_attempt_charge(control, id, 0);
+}
+
+static int
+wl_columnar_ops_reduce_attempt_return(wl_evaluation_control_t *control,
+    uint64_t id, int child_result)
+{
+    int tail = wl_columnar_ops_reduce_attempt_charge(control, id, 0);
+    return tail > 0 ? tail : child_result ? child_result : tail;
+}
+
+static void *
+wl_columnar_ops_reduce_attempt_allocate(size_t bytes)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_reduce_attempt_fail_allocation >= 0) {
+        if (!wl_columnar_ops_test_reduce_attempt_fail_allocation) return NULL;
+        --wl_columnar_ops_test_reduce_attempt_fail_allocation;
+    }
+#endif
+    return malloc(bytes);
+}
+
+static int
+wl_columnar_ops_reduce_attempt_scratch(wl_columnar_join_scratch_t *scratch,
+    uint64_t bytes, wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_init(&scratch->credit);
+    scratch->physical = NULL; scratch->governor = NULL;
+    scratch->allocated = false; scratch->admitted = false;
+    scratch->committed = false; scratch->ref_held = false;
+    scratch->initialized = true;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 9, bytes);
+    if (rc) return rc;
+    if (!bytes) return 0;
+    if (governor) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) return rc;
+        scratch->governor = governor;
+        wl_columnar_memory_governor_ref_retain(governor);
+        scratch->ref_held = true;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 10, bytes);
+        if (rc) return rc;
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(governor), bytes,
+            &scratch->credit, &status, control, id);
+        if (rc) return rc;
+        scratch->admitted = status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY;
+        int admission = scratch->admitted ? 0
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, admission);
+        if (rc) return rc;
+    }
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) return rc;
+    scratch->physical = wl_columnar_ops_reduce_attempt_allocate((size_t)bytes);
+    scratch->allocated = scratch->physical != NULL;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 11, bytes);
+    if (rc > 0 || scratch->allocated) {
+        if (rc) return rc;
+    } else return ENOMEM;
+    if (scratch->admitted) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 12, bytes);
+        if (rc) return rc;
+        rc = wl_columnar_memory_governor_commit_attempt_controlled(
+            &scratch->credit, scratch->physical, &scratch->committed, control,
+            id);
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    }
+    return rc;
+}
+
+static void
+wl_columnar_ops_reduce_attempt_status(
+    const wl_columnar_filter_context_t *context,
+    wl_columnar_filter_status_t *status)
+{
+    status->progress = WL_COLUMNAR_FILTER_PROGRESS_YIELD;
+    status->execution_result = context->execution_result;
+    status->cleanup_result = context->cleanup_result;
+    status->semantic_result = context->semantic_result;
+    status->committed = context->committed;
+}
+
+/* Dense records keep raw first-seen order independently of hash slots. */
+typedef struct {
+    uint32_t representative;
+    int64_t value;
+    double sum;
+    uint64_t count;
+} wl_columnar_ops_reduce_group_t;
+
+int
+wl_columnar_ops_reduce_attempt_start(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status)
+{
+    return wl_columnar_ops_reduce_attempt_start_owned(op, frame, session,
+               control, id, status, NULL);
+}
+
+int
+wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!op || !status) return EINVAL;
+    if (owner && !control) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
+    if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control || record->attempt_id != id)
+            return EINVAL;
+    }
+    if (!control) {
+        int result = op->op == WL_PLAN_OP_REDUCE
+            ? col_op_reduce(op, stack, session) : EINVAL;
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = result; status->semantic_result = result;
+        status->cleanup_result = 0; status->committed = result == 0;
+        return 0;
+    }
+    rc = wl_columnar_ops_reduce_attempt_guard(control, id);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    /* Refused first admission has no live context or resource ownership. */
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) {
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = rc; status->semantic_result = rc;
+        status->cleanup_result = 0; status->committed = false;
+        return 0;
+    }
+    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->governor = NULL; ctx->values = ctx->inline_values;
+    ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->drain_initialized = false; ctx->heap = false; ctx->admitted = false;
+    ctx->credit_committed = false; ctx->ref_held = false;
+    ctx->unary_started = false; ctx->committed = false;
+    ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->semantic_result = 0;
+    ctx->control = NULL; ctx->pin_owned = false; ctx->thread_valid = false;
+    ctx->busy = false; ctx->frame = frame; ctx->session = session;
+    ctx->attempt_id = id; ctx->join_right_initialized = false;
+    ctx->join_retirement_cursor = 0; ctx->join_result_is_delta = false;
+    ctx->join_decision_pending = false;
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i) {
+        wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[i];
+        scratch->initialized = false; scratch->allocated = false;
+        scratch->admitted = false; scratch->committed = false;
+        scratch->ref_held = false; scratch->physical = NULL;
+        scratch->governor = NULL;
+    }
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    ctx->control = control; ctx->pin_owned = true; ctx->identity = ctx;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true; ctx->busy = true;
+    ctx->join_initialized = true; ctx->join_decision_pending = true;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
+    bool count = op->agg_fn == WIRELOG_AGG_COUNT;
+    bool floating = !count && op->agg_operand_type == WL_PLAN_AGG_OPERAND_FLOAT;
+    bool domain = op->agg_operand_type >= WL_PLAN_AGG_OPERAND_UNKNOWN
+        && op->agg_operand_type <= WL_PLAN_AGG_OPERAND_FLOAT
+        && (count || op->agg_operand_type != WL_PLAN_AGG_OPERAND_STRING);
+    bool supported = op->op == WL_PLAN_OP_REDUCE && !op->materialized
+        && domain && (count || op->agg_fn == WIRELOG_AGG_SUM
+        || op->agg_fn == WIRELOG_AGG_MIN || op->agg_fn == WIRELOG_AGG_MAX
+        || (op->agg_fn == WIRELOG_AGG_AVG && floating))
+        && !session->current_iteration && !session->diff_operators_active
+        && !session->retraction_seeded && !session->retraction_right_pass
+        && !session->tdd_input_run && !session->tdd_subpass_active
+        && !session->tdd_outbound_only_active && !session->join_batch_bytes
+        && !session->join_output_shared_count && !session->coordinator
+        && session->num_workers <= 1;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 1, 0);
+    if (rc > 0 || supported) {
+        if (rc) goto done;
+    } else {
+        rc = ENOTSUP; goto done;
+    }
+    for (unsigned payment = 0;
+        payment < WL_COLUMNAR_OPS_REDUCE_ATTEMPT_RETIRE_PAYMENTS; ++payment){
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 2, payment);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 3, 0);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+            control, id, owner);
+    if (rc) goto done;
+    ctx->unary_started = true;
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    const col_rel_t *left = NULL;
+    col_rel_t **out_slot = NULL;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_input_owned(frame, &left, owner);
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_output_owned(frame, &out_slot, owner);
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc =
+        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
+            &ctx->source_initialized, control, id);
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc =
+        wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        &ctx->source, left, false);
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    if (ctx->source.timestamps) {
+        rc = ENOTSUP; goto done;
+    }
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    uint32_t gc = op->group_by_count;
+    bool shaped = gc != UINT32_MAX && (!gc || ctx->source.width);
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 30, gc);
+    if (rc > 0 || shaped) {
+        if (rc) goto done;
+    } else {
+        rc = gc == UINT32_MAX ? EOVERFLOW : EINVAL; goto done;
+    }
+    uint32_t width = gc + 1;
+    uint32_t ai = op->aggregate_index < width ? op->aggregate_index : gc;
+    bool expression = !count && op->agg_expr.data && op->agg_expr.size;
+    wl_columnar_memory_governor_ref_t *governor = session->memory_governor
+        ? session->memory_governor : left->memory_governor;
+    uint32_t capacity = 1;
+    uint64_t desired = (uint64_t)(ctx->source.nrows ? ctx->source.nrows : 1) *
+        2u;
+    while ((uint64_t)capacity < desired) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        bool fits = capacity <= UINT32_MAX / 2u;
+        if (fits) capacity *= 2u;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 31, capacity);
+        if (rc > 0 || fits) {
+            if (rc) goto done;
+        } else {
+            rc = EOVERFLOW; goto done;
+        }
+    }
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    uint64_t slot_bytes = 0, group_bytes = 0, lanes = 0, workspace = 0;
+    bool sized = wl_columnar_memory_size_mul(capacity,
+            sizeof(reduce_group_slot_t), &slot_bytes)
+        && wl_columnar_memory_size_mul(ctx->source.nrows,
+            sizeof(wl_columnar_ops_reduce_group_t), &group_bytes)
+        && wl_columnar_memory_size_mul(width, 2u, &lanes)
+        && wl_columnar_memory_size_add(lanes,
+            expression ? ctx->source.width : 0u, &lanes)
+        && wl_columnar_memory_size_mul(lanes, sizeof(int64_t), &workspace)
+        && slot_bytes <= SIZE_MAX && group_bytes <= SIZE_MAX
+        && workspace <= SIZE_MAX;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 32, workspace);
+    if (rc > 0 || sized) {
+        if (rc) goto done;
+    } else {
+        rc = EOVERFLOW; goto done;
+    }
+    uint64_t sizes[WL_COLUMNAR_JOIN_SCRATCH_COUNT] = {
+        slot_bytes, group_bytes, workspace
+    };
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_ops_reduce_attempt_scratch(&ctx->join_scratch[i],
+                sizes[i], governor, control, id);
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+        if (rc) goto done;
+    }
+    reduce_group_slot_t *slots = ctx->join_scratch[0].physical;
+    wl_columnar_ops_reduce_group_t *groups = ctx->join_scratch[1].physical;
+    int64_t *types = ctx->join_scratch[2].physical;
+    int64_t *values = types + width;
+    int64_t *row_values = values + width;
+    for (uint32_t c = 0; c < width; ++c) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        uint32_t key = c > ai ? c - 1u : c;
+        uint32_t source = op->group_by_indices && c != ai
+            ? op->group_by_indices[key] : key;
+        types[c] = c ==
+            ai ? (floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64)
+            : source < ctx->source.width && ctx->source.types
+            ? ctx->source.types[source] : WIRELOG_TYPE_INT64;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 33, c);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    uint32_t initial = governor && ctx->source.nrows < COL_REL_INIT_CAP
+        ? ctx->source.nrows : COL_REL_INIT_CAP;
+    ctx->width = width; ctx->nrows = ctx->source.nrows;
+    rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+        "$reduce", width, initial, types, governor, out_slot, control, id);
+    ctx->output = *out_slot; ctx->private_output = *out_slot;
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    if (expression) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) goto done;
+        bool compiled = false;
+        rc = wl_columnar_expr_compile_attempt_controlled(op->agg_expr.data,
+                op->agg_expr.size, governor, &ctx->program, &compiled, control,
+                id);
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+        if (rc) goto done;
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 34, compiled);
+        if (rc > 0 || compiled) {
+            if (rc) goto done;
+        } else {
+            rc = ENOTSUP; goto done;
+        }
+    }
+    for (uint32_t slot = 0; slot < capacity; ++slot) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        slots[slot].hash = 0; slots[slot].row = 0;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 35, slot);
+        if (rc) goto done;
+    }
+    uint32_t group_count = 0;
+    for (uint32_t r = 0; r < ctx->source.nrows; ++r) {
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        ctx->row = r;
+        int64_t operand = count ? 1 : ctx->source.width > gc
+            ? ctx->source.columns[gc][r] : 1;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 36, r);
+        if (rc) goto done;
+        if (expression) {
+            for (uint32_t c = 0; c < ctx->source.width; ++c) {
+                rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                        WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+                if (rc) goto done;
+                row_values[c] = ctx->source.columns[c][r];
+                rc = wl_columnar_ops_reduce_attempt_tail(control, id, 37, c);
+                if (rc) goto done;
+            }
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+            if (rc) goto done;
+            bool failed = false;
+            rc = wl_columnar_expr_eval_attempt_controlled(ctx->program,
+                    row_values, ctx->source.width, &operand, &failed, control,
+                    id);
+            rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 38, failed);
+            if (rc > 0 || !failed) {
+                if (rc) goto done;
+            } else {
+                rc = ERANGE; goto done;
+            }
+        }
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        bool valid = !floating || wl_columnar_float_bits_valid(operand);
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 39, r);
+        if (rc > 0 || valid) {
+            if (rc) goto done;
+        } else {
+            rc = EINVAL; goto done;
+        }
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (uint32_t k = 0; k < gc; ++k) {
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t c = op->group_by_indices ? op->group_by_indices[k] : k;
+            int64_t value = ctx->source.columns[c <
+                    ctx->source.width ? c : 0][r];
+            if (ctx->source.types && c < ctx->source.width
+                && ctx->source.types[c] == WIRELOG_TYPE_FLOAT)
+                value = (int64_t)wl_columnar_float_canonical_bits(value);
+            hash = (hash ^ (uint64_t)value) * UINT64_C(1099511628211);
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 40, k);
+            if (rc) goto done;
+        }
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        if (!hash) hash = 1;
+        uint32_t slot = (uint32_t)hash & (capacity - 1u);
+        bool found = false;
+        rc = wl_columnar_ops_reduce_attempt_tail(control, id, 41, slot);
+        if (rc) goto done;
+        for (;;) {
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint64_t occupied = slots[slot].hash;
+            bool match = occupied == hash;
+            uint32_t gr = slots[slot].row;
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 42, slot);
+            if (rc) goto done;
+            if (!occupied) break;
+            for (uint32_t k = 0; k < gc && match; ++k) {
+                rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                        WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+                if (rc) goto done;
+                uint32_t c = op->group_by_indices ? op->group_by_indices[k] : k;
+                uint32_t src = c < ctx->source.width ? c : 0;
+                int64_t a = ctx->source.columns[src][r];
+                int64_t b = ctx->source.columns[src][groups[gr].representative];
+                if (ctx->source.types && c < ctx->source.width
+                    && ctx->source.types[c] == WIRELOG_TYPE_FLOAT) {
+                    a = (int64_t)wl_columnar_float_canonical_bits(a);
+                    b = (int64_t)wl_columnar_float_canonical_bits(b);
+                }
+                match = a == b;
+                rc = wl_columnar_ops_reduce_attempt_tail(control, id, 43, k);
+                if (rc) goto done;
+            }
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            found = match;
+            if (!found) slot = (slot + 1u) & (capacity - 1u);
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 44, slot);
+            if (rc) goto done;
+            if (found) break;
+        }
+        if (!found) {
+            /* Raw validates each new group before inspecting any later row.
+             * Keep operand errors before this same-row typed validation. */
+            for (uint32_t c = 0; c < width; ++c) {
+                rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                        WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+                if (rc) goto done;
+                uint32_t k = c > ai ? c - 1u : c;
+                uint32_t src = op->group_by_indices && c != ai
+                    ? op->group_by_indices[k] : k;
+                int64_t value = c == ai ? operand
+                    : ctx->source.columns[src < ctx->source.width ? src : 0][r];
+                valid = types[c] != WIRELOG_TYPE_FLOAT
+                    || wl_columnar_float_bits_valid(value);
+                if (valid && types[c] == WIRELOG_TYPE_FLOAT)
+                    value = (int64_t)wl_columnar_float_canonical_bits(value);
+                values[c] = value;
+                rc = wl_columnar_ops_reduce_attempt_tail(control, id, 45, c);
+                if (rc > 0 || valid) {
+                    if (rc) goto done;
+                } else {
+                    rc = EINVAL; goto done;
+                }
+            }
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            wl_columnar_ops_reduce_group_t *group = &groups[group_count];
+            group->representative = r;
+            group->value = values[ai]; group->count = 1;
+            group->sum = floating ? wl_columnar_float_from_bits(operand) : 0.0;
+            slots[slot].row = group_count++; slots[slot].hash = hash;
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 46, r);
+            if (rc) goto done;
+        } else {
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+            if (rc) goto done;
+            wl_columnar_ops_reduce_group_t *group = &groups[slots[slot].row];
+            int64_t next = group->value;
+            bool overflow = false;
+            if (count) ++next;
+            else if (op->agg_fn == WIRELOG_AGG_SUM && !floating)
+                overflow = wl_columnar_arithmetic_checked_add_int64(
+                    next, operand, &next) != 0;
+            else if (op->agg_fn == WIRELOG_AGG_SUM
+                || op->agg_fn == WIRELOG_AGG_AVG) {
+                group->sum += wl_columnar_float_from_bits(operand);
+                ++group->count;
+                overflow = !isfinite(group->sum);
+                next = (int64_t)wl_columnar_float_canonical_bits(
+                    wl_columnar_float_to_bits(op->agg_fn == WIRELOG_AGG_AVG
+                    ? group->sum / (double)group->count : group->sum));
+            } else {
+                int comparison = floating
+                    ? wl_columnar_float_compare_bits(operand, next)
+                    : operand < next ? -1 : operand > next ? 1 : 0;
+                if ((op->agg_fn == WIRELOG_AGG_MIN && comparison < 0)
+                    || (op->agg_fn == WIRELOG_AGG_MAX && comparison > 0))
+                    next = floating ? (int64_t)
+                        wl_columnar_float_canonical_bits(operand) : operand;
+            }
+            group->value = next;
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 47, r);
+            if (rc > 0 || !overflow) {
+                if (rc) goto done;
+            } else {
+                rc = ERANGE; goto done;
+            }
+        }
+    }
+    if (!group_count) goto done;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    wl_columnar_filter_attempt_batch_init(&ctx->batch);
+    ctx->batch_initialized = true;
+    wl_columnar_relation_private_batch_drain_init(&ctx->batch_drain);
+    ctx->drain_initialized = true;
+    rc = wl_columnar_ops_reduce_attempt_tail(control, id, 15, 0);
+    if (rc) goto done;
+    rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+            WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+            ctx->output, control);
+    rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+    if (rc) goto done;
+    for (uint32_t gr = 0; gr < group_count; ++gr) {
+        for (uint32_t c = 0; c < width; ++c) {
+            rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                    WL_COLUMNAR_OPS_REDUCE_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t k = c > ai ? c - 1u : c;
+            uint32_t src = op->group_by_indices && c != ai
+                ? op->group_by_indices[k] : k;
+            int64_t value = c == ai ? groups[gr].value
+                : ctx->source.columns[src < ctx->source.width ? src : 0]
+                [groups[gr].representative];
+            values[c] = types[c] == WIRELOG_TYPE_FLOAT
+                ? (int64_t)wl_columnar_float_canonical_bits(value) : value;
+            rc = wl_columnar_ops_reduce_attempt_tail(control, id, 48, c);
+            if (rc) goto done;
+        }
+        rc = wl_columnar_ops_reduce_attempt_charge(control, id,
+                WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_relation_append_batch_numeric_row_operator_controlled(
+            &ctx->batch, values, control, id);
+        rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
+        if (rc) goto done;
+    }
+done:
+    if (rc == ENOMEM && ctx->output &&
+        ctx->output->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC) session->memory_budget_denied = true;
+    ctx->execution_result = rc; ctx->semantic_result = rc;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH;
+    ctx->busy = false;
+    wl_columnar_ops_reduce_attempt_status(ctx, status);
+    return 0;
+}

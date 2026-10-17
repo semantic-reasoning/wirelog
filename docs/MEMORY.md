@@ -3287,3 +3287,49 @@ failures at either probe retain the exact preceding owned result and prevent
 later children from starting. Retained scratch credit uses real pending/child
 HOST383/384 retries; operation turnover consumes no successor allowance, and
 a fresh original record on the same stable source recovers canonical results.
+
+### Initial numeric REDUCE ownership
+
+The opt-in REDUCE child uses the existing original FILTER context without
+adding a live owner or changing its layout. Scratch0 contains open-addressed
+hash slots; scratch1 contains dense first-seen records with a representative
+source row and aggregate state; scratch2 contains INT64 type codes, one output
+row and, only for a numeric expression, one input row. Checked size arithmetic
+precedes admission. Each slot initialization, hash/key comparison, accumulator
+update and emitted lane receives admission and an original-attempt cutoff.
+COUNT does not allocate or evaluate an unused numeric expression program.
+
+All fixed lifecycle capacity is admitted before unary/source/scratch ownership.
+The child uses the existing 84 payments of192 with64 current and128 future
+shares, covering the common ten lifecycle turns, B2's eighteen turns, twelve
+scratch turns, inactive right-source turn and original decision turn. PROGRAM
+can now retire the genuine numeric expression owner; that owner's primitive
+retirement interiors retain their own original prepaid contract. The inactive
+right-source and bypassed ordinary-BATCH capacity is neither refunded nor
+reused as forward work. Partial prepayment refusal owns only the fixed
+context/control activation and follows the existing bounded bootstrap unwind.
+
+The existing protected-source, typed-code constructor, numeric expression and
+B2 helpers retain their own admission/retirement protocols. Each caller pays
+for its new direct call and validates the original saved attempt on return.
+Scratch physical disposal precedes credit release, saved reference release and
+record clearing. Program retirement follows all three scratch records, then
+source End and the original unary decision. A refusal retains the original
+record and requires a fresh separately funded host retry; no successor control
+pays for old cleanup. Public/default evaluation still uses raw REDUCE, and both
+private numeric-plan preflights still reject REDUCE at this boundary.
+
+REDUCE pays128 per scalar cell and192 for the existing-group numeric update,
+whose FLOAT comparison/arithmetic dispatch is larger than an ordinary key
+cell. The direct fixture child-return action defers phase/status consumption
+to a later separately funded action; ACK also has its own action. FIFO and
+caller continuations remain part of the complete source inventory.
+
+The REDUCE fixture uses the existing `host_turn` and real engine/witness job
+callbacks. One callback performs one funded child or result-consume action and
+returns through that host turn; ordinary callback requeue/protocol and host
+return work is included in the caller envelope. The next queue-pop prefix is
+part of a new external host turn. Child START/STEP/ACK selection uses compatible
+readonly callbacks selected before HOST admission, with no cast or owner
+transfer. Exact work-limit fixtures pin ENTRY191/192; deeper hash/update/emit
+stops use deterministic cancellation, not an unimplemented deep budget matrix.
