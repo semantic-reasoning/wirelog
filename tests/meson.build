@@ -6290,9 +6290,9 @@ test_compound_gc_hold_exe = executable(
 )
 test('compound_gc_hold', test_compound_gc_hold_exe, timeout: 60)
 
-# Reaches the columnar attempt wrappers through the backend vtable, which the
-# ENOTSUP gate keeps unreachable from the public API.  evaluation_control.c
-# comes from testlib_prod; listing it again would duplicate the symbols.
+# Whole-session controlled gates and actual admission-key owner/report checks.
+# Actual one-relation controlled publication is covered by evaluation_serial.
+# evaluation_control.c already comes from testlib_prod.
 test_evaluation_attempt_owner_exe = executable(
   'test_evaluation_attempt_owner',
   files('test_evaluation_attempt_owner.c'),
@@ -6303,10 +6303,9 @@ test_evaluation_attempt_owner_exe = executable(
 
 test('evaluation_attempt_owner', test_evaluation_attempt_owner_exe)
 
-# Issue #1953: the publication cutoff and what a stop there must leave behind.
-# Drives the columnar impls through the backend vtable and injects cancellation
-# with the WL_SESSION_TEST_HOOKS levers, which testlib_prod defines; the
-# installed library carries no hook symbol.
+# Preserve the raw observer reference and verify unsupported whole controlled
+# calls have no plan/observer/report effects. Aware-entry retry has its own
+# actual generated-plan fixture in evaluation_serial.
 test_evaluation_retry_exe = executable(
   'test_evaluation_retry',
   files('test_evaluation_retry.c'),
@@ -6317,9 +6316,8 @@ test_evaluation_retry_exe = executable(
 
 test('evaluation_retry', test_evaluation_retry_exe, timeout: 60)
 
-# Issue #1953: the snapshot path's two emits and what a stop above each must
-# leave behind.  The stable fast path needs its own case because a cutoff placed
-# for the evaluating path is not on its route.
+# Raw evaluating/stable snapshots, lower quiescent reclamation and whole
+# controlled snapshot no-side-effect gates. Registrations remain unchanged.
 test_evaluation_snapshot_cutoff_exe = executable(
   'test_evaluation_snapshot_cutoff',
   files('test_evaluation_snapshot_cutoff.c'),
@@ -6497,3 +6495,15 @@ test_evaluation_consolidate_exe = executable(
 )
 test('evaluation_consolidate', test_evaluation_consolidate_exe,
      suite: ['unit', 'tsan'], timeout: 600)
+
+# Full backend fixture: retain source-unique production hooks in one archive.
+test_evaluation_serial_exe = executable(
+  'test_evaluation_serial', files('test_evaluation_serial.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_serial', test_evaluation_serial_exe,
+     suite: ['unit', 'tsan'], timeout: 120)

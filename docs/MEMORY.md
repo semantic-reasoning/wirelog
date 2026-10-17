@@ -3544,3 +3544,34 @@ The dedicated composed funding helper validates its ID before directly charging;
 this leaves the actual live host return suffix within the existing unary child
 caller allowance. Original operation identity is separate and keeps all saved-ID
 checks, including turnover. The legacy numeric funding helper is unchanged.
+
+The private fresh-head result bridge embeds its original parent, composed child,
+scalar reader, B2/drain and workspace owner in the cleanup frame. Frame admission
+and full zeroing use the actual `sizeof` of that enlarged frame; no partial frame
+is published. The named candidate has independent heap storage and governor
+credit. Physical workspace disposal precedes credit refund and reference release.
+A retained reader leaves the original entry or candidate reachable in the active
+frame. Stack-slot disposal and later inert-slot proof have separate first-work
+capacities, and a separate close-proof action precedes final parent ACK plus
+mandatory empty-frame close. Materialization ends with a READY candidate before
+the optional registry publication described below. The final frame-credit
+invariant also applies to that publication path.
+
+Private fresh-head publication separately owns four offside physical allocations
+(registry, expected-content snapshot, hash heads and chains) and three RESERVED
+credits. Admission outputs are consumed only after rc0; a nonzero controlled
+reserve has already restored its prior token. Physical storage retires before
+its credit. Four original-address moves transfer old credits into a journal and
+new credits into the session; pre-cutoff failures reverse the completed prefix.
+The candidate payload stays COMMITTED at its descriptor. Old arrays/credits
+retire only after real child ACK. Original session token histories are limited
+to canonical EMPTY/positive RESERVED, plus untouched noGov all-zero tokens;
+RELEASED histories and governed all-zero destinations return ENOTSUP before new
+publication owners. No token bytes are copied or reset to manufacture a refund.
+
+The aware framed entry prepays a distinct first known-empty close before fresh
+frame allocation. Failed parent bootstrap physically closes that newly created
+inert frame before returning its bootstrap receipt. It never adopts a foreign
+frame or retains a phantom failed-bootstrap owner. A successful original parent
+keeps its own independent final-close capacity. The host request and reply are
+external borrowed call objects and are never retained as cleanup authority.

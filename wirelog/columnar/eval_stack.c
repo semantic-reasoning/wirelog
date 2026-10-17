@@ -312,7 +312,27 @@ struct wl_columnar_eval_stack_cleanup_frame {
     const void *numeric_plan_owner;
     wl_columnar_eval_stack_binary_context_t binary;
     wl_columnar_merge_concat_context_t concat;
+    wl_columnar_eval_serial_framed_attempt_t framed;
 };
+
+/* Cold binding only: keep the saturated operator/source getters unchanged.
+ * A parent exists before its child claims and after the child's real ACK. */
+static int
+wl_columnar_eval_stack_framed_admit(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    if (!frame || frame->identity != frame || !frame->session
+        || frame->stack.top > COL_STACK_MAX)
+        return EINVAL;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    if (!ctx->identity) return 0;
+    if (ctx->identity != ctx) return EINVAL;
+    if (owner != &ctx->child) return EBUSY;
+    return ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN
+           || (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+           && ctx->pending_action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN)
+        ? 0 : EBUSY;
+}
 
 int
 wl_columnar_eval_stack_cleanup_begin(wl_col_session_t *sess,
@@ -1449,6 +1469,8 @@ wl_columnar_eval_stack_numeric_claim(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
     const void *owner)
 {
+    int admission = wl_columnar_eval_stack_framed_admit(frame, owner);
+    if (admission) return admission;
     if (!owner || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
     eval_stack_t *stack = NULL;
@@ -1516,6 +1538,8 @@ wl_columnar_eval_stack_numeric_source_claim(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
     wl_columnar_eval_plan_numeric_attempt_t *owner)
 {
+    int admission = wl_columnar_eval_stack_framed_admit(frame, owner);
+    if (admission) return admission;
     int rc = wl_columnar_eval_stack_numeric_source_frame(frame, sess, owner,
             false);
     if (rc) return rc;
@@ -1687,7 +1711,7 @@ wl_columnar_eval_stack_cleanup_finish(
     wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
-    if (frame->numeric_plan_owner
+    if (frame->framed.identity || frame->numeric_plan_owner
         || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED)
@@ -1831,6 +1855,8 @@ wl_columnar_eval_stack_numeric_stack_claim(
     const void *owner, uint32_t expected_depth,
     wl_evaluation_control_t *control, uint64_t id)
 {
+    int admission = wl_columnar_eval_stack_framed_admit(frame, owner);
+    if (admission) return admission;
     if (!expected_depth || expected_depth > COL_STACK_MAX || !owner
         || !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
@@ -2332,4 +2358,205 @@ wl_columnar_eval_stack_composed_source_release(
         return EBUSY;
     frame->numeric_plan_owner = NULL;
     return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_context(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_attempt_t **out)
+{
+    if (!out || !wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session) return EINVAL;
+    if (session->cleanup_active != frame) return EBUSY;
+    *out = &frame->framed;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_fresh(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!ctx || !wl_columnar_eval_stack_unary_frame_valid(frame)
+        || &frame->framed != ctx) return EINVAL;
+    if (ctx->identity || ctx->phase || frame->numeric_plan_owner
+        || frame->stack.top || frame->unary_phase !=
+        WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->binary.phase || frame->concat.phase
+        || frame->unary_control || frame->unary_attempt_id
+        || frame->unary_thread_valid || frame->unary_committed
+        || frame->unary_result_saved || frame->unary_first_result
+        || frame->unary_cleanup_result || frame->unary_alias_rejected
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot))
+        return EBUSY;
+    return 0;
+}
+
+static int
+wl_columnar_eval_stack_framed_workspace(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!ctx || !wl_columnar_eval_serial_framed_owner_valid(ctx, ctx->frame))
+        return EINVAL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || &frame->framed != ctx) return EINVAL;
+    if (frame->session != ctx->session
+        || ctx->session->cleanup_active != frame) return EBUSY;
+    if (frame->numeric_plan_owner != (ctx->child_bound ? &ctx->child : NULL)
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->binary.phase || frame->concat.phase
+        || frame->unary_control || frame->unary_attempt_id
+        || frame->unary_thread_valid || frame->unary_committed
+        || frame->unary_result_saved || frame->unary_first_result
+        || frame->unary_cleanup_result || frame->unary_alias_rejected
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_snapshot))
+        return EBUSY;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_claim(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, bool materialize)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM)
+        return EBUSY;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    if (ctx->gate_owned || frame->unary_phase !=
+        WL_COLUMNAR_EVAL_STACK_UNARY_IDLE) return EBUSY;
+    if (ctx->child_bound && (ctx->child.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        || frame->stack.top != ctx->child.runtime_depth)) return EBUSY;
+    if (materialize) {
+        if (!ctx->child_bound || ctx->child.semantic_result
+            || frame->stack.top != 1
+            || !wl_columnar_eval_stack_unary_entry_inert(&frame->result))
+            return EINVAL;
+        eval_entry_t *entry = &frame->stack.items[0];
+        if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || !entry->owned || !entry->rel || entry->is_delta
+            || entry->continuation || entry->seg_boundaries || entry->seg_count)
+            return ENOTSUP;
+        ctx->input = *entry;
+    }
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE;
+    ctx->gate_owned = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_dispose_slot(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, uint32_t slot)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN)
+        return EBUSY;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    if (slot > COL_STACK_MAX || !ctx->gate_owned
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE)
+        return EINVAL;
+    eval_entry_t *entry = slot == COL_STACK_MAX ? &frame->result
+        : &frame->stack.items[slot];
+    if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || entry->continuation)
+        return ENOTSUP;
+    bool input = slot == 0 && ctx->input.rel == entry->rel;
+    rc = eval_entry_dispose(entry);
+    if (rc) return rc;
+    *entry = (eval_entry_t){0};
+    if (input) ctx->input = (eval_entry_t){0};
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_release_gate(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE)
+        return EBUSY;
+    if (!ctx->gate_owned || ctx->source_initialized || ctx->batch_initialized
+        || ctx->input.rel || ctx->input.seg_boundaries
+        || ctx->frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE)
+        return EBUSY;
+    ctx->frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
+    ctx->gate_owned = false;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_prove_slot(
+    wl_columnar_eval_serial_framed_attempt_t *ctx, uint32_t slot)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF)
+        return EBUSY;
+    if (slot > COL_STACK_MAX || ctx->child_bound || ctx->gate_owned)
+        return EINVAL;
+    const eval_entry_t *entry = slot == COL_STACK_MAX ? &ctx->frame->result
+        : &ctx->frame->stack.items[slot];
+    return wl_columnar_eval_stack_unary_entry_inert(entry) ? 0 : EBUSY;
+}
+
+int
+wl_columnar_eval_stack_framed_normalize(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE)
+        return EBUSY;
+    if (ctx->child_bound || ctx->gate_owned || ctx->cursor != COL_STACK_MAX+1
+        || ctx->frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE)
+        return EBUSY;
+    ctx->frame->stack.top = 0;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_framed_close_proof(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    int rc = wl_columnar_eval_stack_framed_workspace(ctx);
+    if (rc) return rc;
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLOSE_PROOF)
+        return EBUSY;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    if (frame->stack.top ||
+        !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || ctx->child_bound || ctx->child.identity || ctx->gate_owned
+        || ctx->source_initialized || ctx->batch_initialized
+        || ctx->candidate || ctx->candidate_owned || ctx->pending_funding
+        || ctx->scratch.allocated || ctx->scratch.admitted
+        || ctx->scratch.ref_held || ctx->input.rel
+        || (ctx->publication.identity && !ctx->publication.drained)
+        || ctx->cursor != COL_STACK_MAX+1)
+        return EBUSY;
+    if (frame->governor && (frame->reservation.identity != &frame->reservation
+        || atomic_load_explicit(&frame->reservation.state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+        return EINVAL;
+    return 0;
+}
+
+/* Consume the separately established seal. Parent identity/native/original
+ * residence and LIFO are checked by the final API before HOST admission.
+ * No valid serialized parent API or old claim can mutate a sealed empty frame. */
+int
+wl_columnar_eval_stack_framed_close_ready(
+    wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    return ctx && ctx->close_proven && ctx->phase ==
+           WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE ? 0 : EBUSY;
 }

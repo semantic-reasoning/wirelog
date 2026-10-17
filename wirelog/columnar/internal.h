@@ -4788,10 +4788,14 @@ retraction_rel_name(const char *rel, char *buf, size_t sz);
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     uint32_t iteration);
-/* Ordinary serial and TDD rules share admitted persistent ownership. */
+typedef struct wl_columnar_eval_serial_framed_host_request
+    wl_columnar_eval_serial_framed_host_request_t;
+/* Raw synchronous calls pass NULL request. Controlled calls require the aware
+ * one-action host contract defined after the framed parent below. */
 int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
-    wl_col_session_t *sess, bool recursive);
+    wl_col_session_t *sess, bool recursive,
+    const wl_columnar_eval_serial_framed_host_request_t *request);
 int
 col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     uint32_t stratum_idx);
@@ -6072,5 +6076,268 @@ int wl_columnar_eval_stack_composed_source_abort(
 int wl_columnar_eval_stack_composed_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
+
+/* Durable fresh-head evaluation. The parent and its embedded child live at
+ * their original addresses in the cleanup frame, starting before child begin.
+ * Only an initially empty frame and a terminal CONSOLIDATE body are admitted.
+ * This internal protocol does not activate public STEP/SNAPSHOT. */
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_VALIDATE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_PREPARE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_END,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ENTRY_DRAIN,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_PHYSICAL,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_CREDIT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH_REFERENCE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CANDIDATE_ABORT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATE_RELEASE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_ACK,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_SPARE_PROOF,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_NORMALIZE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLOSE_PROOF,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+} wl_columnar_eval_serial_framed_phase_t;
+
+/* Original-address journal for a single fresh registry head. Array images
+ * borrow descriptors until the fixed publication cutoff; they never own them. */
+typedef enum {
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_INERT = 0,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HOLE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_SIZE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ADMIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ALLOC_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_ZERO_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_COPY,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_COMPARE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_INSERT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_SLOT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_BYTE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_HASH_LINK,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_VALIDATE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_MOVE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CHECK_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CHECK_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CUTOFF,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE_MOVE,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_FREE_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_CREDIT_E,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_WAIT_ACK,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_HEAD,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_NEXT,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_CREDIT_R,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_OLD_CREDIT_H,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_PROOF,
+    WL_COLUMNAR_SESSION_HASH_REGISTRY_DRAINED
+} wl_columnar_session_hash_registry_phase_t;
+
+typedef struct wl_columnar_session_hash_registry_attempt {
+    struct wl_columnar_session_hash_registry_attempt *identity;
+    struct wl_columnar_eval_serial_framed_attempt *parent;
+    wl_columnar_session_hash_registry_image_t image;
+    wl_columnar_memory_reservation_t retired_rels, retired_hash;
+    /* Nonowning original-address pair, authenticated in the preceding cell.
+     * Exclusive serialized parent authority keeps it stable through retry. */
+    wl_columnar_memory_reservation_t *reverse_source, *reverse_destination;
+    uint64_t rel_bytes, expected_bytes, hash_bytes;
+    uint64_t old_rel_bytes, old_hash_bytes, name_hash;
+    uint32_t slot, byte, first_hole, cursor, move;
+    wl_columnar_session_hash_registry_phase_t phase;
+    /* 0=not moved, 1=explicit no-credit skip, 2=real original-address move. */
+    uint8_t journal[4];
+    bool credit_rels, credit_expected, credit_hash;
+    bool old_credit_rels, old_credit_hash;
+    bool committed, drained;
+} wl_columnar_session_hash_registry_attempt_t;
+
+typedef struct wl_columnar_eval_serial_framed_attempt {
+    struct wl_columnar_eval_serial_framed_attempt *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_eval_plan_numeric_attempt_t child;
+    wl_columnar_relation_scalar_source_t source;
+    wl_columnar_relation_append_batch_t batch;
+    wl_columnar_relation_private_batch_drain_t drain;
+    wl_columnar_join_scratch_t scratch;
+    col_rel_t *candidate;
+    /* Nonowning snapshot; only the original stack entry owns this relation. */
+    eval_entry_t input;
+    /* The host keeps this completed grant alive and unchanged until consume.
+     * It finishes with execution_status/cleanup_status0 so its report denotes
+     * host disposition, independently of the child's returned protocol. */
+    wl_evaluation_control_t *pending_funding;
+    uint64_t pending_funding_id;
+    wl_columnar_eval_serial_framed_phase_t phase, pending_action;
+    uint32_t registry_slot, name_byte, row, cursor;
+    int primary_result, cleanup_result, inner_protocol;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, pin_owned, child_bound, gate_owned;
+    bool source_initialized, batch_initialized, batch_done;
+    bool candidate_owned, materialized, committed, pending_inner_consume;
+    bool close_proven;
+    wl_columnar_session_hash_registry_attempt_t publication;
+} wl_columnar_eval_serial_framed_attempt_t;
+
+typedef struct {
+    wl_columnar_eval_serial_framed_phase_t phase;
+    int execution_result, cleanup_result;
+    bool ready, retained, committed;
+} wl_columnar_eval_serial_framed_status_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+} wl_columnar_eval_serial_framed_host_action_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED = 0,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+} wl_columnar_eval_serial_framed_host_reply_kind_t;
+
+typedef struct {
+    wl_columnar_eval_serial_framed_host_reply_kind_t kind;
+    int execution_result;
+    bool committed;
+    wl_columnar_eval_serial_framed_status_t status;
+} wl_columnar_eval_serial_framed_host_reply_t;
+
+/* Exclusive serialized/native internal host only. Session, actual immutable
+ * plan, original operation and all inputs remain live through true TERMINAL.
+ * Request/reply are disjoint external objects; neither address is retained.
+ * Each call performs ONE action, then returns before host finish(funding,0,0).
+ * The host owns two or more stable grants/owner keys; never reset a pending
+ * grant. Keep the latest nonSTATUS tuple across STATUS. A refused CONSUME
+ * retains its old tuple; only successful consume releases that borrowed grant.
+ * int is protocol only. Semantic fields are valid only for TERMINAL; status
+ * only for STATUS and rc0. MORE/BOOTSTRAP_RECEIPT rc0 is never logical success.
+ * A bootstrap receipt with no durable parent proves only its completed grant:
+ * exact association to this rp/session/original generation/native owner and
+ * no synthesis/replay is a trusted caller precondition, not runtime authority.
+ * The host begins original once using base.operation_admission, keeps it live
+ * across progress, and finishes it only after TERMINAL if savedID still owns
+ * that generation. A stopped/old parent may clean up without touching successor.
+ * Public and whole-stratum STEP/SNAPSHOT are separately gated. */
+struct wl_columnar_eval_serial_framed_host_request {
+    wl_evaluation_control_t *funding;
+    uint64_t funding_id;
+    wl_evaluation_control_t *operation;
+    uint64_t operation_id;
+    wl_columnar_eval_serial_framed_host_action_t action;
+    bool previous_valid;
+    wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
+    int previous_protocol;
+    wl_evaluation_control_t *previous_funding;
+    uint64_t previous_funding_id;
+    wl_columnar_eval_serial_framed_host_reply_t *reply;
+};
+
+int wl_columnar_eval_stack_framed_context(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_serial_framed_attempt_t **);
+int wl_columnar_eval_stack_framed_fresh(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_claim(
+    wl_columnar_eval_serial_framed_attempt_t *, bool);
+int wl_columnar_eval_stack_framed_dispose_slot(
+    wl_columnar_eval_serial_framed_attempt_t *, uint32_t);
+int wl_columnar_eval_stack_framed_prove_slot(
+    wl_columnar_eval_serial_framed_attempt_t *, uint32_t);
+int wl_columnar_eval_stack_framed_release_gate(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_normalize(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_close_proof(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_close_ready(
+    wl_columnar_eval_serial_framed_attempt_t *);
+bool wl_columnar_eval_serial_framed_owner_valid(
+    const wl_columnar_eval_serial_framed_attempt_t *,
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_serial_framed_attempt_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_serial_framed_attempt_step(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_serial_framed_consume_result(
+    wl_columnar_eval_serial_framed_attempt_t *, int,
+    wl_evaluation_control_t *, uint64_t);
+/* Private caller contract: only the parent dispatcher calls these after its
+ * fresh HOST admission. Each call executes one direct cell, never Aconsume. */
+int wl_columnar_session_hash_registry_attempt_begin(
+    wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_session_hash_registry_attempt_step(
+    wl_columnar_eval_serial_framed_attempt_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern int wl_columnar_session_hash_test_registry_allocation;
+extern int (*wl_columnar_session_hash_test_registry_move)(
+    wl_columnar_eval_serial_framed_attempt_t *, unsigned, bool);
+#endif
+int wl_columnar_eval_serial_framed_attempt_publish(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_serial_framed_attempt_discard(
+    wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_serial_framed_attempt_status(
+    wl_columnar_eval_serial_framed_attempt_t *,
+    wl_columnar_eval_serial_framed_status_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* DONE has no remaining resource owner except parent pin and empty frame.
+ * After admission ACK and mandatory empty-frame close form one action. No
+ * callback/poll/admission/host return intervenes; ctx is freed on success.
+ * Final physical/credit/ref release retains the existing invariant contract. */
+int wl_columnar_eval_serial_framed_attempt_close(
+    wl_columnar_eval_serial_framed_attempt_t *, int *, bool *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *);
+extern int wl_columnar_eval_serial_test_framed_fail_allocation;
+#endif
 
 #endif /* WL_COLUMNAR_INTERNAL_H */

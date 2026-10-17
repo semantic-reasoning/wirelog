@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **170**).
+match the script's count (currently **337**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -1571,7 +1571,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains 332 call sites.
+The complete current atomic-source inventory contains 337 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -1851,3 +1851,66 @@ outside this contract. Normal cancellation may latch. This permits a separate
 composed funding helper with precharge ID validation and direct charge return,
 while every original-operation saved-ID check remains. Host funding cleanup in
 the actual adapter completes before its real return, not inside an omitted poll.
+
+### Private fresh-head result bridge
+
+The fresh-head parent and its composed child are distinct original records in
+the same cleanup frame. Native thread, session, LIFO frame, plan, original
+control and saved generation stay fixed from parent activation through close.
+New cold numeric claims admit only that embedded child during its genuine begin;
+foreign claims remain refused before child binding and after child ACK. The
+existing hot operator getters retain their current authority predicates.
+
+Child calls return to the actual host before result consumption on a later
+freshly funded action. The host keeps two independent grant controls and stable
+owner keys alive across those returns. A pending child borrows its completed
+grant until consume checks the actual completed report and saved generation;
+finish uses execution_status/cleanup_status zero, so host disposition is distinct
+from the child's protocol. Never reset, rebegin, detach or release that grant
+before consume clears the borrow. A failed funded inner consume preserves the
+previous genuine child protocol for retry. Original attempt turnover never
+charges the successor for old cleanup. Parent-owned candidate, reader, writer,
+workspace, credit and control flags are recorded before a fallible poll.
+
+After recoverable disposal, genuine child ACK and bounded spare-slot proof,
+final parent ACK plus known-empty frame close run without a callback, poll,
+new admission or host return between marker release and physical frame close.
+The final action captures the result before freeing the embedded record and
+never reads it afterward. Final frame-credit invariant violations retain the
+existing fail-stop contract, rather than a recoverable freed-frame claim.
+
+
+The private fresh-head close proof observes its original frame credit under the
+serialized parent lifetime before sealing an empty frame. This adds one source
+site to the prior 332-site inventory; it does not publish relation payload.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `eval_stack.c:wl_columnar_eval_stack_framed_close_proof` | `frame->reservation.state` | `atomic_load_explicit` | acquire | Verify the original committed frame credit before the marker-live close seal; original token and native/LIFO authority remain exclusively serialized |
+| `session_hash.c:wl_columnar_session_hash_registry_token` | `token->state` | `atomic_load_explicit` | acquire | Admit only original-address RESERVED or canonical EMPTY tokens before private publication owners; noGov all-zero remains untouched |
+| `session_hash.c:wl_columnar_session_hash_registry_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Reject leased/transition credit before a reversible journal move |
+| `session_hash.c:wl_columnar_session_hash_registry_inert` | `token->state` | `atomic_load_explicit` | acquire | Prove one private or retired token inert before the image drain seal |
+| `session_hash.c:wl_columnar_session_hash_registry_inert#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify no lease remains while the original parent marker still protects retirement |
+
+The private fresh-head publisher creates registry/hash arrays offside, one slot
+or name byte per action. Its original-address four-move journal reverses before
+private arrays are discarded. Old arrays and their moved RESERVED credits remain
+live until the genuine embedded child ACK clears its registry borrow. A separate
+image proof seals every private/retired owner before the parent close proof.
+Each image action uses the parent-admitted HOST; it has no nested grant or new
+Aconsume case. Cleanup never debits the original operation or its successor.
+Old tokens must be canonical self-EMPTY or positive RESERVED; RELEASED history
+and governed all-zero destinations are explicitly unsupported before B ownership.
+Genuine noGov all-zero originals are skipped without initialization or writes.
+
+The aware framed entry performs one action on the original native host and then
+returns. It stores no request, reply or lexical owner-key pointer in the frame.
+The caller retains the session, generated plan, inputs, original operation and
+all borrowed grant controls across those returns. STATUS does not consume the
+pending grant. Original-generation checks for new bootstrap follow existing
+parent authentication; old cleanup may finish after turnover without touching
+its successor. Whole backend/stratum attached-control calls reject before their
+original begin/finish, mutations or worker dispatch, including with a live parent.
+The external FIFO fixture dispatches a separate witness job after the actual
+action job returns; this proves that fixture's queue order, not wall-time latency
+or a general scheduler fairness guarantee.
