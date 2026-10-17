@@ -858,7 +858,7 @@ call.
 | `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -935,3 +935,29 @@ finite scan. FILTER continues to reject a row on expression failure, rather
 than returning MAP's expression error. These rules cover the documented
 private scalar plans, not public/default activation or the remaining #1821
 operator families.
+
+
+### Private scalar SEMIJOIN and ANTIJOIN
+
+The bounded existence-join component consults the full named right relation.
+Duplicate right matches do not multiply left rows. SEMIJOIN emits a left row
+once on its first match; ANTIJOIN emits it once only when no candidate matches.
+Zero keys mean any right row is a match. An existing empty right therefore
+keeps no SEMI rows and all ANTI rows. A missing registry relation is ENOTSUP in
+this initial controlled component; raw's missing-right unchanged repush is not
+reinterpreted as empty data.
+
+SEMI projects only left columns, defaults project_count0 to all left columns,
+and produces canonical colN names with selected physical types/defaultINT64.
+An out-of-range projection is zero/INT64. Nullary output has no native type
+lanes. ANTI ignores projection fields and preserves complete left schema,
+including names, optional type metadata and graph/declaration metadata. Both
+right-present results are non-delta, without segment metadata, and ignore
+ordinary JOIN delta selection and output-limit/peak policy.
+
+Controlled materialization and raw keep-all shortcuts agree on valid admitted
+logical results; physical identity, relation name, retained sort cache and
+exact allocation thresholds may differ. Invalid manually corrupted FLOAT
+payloads are outside that equivalence: typed copying still rejects them.
+The component remains private and opt-in, with numeric-plan admission and
+public/default/session scheduling separate from its standalone/owned entry.

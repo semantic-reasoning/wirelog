@@ -4887,6 +4887,501 @@ done:
     return 0;
 }
 
+/* Controlled existence joins deliberately materialize valid scalar results.
+ * They share the original JOIN owners/retirement, not its delta selection,
+ * concatenated row shape, multiplicity or output-limit policy. */
+int
+wl_columnar_join_probe_op_attempt_start(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status)
+{
+    return wl_columnar_join_probe_op_attempt_start_owned(op, frame, session,
+               control, id, status, NULL);
+}
+
+int
+wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!op || !status) return EINVAL;
+    if (owner && !control) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
+    if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control || record->attempt_id != id)
+            return EINVAL;
+    }
+    if (!control) {
+        int result = op->op == WL_PLAN_OP_SEMIJOIN
+            ? col_op_semijoin(op, stack, session)
+            : op->op == WL_PLAN_OP_ANTIJOIN
+            ? col_op_antijoin(op, stack, session) : EINVAL;
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = result; status->semantic_result = result;
+        status->cleanup_result = 0; status->committed = result == 0;
+        return 0;
+    }
+    rc = wl_columnar_join_attempt_guard(control, id);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    /* Refused first admission has no live context or resource ownership. */
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) {
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = rc; status->semantic_result = rc;
+        status->cleanup_result = 0; status->committed = false;
+        return 0;
+    }
+    ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
+    ctx->governor = NULL; ctx->values = ctx->inline_values;
+    ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->drain_initialized = false; ctx->heap = false; ctx->admitted = false;
+    ctx->credit_committed = false; ctx->ref_held = false;
+    ctx->unary_started = false; ctx->committed = false;
+    ctx->row = 0; ctx->width = 0; ctx->nrows = 0;
+    ctx->execution_result = 0; ctx->cleanup_result = 0;
+    ctx->semantic_result = 0;
+    ctx->control = NULL; ctx->pin_owned = false; ctx->thread_valid = false;
+    ctx->busy = false; ctx->frame = frame; ctx->session = session;
+    ctx->attempt_id = id; ctx->join_right_initialized = false;
+    ctx->join_retirement_cursor = 0; ctx->join_result_is_delta = false;
+    ctx->join_decision_pending = false;
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i) {
+        wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[i];
+        scratch->initialized = false; scratch->allocated = false;
+        scratch->admitted = false; scratch->committed = false;
+        scratch->ref_held = false; scratch->physical = NULL;
+        scratch->governor = NULL;
+    }
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    ctx->control = control; ctx->pin_owned = true; ctx->identity = ctx;
+#if defined(WL_HAVE_C11_THREADS)
+    ctx->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    ctx->owner_thread = GetCurrentThreadId();
+#else
+    ctx->owner_thread = pthread_self();
+#endif
+    ctx->thread_valid = true; ctx->busy = true;
+    ctx->join_initialized = true; ctx->join_decision_pending = true;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
+    bool semi = op->op == WL_PLAN_OP_SEMIJOIN;
+    bool supported = (semi || op->op == WL_PLAN_OP_ANTIJOIN)
+        && !op->right_filter_expr.size && !op->materialized
+        && (!semi || !op->project_count || op->project_indices)
+        && !session->current_iteration && !session->diff_operators_active
+        && !session->retraction_seeded
+        && !session->retraction_right_pass && !session->tdd_input_run
+        && !session->tdd_subpass_active && !session->tdd_outbound_only_active
+        && !session->join_batch_bytes && !session->join_output_shared_count
+        && !session->coordinator && session->num_workers <= 1;
+    rc = wl_columnar_join_attempt_tail(control, id, 1, 0);
+    if (rc > 0 || supported) {
+        if (rc) goto done;
+    } else {
+        rc = ENOTSUP; goto done;
+    }
+    for (unsigned payment = 0;
+        payment < WL_COLUMNAR_JOIN_ATTEMPT_RETIRE_PAYMENTS; ++payment){
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_tail(control, id, 2, payment);
+        if (rc) goto done;
+    }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_tail(control, id, 3, 0);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_begin_attempt_context_owned(frame, ctx,
+            control, id, owner);
+    if (rc) goto done;
+    ctx->unary_started = true;
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    const col_rel_t *left = NULL;
+    col_rel_t **out_slot = NULL;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_input_owned(frame, &left, owner);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_eval_stack_unary_output_owned(frame, &out_slot, owner);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc =
+        wl_columnar_relation_scalar_source_init_attempt_controlled(&ctx->source,
+            &ctx->source_initialized, control, id);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc =
+        wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        &ctx->source, left, false);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    if (ctx->source.timestamps) {
+        rc = ENOTSUP; goto done;
+    }
+    col_rel_t *right = NULL;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_lookup(session, op->right_relation, false,
+            &right, control, id);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    bool present = right != NULL;
+    bool projected = semi && op->project_count;
+    rc = wl_columnar_join_attempt_tail(control, id, 7, present);
+    if (rc > 0 || present) {
+        if (rc) goto done;
+    } else {
+        rc = ENOTSUP; goto done;
+    }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+        &ctx->join_right, &ctx->join_right_initialized, control, id);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+        &ctx->join_right, right, false);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    if (ctx->join_right.timestamps) {
+        rc = ENOTSUP; goto done;
+    }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    wl_columnar_memory_governor_ref_t *governor = session->memory_governor
+        ? session->memory_governor : left->memory_governor
+        ? left->memory_governor : right ? right->memory_governor : NULL;
+    uint32_t *left_keys = NULL, *right_keys = NULL;
+    bool keyed = op->key_count != 0;
+    rc = wl_columnar_join_attempt_tail(control, id, 24, op->key_count);
+    if (rc) goto done;
+    if (keyed) {
+        if (!ctx->source.width || !ctx->join_right.width) {
+            rc = EINVAL; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint64_t key_bytes = 0;
+        bool key_sized = wl_columnar_memory_size_mul(op->key_count,
+                2u * sizeof(uint32_t), &key_bytes) && key_bytes <= SIZE_MAX;
+        rc = wl_columnar_join_attempt_tail(control, id, 24, key_bytes);
+        if (rc > 0 || key_sized) {
+            if (rc) goto done;
+        } else {
+            rc = EOVERFLOW; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_scratch(&ctx->join_scratch[0], key_bytes,
+                governor, control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        left_keys = ctx->join_scratch[0].physical;
+        right_keys = left_keys + op->key_count;
+        for (uint32_t key = 0; key < op->key_count; ++key) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_key(&ctx->source,
+                    op->left_keys ? op->left_keys[key] : NULL,
+                    &left_keys[key], control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_key(&ctx->join_right,
+                    op->right_keys ? op->right_keys[key] : NULL,
+                    &right_keys[key], control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            wirelog_column_type_t lt = ctx->source.types
+                ? ctx->source.types[left_keys[key]] : WIRELOG_TYPE_INT64;
+            wirelog_column_type_t rt = ctx->join_right.types
+                ? ctx->join_right.types[right_keys[key]] : WIRELOG_TYPE_INT64;
+            bool compatible = (lt == WIRELOG_TYPE_FLOAT) ==
+                (rt == WIRELOG_TYPE_FLOAT);
+            rc = wl_columnar_join_attempt_tail(control, id, 25, key);
+            if (rc > 0 || compatible) {
+                if (rc) goto done;
+            } else {
+                rc = EINVAL; goto done;
+            }
+        }
+    }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    uint64_t width64 = projected ? op->project_count : ctx->source.width;
+    uint64_t type_bytes = 0, padded = 0, row_bytes = 0, bytes = 0;
+    bool sized = width64 <= UINT32_MAX
+        && wl_columnar_memory_size_mul(semi ? width64 : 0,
+            sizeof(wirelog_column_type_t),
+            &type_bytes)
+        && wl_columnar_memory_size_add(type_bytes, sizeof(int64_t) - 1u,
+            &padded)
+        && wl_columnar_memory_size_mul(width64, sizeof(int64_t), &row_bytes)
+        && wl_columnar_memory_size_add(padded &
+            ~(uint64_t)(sizeof(int64_t) - 1u), row_bytes, &bytes)
+        && bytes <= SIZE_MAX;
+    rc = wl_columnar_join_attempt_tail(control, id, 8, width64);
+    if (rc > 0 || sized) {
+        if (rc) goto done;
+    } else {
+        rc = EOVERFLOW; goto done;
+    }
+    ctx->width = (uint32_t)width64; ctx->nrows = ctx->source.nrows;
+
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_scratch(&ctx->join_scratch[1], bytes,
+            governor, control, id);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    wirelog_column_type_t *types = ctx->join_scratch[1].physical;
+    int64_t *values = bytes ? (int64_t *)((unsigned char *)types
+        + (size_t)(padded &
+        ~(uint64_t)(sizeof(int64_t) - 1u))) : ctx->inline_values;
+    if (semi) for (uint32_t c = 0; c < ctx->width; ++c) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t source = projected ? op->project_indices[c] : c;
+            types[c] = source < ctx->source.width && ctx->source.types
+            ? ctx->source.types[source] : WIRELOG_TYPE_INT64;
+            rc = wl_columnar_join_attempt_tail(control, id, 13, c);
+            if (rc) goto done;
+        }
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    if (semi)
+        rc = wl_columnar_relation_new_typed_operator_attempt_controlled(
+            "$semijoin", ctx->width, types, governor, out_slot, control, id);
+    else
+        rc =
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &ctx->source, "$antijoin", governor, out_slot);
+    ctx->output = *out_slot; ctx->private_output = *out_slot;
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    if (!ctx->source.nrows || (semi && !ctx->join_right.nrows)) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    wl_columnar_filter_attempt_batch_init(&ctx->batch);
+    ctx->batch_initialized = true;
+    wl_columnar_relation_private_batch_drain_init(&ctx->batch_drain);
+    ctx->drain_initialized = true;
+    rc = wl_columnar_join_attempt_tail(control, id, 15, 0);
+    if (rc) goto done;
+    rc = wl_columnar_join_attempt_charge(control, id,
+            WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+    if (rc) goto done;
+    rc = wl_columnar_relation_append_batch_begin_controlled(&ctx->batch,
+            ctx->output, control);
+    rc = wl_columnar_join_attempt_return(control, id, rc);
+    if (rc) goto done;
+    uint32_t buckets = 1;
+    uint32_t *heads = NULL, *next = NULL;
+    if (keyed && ctx->join_right.nrows) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        if (ctx->join_right.nrows > UINT32_MAX / 2u) {
+            rc = ENOMEM; goto done;
+        }
+        uint32_t target = ctx->join_right.nrows * 2u;
+        rc = wl_columnar_join_attempt_tail(control, id, 26, target);
+        if (rc) goto done;
+        while (buckets < target) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            bool fits = buckets <= UINT32_MAX / 2u;
+            if (fits) buckets *= 2u;
+            rc = wl_columnar_join_attempt_tail(control, id, 26, buckets);
+            if (rc > 0 || fits) {
+                if (rc) goto done;
+            } else {
+                rc = ENOMEM; goto done;
+            }
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint64_t slots = 0, hash_bytes = 0;
+        bool hash_sized = wl_columnar_memory_size_add(buckets,
+                ctx->join_right.nrows, &slots)
+            && wl_columnar_memory_size_mul(slots, sizeof(uint32_t), &hash_bytes)
+            && hash_bytes <= SIZE_MAX;
+        rc = wl_columnar_join_attempt_tail(control, id, 26, hash_bytes);
+        if (rc > 0 || hash_sized) {
+            if (rc) goto done;
+        } else {
+            rc = EOVERFLOW; goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_scratch(&ctx->join_scratch[2], hash_bytes,
+                governor, control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        heads = ctx->join_scratch[2].physical; next = heads + buckets;
+        for (uint64_t slot = 0; slot < slots; ++slot) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            heads[slot] = UINT32_MAX;
+            rc = wl_columnar_join_attempt_tail(control, id, 26, slot);
+            if (rc) goto done;
+        }
+        for (uint32_t row = 0; row < ctx->join_right.nrows; ++row) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+            if (rc) goto done;
+            uint32_t hash = 0;
+            rc = wl_columnar_join_attempt_hash(right, row, right_keys,
+                    op->key_count, &hash, control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t bucket = hash & (buckets - 1u);
+            next[row] = heads[bucket]; heads[bucket] = row;
+            rc = wl_columnar_join_attempt_tail(control, id, 28, row);
+            if (rc) goto done;
+        }
+    }
+    for (uint32_t lr = 0; lr < ctx->source.nrows; ++lr) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        uint32_t first = ctx->join_right.nrows ? 0 : UINT32_MAX;
+        if (keyed && ctx->join_right.nrows) {
+            uint32_t hash = 0;
+            rc = wl_columnar_join_attempt_hash(left, lr, left_keys,
+                    op->key_count, &hash, control, id);
+            rc = wl_columnar_join_attempt_return(control, id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            first = heads[hash & (buckets - 1u)];
+            rc = wl_columnar_join_attempt_tail(control, id, 29, lr);
+            if (rc) goto done;
+        }
+        bool matched = false;
+        for (uint32_t rr = first; rr < ctx->join_right.nrows;
+            rr = keyed ? next[rr] : rr + 1u) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            ctx->row = lr;
+            rc = wl_columnar_join_attempt_tail(control, id, 17,
+                    (uint64_t)lr * ctx->join_right.nrows + rr);
+            if (rc) goto done;
+            if (keyed) {
+                rc = wl_columnar_join_attempt_charge(control, id,
+                        WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+                if (rc) goto done;
+                bool match = false;
+                rc = wl_columnar_join_attempt_match(left, lr, left_keys,
+                        right, rr, right_keys, op->key_count, &match, control,
+                        id);
+                rc = wl_columnar_join_attempt_return(control, id, rc);
+                if (rc) goto done;
+                if (!match) continue;
+            }
+            matched = true;
+            break;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        bool selected = matched == semi;
+        rc = wl_columnar_join_attempt_tail(control, id, 31, lr);
+        if (rc) goto done;
+        if (!selected) continue;
+        for (uint32_t c = 0; c < ctx->width; ++c) {
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            uint32_t source = projected ? op->project_indices[c] : c;
+            values[c] = source < ctx->source.width
+                ? ctx->source.columns[source][lr] : 0;
+            rc = wl_columnar_join_attempt_tail(control, id, 18, c);
+            if (rc) goto done;
+        }
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_relation_append_batch_numeric_row_operator_controlled(
+            &ctx->batch, values, control, id);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_join_attempt_tail(control, id, 20, ctx->output->nrows);
+        if (rc) goto done;
+    }
+
+done:
+    if (rc == ENOMEM && ctx->output &&
+        ctx->output->memory_budget_denial_pending)
+        rc = ENOSPC;
+    if (rc == ENOSPC) session->memory_budget_denied = true;
+    ctx->execution_result = rc; ctx->semantic_result = rc;
+    ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_BATCH;
+    ctx->busy = false;
+    wl_columnar_join_attempt_status(ctx, status);
+    return 0;
+}
+
 /* Compatibility entry points used by internal test fixtures and downstream
  * backend code while the operator implementations use the directory-aware
  * wl_columnar_* naming convention. */

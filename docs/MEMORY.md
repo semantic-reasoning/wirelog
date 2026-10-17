@@ -3230,3 +3230,46 @@ The remaining activation boundary is explicit:
 Unsupported opcodes fail the complete preflight before source publication or the
 first child; supported opcodes with unsupported input shapes fail at that child.
 There is no controlled-to-raw fallback. This increment does not complete #1821.
+
+
+### Initial scalar existence-join component
+
+The private `wl_columnar_join_probe_op_attempt_start[_owned]` component adds
+bounded SEMIJOIN and ANTIJOIN using the original unary replacement, two held
+scalar sources, three JOIN scratch records and B2 batch/drain. It creates no
+new live context owner or binary transaction. The ordinary JOIN entry and its
+delta selection/output-limit policy remain separate. This component is not yet
+admitted by the private numeric plan driver or public/default dispatch.
+
+A named full right registry relation is required. A missing right returns
+ENOTSUP with the original left entry uncommitted; this explicitly differs from
+raw SEMI/ANTI's missing-right repush. An existing empty right is supported:
+SEMI returns empty and ANTI returns all left rows. No right-delta selection,
+JOIN output limit/peak update, right filter, materialized, differential,
+retraction, TDD, batch, parallel or coordinator execution is enabled. Sources
+must be ordinary scalar/noTS; compound and timestamped inputs are refused.
+
+SEMI copies at most one left row after its first key match, with only left
+projection lanes and canonical colN names/selected physical types (INT64 for
+untyped or out-of-range zero-fill). ANTI copies one complete left row only
+after its collision chain has no match, preserving left names, native type
+presence and graph/declaration metadata. Zero keys test whether the right has
+any row. Both results are non-delta and discard input segment boundaries.
+
+Each registry/name byte, key comparison, right hash build/link, collision
+candidate, selected lane and append has original-ID admission/checkpoints.
+Rejected candidates are charged even when the result is empty. Existing84
+JOIN lifecycle payments are retained for these same discoverable source,
+scratch, batch, output, control and unary owners; unused named shares are
+admitted slack, not executed-work telemetry. Physical scratch retires before
+its original credit/reference; refusal retains those markers, and each retry
+requires fresh distinct HOST funding. No successor allowance funds retirement.
+
+The controlled route deliberately materializes valid scalar probe results.
+Raw keep-all may retain relation identity/name, allocation provenance and sort
+caches; these are not promised identical. Logical names/types/graph/tuples,
+non-delta publication and later operators are the compatibility boundary.
+Additional materialization can fail admission where raw passthrough succeeds,
+and copied invalid FLOAT payloads retain typed append validation rather than
+inherit an invalid-input passthrough promise. Missing-right and unsupported
+shapes never silently execute raw under a nonNULL control.
