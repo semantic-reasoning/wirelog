@@ -1514,7 +1514,13 @@ instead of running one-shot and records nothing.  A materialized join whose
 result is already cached is copied from the cache before this decision, so
 it is neither recorded nor refused.  Under strict mode a differential
 evaluation therefore fails as soon as one of its joins reads a delta on the
-right or filters the right relation; it is a diagnostic setting.
+right or filters the right relation; it is a diagnostic setting.  A keyed
+differential join whose left input has rows but no columns fails with
+`EINVAL` with the knob off or on, as the ordinary JOIN does, before the
+cache lookup and the bounded-mode decision, so nothing is recorded.  A
+missing or forced-empty right operand still yields the empty result
+first, and an error from the right relation's filter, which runs before
+the check, is returned instead (#2202).
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true

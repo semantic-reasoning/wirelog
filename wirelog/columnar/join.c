@@ -3316,6 +3316,18 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
+    /* A nonempty nullary left has no key column to probe: the one-shot hash
+     * and the bounded producer would read its absent column 0.  Empty left
+     * inputs and nullary cross joins remain valid.  Refuse with EINVAL, as
+     * the ordinary JOIN does, before a cached result, the bounded-mode
+     * decision or the differential arrangement is reached (#2202). */
+    if (op->key_count > 0 && left_e.rel->ncols == 0
+        && left_e.rel->nrows > 0) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
+    }
+
     /* Materialization cache check */
     bool projected_join = op->project_count > 0 && op->project_indices;
     /* Owned filtered fallbacks are operation-local; see the ordinary path. */
