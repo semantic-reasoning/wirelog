@@ -433,6 +433,12 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     right = session_find_rel(sess, op->right_relation);
     if (!right)
         return ENOENT;
+    /* A key index outside either input, such as column 0 of a zero-column
+     * relation, is refused before any reservation, reader or arrangement
+     * is taken, as in the non-differential producer (#2202). */
+    for (uint32_t k = 0; k < kc; k++)
+        if (lk[k] >= left->ncols || rk[k] >= right->ncols)
+            return EINVAL;
     if (!wl_columnar_memory_size_mul(op->project_count,
         sizeof(uint32_t), &project_bytes)
         || !wl_columnar_memory_size_mul(kc,

@@ -3317,10 +3317,11 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     }
 
     /* A nonempty nullary left has no key column to probe: the one-shot hash
-     * and the bounded producer would read its absent column 0.  Empty left
-     * inputs and nullary cross joins remain valid.  Refuse with EINVAL, as
-     * the ordinary JOIN does, before a cached result, the bounded-mode
-     * decision or the differential arrangement is reached (#2202). */
+     * would read its absent column 0, and the bounded producer rejects that
+     * index with EINVAL.  Empty left inputs and nullary cross joins remain
+     * valid.  Refuse with EINVAL, as the ordinary JOIN does, before a cached
+     * result, the bounded-mode decision or the differential arrangement is
+     * reached (#2202). */
     if (op->key_count > 0 && left_e.rel->ncols == 0
         && left_e.rel->nrows > 0) {
         if (right_filtered)
@@ -3408,13 +3409,12 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         col_join_batch_record_fallback(sess, batch_elig);
     }
     /* An empty input on either side has nothing to bound: the one-shot
-    * join below yields zero rows in one pass, so do not dispatch the
-    * producer.  Otherwise two empty zero-column inputs give a zero-width
-    * output, which the create of the producer reports as one row not
-    * fitting the batch budget: recorded as row-too-large, or refused
-    * under strict mode (#2202).  Decided after the strict and fallback
-    * handling above, as in the ordinary join: it is neither a fallback
-    * nor a strict-mode failure, and the eligibility verdict stands. */
+     * join below yields zero rows in one pass, so do not dispatch the
+     * producer.  An empty zero-column input resolves its keys to column 0
+     * by fallback, an index the producer rejects with EINVAL (#2202).
+     * Decided after the strict and fallback handling above, as in the
+     * ordinary join: it is neither a fallback nor a strict-mode failure,
+     * and the eligibility verdict stands. */
     bool bounded = batch_elig == COL_JOIN_BATCH_ELIGIBLE
         && left->nrows > 0 && right->nrows > 0;
     if (bounded) {
