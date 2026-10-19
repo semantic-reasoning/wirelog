@@ -781,11 +781,32 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     }
 
     /* The output has the schema the sequential tail would publish: a MAP's
-     * is new_auto(project_count), as in col_op_map(); a FILTER's is its
-     * input's, which is the JOIN output's for a FILTER-only tail. */
+     * has the column types col_op_map() gives the tail's input, resolved
+     * without evaluating an expression; a FILTER's is its input's, which
+     * is the JOIN output's for a FILTER-only tail. */
     if (last->op == WL_PLAN_OP_MAP) {
+        /* The MAP's input is the last stage's schema, or the JOIN output's
+         * (the producer's batch schema) when no stage precedes it. */
+        col_rel_t *shape = stage_template;
+        col_rel_t *join_shape = NULL;
         out = col_rel_new_auto("$join_pipeline", last->project_count);
         rc = out ? 0 : ENOMEM;
+        if (rc == 0 && !shape) {
+            join_shape = col_rel_new_auto("$join_pipeline_shape",
+                    col_join_output_width(stack->items[stack->top - 1].rel,
+                    right, join));
+            rc = join_shape ? col_join_set_output_types(join_shape,
+                    stack->items[stack->top - 1].rel, right, join) : ENOMEM;
+            shape = join_shape;
+        }
+        if (rc == 0) {
+            const col_rel_t *left_rel = stack->items[stack->top - 1].rel;
+            rc = col_op_map_output_types(last, shape, sess,
+                    sess->memory_governor ? sess->memory_governor
+                    : left_rel->memory_governor ? left_rel->memory_governor
+                    : right->memory_governor, out);
+        }
+        col_rel_destroy(join_shape);
     } else if (stage_template) {
         /* The last stage's schema; new_like copies no timestamps. */
         out = col_rel_new_like("$join_pipeline", stage_template);

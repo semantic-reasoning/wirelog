@@ -4684,6 +4684,13 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess);
+/* Install on the empty @out the column types col_op_map would give @op's
+ * output over @input's schema, without evaluating an expression.  Scratch
+ * is admitted under @governor; @out stays untyped where col_op_map's would. */
+int
+col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
+    wl_col_session_t *sess, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t *out);
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);

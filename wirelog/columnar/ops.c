@@ -273,6 +273,82 @@ wl_columnar_ops_map_set_types(const wl_plan_op_t *op, const col_rel_t *input,
     return rc;
 }
 
+/* Compile @op's non-empty MAP expressions once.  An expression the compiler
+ * declines (ENOTSUP) leaves a NULL program, which the interpreter evaluates;
+ * any other compile error is returned after freeing what was compiled. */
+static int
+wl_columnar_ops_map_compile(const wl_plan_op_t *op, wl_col_session_t *sess,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_compiled_t ***programs, uint32_t *program_count)
+{
+    uint32_t pc = op->project_count;
+    *programs = NULL;
+    *program_count = 0;
+    if (!op->map_exprs || op->map_expr_count == 0)
+        return 0;
+    wl_columnar_expr_compiled_t **ce = (wl_columnar_expr_compiled_t **)calloc(
+        pc, sizeof(wl_columnar_expr_compiled_t *));
+    if (!ce && pc > 0)
+        return ENOMEM;
+    uint32_t count = (op->map_expr_count < pc) ? op->map_expr_count : pc;
+    for (uint32_t c = 0; c < count; c++) {
+        if (op->map_exprs[c].data && op->map_exprs[c].size > 0) {
+            int expr_rc = ENOTSUP;
+            ce[c] = wl_columnar_expr_compile_governed(op->map_exprs[c].data,
+                    op->map_exprs[c].size, sess ? sess->intern : NULL,
+                    governor, sess, &expr_rc);
+            if (expr_rc != ENOTSUP && expr_rc != 0) {
+                for (uint32_t j = 0; j < c; j++)
+                    wl_columnar_expr_compiled_free(ce[j]);
+                free((void *)ce);
+                return expr_rc;
+            }
+        }
+    }
+    *programs = ce;
+    *program_count = count;
+    return 0;
+}
+
+int
+col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
+    wl_col_session_t *sess, wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t *out)
+{
+    if (!op || !input || !sess || !out || op->op != WL_PLAN_OP_MAP)
+        return EINVAL;
+    uint32_t pc = op->project_count;
+    uint64_t scratch_bytes = 0;
+    uint64_t bytes = 0;
+    bool sized = wl_columnar_memory_size_mul(pc, sizeof(wirelog_column_type_t),
+            &bytes)
+        && wl_columnar_memory_size_add(scratch_bytes, bytes, &scratch_bytes);
+    if (op->map_exprs && op->map_expr_count > 0)
+        sized = sized
+            && wl_columnar_memory_size_mul(pc,
+                sizeof(wl_columnar_expr_compiled_t *), &bytes)
+            && wl_columnar_memory_size_add(scratch_bytes, bytes,
+                &scratch_bytes);
+    if (!sized || scratch_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    wl_ops_scratch_t scratch;
+    int rc = wl_ops_scratch_reserve(&scratch, governor, scratch_bytes, sess);
+    if (rc != 0)
+        return rc;
+    wl_columnar_expr_compiled_t **programs = NULL;
+    uint32_t program_count = 0;
+    rc = wl_columnar_ops_map_compile(op, sess, governor, &programs,
+            &program_count);
+    if (rc == 0)
+        rc = wl_columnar_ops_map_set_types(op, input, out, programs,
+                program_count);
+    for (uint32_t c = 0; c < program_count; c++)
+        wl_columnar_expr_compiled_free(programs[c]);
+    free((void *)programs);
+    wl_ops_scratch_release(&scratch);
+    return rc;
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {
@@ -358,36 +434,13 @@ col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
     /* Pre-compile map expressions once to avoid per-row strtol. */
     wl_columnar_expr_compiled_t **ce_map = NULL;
     uint32_t ce_map_count = 0;
-    if (op->map_exprs && op->map_expr_count > 0) {
-        ce_map = (wl_columnar_expr_compiled_t **)calloc(pc,
-                sizeof(wl_columnar_expr_compiled_t *));
-        if (!ce_map && pc > 0) {
-            free(tmp);
-            col_rel_destroy(out);
-            WL_MAP_RELEASE_SCRATCH();
-            return wl_columnar_ops_dispose_entry(stack, &e, ENOMEM);
-        }
-        ce_map_count = (op->map_expr_count < pc) ? op->map_expr_count : pc;
-        for (uint32_t c = 0; c < ce_map_count; c++) {
-            if (op->map_exprs[c].data && op->map_exprs[c].size > 0) {
-                int expr_rc = ENOTSUP;
-                ce_map[c] = wl_columnar_expr_compile_governed(
-                    op->map_exprs[c].data, op->map_exprs[c].size,
-                    sess ? sess->intern : NULL,
-                    governor, sess, &expr_rc);
-                if (expr_rc != ENOTSUP && expr_rc != 0) {
-                    for (uint32_t j = 0; j < c; j++)
-                        wl_columnar_expr_compiled_free(ce_map[j]);
-                    free((void *)ce_map);
-                    free(tmp);
-                    col_rel_destroy(out);
-                    WL_MAP_RELEASE_SCRATCH();
-                    return wl_columnar_ops_admission_failure(stack, &e,
-                               sess,
-                               expr_rc);
-                }
-            }
-        }
+    int compile_rc = wl_columnar_ops_map_compile(op, sess, governor, &ce_map,
+            &ce_map_count);
+    if (compile_rc != 0) {
+        free(tmp);
+        col_rel_destroy(out);
+        WL_MAP_RELEASE_SCRATCH();
+        return wl_columnar_ops_admission_failure(stack, &e, sess, compile_rc);
     }
 
     int schema_rc = wl_columnar_ops_map_set_types(op, e.rel, out, ce_map,

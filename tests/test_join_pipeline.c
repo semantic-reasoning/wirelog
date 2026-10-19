@@ -1153,6 +1153,7 @@ test_expression_pipeline_budget_sweep(void)
             break;
         governor = wl_columnar_memory_governor_ref_get(ref);
         sess->memory_governor = ref;
+        sess->memory_budget_denied = false;
         pl_observe_reset();
         run = pl_run(sess, &p.plan, sess->join_batch_bytes);
         sess->memory_governor = NULL;
@@ -1161,8 +1162,8 @@ test_expression_pipeline_budget_sweep(void)
             CHECK(pl_same_rows(&run, &want),
                 "governed expression pipeline matches the oracle");
         } else {
-            CHECK(run.rc == ENOSPC,
-                "budget denial reports ENOSPC");
+            CHECK(run.rc == ENOSPC && sess->memory_budget_denied,
+                "budget denial reports ENOSPC and marks the session");
             CHECK(run.stack_top == 1 && run.restored_left_rows == PL_KEYS,
                 "budget denial restores the left input");
             if (pl_map_calls > 1)
@@ -2951,6 +2952,249 @@ test_filter_tail_output_parity(void)
     a2_observe_reset();
 }
 
+/* ---- MAP-ending tail schema (knob gate, c2ca4fb8) ---------------------
+ * The sequential MAP publishes the column types its expressions and
+ * projections give its input.  A MAP-ending pipeline must publish the same
+ * schema: an untyped FLOAT result cannot be merged into a FLOAT head. */
+
+typedef enum {
+    M4_PROJECT,     /* JOIN -> MAP[3]: one FLOAT projection */
+    M4_EXPRESSION,  /* JOIN -> MAP[col1 + 1, 3]: an INT64 expression */
+    M4_STAGE,       /* JOIN -> SEMIJOIN[1, 3] -> MAP[1]: a reordering stage */
+    M4_NO_MATCH,    /* as M4_PROJECT with no matching key: no batch */
+    M4_UNTYPED,     /* as M4_PROJECT over untyped inputs */
+    M4_SHAPES
+} m4_shape_t;
+
+#define M4_MAX_ROWS 8u
+
+typedef struct {
+    int rc;
+    a2_schema_t schema;
+    char name[32];
+    uint32_t nrows;
+    int64_t rows[M4_MAX_ROWS][2];
+    int append_rc;
+} m4_run_t;
+
+static uint8_t m4_v_plus_one[] = {
+    PL_VAR('1'), PL_INT(1), WL_PLAN_EXPR_ARITH_ADD
+};
+
+static col_rel_t *
+m4_relation(const char *name, const char *const *columns, uint32_t ncols,
+    const int64_t *rows, uint32_t nrows, const wirelog_column_type_t *types)
+{
+    col_rel_t *rel = pipeline_relation(name, columns, ncols, NULL, 0);
+    if (rel && types && col_rel_set_column_types(rel, types, ncols) != 0) {
+        col_rel_destroy(rel);
+        return NULL;
+    }
+    for (uint32_t i = 0; rel && i < nrows; i++) {
+        if (col_rel_append_row(rel, rows + i * ncols) != 0) {
+            col_rel_destroy(rel);
+            return NULL;
+        }
+    }
+    return rel;
+}
+
+static int
+m4_row_cmp(const void *a, const void *b)
+{
+    const int64_t *x = (const int64_t *)a;
+    const int64_t *y = (const int64_t *)b;
+    for (uint32_t c = 0; c < 2; c++) {
+        if (x[c] != y[c])
+            return x[c] < y[c] ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Evaluate the @shape plan with @batch_bytes and copy what it published. */
+static m4_run_t
+m4_map_output(m4_shape_t shape, uint32_t batch_bytes)
+{
+    static const char *const kv[] = { "k", "v" };
+    static const char *const kr[] = { "k", "r" };
+    static const char *const k_only[] = { "k" };
+    static const char *const join_key[] = { "k" };
+    static const char *const stage_key[] = { "col0" };
+    static const uint32_t map_project[] = { 3 };
+    static const uint32_t mixed_project[] = { 0, 3 };
+    static const uint32_t stage_project[] = { 1, 3 };
+    static const uint32_t after_stage[] = { 1 };
+    static const wirelog_column_type_t float_int[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64
+    };
+    static const wirelog_column_type_t float_float[] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_FLOAT
+    };
+    static const wirelog_column_type_t float_one[] = { WIRELOG_TYPE_FLOAT };
+    bool typed = shape != M4_UNTYPED;
+    int64_t half = wl_columnar_float_to_bits(0.5);
+    int64_t one_half = wl_columnar_float_to_bits(1.5);
+    int64_t miss = wl_columnar_float_to_bits(9.5);
+    int64_t right_rows[] = {
+        half, wl_columnar_float_to_bits(10.5),
+        half, wl_columnar_float_to_bits(11.5),
+        half, wl_columnar_float_to_bits(12.5),
+        one_half, wl_columnar_float_to_bits(20.5)
+    };
+    int64_t left_rows[] = {
+        shape == M4_NO_MATCH ? miss : half, 7,
+        shape == M4_NO_MATCH ? miss : one_half, 8
+    };
+    int64_t stage_rows[] = { half };
+    wl_plan_expr_buffer_t exprs[2] = {
+        { m4_v_plus_one, sizeof(m4_v_plus_one) }, { NULL, 0 }
+    };
+    wl_plan_op_t ops[3];
+    wl_plan_relation_t plan = { .ops = ops, .op_count = 2 };
+    wl_col_session_t *sess = pipeline_session();
+    col_rel_t *right = m4_relation("right", kr, 2, right_rows, 4,
+            typed ? float_float : NULL);
+    col_rel_t *stage = m4_relation("S", k_only, 1, stage_rows, 1,
+            typed ? float_one : NULL);
+    col_rel_t *left = m4_relation("left", kv, 2, left_rows, 2,
+            typed ? float_int : NULL);
+    eval_stack_t stack;
+    m4_run_t run;
+
+    memset(&run, 0, sizeof(run));
+    run.rc = ENOMEM;
+    run.append_rc = -1;
+    eval_stack_init(&stack);
+    if (!sess || !right || !stage || !left
+        || session_add_rel(sess, right) != 0) {
+        col_rel_destroy(right);
+        col_rel_destroy(stage);
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return run;
+    }
+    if (session_add_rel(sess, stage) != 0) {
+        col_rel_destroy(stage);
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return run;
+    }
+    if (!col_session_get_arrangement(&sess->base, "right",
+        (const uint32_t[]){ 0 }, 1)
+        || eval_stack_push_delta(&stack, left, true, false) != 0) {
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return run;
+    }
+    memset(ops, 0, sizeof(ops));
+    ops[0] = (wl_plan_op_t){ .op = WL_PLAN_OP_JOIN, .right_relation = "right",
+                             .left_keys = join_key, .right_keys = join_key,
+                             .key_count = 1 };
+    ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_MAP, .project_count = 1,
+                             .project_indices = map_project };
+    if (shape == M4_EXPRESSION) {
+        ops[1].map_exprs = exprs;
+        ops[1].map_expr_count = 2;
+        ops[1].project_count = 2;
+        ops[1].project_indices = mixed_project;
+    } else if (shape == M4_STAGE) {
+        ops[1] = (wl_plan_op_t){ .op = WL_PLAN_OP_SEMIJOIN,
+                                 .right_relation = "S",
+                                 .left_keys = stage_key,
+                                 .right_keys = k_only, .key_count = 1,
+                                 .project_count = 2,
+                                 .project_indices = stage_project };
+        ops[2] = (wl_plan_op_t){ .op = WL_PLAN_OP_MAP, .project_count = 1,
+                                 .project_indices = after_stage };
+        plan.op_count = 3;
+    }
+    sess->join_batch_bytes = batch_bytes;
+    run.rc = col_eval_relation_plan(&plan, &stack, sess);
+    if (run.rc == 0 && stack.top == 1 && stack.items[0].rel
+        && stack.items[0].rel->ncols <= 2
+        && stack.items[0].rel->nrows <= M4_MAX_ROWS) {
+        const col_rel_t *out = stack.items[0].rel;
+        run.schema.ncols = out->ncols;
+        run.schema.timestamps = out->timestamps != NULL;
+        run.schema.typed = out->column_types != NULL;
+        for (uint32_t c = 0; c < out->ncols; c++) {
+            if (out->col_names && out->col_names[c])
+                snprintf(run.schema.names[c], sizeof(run.schema.names[c]),
+                    "%s", out->col_names[c]);
+            if (out->column_types)
+                run.schema.types[c] = out->column_types[c];
+        }
+        snprintf(run.name, sizeof(run.name), "%s",
+            out->name ? out->name : "");
+        run.nrows = out->nrows;
+        for (uint32_t r = 0; r < out->nrows; r++)
+            for (uint32_t c = 0; c < out->ncols; c++)
+                run.rows[r][c] = out->columns[c][r];
+        qsort(run.rows, run.nrows, sizeof(run.rows[0]), m4_row_cmp);
+        if (shape == M4_PROJECT) {
+            /* The published relation must merge into a FLOAT head. */
+            col_rel_t *head = m4_relation("head", k_only, 1, NULL, 0,
+                    float_one);
+            run.append_rc = head ? col_rel_append_all(head, out, NULL)
+                : ENOMEM;
+            col_rel_destroy(head);
+        }
+    } else if (run.rc == 0) {
+        run.rc = EINVAL;
+    }
+    (void)eval_stack_drain(&stack);
+    pipeline_session_destroy(sess);
+    return run;
+}
+
+static void
+test_map_tail_output_parity(void)
+{
+    static const wirelog_column_type_t want_first[M4_SHAPES] = {
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT,
+        WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_INT64
+    };
+    static const uint32_t want_rows[M4_SHAPES] = { 4, 4, 3, 0, 4 };
+
+    wl_columnar_ops_test_before_map_dispose = pl_map_observer;
+    for (int shape = 0; shape < M4_SHAPES; shape++) {
+        m4_run_t off;
+        m4_run_t on;
+        bool same_rows;
+
+        pl_observe_reset();
+        off = m4_map_output((m4_shape_t)shape, 0);
+        pl_observe_reset();
+        on = m4_map_output((m4_shape_t)shape, SEL_BATCH_BYTES);
+        same_rows = on.nrows == off.nrows
+            && memcmp(on.rows, off.rows, sizeof(on.rows)) == 0;
+        if (off.rc != 0 || on.rc != 0 || !a2_same_schema(&off.schema,
+            &on.schema) || !off.schema.typed || !same_rows
+            || strcmp(on.name, "$join_pipeline") != 0)
+            fprintf(stderr, "  map parity shape %d: rc %d/%d typed %d/%d "
+                "type0 %d/%d rows %u/%u name %s maps=%u\n", shape, off.rc,
+                on.rc, off.schema.typed, on.schema.typed,
+                (int)off.schema.types[0], (int)on.schema.types[0],
+                off.nrows, on.nrows, on.name, pl_map_calls);
+        CHECK(off.rc == 0 && on.rc == 0 && off.schema.typed
+            && off.schema.types[0] == want_first[shape]
+            && a2_same_schema(&off.schema, &on.schema),
+            "a MAP-ending tail publishes the sequential MAP's schema");
+        CHECK(same_rows && on.nrows == want_rows[shape],
+            "a MAP-ending tail publishes the sequential MAP's rows");
+        /* The sequential path publishes $map; with no batch the MAP never
+        * runs, so the name alone shows the pipeline consumed the tail. */
+        CHECK(strcmp(on.name, "$join_pipeline") == 0
+            && (shape == M4_NO_MATCH || pl_map_calls >= 2),
+            "the parity run consumed the MAP tail");
+        if (shape == M4_PROJECT)
+            CHECK(on.append_rc == 0 && off.append_rc == 0,
+                "a FLOAT MAP-ending tail merges into a FLOAT relation");
+    }
+    wl_columnar_ops_test_before_map_dispose = NULL;
+    pl_observe_reset();
+}
+
 static void
 test_filter_tail_budget_sweep(void)
 {
@@ -4711,6 +4955,7 @@ main(void)
     test_filter_only_tail_matches_oracle();
     test_map_ends_the_tail_before_a_filter();
     test_filter_tail_output_parity();
+    test_map_tail_output_parity();
     test_filter_tail_budget_sweep();
     test_stage_grammar_preflight();
     test_probe_stage_pipeline_matches_oracle();

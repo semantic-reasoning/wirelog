@@ -1256,15 +1256,17 @@ always ends the tail.  The full join intermediate is therefore not
 materialized while the pipeline runs: each batch is filtered (and mapped)
 into one output relation, which is published only after the last batch and
 has the schema the sequential operators would publish -- the JOIN output's
-for a FILTER ending, the last stage's after a probe stage, `col0..` without
-types for a MAP ending.  Operators after the tail run as before, and what
-reads the tail's output decides strict mode as described below.  The FILTERs
-may use only numeric variables, numeric and boolean literals, and
-comparisons.  The MAP may project columns or evaluate numeric expressions --
-integer and float arithmetic and comparisons (#1777).  A MAP with a string,
-digest, UUID, aggregate or extension expression is not consumed; those have
-no batch contract yet.  A pipeline whose input goes stale mid-stream, or
-whose arrangement is unavailable, re-runs on the ordinary JOIN with reason
+for a FILTER ending, the last stage's after a probe stage, and for a MAP
+ending `col0..` with the column types the MAP operator gives the tail's
+input, so a result the MAP operator types FLOAT stays FLOAT.  Operators
+after the tail run as before, and what reads the tail's output decides
+strict mode as described below.  The FILTERs may use only numeric variables,
+numeric and boolean literals, and comparisons.  The MAP may project columns
+or evaluate numeric expressions -- integer and float arithmetic and
+comparisons (#1777).  A MAP with a string, digest, UUID, aggregate or
+extension expression is not consumed; those have no batch contract yet.  A
+pipeline whose input goes stale mid-stream, or whose arrangement is
+unavailable, re-runs on the ordinary JOIN with reason
 `pipeline-not-consumable` (`ENOTSUP` under `WIRELOG_JOIN_BATCH_STRICT=1`).
 A FILTER or MAP failure inside the pipeline returns that operator's errno --
 for MAP, `ERANGE` for a failed expression and `ENOSPC` for a denied
@@ -1288,9 +1290,12 @@ scales with the right relation, not with `WIRELOG_JOIN_BATCH_BYTES`.  A
 stage's per-batch output and row scratch, and for a parallel SEMIJOIN its
 worker contexts and offsets, are held only while that batch is in the tail.
 Setting the stages up admits at most two zero-row stage output templates at
-a time, and the last one is held until the output relation exists, after the
-producer.  Because the pipeline holds the producer, its output and the sets
-at once, a budget the sequential operators fit can deny the pipeline; a
+a time, and the last one is held until the output relation's schema is set,
+after the producer.  A MAP ending compiles its expressions once more at that
+point, without evaluating them, to resolve the output's column types; that
+compile is admitted as the MAP operator admits its own, and freed before the
+first batch.  Because the pipeline holds the producer, its output and the
+sets at once, a budget the sequential operators fit can deny the pipeline; a
 denied set fails it with `ENOSPC`, keeping the left input.
 
 Outside the pipeline, the SEMIJOIN and ANTIJOIN operators
