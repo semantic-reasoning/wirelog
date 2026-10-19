@@ -3329,14 +3329,17 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
-    /* A nonempty nullary left has no key column to probe: the one-shot hash
-     * would read its absent column 0, and the bounded producer rejects that
-     * index with EINVAL.  Empty left inputs and nullary cross joins remain
-     * valid.  Refuse with EINVAL, as the ordinary JOIN does, before a cached
-     * result, the bounded-mode decision or the differential arrangement is
-     * reached (#2202). */
-    if (op->key_count > 0 && left_e.rel->ncols == 0
-        && left_e.rel->nrows > 0) {
+    /* A nonempty nullary input on either side has no key column to probe:
+     * the one-shot hash would read its absent column 0, and the bounded
+     * producer rejects that index with EINVAL.  An empty nullary input is
+     * not refused on its own account, and nullary cross joins remain valid.
+     * The check follows the right operand selection and the right filter,
+     * so a missing, forced-empty or filtered-out right keeps its result.
+     * Refuse with EINVAL, as the ordinary JOIN does, before a cached result,
+     * the bounded-mode decision or the differential arrangement is reached
+     * (#2202, #2209). */
+    if (col_join_keyed_nullary(op, left_e.rel)
+        || col_join_keyed_nullary(op, right)) {
         if (right_filtered)
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);

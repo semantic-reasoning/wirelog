@@ -4673,11 +4673,12 @@ test_diff_operator_empty_input_nothing_to_bound(void)
         FAIL("empty differential input dispatched or refused");
 }
 
-/* #2209: a keyed JOIN refuses a nonempty nullary right with EINVAL, as it
- * refuses a nonempty nullary left: the right has no column 0 for its key to
- * read.  The check follows the right operand selection and the right
- * filter, and precedes the materialization cache and the bounded-mode
- * decision.  @diff runs the differential operator instead. */
+/* #2209: a keyed JOIN or differential JOIN refuses a nonempty nullary right
+ * with EINVAL, as it refuses a nonempty nullary left: the right has no
+ * column 0 for its key to read.  The check follows the right operand
+ * selection and the right filter, and precedes the materialization cache
+ * and the bounded-mode decision.  @diff selects the differential
+ * operator. */
 typedef enum {
     NR_PLAIN,         /* registered nonempty nullary right */
     NR_DELTA,         /* FORCE_DELTA $d$right, no filter */
@@ -4815,7 +4816,23 @@ run_nullary_right_case(const nullary_right_case_t *t, bool diff)
             goto cleanup;
         }
     }
-    if (left->ncols == 2) {
+    if (left->ncols == 2 && diff) {
+        /* The differential operator itself runs a valid keyed join. */
+        eval_entry_t out;
+        eval_stack_init(&stack);
+        rc = eval_stack_push(&stack, left, false);
+        rc = rc == 0 ? col_op_join_diff(&op, &stack, sess) : rc;
+        if (rc == 0 && stack.top == 1) {
+            out = eval_stack_pop(&stack);
+            ok = ok && out.rel->nrows == left_rows;
+            free(out.seg_boundaries);
+            if (out.owned)
+                col_rel_destroy(out.rel);
+        } else {
+            ok = false;
+        }
+        (void)eval_stack_drain(&stack);
+    } else if (left->ncols == 2) {
         result = run_oracle(sess, left, &op);
         ok = ok && result && result->nrows == left_rows;
         col_rel_destroy(result);
@@ -4904,6 +4921,16 @@ test_nonempty_nullary_right_cleanup(void)
         PASS();
     else
         FAIL("nullary right refusal, cleanup or reuse mismatch");
+}
+
+static void
+test_diff_nonempty_nullary_right_cleanup(void)
+{
+    TEST("diff nullary keyed right refusal preserves ownership and reuse");
+    if (run_nullary_right_matrix(true))
+        PASS();
+    else
+        FAIL("diff nullary right refusal, cleanup or reuse mismatch");
 }
 
 static void
@@ -5520,6 +5547,7 @@ main(void)
     test_operator_empty_left_nothing_to_bound();
     test_nonempty_nullary_left_cleanup();
     test_nonempty_nullary_right_cleanup();
+    test_diff_nonempty_nullary_right_cleanup();
     test_diff_nonempty_nullary_left_cleanup();
     test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
