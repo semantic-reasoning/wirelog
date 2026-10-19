@@ -3407,7 +3407,17 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         col_join_batch_record_fallback(sess, batch_elig);
     }
-    if (batch_elig == COL_JOIN_BATCH_ELIGIBLE) {
+    /* An empty input on either side has nothing to bound: the one-shot
+    * join below yields zero rows in one pass, so do not dispatch the
+    * producer.  Otherwise two empty zero-column inputs give a zero-width
+    * output, which the create of the producer reports as one row not
+    * fitting the batch budget: recorded as row-too-large, or refused
+    * under strict mode (#2202).  Decided after the strict and fallback
+    * handling above, as in the ordinary join: it is neither a fallback
+    * nor a strict-mode failure, and the eligibility verdict stands. */
+    bool bounded = batch_elig == COL_JOIN_BATCH_ELIGIBLE
+        && left->nrows > 0 && right->nrows > 0;
+    if (bounded) {
         wl_columnar_continuation_t *cont = NULL;
         col_rel_t *bounded_out = NULL;
         int bounded_rc = wl_columnar_join_new_output(sess, left, right,

@@ -1137,8 +1137,9 @@ test_diff_operator_high_fanout_independent_oracle(void)
     fixture_fini(&f);
 }
 
-/* An empty left input and an owned left input on the bounded differential
- * path: exact results, no fallback, and (under ASan) the owned input is
+/* An empty left input and an owned left input with the differential knob
+ * set: exact results and no fallback.  The empty left is joined one-shot
+ * (#2202); the owned left runs on the bounded path and (under ASan) is
  * released exactly once. */
 static void
 test_diff_operator_empty_and_owned_left(void)
@@ -1150,7 +1151,7 @@ test_diff_operator_empty_and_owned_left(void)
     col_rel_t *out = NULL;
     bool ok = true;
 
-    TEST("bounded differential join over empty and owned left inputs");
+    TEST("differential join knob over empty and owned left inputs");
     if (!fixture_init(&f, 1u << 24, keys, 3, 3, 4)) {
         FAIL("fixture");
         fixture_fini(&f);
@@ -4488,6 +4489,113 @@ cleanup:
     }
 }
 
+/* Run one keyed differential JOIN of borrowed @left against the session's
+ * "right".  Returns its rc and the result's name, width and row count. */
+static int
+empty_input_diff_join(wl_col_session_t *sess, col_rel_t *left,
+    uint32_t batch_bytes, bool strict, char *name, size_t name_size,
+    uint32_t *ncols, uint32_t *nrows)
+{
+    const char *keys[1] = { "k" };
+    wl_plan_op_t op;
+    eval_stack_t stack;
+    eval_entry_t result;
+    int rc;
+
+    init_join_op(&op, keys, keys);
+    sess->join_batch_bytes = batch_bytes;
+    sess->join_batch_strict = strict;
+    eval_stack_init(&stack);
+    eval_stack_push(&stack, left, false);
+    rc = col_op_join_diff(&op, &stack, sess);
+    sess->join_batch_bytes = 0;
+    sess->join_batch_strict = false;
+    if (rc != 0 || stack.top != 1) {
+        (void)eval_stack_drain(&stack);
+        return rc != 0 ? rc : EIO;
+    }
+    result = eval_stack_pop(&stack);
+    snprintf(name, name_size, "%s",
+        result.rel && result.rel->name ? result.rel->name : "");
+    *ncols = result.rel ? result.rel->ncols : 0;
+    *nrows = result.rel ? result.rel->nrows : UINT32_MAX;
+    free(result.seg_boundaries);
+    if (result.owned)
+        col_rel_destroy(result.rel);
+    return 0;
+}
+
+/* #2202: an empty input on either side of an eligible differential JOIN
+ * has nothing to bound, so the operator joins it one-shot instead of
+ * dispatching the producer.  Before, both inputs zero-column and empty
+ * gave a zero-width output that the producer reported as row-too-large:
+ * recorded at 224 and refused with ENOTSUP under strict mode. */
+static void
+test_diff_operator_empty_input_nothing_to_bound(void)
+{
+    const char *names[] = { "k", "r" };
+    const int64_t row[] = { 7, 1 };
+    bool ok = true;
+
+    TEST("empty differential join input yields zero rows one-shot");
+    /* Shapes: 0 empty zero-column left, 1 empty two-column left, both
+     * against a nonempty two-column right; 2 nonempty left against an
+     * empty two-column right; 3 nonempty left against an empty
+     * zero-column right; 4 empty zero-column left and right. */
+    for (unsigned shape = 0; shape < 5; shape++) {
+        for (int run = 0; run < 3; run++) {
+            uint32_t bytes = run == 0 ? 0u : 7u * 32u;
+            bool strict = run == 2;
+            wl_col_session_t *sess = make_session(1u << 24);
+            uint32_t rcols = shape == 3 || shape == 4 ? 0u : 2u;
+            col_rel_t *right = make_rel("right", rcols, rcols ? names : NULL);
+            col_rel_t *left = shape == 0 || shape == 4
+                ? col_rel_new_auto("left", 0) : make_left(NULL, 0);
+            const col_diff_arr_entry_t *entry = NULL;
+            char name[64] = "";
+            uint32_t ncols = 0;
+            uint32_t nrows = 0;
+            int rc = EINVAL;
+
+            if (!sess || !right || !left
+                || (shape < 2 && col_rel_append_row(right, row) != 0)
+                || ((shape == 2 || shape == 3)
+                && col_rel_append_row(left, row) != 0)
+                || register_relation(sess, &right, "right") != 0) {
+                ok = false;
+            } else {
+                /* Left width plus right width, per shape. */
+                static const uint32_t widths[5] = { 2, 4, 4, 2, 0 };
+                uint32_t want = widths[shape];
+                rc = empty_input_diff_join(sess, left, bytes, strict, name,
+                        sizeof(name), &ncols, &nrows);
+                for (uint32_t i = 0; i < sess->diff_arr_count; i++)
+                    if (strcmp(sess->diff_arr_entries[i].rel_name, "right")
+                        == 0)
+                        entry = &sess->diff_arr_entries[i];
+                if (rc != 0 || nrows != 0u || ncols != want
+                    || strcmp(name, "$join_diff") != 0
+                    || sess->join_batch_fallback_count != 0u
+                    || !entry || entry->pin_count != 0u) {
+                    printf("(shape %u run %d: rc=%d name=%s ncols=%u/%u "
+                        "nrows=%u fallbacks=%u entry=%d pins=%u) ", shape,
+                        run, rc, name, ncols, want, nrows,
+                        sess->join_batch_fallback_count, entry != NULL,
+                        entry ? entry->pin_count : 0u);
+                    ok = false;
+                }
+            }
+            col_rel_destroy(left);
+            col_rel_destroy(right);
+            destroy_session(sess);
+        }
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("empty differential input dispatched or refused");
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
@@ -5101,6 +5209,7 @@ main(void)
     test_operator_empty_left_nothing_to_bound();
     test_nonempty_nullary_left_cleanup();
     test_diff_nonempty_nullary_left_cleanup();
+    test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
