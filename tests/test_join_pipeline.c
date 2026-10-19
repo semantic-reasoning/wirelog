@@ -1584,13 +1584,17 @@ sel_expect_decline(wl_col_session_t *sess, col_rel_t *left,
     (void)eval_stack_drain(&stack);
 }
 
-/* A session whose "right" relation has no columns and no rows. */
+/* A session whose "right" relation has no columns, and one row when
+ * @with_row is set. */
 static wl_col_session_t *
-sel_zero_column_session(void)
+sel_zero_column_session(bool with_row)
 {
+    static const int64_t no_columns[1] = { 0 };
     wl_col_session_t *sess = pipeline_session();
     col_rel_t *right = col_rel_new_auto("right", 0);
-    if (!sess || !right || session_add_rel(sess, right) != 0) {
+    if (!sess || !right
+        || (with_row && col_rel_append_row(right, no_columns) != 0)
+        || session_add_rel(sess, right) != 0) {
         col_rel_destroy(right);
         pipeline_session_destroy(sess);
         return NULL;
@@ -1608,7 +1612,7 @@ test_pipeline_zero_column_right_declines(void)
     for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); b++) {
         sel_plan_t p;
         sel_run_t run;
-        wl_col_session_t *sess = sel_zero_column_session();
+        wl_col_session_t *sess = sel_zero_column_session(false);
         CHECK(sess != NULL, "zero-column right fixture");
         if (!sess)
             continue;
@@ -1622,8 +1626,8 @@ test_pipeline_zero_column_right_declines(void)
         pipeline_session_destroy(sess);
     }
 
-    {
-        wl_col_session_t *sess = sel_zero_column_session();
+    for (int with_row = 0; with_row < 2; with_row++) {
+        wl_col_session_t *sess = sel_zero_column_session(with_row != 0);
         col_rel_t *left = pipeline_relation("left", left_names, 2,
                 left_rows, 2);
         CHECK(sess && left, "zero-column right decline fixture");
@@ -1633,6 +1637,30 @@ test_pipeline_zero_column_right_declines(void)
         else
             col_rel_destroy(left);
         pipeline_session_destroy(sess);
+    }
+
+    /* A zero-column right that holds a row has no key column: the ordinary
+     * JOIN the pipeline declines to refuses it with EINVAL and records
+     * nothing, with or without strict mode (#2209). */
+    for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); b++) {
+        for (int strict = 0; strict < 2; strict++) {
+            sel_plan_t p;
+            sel_run_t run;
+            wl_col_session_t *sess = sel_zero_column_session(true);
+            CHECK(sess != NULL, "nonempty zero-column right fixture");
+            if (!sess)
+                continue;
+            sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+            sess->join_batch_strict = strict != 0;
+            run = sel_eval(sess, &p.plan, budgets[b], NULL);
+            if (run.rc != EINVAL || sess->join_batch_fallback_count != 0)
+                fprintf(stderr, "  budget %u strict %d: rc=%d fb=%u\n",
+                    budgets[b], strict, run.rc,
+                    sess->join_batch_fallback_count);
+            CHECK(run.rc == EINVAL && sess->join_batch_fallback_count == 0,
+                "a nonempty zero-column right side is refused");
+            pipeline_session_destroy(sess);
+        }
     }
 }
 
@@ -2060,7 +2088,7 @@ test_nothing_to_bound_follows_the_ordinary_join(void)
             wl_col_session_t *sess = c == A1_NB_FORCE_EMPTY
                 ? sel_case_session(SEL_FORCE_EMPTY)
                 : c == A1_NB_MISSING_RIGHT ? pipeline_session()
-                : sel_zero_column_session();
+                : sel_zero_column_session(false);
 
             CHECK(sess != NULL, "nothing-to-bound fixture");
             if (!sess)

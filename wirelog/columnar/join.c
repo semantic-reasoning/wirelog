@@ -284,6 +284,15 @@ col_op_resolve_key(const col_rel_t *rel, const char *name, const char *side,
     return 0;
 }
 
+/* A keyed operator reads a key column from each row of its inputs.  A
+ * zero-column input that holds rows has no column 0 to read: its keys
+ * resolve to column 0 by fallback, an index outside the relation. */
+static bool
+col_join_keyed_nullary(const wl_plan_op_t *op, const col_rel_t *rel)
+{
+    return op->key_count > 0 && rel->ncols == 0 && rel->nrows > 0;
+}
+
 /* Return a valid hash bucket count, rejecting representational overflow. */
 static int
 col_join_bucket_count(uint32_t nrows, uint32_t *out)
@@ -1371,11 +1380,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
     }
 
-    /* A nonempty nullary left has no key column to probe. Empty left inputs
-     * and nullary cross joins remain valid; match the bounded producer's
-     * EINVAL before a cached result or one-shot probe can bypass validation. */
-    if (op->key_count > 0 && left_e.rel->ncols == 0
-        && left_e.rel->nrows > 0) {
+    /* A nonempty nullary input on either side has no key column to probe.
+     * An empty nullary input is not refused on its own account, and nullary
+     * cross joins remain valid.  The check follows the right operand
+     * selection and the right filter, so a missing, forced-empty or
+     * filtered-out right keeps its result, and precedes the materialization
+     * cache and the bounded-mode decision, so a cached result cannot bypass
+     * it and nothing is recorded (#2170, #2209). */
+    if (col_join_keyed_nullary(op, left_e.rel)
+        || col_join_keyed_nullary(op, right)) {
         if (right_filtered)
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
