@@ -3690,3 +3690,78 @@ stops before checkpoint 128 after 127 pair callbacks, while the exact
 allowance reaches checkpoint 128 and deterministic cancellation. Output-cell
 and B2 append charges vary between pairs, so this is not a universal product
 tariff or a substitute for the keyed source-derived boundary above.
+
+### Immutable spill segment foundation (#1372, partial)
+
+`columnar/spill.h` provides an **internal, explicitly opened** store. Opening
+requires an existing caller-controlled directory, the shared governor, a disk
+quota, and a maximum encoded row size. No environment variable or public
+session option enables spill yet, and existing evaluators do not use this
+store automatically.
+
+A private writer streams one row at a time into an exclusively created file.
+Only a complete write publishes a segment. The process-local versioned format
+encodes fields in little-endian order: scalar schema, row count, lane bits,
+iteration/stratum/worker timestamps, and signed multiplicity. There is no
+restart/import API or durability guarantee. Scalar INT32/INT64/UINT32/UINT64,
+FLOAT and BOOL schemas have identical logical and physical columns; the caller
+supplies valid self-contained lanes. STRING, compound schemas, intern IDs and
+pointers are unsupported. An integer type is not permission to encode a borrowed
+reference. Reference-bearing payloads require a later session-lifetime design.
+
+Readers acquire separate handles and one-row buffers. Stable segment-relative
+ordinals support sequential range iteration and individual row lookup without
+mapping or loading the whole file. Each read verifies file length and the
+versioned schema/header, then returns one complete row or an explicit failure.
+Failed reads expose no partial row. This detects truncation and invalid metadata;
+it is not a checksum or authenticated integrity format for arbitrary bit damage.
+The returned row is borrowed until the same reader's next read or release.
+
+All store/segment/reader lifecycle operations require external serialization.
+Independent acquired readers may read concurrently; one reader cannot have
+concurrent reads or be released during its read. Segment release returns BUSY
+without changing ownership while any reader exists, and store close similarly
+refuses while segments exist. The caller must release readers, then segments,
+then the store; failed close/release is not implicit cancellation. Cancellation
+callbacks must not reenter the store/segment. Each I/O chunk checks cancellation,
+short transfers make finite progress, and interrupted I/O retries have a fixed
+limit. OS I/O can still block; this primitive does not promise a syscall deadline.
+
+`wl_columnar_spill_floor` reports managed allocation sizes. The construction
+floor is `store_bytes + segment_bytes + writer_bytes`; concurrent reading needs
+`store_bytes + segment_bytes + N * reader_bytes`. Each writer/reader has one
+encoded row of scratch; the writer also owns a temporary pathname. Every owned
+allocation (descriptor, schema, path and scratch) is admitted before allocation,
+and refunded after freeing. The governor reference remains alive through store
+close. Caller input/output, the governor object, allocator overhead, file
+handles and OS page cache are additional resident costs; this is not an RSS
+ceiling or proof that an existing input relation was reclaimed.
+
+Quota includes headers, schema and row records and is reserved before writing.
+Failure or cancellation refunds the quota and destroys the unpublished handle.
+Free-space checks run before and during writes but are only observations: actual
+short writes, ENOSPC, read errors and zero-progress I/O remain authoritative.
+Managed-memory denial, allocation failure, quota, physical capacity, I/O,
+cancellation, invalid arguments, unsupported types and arithmetic overflow have
+distinct internal status values.
+
+POSIX files use exclusive `mkstemp` creation and immediate unlink; the descriptor
+owns the remaining lifetime. Windows uses exclusive creation and
+`FILE_FLAG_DELETE_ON_CLOSE`. Cleanup targets only the exact owned artifact and
+never scans for guessed process names. Platform-specific execution evidence is
+required before claiming platform qualification.
+
+`spill_segments` checks exact numeric/boolean rows and signed provenance,
+independent readers, ordinal boundaries, a roughly 480 KB segment under a
+managed allocation allowance below 4 KB, explicit floor failure, short I/O,
+interruption, zero progress, partial-write failure, cancellation, truncation,
+header corruption, and allocation/refcount cleanup. This is storage-primitive
+coverage, not mixed resident/spilled evaluation.
+
+Remaining #1372 work: session ownership and opt-in API; intern/compound lifetime
+pins; continuation/batch payload integration for #1373; direct-column and
+arrangement/index consumer audits; supported relation/trace transitions; actual
+mixed resident/cold indexed execution under pressure. Retained index chains,
+session state and unavoidable scratch must be included in that execution's
+resident floor. This foundation does not close #1372 or qualify bounded DOOP
+(#1385), and it does not make unsupported materializing paths bounded.

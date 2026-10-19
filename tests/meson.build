@@ -108,6 +108,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/cache.c',
     '../wirelog/columnar/compound_side.c',
     '../wirelog/columnar/continuation.c',
+    '../wirelog/columnar/spill.c',
     '../wirelog/columnar/delta_pool.c',
     '../wirelog/columnar/delta_pool_admission.c',
     '../wirelog/columnar/diff.c',
@@ -6507,3 +6508,14 @@ test_evaluation_serial_exe = executable(
 )
 test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+
+# #1372 primitive spill I/O faults stay out of the production library.
+test_spill_segments_exe = executable(
+  'test_spill_segments',
+  files('test_spill_segments.c', '../wirelog/columnar/spill.c',
+        '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c') + thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+  c_args: ['-DWL_TEST_SPILL=1'],
+)
+test('spill_segments', test_spill_segments_exe, suite: ['unit', 'tsan'], timeout: 60)
