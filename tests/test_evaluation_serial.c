@@ -1223,6 +1223,12 @@ entry_init_inputs(entry_fixture_t *f, const char *source,
         &options, &base));
     f->governor = governor;
     f->session = (wl_col_session_t *)base;
+    /* The session reads WIRELOG_JOIN_BATCH_BYTES and _STRICT at creation,
+     * and the framed bootstrap refuses the knob (e3580a61); these fixtures
+     * exercise the entry itself.  test_entry_refuses_join_batch_knob pins
+     * the refusal. */
+    f->session->join_batch_bytes = 0;
+    f->session->join_batch_strict = false;
     CHECK(!session_find_rel(f->session, "output"));
     for (uint32_t i = 0; i < input_count; ++i) {
         CHECK(inputs[i].name && (inputs[i].rows || !inputs[i].count));
@@ -1622,6 +1628,49 @@ entry_until(entry_fixture_t *f, wl_columnar_eval_serial_framed_phase_t phase)
             && f->reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL);
         CHECK(!entry_turn(f, false, 0));
     }
+}
+
+/* The controlled framed bootstrap is not a bounded JOIN: with
+ * join_batch_bytes set it refuses with ENOTSUP before taking a frame,
+ * admitting a byte or touching the output, and leaves the operation's
+ * attempt active.  The refusal still leaves BOOTSTRAP_RECEIPT in
+ * reply.kind, so a host must act on the protocol rc.  Strict mode alone
+ * does not refuse: the guard reads the byte knob. */
+static void
+test_entry_refuses_join_batch_knob(void)
+{
+    entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_memory_governor_t *g = wl_columnar_memory_governor_ref_get(
+        f.session->memory_governor);
+    uint64_t baseline = wl_columnar_memory_reserved(g);
+    f.session->join_batch_bytes = 224;
+    /* One ADVANCE built as entry_turn builds it; entry_turn itself would
+     * record the receipt for a later turn to consume. */
+    grant_t *grant = entry_grant(&f, 0);
+    wl_columnar_eval_serial_framed_host_request_t request = f.previous;
+    request.funding = grant->control; request.funding_id = grant->id;
+    request.operation = f.operation; request.operation_id = f.id;
+    request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
+    request.reply = &f.reply;
+    CHECK(entry_host(&f, &request, grant) == ENOTSUP);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant->control, &report)
+        && report.attempt_id == grant->id && !report.cleanup_status
+        && !wl_evaluation_control_active_attempt_id(grant->control));
+    CHECK(!entry_context(&f) && !f.session->cleanup_active
+        && !f.session->cleanup_pending && !f.session->cleanup_reserved_bytes
+        && !session_find_rel(f.session, "output")
+        && wl_columnar_memory_reserved(g) == baseline
+        && wl_evaluation_control_active_attempt_id(f.operation) == f.id
+        && f.session->join_batch_bytes == 224);
+    f.session->join_batch_bytes = 0;
+    f.session->join_batch_strict = true;
+    CHECK(!entry_turn(&f, false, 0));
+    CHECK(f.reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
+        && entry_context(&f));
+    f.session->join_batch_strict = false;
+    entry_complete(&f);
+    entry_destroy(&f);
 }
 
 static void
@@ -2544,6 +2593,7 @@ main(void)
     test_entry_generated_right_filter_collisions_and_stop();
     test_entry_generated_right_filter_product_work_boundary();
     test_entry_receipts(); test_entry_bootstrap_failures();
+    test_entry_refuses_join_batch_knob();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_unsupported_generated();
 
