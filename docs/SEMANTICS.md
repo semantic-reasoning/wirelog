@@ -963,6 +963,23 @@ exact allocation thresholds may differ. Invalid manually corrupted FLOAT
 payloads are outside that equivalence: typed copying still rejects them.
 The component remains private and opt-in. Both source and prebound numeric
 plans admit these opcodes and invoke their original owned entry directly.
+
+### Controlled ordinary JOIN right predicates
+
+An ordinary controlled JOIN evaluates a supported numeric `right_filter_expr`
+over each present right row before key construction and output work. A failed
+numeric expression rejects that row, matching FILTER semantics. Missing and
+forced-empty right inputs skip the predicate. SEMIJOIN and ANTIJOIN retain
+their separate contract and reject right predicates. Unsupported string or
+extension expressions return `ENOTSUP` without invoking raw callbacks.
+
+Selection retains original physical right-row indices, so keyed hash chains,
+cross joins, duplicates, projection, and output order use the same source rows
+as raw JOIN. For each passing row, all typed FLOAT lanes must be finite,
+including lanes unused by the predicate, keys, or projection; otherwise JOIN
+returns `EINVAL` before evaluating a later row. Rejected rows do not undergo
+that payload check. Predicate truth is computed from the original stored bits;
+the existing output path canonicalizes signed zero as before.
 Complete generated SIP/negation bodies and composed MAP/probe chains retain
 terminal CONSOLIDATE semantics, including sorted distinct FLOAT output.
 Public/default/session scheduling remains separate from this interface.
