@@ -1211,6 +1211,13 @@ operation work. These tests establish this initial generated route; they do not
 extend support to SEMI/ANTI right predicates, whole-session STEP/SNAPSHOT,
 recursive or differential evaluation, or public/default activation.
 
+For the generated 64-by-257 product, the test also records an empirical
+original-work allowance by cancelling at the 128th pair checkpoint. One unit
+less reaches only 127 pair callbacks and returns work exhaustion; the measured
+allowance reaches callback 128 and returns the deliberately requested
+cancellation. Output cells and B2 append work contribute between pair
+checkpoints, so this fixture measurement is not a general source tariff.
+
 Whole serial/TDD/multiworker strata and backend STEP/SNAPSHOT now reject attached
 controls before their first mutation, queue submission, original begin or finish.
 The public gates remain. The former direct-vtable controlled tests described
