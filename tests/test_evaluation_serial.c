@@ -2536,6 +2536,188 @@ test_entry_unsupported_generated(void)
     entry_destroy(&f);
 }
 
+static const char entry_filter_large[] =
+    ".decl input(x:int64)\n"
+    ".decl output(y:int64)\n"
+    "output(x+1) :- input(x), x>1.\n";
+
+typedef struct {
+    wl_evaluation_control_t *operation;
+    uint64_t target_row, phase13_hits;
+    bool reached_target;
+} entry_filter_probe_t;
+
+static entry_filter_probe_t *entry_filter_probe;
+
+static void
+entry_filter_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    entry_filter_probe_t *probe = entry_filter_probe;
+    if (!probe || control != probe->operation || phase != 13) return;
+    ++probe->phase13_hits;
+    if (progress == probe->target_row) probe->reached_target = true;
+}
+
+static const wl_plan_op_t *
+entry_assert_generated_filter(entry_fixture_t *f)
+{
+    const wl_plan_op_t *found = NULL;
+    for (uint32_t i = 0; i < f->relation->op_count; ++i) {
+        const wl_plan_op_t *op = &f->relation->ops[i];
+        if (op->op != WL_PLAN_OP_FILTER) continue;
+        CHECK(!found);
+        found = op;
+    }
+    CHECK(found && found->filter_expr.data && found->filter_expr.size);
+    return found;
+}
+
+typedef struct {
+    int result;
+    uint64_t consumed, phase13_hits;
+    bool reached_target;
+} entry_filter_trial_t;
+
+static entry_filter_trial_t
+entry_filter_run_trial(const int64_t *rows, uint32_t count, uint64_t limit,
+    uint64_t target_row)
+{
+    entry_fixture_t f;
+    entry_init(&f, entry_filter_large, rows, count, 1, limit);
+    (void)entry_assert_generated_filter(&f);
+    entry_filter_probe_t probe = {
+        .operation = f.operation, .target_row = target_row
+    };
+    entry_filter_probe = &probe;
+    wl_columnar_filter_test_attempt_checkpoint = entry_filter_checkpoint;
+    entry_complete(&f);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    entry_filter_probe = NULL;
+    CHECK(!f.reply.execution_result || f.reply.execution_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.result == f.reply.execution_result
+        && !report.cleanup_status);
+    entry_filter_trial_t trial = {
+        .result = f.reply.execution_result,
+        .consumed = report.consumed,
+        .phase13_hits = probe.phase13_hits,
+        .reached_target = probe.reached_target
+    };
+    entry_destroy(&f);
+    return trial;
+}
+
+static void
+entry_retry_large_filter(entry_fixture_t *f, const int64_t *rows,
+    uint32_t count)
+{
+    CHECK(!wl_evaluation_control_reset(f->operation));
+    CHECK(!wl_evaluation_control_configure(f->operation, 0));
+    CHECK(!wl_evaluation_control_begin(f->operation,
+        f->session->base.operation_admission));
+    f->id = wl_evaluation_control_active_attempt_id(f->operation);
+    CHECK(f->id);
+    f->previous.previous_valid = false;
+    memset(&f->reply, 0, sizeof(f->reply));
+    f->reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_complete(f);
+    CHECK(!f->reply.execution_result && f->reply.committed);
+    entry_compare(f, entry_filter_large, rows, count, 1);
+    const col_rel_t *out = session_rel_hash_lookup(f->session, "output");
+    CHECK(out && out->nrows == count - 1 && out->ncols == 1);
+    for (uint32_t i = 0; i < out->nrows; ++i)
+        CHECK(out->columns[0][i] == (int64_t)i + 3);
+}
+
+static void
+test_entry_generated_filter_work_boundary(void)
+{
+    const uint32_t row_count = 4096;
+    const uint64_t target_row = 1024;
+    int64_t *rows = malloc((size_t)row_count * sizeof(*rows));
+    CHECK(rows);
+    for (uint32_t i = 0; i < row_count; ++i) rows[i] = (int64_t)i + 1;
+
+    /* Search fresh operations for the first allowance that reaches the
+     * known-true target row after predicate evaluation. This observes the
+     * actual configured limit without turning cleanup-inclusive report totals
+     * into a phase-local tariff. */
+    uint64_t high = 256;
+    entry_filter_trial_t trial = entry_filter_run_trial(rows, row_count, high,
+            target_row);
+    while (!trial.reached_target) {
+        CHECK(high <= UINT64_MAX / 2);
+        high *= 2;
+        trial = entry_filter_run_trial(rows, row_count, high, target_row);
+    }
+    uint64_t low = 1;
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        trial = entry_filter_run_trial(rows, row_count, mid, target_row);
+        if (trial.reached_target) high = mid;
+        else low = mid + 1;
+    }
+    const uint64_t limit = low;
+
+    entry_filter_trial_t short_trial = entry_filter_run_trial(rows,
+            row_count, limit - 1, target_row);
+    CHECK(short_trial.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !short_trial.reached_target);
+    entry_filter_trial_t exact_trial = entry_filter_run_trial(rows,
+            row_count, limit, target_row);
+    CHECK(exact_trial.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && exact_trial.reached_target
+        && exact_trial.phase13_hits == target_row + 1);
+    entry_filter_trial_t repeated_trial = entry_filter_run_trial(rows,
+            row_count, limit, target_row);
+    CHECK(repeated_trial.result == exact_trial.result
+        && repeated_trial.consumed == exact_trial.consumed
+        && repeated_trial.phase13_hits == exact_trial.phase13_hits
+        && repeated_trial.reached_target);
+
+    entry_fixture_t retry;
+    entry_init(&retry, entry_filter_large, rows, row_count, 1, limit);
+    (void)entry_assert_generated_filter(&retry);
+    col_rel_t **old_rels = retry.session->rels;
+    uint32_t old_nrels = retry.session->nrels;
+    col_rel_t *old_input = session_find_rel(retry.session, "input");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(retry.governor));
+    entry_filter_probe_t probe = {
+        .operation = retry.operation, .target_row = target_row
+    };
+    entry_filter_probe = &probe;
+    wl_columnar_filter_test_attempt_checkpoint = entry_filter_checkpoint;
+    entry_complete(&retry);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    entry_filter_probe = NULL;
+    CHECK(retry.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && probe.reached_target && probe.phase13_hits == target_row + 1
+        && !retry.reply.committed
+        && !session_rel_hash_lookup(retry.session, "output")
+        && retry.session->rels == old_rels && retry.session->nrels == old_nrels
+        && session_find_rel(retry.session, "input") == old_input
+        && old_input->nrows == row_count
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(retry.governor)) == reserved
+        && !retry.session->cleanup_active && !retry.session->cleanup_pending
+        && !retry.session->cleanup_reserved_bytes);
+    for (uint32_t i = 0; i < row_count; ++i)
+        CHECK(old_input->columns[0][i] == rows[i]);
+    entry_finish_original(&retry);
+    wl_evaluation_control_report_t retry_report;
+    CHECK(!wl_evaluation_control_report(retry.operation, &retry_report)
+        && retry_report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && retry_report.consumed == exact_trial.consumed);
+    entry_retry_large_filter(&retry, rows, row_count);
+    entry_destroy(&retry);
+    free(rows);
+}
+
 int
 main(void)
 {
@@ -2546,6 +2728,7 @@ main(void)
     test_entry_receipts(); test_entry_bootstrap_failures();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_unsupported_generated();
+    test_entry_generated_filter_work_boundary();
 
     test_shapes(); test_generated_union(); test_refusal_and_identity();
     test_failures(); test_retained_and_consume_refusal();
