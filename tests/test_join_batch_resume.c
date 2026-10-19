@@ -4319,6 +4319,175 @@ cleanup:
     }
 }
 
+/* #2202: the differential JOIN refuses a keyed probe of a nonempty nullary
+ * left with EINVAL, as the ordinary JOIN does, before its materialization
+ * cache, its bounded-mode decision and its differential arrangement. */
+static void
+test_diff_nonempty_nullary_left_cleanup(void)
+{
+    const char *names[] = { "k", "r" };
+    const char *keys[] = { "k" };
+    const int64_t row[] = { 0, 1 };
+    static uint8_t keep[] = { WL_PLAN_EXPR_BOOL, 1 };
+    static uint8_t reject[] = { WL_PLAN_EXPR_BOOL, 0 };
+
+    /* Cases 0-11: both right widths, both ownership modes, knob off, 224
+     * and 224 strict.  Cases 12-14: the owned filtered fallback in the
+     * three modes (a delta-right fallback is recorded at 224 and refused
+     * under strict, so a refusal after that decision is caught), the
+     * strict case with an empty effective right.  Cases 15-16: an existing
+     * empty right.  Cases 17-18: missing and forced-empty right operands,
+     * which return an empty result before the refusal.  Cases 19-21: a
+     * seeded materialization cache in the three modes.  Case 22: the left
+     * pushed as a delta.  Cases 23-24: an empty nullary left, knob off and
+     * 224, still joins to nothing. */
+    for (unsigned c = 0; c < 25; c++) {
+        bool filtered = c >= 12 && c < 15;
+        bool empty_right = c == 14;
+        bool empty_left = c >= 23;
+        bool early_empty = c == 17 || c == 18 || empty_left;
+        bool materialized = c >= 19 && c < 22;
+        bool as_delta = c == 22;
+        bool owned = c >= 12 ? c == 13 : (c % 2) != 0;
+        unsigned mode = c >= 23 ? c - 23 : c >= 19 ? (c == 22 ? 1 : c - 19)
+            : c >= 15 ? 0 : c >= 12 ? c - 12 : (c / 2) % 3;
+        unsigned width = c >= 12 ? (c == 15 ? 1 : 2) : 1 + c / 6;
+        wl_col_session_t *sess = make_session(1u << 24);
+        col_rel_t *right = make_rel("right", width, names);
+        col_rel_t *delta = NULL;
+        col_rel_t *left = col_rel_new_auto("left", 0);
+        col_rel_t *valid = NULL;
+        col_rel_t *seed = NULL;
+        col_rel_t *result = NULL;
+        eval_stack_t stack;
+        eval_entry_t out;
+        wl_plan_op_t op;
+        bool ok = false;
+        int rc;
+
+        TEST("diff nullary keyed refusal preserves ownership and reuse");
+        eval_stack_init(&stack);
+        if (!sess || !right || !left
+            || col_rel_append_row(right, row) != 0
+            || (!empty_left && col_rel_append_row(left, row) != 0)
+            || register_relation(sess, &right, "right") != 0)
+            goto cleanup;
+        init_join_op(&op, keys, keys);
+        if (filtered) {
+            delta = make_right_named("$d$right", 1, 1);
+            if (!delta || register_relation(sess, &delta, "$d$right") != 0)
+                goto cleanup;
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            op.right_filter_expr = (wl_plan_expr_buffer_t){
+                empty_right ? reject : keep, sizeof(keep)
+            };
+        }
+        if (c == 15 || c == 16) {
+            right = make_rel("right", width, names);
+            if (!right || register_relation(sess, &right, "right") != 0)
+                goto cleanup;
+        }
+        if (c == 17)
+            op.right_relation = "missing";
+        if (c == 18) {
+            op.delta_mode = WL_DELTA_FORCE_DELTA;
+            sess->delta_seeded = true;
+        }
+        if (materialized) {
+            /* A cached result for this exact left and right must not
+             * bypass the refusal. */
+            seed = make_rel("seed", width, names);
+            if (!seed || col_rel_append_row(seed, row) != 0
+                || col_mat_cache_insert(&sess->mat_cache, left,
+                session_find_rel(sess, "right"), seed) != 0)
+                goto cleanup;
+            seed = NULL; /* The cache owns the result. */
+            op.materialized = true;
+        }
+        uint64_t reserved = reserved_of(sess);
+        uint32_t diff_arrs = sess->diff_arr_count;
+        uint32_t fallbacks = sess->join_batch_fallback_count;
+        sess->join_batch_bytes = mode == 0 ? 0 : 224;
+        sess->join_batch_strict = mode == 2;
+        if ((as_delta ? eval_stack_push_delta(&stack, left, owned, true)
+            : eval_stack_push(&stack, left, owned)) != 0)
+            goto cleanup;
+        if (owned)
+            left = NULL; /* The stack/operator owns the original. */
+        rc = col_op_join_diff(&op, &stack, sess);
+        if (early_empty) {
+            ok = rc == 0 && stack.top == 1
+                && stack.items[0].rel->nrows == 0
+                && (!empty_left || stack.items[0].rel->ncols == width);
+            (void)eval_stack_drain(&stack);
+        } else {
+            ok = rc == EINVAL && stack.top == 0
+                && sess->diff_arr_count == diff_arrs;
+        }
+        /* An empty left that is joined may build the right's arrangement
+         * and keep its reservation. */
+        ok = ok && (empty_left || reserved_of(sess) == reserved)
+            && sess->join_batch_fallback_count == fallbacks;
+        if (left)
+            ok = ok && left->ncols == 0
+                && left->nrows == (empty_left ? 0u : 1u)
+                && left->columns == NULL;
+
+        /* The same session still handles a valid keyed differential
+         * join. */
+        init_join_op(&op, keys, keys);
+        sess->delta_seeded = false;
+        sess->join_batch_bytes = 0;
+        sess->join_batch_strict = false;
+        valid = make_left(row, 1);
+        if (!valid) {
+            ok = false;
+            goto cleanup;
+        }
+        uint32_t want_rows = c == 15 || c == 16 ? 0 : 1;
+        eval_stack_init(&stack);
+        rc = eval_stack_push(&stack, valid, false);
+        rc = rc == 0 ? col_op_join_diff(&op, &stack, sess) : rc;
+        if (rc == 0 && stack.top == 1) {
+            out = eval_stack_pop(&stack);
+            ok = ok && out.rel->nrows == want_rows;
+            free(out.seg_boundaries);
+            if (out.owned)
+                col_rel_destroy(out.rel);
+        } else {
+            ok = false;
+        }
+        (void)eval_stack_drain(&stack);
+        /* A nonempty nullary relation is valid for a cross join. */
+        if (!left || empty_left) {
+            col_rel_destroy(left);
+            left = col_rel_new_auto("left", 0);
+            if (!left || col_rel_append_row(left, row) != 0) {
+                ok = false;
+                goto cleanup;
+            }
+        }
+        op.op = WL_PLAN_OP_JOIN;
+        op.key_count = 0;
+        result = run_oracle(sess, left, &op);
+        ok = ok && result && result->nrows == want_rows
+            && result->ncols == width;
+cleanup:
+        (void)eval_stack_drain(&stack);
+        col_rel_destroy(result);
+        col_rel_destroy(valid);
+        col_rel_destroy(seed);
+        col_rel_destroy(left);
+        col_rel_destroy(delta);
+        col_rel_destroy(right);
+        destroy_session(sess);
+        if (ok)
+            PASS();
+        else
+            FAIL("diff refusal, cleanup, empty-right or valid reuse mismatch");
+    }
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
@@ -4931,6 +5100,7 @@ main(void)
     test_operator_empty_right_and_row_too_large();
     test_operator_empty_left_nothing_to_bound();
     test_nonempty_nullary_left_cleanup();
+    test_diff_nonempty_nullary_left_cleanup();
     test_join_batch_eligibility_order();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
