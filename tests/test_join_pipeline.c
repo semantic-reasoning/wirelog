@@ -3303,6 +3303,21 @@ a3_session(bool with_s)
     return sess;
 }
 
+/* sel_session plus S(a,b) = {(101,0),(200,0)}, with no N. */
+static wl_col_session_t *
+a3_session_s_only(void)
+{
+    static const int64_t s_rows[] = { 101, 0, 200, 0 };
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *s = pipeline_relation("S", a3_stage_names, 2, s_rows, 2);
+    if (!sess || !s || session_add_rel(sess, s) != 0) {
+        col_rel_destroy(s);
+        pipeline_session_destroy(sess);
+        return NULL;
+    }
+    return sess;
+}
+
 static void
 a3_stage(wl_plan_op_t *op, wl_plan_op_type_t type, const char *right,
     const char *const *left_key)
@@ -3493,6 +3508,69 @@ a3_plan_init(a3_plan_t *p, a3_shape_t shape)
     }
     p->plan.ops = p->ops;
     p->plan.op_count = n;
+}
+
+/* #2209: a probe stage whose right relation has rows but no columns fails
+ * the pipeline's run-time key range check, so the tail ends before it and
+ * the standalone operator refuses that right with EINVAL.  When the stage
+ * directly follows the JOIN, a batch budget makes the pipeline record
+ * pipeline-not-consumable first; behind a FILTER or a consumed stage the
+ * pipeline consumes the shorter tail and records nothing.  Under strict
+ * mode the pipeline refuses with ENOTSUP and keeps the left input, as
+ * before. */
+static void
+test_probe_stage_nullary_right_refused(void)
+{
+    static const int64_t no_columns[1] = { 0 };
+    static const struct {
+        /* The failing stage comes first (A3_ANTI_END), behind a FILTER
+         * (S in A3_CHAIN) or behind a consumed stage (N in A3_CHAIN). */
+        a3_shape_t shape;
+        const char *nullary;
+        uint32_t budget;
+        bool strict;
+        int rc;
+        uint32_t fallbacks;
+    } cases[] = {
+        { A3_ANTI_END, "N", 0, false, EINVAL, 0 },
+        { A3_ANTI_END, "N", SEL_BATCH_BYTES, false, EINVAL, 1 },
+        { A3_ANTI_END, "N", SEL_BATCH_BYTES, true, ENOTSUP, 1 },
+        { A3_CHAIN, "S", SEL_BATCH_BYTES, false, EINVAL, 0 },
+        { A3_CHAIN, "S", SEL_BATCH_BYTES, true, ENOTSUP, 1 },
+        { A3_CHAIN, "N", SEL_BATCH_BYTES, false, EINVAL, 0 },
+        { A3_CHAIN, "N", SEL_BATCH_BYTES, true, ENOTSUP, 1 },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        a3_plan_t p;
+        a1_run_t run;
+        wl_col_session_t *sess = cases[c].shape == A3_CHAIN
+            && cases[c].nullary[0] == 'S' ? a3_session(false)
+            : cases[c].shape == A3_CHAIN ? a3_session_s_only()
+            : sel_session();
+        col_rel_t *n = col_rel_new_auto(cases[c].nullary, 0);
+        if (!sess || !n || col_rel_append_row(n, no_columns) != 0
+            || session_add_rel(sess, n) != 0) {
+            CHECK(false, "nullary stage right fixture");
+            col_rel_destroy(n);
+            pipeline_session_destroy(sess);
+            continue;
+        }
+        a3_plan_init(&p, cases[c].shape);
+        sess->join_batch_strict = cases[c].strict;
+        run = a1_eval(sess, &p.plan, cases[c].budget, NULL, NULL);
+        if (run.rc != cases[c].rc
+            || sess->join_batch_fallback_count != cases[c].fallbacks)
+            fprintf(stderr, "  shape %d budget %u strict %d: rc=%d fb=%u\n",
+                (int)cases[c].shape, cases[c].budget, cases[c].strict,
+                run.rc, sess->join_batch_fallback_count);
+        CHECK(run.rc == cases[c].rc
+            && sess->join_batch_fallback_count == cases[c].fallbacks,
+            "a nonempty nullary stage right is refused after the tail");
+        CHECK(!cases[c].strict || run.left_kept,
+            "strict mode keeps the left input");
+        pipeline_session_destroy(sess);
+    }
 }
 
 static void
@@ -4987,6 +5065,7 @@ main(void)
     test_filter_tail_budget_sweep();
     test_stage_grammar_preflight();
     test_probe_stage_pipeline_matches_oracle();
+    test_probe_stage_nullary_right_refused();
     test_stage_output_parity();
     test_probe_stage_runtime_truncation();
     test_probe_stage_staleness();

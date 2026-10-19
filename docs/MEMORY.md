@@ -1277,9 +1277,14 @@ stage is consumed when it is keyed, has no right filter, is not materialized
 and reads a relation whose name does not start with `$`, and when, checked
 once per pipeline against the stage's input, that relation exists and the
 keys resolve in range with compatible types.  A stage that fails the
-run-time check ends the tail before it and runs as before.  Each consumed
-stage probes a hash set built once per pipeline, on the first batch that
-reaches the stage, from its right relation as it is when the pipeline
+run-time check ends the tail before it and runs as before.  With the knob
+set, a stage whose right relation has rows but no columns fails that check
+and ends the tail before it.  Without strict mode the standalone operator
+then refuses that right with `EINVAL`, and when that stage directly follows
+the JOIN the pipeline first records `pipeline-not-consumable`; under strict
+mode the pipeline refuses with `ENOTSUP` and keeps the left (#2209).  Each
+consumed stage probes a hash set built once per pipeline, on the first batch
+that reaches the stage, from its right relation as it is when the pipeline
 starts; a change to that relation, checked whenever a batch reaches the
 stage, is reported as stale (`pipeline-not-consumable`, `ENOTSUP` under
 `WIRELOG_JOIN_BATCH_STRICT=1`).  In a governed session each set holds the
@@ -1331,6 +1336,15 @@ pass-through against 56.0 GB without it (-36.7%), the session ledger peak
 against 765 s.
 These are single runs at one checkpoint; the full DOOP run does not
 complete under that scope (#2182).
+
+A keyed SEMIJOIN or ANTIJOIN whose left input, or whose right operand
+after the right filter, has rows but no columns fails with `EINVAL` before
+the probe set and the pass-through scan (#2209).  A missing right still
+repushes the left, and a right that the filter empties is not refused.
+When neither input is a zero-column input with rows, an empty zero-column
+input keeps the operator's empty-input result: SEMIJOIN keeps no row, and
+ANTIJOIN keeps no row of an empty left and every row of a left whose right
+is empty.  Neither operator consults the bounded-join knob here.
 
 When the pipeline does not consume a JOIN, the reason decides what is
 recorded.  These rules apply to non-differential evaluation only: the
