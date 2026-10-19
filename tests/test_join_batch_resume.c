@@ -15,6 +15,7 @@
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/diff_join_batch.h"
 #include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/util/log.h"
 #include "../wirelog/exec_plan_gen.h"
@@ -3710,6 +3711,82 @@ test_diff_operator_create_failure_records_nothing(void)
     fixture_fini(&f);
 }
 
+/* Create the differential producer with explicit key indices and report
+ * whether it refused them before taking any reservation, arrangement or
+ * reader.  A continuation it returns is destroyed. */
+static bool
+diff_create_refuses_keys(wl_col_session_t *sess, col_rel_t *left,
+    uint32_t lkey, uint32_t rkey, const char *label)
+{
+    const char *keys[1] = { "k" };
+    wl_columnar_continuation_t *cont = NULL;
+    col_rel_t *right = session_find_rel(sess, "right");
+    uint64_t reserved = reserved_of(sess);
+    uint32_t diff_arrs = sess->diff_arr_count;
+    wl_plan_op_t op;
+    int rc;
+
+    init_join_op(&op, keys, keys);
+    rc = col_diff_join_batch_producer_create(sess, &op, left, false, &lkey,
+            &rkey, 1, 7u * 32u, &cont);
+    if (cont) {
+        wl_columnar_continuation_destroy(cont);
+        cont = NULL;
+    }
+    if (rc != EINVAL || reserved_of(sess) != reserved
+        || sess->diff_arr_count != diff_arrs || !no_reader_holds(left)
+        || !right || !no_reader_holds(right)) {
+        printf("(%s: rc=%d) ", label, rc);
+        return false;
+    }
+    return true;
+}
+
+/* #2202: the differential producer rejects a key index outside either
+ * input, as the non-differential producer does, before its descriptor
+ * reservation, its readers and the right's differential arrangement. */
+static void
+test_diff_producer_rejects_out_of_range_keys(void)
+{
+    const int64_t keys[] = { 0, 1 };
+    const int64_t no_columns[1] = { 0 };
+    fixture_t f;
+    col_rel_t *nullary = col_rel_new_auto("left", 0);
+    wl_col_session_t *sess = make_session(1u << 24);
+    col_rel_t *nullary_right = col_rel_new_auto("right", 0);
+    bool ok;
+
+    TEST("differential producer rejects out-of-range key indices");
+    ok = fixture_init(&f, 1u << 24, keys, 2, 2, 2) && nullary && sess
+        && nullary_right && col_rel_append_row(nullary, no_columns) == 0
+        && col_rel_append_row(nullary_right, no_columns) == 0
+        && register_relation(sess, &nullary_right, "right") == 0;
+    if (!ok) {
+        FAIL("fixture");
+        goto out;
+    }
+    ok = diff_create_refuses_keys(f.sess, f.left, f.left->ncols, 0,
+            "left key past left width");
+    ok = diff_create_refuses_keys(f.sess, f.left, 0,
+            session_find_rel(f.sess, "right")->ncols,
+            "right key past right width") && ok;
+    ok = diff_create_refuses_keys(f.sess, nullary, 0, 0,
+            "zero-column left") && ok;
+    /* Last: before the check, indexing a zero-column right read its
+     * absent column 0. */
+    ok = diff_create_refuses_keys(sess, f.left, 0, 0,
+            "zero-column right") && ok;
+    if (ok)
+        PASS();
+    else
+        FAIL("out-of-range key accepted or refusal not clean");
+out:
+    col_rel_destroy(nullary);
+    col_rel_destroy(nullary_right);
+    destroy_session(sess);
+    fixture_fini(&f);
+}
+
 /* Every recordable reason warns once, on its own bit of the session's
  * warned-reasons mask (#1382).  Under the former 8-bit "& 7" mask, LFTJ
  * (10) shared CROSS's bit (2), so a session that recorded a cross join
@@ -5195,6 +5272,7 @@ main(void)
     test_operator_delta_and_filtered_fallbacks();
     test_diff_operator_exclusions_recorded_and_strict();
     test_diff_operator_create_failure_records_nothing();
+    test_diff_producer_rejects_out_of_range_keys();
     test_join_batch_reason_mask_distinct();
     test_high_fanout_independent_oracle();
     test_diff_operator_high_fanout_independent_oracle();

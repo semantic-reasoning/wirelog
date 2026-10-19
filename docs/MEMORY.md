@@ -1524,9 +1524,11 @@ check, is returned instead (#2202).  For a shape eligible for bounded mode,
 an empty input on either side is joined one-shot without the producer, and
 nothing is recorded or refused; an excluded shape is still recorded, or
 refused under strict mode, before that decision.  Two empty zero-column
-inputs therefore yield the empty result with or without strict mode, where
-the producer refused their zero-width output: recorded as `row-too-large`,
-or `ENOTSUP` under strict mode (#2202).
+inputs therefore yield the empty result with or without strict mode;
+before #2202 the producer refused their zero-width output, recorded as
+`row-too-large`, or `ENOTSUP` under strict mode.  The producer itself
+rejects a key index outside either input with `EINVAL`, before any
+reservation, reader or arrangement is taken (#2202).
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
