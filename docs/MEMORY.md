@@ -1508,19 +1508,25 @@ are bounded.  Since #1382 the differential join decides them with the same
 eligibility check as the ordinary join and then excludes materialized
 joins.  Without strict mode each records its reason (`worker-session`,
 `cross-join`, `delta-right`, `filtered-right` or `materialized`, and
-`row-too-large` when create refuses a batch budget below one output row or a
-zero-width output); under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP`
-instead of running one-shot and records nothing.  A materialized join whose
-result is already cached is copied from the cache before this decision, so
-it is neither recorded nor refused.  Under strict mode a differential
-evaluation therefore fails as soon as one of its joins reads a delta on the
-right or filters the right relation; it is a diagnostic setting.  A keyed
+`row-too-large` when create refuses a batch budget below one output row);
+under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP` instead of running
+one-shot and records nothing.  A materialized join whose result is already
+cached is copied from the cache before this decision, so it is neither
+recorded nor refused.  Under strict mode a differential evaluation
+therefore fails as soon as one of its joins reads a delta on the right or
+filters the right relation; it is a diagnostic setting.  A keyed
 differential join whose left input has rows but no columns fails with
 `EINVAL` with the knob off or on, as the ordinary JOIN does, before the
 cache lookup and the bounded-mode decision, so nothing is recorded.  A
-missing or forced-empty right operand still yields the empty result
-first, and an error from the right relation's filter, which runs before
-the check, is returned instead (#2202).
+missing or forced-empty right operand still yields the empty result first,
+and an error from the right relation's filter, which runs before the
+check, is returned instead (#2202).  For a shape eligible for bounded mode,
+an empty input on either side is joined one-shot without the producer, and
+nothing is recorded or refused; an excluded shape is still recorded, or
+refused under strict mode, before that decision.  Two empty zero-column
+inputs therefore yield the empty result with or without strict mode, where
+the producer refused their zero-width output: recorded as `row-too-large`,
+or `ENOTSUP` under strict mode (#2202).
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
