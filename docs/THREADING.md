@@ -1713,6 +1713,14 @@ uses separately funded host actions and the original resource tokens. The JOIN
 delta flag and output are published together inside the existing callback-free
 unary cutoff; no new atomic site or memory-order protocol is introduced.
 
+Ordinary JOIN right-predicate selection reuses the original filter context's
+program, generic value vector, governor reference and reservation. The vector
+keeps physical source indices followed by one gathered row; JOIN output remains
+in its existing separate scratch slot. Cleanup retires these owners through
+the already prepaid PROGRAM, PHYSICAL, CREDIT and REFERENCE actions before the
+source lease and decision stage. Keep expression bytes, relation storage and
+governor configuration stable through acknowledgement.
+
 
 The initial scalar cooperative CONSOLIDATE composes the original scalar source,
 private writer and common unary FILTER lifecycle on one serialized native
