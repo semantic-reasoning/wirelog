@@ -3245,6 +3245,13 @@ operation attempt without charging it. Chained delta/projection tests inspect
 both committed JOINs before a MAP can clear their delta markers and compare
 the identical fragment against raw tuple-bag results.
 
+Generated aware-host coverage also exercises an ordinary integer FILTER. The test
+requires one generated FILTER descriptor, finds the minimum configured work
+limit that reaches a known-true row after predicate evaluation, and verifies the
+next charged action stops with `WORK_LIMIT`. Fresh fixtures reproduce the stop;
+the same operation then retries in a new generation and matches both raw output
+and literal rows. This is fixture-specific boundary evidence, not a general
+FILTER tariff or evidence for other types and evaluator routes.
 
 ### Complete initial scalar operator plans through CONSOLIDATE (#1821)
 

@@ -707,6 +707,14 @@ iteration/count equality is not promised. Parsing, planning and input ingestion
 are outside the evaluation-work count. Output cardinality and iteration count
 alone cannot bound an expensive acyclic JOIN with no matching output.
 
+The generated integer FILTER aware-host fixture verifies one concrete checkpoint
+boundary after predicate evaluation: it searches fresh executions for the first
+configured allowance that reaches a known-true row, then observes `WORK_LIMIT`
+on the following charged action. Its retry checks output against a raw reference
+and literal rows. That result is limited to this fixture; it does not establish a
+universal FILTER cost, FLOAT coverage, cancellation behavior, or coverage of
+other evaluator routes.
+
 Synchronous allocator/runtime calls, whole-input library sorts/copies, host
 scalar addons, and output callback bodies cannot be preempted by this token.
 Downstream integration must split engine-owned large sorts/copies into bounded
