@@ -3369,6 +3369,20 @@ first child; supported opcodes with unsupported input shapes fail at that child.
 There is no controlled-to-raw fallback. This increment does not complete #1821.
 
 
+### Generated integer MAP work-limit boundary
+
+The aware-host generated-operator integration fixture runs the generated
+`output(x+1) :- input(x)` integer MAP over 4096 rows. Its phase-109 checkpoint
+counts rows after expression evaluation and value staging. Fresh sessions find
+the first configured operation allowance that reaches the 1024th row; the immediately
+lower allowance and that boundary both stop with `WORK_LIMIT`, publish no
+output, preserve the input relation and bytes, and drain reservations and
+cleanup. Repeating the boundary gives the same checkpoint count. A new attempt
+generation on the same operation then completes all rows and matches raw
+execution and literal `2..4097` output. This is evidence for this generated
+integer MAP and host route only; it does not establish a general work tariff or
+coverage of other MAP expressions and entry paths.
+
 ### Initial scalar existence-join component
 
 The private `wl_columnar_join_probe_op_attempt_start[_owned]` component adds

@@ -939,6 +939,16 @@ private scalar plans, not public/default activation or the remaining #1821
 operator families.
 
 
+### Generated integer MAP host boundary
+
+The generated integer MAP `output(x+1) :- input(x)` is exercised through the
+aware framed host with 4096 input rows. A checkpoint after expression
+materialization identifies the 1024th row boundary. The allowance immediately
+below that boundary and the boundary itself stop without publishing output; a
+fresh generation on the same operation completes and agrees with raw execution
+and the literal result. This fixture describes only the generated integer MAP
+host path and does not define allowances for other expressions or routes.
+
 ### Private scalar SEMIJOIN and ANTIJOIN
 
 The bounded existence-join component consults the full named right relation.
