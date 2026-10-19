@@ -3520,6 +3520,22 @@ cleanup capacity. Full generated/composed tests compare literal typed results
 and independently cloned raw execution; raw empty CONS run-cache conventions
 are not imported into controlled empty results.
 
+### Generated COUNT REDUCE work-limit boundary
+
+The generated aware-host fixture runs a one-group integer `COUNT` REDUCE over
+4096 ordered rows. Its phase-36 checkpoint reports the zero-based row being
+entered before that row contributes to the count. A high-limit run completes
+all rows; fresh sessions then find the first operation allowance to reach row
+1023. The preceding allowance stops before that checkpoint, while the boundary
+and repeated-boundary runs reach it and stop with `WORK_LIMIT`. Both leave the
+output unpublished, preserve the input registry and row bytes, and drain
+reservations and cleanup. The completed reports repeat the same admitted-work
+total for this fixture; that total is not a phase-local tariff. A fresh attempt
+generation on the same operation then publishes `COUNT=4096` and agrees with
+raw execution. This evidence covers only the generated one-group integer COUNT
+path through the aware host; it does not define grouped, other aggregate, FLOAT
+or other-route allowances.
+
 ### Private controlled CONCAT ownership
 
 CONCAT adds a dedicated frame-embedded continuation with two original scalar
