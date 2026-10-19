@@ -1184,9 +1184,15 @@ typedef struct {
     unsigned next, calls, witnesses;
 } entry_fixture_t;
 
+typedef struct {
+    const char *name;
+    const int64_t *rows;
+    uint32_t count, width;
+} entry_input_t;
+
 static void
-entry_init(entry_fixture_t *f, const char *source, const int64_t *rows,
-    uint32_t count, uint32_t width, uint64_t limit)
+entry_init_inputs(entry_fixture_t *f, const char *source,
+    const entry_input_t *inputs, uint32_t input_count, uint64_t limit)
 {
     memset(f, 0, sizeof(*f));
     wirelog_error_t error;
@@ -1218,7 +1224,12 @@ entry_init(entry_fixture_t *f, const char *source, const int64_t *rows,
     f->governor = governor;
     f->session = (wl_col_session_t *)base;
     CHECK(!session_find_rel(f->session, "output"));
-    if (count) CHECK(!wl_session_insert(base, "input", rows, count, width));
+    for (uint32_t i = 0; i < input_count; ++i) {
+        CHECK(inputs[i].name && (inputs[i].rows || !inputs[i].count));
+        if (inputs[i].count)
+            CHECK(!wl_session_insert(base, inputs[i].name, inputs[i].rows,
+                inputs[i].count, inputs[i].width));
+    }
     /* Non-owner bookkeeping probes make a misplaced heads clear or frontier
      * reset observable. No engine phase, READY state or token is fabricated. */
     f->session->eval_stratum_heads_final = true;
@@ -1232,6 +1243,14 @@ entry_init(entry_fixture_t *f, const char *source, const int64_t *rows,
     f->id = wl_evaluation_control_active_attempt_id(f->operation);
     for (unsigned i = 0; i < 3; ++i)
         f->grants[i].control = control_new(0, &f->grants[i].owner);
+}
+
+static void
+entry_init(entry_fixture_t *f, const char *source, const int64_t *rows,
+    uint32_t count, uint32_t width, uint64_t limit)
+{
+    const entry_input_t input = {"input", rows, count, width};
+    entry_init_inputs(f, source, &input, 1, limit);
 }
 
 static wl_columnar_eval_serial_framed_attempt_t *
@@ -1393,17 +1412,20 @@ entry_destroy(entry_fixture_t *f)
             &f->grants[i].owner));
         wl_evaluation_control_release(f->grants[i].control);
     }
+    CHECK(f->session->memory_governor);
     wl_session_destroy(&f->session->base);
     wl_evaluation_control_release(f->operation);
     wl_plan_free(f->plan); wirelog_program_free(f->program);
-    CHECK(!wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(f->governor)));
-    wl_columnar_memory_governor_ref_release(f->governor);
+    if (f->governor) {
+        CHECK(!wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(f->governor)));
+        wl_columnar_memory_governor_ref_release(f->governor);
+    }
 }
 
 static void
-entry_compare(entry_fixture_t *f, const char *source, const int64_t *rows,
-    uint32_t count, uint32_t width)
+entry_compare_inputs(entry_fixture_t *f, const char *source,
+    const entry_input_t *inputs, uint32_t input_count)
 {
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(source, &error);
@@ -1411,7 +1433,10 @@ entry_compare(entry_fixture_t *f, const char *source, const int64_t *rows,
     wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
     wl_session_t *base = NULL;
     CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &base));
-    if (count) CHECK(!wl_session_insert(base, "input", rows, count, width));
+    for (uint32_t i = 0; i < input_count; ++i)
+        if (inputs[i].count)
+            CHECK(!wl_session_insert(base, inputs[i].name, inputs[i].rows,
+                inputs[i].count, inputs[i].width));
     const wl_plan_relation_t *rp = NULL;
     for (uint32_t s = 0; s < plan->stratum_count; ++s)
         for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
@@ -1436,6 +1461,14 @@ entry_compare(entry_fixture_t *f, const char *source, const int64_t *rows,
             CHECK(a->columns[c][r] == b->columns[c][r]);
     }
     wl_session_destroy(base); wl_plan_free(plan); wirelog_program_free(program);
+}
+
+static void
+entry_compare(entry_fixture_t *f, const char *source, const int64_t *rows,
+    uint32_t count, uint32_t width)
+{
+    const entry_input_t input = {"input", rows, count, width};
+    entry_compare_inputs(f, source, &input, 1);
 }
 
 static char *
@@ -1863,6 +1896,417 @@ test_entry_generated_operators(void)
     }
 }
 
+typedef struct {
+    wl_evaluation_control_t *operation;
+    uint64_t cancel_after;
+    unsigned cancel_phase;
+    uint64_t phase17_hits, phase30_hits, phase28_hits, phase46_hits;
+    uint64_t last_progress;
+    bool cancelled;
+} entry_join_probe_t;
+
+static entry_join_probe_t *entry_join_probe;
+
+static void
+entry_join_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    entry_join_probe_t *probe = entry_join_probe;
+    if (!probe || control != probe->operation) return;
+    if (phase == 17) ++probe->phase17_hits;
+    if (phase == 30) ++probe->phase30_hits;
+    if (phase == 28) ++probe->phase28_hits;
+    if (phase == 46) ++probe->phase46_hits;
+    probe->last_progress = progress;
+    uint64_t hits = phase == probe->cancel_phase
+        ? (phase == 17 ? probe->phase17_hits
+            : phase == 30 ? probe->phase30_hits
+            : phase == 28 ? probe->phase28_hits : 0) : 0;
+    if (probe->cancel_after && hits == probe->cancel_after) {
+        probe->cancelled = true;
+        (void)wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static const char entry_filter_product[] =
+    ".decl input(x:int64)\n"
+    ".decl right(y:int64,flag:int64)\n"
+    ".decl output(x:int64,y:int64)\n"
+    "output(x,y) :- input(x), right(y,1).\n";
+
+static const char entry_filter_keyed[] =
+    ".decl input(k:int64)\n"
+    ".decl right(k:int64,flag:int64)\n"
+    ".decl output(k:int64)\n"
+    "output(k) :- input(k), right(k,1).\n";
+
+static const wl_plan_op_t *
+entry_assert_generated_join(entry_fixture_t *f, const char *right_name,
+    uint32_t key_count)
+{
+    CHECK(f->relation->op_count >= 2
+        && f->relation->ops[0].op == WL_PLAN_OP_VARIABLE
+        && f->relation->ops[f->relation->op_count - 1].op ==
+        WL_PLAN_OP_CONSOLIDATE);
+    const wl_plan_op_t *found = NULL;
+    for (uint32_t i = 0; i < f->relation->op_count; ++i) {
+        const wl_plan_op_t *op = &f->relation->ops[i];
+        if (op->op != WL_PLAN_OP_JOIN || !op->right_relation
+            || strcmp(op->right_relation, right_name)) continue;
+        CHECK(!found);
+        found = op;
+    }
+    CHECK(found && found->key_count == key_count
+        && found->right_filter_expr.data
+        && found->right_filter_expr.size);
+    return found;
+}
+
+static void
+entry_large_inputs(int64_t input_rows[64], int64_t right_rows[513 * 2],
+    bool keyed)
+{
+    for (uint32_t i = 0; i < 64; ++i)
+        input_rows[i] = keyed ? (int64_t)(i + 1) * 1024 : 100 + i;
+    for (uint32_t i = 0; i < 513; ++i) {
+        right_rows[i * 2] = keyed
+            ? (int64_t)(1000 + i / 2) * 1024 : 2000 + i;
+        right_rows[i * 2 + 1] = (i & 1u) ? 0 : 1;
+    }
+}
+
+static void
+entry_assert_filtered_selection(const entry_join_probe_t *probe,
+    uint32_t expected_rows)
+{
+    CHECK(probe->phase46_hits == expected_rows);
+}
+
+static void
+test_entry_generated_right_filter_large(void)
+{
+    int64_t input_rows[64], right_rows[513 * 2];
+    entry_large_inputs(input_rows, right_rows, false);
+    const entry_input_t inputs[] = {
+        {"input", input_rows, 64, 1},
+        {"right", right_rows, 513, 2}
+    };
+    const uint32_t products = 64 * 257;
+    entry_fixture_t f;
+    entry_init_inputs(&f, entry_filter_product, inputs, 2, 0);
+    const wl_plan_op_t *join = entry_assert_generated_join(&f, "right", 0);
+    CHECK(join->right_filter_expr.size > 0 && f.session->memory_governor);
+    entry_join_probe_t probe = {.operation = f.operation};
+    entry_join_probe = &probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&f);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(!f.reply.execution_result && f.reply.committed
+        && probe.phase17_hits == products);
+    entry_assert_filtered_selection(&probe, 257);
+    const col_rel_t *out = session_rel_hash_lookup(f.session, "output");
+    CHECK(out && out->nrows == products && out->ncols == 2);
+    uint32_t row = 0;
+    for (uint32_t x = 0; x < 64; ++x)
+        for (uint32_t y = 0; y < 257; ++y, ++row)
+            CHECK(out->columns[0][row] == input_rows[x]
+                && out->columns[1][row] == right_rows[(2 * y) * 2]);
+    entry_compare_inputs(&f, entry_filter_product, inputs, 2);
+    entry_destroy(&f);
+}
+
+static void
+entry_prepare_keyed_collision(int64_t input_rows[64],
+    int64_t right_rows[513 * 2])
+{
+    entry_large_inputs(input_rows, right_rows, true);
+}
+
+static void
+entry_assert_unpublished_and_unchanged(entry_fixture_t *f,
+    col_rel_t **old_rels, uint32_t old_nrels, col_rel_t *input,
+    col_rel_t *right, const int64_t *input_rows, const int64_t *right_rows,
+    uint64_t reserved)
+{
+    bool inputs_unchanged = input->nrows == 64 && right->nrows == 513
+        && right->ncols == 2
+        && !memcmp(input->columns[0], input_rows, 64 * sizeof(int64_t));
+    for (uint32_t r = 0; inputs_unchanged && r < 513; ++r)
+        inputs_unchanged = right->columns[0][r] == right_rows[2 * r]
+            && right->columns[1][r] == right_rows[2 * r + 1];
+    CHECK(!f->reply.committed
+        && !session_rel_hash_lookup(f->session, "output")
+        && f->session->rels == old_rels && f->session->nrels == old_nrels
+        && session_find_rel(f->session, "input") == input
+        && session_find_rel(f->session, "right") == right
+        && inputs_unchanged
+        && (!f->governor || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(f->governor)) == reserved));
+    CHECK(!f->session->cleanup_active && !f->session->cleanup_pending
+        && !f->session->cleanup_reserved_bytes);
+}
+
+static void
+entry_retry_after_finished_stop(entry_fixture_t *f, const char *source,
+    const entry_input_t *inputs, uint32_t input_count)
+{
+    CHECK(!wl_evaluation_control_reset(f->operation));
+    CHECK(!wl_evaluation_control_configure(f->operation, 0));
+    CHECK(!wl_evaluation_control_begin(f->operation,
+        f->session->base.operation_admission));
+    f->id = wl_evaluation_control_active_attempt_id(f->operation);
+    CHECK(f->id);
+    f->previous.previous_valid = false;
+    memset(&f->reply, 0, sizeof(f->reply));
+    f->reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_complete(f);
+    CHECK(!f->reply.execution_result && f->reply.committed);
+    entry_compare_inputs(f, source, inputs, input_count);
+}
+
+static void
+entry_retry_after_stop(entry_fixture_t *f, const char *source,
+    const entry_input_t *inputs, uint32_t input_count)
+{
+    entry_finish_original(f);
+    entry_retry_after_finished_stop(f, source, inputs, input_count);
+}
+
+static void
+test_entry_generated_right_filter_collisions_and_stop(void)
+{
+    int64_t input_rows[64], right_rows[513 * 2];
+    entry_prepare_keyed_collision(input_rows, right_rows);
+    const entry_input_t inputs[] = {
+        {"input", input_rows, 64, 1},
+        {"right", right_rows, 513, 2}
+    };
+    const uint64_t pairs = 64u * 257u;
+
+    entry_fixture_t complete;
+    entry_init_inputs(&complete, entry_filter_keyed, inputs, 2, 0);
+    const wl_plan_op_t *join = entry_assert_generated_join(&complete, "right",
+            1);
+    CHECK(join->key_count == 1 && complete.session->memory_governor);
+    entry_join_probe_t full_probe = {.operation = complete.operation};
+    entry_join_probe = &full_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&complete);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(!complete.reply.execution_result && complete.reply.committed
+        && full_probe.phase17_hits == pairs
+        && full_probe.phase30_hits == pairs);
+    entry_assert_filtered_selection(&full_probe, 257);
+    const col_rel_t *empty = session_rel_hash_lookup(complete.session,
+            "output");
+    CHECK(empty && !empty->nrows);
+    entry_compare_inputs(&complete, entry_filter_keyed, inputs, 2);
+    entry_finish_original(&complete);
+    wl_evaluation_control_report_t complete_report;
+    CHECK(!wl_evaluation_control_report(complete.operation, &complete_report)
+        && complete_report.result == 0 && complete_report.consumed > 0);
+    uint64_t measured_total = complete_report.consumed;
+    entry_destroy(&complete);
+
+    entry_fixture_t prefix_anchor;
+    col_rel_t **prefix_rels;
+    uint32_t prefix_nrels;
+    col_rel_t *prefix_input, *prefix_right;
+    uint64_t prefix_reserved;
+    entry_init_inputs(&prefix_anchor, entry_filter_keyed, inputs, 2, 0);
+    (void)entry_assert_generated_join(&prefix_anchor, "right", 1);
+    prefix_rels = prefix_anchor.session->rels;
+    prefix_nrels = prefix_anchor.session->nrels;
+    prefix_input = session_find_rel(prefix_anchor.session, "input");
+    prefix_right = session_find_rel(prefix_anchor.session, "right");
+    prefix_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(prefix_anchor.governor));
+    entry_join_probe_t anchor_probe = {
+        .operation = prefix_anchor.operation,
+        .cancel_after = 257,
+        .cancel_phase = 28
+    };
+    entry_join_probe = &anchor_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&prefix_anchor);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(anchor_probe.cancelled && anchor_probe.phase28_hits == 257
+        && !anchor_probe.phase17_hits
+        && prefix_anchor.reply.execution_result ==
+        WL_EVALUATION_CONTROL_CANCELLED);
+    entry_assert_unpublished_and_unchanged(&prefix_anchor, prefix_rels,
+        prefix_nrels, prefix_input, prefix_right, input_rows, right_rows,
+        prefix_reserved);
+    entry_finish_original(&prefix_anchor);
+    wl_evaluation_control_report_t anchor_report;
+    CHECK(!wl_evaluation_control_report(prefix_anchor.operation,
+        &anchor_report)
+        && anchor_report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && anchor_report.consumed > 0);
+    uint64_t measured_k28 = anchor_report.consumed;
+    entry_retry_after_finished_stop(&prefix_anchor, entry_filter_keyed,
+        inputs, 2);
+    entry_destroy(&prefix_anchor);
+
+    /* To candidate 128, the source charges 576 initially, then 448 for
+     * each additional candidate: parent WORK, match key CELL, phase17 CELL. */
+    const uint64_t local_prefix = 576 + 127 * 448;
+    entry_fixture_t prefix_short;
+    entry_init_inputs(&prefix_short, entry_filter_keyed, inputs, 2,
+        measured_k28 + local_prefix - 1);
+    (void)entry_assert_generated_join(&prefix_short, "right", 1);
+    prefix_rels = prefix_short.session->rels;
+    prefix_nrels = prefix_short.session->nrels;
+    prefix_input = session_find_rel(prefix_short.session, "input");
+    prefix_right = session_find_rel(prefix_short.session, "right");
+    prefix_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(prefix_short.governor));
+    entry_join_probe_t short_probe = {.operation = prefix_short.operation};
+    entry_join_probe = &short_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&prefix_short);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(prefix_short.reply.execution_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT && short_probe.phase17_hits == 127
+        && short_probe.phase30_hits == 127
+        && !prefix_short.reply.committed
+        && !session_rel_hash_lookup(prefix_short.session, "output"));
+    entry_assert_unpublished_and_unchanged(&prefix_short, prefix_rels,
+        prefix_nrels, prefix_input, prefix_right, input_rows, right_rows,
+        prefix_reserved);
+    entry_finish_original(&prefix_short);
+    wl_evaluation_control_report_t short_report;
+    CHECK(!wl_evaluation_control_report(prefix_short.operation,
+        &short_report)
+        && short_report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    entry_retry_after_finished_stop(&prefix_short, entry_filter_keyed,
+        inputs, 2);
+    entry_destroy(&prefix_short);
+
+    entry_fixture_t prefix_exact;
+    entry_init_inputs(&prefix_exact, entry_filter_keyed, inputs, 2,
+        measured_k28 + local_prefix);
+    (void)entry_assert_generated_join(&prefix_exact, "right", 1);
+    prefix_rels = prefix_exact.session->rels;
+    prefix_nrels = prefix_exact.session->nrels;
+    prefix_input = session_find_rel(prefix_exact.session, "input");
+    prefix_right = session_find_rel(prefix_exact.session, "right");
+    prefix_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(prefix_exact.governor));
+    entry_join_probe_t exact_probe = {
+        .operation = prefix_exact.operation,
+        .cancel_after = 128,
+        .cancel_phase = 17
+    };
+    entry_join_probe = &exact_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&prefix_exact);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(exact_probe.cancelled && exact_probe.phase17_hits == 128
+        && exact_probe.phase30_hits == 127
+        && prefix_exact.reply.execution_result ==
+        WL_EVALUATION_CONTROL_CANCELLED
+        && !prefix_exact.reply.committed);
+    entry_assert_unpublished_and_unchanged(&prefix_exact, prefix_rels,
+        prefix_nrels, prefix_input, prefix_right, input_rows, right_rows,
+        prefix_reserved);
+    entry_finish_original(&prefix_exact);
+    wl_evaluation_control_report_t prefix_report;
+    CHECK(!wl_evaluation_control_report(prefix_exact.operation,
+        &prefix_report)
+        && prefix_report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && prefix_report.consumed == measured_k28 + local_prefix);
+    entry_retry_after_finished_stop(&prefix_exact, entry_filter_keyed,
+        inputs, 2);
+    entry_destroy(&prefix_exact);
+
+    entry_fixture_t exact;
+    entry_init_inputs(&exact, entry_filter_keyed, inputs, 2, measured_total);
+    entry_complete(&exact);
+    CHECK(!exact.reply.execution_result && exact.reply.committed);
+    entry_finish_original(&exact);
+    wl_evaluation_control_report_t exact_report;
+    CHECK(!wl_evaluation_control_report(exact.operation, &exact_report)
+        && exact_report.consumed == measured_total);
+    entry_destroy(&exact);
+
+    entry_fixture_t short_one;
+    entry_init_inputs(&short_one, entry_filter_keyed, inputs, 2,
+        measured_total - 1);
+    join = entry_assert_generated_join(&short_one, "right", 1);
+    CHECK(join->right_filter_expr.data);
+    col_rel_t **old_rels = short_one.session->rels;
+    uint32_t old_nrels = short_one.session->nrels;
+    col_rel_t *old_input = session_find_rel(short_one.session, "input");
+    col_rel_t *old_right = session_find_rel(short_one.session, "right");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(short_one.governor));
+    entry_complete(&short_one);
+    CHECK(short_one.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    entry_assert_unpublished_and_unchanged(&short_one, old_rels, old_nrels,
+        old_input, old_right, input_rows, right_rows, reserved);
+    entry_retry_after_stop(&short_one, entry_filter_keyed, inputs, 2);
+    entry_destroy(&short_one);
+
+    entry_fixture_t cancelled;
+    entry_init_inputs(&cancelled, entry_filter_keyed, inputs, 2, 0);
+    (void)entry_assert_generated_join(&cancelled, "right", 1);
+    old_rels = cancelled.session->rels;
+    old_nrels = cancelled.session->nrels;
+    old_input = session_find_rel(cancelled.session, "input");
+    old_right = session_find_rel(cancelled.session, "right");
+    reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(cancelled.governor));
+    entry_join_probe_t cancel_probe = {
+        .operation = cancelled.operation,
+        .cancel_after = 777,
+        .cancel_phase = 30
+    };
+    entry_join_probe = &cancel_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&cancelled);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(cancel_probe.cancelled && cancel_probe.phase30_hits == 777
+        && cancelled.reply.execution_result ==
+        WL_EVALUATION_CONTROL_CANCELLED);
+    entry_assert_unpublished_and_unchanged(&cancelled, old_rels, old_nrels,
+        old_input, old_right, input_rows, right_rows, reserved);
+    entry_retry_after_stop(&cancelled, entry_filter_keyed, inputs, 2);
+    entry_destroy(&cancelled);
+
+    int64_t product_input[64], product_right[513 * 2];
+    entry_large_inputs(product_input, product_right, false);
+    const entry_input_t product_inputs[] = {
+        {"input", product_input, 64, 1},
+        {"right", product_right, 513, 2}
+    };
+    entry_fixture_t product;
+    entry_init_inputs(&product, entry_filter_product, product_inputs, 2, 0);
+    (void)entry_assert_generated_join(&product, "right", 0);
+    entry_join_probe_t pair_cancel = {
+        .operation = product.operation,
+        .cancel_after = 8192,
+        .cancel_phase = 17
+    };
+    entry_join_probe = &pair_cancel;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&product);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(pair_cancel.cancelled && pair_cancel.phase17_hits == 8192
+        && product.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !product.reply.committed
+        && !session_rel_hash_lookup(product.session, "output"));
+    entry_retry_after_stop(&product, entry_filter_product, product_inputs, 2);
+    entry_destroy(&product);
+}
+
 static wl_columnar_eval_serial_framed_host_request_t
 entry_request(entry_fixture_t *f, grant_t *grant)
 {
@@ -1990,6 +2434,8 @@ int
 main(void)
 {
     test_entry_shapes(); test_entry_generated_operators();
+    test_entry_generated_right_filter_large();
+    test_entry_generated_right_filter_collisions_and_stop();
     test_entry_receipts(); test_entry_bootstrap_failures();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_unsupported_generated();
