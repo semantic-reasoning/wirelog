@@ -1346,11 +1346,13 @@ bounded-mode rules below, which refuse its excluded shapes.
   missing right relation, a forced-empty right operand, or a key that
   resolves outside a zero-column input is left to the ordinary JOIN, whose
   result stands in both modes and nothing is recorded; there a zero-column
-  left input without rows yields the empty result, and one with rows still
-  fails with `EINVAL` (#2170).  A FLOAT key paired with a non-FLOAT key is
-  `EINVAL`, as from the ordinary JOIN.  A `$d$` or `$r$` right operand
-  records `delta-right`, and strict mode refuses it with `ENOTSUP` before
-  the JOIN runs.
+  input with rows (the left, or a right that remains after the right
+  filter) fails with `EINVAL`, except that a missing or forced-empty right
+  keeps its empty result; when neither input is a zero-column input with
+  rows, an empty zero-column input yields the empty result (#2170, #2209).
+  A FLOAT key paired with a non-FLOAT key is `EINVAL`, as from the ordinary
+  JOIN.  A `$d$` or `$r$` right operand records `delta-right`, and strict
+  mode refuses it with `ENOTSUP` before the JOIN runs.
 - Otherwise, when the session, the JOIN or the shape of its tail is not
   consumable, what reads the JOIN's output decides.  If the output reaches
   the end of the plan only through CONCAT, CONSOLIDATE, or an EXCHANGE that
@@ -1687,7 +1689,12 @@ refuses the knob with `ENOTSUP` without recording a reason; the numeric plan
 driver that dispatches it is not yet reached from session evaluation.
 Strict mode therefore refuses incremental differential programs whose joins
 read a right delta, LFTJ chains, and recursive multi-way rules (whose joins
-feed joins and read right deltas); it is a diagnostic setting.
+feed joins and read right deltas); it is a diagnostic setting.  A keyed
+ordinary JOIN whose left input, or whose right operand after selection and
+the right filter, has rows but no columns fails with `EINVAL` before the
+materialization cache and the bounded-mode decision (#2209).  Nothing is
+recorded, and such a delta or filtered right gets `EINVAL`, not `ENOTSUP`,
+under strict mode.  A missing or forced-empty right keeps its empty result.
 
 The bounded paths report failures as typed errors:
 - a governor denial is `ENOSPC` with `wl_columnar_session_budget_denied()`

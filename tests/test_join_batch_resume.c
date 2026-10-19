@@ -4673,6 +4673,239 @@ test_diff_operator_empty_input_nothing_to_bound(void)
         FAIL("empty differential input dispatched or refused");
 }
 
+/* #2209: a keyed JOIN refuses a nonempty nullary right with EINVAL, as it
+ * refuses a nonempty nullary left: the right has no column 0 for its key to
+ * read.  The check follows the right operand selection and the right
+ * filter, and precedes the materialization cache and the bounded-mode
+ * decision.  @diff runs the differential operator instead. */
+typedef enum {
+    NR_PLAIN,         /* registered nonempty nullary right */
+    NR_DELTA,         /* FORCE_DELTA $d$right, no filter */
+    NR_DELTA_KEEP,    /* FORCE_DELTA $d$right, owned filter keeping it */
+    NR_DELTA_REJECT,  /* FORCE_DELTA $d$right, owned filter emptying it */
+    NR_CACHED_KEEP,   /* FORCE_FULL right, cached filter keeping it */
+    NR_MISSING,       /* right relation not registered */
+    NR_FORCED_EMPTY,  /* FORCE_DELTA with no $d$right: empty operand */
+    NR_MATERIALIZED,  /* materialized, result cached for this left/right */
+    NR_EMPTY_RIGHT,   /* registered empty nullary right */
+} nullary_right_shape_t;
+
+typedef struct {
+    nullary_right_shape_t shape;
+    unsigned left;   /* 0 two-column with a row, 1 two-column empty,
+                      * 2 nullary with a row */
+    bool owned;
+    unsigned mode;   /* knob off, 224, 224 strict */
+    bool delta_left; /* pushed with eval_stack_push_delta */
+} nullary_right_case_t;
+
+static bool
+run_nullary_right_case(const nullary_right_case_t *t, bool diff)
+{
+    const char *names[] = { "k", "r" };
+    const char *keys[] = { "k" };
+    const int64_t row[] = { 0, 1 };
+    const int64_t no_columns[1] = { 0 };
+    static uint8_t keep[] = { WL_PLAN_EXPR_BOOL, 1 };
+    static uint8_t reject[] = { WL_PLAN_EXPR_BOOL, 0 };
+    bool refused = t->shape == NR_PLAIN || t->shape == NR_DELTA
+        || t->shape == NR_DELTA_KEEP
+        || t->shape == NR_CACHED_KEEP || t->shape == NR_MATERIALIZED;
+    wl_col_session_t *sess = make_session(1u << 24);
+    col_rel_t *right = col_rel_new_auto("right", 0);
+    col_rel_t *delta = NULL;
+    col_rel_t *other = make_right_named("other", 1, 1);
+    col_rel_t *left = t->left == 2 ? col_rel_new_auto("left", 0)
+        : make_left(row, t->left == 0 ? 1 : 0);
+    col_rel_t *seed = NULL;
+    col_rel_t *result = NULL;
+    uint32_t left_rows = t->left == 1 ? 0u : 1u;
+    uint32_t left_cols = t->left == 2 ? 0u : 2u;
+    eval_stack_t stack;
+    wl_plan_op_t op;
+    bool ok = false;
+    uint32_t top = 0;
+    int rc = -1;
+
+    eval_stack_init(&stack);
+    if (!sess || !right || !other || !left
+        || (t->shape != NR_EMPTY_RIGHT
+        && col_rel_append_row(right, no_columns) != 0)
+        || (t->left == 2 && col_rel_append_row(left, no_columns) != 0)
+        || register_relation(sess, &other, "other") != 0)
+        goto cleanup;
+    if (t->shape != NR_MISSING
+        && register_relation(sess, &right, "right") != 0)
+        goto cleanup;
+    init_join_op(&op, keys, keys);
+    if (t->shape == NR_DELTA || t->shape == NR_DELTA_KEEP
+        || t->shape == NR_DELTA_REJECT) {
+        delta = col_rel_new_auto("$d$right", 0);
+        if (!delta || col_rel_append_row(delta, no_columns) != 0
+            || register_relation(sess, &delta, "$d$right") != 0)
+            goto cleanup;
+        op.delta_mode = WL_DELTA_FORCE_DELTA;
+    }
+    if (t->shape == NR_DELTA_KEEP || t->shape == NR_DELTA_REJECT)
+        op.right_filter_expr = (wl_plan_expr_buffer_t){
+            t->shape == NR_DELTA_KEEP ? keep : reject, sizeof(keep)
+        };
+    if (t->shape == NR_CACHED_KEEP)
+        op.right_filter_expr = (wl_plan_expr_buffer_t){ keep, sizeof(keep) };
+    if (t->shape == NR_FORCED_EMPTY) {
+        op.delta_mode = WL_DELTA_FORCE_DELTA;
+        sess->delta_seeded = true;
+    }
+    if (t->shape == NR_MATERIALIZED) {
+        /* A cached result for this exact left and right must not bypass
+         * the refusal. */
+        seed = make_rel("seed", 2, names);
+        if (!seed || col_rel_append_row(seed, row) != 0
+            || col_mat_cache_insert(&sess->mat_cache, left,
+            session_find_rel(sess, "right"), seed) != 0)
+            goto cleanup;
+        seed = NULL; /* The cache owns the result. */
+        op.materialized = true;
+    }
+    uint64_t reserved = reserved_of(sess);
+    uint32_t fallbacks = sess->join_batch_fallback_count;
+    uint32_t arrs = sess->arr_count;
+    uint32_t diff_arrs = sess->diff_arr_count;
+    sess->join_batch_bytes = t->mode == 0 ? 0 : 224;
+    sess->join_batch_strict = t->mode == 2;
+    if ((t->delta_left ? eval_stack_push_delta(&stack, left, t->owned, true)
+        : eval_stack_push(&stack, left, t->owned)) != 0)
+        goto cleanup;
+    if (t->owned)
+        left = NULL; /* The stack/operator owns the original. */
+    rc = diff ? col_op_join_diff(&op, &stack, sess)
+        : col_op_join(&op, &stack, sess);
+    top = stack.top;
+    if (refused) {
+        /* The cached filter keeps its entry, so only it holds bytes. */
+        ok = rc == EINVAL && stack.top == 0
+            && (t->shape == NR_CACHED_KEEP || reserved_of(sess) == reserved)
+            && sess->filt_cache_active_pins == 0
+            && sess->arr_count == arrs && sess->diff_arr_count == diff_arrs
+            && sess->join_batch_fallback_count == fallbacks;
+    } else {
+        ok = rc == 0 && stack.top == 1 && stack.items[0].rel->nrows == 0
+            && stack.items[0].rel->ncols == left_cols
+            && sess->join_batch_fallback_count == fallbacks;
+    }
+    (void)eval_stack_drain(&stack);
+    if (left)
+        ok = ok && left->ncols == left_cols && left->nrows == left_rows;
+    if (!ok)
+        printf("(shape %d left %u owned %d mode %u: rc=%d top=%u) ",
+            (int)t->shape, t->left, t->owned, t->mode, rc, top);
+
+    /* The session still runs a valid keyed join and a nullary cross
+     * join. */
+    sess->join_batch_bytes = 0;
+    sess->join_batch_strict = false;
+    sess->delta_seeded = false;
+    init_join_op(&op, keys, keys);
+    op.right_relation = "other";
+    if (!left) {
+        left = make_left(row, 1);
+        left_rows = 1;
+        if (!left) {
+            ok = false;
+            goto cleanup;
+        }
+    }
+    if (left->ncols == 2) {
+        result = run_oracle(sess, left, &op);
+        ok = ok && result && result->nrows == left_rows;
+        col_rel_destroy(result);
+        result = NULL;
+    }
+    if (t->shape != NR_MISSING) {
+        op.right_relation = "right";
+        op.key_count = 0;
+        result = run_oracle(sess, left, &op);
+        ok = ok && result && result->ncols == left->ncols
+            && result->nrows
+            == (t->shape == NR_EMPTY_RIGHT ? 0u : left->nrows);
+    }
+cleanup:
+    if (rc == -1)
+        printf("(shape %d left %u: fixture) ", (int)t->shape, t->left);
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(result);
+    col_rel_destroy(seed);
+    col_rel_destroy(left);
+    col_rel_destroy(delta);
+    col_rel_destroy(other);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    return ok;
+}
+
+static bool
+run_nullary_right_matrix(bool diff)
+{
+    bool ok = true;
+
+    for (unsigned mode = 0; mode < 3; mode++) {
+        for (unsigned left = 0; left < 3; left++) {
+            for (int owned = 0; owned < 2; owned++) {
+                nullary_right_case_t t = {
+                    NR_PLAIN, left, owned != 0, mode, false
+                };
+                ok = run_nullary_right_case(&t, diff) && ok;
+            }
+        }
+        nullary_right_case_t delta_left = {
+            NR_PLAIN, 0, false, mode, true
+        };
+        nullary_right_case_t delta = {
+            NR_DELTA, 0, true, mode, false
+        };
+        nullary_right_case_t delta_keep = {
+            NR_DELTA_KEEP, 0, true, mode, false
+        };
+        nullary_right_case_t cached_keep = {
+            NR_CACHED_KEEP, 0, false, mode, false
+        };
+        nullary_right_case_t materialized = {
+            NR_MATERIALIZED, 0, false, mode, false
+        };
+        nullary_right_case_t empty_right = {
+            NR_EMPTY_RIGHT, 0, false, mode, false
+        };
+        ok = run_nullary_right_case(&delta_left, diff) && ok;
+        ok = run_nullary_right_case(&delta, diff) && ok;
+        ok = run_nullary_right_case(&delta_keep, diff) && ok;
+        ok = run_nullary_right_case(&cached_keep, diff) && ok;
+        ok = run_nullary_right_case(&materialized, diff) && ok;
+        ok = run_nullary_right_case(&empty_right, diff) && ok;
+    }
+    /* Knob off: a filter that empties the right, a missing right and a
+     * forced-empty right keep their results; the check never sees a row.
+     * With the knob set, an emptied filtered right still takes the
+     * filtered-right path (recorded, or ENOTSUP under strict mode), which
+     * other tests cover. */
+    nullary_right_case_t reject = { NR_DELTA_REJECT, 0, false, 0, false };
+    nullary_right_case_t missing = { NR_MISSING, 0, false, 0, false };
+    nullary_right_case_t forced = { NR_FORCED_EMPTY, 0, false, 0, false };
+    ok = run_nullary_right_case(&reject, diff) && ok;
+    ok = run_nullary_right_case(&missing, diff) && ok;
+    ok = run_nullary_right_case(&forced, diff) && ok;
+    return ok;
+}
+
+static void
+test_nonempty_nullary_right_cleanup(void)
+{
+    TEST("nullary keyed right refusal preserves ownership and reuse");
+    if (run_nullary_right_matrix(false))
+        PASS();
+    else
+        FAIL("nullary right refusal, cleanup or reuse mismatch");
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
@@ -5286,6 +5519,7 @@ main(void)
     test_operator_empty_right_and_row_too_large();
     test_operator_empty_left_nothing_to_bound();
     test_nonempty_nullary_left_cleanup();
+    test_nonempty_nullary_right_cleanup();
     test_diff_nonempty_nullary_left_cleanup();
     test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
