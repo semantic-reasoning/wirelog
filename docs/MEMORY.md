@@ -3575,3 +3575,30 @@ inert frame before returning its bootstrap receipt. It never adopts a foreign
 frame or retains a phantom failed-bootstrap owner. A successful original parent
 keeps its own independent final-close capacity. The host request and reply are
 external borrowed call objects and are never retained as cleanup authority.
+
+The generated-aware JOIN coverage now runs the actual parsed and lowered
+ordinary JOIN body, including its pushed-down numeric right predicate, through
+the terminal CONSOLIDATE and publication callback. The product fixture uses 64
+left rows and 513 right rows, of which 257 pass; the keyed fixture uses those
+same physical right rows and creates 16,448 unequal candidate comparisons in a
+single bucket while producing an empty result. Both fixtures assert the
+generated JOIN descriptor's nonempty predicate bytes before execution. They
+compare committed metadata and rows against a separately parsed raw session
+and literal geometry.
+
+The same full aware route exercises an original-operation work limit at a
+source-derived 57,472-unit local boundary from the measured final right-hash
+insertion through keyed candidate 128. The source charges 576 units to reach
+candidate 1, then 448 for each next candidate (parent WORK, match key CELL,
+phase17 CELL). One unit less reaches only 127 candidate comparisons; the exact amount
+reaches candidate 128 before deterministic cancellation. It also exercises
+cancellation during pair/candidate progress. It
+confirms the old registry,
+source descriptors and governed reservation baseline survive cleanup, then
+finishes the reported stopped generation and retries with a fresh original
+generation. The keyed total-reservation `T` versus `T-1` check is a measured
+single-worker acceptance allowance; it does not define a source tariff or the
+256-unit source quantum. HOST384 remains separate financing for each real
+callback. These tests cover this generated ordinary right-filter route only;
+they do not close whole STEP/SNAPSHOT, recursive, differential, weighted,
+TDD/parallel, LFTJ/K-fusion, or public/default #1821 coverage.

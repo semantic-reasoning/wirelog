@@ -1291,6 +1291,58 @@ find_plan_relation(const wl_plan_t *plan, const char *name)
     return NULL;
 }
 
+static void
+test_generated_ordinary_join_retains_right_filter(void)
+{
+    TEST("generated ordinary JOIN retains pushed-down right predicates");
+    static const struct {
+        const char *source;
+        uint32_t keys;
+    } cases[] = {
+        {".decl input(x:int64)\n"
+         ".decl right(y:int64,flag:int64)\n"
+         ".decl output(x:int64,y:int64)\n"
+         "output(x,y) :- input(x), right(y,1).\n", 0},
+        {".decl input(k:int64)\n"
+         ".decl right(k:int64,flag:int64)\n"
+         ".decl output(k:int64)\n"
+         "output(k) :- input(k), right(k,1).\n", 1}
+    };
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(cases[c].source,
+                &error);
+        ASSERT(program != NULL, "right-filter program parse failed");
+        wl_plan_t *plan = NULL;
+        ASSERT(!wl_plan_from_program(program, &plan) && plan,
+            "right-filter program must generate an execution plan");
+        const wl_plan_relation_t *output = find_plan_relation(plan, "output");
+        ASSERT(output && output->op_count >= 2,
+            "generated output relation is missing");
+        ASSERT(output->ops[0].op == WL_PLAN_OP_VARIABLE
+            && output->ops[output->op_count - 1].op ==
+            WL_PLAN_OP_CONSOLIDATE,
+            "generated body must retain VARIABLE and terminal CONSOLIDATE");
+        const wl_plan_op_t *join = NULL;
+        for (uint32_t i = 0; i < output->op_count; ++i) {
+            const wl_plan_op_t *op = &output->ops[i];
+            if (op->op == WL_PLAN_OP_JOIN && op->right_relation
+                && !strcmp(op->right_relation, "right")) {
+                ASSERT(!join, "generated body has duplicate right JOINs");
+                join = op;
+            }
+        }
+        ASSERT(join && join->key_count == cases[c].keys,
+            "generated ordinary JOIN has the expected key shape");
+        ASSERT(join->right_filter_expr.data
+            && join->right_filter_expr.size,
+            "right constant must lower to a nonempty JOIN predicate");
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+    PASS();
+}
+
 /* Issue #994: side-compound joins must lower from either atom position. */
 static void
 test_side_compound_lowers_in_either_atom_position(void)
@@ -1525,6 +1577,7 @@ main(void)
     test_join_with_composite_right_child_rejected();
     test_antijoin_with_composite_right_child_rejected();
     test_semijoin_with_composite_right_child_rejected();
+    test_generated_ordinary_join_retains_right_filter();
     test_side_compound_lowers_in_either_atom_position();
     test_plan_generation_diagnostics();
     test_float_plan_lowering();

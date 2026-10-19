@@ -1196,6 +1196,21 @@ after genuine child ACK, without rerunning the body or undoing the committed
 head. An original cancellation merely requested after cutoff stays sticky for
 the next attempt; `finish(0, 0)` does not poll it.
 
+Governed generated-body coverage also exercises ordinary JOINs whose lowered descriptor
+contains a nonempty numeric `right_filter_expr`. The actual generated relation
+body runs through terminal CONSOLIDATE and publication. Tests cover a 64-by-257
+filtered product and a keyed empty result that visits 16,448 colliding unequal
+candidates. A keyed stop tests the source-derived 57,472-unit local boundary
+from the final right-hash insertion through candidate 128: one unit less admits
+only 127 candidate comparisons, while the exact amount reaches candidate 128
+before deterministic cancellation.
+Separate cancellation cases stop during product pairs and keyed comparisons;
+each stopped generation is reported and retried with a fresh generation. HOST
+grants remain distinct from original
+operation work. These tests establish this initial generated route; they do not
+extend support to SEMI/ANTI right predicates, whole-session STEP/SNAPSHOT,
+recursive or differential evaluation, or public/default activation.
+
 Whole serial/TDD/multiworker strata and backend STEP/SNAPSHOT now reject attached
 controls before their first mutation, queue submission, original begin or finish.
 The public gates remain. The former direct-vtable controlled tests described
