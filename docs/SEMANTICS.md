@@ -1061,6 +1061,17 @@ a canonical full-plan retry uses the stable original registry and a new record
 after real cleanup and numeric ACK. This does not activate public/default
 session scheduling or complete issue #1821.
 
+### Generated COUNT REDUCE host boundary
+
+The aware-host generated one-group integer `COUNT` fixture scans 4096 rows.
+Phase 36 identifies entry into a source row before adding that row to the
+aggregate: progress 1023 marks the 1024th row. A high-limit attempt completes;
+the minimum allowance that reaches that checkpoint and a repeated run both
+stop with `WORK_LIMIT` before publication. A fresh generation on the same
+operation then publishes one result, `4096`, and matches raw execution. This
+is fixture-specific evidence, not a general REDUCE work tariff or proof for
+grouped aggregates, other functions, FLOAT, or other evaluator routes.
+
 ### Original two-entry replacement
 
 The private binary transaction snapshots the complete top two relation entries,
