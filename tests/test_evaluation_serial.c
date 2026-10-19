@@ -1729,6 +1729,154 @@ static const char entry_simple[] =
     "output(x) :- input(x).\n";
 static const int64_t entry_rows[] = {3, 1, 3, 2};
 
+static const char entry_generated_count_reduce[] =
+    ".decl input(x:int64)\n.decl output(n:int64)\n"
+    "output(count(x)) :- input(x).\n";
+static unsigned entry_reduce_checkpoint_count;
+static uint64_t entry_reduce_last_progress;
+static bool entry_reduce_target_seen;
+
+static void
+entry_reduce_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)control;
+    if (phase != 36) return;
+    ++entry_reduce_checkpoint_count;
+    entry_reduce_last_progress = progress;
+    if (progress == 1023) entry_reduce_target_seen = true;
+}
+
+typedef struct {
+    unsigned checkpoints;
+    uint64_t last_progress, consumed;
+    int result, cleanup_status;
+    wl_evaluation_control_stop_t stop_reason;
+    bool target_seen, committed;
+} entry_reduce_trial_t;
+
+static entry_reduce_trial_t
+entry_reduce_trial(uint64_t limit, bool require_success)
+{
+    int64_t rows[4096]; entry_map_fill_rows(rows, 4096);
+    entry_fixture_t f; entry_init(&f, entry_generated_count_reduce, rows,
+        4096, 1, limit);
+    const wl_plan_op_t *reduce = NULL; unsigned reduces = 0;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_REDUCE) {
+            reduce = &f.relation->ops[i]; ++reduces;
+        }
+    CHECK(reduces == 1 && reduce->agg_fn == WIRELOG_AGG_COUNT
+        && reduce->group_by_count == 0);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    col_rel_t **registry = f.session->rels;
+    uint32_t registry_count = f.session->nrels;
+    col_rel_t *input = session_find_rel(f.session, "input");
+    CHECK(input && input->nrows == 4096 && input->ncols == 1);
+    const int64_t *input_values = input->columns[0];
+    entry_reduce_checkpoint_count = 0;
+    entry_reduce_last_progress = UINT64_MAX;
+    entry_reduce_target_seen = false;
+    wl_columnar_ops_test_reduce_attempt_checkpoint = entry_reduce_checkpoint;
+    entry_complete(&f);
+    wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+
+    entry_reduce_trial_t trial = {
+        .checkpoints = entry_reduce_checkpoint_count,
+        .last_progress = entry_reduce_last_progress,
+        .target_seen = entry_reduce_target_seen,
+        .committed = f.reply.committed
+    };
+    if (f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        CHECK(!f.reply.committed && !session_find_rel(f.session, "output")
+            && session_rel_hash_lookup(f.session, "input") == input
+            && f.session->rels == registry && f.session->nrels == registry_count
+            && input->columns[0] == input_values && input->nrows == 4096
+            && wl_columnar_memory_reserved(governor) == reserved);
+        for (uint32_t i = 0; i < 4096; ++i)
+            CHECK(input_values[i] == (int64_t)i + 1);
+    } else {
+        CHECK(!f.reply.execution_result && f.reply.committed);
+        const col_rel_t *out = session_rel_hash_lookup(f.session, "output");
+        CHECK(out && out->nrows == 1 && out->ncols == 1
+            && out->columns[0][0] == 4096);
+    }
+    if (require_success)
+        CHECK(!f.reply.execution_result && f.reply.committed
+            && trial.checkpoints == 4096 && trial.last_progress == 4095);
+    else if (!trial.target_seen)
+        CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.attempt_id == f.id && !report.cleanup_status);
+    trial.consumed = report.consumed;
+    trial.result = report.result;
+    trial.stop_reason = report.stop_reason;
+    trial.cleanup_status = report.cleanup_status;
+    entry_destroy(&f);
+    return trial;
+}
+
+static void
+test_entry_generated_reduce_work_limit(void)
+{
+    const unsigned target = 1023;
+    const entry_reduce_trial_t high = entry_reduce_trial(UINT64_C(1) << 30,
+            true);
+    uint64_t low = 1, upper = UINT64_C(1) << 30;
+    while (low < upper) {
+        uint64_t mid = low + (upper - low) / 2;
+        entry_reduce_trial_t trial = entry_reduce_trial(mid, false);
+        if (trial.target_seen) upper = mid;
+        else low = mid + 1;
+    }
+    const uint64_t limit = low;
+    const entry_reduce_trial_t below = entry_reduce_trial(limit - 1, false);
+    const entry_reduce_trial_t boundary = entry_reduce_trial(limit, false);
+    const entry_reduce_trial_t repeat = entry_reduce_trial(limit, false);
+    CHECK(high.checkpoints == 4096 && high.last_progress == 4095
+        && high.committed && high.result == 0);
+    CHECK(!below.target_seen && below.last_progress == target - 1
+        && below.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && below.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(boundary.target_seen && boundary.last_progress == target
+        && boundary.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && boundary.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(repeat.target_seen && repeat.last_progress == target
+        && repeat.result == boundary.result
+        && repeat.consumed == boundary.consumed
+        && repeat.stop_reason == boundary.stop_reason
+        && repeat.cleanup_status == boundary.cleanup_status);
+
+    int64_t rows[4096]; entry_map_fill_rows(rows, 4096);
+    entry_fixture_t f; entry_init(&f, entry_generated_count_reduce, rows,
+        4096, 1, limit);
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !f.reply.committed && !session_find_rel(f.session, "output"));
+    const uint64_t stopped_id = f.id;
+    entry_finish_original(&f);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_configure(f.operation, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation,
+        f.session->base.operation_admission));
+    f.id = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(f.id && f.id != stopped_id);
+    f.previous.previous_valid = false;
+    f.reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *out = session_rel_hash_lookup(f.session, "output");
+    CHECK(out && out->nrows == 1 && out->ncols == 1
+        && out->columns[0][0] == 4096);
+    entry_compare(&f, entry_generated_count_reduce, rows, 4096, 1);
+    entry_destroy(&f);
+}
+
 static void
 entry_until(entry_fixture_t *f, wl_columnar_eval_serial_framed_phase_t phase)
 {
@@ -2054,6 +2202,7 @@ test_entry_generated_operators(void)
         entry_compare(&f, cases[i].source, entry_rows, 4, 1); entry_destroy(&f);
     }
     test_entry_generated_map_work_limit();
+    test_entry_generated_reduce_work_limit();
 }
 
 typedef struct {
