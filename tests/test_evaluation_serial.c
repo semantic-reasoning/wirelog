@@ -1608,6 +1608,116 @@ test_entry_shapes(void)
             }
 }
 
+static const char entry_generated_map[] =
+    ".decl input(x:int64)\n.decl output(y:int64)\n"
+    "output(x+1) :- input(x).\n";
+static unsigned entry_map_checkpoint_count;
+
+static void
+entry_map_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)control;
+    if (phase == 109 && progress == 0) ++entry_map_checkpoint_count;
+}
+
+static void
+entry_map_fill_rows(int64_t *rows, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) rows[i] = i + 1;
+}
+
+static unsigned
+entry_map_trial(uint64_t limit, bool require_stop, bool require_success)
+{
+    int64_t rows[4096]; entry_map_fill_rows(rows, 4096);
+    entry_fixture_t f; entry_init(&f, entry_generated_map, rows, 4096, 1,
+        limit);
+    const wl_plan_op_t *map = NULL; unsigned maps = 0;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_MAP) {
+            map = &f.relation->ops[i]; ++maps;
+        }
+    CHECK(maps == 1 && map->map_exprs && map->map_exprs[0].data
+        && map->map_exprs[0].size);
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    col_rel_t **registry = f.session->rels;
+    uint32_t registry_count = f.session->nrels;
+    col_rel_t *input = session_find_rel(f.session, "input");
+    CHECK(input && input->nrows == 4096 && input->ncols == 1);
+    const int64_t *input_values = input->columns[0];
+    entry_map_checkpoint_count = 0;
+    wl_columnar_filter_test_attempt_checkpoint = entry_map_checkpoint;
+    entry_complete(&f);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    unsigned reached = entry_map_checkpoint_count;
+    if (require_stop) {
+        CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !f.reply.committed && !session_find_rel(f.session, "output")
+            && session_find_rel(f.session, "input") == input
+            && f.session->rels == registry && f.session->nrels == registry_count
+            && input->columns[0] == input_values && input->nrows == 4096
+            && wl_columnar_memory_reserved(governor) == reserved);
+        for (uint32_t i = 0; i < 4096; ++i)
+            CHECK(input_values[i] == (int64_t)i + 1);
+    } else if (require_success) {
+        CHECK(!f.reply.execution_result && f.reply.committed);
+    }
+    entry_destroy(&f);
+    return reached;
+}
+
+static void
+test_entry_generated_map_work_limit(void)
+{
+    const unsigned target = 1023;
+    uint64_t low = 1, high = UINT64_C(1) << 30;
+    CHECK(entry_map_trial(high, false, true) == 4096);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        if (entry_map_trial(mid, false, false) > target) high = mid;
+        else low = mid + 1;
+    }
+    uint64_t limit = low;
+    CHECK(entry_map_trial(limit - 1, true, false) <= target);
+    CHECK(entry_map_trial(limit, true, false) == target + 1);
+    CHECK(entry_map_trial(limit, true, false) == target + 1);
+
+    int64_t rows[4096]; entry_map_fill_rows(rows, 4096);
+    entry_fixture_t f; entry_init(&f, entry_generated_map, rows, 4096, 1,
+        limit);
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !f.reply.committed && !session_find_rel(f.session, "output"));
+    uint64_t stopped_id = f.id;
+    CHECK(wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission,
+        WL_EVALUATION_CONTROL_WORK_LIMIT, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_configure(f.operation, 0));
+    CHECK(!wl_evaluation_control_begin(f.operation,
+        f.session->base.operation_admission));
+    f.id = wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(f.id && f.id != stopped_id);
+    f.previous.previous_valid = false;
+    f.reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_map_checkpoint_count = 0;
+    wl_columnar_filter_test_attempt_checkpoint = entry_map_checkpoint;
+    entry_complete(&f);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    CHECK(!f.reply.execution_result && f.reply.committed
+        && entry_map_checkpoint_count == 4096);
+    const col_rel_t *out = session_rel_hash_lookup(f.session, "output");
+    CHECK(out && out->nrows == 4096 && out->ncols == 1);
+    for (uint32_t i = 0; i < 4096; ++i)
+        CHECK(out->columns[0][i] == (int64_t)i + 2);
+    entry_compare(&f, entry_generated_map, rows, 4096, 1);
+    entry_destroy(&f);
+}
+
 static const char entry_simple[] =
     ".decl input(x:int64)\n.decl output(x:int64)\n"
     "output(x) :- input(x).\n";
@@ -1894,6 +2004,7 @@ test_entry_generated_operators(void)
                 CHECK(out->columns[0][r] == (int64_t)r + 1);
         entry_compare(&f, cases[i].source, entry_rows, 4, 1); entry_destroy(&f);
     }
+    test_entry_generated_map_work_limit();
 }
 
 typedef struct {
