@@ -1072,6 +1072,15 @@ operation then publishes one result, `4096`, and matches raw execution. This
 is fixture-specific evidence, not a general REDUCE work tariff or proof for
 grouped aggregates, other functions, FLOAT, or other evaluator routes.
 
+The generated grouped `COUNT` fixture also scans 4096 two-column rows across
+four recurring keys. Its phase 36 checkpoint is before the row's grouping and
+count update. The high-limit run checks each key's count, while the minimum
+allowance reaching progress 1023 and its repeat stop with `WORK_LIMIT` before
+publication; a fresh generation then retries and matches both the raw evaluator
+and the literal per-key counts. This covers grouped key creation and updates
+only in this generated framed route. It says nothing about metering the separate
+legacy result-to-head `append_all()` copy.
+
 ### Original two-entry replacement
 
 The private binary transaction snapshots the complete top two relation entries,
