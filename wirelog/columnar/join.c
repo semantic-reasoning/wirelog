@@ -2742,6 +2742,18 @@ wl_columnar_antijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         right_filtered = filtered;
     }
 
+    /* A nonempty nullary input on either side has no key column to probe;
+     * an empty nullary input is not refused on its own account.  The check
+     * follows the right filter, so a right it empties keeps its result, and
+     * a missing right has already repushed the left.  It precedes the
+     * keep-all scan (#1370) and the probe set (#2209). */
+    if (col_join_keyed_nullary(op, left_e.rel)
+        || col_join_keyed_nullary(op, right)) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
+    }
+
     col_rel_t *left = left_e.rel;
     uint32_t kc = op->key_count;
 
@@ -3152,6 +3164,18 @@ wl_columnar_semijoin_op(const wl_plan_op_t *op, eval_stack_t *stack,
         }
         right = filtered;
         right_filtered = filtered;
+    }
+
+    /* A nonempty nullary input on either side has no key column to probe;
+     * an empty nullary input is not refused on its own account.  The check
+     * follows the right filter, so a right it empties keeps its result, and
+     * a missing right has already repushed the left.  It precedes the
+     * keep-all scan (#1370) and the probe set (#2209). */
+    if (col_join_keyed_nullary(op, left_e.rel)
+        || col_join_keyed_nullary(op, right)) {
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
+        return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
     }
 
     col_rel_t *left = left_e.rel;

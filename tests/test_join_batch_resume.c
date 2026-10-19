@@ -4933,6 +4933,250 @@ test_diff_nonempty_nullary_right_cleanup(void)
         FAIL("diff nullary right refusal, cleanup or reuse mismatch");
 }
 
+/* #2209: a keyed SEMIJOIN or ANTIJOIN refuses with EINVAL a left input, or
+ * a right operand after the right filter, that has rows but no columns: it
+ * has no column 0 for its key to read.  A missing right still repushes the
+ * left.  Neither operator consults the bounded-join knob; running each case
+ * with the knob off, at 224 and at 224 strict only shows that nothing is
+ * recorded. */
+typedef enum { XL_ROW, XL_EMPTY, XL_NULLARY, XL_NULLARY_EMPTY } xl_kind_t;
+typedef enum {
+    XR_ROW, XR_EMPTY, XR_NULLARY, XR_NULLARY_EMPTY, XR_MISSING
+} xr_kind_t;
+
+typedef struct {
+    bool anti;
+    xl_kind_t left;
+    xr_kind_t right;
+    unsigned filter; /* 0 none, 1 keeps every row, 2 rejects every row */
+    bool owned;
+    unsigned mode;
+} existence_case_t;
+
+static bool
+run_existence_nullary_case(const existence_case_t *t)
+{
+    const char *left_names[] = { "col0", "col1" };
+    const char *right_names[] = { "k", "r" };
+    const char *left_key[] = { "col0" };
+    const char *right_key[] = { "k" };
+    const int64_t row[] = { 0, 1 };
+    const int64_t no_columns[1] = { 0 };
+    static uint8_t keep[] = { WL_PLAN_EXPR_BOOL, 1 };
+    static uint8_t reject[] = { WL_PLAN_EXPR_BOOL, 0 };
+    bool nullary_left = t->left == XL_NULLARY || t->left == XL_NULLARY_EMPTY;
+    bool left_rows = t->left == XL_ROW || t->left == XL_NULLARY;
+    bool nullary_right = t->right == XR_NULLARY
+        || t->right == XR_NULLARY_EMPTY;
+    bool right_rows = (t->right == XR_ROW || t->right == XR_NULLARY)
+        && t->filter != 2;
+    bool refused = (nullary_left && left_rows && t->right != XR_MISSING)
+        || (nullary_right && right_rows);
+    wl_col_session_t *sess = make_session(1u << 24);
+    col_rel_t *left = nullary_left ? col_rel_new_auto("left", 0)
+        : make_rel("left", 2, left_names);
+    col_rel_t *right = nullary_right ? col_rel_new_auto("right", 0)
+        : make_rel("right", 2, right_names);
+    col_rel_t *borrowed = NULL;
+    eval_stack_t stack;
+    wl_plan_op_t op;
+    uint32_t top = 0;
+    bool ok = false;
+    int rc = -1;
+
+    eval_stack_init(&stack);
+    if (!sess || !left || !right
+        || (left_rows && col_rel_append_row(left,
+        nullary_left ? no_columns : row) != 0)
+        || ((t->right == XR_ROW || t->right == XR_NULLARY)
+        && col_rel_append_row(right,
+        nullary_right ? no_columns : row) != 0)
+        || (t->right != XR_MISSING
+        && register_relation(sess, &right, "right") != 0))
+        goto cleanup;
+    memset(&op, 0, sizeof(op));
+    op.op = t->anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+    op.right_relation = "right";
+    op.key_count = 1;
+    op.left_keys = left_key;
+    op.right_keys = right_key;
+    if (t->filter)
+        op.right_filter_expr = (wl_plan_expr_buffer_t){
+            t->filter == 1 ? keep : reject, sizeof(keep)
+        };
+    uint64_t reserved = reserved_of(sess);
+    uint32_t fallbacks = sess->join_batch_fallback_count;
+    sess->join_batch_bytes = t->mode == 0 ? 0 : 224;
+    sess->join_batch_strict = t->mode == 2;
+    if (eval_stack_push(&stack, left, t->owned) != 0)
+        goto cleanup;
+    borrowed = t->owned ? NULL : left;
+    if (t->owned)
+        left = NULL; /* The stack/operator owns the original. */
+    rc = t->anti ? wl_columnar_antijoin_op(&op, &stack, sess)
+        : wl_columnar_semijoin_op(&op, &stack, sess);
+    top = stack.top;
+    if (refused) {
+        ok = rc == EINVAL && top == 0 && reserved_of(sess) == reserved;
+    } else {
+        /* ANTIJOIN keeps the left where no right row can match it; SEMIJOIN
+         * then keeps nothing. */
+        bool keep_left = t->right == XR_MISSING
+            || (t->anti && !right_rows);
+        uint32_t want = keep_left && left_rows ? 1u : 0u;
+        ok = rc == 0 && top == 1 && stack.items[0].rel->nrows == want;
+        /* A missing right repushes the left itself, and ANTIJOIN over an
+         * empty right passes it through (#1370). */
+        if (ok && borrowed && (t->right == XR_MISSING
+            || (t->anti && t->right == XR_NULLARY_EMPTY && left_rows)))
+            ok = stack.items[0].rel == borrowed;
+    }
+    ok = ok && sess->join_batch_fallback_count == fallbacks;
+    (void)eval_stack_drain(&stack);
+    if (borrowed)
+        ok = ok && borrowed->ncols == (nullary_left ? 0u : 2u)
+            && borrowed->nrows == (left_rows ? 1u : 0u);
+    if (!ok)
+        printf("(%s left %d right %d filter %u owned %d mode %u: rc=%d "
+            "top=%u) ", t->anti ? "anti" : "semi", (int)t->left,
+            (int)t->right, t->filter, t->owned, t->mode, rc, top);
+cleanup:
+    if (rc == -1)
+        printf("(%s left %d right %d: fixture) ", t->anti ? "anti" : "semi",
+            (int)t->left, (int)t->right);
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+    destroy_session(sess);
+    return ok;
+}
+
+/* The session is reused after a refusal, for a nullary existence check
+ * (key_count 0) over a nonempty nullary right and for a valid keyed one. */
+static bool
+run_existence_nullary_reuse(bool anti)
+{
+    const char *left_names[] = { "col0", "col1" };
+    const char *right_names[] = { "k", "r" };
+    const char *left_key[] = { "col0" };
+    const char *right_key[] = { "k" };
+    const int64_t row[] = { 0, 1 };
+    const int64_t no_columns[1] = { 0 };
+    wl_col_session_t *sess = make_session(1u << 24);
+    col_rel_t *left = make_rel("left", 2, left_names);
+    col_rel_t *nullary = col_rel_new_auto("nullary", 0);
+    col_rel_t *other = make_rel("other", 2, right_names);
+    eval_stack_t stack;
+    wl_plan_op_t op;
+    bool ok = false;
+
+    eval_stack_init(&stack);
+    if (!sess || !left || !nullary || !other
+        || col_rel_append_row(left, row) != 0
+        || col_rel_append_row(nullary, no_columns) != 0
+        || col_rel_append_row(other, row) != 0
+        || register_relation(sess, &nullary, "nullary") != 0
+        || register_relation(sess, &other, "other") != 0)
+        goto cleanup;
+    memset(&op, 0, sizeof(op));
+    op.op = anti ? WL_PLAN_OP_ANTIJOIN : WL_PLAN_OP_SEMIJOIN;
+    op.right_relation = "nullary";
+    op.key_count = 1;
+    op.left_keys = left_key;
+    op.right_keys = right_key;
+    for (int pass = 0; pass < 3; pass++) {
+        uint32_t want = 0;
+        int want_rc = 0;
+        int rc;
+        if (pass == 0) {
+            want_rc = EINVAL; /* keyed against the nullary right */
+        } else if (pass == 1) {
+            op.key_count = 0; /* existence of any right row */
+            want = anti ? 0u : 1u;
+        } else {
+            op.key_count = 1; /* keyed against a matching right row */
+            op.right_relation = "other";
+            want = anti ? 0u : 1u;
+        }
+        eval_stack_init(&stack);
+        if (eval_stack_push(&stack, left, false) != 0)
+            goto cleanup;
+        rc = anti ? wl_columnar_antijoin_op(&op, &stack, sess)
+            : wl_columnar_semijoin_op(&op, &stack, sess);
+        if (rc != want_rc || (rc == 0 && (stack.top != 1
+            || stack.items[0].rel->nrows != want))) {
+            printf("(%s reuse pass %d: rc=%d) ", anti ? "anti" : "semi",
+                pass, rc);
+            goto cleanup;
+        }
+        (void)eval_stack_drain(&stack);
+    }
+    ok = left->nrows == 1 && left->ncols == 2;
+cleanup:
+    (void)eval_stack_drain(&stack);
+    col_rel_destroy(left);
+    col_rel_destroy(nullary);
+    col_rel_destroy(other);
+    destroy_session(sess);
+    return ok;
+}
+
+static void
+test_existence_join_nonempty_nullary_cleanup(void)
+{
+    bool ok = true;
+
+    TEST("existence join nullary keyed refusal preserves the left");
+    for (int anti = 0; anti < 2; anti++) {
+        for (unsigned mode = 0; mode < 3; mode++) {
+            for (int owned = 0; owned < 2; owned++) {
+                /* Nonempty nullary left against each right operand. */
+                for (int r = XR_ROW; r <= XR_MISSING; r++) {
+                    existence_case_t t = {
+                        anti != 0, XL_NULLARY, (xr_kind_t)r, 0,
+                        owned != 0, mode
+                    };
+                    ok = run_existence_nullary_case(&t) && ok;
+                }
+                /* Each left against a nonempty nullary right. */
+                for (int l = XL_ROW; l <= XL_NULLARY_EMPTY; l++) {
+                    existence_case_t t = {
+                        anti != 0, (xl_kind_t)l, XR_NULLARY, 0,
+                        owned != 0, mode
+                    };
+                    ok = run_existence_nullary_case(&t) && ok;
+                }
+            }
+            /* A filter keeping the nullary right still refuses; one
+             * rejecting every row leaves an empty right, which is not. */
+            for (unsigned f = 1; f <= 2; f++) {
+                existence_case_t t = {
+                    anti != 0, XL_ROW, XR_NULLARY, f, false, mode
+                };
+                ok = run_existence_nullary_case(&t) && ok;
+            }
+            /* Empty nullary inputs keep their results. */
+            existence_case_t empty_right = {
+                anti != 0, XL_ROW, XR_NULLARY_EMPTY, 0, false, mode
+            };
+            existence_case_t both_empty = {
+                anti != 0, XL_NULLARY_EMPTY, XR_NULLARY_EMPTY, 0, false, mode
+            };
+            existence_case_t empty_left = {
+                anti != 0, XL_NULLARY_EMPTY, XR_ROW, 0, false, mode
+            };
+            ok = run_existence_nullary_case(&empty_right) && ok;
+            ok = run_existence_nullary_case(&both_empty) && ok;
+            ok = run_existence_nullary_case(&empty_left) && ok;
+        }
+        ok = run_existence_nullary_reuse(anti != 0) && ok;
+    }
+    if (ok)
+        PASS();
+    else
+        FAIL("existence join nullary refusal, result or reuse mismatch");
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
@@ -5548,6 +5792,7 @@ main(void)
     test_nonempty_nullary_left_cleanup();
     test_nonempty_nullary_right_cleanup();
     test_diff_nonempty_nullary_right_cleanup();
+    test_existence_join_nonempty_nullary_cleanup();
     test_diff_nonempty_nullary_left_cleanup();
     test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
