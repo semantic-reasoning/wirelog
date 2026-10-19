@@ -3602,3 +3602,11 @@ single-worker acceptance allowance; it does not define a source tariff or the
 callback. These tests cover this generated ordinary right-filter route only;
 they do not close whole STEP/SNAPSHOT, recursive, differential, weighted,
 TDD/parallel, LFTJ/K-fusion, or public/default #1821 coverage.
+
+The generated product route also pins an empirical original-work boundary at
+pair 128. An unlimited attempt is cancelled at that JOIN checkpoint; its
+reported consumed work supplies the fixture-specific allowance. One unit less
+stops before checkpoint 128 after 127 pair callbacks, while the exact
+allowance reaches checkpoint 128 and deterministic cancellation. Output-cell
+and B2 append charges vary between pairs, so this is not a universal product
+tariff or a substitute for the keyed source-derived boundary above.

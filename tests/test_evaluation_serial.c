@@ -2307,6 +2307,112 @@ test_entry_generated_right_filter_collisions_and_stop(void)
     entry_destroy(&product);
 }
 
+static void
+test_entry_generated_right_filter_product_work_boundary(void)
+{
+    int64_t input_rows[64], right_rows[513 * 2];
+    entry_large_inputs(input_rows, right_rows, false);
+    const entry_input_t inputs[] = {
+        {"input", input_rows, 64, 1},
+        {"right", right_rows, 513, 2}
+    };
+
+    /* Capture the actual original-control allowance through the exact
+     * candidate checkpoint. Product output-cell and B2 charges vary by row,
+     * so this is a fixture-specific empirical boundary, not a source tariff. */
+    entry_fixture_t anchor;
+    entry_init_inputs(&anchor, entry_filter_product, inputs, 2, 0);
+    (void)entry_assert_generated_join(&anchor, "right", 0);
+    col_rel_t **old_rels = anchor.session->rels;
+    uint32_t old_nrels = anchor.session->nrels;
+    col_rel_t *old_input = session_find_rel(anchor.session, "input");
+    col_rel_t *old_right = session_find_rel(anchor.session, "right");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(anchor.governor));
+    entry_join_probe_t anchor_probe = {
+        .operation = anchor.operation,
+        .cancel_after = 128,
+        .cancel_phase = 17
+    };
+    entry_join_probe = &anchor_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&anchor);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(anchor_probe.cancelled && anchor_probe.phase46_hits == 257
+        && anchor_probe.phase17_hits == 128
+        && anchor.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED);
+    entry_assert_unpublished_and_unchanged(&anchor, old_rels, old_nrels,
+        old_input, old_right, input_rows, right_rows, reserved);
+    entry_finish_original(&anchor);
+    wl_evaluation_control_report_t anchor_report;
+    CHECK(!wl_evaluation_control_report(anchor.operation, &anchor_report)
+        && anchor_report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && anchor_report.consumed > 0);
+    uint64_t checkpoint_allowance = anchor_report.consumed;
+    entry_retry_after_finished_stop(&anchor, entry_filter_product, inputs, 2);
+    entry_destroy(&anchor);
+
+    /* The one-unit-short charge cannot admit the 128-unit candidate
+     * checkpoint charge, so the callback sees exactly 127 candidates. */
+    entry_fixture_t short_one;
+    entry_init_inputs(&short_one, entry_filter_product, inputs, 2,
+        checkpoint_allowance - 1);
+    (void)entry_assert_generated_join(&short_one, "right", 0);
+    old_rels = short_one.session->rels;
+    old_nrels = short_one.session->nrels;
+    old_input = session_find_rel(short_one.session, "input");
+    old_right = session_find_rel(short_one.session, "right");
+    reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(short_one.governor));
+    entry_join_probe_t short_probe = {.operation = short_one.operation};
+    entry_join_probe = &short_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&short_one);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(short_one.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && short_probe.phase46_hits == 257
+        && short_probe.phase17_hits == 127 && !short_one.reply.committed);
+    entry_assert_unpublished_and_unchanged(&short_one, old_rels, old_nrels,
+        old_input, old_right, input_rows, right_rows, reserved);
+    entry_finish_original(&short_one);
+    wl_evaluation_control_report_t short_report;
+    CHECK(!wl_evaluation_control_report(short_one.operation, &short_report)
+        && short_report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    entry_retry_after_finished_stop(&short_one, entry_filter_product, inputs,
+        2);
+    entry_destroy(&short_one);
+
+    /* At the measured allowance the same callback is reachable exactly;
+     * cancellation makes the cutoff deterministic before candidate output. */
+    entry_fixture_t exact;
+    entry_init_inputs(&exact, entry_filter_product, inputs, 2,
+        checkpoint_allowance);
+    (void)entry_assert_generated_join(&exact, "right", 0);
+    entry_join_probe_t exact_probe = {
+        .operation = exact.operation,
+        .cancel_after = 128,
+        .cancel_phase = 17
+    };
+    entry_join_probe = &exact_probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    entry_complete(&exact);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(exact_probe.cancelled && exact_probe.phase46_hits == 257
+        && exact_probe.phase17_hits == 128
+        && exact.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !exact.reply.committed);
+    entry_finish_original(&exact);
+    wl_evaluation_control_report_t exact_report;
+    CHECK(!wl_evaluation_control_report(exact.operation, &exact_report)
+        && exact_report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && exact_report.consumed == checkpoint_allowance);
+    entry_retry_after_finished_stop(&exact, entry_filter_product, inputs, 2);
+    entry_destroy(&exact);
+}
+
 static wl_columnar_eval_serial_framed_host_request_t
 entry_request(entry_fixture_t *f, grant_t *grant)
 {
@@ -2436,6 +2542,7 @@ main(void)
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
     test_entry_generated_right_filter_collisions_and_stop();
+    test_entry_generated_right_filter_product_work_boundary();
     test_entry_receipts(); test_entry_bootstrap_failures();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_unsupported_generated();
