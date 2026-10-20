@@ -724,6 +724,17 @@ addon/callback duration and mandatory cleanup/rollback/task drain are excluded
 from the unit-to-return bound. There is no millisecond deadline guarantee.
 Cleanup remains permitted after exhaustion so recovery can retain/release owners.
 
+### Delta observer retirement retry
+
+Observer cleanup releases readers and physical staging/baseline storage before
+returning their memory credits. A refused credit remains owned with its original
+identity so a later cleanup can retry without repeating completed frees. If a
+completed STEP has already delivered its callback and bookkeeping but observer
+retirement then fails, the next STEP call retries retirement only; it does not
+evaluate again or deliver the callback twice. Retirement left by observer
+construction failure is cleared before the next evaluation. This defines cleanup
+retry only; it does not enable controlled observed STEP evaluation.
+
 ### Required recovery and publication contract (not implemented here)
 
 One external STEP or evaluating SNAPSHOT is one attempt, including an internal
