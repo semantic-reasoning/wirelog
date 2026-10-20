@@ -9605,6 +9605,8 @@ cleanup:
 
 extern void (*wl_columnar_eval_delta_test_observer_boundary)(wl_col_session_t *,
     unsigned);
+extern void (*wl_columnar_eval_delta_test_before_retire_credit)(
+    wl_col_session_t *, unsigned, wl_columnar_memory_reservation_t *);
 static unsigned observer_seen_plans;
 static wl_columnar_source_access_reader_t observer_result_reader;
 
@@ -11917,6 +11919,160 @@ observer_inject_boundary(wl_col_session_t *sess, unsigned boundary)
     }
 }
 
+static unsigned observer_retire_credit, observer_retire_calls;
+static wl_columnar_memory_reservation_t *observer_retire_token;
+static const void *observer_retire_identity;
+
+static void
+observer_refuse_retire_credit(wl_col_session_t *sess, unsigned credit,
+    wl_columnar_memory_reservation_t *token)
+{
+    (void)sess;
+    if (credit != observer_retire_credit || observer_retire_calls
+        || (atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+        return;
+    observer_retire_calls++;
+    observer_retire_token = token;
+    observer_retire_identity = token->identity;
+    token->identity = NULL;
+}
+
+static void
+test_observer_retirement_credit(unsigned credit)
+{
+    TEST("observer retirement: credit refusal retains authority for retry");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "A", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+    int64_t one = 1, two = 2;
+#define RETIRE_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    observer_retire_credit = credit;
+    observer_retire_calls = 0;
+    observer_retire_token = NULL;
+    observer_retire_identity = NULL;
+    RETIRE_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    RETIRE_CHECK(wl_session_insert(session, "input", &one, 1, 1) == 0
+        && wl_session_step(session) == 0, "baseline step");
+    deltas.count = 0;
+    RETIRE_CHECK(wl_session_insert(session, "input", &two, 1, 1) == 0,
+        "insert second row");
+    wl_columnar_eval_delta_test_before_retire_credit =
+        observer_refuse_retire_credit;
+    RETIRE_CHECK(wl_session_step(session) == EINVAL,
+        "credit identity refusal was not returned");
+    wl_columnar_eval_delta_test_before_retire_credit = NULL;
+    RETIRE_CHECK(observer_retire_calls == 1 && observer_retire_token
+        && observer_retire_identity == observer_retire_token
+        && observer_retire_token->identity == NULL
+        && atomic_load_explicit(&observer_retire_token->state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED,
+        "refused token authority was not retained");
+    RETIRE_CHECK(sess->delta_observer_retirement
+        == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_COMPLETED_STEP
+        && sess->delta_observer_reserved_bytes >= observer_retire_token->bytes
+        && deltas.count == 1,
+        "completed step state was lost after retirement refusal");
+    observer_retire_token->identity = observer_retire_identity;
+    serial_scope_hook_calls = 0;
+    wl_columnar_eval_serial_test_after_plan = count_serial_scope_hook;
+    RETIRE_CHECK(wl_session_step(session) == 0
+        && serial_scope_hook_calls == 0 && deltas.count == 1
+        && !sess->delta_observer && sess->delta_observer_reserved_bytes == 0
+        && sess->delta_observer_retirement
+        == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        && atomic_load_explicit(&sess->delta_observer_retirement_metadata.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY,
+        "retirement retry reevaluated or left authority behind");
+    observer_retire_token = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    RETIRE_CHECK(has_delta(&deltas, "A", &two, 1, +1),
+        "completed step callback was not preserved");
+cleanup:
+    wl_columnar_eval_delta_test_before_retire_credit = NULL;
+    wl_columnar_eval_serial_test_after_plan = NULL;
+    if (observer_retire_token && observer_retire_token->identity == NULL)
+        observer_retire_token->identity = observer_retire_identity;
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef RETIRE_CHECK
+}
+
+static void
+test_observer_begin_abort_retirement(void)
+{
+    TEST(
+        "observer retirement: begin abort preserves initiating error and retries");
+    wl_plan_op_t op = { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" };
+    wl_plan_relation_t relation = { .name = "A", .ops = &op, .op_count = 1 };
+    wl_plan_stratum_t stratum = { .relations = &relation, .relation_count = 1 };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    wl_col_session_t *sess;
+    delta_collector_t deltas = { 0 };
+    const char *failure = NULL;
+#define BEGIN_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    observer_retire_credit = WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_METADATA;
+    observer_retire_calls = 0;
+    observer_retire_token = NULL;
+    observer_retire_identity = NULL;
+    BEGIN_CHECK(wl_session_create(wl_backend_columnar(), &plan, 1,
+        &session) == 0, "create");
+    sess = COL_SESSION(session);
+    wl_session_set_delta_cb(session, collect_delta, &deltas);
+    relation.name = NULL;
+    wl_columnar_eval_delta_test_before_retire_credit =
+        observer_refuse_retire_credit;
+    BEGIN_CHECK(wl_columnar_eval_delta_observer_begin(sess, UINT64_MAX)
+        == EINVAL, "observer begin did not preserve its initiating error");
+    wl_columnar_eval_delta_test_before_retire_credit = NULL;
+    BEGIN_CHECK(observer_retire_calls == 1 && !sess->delta_observer
+        && sess->delta_observer_retirement
+        == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT
+        && observer_retire_token == &sess->delta_observer_retirement_metadata
+        && observer_retire_token->identity == NULL,
+        "begin-abort metadata authority was not retained");
+    observer_retire_token->identity = observer_retire_identity;
+    relation.name = "A";
+    BEGIN_CHECK(wl_session_step(session) == 0 && !sess->delta_observer
+        && sess->delta_observer_retirement
+        == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE
+        && sess->delta_observer_reserved_bytes == 0,
+        "next step did not retire begin-abort state before evaluation");
+    observer_retire_token = NULL;
+cleanup:
+    wl_columnar_eval_delta_test_before_retire_credit = NULL;
+    if (observer_retire_token && observer_retire_token->identity == NULL)
+        observer_retire_token->identity = observer_retire_identity;
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef BEGIN_CHECK
+}
+
 static void
 test_observer_completion_retry(unsigned mode, bool cancel)
 {
@@ -11933,6 +12089,7 @@ test_observer_completion_retry(unsigned mode, bool cancel)
     delta_collector_t deltas = { 0 };
     const char *failure = NULL;
     int64_t one = 1, two = 2;
+    int retry_rc = -1;
 #define COMPLETE_CHECK(condition, message) \
         do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
     memset(&observer_compaction_reader, 0, sizeof(observer_compaction_reader));
@@ -11977,7 +12134,8 @@ test_observer_completion_retry(unsigned mode, bool cancel)
             "compaction reader release");
     serial_scope_hook_calls = 0;
     wl_columnar_eval_serial_test_after_plan = count_serial_scope_hook;
-    COMPLETE_CHECK(wl_session_step(session) == 0 && serial_scope_hook_calls == 0
+    retry_rc = wl_session_step(session);
+    COMPLETE_CHECK(retry_rc == 0 && serial_scope_hook_calls == 0
         && !sess->delta_observer && sess->delta_observer_reserved_bytes == 0
         && session_find_rel(sess, "A")->nrows == 2
         && deltas.count == (cancel ? 0 : 1)
@@ -16595,6 +16753,13 @@ main(void)
     test_observer_completion_retry(0, false);
     test_observer_completion_retry(0, true);
     test_observer_completion_retry(2, false);
+    test_observer_retirement_credit(
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_STAGING);
+    test_observer_retirement_credit(
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_PAYLOAD);
+    test_observer_retirement_credit(
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_METADATA);
+    test_observer_begin_abort_retirement();
 #ifdef WL_TEST_ALLOC_WRAP
     test_observer_completion_retry(1, false);
     test_observer_capture_failure(0);
