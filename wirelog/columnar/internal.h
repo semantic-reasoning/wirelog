@@ -1950,6 +1950,19 @@ typedef struct wl_columnar_session_source_lease {
 typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t;
 typedef struct wl_columnar_eval_delta_observer wl_columnar_eval_delta_observer_t;
 
+typedef enum {
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE = 0,
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT,
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_COMPLETED_STEP,
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_DISCARD,
+} wl_columnar_eval_delta_observer_retire_t;
+
+enum wl_columnar_eval_delta_observer_retire_credit {
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_STAGING = 1,
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_PAYLOAD,
+    WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_METADATA,
+};
+
 /* Durable continuation for a plain STEP whose worker merge completed but
  * checked publication/compaction was refused.  This state contains only
  * bounded scalar cursors; worker contexts and temporary plans are never
@@ -2379,6 +2392,12 @@ typedef struct wl_col_session_t {
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;
     uint64_t delta_observer_reserved_bytes;
+    /* Keep metadata credit alive after the observer allocation is freed if
+     * its checked retirement refuses. A later serialized cleanup retries it. */
+    wl_columnar_memory_reservation_t delta_observer_retirement_metadata;
+    wl_columnar_memory_governor_ref_t *delta_observer_retirement_governor;
+    wl_columnar_eval_delta_observer_retire_t delta_observer_retirement;
+    bool delta_observer_retirement_gc;
     bool delta_publish_active;
     bool delta_publish_cancelled;
     /* Serial K-Fusion retains refused evaluator entries here until the

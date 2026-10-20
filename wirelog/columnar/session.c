@@ -3059,6 +3059,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     sess->memory_governor = memory_governor;
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     wl_columnar_memory_reservation_init(&sess->rels_reservation);
+    wl_columnar_memory_reservation_init(
+        &sess->delta_observer_retirement_metadata);
     wl_columnar_memory_reservation_init(&sess->delta_queue_ring_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
@@ -3959,6 +3961,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->delta_rollback_reserved_bytes = 0;
     out_worker->delta_observer = NULL;
     out_worker->delta_observer_reserved_bytes = 0;
+    wl_columnar_memory_reservation_init(
+        &out_worker->delta_observer_retirement_metadata);
+    out_worker->delta_observer_retirement_governor = NULL;
+    out_worker->delta_observer_retirement =
+        WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE;
+    out_worker->delta_observer_retirement_gc = false;
     out_worker->delta_publish_active = false;
     out_worker->delta_publish_cancelled = false;
     out_worker->retained_eval_entries = NULL;
@@ -5287,6 +5295,20 @@ static int
 col_session_step_impl(wl_session_t *session)
 {
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->delta_observer_retirement
+        == WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_COMPLETED_STEP) {
+        int retire_rc = wl_columnar_eval_delta_observer_discard(sess);
+        if (retire_rc != 0)
+            return retire_rc;
+        col_session_reclaim_quiescent(sess);
+        return 0;
+    }
+    if (sess->delta_observer_retirement
+        != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE) {
+        int retire_rc = wl_columnar_eval_delta_observer_discard(sess);
+        if (retire_rc != 0)
+            return retire_rc;
+    }
     wl_columnar_session_budget_denial_clear(sess);
     if (sess->plain_step_completion_pending
         && sess->plain_step_completion_active)
