@@ -2036,6 +2036,305 @@ test_entry_generated_grouped_count_work_limit(void)
     entry_destroy(&f);
 }
 
+typedef struct {
+    entry_fixture_t *fixture;
+    unsigned phase46_hits, phase47_hits;
+    uint64_t phase47_last_progress;
+    bool target_seen;
+} entry_numeric_reduce_probe_t;
+
+static entry_numeric_reduce_probe_t *entry_numeric_reduce_probe;
+
+static void
+entry_numeric_reduce_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    entry_numeric_reduce_probe_t *probe = entry_numeric_reduce_probe;
+    if (!probe) return;
+    bool belongs = control == probe->fixture->operation;
+    for (unsigned i = 0; i < 3; ++i)
+        belongs |= control == probe->fixture->grants[i].control;
+    CHECK(belongs && wl_evaluation_control_active_attempt_id(control));
+    if (phase == 46) ++probe->phase46_hits;
+    if (phase == 47) {
+        ++probe->phase47_hits;
+        probe->phase47_last_progress = progress;
+        /* phase 47 runs after the private group value is updated. */
+        if (progress == 1023) probe->target_seen = true;
+    }
+}
+
+typedef struct {
+    const char *name;
+    const char *source;
+    wirelog_agg_fn_t fn;
+    bool floating;
+    int64_t expected_integer[4];
+    double expected_float[4];
+} entry_numeric_reduce_case_t;
+
+static const entry_numeric_reduce_case_t entry_numeric_reduce_cases[] = {
+    {.name = "MIN", .source = ".decl input(k:int64,x:int64)\n"
+         ".decl output(k:int64,n:int64)\n"
+         "output(k,min(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_MIN,
+     .expected_integer = {-2048, -2047, -2046, -2045}},
+    {.name = "SUM", .source = ".decl input(k:int64,x:int64)\n"
+         ".decl output(k:int64,n:int64)\n"
+         "output(k,sum(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_SUM,
+     .expected_integer = {-2048, -1024, 0, 1024}},
+    {.name = "MAX", .source = ".decl input(k:int64,x:int64)\n"
+         ".decl output(k:int64,n:int64)\n"
+         "output(k,max(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_MAX,
+     .expected_integer = {2044, 2045, 2046, 2047}},
+    {.name = "FLOAT MIN", .source = ".decl input(k:int64,x:float)\n"
+         ".decl output(k:int64,n:float)\n"
+         "output(k,min(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_MIN,
+     .floating = true,
+     .expected_float = {-512.0, -511.75, -511.5, -511.25}},
+    {.name = "FLOAT SUM", .source = ".decl input(k:int64,x:float)\n"
+         ".decl output(k:int64,n:float)\n"
+         "output(k,sum(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_SUM,
+     .floating = true,
+     .expected_float = {-512.0, -256.0, 0.0, 256.0}},
+    {.name = "FLOAT MAX", .source = ".decl input(k:int64,x:float)\n"
+         ".decl output(k:int64,n:float)\n"
+         "output(k,max(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_MAX,
+     .floating = true,
+     .expected_float = {511.0, 511.25, 511.5, 511.75}},
+    {.name = "FLOAT AVG", .source = ".decl input(k:int64,x:float)\n"
+         ".decl output(k:int64,n:float)\n"
+         "output(k,average(x)) :- input(k,x).\n", .fn = WIRELOG_AGG_AVG,
+     .floating = true,
+     .expected_float = {-0.5, -0.25, 0.0, 0.25}}
+};
+
+static uint32_t
+entry_numeric_reduce_float_index(uint32_t row)
+{
+    const uint32_t group_index = row / 4;
+    if (group_index == 0) return 512;
+    if (group_index == 1) return 1023;
+    if (group_index == 2) return 0;
+    const uint32_t remaining = group_index - 3;
+    return remaining < 511 ? remaining + 1 : remaining + 2;
+}
+
+static int64_t
+entry_numeric_reduce_input_value(uint32_t row, bool floating)
+{
+    if (!floating) return (int64_t)row - 2048;
+    const uint32_t key = row % 4;
+    const uint32_t value_index = entry_numeric_reduce_float_index(row);
+    const double value = (double)((int64_t)4 * value_index + key - 2048)
+        / 4.0;
+    return (int64_t)wl_columnar_float_to_bits(value);
+}
+
+static void
+entry_numeric_reduce_fill_rows(int64_t rows[4096 * 2])
+{
+    for (uint32_t i = 0; i < 4096; ++i) {
+        rows[2 * i] = (int64_t)(i % 4);
+        rows[2 * i + 1] = entry_numeric_reduce_input_value(i, false);
+    }
+}
+
+static void
+entry_numeric_reduce_fill_float_rows(int64_t rows[4096 * 2])
+{
+    for (uint32_t i = 0; i < 4096; ++i) {
+        rows[2 * i] = (int64_t)(i % 4);
+        rows[2 * i + 1] = entry_numeric_reduce_input_value(i, true);
+    }
+}
+
+static void
+entry_numeric_reduce_assert_output(const col_rel_t *out,
+    const entry_numeric_reduce_case_t *test_case)
+{
+    CHECK(out && out->nrows == 4 && out->ncols == 2);
+    bool found[4] = {false, false, false, false};
+    if (test_case->floating)
+        CHECK(out->column_types
+            && out->column_types[0] == WIRELOG_TYPE_INT64
+            && out->column_types[1] == WIRELOG_TYPE_FLOAT);
+    for (uint32_t r = 0; r < out->nrows; ++r) {
+        int64_t key = out->columns[0][r];
+        CHECK(key >= 0 && key < 4 && !found[key]);
+        if (test_case->floating)
+            CHECK(out->columns[1][r] == (int64_t)
+                wl_columnar_float_to_bits(test_case->expected_float[key]));
+        else
+            CHECK(out->columns[1][r] == test_case->expected_integer[key]);
+        found[key] = true;
+    }
+    CHECK(found[0] && found[1] && found[2] && found[3]);
+}
+
+typedef struct {
+    unsigned phase46_hits, phase47_hits;
+    uint64_t phase47_last_progress, consumed;
+    int result, cleanup_status;
+    wl_evaluation_control_stop_t stop_reason;
+    bool target_seen, committed;
+} entry_numeric_reduce_trial_t;
+
+static entry_numeric_reduce_trial_t
+entry_numeric_reduce_trial(const entry_numeric_reduce_case_t *test_case,
+    uint64_t limit, bool require_success)
+{
+    int64_t rows[4096 * 2];
+    if (test_case->floating) entry_numeric_reduce_fill_float_rows(rows);
+    else entry_numeric_reduce_fill_rows(rows);
+    entry_input_t input = {"input", rows, 4096, 2};
+    entry_fixture_t f;
+    entry_init_inputs(&f, test_case->source, &input, 1, limit);
+    const wl_plan_op_t *reduce = NULL;
+    unsigned reduces = 0;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_REDUCE) {
+            reduce = &f.relation->ops[i];
+            ++reduces;
+        }
+    CHECK(reduces == 1 && reduce->agg_fn == test_case->fn
+        && reduce->group_by_count == 1 && reduce->group_by_indices
+        && reduce->group_by_indices[0] == 0 && reduce->aggregate_index == 1
+        && reduce->agg_operand_type == (test_case->floating
+            ? WL_PLAN_AGG_OPERAND_FLOAT : WL_PLAN_AGG_OPERAND_SCALAR)
+        && reduce->agg_result_type == (test_case->floating
+            ? WL_PLAN_AGG_OPERAND_FLOAT : WL_PLAN_AGG_OPERAND_SCALAR));
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor);
+    uint64_t reserved = wl_columnar_memory_reserved(governor);
+    col_rel_t **registry = f.session->rels;
+    uint32_t registry_count = f.session->nrels;
+    col_rel_t *source = session_find_rel(f.session, "input");
+    CHECK(source && source->nrows == 4096 && source->ncols == 2);
+    if (test_case->floating)
+        CHECK(source->column_types
+            && source->column_types[0] == WIRELOG_TYPE_INT64
+            && source->column_types[1] == WIRELOG_TYPE_FLOAT);
+    const int64_t *source_keys = source->columns[0];
+    const int64_t *source_values = source->columns[1];
+    entry_numeric_reduce_probe_t probe = {.fixture = &f,
+                                          .phase47_last_progress = UINT64_MAX};
+    entry_numeric_reduce_probe = &probe;
+    wl_columnar_ops_test_reduce_attempt_checkpoint =
+        entry_numeric_reduce_checkpoint;
+    entry_complete(&f);
+    wl_columnar_ops_test_reduce_attempt_checkpoint = NULL;
+    entry_numeric_reduce_probe = NULL;
+
+    entry_numeric_reduce_trial_t trial = {
+        .phase46_hits = probe.phase46_hits,
+        .phase47_hits = probe.phase47_hits,
+        .phase47_last_progress = probe.phase47_last_progress,
+        .target_seen = probe.target_seen,
+        .committed = f.reply.committed
+    };
+    if (f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        CHECK(!f.reply.committed && !session_find_rel(f.session, "output")
+            && session_rel_hash_lookup(f.session, "input") == source
+            && f.session->rels == registry && f.session->nrels == registry_count
+            && source->columns[0] == source_keys
+            && source->columns[1] == source_values && source->nrows == 4096
+            && wl_columnar_memory_reserved(governor) == reserved);
+        for (uint32_t i = 0; i < 4096; ++i)
+            CHECK(source_keys[i] == (int64_t)(i % 4)
+                && source_values[i] == entry_numeric_reduce_input_value(i,
+                test_case->floating));
+    } else {
+        CHECK(!f.reply.execution_result && f.reply.committed);
+        entry_numeric_reduce_assert_output(
+            session_rel_hash_lookup(f.session, "output"), test_case);
+    }
+    if (require_success)
+        CHECK(!f.reply.execution_result && f.reply.committed
+            && trial.phase46_hits == 4 && trial.phase47_hits == 4092
+            && trial.phase47_last_progress == 4095);
+    else if (!trial.target_seen)
+        CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.attempt_id == f.id && !report.cleanup_status);
+    trial.consumed = report.consumed;
+    trial.result = report.result;
+    trial.stop_reason = report.stop_reason;
+    trial.cleanup_status = report.cleanup_status;
+    entry_destroy(&f);
+    return trial;
+}
+
+static void
+test_entry_generated_grouped_numeric_reduce_work_limit(void)
+{
+    for (unsigned i = 0; i < sizeof(entry_numeric_reduce_cases)
+        / sizeof(entry_numeric_reduce_cases[0]); ++i) {
+        const entry_numeric_reduce_case_t *test_case =
+            &entry_numeric_reduce_cases[i];
+        const entry_numeric_reduce_trial_t high = entry_numeric_reduce_trial(
+            test_case, UINT64_C(1) << 30, true);
+        uint64_t low = 1, upper = UINT64_C(1) << 30;
+        while (low < upper) {
+            uint64_t mid = low + (upper - low) / 2;
+            entry_numeric_reduce_trial_t trial = entry_numeric_reduce_trial(
+                test_case, mid, false);
+            if (trial.target_seen) upper = mid;
+            else low = mid + 1;
+        }
+        const uint64_t limit = low;
+        const entry_numeric_reduce_trial_t below = entry_numeric_reduce_trial(
+            test_case, limit - 1, false);
+        const entry_numeric_reduce_trial_t boundary =
+            entry_numeric_reduce_trial(test_case, limit, false);
+        const entry_numeric_reduce_trial_t repeat =
+            entry_numeric_reduce_trial(test_case, limit, false);
+        CHECK(high.committed && high.result == 0
+            && !below.target_seen && below.phase47_last_progress == 1022
+            && below.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && below.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(boundary.target_seen
+            && boundary.phase47_last_progress == 1023
+            && boundary.phase47_hits == 1020
+            && boundary.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && boundary.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(repeat.target_seen && repeat.phase47_last_progress == 1023
+            && repeat.phase47_hits == boundary.phase47_hits
+            && repeat.result == boundary.result
+            && repeat.consumed == boundary.consumed
+            && repeat.stop_reason == boundary.stop_reason
+            && repeat.cleanup_status == boundary.cleanup_status);
+
+        int64_t rows[4096 * 2];
+        if (test_case->floating) entry_numeric_reduce_fill_float_rows(rows);
+        else entry_numeric_reduce_fill_rows(rows);
+        entry_input_t input = {"input", rows, 4096, 2};
+        entry_fixture_t f;
+        entry_init_inputs(&f, test_case->source, &input, 1, limit);
+        entry_complete(&f);
+        CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !f.reply.committed && !session_find_rel(f.session, "output"));
+        const uint64_t stopped_id = f.id;
+        entry_finish_original(&f);
+        CHECK(!wl_evaluation_control_reset(f.operation));
+        CHECK(!wl_evaluation_control_configure(f.operation, 0));
+        CHECK(!wl_evaluation_control_begin(f.operation,
+            f.session->base.operation_admission));
+        f.id = wl_evaluation_control_active_attempt_id(f.operation);
+        CHECK(f.id && f.id != stopped_id);
+        f.previous.previous_valid = false;
+        f.reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+        entry_complete(&f);
+        CHECK(!f.reply.execution_result && f.reply.committed);
+        entry_numeric_reduce_assert_output(
+            session_rel_hash_lookup(f.session, "output"), test_case);
+        entry_compare_inputs(&f, test_case->source, &input, 1);
+        entry_destroy(&f);
+    }
+}
+
 static void
 entry_until(entry_fixture_t *f, wl_columnar_eval_serial_framed_phase_t phase)
 {
@@ -2363,6 +2662,7 @@ test_entry_generated_operators(void)
     test_entry_generated_map_work_limit();
     test_entry_generated_reduce_work_limit();
     test_entry_generated_grouped_count_work_limit();
+    test_entry_generated_grouped_numeric_reduce_work_limit();
 }
 
 typedef struct {

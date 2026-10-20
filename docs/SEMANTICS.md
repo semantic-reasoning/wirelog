@@ -1081,6 +1081,27 @@ and the literal per-key counts. This covers grouped key creation and updates
 only in this generated framed route. It says nothing about metering the separate
 legacy result-to-head `append_all()` copy.
 
+Generated grouped integer `SUM`, `MIN`, and `MAX` fixtures each scan 4096
+two-column rows across four recurring keys with varying signed values. The
+fixtures observe phase 47 after an existing group is processed and its
+aggregate slot is assigned. The minimum allowance that reaches progress 1023
+and a repeated run both stop with `WORK_LIMIT` before publication. Fresh
+generations retry and match the literal per-key values and the raw evaluator.
+This is bounded evidence for these generated framed routes; it does not
+establish overflow, FLOAT, `AVG`, legacy
+`append_all()` copying, or other evaluator coverage.
+
+Generated grouped finite FLOAT `SUM`, `MIN`, `MAX`, and `AVG` fixtures also
+scan 4096 two-column rows across four recurring keys. The per-key input order
+starts between the extrema, then visits a new maximum and minimum, and uses
+exact binary fractions so literal sums, extrema, and averages are stable. The
+fixtures assert FLOAT operand/result descriptors, phase 47 after existing-group
+processing and aggregate-slot assignment, and the same minimum-allowance,
+repeat, no-publication, and fresh-generation retry properties above. This
+covers these finite generated framed routes; it does not establish behavior for
+nonfinite values, overflow, non-dyadic rounding, other evaluator paths, or
+legacy `append_all()` copying.
+
 ### Original two-entry replacement
 
 The private binary transaction snapshots the complete top two relation entries,
