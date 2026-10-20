@@ -591,7 +591,7 @@ required — 64 bits is not collision-resistant at scale.
   `strlen()` many, **with no NUL terminator**. `hash("abc")` is
   therefore the value `printf 'abc' | xxhsum -H3` prints, and
   `crc32_ethernet(payload)` is the value `zlib.crc32(payload)` prints.
-- A numeric operand digests the 8-byte little-endian `int64`
+- A numeric operand digests the native 8-byte `int64`
   representation of its value.
 
 `hmac_sha256(msg, key)` and `uuid5(namespace, name)` decide the two
@@ -622,7 +622,7 @@ value whose reverse lookup failed. Declare the relation.
 
 Both return a non-negative `int64` in the range `[0, 2^32)`, computed
 over the operand's bytes as described above: the string's bytes for a
-`symbol` column, the 8-byte `int64` representation for a numeric one.
+`symbol` column, the native 8-byte `int64` representation for a numeric one.
 `crc32_ethernet` uses the Ethernet/ISO-HDLC polynomial (0x04C11DB7,
 ISO 3309 / IEEE 802.3); `crc32_castagnoli` uses the Castagnoli
 polynomial (CRC-32C, iSCSI/SCTP). Unlike the crypto hash built-ins

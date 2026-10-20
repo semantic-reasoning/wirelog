@@ -957,6 +957,16 @@ fresh generation on the same operation completes and agrees with raw execution
 and the literal result. This fixture describes only the generated integer MAP
 host path and does not define allowances for other expressions or routes.
 
+### Controlled integer CRC expressions
+
+The aware framed generated MAP and FILTER routes accept `crc32_ethernet(x)`
+and `crc32_castagnoli(x)` when `x` is an integer value. Each operation digests
+the native eight-byte `int64` representation, matching raw evaluation; the
+controlled path uses a fixed eight-byte CRC loop and checks the original
+attempt between bytes. A stopped attempt publishes no partial result and a
+fresh generation reproduces the raw result. CRC calls over symbols, other
+digest functions, and other evaluator routes remain outside this support.
+
 ### Private scalar SEMIJOIN and ANTIJOIN
 
 The bounded existence-join component consults the full named right relation.
