@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **337**).
+match the script's count (currently **339**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -730,7 +730,7 @@ commit keeps their sum without crediting either image.
 | `relation.c:wl_columnar_relation_retirement_writer_valid` | `source_access.state` | `atomic_load_explicit` | acquire | Confirm the retirement writer still owns the source-access gate |
 | `relation.c:wl_columnar_relation_retirement_commit` | `storage_alias_borrows` | `atomic_store_explicit` | relaxed | Clear the alias count when a pooled relation descriptor is reset for reuse |
 
-### 5.17 `wirelog/columnar/eval_delta.c` — observer and retraction reservations (3 rows)
+### 5.17 `wirelog/columnar/eval_delta.c` — observer and retraction reservations (5 rows)
 
 Observer cleanup releases only admitted tokens. The session owns these stable
 reservation objects exclusively; their state follows the governor protocol.
@@ -743,6 +743,8 @@ release to be retried without retaining freed storage.
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
 | `eval_delta.c:wl_columnar_eval_delta_observer_release_credit` | `token->state` | `atomic_load_explicit` | acquire | Observe reservation state before checked retirement; preserve the original token when release refuses |
+| `eval_delta.c:wl_columnar_eval_delta_release_token` | `token->state` | `atomic_load_explicit` | acquire | Observe temporary scratch reservation state before its local release path |
+| `eval_delta.c:wl_columnar_eval_delta_observer_discard` | `sess->delta_observer_retirement_metadata.state` | `atomic_load_explicit` | acquire | Check the session-owned metadata token before retrying observer retirement |
 | `eval_delta.c:wl_retraction_stage_prepare` | `r->retained_reservation.state` | `atomic_load_explicit` | acquire | Validate the committed payload token under the relation writer before staging a second physical image |
 | `eval_delta.c:wl_retraction_stage_prepare#2` | `r->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the token is still bound to the canonical relation before growing its charge |
 
@@ -1576,7 +1578,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
 
-The complete current atomic-source inventory contains 337 call sites.
+The complete current atomic-source inventory contains 339 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
