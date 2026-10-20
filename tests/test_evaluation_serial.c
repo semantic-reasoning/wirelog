@@ -1724,6 +1724,313 @@ test_entry_generated_map_work_limit(void)
     entry_destroy(&f);
 }
 
+static const char entry_crc_eth_map[] =
+    ".decl input(x:int64)\n.decl output(y:int64)\n"
+    "output(crc32_ethernet(x)) :- input(x).\n";
+static const char entry_crc_cast_map[] =
+    ".decl input(x:int64)\n.decl output(y:int64)\n"
+    "output(crc32_castagnoli(x)) :- input(x).\n";
+static const char entry_crc_eth_filter[] =
+    ".decl input(x:int64)\n.decl output(x:int64)\n"
+    "output(x) :- input(x), crc32_ethernet(x) >= 0.\n";
+static const char entry_crc_cast_filter[] =
+    ".decl input(x:int64)\n.decl output(x:int64)\n"
+    "output(x) :- input(x), crc32_castagnoli(x) >= 0.\n";
+
+static void
+entry_assert_generated_crc(const wl_plan_op_t *op, bool map,
+    uint8_t expected)
+{
+    CHECK((map && op->op == WL_PLAN_OP_MAP && op->map_exprs)
+        || (!map && op->op == WL_PLAN_OP_FILTER));
+    const wl_plan_expr_buffer_t *expr = map ? &op->map_exprs[0]
+        : &op->filter_expr;
+    CHECK(expr->data && expr->size);
+    uint32_t pos = 0, matches = 0;
+    while (pos < expr->size) {
+        uint8_t tag = expr->data[pos++];
+        if (tag == expected) ++matches;
+        if (tag == WL_PLAN_EXPR_VAR || tag == WL_PLAN_EXPR_VAR_FLOAT) {
+            CHECK(expr->size - pos >= 2);
+            uint16_t length;
+            memcpy(&length, expr->data + pos, sizeof(length));
+            pos += 2;
+            CHECK(length <= expr->size - pos);
+            pos += length;
+        } else if (tag == WL_PLAN_EXPR_CONST_INT
+            || tag == WL_PLAN_EXPR_CONST_FLOAT) {
+            CHECK(expr->size - pos >= 8);
+            pos += 8;
+        } else if (tag == WL_PLAN_EXPR_BOOL) {
+            CHECK(pos < expr->size);
+            ++pos;
+        }
+    }
+    CHECK(matches == 1);
+}
+
+static void
+entry_compare_crc_values(entry_fixture_t *f, const char *source,
+    const int64_t *rows, uint32_t count)
+{
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_session_t *base = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &base));
+    if (count)
+        CHECK(!wl_session_insert(base, "input", rows, count, 1));
+    const wl_plan_relation_t *rp = NULL;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r)
+            if (!strcmp(plan->strata[s].relations[r].name, "output"))
+                rp = &plan->strata[s].relations[r];
+    CHECK(rp && !wl_columnar_eval_serial_framed_relation(rp,
+        (wl_col_session_t *)base, false, NULL));
+    const col_rel_t *a = session_rel_hash_lookup(f->session, "output");
+    const col_rel_t *b = session_find_rel((wl_col_session_t *)base, "output");
+    CHECK(a && b && a->nrows == b->nrows && a->ncols == b->ncols
+        && a->sorted_nrows == a->nrows
+        && a->run_count == (a->nrows != 0)
+        && a->column_types && a->column_types[0] == WIRELOG_TYPE_INT64);
+    if (b->column_types)
+        CHECK(b->column_types[0] == a->column_types[0]);
+    for (uint32_t c = 0; c < a->ncols; ++c) {
+        CHECK(!strcmp(a->col_names[c], b->col_names[c]));
+        for (uint32_t r = 0; r < a->nrows; ++r)
+            CHECK(a->columns[c][r] == b->columns[c][r]);
+    }
+    wl_session_destroy(base);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+typedef struct {
+    wl_evaluation_control_t *operation;
+    bool target_seen, cancel;
+    uint64_t target_hits, total_hits;
+} entry_crc_probe_t;
+
+static entry_crc_probe_t *entry_crc_probe;
+
+static void entry_retry_after_stop(entry_fixture_t *f, const char *source,
+    const entry_input_t *inputs, uint32_t input_count);
+
+static void
+entry_crc_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    (void)failed;
+    entry_crc_probe_t *probe = entry_crc_probe;
+    if (!probe || control != probe->operation || phase != 25) return;
+    ++probe->total_hits;
+    if (progress != 4) return;
+    probe->target_seen = true;
+    ++probe->target_hits;
+    if (probe->cancel) {
+        probe->cancel = false;
+        (void)wl_evaluation_control_request_cancel(control);
+    }
+}
+
+typedef struct {
+    uint64_t consumed;
+    int result;
+    bool target_seen;
+} entry_crc_trial_t;
+
+static entry_crc_trial_t
+entry_crc_limit_trial(uint64_t limit)
+{
+    static const int64_t rows[] = {1, 0, -1, INT64_MIN, INT64_MAX, 42, -42, 7};
+    entry_fixture_t f;
+    entry_init(&f, entry_crc_eth_map, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, limit);
+    const wl_plan_op_t *map = NULL;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_MAP) map = &f.relation->ops[i];
+    CHECK(map);
+    entry_assert_generated_crc(map, true, WL_PLAN_EXPR_ARITH_CRC32_ETH);
+    entry_crc_probe_t probe = {.operation = f.operation};
+    entry_crc_probe = &probe;
+    wl_columnar_expr_test_checkpoint = entry_crc_checkpoint;
+    entry_complete(&f);
+    wl_columnar_expr_test_checkpoint = NULL;
+    entry_crc_probe = NULL;
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        || (!f.reply.execution_result && f.reply.committed));
+    if (f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        CHECK(!f.reply.committed && !session_rel_hash_lookup(f.session,
+            "output") && !f.session->cleanup_active
+            && !f.session->cleanup_pending
+            && !f.session->cleanup_reserved_bytes);
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.result == f.reply.execution_result
+        && !report.cleanup_status);
+    entry_crc_trial_t trial = {
+        .consumed = report.consumed,
+        .result = report.result,
+        .target_seen = probe.target_seen
+    };
+    entry_destroy(&f);
+    return trial;
+}
+
+static void
+test_entry_generated_integer_crc(void)
+{
+    static const int64_t rows[] = {1, 0, -1, INT64_MIN, INT64_MAX, 42, -42};
+    const struct {
+        const char *source;
+        bool map;
+        uint8_t tag;
+    } cases[] = {
+        {entry_crc_eth_map, true, WL_PLAN_EXPR_ARITH_CRC32_ETH},
+        {entry_crc_cast_map, true, WL_PLAN_EXPR_ARITH_CRC32_CAST},
+        {entry_crc_eth_filter, false, WL_PLAN_EXPR_ARITH_CRC32_ETH},
+        {entry_crc_cast_filter, false, WL_PLAN_EXPR_ARITH_CRC32_CAST}
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+        entry_fixture_t f;
+        entry_init(&f, cases[c].source, rows,
+            sizeof(rows) / sizeof(rows[0]), 1, 0);
+        const wl_plan_op_t *op = NULL;
+        for (uint32_t i = 0; i < f.relation->op_count; ++i)
+            if (f.relation->ops[i].op == (cases[c].map
+                ? WL_PLAN_OP_MAP : WL_PLAN_OP_FILTER)) op = &f.relation->ops[i];
+
+
+        CHECK(op);
+        entry_assert_generated_crc(op, cases[c].map, cases[c].tag);
+        entry_complete(&f);
+        CHECK(!f.reply.execution_result && f.reply.committed);
+        const col_rel_t *out = session_rel_hash_lookup(f.session, "output");
+        CHECK(out && out->nrows == sizeof(rows) / sizeof(rows[0]));
+        if (cases[c].map) {
+            uint16_t endian = 1;
+            int64_t expected = cases[c].tag == WL_PLAN_EXPR_ARITH_CRC32_ETH
+                ? (*(uint8_t *)&endian ? INT64_C(2844319735)
+                    : INT64_C(304476159))
+                : (*(uint8_t *)&endian ? INT64_C(3306475437)
+                    : INT64_C(2118332809));
+            bool found = false;
+            for (uint32_t i = 0; i < out->nrows; ++i)
+                found |= out->columns[0][i] == expected;
+            CHECK(found);
+        } else {
+            for (uint32_t i = 0; i < out->nrows; ++i) {
+                bool found = false;
+                for (uint32_t r = 0; r < sizeof(rows) / sizeof(rows[0]); ++r)
+                    found |= out->columns[0][i] == rows[r];
+                CHECK(found);
+            }
+        }
+        entry_compare_crc_values(&f, cases[c].source, rows,
+            sizeof(rows) / sizeof(rows[0]));
+        entry_destroy(&f);
+    }
+
+    static const char symbol_crc[] =
+        ".decl input(x:symbol)\n.decl output(y:int64)\n"
+        "output(crc32_ethernet(x)) :- input(x).\n";
+    entry_fixture_t symbol;
+    entry_init(&symbol, symbol_crc, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, 0);
+    const wl_plan_op_t *symbol_map = NULL;
+    for (uint32_t i = 0; i < symbol.relation->op_count; ++i)
+        if (symbol.relation->ops[i].op == WL_PLAN_OP_MAP)
+            symbol_map = &symbol.relation->ops[i];
+    CHECK(symbol_map);
+    entry_assert_generated_crc(symbol_map, true,
+        WL_PLAN_EXPR_ARITH_CRC32_ETH_S);
+    col_rel_t **symbol_rels = symbol.session->rels;
+    uint32_t symbol_nrels = symbol.session->nrels;
+    col_rel_t *symbol_input = session_find_rel(symbol.session, "input");
+    entry_complete(&symbol);
+    CHECK(symbol.reply.execution_result == ENOTSUP
+        && !symbol.reply.committed
+        && !session_rel_hash_lookup(symbol.session, "output")
+        && symbol.session->rels == symbol_rels
+        && symbol.session->nrels == symbol_nrels
+        && session_find_rel(symbol.session, "input") == symbol_input);
+    entry_destroy(&symbol);
+
+    /* Find the repeatable allowance that admits the fourth byte checkpoint.
+     * With one int64 operand this checkpoint is inside the fixed CRC loop. */
+    uint64_t low = 1, high = UINT64_C(1) << 20;
+    CHECK(entry_crc_limit_trial(high).result == 0);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        if (entry_crc_limit_trial(mid).target_seen) high = mid;
+        else low = mid + 1;
+    }
+    const uint64_t limit = low;
+    entry_crc_trial_t below = entry_crc_limit_trial(limit - 1);
+    entry_crc_trial_t exact = entry_crc_limit_trial(limit);
+    entry_crc_trial_t repeat = entry_crc_limit_trial(limit);
+    CHECK(!below.target_seen
+        && below.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && exact.target_seen
+        && exact.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && repeat.target_seen && repeat.result == exact.result
+        && repeat.consumed == exact.consumed);
+
+    static const int64_t cancel_rows[] = {1, 0, -1, INT64_MIN,
+                                          INT64_MAX, 42, -42, 7};
+    entry_fixture_t cancelled;
+    entry_init(&cancelled, entry_crc_eth_map, cancel_rows,
+        sizeof(cancel_rows) / sizeof(cancel_rows[0]), 1, 0);
+    col_rel_t **old_rels = cancelled.session->rels;
+    uint32_t old_nrels = cancelled.session->nrels;
+    col_rel_t *old_input = session_find_rel(cancelled.session, "input");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(
+            cancelled.session->memory_governor));
+    entry_crc_probe_t cancel_probe = {
+        .operation = cancelled.operation, .cancel = true
+    };
+    entry_crc_probe = &cancel_probe;
+    wl_columnar_expr_test_checkpoint = entry_crc_checkpoint;
+    entry_complete(&cancelled);
+    wl_columnar_expr_test_checkpoint = NULL;
+    entry_crc_probe = NULL;
+    CHECK(cancel_probe.target_hits == 1 && cancel_probe.total_hits == 4
+        && cancelled.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !cancelled.reply.committed
+        && !session_rel_hash_lookup(cancelled.session, "output")
+        && cancelled.session->rels == old_rels
+        && cancelled.session->nrels == old_nrels
+        && session_find_rel(cancelled.session, "input") == old_input
+        && old_input->nrows == sizeof(cancel_rows) / sizeof(cancel_rows[0])
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            cancelled.session->memory_governor)) == reserved
+        && !cancelled.session->cleanup_active
+        && !cancelled.session->cleanup_pending
+        && !cancelled.session->cleanup_reserved_bytes);
+    for (uint32_t i = 0; i < old_input->nrows; ++i)
+        CHECK(old_input->columns[0][i] == cancel_rows[i]);
+    entry_finish_original(&cancelled);
+    CHECK(!wl_evaluation_control_reset(cancelled.operation));
+    CHECK(!wl_evaluation_control_configure(cancelled.operation, 0));
+    CHECK(!wl_evaluation_control_begin(cancelled.operation,
+        cancelled.session->base.operation_admission));
+    cancelled.id = wl_evaluation_control_active_attempt_id(
+        cancelled.operation);
+    CHECK(cancelled.id);
+    cancelled.previous.previous_valid = false;
+    memset(&cancelled.reply, 0, sizeof(cancelled.reply));
+    cancelled.reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_complete(&cancelled);
+    CHECK(!cancelled.reply.execution_result && cancelled.reply.committed);
+    entry_compare_crc_values(&cancelled, entry_crc_eth_map, cancel_rows,
+        sizeof(cancel_rows) / sizeof(cancel_rows[0]));
+    entry_destroy(&cancelled);
+}
+
 static const char entry_simple[] =
     ".decl input(x:int64)\n.decl output(x:int64)\n"
     "output(x) :- input(x).\n";
@@ -2660,6 +2967,7 @@ test_entry_generated_operators(void)
         entry_compare(&f, cases[i].source, entry_rows, 4, 1); entry_destroy(&f);
     }
     test_entry_generated_map_work_limit();
+    test_entry_generated_integer_crc();
     test_entry_generated_reduce_work_limit();
     test_entry_generated_grouped_count_work_limit();
     test_entry_generated_grouped_numeric_reduce_work_limit();

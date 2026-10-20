@@ -1506,6 +1506,8 @@ wl_columnar_expr_result_type(const expr_instr_t *instructions,
         case WL_PLAN_EXPR_ARITH_SHL:
         case WL_PLAN_EXPR_ARITH_SHR:
         case WL_PLAN_EXPR_ARITH_BNOT:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST:
             break;
         default:
             return false;
@@ -2103,6 +2105,8 @@ wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
     case WL_PLAN_EXPR_CMP_FLOAT_EQ: case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
     case WL_PLAN_EXPR_CMP_FLOAT_LT: case WL_PLAN_EXPR_CMP_FLOAT_LTE:
     case WL_PLAN_EXPR_CMP_FLOAT_GT: case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+    case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+    case WL_PLAN_EXPR_ARITH_CRC32_CAST:
     case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
     case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
         break;
@@ -2400,6 +2404,11 @@ wl_columnar_expr_result_type_attempt_controlled(
  * ROW <= rc3+read/store2+rowT29+FLOAT/route/push30+return1+suffix55
  *       =120 <=144 (BOTH row and later step tails included),
  * FINAL <= rc3+pending select8+T29+two outputs2+return1 =43 <=48.
+ * Native-integer CRC uses a separate fixed-width lane: charge16 before the
+ * pop/native copy, charge8 before initialization, eight repetitions of
+ * charge17 plus eight bit steps and a guarded checkpoint, then final8. It
+ * reads exactly sizeof(int64_t) bytes and polls between bytes; no symbol
+ * lookup or input-sized fallback is admitted.
  * STEP pays pre-ROW/refused-ROW caller work; admitted ROW pays its actual
  * lane and remaining step/eval continuation once. Initial invalid/first
  * refused read-only bootstrap <=28 can execute at consumed0. Only top and
@@ -2479,6 +2488,44 @@ wl_columnar_expr_attempt_numeric_step(expr_stack_t *stack,
     } else if (in->op == WL_PLAN_EXPR_CONST_INT ||
         in->op == WL_PLAN_EXPR_BOOL) {
         expr_push(stack, in->larg);
+    } else if (in->op == WL_PLAN_EXPR_ARITH_CRC32_ETH
+        || in->op == WL_PLAN_EXPR_ARITH_CRC32_CAST) {
+        /* These tags consume one native int64 operand. Eight bytes and eight
+         * bit steps per byte give a fixed bounded region; symbol tags remain
+         * outside the numeric decoder. */
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id, 16);
+        if (rc) return rc;
+        int64_t operand = expr_pop(stack);
+        uint8_t native[sizeof(operand)];
+        memcpy(native, &operand, sizeof(native));
+        uint32_t polynomial = in->op == WL_PLAN_EXPR_ARITH_CRC32_ETH
+            ? UINT32_C(0xedb88320) : UINT32_C(0x82f63b78);
+        rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id, 24, 0,
+                false);
+        if (rc) return rc;
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id, 8);
+        if (rc) return rc;
+        uint32_t crc = UINT32_MAX;
+        rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id, 24, 0,
+                false);
+        if (rc) return rc;
+        for (uint32_t i = 0; i < sizeof(native); ++i) {
+            rc = wl_columnar_expr_attempt_charge(control, attempt_id, 17);
+            if (rc) return rc;
+            crc ^= native[i];
+            for (unsigned bit = 0; bit < 8; ++bit)
+                crc = (crc >> 1) ^ ((crc & 1u) ? polynomial : 0u);
+            rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id, 25,
+                    i + 1u, false);
+            if (rc) return rc;
+        }
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id, 8);
+        if (rc) return rc;
+        int64_t result = (int64_t)(crc ^ UINT32_MAX);
+        rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id, 24, 1,
+                false);
+        if (rc) return rc;
+        expr_push(stack, result);
     } else if (in->op == WL_PLAN_EXPR_ARITH_BNOT) {
         int64_t a = expr_pop(stack); expr_push(stack, ~a);
     } else if (in->op == WL_PLAN_EXPR_AGG_COUNT ||
