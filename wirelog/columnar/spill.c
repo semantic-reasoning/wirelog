@@ -20,6 +20,10 @@
 #define WL_COLUMNAR_SPILL_IO_CHUNK 4096u
 #define WL_COLUMNAR_SPILL_MAX_INTERRUPTS 16u
 
+static const unsigned char wl_columnar_spill_magic[8] = {
+    'W', 'L', 'S', 'P', 'I', 'L', 'L', '1'
+};
+
 typedef struct {
     wl_columnar_memory_reservation_t reservation;
 } wl_columnar_spill_allocation_t;
@@ -76,10 +80,12 @@ wl_columnar_spill_allocate(wl_columnar_spill_store_t *store, uint64_t bytes,
         return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
             ? WL_COLUMNAR_SPILL_MEMORY : WL_COLUMNAR_SPILL_OVERFLOW;
     wl_columnar_spill_allocation_t *p = NULL;
+    bool fail_allocation = false;
 #ifdef WL_TEST_SPILL
-    if (!wl_columnar_spill_test_allocation())
+    fail_allocation = wl_columnar_spill_test_allocation();
 #endif
-    p = calloc(1, (size_t)bytes);
+    if (!fail_allocation)
+        p = calloc(1, (size_t)bytes);
     if (!p) {
         if (!wl_columnar_memory_rollback(&pending)) abort();
         return WL_COLUMNAR_SPILL_ALLOCATION;
@@ -350,7 +356,8 @@ wl_columnar_spill_validate_file(wl_columnar_spill_segment_t *s,
     wl_columnar_spill_status_t rc = wl_columnar_spill_io(s, false, 0,
             buffer, WL_COLUMNAR_SPILL_HEADER, cancel, context);
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
-    if (memcmp(buffer, "WLSPILL1", 8) != 0
+    if (memcmp(buffer, wl_columnar_spill_magic,
+        sizeof(wl_columnar_spill_magic)) != 0
         || wl_columnar_spill_get(buffer + 8, 4) != 1
         || wl_columnar_spill_get(buffer + 12, 4) != s->ncols
         || wl_columnar_spill_get(buffer + 16, 8) != s->nrows
@@ -443,7 +450,7 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
     opened = true;
     rc = wl_columnar_spill_capacity(s, bytes);
     if (rc != WL_COLUMNAR_SPILL_OK) goto reserved_fail;
-    memcpy(buffer, "WLSPILL1", 8);
+    memcpy(buffer, wl_columnar_spill_magic, sizeof(wl_columnar_spill_magic));
     wl_columnar_spill_put(buffer + 8, 1, 4);
     wl_columnar_spill_put(buffer + 12, ncols, 4);
     wl_columnar_spill_put(buffer + 16, nrows, 8);
