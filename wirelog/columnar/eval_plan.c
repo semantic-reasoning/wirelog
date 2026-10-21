@@ -35,6 +35,42 @@ _Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
     "WL_PLAN_OP__BACKEND_START must equal WL_PLAN_OP_K_FUSION");
 #endif
 
+int
+wl_columnar_eval_plan_numeric_composed_abort_supported(
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    bool *supported)
+{
+    if (!supported) return EINVAL;
+    *supported = false;
+    if (!plan || !plan->ops || begin >= end || end > plan->op_count)
+        return EINVAL;
+    uint32_t depth = 0;
+    for (uint32_t i = begin; i < end; ++i) {
+        switch (plan->ops[i].op) {
+        case WL_PLAN_OP_VARIABLE:
+            if (depth == COL_STACK_MAX) return ENOBUFS;
+            ++depth;
+            break;
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_MAP:
+            if (!depth) return EINVAL;
+            break;
+        case WL_PLAN_OP_CONCAT:
+            if (depth < 2) return EINVAL;
+            --depth;
+            break;
+        case WL_PLAN_OP_CONSOLIDATE:
+            if (!depth || i + 1 != end) return ENOTSUP;
+            break;
+        default:
+            return 0;
+        }
+    }
+    *supported = depth == 1
+        && plan->ops[end - 1].op == WL_PLAN_OP_CONSOLIDATE;
+    return 0;
+}
+
 /*
  * col_eval_relation_plan:
  * Evaluate all operators for one relation plan using the eval stack.

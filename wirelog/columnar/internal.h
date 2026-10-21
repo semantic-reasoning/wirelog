@@ -6204,6 +6204,10 @@ int wl_columnar_eval_plan_numeric_composed_attempt_step(
 int wl_columnar_eval_plan_numeric_composed_abort_request(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Pure generated-closure check used before the framed host consumes any
+ * progress receipt; unsupported requests must be completely inert. */
+int wl_columnar_eval_plan_numeric_composed_abort_supported(
+    const wl_plan_relation_t *, uint32_t, uint32_t, bool *);
 int wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *, int, wl_evaluation_control_t *,
     uint64_t);
@@ -6368,7 +6372,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool thread_valid, pin_owned, child_bound, gate_owned;
     bool source_initialized, batch_initialized, batch_done;
     bool candidate_owned, materialized, committed, pending_inner_consume;
-    bool close_proven;
+    bool close_proven, abort_supported, abort_requested;
     wl_columnar_session_hash_registry_attempt_t publication;
 } wl_columnar_eval_serial_framed_attempt_t;
 
@@ -6380,7 +6384,10 @@ typedef struct {
 
 typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE = 0,
-    WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
 } wl_columnar_eval_serial_framed_host_action_t;
 
 typedef enum {
@@ -6388,12 +6395,14 @@ typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS,
-    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL,
+    WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING
 } wl_columnar_eval_serial_framed_host_reply_kind_t;
 
 typedef struct {
     wl_columnar_eval_serial_framed_host_reply_kind_t kind;
     int execution_result;
+    int cleanup_result;
     bool committed;
     wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
     wl_columnar_eval_serial_framed_status_t status;
@@ -6406,8 +6415,12 @@ typedef struct {
  * The host owns two or more stable grants/owner keys; never reset a pending
  * grant. Keep the latest nonSTATUS tuple across STATUS. A refused CONSUME
  * retains its old tuple; only successful consume releases that borrowed grant.
- * int is protocol only. Semantic fields are valid only for TERMINAL; status
- * only for STATUS and rc0. MORE/BOOTSTRAP_RECEIPT rc0 is never logical success.
+ * int is protocol only. Semantic fields are valid for TERMINAL and
+ * TERMINAL_CLEANUP_PENDING; status only for STATUS and rc0.
+ * TERMINAL_CLEANUP_PENDING means evaluation is terminal while its keyed frame
+ * still needs cleanup retry; it is never logical success. Receipt-only STATUS,
+ * ABORT/RECEIPT_RETRY and RECEIPT_ACK require copying the full key from reply.
+ * MORE/BOOTSTRAP_RECEIPT rc0 is never logical success.
  * A bootstrap receipt with no durable parent proves only its completed grant:
  * exact association to this rp/session/original generation/native owner and
  * no synthesis/replay is a trusted caller precondition, not runtime authority.
@@ -6423,6 +6436,7 @@ struct wl_columnar_eval_serial_framed_host_request {
     /* Stable host operation identity, distinct from the control attempt ID. */
     uint64_t operation_identity;
     wl_columnar_eval_serial_framed_host_action_t action;
+    wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     bool previous_valid;
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
