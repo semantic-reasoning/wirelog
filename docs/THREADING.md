@@ -1944,6 +1944,19 @@ registry and plan lifetime remain the host's responsibility until READY or
 completed discard. Worker copy checks both constructor pointers before copying
 and initializes the destination pointer to NULL before any cleanup path.
 
+The signed-delta prepare continuation uses a distinct session-owned record and
+separate preflight and capture reader leases. It must be serialized with STEP,
+observer begin/prepare, worker cloning, and teardown. Every continuation call
+uses its own live attempt ID; after a work-limit stop the host starts a fresh
+attempt while preserving the record. Cancellation requires serialized discard.
+Discard releases a partial acquisition before staging credit; if credit release
+is refused, the reservation remains reachable for a later cleanup attempt.
+Terminal errors are sticky until discard; only EAGAIN and WORK_LIMIT allow
+advance to resume, while cancellation also requires discard.
+The READY handoff records staging-credit commit completion before its final
+poll, so a fresh attempt can finish publication eligibility without repeating
+the commit.
+
 | Site | Atomic field | Operation | Order | Purpose |
 | --- | --- | --- | --- | --- |
 | `relation.c:wl_columnar_relation_reader_step` | `gate->state` | `atomic_load_explicit` | acquire | Observe one admission or release transition without a retry loop |

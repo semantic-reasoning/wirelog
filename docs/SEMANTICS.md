@@ -1346,3 +1346,31 @@ Session destruction drains this continuation before relation storage and aborts
 if it cannot finish. Worker cloning refuses a live constructor at either end.
 Whole controlled STEP and observer delivery remain disabled; this API does not
 claim complete #1821 coverage or enable public dispatch.
+
+### Resumable signed-delta observer preparation (internal opt-in)
+
+`wl_columnar_eval_delta_observer_prepare_start`, `_prepare_advance` and
+`_prepare_discard` extend the internal continuation through current-head
+capture, normalization and signed event construction. The session must already
+own a READY baseline observer from the builder above. This initial stepped path
+supports unary INT64 heads; the existing synchronous prepare remains available
+for other schemas and retains its prior semantics. The host keeps the plan,
+registry and source contents stable and serializes all calls across attempts.
+Preflight and capture use separate reader leases, each released before the next
+phase.
+
+Each advance performs one bounded name-lookup byte, reader transition, cell
+copy, heapsort comparison/swap, deduplication action, merge action or phase
+transition. A work-limit stop retains progress and reader authority for a fresh
+attempt ID. Cancellation leaves the record owned and requires discard. Events
+remain private until READY marks the completed buffer publishable; publication
+is a no-op before that point. STEP, raw prepare, a second observer begin and
+worker cloning refuse while preparation is live. Discard drains partial reader
+acquisition and staging; teardown retries EAGAIN before freeing the observer.
+Positive terminal errors are sticky: later advances return the same error until
+discard drains the continuation. Only EAGAIN and WORK_LIMIT retain a resumable
+cursor; cancellation is sticky and requires discard.
+If a work-limit stop lands after staging credit commits, that completion state
+is retained and a fresh attempt completes READY without committing twice.
+This is still a preparation primitive, not whole controlled STEP or callback
+scheduling, and does not complete #1821 acceptance coverage.
