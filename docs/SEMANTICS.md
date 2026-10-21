@@ -1010,6 +1010,16 @@ plans admit these opcodes and invoke their original owned entry directly.
 
 ### Controlled ordinary JOIN right predicates
 
+The prepared ordinary JOIN producer exposes a private controlled step/peek/ack
+surface for bounded producer work. Acknowledging a ready batch advances only
+producer state; it does not publish rows to a caller or sink. Ordinary JOIN
+dispatch and end-to-end result publication are follow-on work. This producer
+slice admits one native INT64 equality key and at most 64 output lanes. Hashing
+reads only that fixed eight-byte key; each chain candidate comparison and
+chain advance is a separate charged action. `cursor_get` reports only the
+last acknowledged producer position; peeked rows and speculative traversal
+do not advance it.
+
 An ordinary controlled JOIN evaluates a supported numeric `right_filter_expr`
 over each present right row before key construction and output work. A failed
 numeric expression rejects that row, matching FILTER semantics. Missing and

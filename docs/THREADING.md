@@ -1708,6 +1708,14 @@ synchronize nothing, and tests read them after the operator call returns.
 
 ### Controlled ordinary JOIN confinement
 
+The prepared producer-only col_join_batch_control_* API is confined to the
+native thread that binds it. Bind retains the active control and saved attempt
+ID, and one step/peek/ack call must finish before another begins. The producer
+claim blocks raw continuation publication for its lifetime; discard is the
+cleanup path for the lease and scratch. This does not make the existing JOIN
+caller or output sink cooperative: end-to-end caller control and publication
+remain follow-on integration.
+
 The controlled JOIN start and shared step/acknowledgement protocol serialize
 access to the original embedded operator context. The live context, left/right
 source-reader records and each scratch reservation retain their original
