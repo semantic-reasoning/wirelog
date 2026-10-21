@@ -1098,6 +1098,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin(
     record->completed = 0; record->semantic_result = 0;
     record->protocol_result = 0;
     record->source_mode = true; record->source_installed = false;
+    record->abort_supported = true; record->abort_requested = false;
     record->source_empty = false; record->source_is_delta = false;
     record->source_initialized = false; record->source_slot_borrowed = false;
     record->source_registry = session->rels;
@@ -1371,6 +1372,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
+    if (record->abort_requested) {
+        if (wl_evaluation_control_active_attempt_id(record->control)
+            != record->attempt_id) return EINVAL;
+        wl_evaluation_control_request_cancel(record->control);
+    }
     switch (record->phase) {
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS: {
         rc = wl_columnar_eval_plan_composed_charge(record->control,
@@ -1397,6 +1403,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         rc = wl_columnar_eval_plan_numeric_forward(record);
         if (!rc) {
             wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
+            if (kind != WL_PLAN_OP_VARIABLE && kind != WL_PLAN_OP_FILTER
+                && kind != WL_PLAN_OP_MAP && kind != WL_PLAN_OP_CONCAT
+                && !(kind == WL_PLAN_OP_CONSOLIDATE
+                && record->cursor + 1 == record->end))
+                record->abort_supported = false;
             if (kind == WL_PLAN_OP_VARIABLE) {
                 if (record->preflight_depth == COL_STACK_MAX) rc = ENOBUFS;
                 else ++record->preflight_depth;
@@ -1629,6 +1640,34 @@ wl_columnar_eval_plan_numeric_composed_attempt_status(
 }
 
 int
+wl_columnar_eval_plan_numeric_composed_abort_request(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    /* Closure is finalized by the bounded preflight before any child owner
+     * can be started. Unsupported plans remain usable through ADVANCE. */
+    if (record->phase < WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY)
+        return EBUSY;
+    if (!record->abort_supported
+        || record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+        return ENOTSUP;
+    if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+    if (wl_evaluation_control_active_attempt_id(record->control)
+        != record->attempt_id) return EINVAL;
+    if (!record->semantic_result)
+        record->semantic_result = WL_EVALUATION_CONTROL_CANCELLED;
+    record->abort_requested = true;
+    wl_evaluation_control_request_cancel(record->control);
+    return 0;
+}
+
+int
 wl_columnar_eval_plan_numeric_composed_attempt_ack(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
@@ -1651,6 +1690,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->thread_valid = false; record->attempt_id = 0;
     record->composed_mode = false; record->preflight_depth = 0;
     record->runtime_depth = 0;
+    record->abort_supported = false; record->abort_requested = false;
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
     wl_evaluation_control_release(control);
     return 0;
