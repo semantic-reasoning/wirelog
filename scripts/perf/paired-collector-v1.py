@@ -83,7 +83,12 @@ def cleanup_process_group(process, raw):
 
     try:
         if send(signal.SIGTERM):
-            deadline = time.monotonic() + 0.5
+            # Leave signal handlers time to finish their own bounded child
+            # cleanup before escalating.  A shorter grace can SIGKILL the
+            # launcher while it is still reaping a descendant on a loaded
+            # runner, losing the handler's intended exit status in the raw
+            # attempt record.
+            deadline = time.monotonic() + 2.5
             while time.monotonic() < deadline:
                 process.poll()
                 if not send(0):
