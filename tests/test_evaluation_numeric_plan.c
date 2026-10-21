@@ -4132,8 +4132,8 @@ test_composed_abort_request(void)
     col_rel_destroy(b);
     wl_plan_free(plan); wirelog_program_free(program);
 
-    /* Unsupported generated JOIN remains executable, but ABORT is rejected
-     * before state or funding changes. */
+    /* Generated ordinary JOIN cancellation cleans up the composed source
+     * frame and leaves the registered inputs available for a full retry. */
     program = wirelog_parse_string(join_text, &error); plan = NULL;
     CHECK(program && !wl_plan_from_program(program, &plan));
     const wl_plan_relation_t *join = composed_find_relation(plan, "output");
@@ -4143,16 +4143,16 @@ test_composed_abort_request(void)
     col_rel_t *join_registry[] = {a, b};
     composed_fixture(&f, a, 0);
     composed_begin(&f, join, join_registry, 2, 0);
-    saved_phase = f.record.phase;
-    CHECK(composed_abort_request(&f, 0) == EBUSY
-        && f.record.phase == saved_phase && !f.record.abort_requested
-        && !f.record.semantic_result);
     composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 0);
-    CHECK(!f.record.abort_supported);
-    saved_phase = f.record.phase; saved_cursor = f.record.cursor;
-    CHECK(composed_abort_request(&f, 0) == ENOTSUP);
-    CHECK(f.record.phase == saved_phase && f.record.cursor == saved_cursor
-        && !f.record.abort_requested && !f.record.semantic_result);
+    CHECK(f.record.abort_supported && !f.record.abort_requested);
+    CHECK(!composed_abort_request(&f, 0));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.completed == 0);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 0);
+    composed_retry_frame(&f);
+    composed_begin(&f, join, join_registry, 2, 0);
     composed_run(&f);
     CHECK(!f.record.semantic_result && f.record.completed == join->op_count);
     composed_raw_parity(&f, join, 0);

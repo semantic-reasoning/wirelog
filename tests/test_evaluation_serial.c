@@ -3092,23 +3092,22 @@ test_entry_abort_and_unsupported_abort(void)
     const entry_input_t inputs[] = {
         {"input", entry_rows, 4, 1}, {"rhs", entry_rows, 4, 1}
     };
-    entry_fixture_t unsupported;
-    entry_init_inputs(&unsupported, join_source, inputs, 2, 0);
-    CHECK(!entry_turn(&unsupported, false, 0));
-    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&unsupported);
-    CHECK(ctx && !ctx->abort_supported
-        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP);
-    uint64_t operation_id = unsupported.id;
-    CHECK(entry_turn_action(&unsupported,
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0) == ENOTSUP);
-    CHECK(entry_context(&unsupported) == ctx && !ctx->abort_requested
-        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP
-        && wl_evaluation_control_active_attempt_id(unsupported.operation)
-        == operation_id);
-    entry_complete(&unsupported);
-    CHECK(!unsupported.reply.execution_result && unsupported.reply.committed);
-    entry_compare_inputs(&unsupported, join_source, inputs, 2);
-    entry_destroy(&unsupported);
+    entry_fixture_t join_abort;
+    entry_init_inputs(&join_abort, join_source, inputs, 2, 0);
+    CHECK(!entry_turn(&join_abort, false, 0));
+    entry_until(&join_abort, WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&join_abort);
+    CHECK(ctx && ctx->abort_supported
+        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
+    CHECK(!entry_turn_action(&join_abort,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(entry_context(&join_abort)->abort_requested);
+    entry_complete(&join_abort);
+    CHECK(join_abort.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !join_abort.reply.committed
+        && !session_find_rel(join_abort.session, "output"));
+    entry_finish_original(&join_abort);
+    entry_destroy(&join_abort);
 
     entry_fixture_t unsupported_pending;
     entry_init_inputs(&unsupported_pending, join_source, inputs, 2, 0);
@@ -3117,21 +3116,19 @@ test_entry_abort_and_unsupported_abort(void)
     CHECK(!entry_turn(&unsupported_pending, false, 0));
     ctx = entry_context(&unsupported_pending);
     CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
-        && !ctx->abort_supported);
-    wl_evaluation_control_t *pending_funding = ctx->pending_funding;
-    uint64_t pending_funding_id = ctx->pending_funding_id;
+        && ctx->abort_supported);
     wl_columnar_eval_plan_numeric_phase_t child_phase = ctx->child.phase;
-    CHECK(entry_turn_action(&unsupported_pending,
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0) == ENOTSUP);
+    CHECK(!entry_turn_action(&unsupported_pending,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
     CHECK(entry_context(&unsupported_pending) == ctx
-        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
-        && ctx->pending_funding == pending_funding
-        && ctx->pending_funding_id == pending_funding_id
-        && ctx->child.phase == child_phase && !ctx->abort_requested);
+        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        && !ctx->pending_funding && !ctx->pending_funding_id
+        && ctx->child.phase == child_phase && ctx->abort_requested);
     entry_complete(&unsupported_pending);
-    CHECK(!unsupported_pending.reply.execution_result
-        && unsupported_pending.reply.committed);
-    entry_compare_inputs(&unsupported_pending, join_source, inputs, 2);
+    CHECK(unsupported_pending.reply.execution_result ==
+        WL_EVALUATION_CONTROL_CANCELLED && !unsupported_pending.reply.committed
+        && !session_find_rel(unsupported_pending.session, "output"));
+    entry_finish_original(&unsupported_pending);
     entry_destroy(&unsupported_pending);
 
     entry_fixture_t nested;
@@ -3785,6 +3782,73 @@ entry_retry_after_stop(entry_fixture_t *f, const char *source,
 }
 
 static void
+test_entry_generated_join_abort_cleanup_retry(void)
+{
+    int64_t input_rows[64], right_rows[513 * 2];
+    entry_large_inputs(input_rows, right_rows, false);
+    const entry_input_t inputs[] = {
+        {"input", input_rows, 64, 1},
+        {"right", right_rows, 513, 2}
+    };
+    const uint32_t candidates = 64u * 257u;
+    entry_fixture_t f;
+    entry_init_inputs(&f, entry_filter_product, inputs, 2, 0);
+    (void)entry_assert_generated_join(&f, "right", 0);
+    col_rel_t **old_rels = f.session->rels;
+    uint32_t old_nrels = f.session->nrels;
+    col_rel_t *input = session_find_rel(f.session, "input");
+    col_rel_t *right = session_find_rel(f.session, "right");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+
+    entry_join_probe_t probe = {.operation = f.operation};
+    entry_join_probe = &probe;
+    wl_columnar_join_test_attempt_checkpoint = entry_join_checkpoint;
+    CHECK(!entry_turn(&f, false, 0));
+    entry_until(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    entry_join_probe = NULL;
+    CHECK(probe.phase17_hits == candidates);
+
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+    CHECK(ctx && ctx->abort_supported && ctx->candidate && !ctx->committed);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(ctx->candidate, &reader));
+
+    /* The framed host serializes JOIN work on its owner thread, so ABORT is
+     * issued after JOIN work has returned while its result remains private.
+     * The held reader forces candidate cleanup to retain and retry. */
+    CHECK(!entry_turn_action(&f,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(entry_context(&f)->abort_requested);
+    bool cleanup_refused = false;
+    for (unsigned turn = 0; turn < 200000; ++turn) {
+        if (entry_context(&f)->cleanup_result == EBUSY) {
+            cleanup_refused = true;
+            break;
+        }
+        CHECK(entry_context(&f)
+            && !entry_turn(&f, false, 0));
+    }
+    CHECK(cleanup_refused && !f.reply.committed
+        && !session_rel_hash_lookup(f.session, "output"));
+    CHECK(!col_rel_source_reader_release(&reader));
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !f.reply.committed && !session_rel_hash_lookup(f.session, "output"));
+    entry_assert_unpublished_and_unchanged(&f, old_rels, old_nrels, input,
+        right, input_rows, right_rows, reserved);
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.consumed > 0);
+
+    entry_retry_after_finished_stop(&f, entry_filter_product, inputs, 2);
+    entry_destroy(&f);
+}
+
+static void
 test_entry_generated_right_filter_collisions_and_stop(void)
 {
     int64_t input_rows[64], right_rows[513 * 2];
@@ -4240,6 +4304,25 @@ test_entry_unsupported_generated(void)
     CHECK(lftj);
     uint64_t before = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+    CHECK(!entry_turn(&f, false, 0));
+    entry_until(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
+    CHECK(!entry_turn(&f, false, 0));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+    CHECK(ctx && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && !ctx->abort_supported);
+    wl_evaluation_control_t *pending_funding = ctx->pending_funding;
+    uint64_t pending_funding_id = ctx->pending_funding_id;
+    wl_columnar_eval_plan_numeric_phase_t child_phase = ctx->child.phase;
+    CHECK(entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0)
+        == ENOTSUP);
+    CHECK(entry_context(&f) == ctx
+        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->pending_funding == pending_funding
+        && ctx->pending_funding_id == pending_funding_id
+        && ctx->child.phase == child_phase && !ctx->abort_requested
+        && f.previous.previous_valid
+        && f.previous.previous_funding == pending_funding
+        && f.previous.previous_funding_id == pending_funding_id);
     entry_complete(&f);
     CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed
         && !session_rel_hash_lookup(f.session, "output")
@@ -4435,6 +4518,7 @@ main(void)
 {
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
+    test_entry_generated_join_abort_cleanup_retry();
     test_entry_generated_right_filter_collisions_and_stop();
     test_entry_generated_right_filter_product_work_boundary();
     test_entry_receipts(); test_entry_abort_and_unsupported_abort();
