@@ -32,6 +32,44 @@ typedef struct {
 } grant_t;
 
 typedef struct {
+    wl_evaluation_control_t *cancel_control;
+    bool cancel_on_first;
+    uint32_t count;
+    char relations[16][32];
+    uint32_t widths[16];
+    int64_t rows[16][8];
+} snapshot_capture_t;
+
+static void
+capture_snapshot_tuple(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data)
+{
+    snapshot_capture_t *capture = user_data;
+    CHECK(capture && capture->count < 16 && relation && strlen(relation) < 32
+        && ncols <= 8 && (row || ncols == 0));
+    uint32_t at = capture->count++;
+    strcpy(capture->relations[at], relation);
+    capture->widths[at] = ncols;
+    if (ncols)
+        memcpy(capture->rows[at], row, (size_t)ncols * sizeof(*row));
+    if (capture->cancel_on_first && at == 0)
+        wl_evaluation_control_request_cancel(capture->cancel_control);
+}
+
+static void
+check_snapshot_equal(const snapshot_capture_t *left,
+    const snapshot_capture_t *right)
+{
+    CHECK(left->count == right->count);
+    for (uint32_t i = 0; i < left->count; ++i) {
+        CHECK(!strcmp(left->relations[i], right->relations[i]));
+        CHECK(left->widths[i] == right->widths[i]);
+        CHECK(!memcmp(left->rows[i], right->rows[i],
+            (size_t)left->widths[i] * sizeof(left->rows[i][0])));
+    }
+}
+
+typedef struct {
     wl_col_session_t session;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
     wl_columnar_eval_serial_framed_attempt_t *ctx;
@@ -1630,7 +1668,7 @@ entry_outer_guards(entry_fixture_t *f)
     CHECK(wl_session_snapshot(&f->session->base, NULL, NULL) == EBUSY);
     CHECK(f->session->base.backend->session_step(&f->session->base) == EBUSY);
     CHECK(f->session->base.backend->session_snapshot(&f->session->base,
-        NULL, NULL) == ENOTSUP);
+        NULL, NULL) == EBUSY);
     CHECK(col_eval_stratum(f->stratum, f->session, 0) == ENOTSUP);
     CHECK(col_eval_stratum_tdd(f->stratum, f->session, 0) == ENOTSUP);
     CHECK(col_eval_stratum_multiworker(f->stratum, f->session, 0,
@@ -1803,6 +1841,87 @@ test_controlled_session_step_destroy_drain(void)
         && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
 
     wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_session_snapshot_publication(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    const int64_t rows[] = {7, 3, 11};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+
+    wl_session_t *reference = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    CHECK(!wl_session_insert(reference, "input", rows, 3, 1));
+    CHECK(!wl_session_step(reference));
+    snapshot_capture_t expected = {0};
+    CHECK(!wl_session_snapshot(reference, capture_snapshot_tuple, &expected));
+
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", rows, 3, 1));
+    CHECK(!wl_session_step(session));
+
+    wl_evaluation_control_report_t step_report, report;
+    CHECK(!wl_evaluation_control_report(control, &step_report));
+    CHECK(wl_session_snapshot(session, NULL, NULL) == EINVAL);
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.attempt_id == step_report.attempt_id
+        && report.result == step_report.result
+        && !wl_evaluation_control_active_attempt_id(control));
+
+    snapshot_capture_t actual = {0};
+    wl_evaluation_control_request_cancel(control);
+    CHECK(wl_session_snapshot(session, capture_snapshot_tuple, &actual)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual.count == 0
+        && !wl_evaluation_control_active_attempt_id(control));
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED
+        && report.consumed == 0);
+    CHECK(!wl_evaluation_control_reset(control));
+
+    actual = (snapshot_capture_t){.cancel_control = control,
+                                  .cancel_on_first = true};
+    CHECK(!wl_session_snapshot(session, capture_snapshot_tuple, &actual));
+    check_snapshot_equal(&actual, &expected);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == 0
+        && report.stop_reason == WL_EVALUATION_CONTROL_NONE
+        && report.consumed == 0);
+
+    actual = (snapshot_capture_t){0};
+    CHECK(wl_session_snapshot(session, capture_snapshot_tuple, &actual)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(actual.count == 0);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!wl_evaluation_control_reset(control));
+
+    actual = (snapshot_capture_t){0};
+    CHECK(!wl_session_snapshot(session, capture_snapshot_tuple, &actual));
+    check_snapshot_equal(&actual, &expected);
+    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_session_destroy(reference);
     wl_plan_free(plan);
     wirelog_program_free(program);
 }
@@ -4684,6 +4803,7 @@ main(void)
     test_controlled_session_step_resume();
     test_controlled_session_step_prefix_resume();
     test_controlled_session_step_destroy_drain();
+    test_controlled_session_snapshot_publication();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
     test_entry_generated_join_abort_cleanup_retry();

@@ -7014,11 +7014,44 @@ evaluated:;
 }
 
 static int
+col_session_snapshot_controlled(wl_session_t *session,
+    wirelog_on_tuple_fn callback, void *user_data)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_evaluation_control_t *control = session->evaluation_control;
+    const void *owner = session->operation_admission;
+    if (!control || !owner)
+        return EINVAL;
+
+    wl_controlled_step_state_t state =
+        col_session_controlled_step_state(session);
+    if (state == WL_CONTROLLED_STEP_PENDING)
+        return EBUSY;
+    if (state != WL_CONTROLLED_STEP_COMPLETE)
+        return ENOTSUP;
+    if (!callback)
+        return EINVAL;
+
+    int rc = wl_evaluation_control_begin(control, owner);
+    if (rc)
+        return rc;
+
+    /* This is the publication cutoff. Once the first tuple is delivered,
+     * finish the batch without polling; a later cancel remains sticky for
+     * the next snapshot attempt, as required for all-or-nothing delivery. */
+    rc = wl_evaluation_control_charge(control, 0);
+    if (!rc)
+        rc = col_session_emit_snapshot(sess->plan, sess, callback, user_data);
+    return wl_evaluation_control_finish(control, owner, rc, 0);
+}
+
+static int
 col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     if (!session) return EINVAL;
-    if (session->evaluation_control) return ENOTSUP;
+    if (session->evaluation_control)
+        return col_session_snapshot_controlled(session, callback, user_data);
     return col_session_snapshot_impl(session, callback, user_data);
 }
 

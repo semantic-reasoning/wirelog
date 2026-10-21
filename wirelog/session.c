@@ -105,6 +105,29 @@ wl_session_operation_begin_step(wl_session_t *session)
     return 0;
 }
 
+/* A completed controlled initial STEP permits read-only snapshot delivery.
+ * Keep the whole callback batch inside the same admission gate so mutations,
+ * another STEP, and a concurrent snapshot cannot observe a partial batch. */
+static int
+wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    if (!admission)
+        return ENOTSUP;
+
+    wl_mutex_lock(&admission->mutex);
+    int rc = 0;
+    if (admission->closing || admission->active_operations != 0
+        || admission->controlled_step_pending)
+        rc = EBUSY;
+    else if (!admission->controlled_step_complete)
+        rc = ENOTSUP;
+    else
+        admission->active_operations++;
+    wl_mutex_unlock(&admission->mutex);
+    return rc;
+}
+
 static void
 wl_session_operation_end_step(wl_session_t *session,
     wl_controlled_step_state_t state, bool continuation_pending)
@@ -542,14 +565,16 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     int rc;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    bool controlled = session->evaluation_control != NULL;
+    rc = controlled ? wl_session_operation_begin_controlled_snapshot(session)
+        : wl_session_operation_begin(session);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_snapshot
         || session->input_load_failed)
         rc = -1;
-    else if (session->evaluation_control)
-        rc = ENOTSUP; /* Never silently evaluate an attached control. */
+    else if (controlled && !callback)
+        rc = EINVAL;
     else
         rc = session->backend->session_snapshot(session, callback, user_data);
     wl_session_operation_end(session);
