@@ -755,7 +755,7 @@ the committed token after publication and before a growth transaction.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `eval_dedup.c:wl_columnar_eval_dedup_set_bytes` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm an empty table has no active reservation before attach or reuse |
+| `eval_dedup.c:wl_columnar_eval_dedup_set_metadata_bytes` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm an empty table has no active reservation before attach or reuse |
 | `eval_dedup.c:wl_dedup_token_valid` | `r->dedup_reservation.state` | `atomic_load_explicit` | acquire | Confirm a populated table is covered by a committed token before mutation or lookup |
 | `eval_dedup.c:wl_dedup_token_valid#2` | `r->dedup_reservation.owner_bits` | `atomic_load_explicit` | acquire | Confirm the committed token belongs to this relation before growth or transfer |
 | `eval_dedup.c:wl_columnar_eval_dedup_test_fail_next_growth_alloc` | test-only fault flag | `atomic_store_explicit` | release | Arm one allocation refusal before a test invokes dedup growth; excluded from the production library |

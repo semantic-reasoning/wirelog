@@ -783,6 +783,85 @@ typedef struct col_rel_mutable_image {
     wl_columnar_source_access_writer_t writer;
 } col_rel_mutable_image_t;
 
+/* A resumable, private incremental consolidation. Initialize the object with
+ * { 0 } before begin. The object and its writer are address- and thread-bound;
+ * keep it in one frame and pass by pointer.
+ * EAGAIN from advance means only that this call's work slice was consumed;
+ * the private candidate and source writer remain live for a later call.
+ * Terminal control stops and execution errors discard the attempt. */
+typedef enum wl_columnar_merge_incremental_delta_phase {
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_INERT = 0,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY_DEDUP,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_FAST_OLD_MAX,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_FAST_CHECK,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SORT,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DEDUP,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COUNT_NOVEL,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_ALLOC_DELTA,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_EMIT_DELTA,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DONE
+} wl_columnar_merge_incremental_delta_phase_t;
+
+typedef struct wl_columnar_merge_incremental_delta_attempt {
+    uintptr_t identity;
+    col_rel_mutable_image_t transaction;
+    col_rel_t *delta;
+    wl_evaluation_control_t *control;
+    uint64_t control_attempt_id;
+    col_relation_snapshot_t source_snapshot;
+    uint32_t old_nrows;
+    uint32_t source_nrows;
+    uint32_t run_count;
+    uint32_t run_ends[COL_MAX_RUNS];
+    wl_columnar_merge_incremental_delta_phase_t phase;
+    bool no_op;
+    uint32_t dedup_copy_cursor, dedup_copy_count, dedup_copy_occupied;
+    uint32_t copy_row, copy_column;
+    uint32_t max_old_row, fast_scan_row;
+    bool fast_path;
+    uint32_t sort_width, sort_left, sort_mid, sort_right;
+    uint32_t sort_i, sort_j, sort_out, sort_copy_column;
+    uint32_t sort_copy_row;
+    bool sort_source_primary;
+    bool sort_run_active;
+    bool sort_copy_active;
+    uint32_t dedup_input, dedup_write, dedup_copy_column;
+    bool dedup_copy_active;
+    uint32_t novel_row, novel_run, search_low, search_high;
+    bool novel_search_active;
+    bool novel_found;
+    uint32_t novel_count;
+    uint32_t emit_input, emit_run, emit_low, emit_high;
+    uint32_t emit_copy_column, emit_count;
+    bool emit_search_active, emit_found;
+    bool emit_copy_active;
+    bool compare_active, compare_zero_charged;
+    uint8_t compare_left_grid, compare_right_grid;
+    uint32_t compare_left_row, compare_right_row, compare_column;
+} wl_columnar_merge_incremental_delta_attempt_t;
+
+/* Caller holds the canonical source writer. Creates a governed, empty
+ * relation with the source's schema and interpretation metadata but no name,
+ * rows, timestamps, or shared storage. */
+int wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
+    col_rel_t **out);
+int wl_columnar_relation_mutable_image_prepare_empty(col_rel_t *source,
+    col_rel_mutable_image_t *transaction, uint32_t capacity);
+
+int wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
+    uint32_t old_nrows, wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    wl_evaluation_control_t *control);
+int wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    wl_evaluation_control_t *control, uint64_t work_budget);
+int wl_columnar_merge_incremental_delta_attempt_commit(col_rel_t *source,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    col_rel_t **delta_out,
+    int *out_fast_path, wl_evaluation_control_t *control);
+int wl_columnar_merge_incremental_delta_attempt_abort(col_rel_t *source,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt);
+
 /* The boundary that matters is thread affinity, not the return code.
  *
  * discard() is a no-op when the transaction records no source.  Otherwise it
@@ -4920,6 +4999,10 @@ uint64_t
 wl_columnar_eval_dedup_row_hash(const col_rel_t *r, uint32_t row);
 int wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst,
     const col_rel_t *src);
+int wl_columnar_eval_dedup_set_clone_begin(col_rel_t *dst,
+    const col_rel_t *src);
+int wl_columnar_eval_dedup_set_clone_slot(col_rel_t *dst,
+    const col_rel_t *src, uint32_t slot);
 bool
 wl_columnar_eval_dedup_set_insert(col_rel_t *r, uint64_t h);
 /* Worker transaction path: a duplicate needs no growth.  On error neither
@@ -4948,6 +5031,8 @@ int wl_columnar_session_test_snapshot_insert(wl_session_t *session,
 #endif
 /* Validate a persistent hash table and clear it after physical free. */
 int wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes);
+int wl_columnar_eval_dedup_set_metadata_bytes(const col_rel_t *r,
+    uint64_t *bytes);
 void wl_columnar_eval_dedup_set_clear(col_rel_t *r);
 
 /* ======================================================================== */

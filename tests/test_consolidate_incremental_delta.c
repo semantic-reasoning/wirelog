@@ -2131,6 +2131,589 @@ test_ts_governor_create(uint64_t usable_bytes)
     return wl_columnar_memory_governor_ref_create(&resolution);
 }
 
+static wl_evaluation_control_t *
+attempt_test_control_create(uint64_t limit, const void *owner)
+{
+    wl_evaluation_control_t *control = NULL;
+    if (wl_evaluation_control_create(limit, &control) != 0
+        || wl_evaluation_control_attach(control, owner) != 0
+        || wl_evaluation_control_begin(control, owner) != 0) {
+        if (control)
+            wl_evaluation_control_release(control);
+        return NULL;
+    }
+    return control;
+}
+
+static col_rel_t *
+attempt_test_source(wl_columnar_memory_governor_ref_t **out_governor,
+    bool append_sorted_delta)
+{
+    const int64_t initial[][2] = { { 3, 3 }, { 1, 1 }, { 3, 3 } };
+    const int64_t interleaved_delta[][2] = {
+        { 4, 0 }, { 1, 1 }, { 2, 5 }, { 3, 3 }, { 2, 5 }
+    };
+    const int64_t sorted_delta[][2] = { { 4, 0 }, { 4, 0 }, { 5, 0 } };
+    const int64_t (*delta)[2] = append_sorted_delta ? sorted_delta
+        : interleaved_delta;
+    size_t delta_count = append_sorted_delta
+        ? sizeof(sorted_delta) / sizeof(sorted_delta[0])
+        : sizeof(interleaved_delta) / sizeof(interleaved_delta[0]);
+    col_rel_t *rel = test_rel_alloc(2);
+    int fast_path = -1;
+    *out_governor = NULL;
+    if (!rel)
+        return NULL;
+    for (size_t i = 0; i < sizeof(initial) / sizeof(initial[0]); i++)
+        if (test_rel_append_row(rel, initial[i]) != 0)
+            goto fail;
+    if (col_op_consolidate_incremental_delta(rel, 0, NULL, &fast_path) != 0
+        || fast_path != 1 || rel->nrows != 2)
+        goto fail;
+    for (size_t i = 0; i < delta_count; i++)
+        if (test_rel_append_row(rel, delta[i]) != 0)
+            goto fail;
+    *out_governor = test_ts_governor_create(64u << 20);
+    if (!*out_governor || col_rel_attach_memory_governor(rel,
+        *out_governor) != 0)
+        goto fail;
+    return rel;
+fail:
+    test_rel_free(rel);
+    if (*out_governor) {
+        wl_columnar_memory_governor_ref_release(*out_governor);
+        *out_governor = NULL;
+    }
+    return NULL;
+}
+
+static void
+attempt_test_control_destroy(wl_evaluation_control_t *control,
+    const void *owner, int execution_status)
+{
+    if (!control)
+        return;
+    (void)wl_evaluation_control_finish(control, owner, execution_status, 0);
+    (void)wl_evaluation_control_detach(control, owner);
+    wl_evaluation_control_release(control);
+}
+
+static bool
+attempt_test_pair_is(const col_rel_t *rel, uint32_t row,
+    int64_t first, int64_t second)
+{
+    return rel && rel->ncols == 2 && row < rel->nrows
+           && rel->columns[0][row] == first
+           && rel->columns[1][row] == second;
+}
+
+static void
+test_controlled_incremental_delta_resumes_and_commits(void)
+{
+    TEST(
+        "controlled incremental delta resumes and publishes atomically (#1821)");
+
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = attempt_test_source(&governor, false);
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    wl_columnar_merge_incremental_delta_attempt_t copied;
+    col_rel_t *delta = NULL;
+    const col_delta_timestamp_t *timestamps;
+    uint32_t before_rows;
+    uint64_t before_view, before_storage;
+    int fast_path = -1;
+    bool ok = source && control;
+    uint64_t preserved_dedup_hash = 0;
+
+    ASSERT(ok, "attempt fixture and active control");
+    if (!ok)
+        goto done;
+    ASSERT(wl_columnar_eval_dedup_set_init_from_rel(source) == 0,
+        "fixture starts with active evaluator dedup state");
+    preserved_dedup_hash = wl_columnar_eval_dedup_row_hash(source, 0);
+    ASSERT(col_rel_enable_timestamps(source) == 0 && source->timestamps,
+        "source timestamps are enabled before private preparation");
+    timestamps = source->timestamps;
+    before_rows = source->nrows;
+    before_view = source->view_generation;
+    before_storage = source->storage_generation;
+    int begin_rc = wl_columnar_merge_incremental_delta_attempt_begin(source, 2,
+            &attempt, control);
+    ASSERT(begin_rc == 0, "begin holds source and prepares private image");
+    if (!attempt.identity)
+        goto done;
+
+    copied = attempt;
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_advance(source, &copied,
+        control, 1) == EINVAL && attempt.identity != 0,
+        "a copied address-bound attempt cannot impersonate its writer");
+    memset(&copied, 0, sizeof(copied));
+
+    uint32_t slices = 0;
+    int rc;
+    do {
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt,
+                control, 1);
+        ASSERT(source->nrows == before_rows
+            && source->view_generation == before_view
+            && source->storage_generation == before_storage
+            && source->timestamps == timestamps && delta == NULL,
+            "each bounded slice keeps source and output unpublished");
+        slices++;
+    } while (rc == EAGAIN && slices < 10000);
+    ASSERT(rc == 0 && slices > 1 && attempt.phase
+        == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DONE,
+        "one-unit work slices eventually complete the private candidate");
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_commit(source, &attempt,
+        &delta,
+        &fast_path, control) == 0,
+        "commit publishes the complete source and delta together");
+    ASSERT(fast_path == 0 && source->nrows == 4 && source->sorted_nrows == 4
+        && source->run_count == 1 && source->run_ends[0] == 4
+        && attempt_test_pair_is(source, 0, 1, 1)
+        && attempt_test_pair_is(source, 1, 2, 5)
+        && attempt_test_pair_is(source, 2, 3, 3)
+        && attempt_test_pair_is(source, 3, 4, 0),
+        "published source is sorted, unique, and retains the old rows");
+    ASSERT(delta && delta->nrows == 2
+        && attempt_test_pair_is(delta, 0, 2, 5)
+        && attempt_test_pair_is(delta, 1, 4, 0),
+        "delta contains exactly the sorted novel rows");
+    ASSERT(source->timestamps == NULL && source->timestamp_capacity == 0,
+        "successful replacement retires source timestamps");
+    ASSERT(source->dedup_slots && source->dedup_count > 0
+        && wl_columnar_eval_dedup_set_contains(source, preserved_dedup_hash),
+        "successful replacement preserves active evaluator dedup state");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0,
+        "successful controlled attempt reports success");
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+    test_rel_free(delta);
+    delta = NULL;
+    test_rel_free(source);
+    source = NULL;
+    wl_columnar_memory_governor_ref_release(governor);
+    governor = NULL;
+    PASS();
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_controlled_incremental_delta_zero_column(void)
+{
+    TEST("controlled incremental delta emits an inhabited empty tuple (#1821)");
+
+    int owner = 0;
+    int64_t empty_tuple = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = test_rel_alloc(0);
+    wl_evaluation_control_t *control = NULL;
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    col_rel_t *delta = NULL;
+    bool ok = source != NULL;
+
+    ASSERT(ok, "zero-column fixture allocates");
+    if (!ok)
+        goto done;
+    ASSERT(test_rel_append_row(source, &empty_tuple) == 0,
+        "fixture contains one nullary tuple");
+    governor = test_ts_governor_create(8u << 20);
+    ASSERT(governor && col_rel_attach_memory_governor(source, governor) == 0,
+        "fixture receives a memory governor");
+    if (!governor)
+        goto done;
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control, "fixture has active evaluation control");
+    if (!control)
+        goto done;
+    int rc = wl_columnar_merge_incremental_delta_attempt_begin(source, 0,
+            &attempt, control);
+    ASSERT(rc == 0, "begin prepares zero-column source");
+    if (rc != 0)
+        goto done;
+    uint32_t slices = 0;
+    do {
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt, control, 1);
+        slices++;
+    } while (rc == EAGAIN && slices < 1000);
+    ASSERT(rc == 0 && slices > 1,
+        "one-unit slices complete nullary consolidation");
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_commit(source,
+        &attempt, &delta, NULL, control) == 0,
+        "nullary result commits");
+    ASSERT(source->ncols == 0 && source->nrows == 1
+        && delta && delta->ncols == 0 && delta->nrows == 1
+        && delta->nrows <= delta->capacity,
+        "empty tuple is emitted with valid delta capacity");
+    PASS();
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_controlled_incremental_delta_fast_path(void)
+{
+    TEST("controlled incremental delta preserves the sorted fast path (#1821)");
+
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = attempt_test_source(&governor, true);
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    col_rel_t *delta = NULL;
+    int fast_path = -1;
+    bool ok = source && control;
+
+    ASSERT(ok, "sorted-delta fixture and active control");
+    if (!ok)
+        goto done;
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_begin(source, 2,
+        &attempt,
+        control) == 0, "begin sorted-delta candidate");
+    if (!attempt.identity)
+        goto done;
+    int rc;
+    uint32_t slices = 0;
+    do {
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt,
+                control, 3);
+        slices++;
+    } while (rc == EAGAIN && slices < 1000);
+    ASSERT(rc == 0 && wl_columnar_merge_incremental_delta_attempt_commit(source,
+        &attempt, &delta, &fast_path, control) == 0,
+        "sorted-delta attempt completes and commits");
+    ASSERT(fast_path == 1 && source->nrows == 4 && source->run_count == 1
+        && source->run_ends[0] == 4
+        && attempt_test_pair_is(source, 0, 1, 1)
+        && attempt_test_pair_is(source, 1, 3, 3)
+        && attempt_test_pair_is(source, 2, 4, 0)
+        && attempt_test_pair_is(source, 3, 5, 0),
+        "fast-path flag and canonical source match legacy semantics");
+    ASSERT(delta && delta->nrows == 2
+        && attempt_test_pair_is(delta, 0, 4, 0)
+        && attempt_test_pair_is(delta, 1, 5, 0),
+        "fast-path delta excludes duplicate input rows");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0,
+        "fast-path controlled attempt reports success");
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+    test_rel_free(delta);
+    delta = NULL;
+    test_rel_free(source);
+    source = NULL;
+    wl_columnar_memory_governor_ref_release(governor);
+    governor = NULL;
+    PASS();
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_controlled_incremental_delta_cancellation_discards(void)
+{
+    TEST("controlled incremental delta cancellation releases source (#1821)");
+
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = attempt_test_source(&governor, false);
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    col_rel_t *delta = NULL;
+    uint32_t before_rows = source ? source->nrows : 0;
+    uint64_t before_view = source ? source->view_generation : 0;
+    uint64_t preserved_dedup_hash = 0;
+    bool ok = source && control;
+
+    ASSERT(ok, "attempt fixture and active control");
+    if (!ok)
+        goto done;
+    ASSERT(wl_columnar_eval_dedup_set_init_from_rel(source) == 0,
+        "cancellation fixture has active evaluator dedup state");
+    preserved_dedup_hash = wl_columnar_eval_dedup_row_hash(source, 0);
+    int begin_rc = wl_columnar_merge_incremental_delta_attempt_begin(source, 2,
+            &attempt, control);
+    ASSERT(begin_rc == 0, "begin cancellation candidate");
+    if (!attempt.identity)
+        goto done;
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_advance(source, &attempt,
+        control, 1) == EAGAIN && attempt.identity != 0,
+        "first bounded slice retains its private candidate");
+    wl_evaluation_control_request_cancel(control);
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_advance(source, &attempt,
+        control, 100) == WL_EVALUATION_CONTROL_CANCELLED
+        && attempt.identity == 0 && source->nrows == before_rows
+        && source->view_generation == before_view && delta == NULL
+        && source->dedup_slots
+        && wl_columnar_eval_dedup_set_contains(source, preserved_dedup_hash),
+        "cancellation discards the candidate without publishing source or delta");
+    const int64_t appended[2] = { 9, 9 };
+    ASSERT(test_rel_append_row(source, appended) == 0,
+        "cancel releases the canonical source writer");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED,
+        "cancelled controlled attempt reports its stop reason");
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+    test_rel_free(source);
+    source = NULL;
+    wl_columnar_memory_governor_ref_release(governor);
+    governor = NULL;
+    PASS();
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner,
+            WL_EVALUATION_CONTROL_CANCELLED);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+}
+
+static void
+test_controlled_incremental_delta_work_limit_discards(void)
+{
+    TEST("controlled incremental delta work limit discards candidate (#1821)");
+
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = attempt_test_source(&governor, false);
+    wl_evaluation_control_t *control = attempt_test_control_create(1, &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    uint32_t before_rows = source ? source->nrows : 0;
+    uint64_t before_view = source ? source->view_generation : 0;
+    bool ok = source && control;
+
+    ASSERT(ok, "attempt fixture and one-unit control");
+    if (!ok)
+        goto done;
+    int begin_rc = wl_columnar_merge_incremental_delta_attempt_begin(source, 2,
+            &attempt, control);
+    ASSERT(begin_rc == 0, "begin work-limited candidate");
+    if (!attempt.identity)
+        goto done;
+    ASSERT(wl_columnar_merge_incremental_delta_attempt_advance(source, &attempt,
+        control, 100) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && attempt.identity == 0 && source->nrows == before_rows
+        && source->view_generation == before_view,
+        "global work limit is terminal and leaves source unchanged");
+    const int64_t appended[2] = { 9, 9 };
+    ASSERT(test_rel_append_row(source, appended) == 0,
+        "work-limit cleanup releases the canonical source writer");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT,
+        "work-limited attempt reports its stop reason");
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+    test_rel_free(source);
+    source = NULL;
+    wl_columnar_memory_governor_ref_release(governor);
+    governor = NULL;
+    PASS();
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner,
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+}
+
+static bool
+attempt_test_run_global_limit(uint64_t limit, bool expect_success,
+    uint64_t *out_consumed)
+{
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = attempt_test_source(&governor, false);
+    wl_evaluation_control_t *control = attempt_test_control_create(limit,
+            &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    col_rel_t *delta = NULL;
+    int rc = EINVAL;
+    bool ok = source && control;
+
+    if (!ok)
+        goto done;
+    rc = wl_columnar_merge_incremental_delta_attempt_begin(source, 2, &attempt,
+            control);
+    if (rc != 0)
+        goto done;
+    uint32_t slices = 0;
+    do {
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt,
+                control, UINT64_MAX);
+    } while (rc == EAGAIN && ++slices < 10000);
+    if (expect_success) {
+        if (rc != 0 ||
+            wl_columnar_merge_incremental_delta_attempt_commit(source,
+            &attempt, &delta, NULL, control) != 0 || !delta
+            || source->nrows != 4 || delta->nrows != 2)
+            ok = false;
+        else
+            rc = 0;
+    } else if (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+        || attempt.identity != 0 || source->nrows != 7
+        || source->columns[0][0] != 1 || source->columns[1][0] != 1) {
+        ok = false;
+    }
+    int execution_status = rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? 0 : rc;
+    if (wl_evaluation_control_finish(control, &owner, execution_status, 0)
+        != (expect_success ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT))
+        ok = false;
+    wl_evaluation_control_report_t report;
+    int report_rc = wl_evaluation_control_report(control, &report);
+    if (report_rc != 0)
+        ok = false;
+    else if (out_consumed)
+        *out_consumed = report.consumed;
+    if (report_rc == 0) {
+        if (expect_success
+            && report.stop_reason != WL_EVALUATION_CONTROL_NONE)
+            ok = false;
+        if (!expect_success
+            && (report.stop_reason != WL_EVALUATION_CONTROL_WORK_LIMIT
+            || report.consumed != limit))
+            ok = false;
+    }
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control) {
+        /* The normal path has already finished and detached the control. */
+        wl_evaluation_control_report_t ignored;
+        if (wl_evaluation_control_report(control, &ignored) != 0)
+            attempt_test_control_destroy(control, &owner, rc);
+        else {
+            (void)wl_evaluation_control_detach(control, &owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return ok;
+}
+
+static void
+test_controlled_incremental_delta_empty_old_count_is_bounded(void)
+{
+    TEST(
+        "controlled incremental delta charges each novel empty-base row (#1821)");
+
+    const uint32_t nrows = 128;
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor = NULL;
+    col_rel_t *source = test_rel_alloc(1);
+    col_rel_t *delta = NULL;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_merge_incremental_delta_attempt_t attempt = { 0 };
+    bool ok = source && control;
+    int rc = EINVAL;
+    uint32_t slices = 0;
+
+    if (!ok)
+        goto done;
+    for (uint32_t i = 0; i < nrows; i++) {
+        int64_t value = (int64_t)i;
+        if (test_rel_append_row(source, &value) != 0)
+            goto done;
+    }
+    governor = test_ts_governor_create(64u << 20);
+    if (!governor || col_rel_attach_memory_governor(source, governor) != 0
+        || wl_columnar_merge_incremental_delta_attempt_begin(source, 0,
+        &attempt, control) != 0)
+        goto done;
+
+    do {
+        uint32_t count_before = attempt.novel_count;
+        rc = wl_columnar_merge_incremental_delta_attempt_advance(source,
+                &attempt, control, 1);
+        if (attempt.novel_count - count_before > 1u || ++slices >= 10000u)
+            goto done;
+    } while (rc == EAGAIN);
+    if (rc != 0 || attempt.novel_count != nrows
+        || wl_columnar_merge_incremental_delta_attempt_commit(source,
+        &attempt, &delta, NULL, control) != 0
+        || source->nrows != nrows || !delta || delta->nrows != nrows)
+        goto done;
+    ok = true;
+
+done:
+    if (attempt.identity)
+        (void)wl_columnar_merge_incremental_delta_attempt_abort(source,
+            &attempt);
+    test_rel_free(delta);
+    test_rel_free(source);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    if (ok)
+        PASS();
+    else
+        FAIL("empty-base novel counting stays within each one-unit slice");
+}
+
+static void
+test_controlled_incremental_delta_exact_limit_boundaries(void)
+{
+    TEST("controlled incremental delta honors exact work boundaries (#1821)");
+
+    uint64_t work = 0, observed = 0;
+    ASSERT(attempt_test_run_global_limit(0, true, &work) && work > 0,
+        "measure deterministic work for the fixed fixture");
+    ASSERT(attempt_test_run_global_limit(work, true, &observed)
+        && observed == work,
+        "exact work allowance completes without a further charge");
+    ASSERT(attempt_test_run_global_limit(work - 1u, false, &observed)
+        && observed == work - 1u,
+        "one unit below exact allowance stops before excess work");
+    PASS();
+}
+
 /* Release the relation before the governor it is attached to. */
 static void
 ts_fixture_fini(ts_fixture_t *f)
@@ -3157,6 +3740,14 @@ int
 main(void)
 {
     printf("=== test_consolidate_incremental_delta ===\n\n");
+
+    test_controlled_incremental_delta_resumes_and_commits();
+    test_controlled_incremental_delta_zero_column();
+    test_controlled_incremental_delta_fast_path();
+    test_controlled_incremental_delta_cancellation_discards();
+    test_controlled_incremental_delta_work_limit_discards();
+    test_controlled_incremental_delta_empty_old_count_is_bounded();
+    test_controlled_incremental_delta_exact_limit_boundaries();
 
     test_empty_old_all_new();
     test_all_duplicate_delta_no_change();
