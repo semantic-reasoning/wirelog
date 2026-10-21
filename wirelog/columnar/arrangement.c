@@ -1712,6 +1712,20 @@ col_arrangement_find_first(const col_arrangement_t *arr,
 }
 
 uint32_t
+col_arrangement_bucket_head_typed(const col_arrangement_t *arr,
+    const col_rel_t *rel, const int64_t *key_row)
+{
+    if (!arr || !rel || !rel->columns || !key_row || arr->nbuckets == 0
+        || arr->indexed_rows == 0 || !arr->ht_head)
+        return UINT32_MAX;
+    uint32_t bucket = arr_hash_key_typed(rel, key_row, arr->key_cols,
+            arr->key_count, arr->nbuckets);
+    uint64_t head = arr->ht_head[bucket];
+    return ARR_HEAD_GENERATION(head) == arr->generation
+        ? ARR_HEAD_ROW(head) : UINT32_MAX;
+}
+
+uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row)
 {

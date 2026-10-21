@@ -146,6 +146,12 @@ void *
 wl_columnar_continuation_producer_context(
     const wl_columnar_continuation_t *continuation);
 
+/* Transfer producer use to one owner-specific stepping API. Once claimed,
+ * generic publish is refused for the continuation's lifetime. */
+bool
+wl_columnar_continuation_claim_producer(
+    wl_columnar_continuation_t *continuation, const void *owner);
+
 bool
 wl_columnar_continuation_is_done(
     const wl_columnar_continuation_t *continuation);

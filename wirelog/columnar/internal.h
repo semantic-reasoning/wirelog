@@ -2909,6 +2909,11 @@ col_rel_set_column_types(col_rel_t *r,
 uint32_t
 col_arrangement_find_first_typed(const col_arrangement_t *arr,
     const col_rel_t *rel, const int64_t *key_row);
+/* Return only the first row in the typed hash bucket. Unlike find_first,
+ * this does not walk collision chains and is suitable for bounded cursors. */
+uint32_t
+col_arrangement_bucket_head_typed(const col_arrangement_t *arr,
+    const col_rel_t *rel, const int64_t *key_row);
 
 /* join.c helpers shared with join_batch.c (Issue #1446) and
  * join_pipeline.c.  Internal only: hidden visibility keeps them out of the

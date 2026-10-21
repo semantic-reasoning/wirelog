@@ -133,6 +133,54 @@ bool
 col_join_batch_cursor_get(const wl_columnar_continuation_t *cont,
     col_join_batch_cursor_t *out);
 
+/* Producer-only controlled stepping status. Stop and execution-error values
+ * are sticky until the continuation is discarded. */
+typedef enum {
+    COL_JOIN_BATCH_CONTROL_PROGRESS = 0,
+    COL_JOIN_BATCH_CONTROL_BATCH_READY,
+    COL_JOIN_BATCH_CONTROL_DONE,
+    COL_JOIN_BATCH_CONTROL_WORK_LIMIT,
+    COL_JOIN_BATCH_CONTROL_CANCELLED,
+    COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
+    COL_JOIN_BATCH_CONTROL_STALE_INPUT,
+    COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR
+} col_join_batch_control_status_t;
+
+typedef struct {
+    col_join_batch_control_status_t status;
+    int execution_status; /* errno-style code only for EXECUTION_ERROR */
+    uint64_t work_ordinal; /* cumulative admitted logical work */
+    uint64_t batch_generation; /* nonzero only for BATCH_READY */
+} col_join_batch_control_result_t;
+
+/* Bind the prepared producer to one active operation attempt and transfer
+ * exclusive stepping ownership from generic continuation publication.
+ * The bound API is serialized on the thread that calls bind. */
+int
+col_join_batch_control_bind(wl_columnar_continuation_t *cont,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
+
+/* Perform at most max_work units, charging before each state transition or
+ * bounded tuple/hash action. Complete private rows remain hidden until peek. */
+col_join_batch_control_status_t
+col_join_batch_control_step(wl_columnar_continuation_t *cont,
+    uint64_t max_work, col_join_batch_control_result_t *result);
+
+/* Repeated peeks return the same immutable private batch and generation.
+ * Ack consumes only that exact generation. A bad generation is EINVAL and
+ * changes no producer state. */
+int
+col_join_batch_control_peek(wl_columnar_continuation_t *cont,
+    const col_rel_t **batch, uint64_t *generation);
+int
+col_join_batch_control_ack(wl_columnar_continuation_t *cont,
+    uint64_t generation);
+
+/* Discard and destroy the continuation, releasing its arrangement lease,
+ * admitted scratch, and retained control reference; clears *cont. */
+int
+col_join_batch_control_discard(wl_columnar_continuation_t **cont);
+
 /* Synchronous all-or-nothing sink that appends each committed batch to a
  * heap-owned relation admitted under the session governor.  The relation's
  * retained token owns every visible output byte; the sink holds no token. */
