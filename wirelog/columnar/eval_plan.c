@@ -55,6 +55,14 @@ wl_columnar_eval_plan_numeric_composed_abort_supported(
         case WL_PLAN_OP_MAP:
             if (!depth) return EINVAL;
             break;
+        case WL_PLAN_OP_JOIN:
+            if (!depth) return EINVAL;
+            /* The owned ordinary JOIN attempt retains cancellation state and
+             * cleanup after its synchronous run returns. Host ABORT cannot
+             * interrupt that run. Materialized JOIN has no equivalent framed
+             * owner and remains usable only through ordinary advance. */
+            if (plan->ops[i].materialized) return 0;
+            break;
         case WL_PLAN_OP_CONCAT:
             if (depth < 2) return EINVAL;
             --depth;
@@ -1440,7 +1448,10 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         if (!rc) {
             wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
             if (kind != WL_PLAN_OP_VARIABLE && kind != WL_PLAN_OP_FILTER
-                && kind != WL_PLAN_OP_MAP && kind != WL_PLAN_OP_CONCAT
+                && kind != WL_PLAN_OP_MAP
+                && !(kind == WL_PLAN_OP_JOIN
+                && !record->plan->ops[record->cursor].materialized)
+                && kind != WL_PLAN_OP_CONCAT
                 && !(kind == WL_PLAN_OP_CONSOLIDATE
                 && record->cursor + 1 == record->end))
                 record->abort_supported = false;
