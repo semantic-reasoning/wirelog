@@ -2446,6 +2446,10 @@ typedef struct wl_col_session_t {
     uint32_t tdd_active_workers;        /* current adaptive TDD width */
     uint32_t tdd_last_active_workers;   /* last selected TDD width */
     uint32_t tdd_max_active_workers;    /* max selected width this eval */
+    /* Number of base-case VARIABLEs this session replaced by an empty
+     * relation after the first iteration (Issue #2127).  Each session
+     * counts its own; a test reads it on a one-worker session. */
+    uint64_t base_case_skips;
     /* MPSC delta queue for async delta transport (Issue #410).
      * Created/destroyed per recursive stratum evaluation in
      * col_eval_stratum_tdd_recursive(). NULL outside that scope.
@@ -4865,6 +4869,13 @@ retraction_rel_name(const char *rel, char *buf, size_t sz);
 bool
 has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
     uint32_t iteration);
+/* Reports whether @relation_name has new rows in this sub-pass. */
+typedef bool (*wl_columnar_eval_plan_delta_probe_fn)(void *ctx,
+    const char *relation_name);
+bool
+wl_columnar_eval_plan_var_skip_scan(const wl_plan_relation_t *rplan,
+    uint32_t var_idx, wl_columnar_eval_plan_delta_probe_fn has_delta,
+    void *ctx);
 typedef struct wl_columnar_eval_serial_framed_host_request
     wl_columnar_eval_serial_framed_host_request_t;
 /* Raw synchronous calls pass NULL request. Controlled calls require the aware

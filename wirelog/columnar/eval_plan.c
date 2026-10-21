@@ -36,6 +36,81 @@ _Static_assert(WL_PLAN_OP_K_FUSION == WL_PLAN_OP__BACKEND_START,
 #endif
 
 /*
+ * wl_columnar_eval_plan_var_skip_scan:
+ * Decide whether the rows of the VARIABLE at @var_idx can be left out of
+ * this sub-pass (Issue #2127).  The scan follows the stack item that
+ * VARIABLE pushes to the end of the plan:
+ *   - MAP, FILTER, CONSOLIDATE and EXCHANGE change only that item;
+ *   - CONCAT merges it with the item above, after which the merged item is
+ *     followed;
+ *   - JOIN, SEMIJOIN and ANTIJOIN read a second relation by name, so the
+ *     scan continues past one only when it is not FORCE_DELTA and @has_delta
+ *     reports no new rows for its right relation;
+ *   - an op acting on an item pushed above the tracked one is passed over.
+ * REDUCE, an unnamed or FORCE_DELTA join, a join whose right relation has
+ * new rows, and K_FUSION or LFTJ at any depth (their stack effect is not
+ * modelled here) end the scan with false.  True means the item depends only
+ * on relations that @has_delta reports unchanged.  @has_delta recognises
+ * changes published as "$d$<name>" rows and no other form.
+ */
+bool
+wl_columnar_eval_plan_var_skip_scan(const wl_plan_relation_t *rplan,
+    uint32_t var_idx, wl_columnar_eval_plan_delta_probe_fn has_delta,
+    void *ctx)
+{
+    uint32_t above = 0;
+
+    for (uint32_t j = var_idx + 1; j < rplan->op_count; j++) {
+        const wl_plan_op_t *o = &rplan->ops[j];
+
+        switch (o->op) {
+        case WL_PLAN_OP_VARIABLE:
+            above++;
+            continue;
+        case WL_PLAN_OP_CONCAT:
+            if (above > 0)
+                above--;
+            continue;
+        case WL_PLAN_OP_K_FUSION:
+        case WL_PLAN_OP_LFTJ:
+            return false;
+        default:
+            break;
+        }
+        if (above > 0)
+            continue;
+        switch (o->op) {
+        case WL_PLAN_OP_MAP:
+        case WL_PLAN_OP_FILTER:
+        case WL_PLAN_OP_CONSOLIDATE:
+        case WL_PLAN_OP_EXCHANGE:
+            continue;
+        case WL_PLAN_OP_JOIN:
+        case WL_PLAN_OP_SEMIJOIN:
+        case WL_PLAN_OP_ANTIJOIN:
+            if (o->delta_mode != WL_DELTA_FORCE_DELTA && o->right_relation
+                && !has_delta(ctx, o->right_relation))
+                continue;
+            return false;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Delta probe for the skip scan: true when the session holds a nonempty
+ * "$d$<name>". */
+static bool
+session_has_delta_rows(void *ctx, const char *relation_name)
+{
+    char dname[256];
+    snprintf(dname, sizeof(dname), "$d$%s", relation_name);
+    col_rel_t *d = session_find_rel((wl_col_session_t *)ctx, dname);
+    return d && d->nrows > 0;
+}
+
+/*
  * col_eval_relation_plan:
  * Evaluate all operators for one relation plan using the eval stack.
  * On success, the top of stack holds the result relation (owned).
@@ -64,7 +139,11 @@ wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
          * wastes O(N_base) work per sub-pass. Push empty instead.
          * Applies to both W=1 sequential evaluation and W>1 TDD workers.
          * For CRDT (k=1, no FORCE_DELTA expansion), this eliminates redundant
-         * 104K-row consolidation sorting on every sub-pass (Issue #367). */
+         * 104K-row consolidation sorting on every sub-pass (Issue #367).
+         * Issue #2127: a VARIABLE followed by FILTER can still reach a JOIN
+         * with a recursive relation, so the skip also requires
+         * wl_columnar_eval_plan_var_skip_scan() to find no relation with new
+         * rows on the way to the head. */
         if (!sess->tdd_input_run && op->op == WL_PLAN_OP_VARIABLE
             && sess->current_iteration > 0
             && op->delta_mode == WL_DELTA_AUTO && op->relation_name) {
@@ -73,7 +152,9 @@ wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                 && (rplan->ops[i + 1].op == WL_PLAN_OP_JOIN
                 || rplan->ops[i + 1].op == WL_PLAN_OP_SEMIJOIN
                 || rplan->ops[i + 1].op == WL_PLAN_OP_ANTIJOIN));
-            if (!next_is_join) {
+            if (!next_is_join
+                && wl_columnar_eval_plan_var_skip_scan(rplan, i,
+                session_has_delta_rows, sess)) {
                 char dname[256];
                 snprintf(dname, sizeof(dname), "$d$%s", op->relation_name);
                 col_rel_t *d = session_find_rel(sess, dname);
@@ -128,6 +209,7 @@ wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                         col_rel_destroy(empty);
                         return rc;
                     }
+                    sess->base_case_skips++;
                     continue;
                 }
             }

@@ -2234,6 +2234,17 @@ test_tdd_partition_metadata_exe = executable(
 
 test('tdd_partition_metadata', test_tdd_partition_metadata_exe)
 
+# Issue #2127: recursive strata return the same model at every worker count
+test_recursive_model_parity_exe = executable(
+  'test_recursive_model_parity',
+  files('test_recursive_model_parity.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+
+test('recursive_model_parity', test_recursive_model_parity_exe)
+
 # ============================================================================
 # RDF Named-Graph Integration Tests (Issue #535)
 # ============================================================================
