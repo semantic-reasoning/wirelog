@@ -16,6 +16,8 @@ struct wl_columnar_continuation {
     bool producer_retired;
     bool has_pending_batch;
     bool publishing;
+    bool producer_claimed;
+    const void *producer_claim_owner;
     bool cancel_requested;
     bool destroy_requested;
     bool destroying;
@@ -227,6 +229,8 @@ publish_protocol(wl_columnar_continuation_t *continuation,
 
     if (continuation->publishing || continuation->destroying)
         return WL_COLUMNAR_CONTINUATION_INVALID;
+    if (continuation->producer_claimed)
+        return WL_COLUMNAR_CONTINUATION_INVALID;
     if (continuation->terminal)
         return continuation->terminal_status;
     if (continuation->done)
@@ -401,6 +405,8 @@ wl_columnar_continuation_publish(
         return WL_COLUMNAR_CONTINUATION_INVALID;
     if (continuation->publishing || continuation->destroying)
         return WL_COLUMNAR_CONTINUATION_INVALID;
+    if (continuation->producer_claimed)
+        return WL_COLUMNAR_CONTINUATION_INVALID;
     if (continuation->producer.disposition)
         return publish_protocol(continuation, sink);
     if (continuation->cancelled)
@@ -423,6 +429,19 @@ wl_columnar_continuation_producer_context(
     const wl_columnar_continuation_t *continuation)
 {
     return continuation ? continuation->producer.context : NULL;
+}
+
+bool
+wl_columnar_continuation_claim_producer(
+    wl_columnar_continuation_t *continuation, const void *owner)
+{
+    if (!continuation || !owner || continuation->producer_claimed
+        || continuation->publishing || continuation->done
+        || continuation->cancelled || continuation->terminal)
+        return false;
+    continuation->producer_claimed = true;
+    continuation->producer_claim_owner = owner;
+    return true;
 }
 
 bool

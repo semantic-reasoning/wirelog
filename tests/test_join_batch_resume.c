@@ -5741,6 +5741,542 @@ test_env_parse(void)
         FAIL("knob parsing");
 }
 
+static void
+test_controlled_prepared_producer(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 0, 3 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    const col_rel_t *batch_a = NULL, *batch_b = NULL;
+    uint64_t generation_a = 0, generation_b = 0;
+    col_rel_t *gathered = NULL, *oracle = NULL;
+    uint32_t scratch_capacity;
+    uint64_t reserved;
+    wl_columnar_continuation_sink_t raw_sink;
+    col_join_batch_relation_sink_t raw_sink_ctx;
+    bool ok = true, done = false;
+
+    TEST("prepared ordinary JOIN steps through acknowledged private batches");
+    if (!fixture_init(&f, 1u << 24, keys, 4, 2, 3)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 3u * 32u, &cont) != 0
+        || wl_evaluation_control_create(10000, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0
+        || col_join_batch_relation_sink_init(&raw_sink_ctx, &raw_sink,
+        f.sess, f.out) != 0) {
+        FAIL("fixture, producer, or control bind");
+        goto out;
+    }
+    gathered = col_rel_new_auto("$controlled_join", 4);
+    if (!gathered || col_join_set_output_types(gathered, f.left, f.right,
+        &f.op) != 0) {
+        FAIL("gather relation");
+        goto out;
+    }
+    scratch_capacity = col_join_batch_scratch_capacity(cont);
+    reserved = reserved_of(f.sess);
+    if (wl_columnar_continuation_publish(cont, &raw_sink)
+        != WL_COLUMNAR_CONTINUATION_INVALID) {
+        FAIL("bound producer admitted generic continuation publication");
+        goto out;
+    }
+    for (unsigned turns = 0; turns < 10000u; ++turns) {
+        status = col_join_batch_control_step(cont, 16u, &result);
+        if (status == COL_JOIN_BATCH_CONTROL_PROGRESS)
+            continue;
+        if (status == COL_JOIN_BATCH_CONTROL_DONE) {
+            done = true;
+            break;
+        }
+        if (status != COL_JOIN_BATCH_CONTROL_BATCH_READY) {
+            FAIL("controlled producer stopped before producing all batches");
+            ok = false;
+            break;
+        }
+        if (col_join_batch_control_peek(cont, &batch_a, &generation_a) != 0
+            || col_join_batch_control_peek(cont, &batch_b, &generation_b) != 0
+            || batch_a != batch_b || generation_a != generation_b
+            || generation_a == 0 || batch_a->nrows == 0
+            || batch_a->nrows > scratch_capacity) {
+            FAIL("peek did not preserve immutable batch identity/generation");
+            ok = false;
+            break;
+        }
+        for (uint32_t row = 0; row < batch_a->nrows; ++row) {
+            int64_t values[4];
+            for (uint32_t column = 0; column < 4; ++column)
+                values[column] = col_rel_get(batch_a, row, column);
+            if (col_rel_append_row(gathered, values) != 0) {
+                FAIL("could not copy complete private output row");
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            break;
+        if (col_join_batch_control_ack(cont, generation_a + 1u) != EINVAL
+            || col_join_batch_control_ack(cont, generation_a) != 0) {
+            FAIL(
+                "ack accepted stale generation or rejected current generation");
+            ok = false;
+            break;
+        }
+        batch_a = batch_b = NULL;
+    }
+    if (!done || result.work_ordinal == 0 || f.out->nrows != 0
+        || reserved_of(f.sess) != reserved
+        || col_join_batch_scratch_capacity(cont) != scratch_capacity || !ok) {
+        FAIL("controlled stepping mutated output or grew admitted scratch");
+        goto out;
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!oracle || !same_rows(oracle, gathered)) {
+        FAIL("controlled ordinary JOIN differs from independent raw result");
+        goto out;
+    }
+    const col_arr_entry_t *entry = find_entry(f.sess, "right");
+    if (!entry || entry->pin_count != 1u
+        || col_join_batch_control_discard(&cont) != 0 || cont != NULL
+        || entry->pin_count != 0u || reserved_of(f.sess) >= reserved) {
+        FAIL("controlled discard did not release lease and admitted scratch");
+        goto out;
+    }
+    PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (gathered)
+        col_rel_destroy(gathered);
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_work_limit(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+
+    TEST("prepared ordinary JOIN reports a sticky work limit");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 2)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("fixture, producer, or control bind");
+        goto out;
+    }
+    col_join_batch_control_status_t status =
+        col_join_batch_control_step(cont, 64u, &result);
+    if (status != COL_JOIN_BATCH_CONTROL_WORK_LIMIT
+        || result.status != status || result.execution_status != 0
+        || result.work_ordinal != 1u
+        || col_join_batch_control_step(cont, 64u, &result) != status
+        || f.out->nrows != 0) {
+        FAIL("work-limit result was not exact, sticky, and unpublished");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_cancel_and_stale_input(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+
+    TEST("prepared ordinary JOIN cancellation and stale input are sticky");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 2)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("cancel fixture");
+        goto cancel_out;
+    }
+    wl_evaluation_control_request_cancel(control);
+    col_join_batch_control_status_t status =
+        col_join_batch_control_step(cont, 64u, &result);
+    if (status != COL_JOIN_BATCH_CONTROL_CANCELLED
+        || col_join_batch_control_step(cont, 64u, &result) != status
+        || result.status != status || f.out->nrows != 0) {
+        FAIL("cancellation was not exact, sticky, and unpublished");
+        goto cancel_out;
+    }
+    PASS();
+cancel_out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner,
+                WL_EVALUATION_CONTROL_CANCELLED, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+
+    cont = NULL; control = NULL;
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 2)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("stale-input fixture");
+        goto stale_out;
+    }
+    int64_t extra[] = { 7, 70 };
+    if (col_rel_append_row(f.left, extra) != 0
+        || col_join_batch_control_step(cont, 64u, &result)
+        != COL_JOIN_BATCH_CONTROL_STALE_INPUT
+        || col_join_batch_control_step(cont, 64u, &result)
+        != COL_JOIN_BATCH_CONTROL_STALE_INPUT
+        || result.execution_status != EAGAIN || f.out->nrows != 0) {
+        FAIL("stale input did not produce an exact sticky stop");
+        goto stale_out;
+    }
+    PASS();
+stale_out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_cross_key_collision(void)
+{
+    fixture_t f;
+    const int64_t initial_key[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    col_arrangement_t *arr;
+    int64_t match_key, other_key;
+    uint32_t bucket;
+    col_rel_t *gathered = NULL, *oracle = NULL;
+    const col_rel_t *batch;
+    uint64_t generation;
+    bool done = false;
+    col_join_batch_cursor_t saved_cursor, observed_cursor;
+
+    TEST("controlled producer checks cross-key hash collisions before emit");
+    if (!fixture_init(&f, 1u << 24, initial_key, 1, 1024, 2)) {
+        FAIL("fixture");
+        goto out;
+    }
+    arr = col_session_get_arrangement((wl_session_t *)f.sess, "right", KEY0,
+            1);
+    if (!arr || !find_true_collision(arr, f.right, &match_key, &other_key,
+        &bucket)
+        || col_rel_set_raw(f.left, 0, 0, match_key) != 0
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(10000, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("could not prepare an actual cross-key collision");
+        goto out;
+    }
+    (void)other_key;
+    (void)bucket;
+    gathered = col_rel_new_auto("$controlled_collision", 4);
+    if (!gathered || col_join_set_output_types(gathered, f.left, f.right,
+        &f.op) != 0) {
+        FAIL("gather relation");
+        goto out;
+    }
+    if (!col_join_batch_cursor_get(cont, &saved_cursor)
+        || col_join_batch_control_step(cont, 11u, &result)
+        != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 11u
+        || col_join_batch_control_step(cont, 1u, &result)
+        != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 11u
+        || col_join_batch_control_step(cont, 2u, &result)
+        != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 13u
+        || !col_join_batch_cursor_get(cont, &observed_cursor)
+        || observed_cursor.sequence != saved_cursor.sequence
+        || observed_cursor.next.lr != saved_cursor.next.lr
+        || observed_cursor.next.rr != saved_cursor.next.rr) {
+        FAIL("bounded hash/candidate phases or speculative cursor failed");
+        goto out;
+    }
+    for (unsigned turns = 0; turns < 10000u; ++turns) {
+        status = col_join_batch_control_step(cont, 32u, &result);
+        if (status == COL_JOIN_BATCH_CONTROL_PROGRESS)
+            continue;
+        if (status == COL_JOIN_BATCH_CONTROL_DONE) {
+            done = true;
+            break;
+        }
+        if (status != COL_JOIN_BATCH_CONTROL_BATCH_READY
+            || col_join_batch_control_peek(cont, &batch, &generation) != 0
+            || batch->nrows != 1u) {
+            FAIL("collision walk did not produce one complete row at a time");
+            goto out;
+        }
+        if (!col_join_batch_cursor_get(cont, &observed_cursor)
+            || observed_cursor.sequence != saved_cursor.sequence
+            || observed_cursor.next.lr != saved_cursor.next.lr
+            || observed_cursor.next.rr != saved_cursor.next.rr) {
+            FAIL("peek advanced the acknowledged producer cursor");
+            goto out;
+        }
+        int64_t row[4];
+        for (uint32_t c = 0; c < 4; ++c)
+            row[c] = col_rel_get(batch, 0, c);
+        if (col_rel_append_row(gathered, row) != 0
+            || col_join_batch_control_ack(cont, generation) != 0) {
+            FAIL("could not preserve acknowledged collision result");
+            goto out;
+        }
+        if (!col_join_batch_cursor_get(cont, &saved_cursor)
+            || saved_cursor.sequence == 0) {
+            FAIL("ack did not advance the producer-local cursor");
+            goto out;
+        }
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (!done || gathered->nrows != 2u || !oracle
+        || !same_rows(oracle, gathered) || f.out->nrows != 0) {
+        FAIL("controlled collision result differs from raw relation oracle");
+        goto out;
+    }
+    PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (gathered)
+        col_rel_destroy(gathered);
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_cancel_after_bind(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    const col_rel_t *batch = NULL;
+    uint64_t generation = 0;
+
+    TEST("generic cancellation after JOIN bind is sticky and safe");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 2)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("fixture, producer, or control bind");
+        goto out;
+    }
+    wl_columnar_continuation_cancel(cont);
+    if (col_join_batch_control_step(cont, 16u, &result)
+        != COL_JOIN_BATCH_CONTROL_CANCELLED
+        || col_join_batch_control_step(cont, 16u, &result)
+        != COL_JOIN_BATCH_CONTROL_CANCELLED
+        || col_join_batch_control_peek(cont, &batch, &generation)
+        != ECANCELED
+        || col_join_batch_control_ack(cont, 1u) != EINVAL
+        || col_join_batch_control_step(cont, 16u, &result)
+        != COL_JOIN_BATCH_CONTROL_CANCELLED || f.out->nrows != 0) {
+        FAIL("cancelled lease was dereferenced or not sticky");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_stale_attempt(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    uint64_t first_id, second_id;
+
+    TEST("controlled producer rejects a replacement attempt ID stickily");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 1)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0) {
+        FAIL("fixture or control");
+        goto out;
+    }
+    first_id = wl_evaluation_control_active_attempt_id(control);
+    if (col_join_batch_control_bind(cont, control, first_id) != 0
+        || wl_evaluation_control_finish(control, &control_owner, 0, 0) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0) {
+        FAIL("could not replace the active attempt");
+        goto out;
+    }
+    second_id = wl_evaluation_control_active_attempt_id(control);
+    if (second_id == first_id
+        || col_join_batch_control_step(cont, 32u, &result)
+        != COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT
+        || col_join_batch_control_step(cont, 32u, &result)
+        != COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT
+        || result.execution_status != EINVAL || f.out->nrows != 0) {
+        FAIL("replacement attempt was charged or stale stop was not sticky");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_producer_execution_error(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    const uint32_t invalid_projection[] = { 0, 1, 2, 3, 4 };
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+
+    TEST("controlled producer preserves the sticky execution error code");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 1)
+        || col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, &cont) != 0
+        || wl_evaluation_control_create(1000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_control_bind(cont, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0) {
+        FAIL("fixture or producer bind");
+        goto out;
+    }
+    /* The plan contract requires immutable plan storage across the call.
+     * Deliberately corrupt its output width here to exercise producer error
+     * propagation without touching the public output relation. */
+    f.op.project_indices = invalid_projection;
+    f.op.project_count = 5;
+    col_join_batch_control_status_t status;
+    do {
+        status = col_join_batch_control_step(cont, 32u, &result);
+    } while (status == COL_JOIN_BATCH_CONTROL_PROGRESS);
+    if (status != COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR
+        || result.status != status || result.execution_status != EINVAL
+        || col_join_batch_control_step(cont, 32u, &result) != status
+        || result.execution_status != EINVAL || f.out->nrows != 0) {
+        FAIL("execution failure code was lost or not sticky");
+        goto out;
+    }
+    PASS();
+out:
+    if (cont)
+        col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
 int
 main(void)
 {
@@ -5802,6 +6338,13 @@ main(void)
     test_sink_growth_is_geometric();
     test_sink_denied_doubling_falls_back_to_exact();
     test_cross_key_collision_boundary();
+    test_controlled_prepared_producer();
+    test_controlled_producer_work_limit();
+    test_controlled_producer_cancel_and_stale_input();
+    test_controlled_producer_cross_key_collision();
+    test_controlled_producer_cancel_after_bind();
+    test_controlled_producer_stale_attempt();
+    test_controlled_producer_execution_error();
     test_env_parse();
     printf("\n  %d tests: %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
