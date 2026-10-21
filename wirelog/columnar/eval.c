@@ -3605,6 +3605,7 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
     col_rel_t *target;
     col_rel_t *candidate = NULL;
     col_rel_t *schema_source = NULL;
+    col_rel_t *empty_schema = NULL;
     col_rel_replacement_t replacement;
     int rc = 0;
 
@@ -3614,6 +3615,8 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
 
     for (uint32_t w = 0; w < worker_count; w++) {
         col_rel_t *worker = worker_rels[w];
+        if (worker && !empty_schema && worker->ncols > 0)
+            empty_schema = worker;
         if (!worker || worker->nrows == 0)
             continue;
         if (!schema_source)
@@ -3625,9 +3628,21 @@ tdd_merge_relation_results(wl_col_session_t *coord, col_rel_t **target_io,
     if (!schema_source) {
         if (target)
             return 0;
-        candidate = col_rel_new_auto(rel_name, 0);
-        if (!candidate)
-            return ENOMEM;
+        /* No worker derived a row and the coordinator has no relation
+         * yet.  Register the workers' schema so that a later evaluation
+         * can append to it; a zero-column head made the next plain step
+         * that derived a row fail with EINVAL (#2134).  Only when no
+         * worker has a schema is it zero-column. */
+        if (empty_schema) {
+            rc = eval_relation_new_like_checked(coord, rel_name,
+                    empty_schema, NULL, &candidate);
+            if (rc != 0)
+                return rc;
+        } else {
+            candidate = col_rel_new_auto(rel_name, 0);
+            if (!candidate)
+                return ENOMEM;
+        }
         *target_io = candidate;
         return 0;
     }
