@@ -23,6 +23,7 @@
 #include "columnar/mem_ledger.h"
 #include "columnar/source_access.h"
 #include "columnar/memory_governor.h"
+#include "columnar/spill.h"
 #include "columnar/continuation.h"
 #include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
@@ -2303,6 +2304,10 @@ typedef struct wl_col_session_t {
     /* Shared coordinator-owned governor. Workers retain this reference and
      * never copy or destroy the embedded governor value. */
     wl_columnar_memory_governor_ref_t *memory_governor;
+    /* Numeric spill: coordinator owns, workers borrow. Lifecycle operations
+     * require external serialization even when sharing this pointer. */
+    wl_columnar_spill_store_t *spill_store;
+    bool owns_spill_store;
     /* Issue #1380: memory instrumentation state that is not part of the
      * ledger proper.
      *   mem_channel_ring_bytes: bytes charged to CHANNEL for the MPSC ring

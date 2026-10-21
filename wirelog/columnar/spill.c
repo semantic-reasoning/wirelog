@@ -33,6 +33,7 @@ struct wl_columnar_spill_store {
     wl_columnar_memory_governor_ref_t *governor;
     uint64_t quota, used, max_row_bytes, segments;
     size_t directory_bytes;
+    bool retired;
     char directory[];
 };
 
@@ -188,11 +189,23 @@ wl_columnar_spill_status_t
 wl_columnar_spill_store_close(wl_columnar_spill_store_t *store)
 {
     if (!store) return WL_COLUMNAR_SPILL_INVALID;
+    if (store->retired) return WL_COLUMNAR_SPILL_CLOSED;
     if (store->segments) return WL_COLUMNAR_SPILL_BUSY;
     wl_columnar_memory_governor_ref_t *governor = store->governor;
     wl_columnar_spill_free(store);
     wl_columnar_memory_governor_ref_release(governor);
     return WL_COLUMNAR_SPILL_OK;
+}
+
+void
+wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store)
+{
+    if (!store) return;
+    if (!store->segments) {
+        (void)wl_columnar_spill_store_close(store);
+        return;
+    }
+    store->retired = true;
 }
 
 uint64_t
@@ -402,6 +415,7 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
     *out = NULL;
     if (!store || !types || !ncols || (nrows && !source))
         return WL_COLUMNAR_SPILL_INVALID;
+    if (store->retired) return WL_COLUMNAR_SPILL_CLOSED;
     for (uint32_t i = 0; i < ncols; i++) {
         if (types[i] != WIRELOG_TYPE_INT32 && types[i] != WIRELOG_TYPE_INT64
             && types[i] != WIRELOG_TYPE_UINT32 &&
@@ -512,10 +526,16 @@ wl_columnar_spill_release(wl_columnar_spill_segment_t *s)
     if (!s) return WL_COLUMNAR_SPILL_INVALID;
     if (s->readers) return WL_COLUMNAR_SPILL_BUSY;
     wl_columnar_spill_close_file(s);
-    s->store->used -= s->file_bytes;
-    s->store->segments--;
+    wl_columnar_spill_store_t *store = s->store;
+    store->used -= s->file_bytes;
+    store->segments--;
     wl_mutex_destroy(&s->io_lock);
     wl_columnar_spill_free(s);
+    if (store->retired && !store->segments) {
+        wl_columnar_memory_governor_ref_t *governor = store->governor;
+        wl_columnar_spill_free(store);
+        wl_columnar_memory_governor_ref_release(governor);
+    }
     return WL_COLUMNAR_SPILL_OK;
 }
 
@@ -526,6 +546,7 @@ wl_columnar_spill_acquire(wl_columnar_spill_segment_t *s,
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
     if (!s || s->readers == UINT64_MAX) return WL_COLUMNAR_SPILL_INVALID;
+    if (s->store->retired) return WL_COLUMNAR_SPILL_CLOSED;
     void *allocation;
     wl_columnar_spill_status_t rc = wl_columnar_spill_allocate(s->store,
             sizeof(wl_columnar_spill_reader_t) + s->row_bytes, &allocation);

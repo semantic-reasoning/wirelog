@@ -132,7 +132,7 @@ read_thread(void *context)
 }
 
 static void
-round_trip(const char *directory)
+round_trip(const char *directory, bool retire)
 {
     wl_columnar_spill_floor_t floor;
     CHECK(wl_columnar_spill_floor(directory, 3, &floor) == OK);
@@ -172,6 +172,7 @@ round_trip(const char *directory)
     CHECK(wl_thread_create(&threads[0], read_thread, &jobs[0]) == 0);
     CHECK(wl_thread_create(&threads[1], read_thread, &jobs[1]) == 0);
     atomic_store_explicit(&start, 1, memory_order_release);
+    if (retire) wl_columnar_spill_store_retire(store);
     CHECK(wl_columnar_spill_release(segment) == WL_COLUMNAR_SPILL_BUSY);
     wl_thread_join(&threads[0]);
     wl_thread_join(&threads[1]);
@@ -202,9 +203,11 @@ round_trip(const char *directory)
     wl_columnar_spill_reader_release(readers[0]);
     wl_columnar_spill_reader_release(readers[1]);
     CHECK(wl_columnar_spill_release(segment) == OK);
-    CHECK(wl_columnar_spill_store_bytes(store) == 0);
-    CHECK(reserved(g) == floor.store_bytes);
-    CHECK(wl_columnar_spill_store_close(store) == OK);
+    if (!retire) {
+        CHECK(wl_columnar_spill_store_bytes(store) == 0);
+        CHECK(reserved(g) == floor.store_bytes);
+        CHECK(wl_columnar_spill_store_close(store) == OK);
+    }
     CHECK(reserved(g) == 0);
     wl_columnar_memory_governor_ref_release(g);
 }
@@ -369,7 +372,8 @@ main(void)
     CHECK(mkdtemp(directory));
     unsigned descriptors = fd_count();
 #endif
-    round_trip(directory);
+    round_trip(directory, false);
+    round_trip(directory, true);
     failures(directory);
     wide_rows(directory);
 #ifdef _WIN32

@@ -3758,7 +3758,31 @@ interruption, zero progress, partial-write failure, cancellation, truncation,
 header corruption, and allocation/refcount cleanup. This is storage-primitive
 coverage, not mixed resident/spilled evaluation.
 
-Remaining #1372 work: session ownership and opt-in API; intern/compound lifetime
+Internal session options v4 now accept `spill_directory`, `spill_quota_bytes`,
+and `spill_max_row_bytes`. Defaults disable spill; v2/v3 callers remain accepted
+and disabled. The coordinator copies the directory and opens one store against
+its existing governor. Workers borrow that same store and quota; they never
+retire it, including failed creation and reuse. Shared access still requires
+external lifecycle serialization, not concurrent worker creation/release.
+
+After draining worker activity, session destruction retires store ownership.
+Retirement closes admission to new segments/readers (`CLOSED`). An empty store
+is freed immediately and its owner pointer becomes invalid. Existing numeric
+segments retain the store and its governor; existing readers can finish reading
+after the session is gone. Callers must release each reader and then each
+segment. The last segment frees the retired store, after refunding its own
+allocation. A borrowed store pointer remains usable only while a live segment
+keeps it alive, for byte inspection or a rejected create; it must not be closed
+or retired again. This does not retain callback contexts or session intern and
+compound state. Standalone checked close retains its original BUSY contract.
+
+`session_spill` checks disabled defaults, late creation failure cleanup, copied
+configuration, shared-governor accounting, worker failure/reuse, empty-store
+teardown, and multiple readers/segments surviving coordinator destruction with
+complete final refunds. `session_options` covers bounded v2/v3 prefix reads,
+invalid configurations and unsupported legacy backend rejection.
+
+Remaining #1372 work: public opt-in API; intern/compound lifetime
 pins; continuation/batch payload integration for #1373; direct-column and
 arrangement/index consumer audits; supported relation/trace transitions; actual
 mixed resident/cold indexed execution under pressure. Retained index chains,
