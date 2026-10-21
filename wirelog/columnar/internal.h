@@ -1950,6 +1950,8 @@ typedef struct wl_columnar_session_source_lease {
 
 typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t;
 typedef struct wl_columnar_eval_delta_observer wl_columnar_eval_delta_observer_t;
+typedef struct wl_columnar_eval_delta_observer_build
+    wl_columnar_eval_delta_observer_build_t;
 
 typedef enum {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE = 0,
@@ -2396,6 +2398,7 @@ typedef struct wl_col_session_t {
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;
+    wl_columnar_eval_delta_observer_build_t *delta_observer_build;
     uint64_t delta_observer_reserved_bytes;
     /* Keep metadata credit alive after the observer allocation is freed if
      * its checked retirement refuses. A later serialized cleanup retries it. */
@@ -2653,6 +2656,16 @@ typedef struct {
 #define WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES 32u
 
 /* Whole-public-step observer ownership is independent of storage rollback. */
+/* Internal opt-in baseline construction, not whole controlled STEP. The host
+ * keeps plan, registry and source contents stable and serializes every call,
+ * including cross-thread discard. Each advance performs one charged unit;
+ * EAGAIN is progress/retry. A stop retains the cursor and original readers.
+ * A fresh attempt may resume with its own current ID. Only READY publishes.
+ * Discard is one unmetered mandatory cleanup unit, EAGAIN until drained. */
+int wl_columnar_eval_delta_observer_build_start(wl_col_session_t *, uint64_t);
+int wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, bool *ready);
+int wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *);
 int
 wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess,
     uint64_t mask);
@@ -3963,6 +3976,20 @@ int col_rel_source_reader_acquire(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
 int col_rel_source_reader_acquire_transferable(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
+/* One transferable reader transition per call. Original token storage and
+ * canonical relation remain live and externally serialized until both gates
+ * are released. EAGAIN means retry, including a successful descriptor-only
+ * acquisition. A stopped call retains every acquired gate. NULL control is
+ * permitted only for mandatory, externally serialized release. */
+typedef struct {
+    uintptr_t identity;
+    const col_rel_t *relation;
+    bool descriptor_held;
+    wl_columnar_source_access_reader_t token;
+} wl_columnar_relation_reader_step_t;
+int wl_columnar_relation_reader_step(const col_rel_t *relation,
+    wl_columnar_relation_reader_step_t *record, bool release,
+    wl_evaluation_control_t *control, uint64_t attempt_id);
 int col_rel_source_reader_release(wl_columnar_source_access_reader_t *);
 int col_rel_source_writer_acquire(const col_rel_t *,
     wl_columnar_source_access_writer_t *);

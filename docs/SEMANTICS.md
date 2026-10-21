@@ -1313,3 +1313,36 @@ Their raw references and test registrations remain, with this coverage migration
 This is initial nonrecursive scalar one-relation publication for an aware internal
 host. It does not complete whole-session control, recursive/differential/weighted
 execution, TDD/parallel, LFTJ/K-fusion, or default/public activation under #1821.
+
+### Resumable observer baseline construction (internal opt-in)
+
+`wl_columnar_eval_delta_observer_build_start`, `_build_advance` and
+`_build_discard` construct the existing delta observer's baseline independently
+of whole controlled STEP. Supported rule heads must already exist and have
+one flat INT64 column (implicit INT64 is accepted), no timestamps, and initialized
+canonical self-owned storage. All heads, seed shadows and retired shadows are
+preflighted before any reader is acquired. Unsupported schema returns ENOTSUP;
+there is no raw fallback. The host must keep the plan, registry and relation
+contents stable throughout construction and serialize all calls.
+
+Advance accepts a live control and its current nonzero attempt ID. One charged
+unit advances one persistent cursor, allocation, name byte, captured cell,
+heapsort comparison/swap, merge/dedup action or reader transition. A budget stop
+retains the cursor and any original reader authority; a new attempt can resume.
+EAGAIN denotes progress or a contended CAS. Positive construction failures
+require discard. Only the READY transition assigns `session.delta_observer`.
+The baseline preserves the raw committed-model rule: head plus retired rows,
+minus pending seed inserts with multiplicity, then sorted unique values.
+Native-byte-order heapsort is resumable with O(n log n) comparisons and swaps;
+each advance performs at most one bounded comparison, swap, or cursor/state
+transition. This API does not promise raw throughput or a wall-clock bound.
+Fixed constructor bookkeeping is separately allocated; baseline metadata and
+payload retain existing governor admission.
+
+Discard advances mandatory cleanup one unit per call. The host repeats EAGAIN
+under external serialization. Invalid or corrupted authority remains reachable
+and returns an error; it is not cleared to manufacture successful cleanup.
+Session destruction drains this continuation before relation storage and aborts
+if it cannot finish. Worker cloning refuses a live constructor at either end.
+Whole controlled STEP and observer delivery remain disabled; this API does not
+claim complete #1821 coverage or enable public dispatch.

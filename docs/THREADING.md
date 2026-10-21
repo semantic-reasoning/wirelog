@@ -1929,3 +1929,23 @@ original begin/finish, mutations or worker dispatch, including with a live paren
 The external FIFO fixture dispatches a separate witness job after the actual
 action job returns; this proves that fixture's queue order, not wall-time latency
 or a general scheduler fairness guarantee.
+
+### Stepped observer source readers
+
+Constructor storage and its acquisition record are original, noncopyable
+addresses. A descriptor-only claim lives in the acquisition record, while its
+embedded reader remains inert. The reader becomes transferable only after the
+owner CAS succeeds. Each call performs at most one non-spurious CAS (including
+the strong Interlocked implementation behind MSVC's weak-named shim). A stop
+after acquisition retains authority. Release clears the owner token first,
+then releases the descriptor on a separate call. Serialized cross-thread
+release is supported; concurrent advance/discard is not. Source storage,
+registry and plan lifetime remain the host's responsibility until READY or
+completed discard. Worker copy checks both constructor pointers before copying
+and initializes the destination pointer to NULL before any cleanup path.
+
+| Site | Atomic field | Operation | Order | Purpose |
+| --- | --- | --- | --- | --- |
+| `relation.c:wl_columnar_relation_reader_step` | `gate->state` | `atomic_load_explicit` | acquire | Observe one admission or release transition without a retry loop |
+| `relation.c:wl_columnar_relation_reader_step#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire or release/relaxed | MSVC single strong Interlocked transition; failed ownership remains retryable |
+| `relation.c:wl_columnar_relation_reader_step#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire or release/relaxed | One original descriptor/owner acquisition or release per call |
