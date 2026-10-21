@@ -644,8 +644,18 @@ published rule prefix. A work stop at a rule boundary preserves that committed
 prefix, and a fresh STEP attempt resumes at the first unfinished rule.
 Repeated STEP after full completion is a semantic no-op. Because incremental
 re-evaluation is not implemented in this slice, session mutations remain
-`EBUSY` after completion until the session is destroyed. Snapshot is
-`ENOTSUP` before a controlled STEP, and `EBUSY` while it is pending or complete.
+`EBUSY` after completion until the session is destroyed. Snapshot is `ENOTSUP`
+before an eligible controlled STEP completes and `EBUSY` while that STEP is
+pending. After completion, read-only snapshot delivery is allowed under a
+separate control attempt; mutation and another concurrent session operation
+remain blocked. A null callback is rejected before a control attempt begins.
+
+Controlled snapshot checks cancellation immediately before the first tuple
+callback. A stop there publishes no tuples. Once publication starts, the full
+callback batch completes without further polls, so cancellation requested from
+a callback remains sticky for the next snapshot. Callback execution and tuple
+publication are the documented non-preemptible boundary outside the 256-unit
+evaluation-work quantum; this path does not evaluate or modify session state.
 Uncontrolled sessions retain existing behavior.
 
 When framed host setup or cleanup must be retried, STEP returns `EAGAIN` with

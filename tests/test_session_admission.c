@@ -43,6 +43,7 @@ typedef struct {
 typedef struct {
     wl_session_t base;
     test_sync_t *sync;
+    bool controlled_step_complete;
 } fake_session_t;
 
 typedef struct {
@@ -146,7 +147,8 @@ fake_remove(wl_session_t *base, const char *relation, const int64_t *data,
 static int
 fake_step(wl_session_t *base)
 {
-    record_operation((fake_session_t *)base, TEST_OP_STEP);
+    fake_session_t *session = (fake_session_t *)base;
+    record_operation(session, TEST_OP_STEP);
     if (base->evaluation_control) {
         uint64_t id = wl_evaluation_control_active_attempt_id(
             base->evaluation_control);
@@ -155,10 +157,21 @@ fake_step(wl_session_t *base)
                     base->operation_admission);
             return rc ? rc : EAGAIN;
         }
-        return wl_evaluation_control_finish(base->evaluation_control,
-                   base->operation_admission, 0, 0);
+        int rc = wl_evaluation_control_finish(base->evaluation_control,
+                base->operation_admission, 0, 0);
+        if (!rc)
+            session->controlled_step_complete = true;
+        return rc;
     }
     return 0;
+}
+
+static wl_controlled_step_state_t
+fake_controlled_step_state(const wl_session_t *base)
+{
+    const fake_session_t *session = (const fake_session_t *)base;
+    return session->controlled_step_complete ? WL_CONTROLLED_STEP_COMPLETE
+        : WL_CONTROLLED_STEP_IDLE;
 }
 
 static void
@@ -199,7 +212,11 @@ static const wl_compute_backend_t fake_backend = {
     .session_set_delta_cb = fake_set_delta_cb,
     .session_snapshot = fake_snapshot,
     .session_memory_governor = fake_memory_governor,
+    .session_controlled_step_state = fake_controlled_step_state,
 };
+
+static void noop_tuple(const char *relation, const int64_t *row,
+    uint32_t ncols, void *user_data);
 
 static void *
 operation_thread(void *opaque)
@@ -212,7 +229,7 @@ operation_thread(void *opaque)
     } else if (ctx->operation == TEST_OP_STEP)
         ctx->rc = wl_session_step(ctx->session);
     else
-        ctx->rc = wl_session_snapshot(ctx->session, NULL, NULL);
+        ctx->rc = wl_session_snapshot(ctx->session, noop_tuple, NULL);
     return NULL;
 }
 
@@ -241,6 +258,16 @@ noop_delta(const char *relation, const int64_t *row, uint32_t ncols,
     (void)row;
     (void)ncols;
     (void)diff;
+    (void)user_data;
+}
+
+static void
+noop_tuple(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
     (void)user_data;
 }
 
@@ -484,6 +511,10 @@ run_controlled_step_gate(void)
             &options, &session) == 0, "create controlled fake session");
     if (!session) goto done;
 
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL)
+            == ENOTSUP,
+            "snapshot is unavailable before controlled STEP completes");
+
     thread_context_t operation_ctx = {
         .session = session, .sync = &sync, .operation = TEST_OP_INSERT
     };
@@ -539,8 +570,36 @@ run_controlled_step_gate(void)
             "resume is the sole operation admitted through the gate");
     failures += expect(!wl_evaluation_control_active_attempt_id(control),
             "resume finishes the retained attempt");
-    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == 0,
-            "session APIs reopen after terminal completion");
+
+    sync.blocked_operation = TEST_OP_SNAPSHOT;
+    sync.operation_entered = false;
+    sync.release_operation = false;
+    operation_ctx.operation = TEST_OP_SNAPSHOT;
+    operation_ctx.rc = -1;
+    thread_rc = wl_thread_create(&operation_tid, operation_thread,
+            &operation_ctx);
+    failures += expect(thread_rc == 0,
+            "start controlled completed-step snapshot");
+    if (thread_rc != 0) goto destroy_session;
+    wl_mutex_lock(&sync.mutex);
+    while (!sync.operation_entered)
+        wl_cond_wait(&sync.changed, &sync.mutex);
+    wl_mutex_unlock(&sync.mutex);
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
+            "completed controlled STEP still blocks mutation during snapshot");
+    failures += expect(wl_session_step(session) == EBUSY,
+            "snapshot excludes a concurrent controlled STEP");
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL) == EBUSY,
+            "snapshot admission is exclusive");
+    wl_mutex_lock(&sync.mutex);
+    sync.release_operation = true;
+    wl_cond_broadcast(&sync.changed);
+    wl_mutex_unlock(&sync.mutex);
+    wl_thread_join(&operation_tid);
+    failures += expect(operation_ctx.rc == 0,
+            "completed controlled-step snapshot finishes");
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
+            "mutations remain blocked after snapshot completion");
 destroy_session:
     wl_session_destroy(session);
 done:
