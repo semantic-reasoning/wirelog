@@ -1981,6 +1981,38 @@ enum wl_columnar_plain_step_completion_phase {
 
 typedef struct wl_columnar_eval_stack_cleanup_frame
     wl_columnar_eval_stack_cleanup_frame_t;
+#define WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES 32u
+
+typedef enum {
+    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE = 0,
+    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED,
+    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED,
+    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED,
+    WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+} wl_columnar_eval_cleanup_receipt_state_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_FREED = 1,
+    WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_TRANSFERRED_TO_PENDING,
+    WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE
+} wl_columnar_eval_cleanup_outcome_t;
+
+typedef struct {
+    uint64_t session_generation;
+    uint64_t receipt_id;
+    uint64_t plan_epoch;
+    uint64_t operation_attempt_id;
+    uint64_t operation_id;
+} wl_columnar_eval_cleanup_receipt_key_t;
+
+typedef struct {
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    wl_columnar_eval_cleanup_receipt_state_t state;
+    int result;
+    int cleanup_result;
+    bool committed;
+} wl_columnar_eval_cleanup_receipt_t;
+
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
@@ -2381,6 +2413,13 @@ typedef struct wl_col_session_t {
     uint32_t cleanup_active_count;
     uint32_t cleanup_pending_count;
     uint64_t cleanup_reserved_bytes;
+    /* Receipts for framed relation attempts; every access is serialized by
+     * the framed host/session owner and stores scalar identity only. */
+    uint64_t cleanup_receipt_session_generation;
+    uint64_t cleanup_receipt_next_id;
+    uint64_t cleanup_receipt_next_plan_epoch;
+    wl_columnar_eval_cleanup_receipt_t cleanup_receipts[
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
     /* Set false on entry to col_eval_stratum, and true only at each of its
      * two completion points.  col_stratum_step_with_delta clears it again on
      * its own entry, which is the load-bearing clear: its detach loop can
@@ -2655,9 +2694,6 @@ typedef struct {
     uint32_t top;
 } eval_stack_t;
 
-/* Bounds this internal primitive, not public evaluation nesting. */
-#define WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES 32u
-
 /* Whole-public-step observer ownership is independent of storage rollback. */
 /* Internal opt-in baseline construction, not whole controlled STEP. The host
  * keeps plan, registry and source contents stable and serializes every call,
@@ -2718,6 +2754,34 @@ int
 wl_columnar_eval_stack_cleanup_begin_attempt_controlled(wl_col_session_t *sess,
     wl_columnar_eval_stack_cleanup_frame_t **out,
     wl_evaluation_control_t *control, uint64_t attempt_id);
+/* Tracked frames reserve before allocation/activation. Receipt queue access is
+ * serialized by the framed host/session owner, not by admission counters. */
+int wl_columnar_eval_stack_cleanup_receipt_reserve(wl_col_session_t *,
+    uint64_t operation_attempt_id, uint64_t operation_id,
+    wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_session_generation_new(uint64_t *);
+int wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+    wl_col_session_t *, wl_columnar_eval_stack_cleanup_frame_t **,
+    wl_evaluation_control_t *, uint64_t, uint64_t,
+    wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_cancel_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_key_for_frame(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_release(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_read(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *,
+    wl_columnar_eval_cleanup_receipt_t *);
+int wl_columnar_eval_stack_cleanup_receipt_ack(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_retry(wl_col_session_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *);
+int wl_columnar_eval_stack_cleanup_receipt_prepare(
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_cleanup_receipt_key_t *, int, bool);
 enum {
     WL_COLUMNAR_EVAL_STACK_ENTRY_PHASE = 1,
     WL_COLUMNAR_EVAL_STACK_RESERVE_PHASE = 2,
@@ -2741,6 +2805,7 @@ extern void (*wl_columnar_eval_stack_test_checkpoint)(
 extern int wl_columnar_eval_stack_test_fail_allocation;
 /* Physical layout only, never an observed work total. */
 size_t wl_columnar_eval_stack_test_frame_size(void);
+void wl_columnar_eval_stack_test_receipt_next_session_generation(uint64_t);
 #endif
 /* Persistent unary replacement, opt-in only. Begin binds nonNULL control and
  * supplied active ID to an original LIFO frame with a valid relation top.
@@ -2801,6 +2866,10 @@ wl_columnar_eval_stack_cleanup_result(
 int
 wl_columnar_eval_stack_cleanup_finish(
     wl_columnar_eval_stack_cleanup_frame_t **frame);
+int wl_columnar_eval_stack_cleanup_finish_receipted(
+    wl_columnar_eval_stack_cleanup_frame_t **,
+    const wl_columnar_eval_cleanup_receipt_key_t *,
+    wl_columnar_eval_cleanup_outcome_t *);
 /* Refuses while any active frame remains. A finite continuation-first sweep
  * precedes disposal across all pending frames; no promotion or allocation. */
 int
@@ -6271,7 +6340,8 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     wl_col_session_t *session;
     const wl_plan_relation_t *plan;
     wl_evaluation_control_t *control;
-    uint64_t attempt_id;
+    uint64_t attempt_id, operation_identity;
+    wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
     wl_columnar_eval_plan_numeric_attempt_t child;
     wl_columnar_relation_scalar_source_t source;
     wl_columnar_relation_append_batch_t batch;
@@ -6325,6 +6395,7 @@ typedef struct {
     wl_columnar_eval_serial_framed_host_reply_kind_t kind;
     int execution_result;
     bool committed;
+    wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
     wl_columnar_eval_serial_framed_status_t status;
 } wl_columnar_eval_serial_framed_host_reply_t;
 
@@ -6349,6 +6420,8 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t funding_id;
     wl_evaluation_control_t *operation;
     uint64_t operation_id;
+    /* Stable host operation identity, distinct from the control attempt ID. */
+    uint64_t operation_identity;
     wl_columnar_eval_serial_framed_host_action_t action;
     bool previous_valid;
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
@@ -6384,7 +6457,7 @@ bool wl_columnar_eval_serial_framed_owner_valid(
 int wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
-    wl_evaluation_control_t *, uint64_t);
+    uint64_t, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_serial_framed_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);

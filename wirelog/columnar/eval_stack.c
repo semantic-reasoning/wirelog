@@ -12,6 +12,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static wl_atomic_u64 wl_next_cleanup_receipt_session_generation = 1u;
+
+int
+wl_columnar_eval_stack_cleanup_receipt_session_generation_new(uint64_t *out)
+{
+    if (!out) return EINVAL;
+    uint64_t current = atomic_load_explicit(
+        &wl_next_cleanup_receipt_session_generation, memory_order_relaxed);
+    for (;;) {
+        if (!current || current == UINT64_MAX) return EOVERFLOW;
+        uint64_t next = current + 1u;
+        if (atomic_compare_exchange_weak_explicit(
+                &wl_next_cleanup_receipt_session_generation, &current, next,
+                memory_order_relaxed, memory_order_relaxed)) {
+            *out = current;
+            return 0;
+        }
+    }
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void
+wl_columnar_eval_stack_test_receipt_next_session_generation(uint64_t next)
+{
+    atomic_store_explicit(&wl_next_cleanup_receipt_session_generation, next,
+        memory_order_relaxed);
+}
+#endif
+
 void
 eval_stack_init(eval_stack_t *s)
 {
@@ -282,6 +311,8 @@ typedef struct wl_columnar_eval_stack_binary_context {
 struct wl_columnar_eval_stack_cleanup_frame {
     wl_col_session_t *session;
     wl_columnar_eval_stack_cleanup_frame_t *next;
+    uint64_t cleanup_receipt_id;
+    uint64_t cleanup_receipt_plan_epoch;
     eval_stack_t stack;
     eval_entry_t result;
     wl_columnar_memory_reservation_t reservation;
@@ -1687,10 +1718,38 @@ wl_columnar_eval_stack_cleanup_free(
 {
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor = frame->governor;
+    wl_columnar_eval_cleanup_receipt_t *receipt = NULL;
+    if (frame->cleanup_receipt_id) {
+        wl_columnar_eval_cleanup_receipt_key_t key = {0};
+        key.session_generation =
+            frame->session->cleanup_receipt_session_generation;
+        key.receipt_id = frame->cleanup_receipt_id;
+        key.plan_epoch = frame->cleanup_receipt_plan_epoch;
+        for (unsigned i = 0;
+            i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+            wl_columnar_eval_cleanup_receipt_t *candidate
+                = &frame->session->cleanup_receipts[i];
+            if (candidate->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+                && candidate->key.receipt_id == key.receipt_id
+                && candidate->key.session_generation == key.session_generation
+                && candidate->key.plan_epoch == key.plan_epoch) {
+                receipt = candidate;
+                break;
+            }
+        }
+        if (!receipt || (receipt->state !=
+            WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED
+            && receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED))
+            return EINVAL;
+    }
     wl_columnar_memory_reservation_init(&reservation);
     if (governor && !wl_columnar_memory_reservation_move(&reservation,
         &frame->reservation))
         return EINVAL;
+    if (receipt) {
+        receipt->state = WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED;
+        receipt->cleanup_result = 0;
+    }
     frame->session->cleanup_reserved_bytes -= sizeof(*frame);
     free(frame);
     if (governor) {
@@ -1702,15 +1761,245 @@ wl_columnar_eval_stack_cleanup_free(
     return 0;
 }
 
+static bool
+wl_columnar_eval_cleanup_receipt_key_equal(
+    const wl_columnar_eval_cleanup_receipt_key_t *left,
+    const wl_columnar_eval_cleanup_receipt_key_t *right)
+{
+    return left && right && left->session_generation
+           && left->receipt_id && left->plan_epoch
+           && left->operation_attempt_id && left->operation_id
+           && left->session_generation == right->session_generation
+           && left->receipt_id == right->receipt_id
+           && left->plan_epoch == right->plan_epoch
+           && left->operation_attempt_id == right->operation_attempt_id
+           && left->operation_id == right->operation_id;
+}
+
+static wl_columnar_eval_cleanup_receipt_t *
+wl_columnar_eval_cleanup_receipt_find(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    if (!session || !key || !key->session_generation || !key->receipt_id
+        || !key->plan_epoch || !key->operation_attempt_id
+        || !key->operation_id
+        || key->session_generation !=
+        session->cleanup_receipt_session_generation)
+        return NULL;
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+        wl_columnar_eval_cleanup_receipt_t *receipt
+            = &session->cleanup_receipts[i];
+        if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+            && wl_columnar_eval_cleanup_receipt_key_equal(&receipt->key, key))
+            return receipt;
+    }
+    return NULL;
+}
+
 int
-wl_columnar_eval_stack_cleanup_finish(
-    wl_columnar_eval_stack_cleanup_frame_t **handle)
+wl_columnar_eval_stack_cleanup_receipt_reserve(wl_col_session_t *session,
+    uint64_t operation_attempt_id, uint64_t operation_id,
+    wl_columnar_eval_cleanup_receipt_key_t *out)
+{
+    if (!session || !operation_attempt_id || !operation_id || !out)
+        return EINVAL;
+    memset(out, 0, sizeof(*out));
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i)
+        if (session->cleanup_receipts[i].state ==
+            WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE) {
+            if (!session->cleanup_receipt_session_generation) {
+                uint64_t generation = 0;
+                int rc =
+                    wl_columnar_eval_stack_cleanup_receipt_session_generation_new
+                    (
+                    &generation);
+                if (rc) return rc;
+                session->cleanup_receipt_session_generation = generation;
+            }
+            if (!session->cleanup_receipt_next_id)
+                session->cleanup_receipt_next_id = 1;
+            if (!session->cleanup_receipt_next_plan_epoch)
+                session->cleanup_receipt_next_plan_epoch = 1;
+            if (session->cleanup_receipt_next_id == UINT64_MAX
+                || session->cleanup_receipt_next_plan_epoch == UINT64_MAX)
+                return EOVERFLOW;
+            wl_columnar_eval_cleanup_receipt_key_t key = {
+                .session_generation =
+                    session->cleanup_receipt_session_generation,
+                .receipt_id = session->cleanup_receipt_next_id++,
+                .plan_epoch = session->cleanup_receipt_next_plan_epoch++,
+                .operation_attempt_id = operation_attempt_id,
+                .operation_id = operation_id
+            };
+            wl_columnar_eval_cleanup_receipt_t *receipt
+                = &session->cleanup_receipts[i];
+            receipt->key = key;
+            receipt->state = WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED;
+            receipt->result = 0;
+            receipt->cleanup_result = 0;
+            receipt->committed = false;
+            *out = key;
+            return 0;
+        }
+    return ENOBUFS;
+}
+
+int
+wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+    wl_col_session_t *session, wl_columnar_eval_stack_cleanup_frame_t **out,
+    wl_evaluation_control_t *control, uint64_t operation_attempt_id,
+    uint64_t operation_id,
+    wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    if (!session || !out || *out || !operation_id || !key)
+        return EINVAL;
+    memset(key, 0, sizeof(*key));
+    int rc = wl_columnar_eval_stack_cleanup_receipt_reserve(session,
+            operation_attempt_id, operation_id, key);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session, out,
+            control, operation_attempt_id);
+    if (rc) {
+        (void)wl_columnar_eval_stack_cleanup_receipt_release(session, key);
+        memset(key, 0, sizeof(*key));
+        return rc;
+    }
+    (*out)->cleanup_receipt_id = key->receipt_id;
+    (*out)->cleanup_receipt_plan_epoch = key->plan_epoch;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_cancel_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    if (!frame || !frame->identity || !frame->session || !key
+        || frame->cleanup_receipt_id != key->receipt_id
+        || frame->cleanup_receipt_plan_epoch != key->plan_epoch)
+        return EINVAL;
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(frame->session, key);
+    if (!receipt || receipt->state !=
+        WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED)
+        return EBUSY;
+    memset(receipt, 0, sizeof(*receipt));
+    frame->cleanup_receipt_id = 0;
+    frame->cleanup_receipt_plan_epoch = 0;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_key_for_frame(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_eval_cleanup_receipt_key_t *out)
+{
+    if (!frame || !frame->identity || !frame->session || !out
+        || !frame->cleanup_receipt_id || !frame->cleanup_receipt_plan_epoch)
+        return EINVAL;
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i) {
+        wl_columnar_eval_cleanup_receipt_t *receipt
+            = &frame->session->cleanup_receipts[i];
+        if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREE
+            && receipt->key.receipt_id == frame->cleanup_receipt_id
+            && receipt->key.plan_epoch == frame->cleanup_receipt_plan_epoch
+            && receipt->key.session_generation ==
+            frame->session->cleanup_receipt_session_generation) {
+            *out = receipt->key;
+            return 0;
+        }
+    }
+    return ENOENT;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_release(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(session, key);
+    if (!receipt) return ENOENT;
+    if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED)
+        return EBUSY;
+    memset(receipt, 0, sizeof(*receipt));
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_read(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key,
+    wl_columnar_eval_cleanup_receipt_t *out)
+{
+    if (!out) return EINVAL;
+    memset(out, 0, sizeof(*out));
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(session, key);
+    if (!receipt) return ENOENT;
+    *out = *receipt;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_ack(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(session, key);
+    if (!receipt) return ENOENT;
+    if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+        return EBUSY;
+    memset(receipt, 0, sizeof(*receipt));
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_prepare(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_cleanup_receipt_key_t *key, int result,
+    bool committed)
+{
+    if (!frame || !frame->identity || !frame->session
+        || frame->cleanup_receipt_id != (key ? key->receipt_id : 0)
+        || frame->cleanup_receipt_plan_epoch != (key ? key->plan_epoch : 0))
+        return EINVAL;
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(frame->session, key);
+    if (!receipt) return ENOENT;
+    if (receipt->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED)
+        return receipt->result == result && receipt->committed == committed
+            ? 0 : EINVAL;
+    if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_RESERVED)
+        return EBUSY;
+    receipt->result = result;
+    receipt->committed = committed;
+    receipt->cleanup_result = 0;
+    receipt->state = WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED;
+    return 0;
+}
+
+static int
+wl_columnar_eval_stack_cleanup_finish_internal(
+    wl_columnar_eval_stack_cleanup_frame_t **handle,
+    const wl_columnar_eval_cleanup_receipt_key_t *key,
+    wl_columnar_eval_cleanup_outcome_t *outcome)
 {
     if (!handle || !*handle)
         return EINVAL;
     wl_columnar_eval_stack_cleanup_frame_t *frame = *handle;
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
+    wl_columnar_eval_cleanup_receipt_t *receipt = NULL;
+    if (frame->cleanup_receipt_id) {
+        if (!key || frame->cleanup_receipt_id != key->receipt_id
+            || frame->cleanup_receipt_plan_epoch != key->plan_epoch)
+            return EBUSY;
+        receipt = wl_columnar_eval_cleanup_receipt_find(frame->session, key);
+        if (!receipt || receipt->state !=
+            WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED)
+            return EINVAL;
+        if (outcome)
+            *outcome = WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE;
+    } else if (key) return EINVAL;
     if (frame->framed.identity || frame->numeric_plan_owner
         || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
         || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
@@ -1726,12 +2015,61 @@ wl_columnar_eval_stack_cleanup_finish(
     int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
     if (rc == 0)
         rc = wl_columnar_eval_stack_cleanup_free(frame);
+    if (rc == 0) {
+        if (outcome)
+            *outcome = WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_FREED;
+        return 0;
+    }
+    if (receipt) {
+        receipt->state = WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED;
+        receipt->cleanup_result = rc;
+    }
+    if (outcome)
+        *outcome = receipt
+            ? WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_TRANSFERRED_TO_PENDING
+            : WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE;
+    if (sess->cleanup_pending_count >=
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES) {
+        /* Admission reserves this slot before frame begin. Preserve ownership
+         * in the active list if an invariant has nevertheless drifted. */
+        frame->next = sess->cleanup_active;
+        sess->cleanup_active = frame;
+        sess->cleanup_active_count++;
+        *handle = frame;
+        if (receipt) {
+            receipt->state = WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED;
+            receipt->cleanup_result = 0;
+        }
+        if (outcome)
+            *outcome = WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE;
+        return EOVERFLOW;
+    }
     if (rc != 0) {
         frame->next = sess->cleanup_pending;
         sess->cleanup_pending = frame;
         sess->cleanup_pending_count++;
     }
     return rc;
+}
+
+int
+wl_columnar_eval_stack_cleanup_finish(
+    wl_columnar_eval_stack_cleanup_frame_t **handle)
+{
+    if (!handle || !*handle) return EINVAL;
+    /* Tracked frames can only be consumed through their exact receipt. */
+    if ((*handle)->cleanup_receipt_id) return EBUSY;
+    return wl_columnar_eval_stack_cleanup_finish_internal(handle, NULL, NULL);
+}
+
+int
+wl_columnar_eval_stack_cleanup_finish_receipted(
+    wl_columnar_eval_stack_cleanup_frame_t **handle,
+    const wl_columnar_eval_cleanup_receipt_key_t *key,
+    wl_columnar_eval_cleanup_outcome_t *outcome)
+{
+    if (!outcome) return EINVAL;
+    return wl_columnar_eval_stack_cleanup_finish_internal(handle, key, outcome);
 }
 
 int
@@ -1764,6 +2102,42 @@ wl_columnar_eval_stack_cleanup_retry(wl_col_session_t *sess)
         }
     }
     return result;
+}
+
+int
+wl_columnar_eval_stack_cleanup_receipt_retry(wl_col_session_t *session,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    wl_columnar_eval_cleanup_receipt_t *receipt
+        = wl_columnar_eval_cleanup_receipt_find(session, key);
+    if (!receipt) return ENOENT;
+    if (receipt->state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+        return 0;
+    if (receipt->state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)
+        return EBUSY;
+    if (session->cleanup_active) return EBUSY;
+    wl_columnar_eval_stack_cleanup_frame_t **slot = &session->cleanup_pending;
+    while (*slot && ((*slot)->cleanup_receipt_id != key->receipt_id
+        || (*slot)->cleanup_receipt_plan_epoch != key->plan_epoch
+        || (*slot)->session != session))
+        slot = &(*slot)->next;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = *slot;
+    if (!frame) return ENOENT;
+    /* Continuation readers can cross pending frames, so release those held
+     * references first. Only the frame named by this key is disposed/freed. */
+    for (wl_columnar_eval_stack_cleanup_frame_t *pending =
+        session->cleanup_pending; pending; pending = pending->next)
+        wl_columnar_eval_stack_cleanup_continuations(pending);
+    wl_columnar_eval_stack_cleanup_frame_t *next = frame->next;
+    int rc = wl_columnar_eval_stack_cleanup_dispose(frame);
+    if (!rc) rc = wl_columnar_eval_stack_cleanup_free(frame);
+    if (rc) {
+        receipt->cleanup_result = rc;
+        return rc;
+    }
+    *slot = next;
+    session->cleanup_pending_count--;
+    return 0;
 }
 
 /* Binary replacement has its own original owner. The old ACTIVE phase is

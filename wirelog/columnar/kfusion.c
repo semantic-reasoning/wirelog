@@ -993,6 +993,13 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
             wl_columnar_kfusion_test_clone(sess, &worker_sess[d], true);
 #endif
         wl_columnar_session_copy_without_ledger(&worker_sess[d], sess);
+        /* K-Fusion wrappers borrow the coordinator's ordinary resources but
+        * own no framed-host receipt authority. Never copy receipt slots. */
+        worker_sess[d].cleanup_receipt_session_generation = 0;
+        worker_sess[d].cleanup_receipt_next_id = 0;
+        worker_sess[d].cleanup_receipt_next_plan_epoch = 0;
+        memset(worker_sess[d].cleanup_receipts, 0,
+            sizeof(worker_sess[d].cleanup_receipts));
         if (wl_columnar_mem_ledger_clone_unpublished(
                 &worker_sess[d].mem_ledger, &sess->mem_ledger))
             abort(); /* distinct unpublished destination is structural */
