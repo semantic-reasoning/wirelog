@@ -97,6 +97,11 @@ configuration for its invocation count would rest on something a release may
 change, so a host should not do it -- and a delta callback is installed because
 the host wants deltas, not as a tuning knob.
 
+In a session with more than one worker, such a step returns, for a
+non-recursive stratum that joins, negates, tests membership or aggregates,
+the model a snapshot returns (#2134). Before, the step evaluated it on
+worker partitions of its inputs and could lose or gain rows.
+
 The delta stream carries the set difference, so a re-derivation that
 reproduces a row publishes nothing. Inserting a sixth row into a five-row
 source can invoke the callback six times and publish one `+1` event; in the
