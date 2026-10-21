@@ -2016,6 +2016,7 @@ typedef struct {
 struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
+typedef struct wl_columnar_controlled_step wl_columnar_controlled_step_t;
 typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
     uint32_t relation_count;
@@ -2075,6 +2076,9 @@ typedef struct wl_col_session_t {
     uint32_t plain_step_completion_phase;
     uint32_t plain_step_completion_relation;
     bool plain_step_completion_workers_retired;
+    /* Framed controlled initial STEP continuation; opaque to the session
+     * layout so its host protocol types remain declared below. */
+    wl_columnar_controlled_step_t *controlled_step;
     /* Issue #2092: how many leading strata completed in a plain step or a
      * snapshot that has not committed (saturating).  Their heads hold rows
      * no commit accounts for, so the next plain step or snapshot that does
@@ -6485,6 +6489,10 @@ int wl_columnar_session_hash_registry_attempt_begin(
 int wl_columnar_session_hash_registry_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *);
 #ifdef WL_SESSION_TEST_HOOKS
+/* Fail one controlled STEP funding creation before it reaches the host. */
+extern int wl_columnar_session_test_fail_framed_funding_before_stop;
+extern int wl_columnar_session_test_fail_framed_funding_after_stop;
+extern int wl_columnar_session_test_exhaust_after_relation;
 extern int wl_columnar_session_hash_test_registry_allocation;
 extern int (*wl_columnar_session_hash_test_registry_move)(
     wl_columnar_eval_serial_framed_attempt_t *, unsigned, bool);

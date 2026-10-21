@@ -1626,9 +1626,9 @@ entry_outer_guards(entry_fixture_t *f)
     uint64_t before = wl_test_evaluation_guard_state(f->session);
     uint64_t parent_before[64] = {0}, parent_after[64] = {0};
     entry_parent_observation(f, parent_before);
-    CHECK(wl_session_step(&f->session->base) == ENOTSUP);
-    CHECK(wl_session_snapshot(&f->session->base, NULL, NULL) == ENOTSUP);
-    CHECK(f->session->base.backend->session_step(&f->session->base) == ENOTSUP);
+    CHECK(wl_session_step(&f->session->base) == EBUSY);
+    CHECK(wl_session_snapshot(&f->session->base, NULL, NULL) == EBUSY);
+    CHECK(f->session->base.backend->session_step(&f->session->base) == EBUSY);
     CHECK(f->session->base.backend->session_snapshot(&f->session->base,
         NULL, NULL) == ENOTSUP);
     CHECK(col_eval_stratum(f->stratum, f->session, 0) == ENOTSUP);
@@ -1640,6 +1640,171 @@ entry_outer_guards(entry_fixture_t *f)
     CHECK(wl_test_evaluation_guard_state(f->session) == before);
     entry_parent_observation(f, parent_after);
     CHECK(!memcmp(parent_before, parent_after, sizeof(parent_before)));
+}
+
+static void
+test_controlled_session_step_resume(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    const int64_t rows[] = {7, 3, 11};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(1, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", rows, 3, 1));
+
+    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !session_find_rel((wl_col_session_t *)session, "output"));
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+
+    wl_columnar_session_test_fail_framed_funding_before_stop = 1;
+    CHECK(wl_session_step(session) == EAGAIN);
+    uint64_t first_id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(first_id != 0);
+    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+    CHECK(wl_session_snapshot(session, NULL, NULL) == EBUSY);
+    CHECK(wl_evaluation_control_reset(control) == EBUSY);
+    CHECK(wl_evaluation_control_configure(control, 100) == EBUSY);
+
+    int resumed_rc = wl_session_step(session);
+    CHECK(!resumed_rc);
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.attempt_id == first_id && report.result == 0);
+    const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
+            "output");
+    CHECK(output && output->nrows == 3);
+    CHECK(output->columns[0][0] == 3 && output->columns[0][1] == 7
+        && output->columns[0][2] == 11);
+
+    /* Completed controlled STEP is a stable no-op on later calls. */
+    CHECK(!wl_session_step(session));
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.attempt_id == first_id + 1 && report.result == 0
+        && report.consumed == 0);
+    output = session_find_rel((wl_col_session_t *)session, "output");
+    CHECK(output && output->nrows == 3);
+
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_session_step_prefix_resume(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl left(x:int64)\n"
+        ".decl right(x:int64)\n"
+        "left(x) :- input(x).\n"
+        "right(x) :- input(x).\n";
+    const int64_t rows[] = {9, 2, 6};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(2000000, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", rows, 3, 1));
+
+    wl_columnar_session_test_exhaust_after_relation = 1;
+    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_columnar_session_test_exhaust_after_relation = 0;
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    const col_rel_t *left = session_find_rel((wl_col_session_t *)session,
+            "left");
+    const col_rel_t *right = session_find_rel((wl_col_session_t *)session,
+            "right");
+    CHECK((left != NULL) != (right != NULL));
+    const col_rel_t *prefix = left ? left : right;
+    CHECK(prefix && prefix->nrows == 3);
+    CHECK(prefix->columns[0][0] == 2 && prefix->columns[0][1] == 6
+        && prefix->columns[0][2] == 9);
+
+    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+    CHECK(wl_session_snapshot(session, NULL, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!wl_session_step(session));
+
+    left = session_find_rel((wl_col_session_t *)session, "left");
+    right = session_find_rel((wl_col_session_t *)session, "right");
+    CHECK(left && right && left->nrows == 3 && right->nrows == 3);
+    CHECK(prefix->nrows == 3 && prefix->columns[0][0] == 2
+        && prefix->columns[0][1] == 6 && prefix->columns[0][2] == 9);
+    CHECK(left->columns[0][0] == 2 && left->columns[0][1] == 6
+        && left->columns[0][2] == 9);
+    CHECK(right->columns[0][0] == 2 && right->columns[0][1] == 6
+        && right->columns[0][2] == 9);
+    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_session_step_destroy_drain(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+
+    wl_columnar_session_test_fail_framed_funding_before_stop = 1;
+    CHECK(wl_session_step(session) == EAGAIN);
+    CHECK(wl_evaluation_control_active_attempt_id(control) != 0);
+    wl_session_destroy(session);
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report));
+    CHECK(report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
 }
 
 static void
@@ -4516,6 +4681,9 @@ test_entry_generated_filter_work_boundary(void)
 int
 main(void)
 {
+    test_controlled_session_step_resume();
+    test_controlled_session_step_prefix_resume();
+    test_controlled_session_step_destroy_drain();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
     test_entry_generated_join_abort_cleanup_retry();

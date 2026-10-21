@@ -44,6 +44,13 @@ extern "C" {
  */
 typedef struct wl_session wl_session_t;
 
+/* Internal state of an attached-control STEP continuation. */
+typedef enum {
+    WL_CONTROLLED_STEP_IDLE = 0,
+    WL_CONTROLLED_STEP_PENDING,
+    WL_CONTROLLED_STEP_COMPLETE,
+} wl_controlled_step_state_t;
+
 /**
  * wl_compute_backend_t:
  *
@@ -108,6 +115,11 @@ typedef struct {
     /* Optional reset before a new fact mutation. Sessions are externally
      * serialized; the result query then describes that operation alone. */
     void (*session_budget_denial_clear)(void *session);
+
+    /* Optional logical-step state query. PENDING keeps generic session APIs
+     * closed between stopped attempts; COMPLETE rejects later mutations. */
+    wl_controlled_step_state_t (*session_controlled_step_state)(
+        const wl_session_t *session);
 } wl_compute_backend_t;
 
 /**
