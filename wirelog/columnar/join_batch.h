@@ -21,6 +21,7 @@
 #define WL_COLUMNAR_JOIN_BATCH_H
 
 #include "columnar/continuation.h"
+#include "columnar/batch_payload.h"
 #include "columnar/internal.h"
 
 #include <stdbool.h>
@@ -257,5 +258,38 @@ col_join_batch_relation_sink_init(col_join_batch_relation_sink_t *ctx,
 int
 col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
     wl_col_session_t *sess, col_rel_t *out);
+
+/* Owned numeric-payload sink for relation-backed continuation batches. This
+ * does not change the global batch.payload convention or choose spill policy.
+ * Caller-owned context (included in caller floor), new or cleaned before init;
+ * governor/store remain caller-owned and live throughout sink use. Lifecycle
+ * is synchronous and externally serialized. Configure storage/cancel only
+ * between publish calls. Source pointer is borrowed only during publication.
+ * Commit fills ready; take transfers it. An untaken ready blocks publication.
+ * Cleanup releases both private stages and untaken committed payloads; taken
+ * payloads belong solely to callers. Detailed capture errors remain in error. */
+typedef struct {
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_spill_store_t *store;
+    wl_columnar_batch_payload_storage_t storage;
+    wl_columnar_spill_cancel_fn cancel;
+    void *cancel_context;
+    wl_columnar_spill_status_t error;
+    const col_rel_t *source;
+    uint32_t rows;
+    bool begun;
+    wl_columnar_batch_payload_t *staged, *ready;
+} wl_columnar_join_batch_payload_sink_t;
+
+void wl_columnar_join_batch_payload_sink_init(
+    wl_columnar_join_batch_payload_sink_t *context,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage);
+wl_columnar_batch_payload_t *wl_columnar_join_batch_payload_sink_take(
+    wl_columnar_join_batch_payload_sink_t *context);
+void wl_columnar_join_batch_payload_sink_cleanup(
+    wl_columnar_join_batch_payload_sink_t *context);
 
 #endif /* WL_COLUMNAR_JOIN_BATCH_H */

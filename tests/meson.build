@@ -135,6 +135,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/inline.c',
     '../wirelog/columnar/join.c',
     '../wirelog/columnar/join_batch.c',
+    '../wirelog/columnar/batch_payload.c',
     '../wirelog/columnar/join_pipeline.c',
     '../wirelog/columnar/diff_join_batch.c',
     '../wirelog/columnar/kfusion.c',
@@ -2079,6 +2080,7 @@ backend_src = files(
   '../wirelog/columnar/delta_pool_admission.c',
   '../wirelog/columnar/continuation.c',
   '../wirelog/columnar/join_batch.c',
+  '../wirelog/columnar/batch_payload.c',
   '../wirelog/columnar/join_pipeline.c',
   '../wirelog/columnar/diff_join_batch.c',
   '../wirelog/columnar/lftj.c',
@@ -6540,3 +6542,13 @@ test_evaluation_observer_build_exe = executable(
 )
 test('evaluation_observer_build', test_evaluation_observer_build_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# #1372 owned numeric resident/spilled payloads.
+test_batch_payload_exe = executable(
+  'test_batch_payload', files('test_batch_payload.c', '../wirelog/columnar/batch_payload.c'),
+  c_args: ['-DWL_TEST_BATCH_PAYLOAD=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('batch_payload', test_batch_payload_exe, suite: ['unit', 'tsan'], timeout: 120)

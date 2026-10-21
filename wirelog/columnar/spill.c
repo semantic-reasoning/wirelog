@@ -208,6 +208,13 @@ wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store)
     store->retired = true;
 }
 
+bool
+wl_columnar_spill_store_uses_governor(const wl_columnar_spill_store_t *store,
+    const wl_columnar_memory_governor_ref_t *governor)
+{
+    return store && governor && store->governor == governor;
+}
+
 uint64_t
 wl_columnar_spill_store_bytes(const wl_columnar_spill_store_t *store)
 {

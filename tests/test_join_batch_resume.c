@@ -14,6 +14,7 @@
 #endif
 
 #include "../wirelog/backend.h"
+#include "test_tmpdir.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/columnar/diff_join_batch.h"
 #include "../wirelog/columnar/join_batch.h"
@@ -6705,10 +6706,139 @@ out:
     fixture_fini(&f);
 }
 
+#define PAYLOAD_CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", \
+                                              __FILE__, __LINE__, #x); abort(); \
+                              } } while (0)
+
+static void
+test_owned_mixed_payloads(void)
+{
+    TEST(
+        "owned resident/spilled batches survive reuse, abort and producer teardown");
+    fixture_t f;
+    const int64_t keys[] = {0};
+    PAYLOAD_CHECK(fixture_init(&f, 1u<<24, keys, 1, 1, 20));
+    wl_columnar_memory_governor_ref_t *g = f.sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(g);
+    wl_columnar_spill_store_t *store;
+    PAYLOAD_CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 56,
+        &store) == WL_COLUMNAR_SPILL_OK);
+    wl_columnar_continuation_t *cont = NULL;
+    PAYLOAD_CHECK(col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 96, &cont) == 0);
+    wl_columnar_join_batch_payload_sink_t context;
+    wl_columnar_continuation_sink_t sink;
+    wl_columnar_join_batch_payload_sink_init(&context, &sink, g, store,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED);
+    wl_columnar_spill_store_t *quota_limited_store;
+    PAYLOAD_CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1, 56,
+        &quota_limited_store) == WL_COLUMNAR_SPILL_OK);
+    context.store = quota_limited_store;
+    PAYLOAD_CHECK(wl_columnar_continuation_publish(cont,
+        &sink) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE);
+    PAYLOAD_CHECK(context.error == WL_COLUMNAR_SPILL_QUOTA && !context.ready &&
+        !context.staged);
+    PAYLOAD_CHECK(wl_columnar_continuation_cursor(cont)->sequence == 0);
+    PAYLOAD_CHECK(wl_columnar_spill_store_close(
+            quota_limited_store) == WL_COLUMNAR_SPILL_OK);
+    context.store = store;
+    faulty_sink_t fault = {.inner = sink, .fail_append_at = 1};
+    wl_columnar_continuation_sink_t faulty;
+    faulty_sink_wrap(&fault, &faulty);
+    wl_columnar_continuation_cursor_t cursor =
+        *wl_columnar_continuation_cursor(cont);
+    PAYLOAD_CHECK(wl_columnar_continuation_publish(cont,
+        &faulty) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE);
+    PAYLOAD_CHECK(same_continuation_cursor(&cursor,
+        wl_columnar_continuation_cursor(cont)));
+    PAYLOAD_CHECK(!context.ready && !context.staged &&
+        wl_columnar_spill_store_bytes(store) == 0);
+    fault.fail_commit_at = 1;
+    PAYLOAD_CHECK(wl_columnar_continuation_publish(cont,
+        &faulty) == WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS);
+    cursor = *wl_columnar_continuation_cursor(cont);
+    PAYLOAD_CHECK(cursor.sequence == 1 && context.ready);
+    wl_columnar_batch_payload_t *ready = context.ready;
+    PAYLOAD_CHECK(wl_columnar_continuation_publish(cont,
+        &sink) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE);
+    PAYLOAD_CHECK(context.error == WL_COLUMNAR_SPILL_BUSY &&
+        context.ready == ready);
+    PAYLOAD_CHECK(same_continuation_cursor(&cursor,
+        wl_columnar_continuation_cursor(cont)));
+    sink.abort(sink.context); /* abort must never discard committed ownership */
+    PAYLOAD_CHECK(context.ready == ready);
+    wl_columnar_batch_payload_t *payloads[32];
+    unsigned count = 0;
+    payloads[count++] = wl_columnar_join_batch_payload_sink_take(&context);
+    while (!wl_columnar_continuation_is_done(cont)) {
+        context.storage = count%
+            2 ? WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT :
+            WL_COLUMNAR_BATCH_PAYLOAD_SPILLED;
+        wl_columnar_continuation_status_t rc =
+            wl_columnar_continuation_publish(cont, &sink);
+        PAYLOAD_CHECK(rc == WL_COLUMNAR_CONTINUATION_OK ||
+            rc == WL_COLUMNAR_CONTINUATION_DONE);
+        wl_columnar_batch_payload_t *p =
+            wl_columnar_join_batch_payload_sink_take(&context);
+        if (p) {
+            PAYLOAD_CHECK(count < 32); payloads[count++] = p;
+        }
+    }
+    PAYLOAD_CHECK(count == 7 &&
+        wl_columnar_continuation_cursor(cont)->sequence == 7);
+    wl_columnar_continuation_destroy(cont);
+    /* Cleanup releases an untaken commit as well as any uncommitted stage. */
+    wl_columnar_continuation_batch_t batch = {.payload = f.left, .rows = 1};
+    uint64_t baseline =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g));
+    PAYLOAD_CHECK(sink.begin(sink.context,
+        &batch) == WL_COLUMNAR_CONTINUATION_OK);
+    PAYLOAD_CHECK(sink.reserve(sink.context, 0,
+        1) == WL_COLUMNAR_CONTINUATION_OK);
+    PAYLOAD_CHECK(sink.append(sink.context,
+        &batch) == WL_COLUMNAR_CONTINUATION_OK);
+    bool committed = false;
+    PAYLOAD_CHECK(sink.commit(sink.context,
+        &committed) == WL_COLUMNAR_CONTINUATION_OK && committed);
+    wl_columnar_join_batch_payload_sink_cleanup(&context);
+    PAYLOAD_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(g)) == baseline);
+    fixture_fini(&f);
+    bool seen[20] = {false}; unsigned total = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t cols, rows;
+        const wirelog_column_type_t *types =
+            wl_columnar_batch_payload_schema(payloads[i], &cols, &rows);
+        PAYLOAD_CHECK(cols == 4 && rows <= 3 && types[0] == WIRELOG_TYPE_INT64);
+        wl_columnar_batch_payload_reader_t *reader;
+        PAYLOAD_CHECK(wl_columnar_batch_payload_acquire(payloads[i],
+            &reader) == WL_COLUMNAR_SPILL_OK);
+        for (uint32_t row = 0; row < rows; row++) {
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_read(reader, row, NULL,
+                NULL, &lanes, &meta) == WL_COLUMNAR_SPILL_OK);
+            PAYLOAD_CHECK(lanes[0] == 0 && lanes[2] == 0 && lanes[3] < 20 &&
+                !seen[lanes[3]] && meta.multiplicity == 1);
+            seen[lanes[3]] = true; total++;
+        }
+        wl_columnar_batch_payload_reader_release(reader);
+        PAYLOAD_CHECK(wl_columnar_batch_payload_release(payloads[i]) ==
+            WL_COLUMNAR_SPILL_OK);
+    }
+    PAYLOAD_CHECK(total == 20 &&
+        wl_columnar_spill_store_close(store) == WL_COLUMNAR_SPILL_OK);
+    PAYLOAD_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(g)) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    PASS();
+}
+#undef PAYLOAD_CHECK
+
 int
 main(void)
 {
     printf("test_join_batch_resume: bounded keyed-join sub-batches (#1446)\n");
+    test_owned_mixed_payloads();
     test_high_fanout_spans_batches();
     test_boundaries_collision_and_last_match();
     test_boundary_mid_chain();

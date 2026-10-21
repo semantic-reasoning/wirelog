@@ -1877,3 +1877,118 @@ col_join_batch_run_to_relation(wl_columnar_continuation_t *cont,
         return rc;
     }
 }
+
+static wl_columnar_continuation_status_t
+wl_columnar_join_batch_payload_begin(void *context,
+    const wl_columnar_continuation_batch_t *batch)
+{
+    wl_columnar_join_batch_payload_sink_t *s = context;
+    s->error = WL_COLUMNAR_SPILL_OK;
+    if (s->begun || s->ready || s->staged) {
+        s->error = WL_COLUMNAR_SPILL_BUSY;
+        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    }
+    if (!batch || !batch->payload || !batch->rows) {
+        s->error = WL_COLUMNAR_SPILL_INVALID;
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    }
+    s->source = batch->payload; s->rows = batch->rows; s->begun = true;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static wl_columnar_continuation_status_t
+wl_columnar_join_batch_payload_reserve(void *context, uint64_t bytes,
+    uint32_t rows)
+{
+    (void)bytes; /* Capture admits its actual representation, including metadata. */
+    wl_columnar_join_batch_payload_sink_t *s = context;
+    if (!s->begun || s->staged || rows != s->rows) {
+        s->error = WL_COLUMNAR_SPILL_INVALID;
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    }
+    s->error = wl_columnar_batch_payload_capture(s->governor, s->store,
+            s->source, rows, s->storage, s->cancel, s->cancel_context,
+            &s->staged);
+    return s->error == WL_COLUMNAR_SPILL_OK ? WL_COLUMNAR_CONTINUATION_OK
+        : s->error ==
+           WL_COLUMNAR_SPILL_MEMORY ?
+           WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+        : WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+}
+
+static wl_columnar_continuation_status_t
+wl_columnar_join_batch_payload_append(void *context,
+    const wl_columnar_continuation_batch_t *batch)
+{
+    wl_columnar_join_batch_payload_sink_t *s = context;
+    if (!s->begun || !s->staged || !batch || batch->payload != s->source
+        || batch->rows != s->rows) {
+        s->error = WL_COLUMNAR_SPILL_INVALID;
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    }
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static wl_columnar_continuation_status_t
+wl_columnar_join_batch_payload_commit(void *context, bool *committed)
+{
+    wl_columnar_join_batch_payload_sink_t *s = context;
+    *committed = false;
+    if (!s->begun || !s->staged ||
+        s->ready) return WL_COLUMNAR_CONTINUATION_INVALID;
+    s->ready = s->staged; s->staged = NULL;
+    s->begun = false; s->source = NULL; s->rows = 0;
+    *committed = true;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+
+static void
+wl_columnar_join_batch_payload_abort(void *context)
+{
+    wl_columnar_join_batch_payload_sink_t *s = context;
+    if (s->staged &&
+        wl_columnar_batch_payload_release(s->staged) != WL_COLUMNAR_SPILL_OK)
+        abort();
+    s->staged = NULL; s->source = NULL; s->rows = 0; s->begun = false;
+}
+
+void
+wl_columnar_join_batch_payload_sink_init(
+    wl_columnar_join_batch_payload_sink_t *s,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage)
+{
+    memset(s, 0, sizeof(*s));
+    s->governor = governor; s->store = store; s->storage = storage;
+    *sink = (wl_columnar_continuation_sink_t){
+        .context = s, .begin = wl_columnar_join_batch_payload_begin,
+        .reserve = wl_columnar_join_batch_payload_reserve,
+        .append = wl_columnar_join_batch_payload_append,
+        .commit = wl_columnar_join_batch_payload_commit,
+        .abort = wl_columnar_join_batch_payload_abort,
+    };
+}
+
+wl_columnar_batch_payload_t *
+wl_columnar_join_batch_payload_sink_take(
+    wl_columnar_join_batch_payload_sink_t *s)
+{
+    if (!s) return NULL;
+    wl_columnar_batch_payload_t *p = s->ready;
+    s->ready = NULL;
+    return p;
+}
+
+void
+wl_columnar_join_batch_payload_sink_cleanup(
+    wl_columnar_join_batch_payload_sink_t *s)
+{
+    if (!s) return;
+    wl_columnar_join_batch_payload_abort(s);
+    if (s->ready &&
+        wl_columnar_batch_payload_release(s->ready) != WL_COLUMNAR_SPILL_OK)
+        abort();
+    s->ready = NULL;
+}
