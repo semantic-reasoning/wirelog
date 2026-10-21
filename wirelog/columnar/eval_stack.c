@@ -1483,8 +1483,15 @@ wl_columnar_eval_stack_operator_stack_owned(
         || frame->unary_alias_rejected || frame->unary_first_result
         || frame->unary_cleanup_result)
         return EBUSY;
-    if (!frame->stack.top)
-        return EINVAL;
+    if (!frame->stack.top) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (!record || !record->composed_mode
+            || record->phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD)
+            return EINVAL;
+        *out = &frame->stack;
+        return 0;
+    }
     const eval_entry_t *entry = &frame->stack.items[frame->stack.top - 1];
     if (entry->kind == WL_COLUMNAR_EVAL_ENTRY_CONTINUATION)
         return ENOTSUP;

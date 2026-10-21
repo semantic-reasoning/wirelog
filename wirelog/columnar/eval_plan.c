@@ -435,9 +435,12 @@ wl_columnar_eval_plan_numeric_owner_valid(const void *owner,
 {
     const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
     return record && record->identity == record && record->frame == frame
-           && record->session && record->phase >
-           WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
-           && record->phase <= WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
+           && record->session
+           && ((record->phase > WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+           && record->phase <= WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE)
+           || (record->phase >=
+           WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
+           && record->phase <= WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE))
            && wl_columnar_eval_plan_numeric_thread(record);
 }
 
@@ -1461,6 +1464,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
             } else if (kind == WL_PLAN_OP_CONCAT) {
                 if (record->preflight_depth < 2) rc = EINVAL;
                 else --record->preflight_depth;
+            } else if (kind == WL_PLAN_OP_LFTJ) {
+                if (record->preflight_depth != 0) rc = EINVAL;
+                else rc = wl_columnar_ops_lftj_attempt_preflight(
+                        &record->plan->ops[record->cursor], record->session);
+                if (!rc) ++record->preflight_depth;
             } else if (kind == WL_PLAN_OP_FILTER || kind == WL_PLAN_OP_MAP
                 || kind == WL_PLAN_OP_JOIN || kind == WL_PLAN_OP_SEMIJOIN
                 || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_REDUCE
@@ -1502,6 +1510,18 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         }
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_CONCAT) {
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START;
+            return 0;
+        }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_LFTJ) {
+            rc = wl_columnar_ops_lftj_attempt_begin(&record->lftj,
+                    &record->plan->ops[record->cursor], record->frame,
+                    record->session, record->control, record->attempt_id,
+                    record);
+            if (rc) {
+                record->semantic_result = rc;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else record->phase =
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD;
             return 0;
         }
         record->pending_action = record->phase;
@@ -1552,6 +1572,28 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
         return wl_columnar_filter_op_attempt_ack_owned(record->frame, record);
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD: {
+        bool done = false;
+        rc = wl_columnar_ops_lftj_attempt_step(&record->lftj, &done);
+        if (rc) {
+            record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        } else if (done) {
+            if (record->lftj.semantic_result) {
+                record->semantic_result = record->lftj.semantic_result;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else if (++record->runtime_depth > COL_STACK_MAX) {
+                record->semantic_result = ENOBUFS;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else {
+                ++record->completed;
+                record->phase = ++record->cursor == record->end
+                    ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+                    : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+            }
+        }
+        return 0;
+    }
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START:
         rc = wl_columnar_eval_plan_numeric_forward(record);
         if (rc) {
@@ -1599,6 +1641,14 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         return wl_columnar_eval_plan_composed_source_step(record, funding,
                    funding_id);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE:
+        if (record->lftj.identity
+            && record->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
+            bool done = false;
+            (void)wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done);
+            if (!done) return 0;
+            if (!record->semantic_result && record->lftj.semantic_result)
+                record->semantic_result = record->lftj.semantic_result;
+        }
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
         return 0;
     default:
@@ -1738,6 +1788,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->composed_mode = false; record->preflight_depth = 0;
     record->runtime_depth = 0;
     record->abort_supported = false; record->abort_requested = false;
+    memset(&record->lftj, 0, sizeof(record->lftj));
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
     wl_evaluation_control_release(control);
     return 0;
