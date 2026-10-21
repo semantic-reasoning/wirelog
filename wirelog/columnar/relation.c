@@ -1615,6 +1615,113 @@ col_rel_source_reader_release(wl_columnar_source_access_reader_t *token)
 }
 
 int
+wl_columnar_relation_reader_step(const col_rel_t *rel,
+    wl_columnar_relation_reader_step_t *record, bool release,
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!rel || !record || (!control && !release))
+        return EINVAL;
+    if (rel->storage_owner != rel || !rel->relation_identity
+        || rel->relation_identity == UINT64_MAX
+        || rel->storage_owner_identity != rel->relation_identity
+        || !rel->storage_generation || rel->storage_generation == UINT64_MAX
+        || rel->storage_owner_generation != rel->storage_generation)
+        return EINVAL;
+    wl_columnar_source_access_gate_t *descriptor =
+        (wl_columnar_source_access_gate_t *)&rel->descriptor_access;
+    wl_columnar_source_access_gate_t *owner =
+        (wl_columnar_source_access_gate_t *)&rel->source_access;
+    wl_columnar_source_access_reader_t *token = &record->token;
+    bool live = record->descriptor_held;
+    if ((live &&
+        (record->identity != (uintptr_t)record || record->relation != rel))
+        || (!live && (record->identity || record->relation))
+        || token->thread_valid
+        || (token->owner && (!live || token->owner != owner
+        || token->identity != (uintptr_t)token || !token->transferable
+        || token->secondary_owner != descriptor))
+        || (!token->owner && (token->identity || token->secondary_owner
+        || token->transferable)))
+        return EINVAL;
+    if (control && (!attempt_id
+        || wl_evaluation_control_active_attempt_id(control) != attempt_id))
+        return EINVAL;
+    int rc = control ? wl_evaluation_control_charge(control, 1) : 0;
+    if (rc)
+        return rc;
+    wl_columnar_source_access_gate_t *gate = release
+        ? (token->owner ? owner : live ? descriptor : NULL)
+        : (token->owner ? NULL : live ? owner : descriptor);
+    int result = 0;
+    if (gate) {
+        uint64_t value = atomic_load_explicit(&gate->state,
+                memory_order_acquire);
+        if (value == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            result = release ? EINVAL : EBUSY;
+        else if (release && value == 0)
+            result = EINVAL;
+        else if (!release && value == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1)
+            result = EOVERFLOW;
+        else {
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_relation_test_before_reader_cas)
+                wl_columnar_relation_test_before_reader_cas(control, gate,
+                    value);
+#endif
+#ifdef _MSC_VER
+            /* The MSVC weak-named shim is one non-spurious Interlocked CAS. */
+            bool changed = atomic_compare_exchange_weak_explicit(
+                &gate->state, &value, release ? value - 1 : value + 1,
+                release ? memory_order_release : memory_order_acquire,
+                memory_order_relaxed);
+#else
+            bool changed = atomic_compare_exchange_strong_explicit(
+                &gate->state, &value, release ? value - 1 : value + 1,
+                release ? memory_order_release : memory_order_acquire,
+                memory_order_relaxed);
+#endif
+            result = EAGAIN;
+            if (changed) {
+                if (!release) {
+                    if (gate == descriptor) {
+                        record->identity = (uintptr_t)record;
+                        record->relation = rel;
+                        record->descriptor_held = true;
+                    } else {
+                        wl_columnar_source_access_reader_initialize(owner,
+                            token, true);
+                        token->secondary_owner = descriptor;
+                        result = 0;
+                    }
+                } else if (gate == owner) {
+                    token->owner = NULL;
+                    token->secondary_owner = NULL;
+                    token->identity = 0;
+                    token->transferable = false;
+                } else {
+                    record->descriptor_held = false;
+                    record->identity = 0;
+                    record->relation = NULL;
+                    result = 0;
+                }
+            }
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_relation_test_after_reader_cas)
+                wl_columnar_relation_test_after_reader_cas(control, gate,
+                    changed);
+#endif
+        }
+    }
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control) != attempt_id)
+            return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0);
+    }
+    return rc > 0 ? rc : (result != 0 && result != EAGAIN) ? result
+        : rc ? rc : result;
+}
+
+int
 col_rel_source_writer_acquire(const col_rel_t *rel,
     wl_columnar_source_access_writer_t *token)
 {

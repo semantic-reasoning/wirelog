@@ -6519,3 +6519,14 @@ test_spill_segments_exe = executable(
   c_args: ['-DWL_TEST_SPILL=1'],
 )
 test('spill_segments', test_spill_segments_exe, suite: ['unit', 'tsan'], timeout: 60)
+
+# Production resumable observer baseline and transferable reader transitions.
+test_evaluation_observer_build_exe = executable(
+  'test_evaluation_observer_build',
+  files('test_evaluation_observer_build.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_observer_build', test_evaluation_observer_build_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

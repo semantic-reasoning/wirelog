@@ -3691,6 +3691,14 @@ col_session_destroy(wl_session_t *session)
     /* Public destruction has already closed admission and drained workers.
      * Refused internal readers violate the same synchronous teardown invariant
      * as refused relation destruction below; never free their allocators. */
+    int build_rc;
+    do {
+        build_rc = wl_columnar_eval_delta_observer_build_discard(sess);
+    } while (build_rc == EAGAIN);
+    if (build_rc != 0) {
+        fputs("wirelog: observer construction cleanup failed\n", stderr);
+        abort();
+    }
     int cleanup_rc = (sess->tdd_input_run || sess->cleanup_active
         || wl_columnar_eval_delta_rollback_active(sess)) ? EBUSY
         : wl_columnar_eval_stack_cleanup_retry(sess);
@@ -3859,7 +3867,8 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Worker storage is reusable only after a complete destroy. A refused
      * teardown leaves ownership in place and permanently closes this worker. */
     if (out_worker->teardown_started || out_worker->tdd_input_run
-        || coordinator->tdd_input_run)
+        || coordinator->tdd_input_run || coordinator->delta_observer_build
+        || out_worker->delta_observer_build)
         return EBUSY;
 
     /* #1661: the worker registry is heap-only, and this is the one registry
@@ -3892,6 +3901,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
     wl_columnar_session_copy_without_ledger(out_worker, coordinator);
+    out_worker->delta_observer_build = NULL;
     /* Independent authority exists before any failure cleanup. The worker
      * attribution budget is initialized below after its policy is resolved. */
     wl_mem_ledger_init(&out_worker->mem_ledger, 0);
@@ -4193,6 +4203,12 @@ col_worker_session_destroy(wl_col_session_t *worker)
     if (worker->tdd_input_run || worker->cleanup_active
         || wl_columnar_eval_delta_rollback_active(worker))
         return EBUSY;
+    int build_rc;
+    do {
+        build_rc = wl_columnar_eval_delta_observer_build_discard(worker);
+    } while (build_rc == EAGAIN);
+    if (build_rc != 0)
+        return build_rc;
     int cleanup_rc = wl_columnar_eval_stack_cleanup_retry(worker);
     if (cleanup_rc == 0)
         cleanup_rc = wl_columnar_eval_delta_rollback_discard(worker);
