@@ -668,6 +668,7 @@ static void session_destroy_drains_live_prepare(void)
 
 int main(void)
 {
+    assert(wl_columnar_eval_delta_observer_prepare(NULL) == EINVAL);
     reader_steps(); build(false); build(true);
     byte_order_no_change(false); byte_order_no_change(true);
     large_reverse_input_is_bounded(); unsupported();
