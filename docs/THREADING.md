@@ -1916,11 +1916,17 @@ existing fail-stop contract, rather than a recoverable freed-frame claim.
 
 
 The private fresh-head close proof observes its original frame credit under the
-serialized parent lifetime before sealing an empty frame. This adds one source
-site to the prior 332-site inventory; it does not publish relation payload.
+serialized parent lifetime before sealing an empty frame; that was one source
+site added to the prior 332-site inventory. Cleanup receipt session generations
+are allocated from one relaxed atomic counter; uniqueness is the only
+cross-session property, and the counter publishes no payload. This adds three
+more source sites. The test hook resets that counter only in isolated tests.
 
 | Anchor | Object | Operation | Ordering | Purpose |
 |--------|--------|-----------|----------|---------|
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_session_generation_new` | `wl_next_cleanup_receipt_session_generation` | `atomic_load_explicit` | relaxed | Read the generation candidate; uniqueness does not publish payload |
+| `eval_stack.c:wl_columnar_eval_stack_cleanup_receipt_session_generation_new#2` | `wl_next_cleanup_receipt_session_generation` | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Reserve one unique cleanup receipt session generation; retries retain the candidate returned by the failed CAS |
+| `eval_stack.c:wl_columnar_eval_stack_test_receipt_next_session_generation` | `wl_next_cleanup_receipt_session_generation` | `atomic_store_explicit` | relaxed | Reset the generation source for isolated test cases only |
 | `eval_stack.c:wl_columnar_eval_stack_framed_close_proof` | `frame->reservation.state` | `atomic_load_explicit` | acquire | Verify the original committed frame credit before the marker-live close seal; original token and native/LIFO authority remain exclusively serialized |
 | `session_hash.c:wl_columnar_session_hash_registry_token` | `token->state` | `atomic_load_explicit` | acquire | Admit only original-address RESERVED or canonical EMPTY tokens before private publication owners; noGov all-zero remains untouched |
 | `session_hash.c:wl_columnar_session_hash_registry_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Reject leased/transition credit before a reversible journal move |
