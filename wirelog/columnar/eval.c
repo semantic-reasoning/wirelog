@@ -7892,17 +7892,27 @@ done:
  * semijoin, aggregate or LFTJ can give results different from one worker
  * under that partition (#2134), so it is evaluated as a snapshot evaluates
  * it.  An EXCHANGE counts only when it does not redistribute
- * (num_workers <= 1).
+ * (num_workers <= 1).  A VARIABLE over a zero-column relation of @coord
+ * that holds rows does not count either: tdd_init_workers gives each
+ * worker an empty copy of a zero-column relation, so a rule reading it
+ * derived nothing on any worker (#2134).
  */
 static bool
-tdd_nonrec_stratum_row_local(const wl_plan_stratum_t *sp)
+tdd_nonrec_stratum_row_local(const wl_plan_stratum_t *sp,
+    wl_col_session_t *coord)
 {
     for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
         const wl_plan_relation_t *rp = &sp->relations[ri];
         for (uint32_t oi = 0; oi < rp->op_count; oi++) {
             const wl_plan_op_t *op = &rp->ops[oi];
             switch (op->op) {
-            case WL_PLAN_OP_VARIABLE:
+            case WL_PLAN_OP_VARIABLE: {
+                const col_rel_t *in = op->relation_name
+                    ? session_find_rel(coord, op->relation_name) : NULL;
+                if (in && in->ncols == 0 && in->nrows > 0)
+                    return false;
+                break;
+            }
             case WL_PLAN_OP_MAP:
             case WL_PLAN_OP_FILTER:
             case WL_PLAN_OP_CONCAT:
@@ -7937,7 +7947,7 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     uint32_t W = coord->num_workers;
     int rc;
 
-    W = tdd_nonrec_stratum_row_local(sp)
+    W = tdd_nonrec_stratum_row_local(sp, coord)
         ? tdd_choose_active_workers(sp, coord, W, false) : 1;
     if (W <= 1) {
         tdd_record_active_workers(coord, 1);

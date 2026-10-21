@@ -489,6 +489,59 @@ test_multi_atom_plain_step_matches_one_worker(void)
 }
 
 /*
+ * A rule that reads a nullary relation holding a row derives that row's
+ * consequence at more than one worker as at one (#2134), and a nullary
+ * head derived from a partitioned relation stays one row.  A nullary
+ * relation without rows does not stop the stratum being partitioned.
+ */
+static void
+test_nullary_input_plain_step_matches_one_worker(void)
+{
+    /* The flag row is inserted below; the session loads no facts. */
+    static const char flag_src[] =
+        ".decl e(x: int64)\n.decl flag()\n.decl p(x: int64)\n"
+        "p(100) :- flag().\np(x) :- e(x).\n";
+    static const char ok_src[] =
+        ".decl e(x: int64)\n.decl ok()\nok() :- e(_).\n";
+    static const int64_t v123[] = { 1, 2, 3 };
+    static const int64_t no_columns[1] = { 0 };
+    const seq_op_t ops[] = {
+        { OP_INSERT, "flag", 0, 1, no_columns },
+        { OP_INSERT, "e", 1, 3, v123 }, { OP_STEP, NULL, 0, 0, NULL },
+    };
+    static const uint32_t widths[] = { 2, 4 };
+    bool ok = true;
+
+    TEST("plain step reads a nonempty nullary relation as one worker does");
+    knob_set("1");
+    for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+        ok = matches_one_worker("nullary input", flag_src, "p", widths[w],
+                ops, 3) && ok;
+        ok = matches_one_worker("nullary head", ok_src, "ok", widths[w],
+                ops + 1, 2) && ok;
+    }
+    /* A nullary relation without rows leaves the stratum partitioned. */
+    {
+        static const char empty_flag_src[] =
+            ".decl e(x: int64)\n.decl flag()\n.decl p(x: int64)\n"
+            "p(100) :- flag().\np(x) :- e(x).\n";
+        seq_result_t got = run_sequence(empty_flag_src, false, "p", 4,
+                ops + 1, 2);
+        ok = matches_one_worker("empty nullary input", empty_flag_src, "p",
+                4, ops + 1, 2) && ok;
+        if (got.rc != 0 || got.nreads != 1 || got.max_active_workers[0] <= 1) {
+            printf("\n    empty nullary input: not partitioned");
+            ok = false;
+        }
+    }
+    knob_restore();
+    if (ok)
+        PASS();
+    else
+        FAIL("a multi-worker plain step differs from one worker");
+}
+
+/*
  * A stratum whose rule reads one row per derivation stays partitioned: the
  * projection still matches one worker, including a removal whose value
  * another row still derives, and the step ran on more than one worker.
@@ -808,6 +861,7 @@ main(void)
     test_w2_large();
     test_multi_atom_plain_step_matches_one_worker();
     test_row_local_plain_step_stays_partitioned();
+    test_nullary_input_plain_step_matches_one_worker();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
