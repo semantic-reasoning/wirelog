@@ -152,6 +152,7 @@ typedef struct {
     uint32_t selected_workers;
     uint32_t max_active_workers;
     uint64_t base_case_skips;
+    uint64_t mat_cache_hits;
 } run_t;
 
 static void
@@ -273,6 +274,7 @@ run_fixture(const char *src, const char *data, passes_t passes,
         wl_columnar_session_get_tdd_worker_width_stats(sess, NULL,
             &out.max_active_workers);
         out.base_case_skips = cs->base_case_skips;
+        out.mat_cache_hits = cs->mat_cache.hits;
         wl_session_destroy(sess);
     }
     if (plan)
@@ -308,8 +310,8 @@ static const uint32_t worker_counts[] = { 1, 2, 4 };
  * capture separated by a vertical bar, at one, two and four workers, each
  * pass setting and both entry points. */
 static void
-check_fixture(const char *name, const char *src, const char *data,
-    const char *expected)
+check_fixture_modes(const char *name, const char *src, const char *data,
+    const char *expected, bool with_step)
 {
     char want[MAX_CAPTURES][2048];
     char got[2048];
@@ -329,7 +331,7 @@ check_fixture(const char *name, const char *src, const char *data,
             break;
         p += len + 1;
     }
-    for (int st = 0; st < 2; st++) {
+    for (int st = 0; st < (with_step ? 2 : 1); st++) {
         for (int ps = PASSES_NONE; ps <= PASSES_ALL; ps++) {
             for (size_t wi = 0; wi < WORKER_COUNTS; wi++) {
                 run_t r = run_fixture(src, data, (passes_t)ps,
@@ -366,6 +368,13 @@ check_fixture(const char *name, const char *src, const char *data,
         PASS();
     else
         FAIL("model differs from the expected one");
+}
+
+static void
+check_fixture(const char *name, const char *src, const char *data,
+    const char *expected)
+{
+    check_fixture_modes(name, src, data, expected, true);
 }
 
 /* ======================================================================== */
@@ -593,6 +602,22 @@ static const char program_m63[]
     "b(x0,x0) :- l0(x0,x1), a(x2,x1), !e2(x0,x1,x0).\n"
     "a(x1,x0) :- b(x0,x1), b(x1,x2), a(x3,x4), !l0(x4,x3).\n";
 
+/* Two rules join the same inputs on different columns. */
+static const char program_b[]
+    = ".decl e0(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e1(c0: int64, c1: int64, c2: int64)\n"
+    ".decl e2(c0: int64, c1: int64)\n"
+    ".decl e3(c0: int64, c1: int64)\n"
+    ".decl a(c0: int64, c1: int64)\n"
+    ".decl z(c0: int64)\n"
+    "a(x3,x3) :- e0(x1,x0,0), e1(x2,x1,x1), e3(x2,x3).\n"
+    "a(x2,x0) :- e0(x1,x0,y0), e2(x2,x1).\n"
+    "a(x2,x2) :- a(x0,x1), e3(x1,x2).\n"
+    "a(x0,x3) :- e2(x0,x1), e3(x1,x2), a(x2,x3).\n"
+    "a(x2,x2) :- a(x1,x0), a(x1,x2), x0 != x1.\n"
+    "a(x0,x2) :- a(x0,x1), a(x2,x1), !e2(x1,x2).\n"
+    "z(x0) :- e2(x0,x0), !a(x0,x0).\n";
+
 /* ======================================================================== */
 /* Tests                                                                    */
 /* ======================================================================== */
@@ -616,6 +641,65 @@ test_rule_joining_new_rows_after_filter(void)
         "a(0,0) a(0,24) a(11,11) a(15,1) a(15,15) a(7,7) "
         "b(0,0) b(0,1) b(0,15) b(11,11) b(15,7) b(7,24) "
         "l0(0,7) l0(11,15) l0(15,24) l0(7,1)");
+}
+
+/* Rules 5 and 6 of program B join a delta of a with a on different
+ * columns.  A cached join result is reused only for the same join. */
+static void
+test_cached_join_matches_its_operation(void)
+{
+    check_fixture("B: two joins of the same inputs on different columns",
+        program_b, "e0 4 23 11; e2 21 4",
+        "a(21,21) a(21,23) a(23,21) a(23,23)");
+    check_fixture("B2: the same rows inserted in two steps", program_b,
+        "e0 4 23 11|e2 21 4", "|a(21,21) a(21,23) a(23,21) a(23,23)");
+}
+
+/* Two occurrences of the same join still share a cached result.  Only the
+ * snapshot path is checked: a step at two and at four workers returns
+ * EINVAL on this program on main as well, where p has no columns before its
+ * first evaluation. */
+static void
+test_same_join_still_shares_cache(void)
+{
+    static const char src[]
+        = ".decl e(x: int64, y: int64)\n"
+        ".decl p(x: int64, y: int64)\n"
+        "p(x,y) :- e(x,y).\n"
+        "p(x,w) :- p(x,y), p(y,z), p(z,w).\n";
+    static const char data[] = "e 1 2; e 2 3; e 3 4; e 4 5; e 5 6; e 6 7";
+
+    check_fixture_modes("same join: model", src, data,
+        "p(1,2) p(1,4) p(1,6) p(2,3) p(2,5) p(2,7) p(3,4) p(3,6) "
+        "p(4,5) p(4,7) p(5,6) p(6,7)", false);
+    TEST("same join: the cache is hit at one worker");
+    run_t r = run_fixture(src, data, PASSES_NONE, 1, false);
+    if (r.rc != 0) {
+        printf("\n    rc=%d", r.rc);
+        FAIL("snapshot failed");
+    } else if (r.mat_cache_hits == 0) {
+        FAIL("no materialization cache hit");
+    } else {
+        PASS();
+    }
+}
+
+/* Joins that filter their right relation differently are not confused. */
+static void
+test_right_filter_guard(void)
+{
+    static const char src[]
+        = ".decl e(c0: int64, c1: int64)\n"
+        ".decl a(c0: int64, c1: int64)\n"
+        "a(x,y) :- e(x,y).\n"
+        "a(x,x) :- a(x,y), a(y,3), !e(y,x).\n"
+        "a(y,x) :- a(x,y), a(y,4), !e(x,x).\n";
+
+    check_fixture("right filter: two filtered joins of a", src,
+        "e 3 5; e 6 2; e 3 0; e 1 2; e 3 3; e 6 0; e 7 7; e 7 6; e 7 3; "
+        "e 6 1; e 7 3; e 0 4; e 6 7; e 6 1",
+        "a(0,4) a(0,6) a(1,2) a(3,0) a(3,3) a(3,5) a(6,0) a(6,1) a(6,2) "
+        "a(6,7) a(7,3) a(7,6) a(7,7)");
 }
 
 static void
@@ -718,6 +802,9 @@ main(void)
     knobs_set();
     test_skip_scan();
     test_rule_joining_new_rows_after_filter();
+    test_cached_join_matches_its_operation();
+    test_same_join_still_shares_cache();
+    test_right_filter_guard();
     test_step_stays_successful();
     test_static_rule_still_skipped();
     test_parallel_strategy_runs();

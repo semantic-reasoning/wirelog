@@ -1557,6 +1557,9 @@ typedef struct {
 typedef struct {
     uint64_t left_hash;  /* content hash of left input relation  */
     uint64_t right_hash; /* content hash of right input relation */
+    /* Join operation that produced result (Issue #2127): see
+     * col_mat_cache_join_signature().  0 for the unkeyed entry points. */
+    uint64_t op_signature;
     col_rel_t *result;   /* owned cached join result             */
     size_t mem_bytes;    /* bytes used by result->data           */
     uint64_t lru_clock;  /* logical time of last access          */
@@ -4274,6 +4277,22 @@ col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_mat_cache_pin_t *pin);
 void
 col_mat_cache_pin_release(col_mat_cache_pin_t *pin);
+/* Keyed entry points (Issue #2127).  Two joins over the same left and right
+ * inputs can produce different results when their kind, path, keys or right
+ * filter differ, so a lookup hits only an entry inserted with the same
+ * signature.  The unkeyed functions above use signature 0. */
+uint64_t
+col_mat_cache_join_signature(const wl_plan_op_t *op, bool diff_path);
+int
+col_mat_cache_insert_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_rel_t *result);
+int
+col_mat_cache_insert_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_rel_t *result,
+    col_mat_cache_pin_t *pin);
+col_rel_t *
+col_mat_cache_lookup_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_mat_cache_pin_t *pin);
 /* Release only implicit epoch pins from the legacy lookup path and advance
  * the epoch.  Deferred entries whose final implicit pin is released are
  * removed here.  Explicit col_mat_cache_pin_t handles remain owned by their

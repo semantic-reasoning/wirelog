@@ -493,8 +493,9 @@ synthetic_cases(wl_col_session_t *coord)
             if (join) {
                 const int64_t wrong[][2] = {{999, 999}};
                 col_rel_t *cached = relation("bad-cache", wrong, 1, 0, 0);
-                CHECK(cached && col_mat_cache_insert(&worker.mat_cache, delta,
-                    full, cached) == 0);
+                CHECK(cached && col_mat_cache_insert_keyed(&worker.mat_cache,
+                    delta, full, col_mat_cache_join_signature(&ops[1], false),
+                    cached) == 0);
             }
             uint64_t before = reserved(&worker), hits = worker.mat_cache.hits,
                 misses = worker.mat_cache.misses;

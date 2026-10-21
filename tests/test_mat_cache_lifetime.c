@@ -10,6 +10,7 @@
 #include "../wirelog/arena/arena.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int tests_run;
 static int tests_failed;
@@ -459,6 +460,115 @@ test_snapshot_invalidates_same_shape_and_poisoned_generations(void)
     col_rel_destroy(right);
 }
 
+static wl_plan_op_t
+make_join_op(const char *const *left_keys, const char *const *right_keys,
+    uint32_t key_count)
+{
+    wl_plan_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.op = WL_PLAN_OP_JOIN;
+    op.right_relation = "a";
+    op.left_keys = left_keys;
+    op.right_keys = right_keys;
+    op.key_count = key_count;
+    return op;
+}
+
+static void
+test_join_signature_separates_operations(void)
+{
+    tests_run++;
+    static const char *const col0[] = { "col0" };
+    static const char *const col1[] = { "col1" };
+    static const char *const ab[] = { "ab" };
+    static const char *const c[] = { "c" };
+    static const char *const a[] = { "a" };
+    static const char *const bc[] = { "bc" };
+    uint8_t filter_one[] = { 1, 2, 3 };
+    uint8_t filter_two[] = { 1, 2, 4 };
+
+    wl_plan_op_t join0 = make_join_op(col0, col0, 1);
+    wl_plan_op_t join0_again = make_join_op(col0, col0, 1);
+    wl_plan_op_t join1 = make_join_op(col1, col1, 1);
+    wl_plan_op_t split_ab = make_join_op(ab, c, 1);
+    wl_plan_op_t split_bc = make_join_op(a, bc, 1);
+    wl_plan_op_t semijoin = join0;
+    semijoin.op = WL_PLAN_OP_SEMIJOIN;
+    wl_plan_op_t filtered_one = join0;
+    filtered_one.right_filter_expr.data = filter_one;
+    filtered_one.right_filter_expr.size = sizeof(filter_one);
+    wl_plan_op_t filtered_two = join0;
+    filtered_two.right_filter_expr.data = filter_two;
+    filtered_two.right_filter_expr.size = sizeof(filter_two);
+
+    uint64_t sig0 = col_mat_cache_join_signature(&join0, false);
+    ASSERT_TRUE(sig0 != 0, "a join signature is nonzero");
+    ASSERT_TRUE(sig0 == col_mat_cache_join_signature(&join0_again, false),
+        "equal joins have equal signatures");
+    ASSERT_TRUE(sig0 != col_mat_cache_join_signature(&join1, false),
+        "joins on different columns have different signatures");
+    ASSERT_TRUE(sig0 != col_mat_cache_join_signature(&join0, true),
+        "the differential path has its own signature");
+    ASSERT_TRUE(sig0 != col_mat_cache_join_signature(&semijoin, false),
+        "the operation kind is part of the signature");
+    ASSERT_TRUE(col_mat_cache_join_signature(&split_ab, false)
+        != col_mat_cache_join_signature(&split_bc, false),
+        "key names are separated in the signature");
+    ASSERT_TRUE(sig0 != col_mat_cache_join_signature(&filtered_one, false)
+        && col_mat_cache_join_signature(&filtered_one, false)
+        != col_mat_cache_join_signature(&filtered_two, false),
+        "right filter bytes are part of the signature");
+}
+
+static void
+test_keyed_entries_match_only_their_signature(void)
+{
+    tests_run++;
+    static const char *const col0[] = { "col0" };
+    static const char *const col1[] = { "col1" };
+    col_mat_cache_t cache = { 0 };
+    col_rel_t *left = make_relation(1);
+    col_rel_t *right = make_relation(2);
+    col_rel_t *result = make_relation(3);
+    col_rel_t *legacy_result = make_relation(4);
+    ASSERT_TRUE(left && right && result && legacy_result,
+        "relations allocated");
+    wl_plan_op_t join0 = make_join_op(col0, col0, 1);
+    wl_plan_op_t join1 = make_join_op(col1, col1, 1);
+    uint64_t sig0 = col_mat_cache_join_signature(&join0, false);
+    uint64_t sig1 = col_mat_cache_join_signature(&join1, false);
+
+    ASSERT_TRUE(col_mat_cache_insert_keyed(&cache, left, right, sig0, result)
+        == 0, "keyed insert succeeds");
+    ASSERT_TRUE(cache.entries[0].op_signature == sig0,
+        "the entry records its signature");
+    col_mat_cache_pin_t pin = { 0 };
+    ASSERT_TRUE(col_mat_cache_lookup_pin_keyed(&cache, left, right, sig1,
+        &pin) == NULL && !pin.active,
+        "a different join on the same inputs misses");
+    ASSERT_TRUE(col_mat_cache_lookup_pin(&cache, left, right, &pin) == NULL,
+        "an unkeyed lookup misses a keyed entry");
+    ASSERT_TRUE(col_mat_cache_lookup(&cache, left, right) == NULL,
+        "a legacy lookup misses a keyed entry");
+    ASSERT_TRUE(col_mat_cache_lookup_pin_keyed(&cache, left, right, sig0,
+        &pin) == result && pin.active,
+        "the same join hits");
+    col_mat_cache_pin_release(&pin);
+
+    ASSERT_TRUE(col_mat_cache_insert(&cache, left, right, legacy_result) == 0,
+        "legacy insert succeeds");
+    ASSERT_TRUE(col_mat_cache_lookup(&cache, left, right) == legacy_result,
+        "a legacy lookup hits a legacy entry");
+    col_mat_cache_release_pins(&cache);
+    col_mat_cache_remove_result(&cache, result);
+    ASSERT_TRUE(col_mat_cache_lookup_pin_keyed(&cache, left, right, sig0,
+        &pin) == NULL, "a keyed lookup misses a legacy entry");
+    col_mat_cache_clear(&cache);
+    ASSERT_TRUE(cache.count == 0, "clear empties the cache");
+    col_rel_destroy(left);
+    col_rel_destroy(right);
+}
+
 int
 main(void)
 {
@@ -470,6 +580,8 @@ main(void)
     test_all_pinned_insert_retains_callers_ownership();
     test_copy_survives_cache_eviction();
     test_snapshot_invalidates_same_shape_and_poisoned_generations();
+    test_join_signature_separates_operations();
+    test_keyed_entries_match_only_their_signature();
     printf("materialization-cache lifetime: %d tests, %d failures\n",
         tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

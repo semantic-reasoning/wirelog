@@ -4477,8 +4477,9 @@ test_diff_nonempty_nullary_left_cleanup(void)
              * bypass the refusal. */
             seed = make_rel("seed", width, names);
             if (!seed || col_rel_append_row(seed, row) != 0
-                || col_mat_cache_insert(&sess->mat_cache, left,
-                session_find_rel(sess, "right"), seed) != 0)
+                || col_mat_cache_insert_keyed(&sess->mat_cache, left,
+                session_find_rel(sess, "right"),
+                col_mat_cache_join_signature(&op, true), seed) != 0)
                 goto cleanup;
             seed = NULL; /* The cache owns the result. */
             op.materialized = true;
@@ -4763,8 +4764,9 @@ run_nullary_right_case(const nullary_right_case_t *t, bool diff)
          * the refusal. */
         seed = make_rel("seed", 2, names);
         if (!seed || col_rel_append_row(seed, row) != 0
-            || col_mat_cache_insert(&sess->mat_cache, left,
-            session_find_rel(sess, "right"), seed) != 0)
+            || col_mat_cache_insert_keyed(&sess->mat_cache, left,
+            session_find_rel(sess, "right"),
+            col_mat_cache_join_signature(&op, diff), seed) != 0)
             goto cleanup;
         seed = NULL; /* The cache owns the result. */
         op.materialized = true;

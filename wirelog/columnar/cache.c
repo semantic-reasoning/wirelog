@@ -298,6 +298,49 @@ col_mat_cache_evict_until(col_mat_cache_t *cache, size_t target_bytes)
     }
 }
 
+static uint64_t
+mat_cache_fnv1a(uint64_t h, const void *data, size_t size)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < size; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static uint64_t
+mat_cache_fnv1a_key(uint64_t h, const char *key)
+{
+    static const unsigned char separator = 0xff;
+    if (key)
+        h = mat_cache_fnv1a(h, key, strlen(key));
+    return mat_cache_fnv1a(h, &separator, 1);
+}
+
+uint64_t
+col_mat_cache_join_signature(const wl_plan_op_t *op, bool diff_path)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (!op)
+        return 1;
+    uint32_t kind = (uint32_t)op->op;
+    unsigned char path = diff_path ? 1 : 0;
+    h = mat_cache_fnv1a(h, &kind, sizeof(kind));
+    h = mat_cache_fnv1a(h, &path, sizeof(path));
+    h = mat_cache_fnv1a(h, &op->key_count, sizeof(op->key_count));
+    for (uint32_t k = 0; k < op->key_count; k++) {
+        h = mat_cache_fnv1a_key(h, op->left_keys ? op->left_keys[k] : NULL);
+        h = mat_cache_fnv1a_key(h, op->right_keys ? op->right_keys[k] : NULL);
+    }
+    h = mat_cache_fnv1a(h, &op->right_filter_expr.size,
+            sizeof(op->right_filter_expr.size));
+    if (op->right_filter_expr.data && op->right_filter_expr.size > 0)
+        h = mat_cache_fnv1a(h, op->right_filter_expr.data,
+                op->right_filter_expr.size);
+    return h != 0 ? h : 1;
+}
+
 col_rel_t *
 col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right)
@@ -311,6 +354,7 @@ col_mat_cache_lookup(col_mat_cache_t *cache, const col_rel_t *left,
     for (uint32_t i = 0; i < cache->count; i++) {
         if (cache->entries[i].left_hash == lh
             && cache->entries[i].right_hash == rh
+            && cache->entries[i].op_signature == 0
             && wl_columnar_relation_snapshot_equal(
                 cache->entries[i].left_snapshot,
                 wl_columnar_relation_snapshot(left))
@@ -341,6 +385,13 @@ col_rel_t *
 col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_mat_cache_pin_t *pin)
 {
+    return col_mat_cache_lookup_pin_keyed(cache, left, right, 0, pin);
+}
+
+col_rel_t *
+col_mat_cache_lookup_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_mat_cache_pin_t *pin)
+{
     if (!cache || !left || !right || !pin)
         return NULL;
     memset(pin, 0, sizeof(*pin));
@@ -349,6 +400,7 @@ col_mat_cache_lookup_pin(col_mat_cache_t *cache, const col_rel_t *left,
     for (uint32_t i = 0; i < cache->count; i++) {
         col_mat_entry_t *entry = &cache->entries[i];
         if (entry->left_hash == lh && entry->right_hash == rh
+            && entry->op_signature == op_signature
             && wl_columnar_relation_snapshot_equal(entry->left_snapshot,
             wl_columnar_relation_snapshot(left))
             && wl_columnar_relation_snapshot_equal(entry->right_snapshot,
@@ -405,6 +457,14 @@ int
 col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result, col_mat_cache_pin_t *pin)
 {
+    return col_mat_cache_insert_pin_keyed(cache, left, right, 0, result, pin);
+}
+
+int
+col_mat_cache_insert_pin_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_rel_t *result,
+    col_mat_cache_pin_t *pin)
+{
     if (pin)
         memset(pin, 0, sizeof(*pin));
     if (!cache || !left || !right || !result)
@@ -441,6 +501,7 @@ col_mat_cache_insert_pin(col_mat_cache_t *cache, const col_rel_t *left,
     col_mat_entry_t *e = &cache->entries[cache->count++];
     e->left_hash = col_mat_cache_key_content(left);
     e->right_hash = col_mat_cache_key_content(right);
+    e->op_signature = op_signature;
     e->left_snapshot = wl_columnar_relation_snapshot(left);
     e->right_snapshot = wl_columnar_relation_snapshot(right);
     e->result = result;
@@ -490,7 +551,16 @@ int
 col_mat_cache_insert(col_mat_cache_t *cache, const col_rel_t *left,
     const col_rel_t *right, col_rel_t *result)
 {
-    return col_mat_cache_insert_pin(cache, left, right, result, NULL);
+    return col_mat_cache_insert_pin_keyed(cache, left, right, 0, result,
+               NULL);
+}
+
+int
+col_mat_cache_insert_keyed(col_mat_cache_t *cache, const col_rel_t *left,
+    const col_rel_t *right, uint64_t op_signature, col_rel_t *result)
+{
+    return col_mat_cache_insert_pin_keyed(cache, left, right, op_signature,
+               result, NULL);
 }
 
 void

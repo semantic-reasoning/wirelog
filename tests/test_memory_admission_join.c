@@ -4254,13 +4254,14 @@ test_differential_cache_hit_reclaim_pin(void)
         goto out;
     }
     right = NULL;
-    if (col_mat_cache_insert(&sess->mat_cache, left,
-        session_find_rel(sess, "right"), cached_result) != 0) {
+    init_diff_keyed_op(&op);
+    if (col_mat_cache_insert_keyed(&sess->mat_cache, left,
+        session_find_rel(sess, "right"),
+        col_mat_cache_join_signature(&op, true), cached_result) != 0) {
         FAIL("could not seed differential cache hit");
         goto out;
     }
     cache_owns_result = true;
-    init_diff_keyed_op(&op);
     test_cache_pin_protected = false;
     test_cache_reclaim_attempt = true;
     test_reclaim_sess = sess;
@@ -5033,13 +5034,14 @@ test_cache_copy_governor_precedence(void)
     }
     right = NULL;
     source_bytes = relation_charge(cached);
-    if (col_mat_cache_insert(&sess->mat_cache, left,
-        session_find_rel(sess, "right"), cached) != 0) {
+    init_cross_op(&op);
+    if (col_mat_cache_insert_keyed(&sess->mat_cache, left,
+        session_find_rel(sess, "right"),
+        col_mat_cache_join_signature(&op, false), cached) != 0) {
         FAIL("could not seed governed cache result");
         goto out;
     }
     cache_owns_result = true;
-    init_cross_op(&op);
 
     sess->memory_governor = other;
     if (run_join(sess, left, &op, &result) != 0 || !result.rel

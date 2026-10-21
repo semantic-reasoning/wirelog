@@ -1405,8 +1405,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (op->materialized && !sess->tdd_input_run && !projected_join &&
         !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
-        col_rel_t *cached
-            = col_mat_cache_lookup_pin(&sess->mat_cache, left_e.rel, right,
+        col_rel_t *cached = col_mat_cache_lookup_pin_keyed(&sess->mat_cache,
+                left_e.rel, right, col_mat_cache_join_signature(op, false),
                 &cache_pin);
         if (cached) {
             col_rel_t *copy = NULL;
@@ -2269,7 +2269,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
             return wl_columnar_join_dispose_left(stack, &left_e,
                        wl_columnar_join_memory_error(sess, copy_rc));
         }
-        int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right, out);
+        int cache_rc = col_mat_cache_insert_keyed(&sess->mat_cache, left,
+                right, col_mat_cache_join_signature(op, false), out);
         bool publish_original = (cache_rc == ENOMEM || cache_rc == ENOSPC)
             && wl_columnar_join_original_is_accounted(out, effective);
         if (cache_rc != 0 && !publish_original) {
@@ -3374,8 +3375,8 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
     /* Owned filtered fallbacks are operation-local; see the ordinary path. */
     if (op->materialized && !projected_join && !right_filtered) {
         col_mat_cache_pin_t cache_pin = { 0 };
-        col_rel_t *cached
-            = col_mat_cache_lookup_pin(&sess->mat_cache, left_e.rel, right,
+        col_rel_t *cached = col_mat_cache_lookup_pin_keyed(&sess->mat_cache,
+                left_e.rel, right, col_mat_cache_join_signature(op, true),
                 &cache_pin);
         if (cached) {
             col_rel_t *copy = NULL;
@@ -4061,8 +4062,8 @@ join_success:
         int copy_rc = wl_columnar_relation_deep_copy_governed(out, &copy,
                 effective);
         if (copy_rc == 0) {
-            int cache_rc = col_mat_cache_insert(&sess->mat_cache, left, right,
-                    out);
+            int cache_rc = col_mat_cache_insert_keyed(&sess->mat_cache, left,
+                    right, col_mat_cache_join_signature(op, true), out);
             if (cache_rc == 0) {
                 publish = copy;
                 cached = true;
