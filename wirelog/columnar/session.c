@@ -3524,6 +3524,22 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * pairs to prevent incorrect skip-condition evaluation across epochs. */
     /* outer_epoch = 0; */ /* Already zeroed by calloc */
 
+    /* Last fallible initialization: no store-owning early return follows.
+     * All spill allocations use the session's existing admission governor. */
+    if (options && options->spill_directory) {
+        wl_columnar_spill_status_t spill_rc = wl_columnar_spill_store_open(
+            options->spill_directory, sess->memory_governor,
+            options->spill_quota_bytes, options->spill_max_row_bytes,
+            &sess->spill_store);
+        if (spill_rc != WL_COLUMNAR_SPILL_OK) {
+            relation_create_rc = spill_rc == WL_COLUMNAR_SPILL_MEMORY
+                ? ENOSPC : spill_rc == WL_COLUMNAR_SPILL_ALLOCATION
+                ? ENOMEM : spill_rc == WL_COLUMNAR_SPILL_INVALID ? EINVAL : EIO;
+            goto oom;
+        }
+        sess->owns_spill_store = true;
+    }
+
     /* Issue #317: Initialize per-worker frontier progress tracker.
      * Uses MAX_STRATA so the tracker is valid without knowing the plan's
      * stratum count at init time.  Failure is non-fatal: progress tracking
@@ -3815,6 +3831,8 @@ col_session_destroy(wl_session_t *session)
     if (!wl_compound_arena_free_checked(sess->compound_arena))
         WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
             "compound arena still has active worker leases");
+    if (sess->owns_spill_store)
+        wl_columnar_spill_store_retire(sess->spill_store);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
     free(sess);
 }
@@ -3892,6 +3910,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
     wl_columnar_session_copy_without_ledger(out_worker, coordinator);
+    out_worker->owns_spill_store = false; /* Borrow, including failure cleanup. */
     /* Independent authority exists before any failure cleanup. The worker
      * attribution budget is initialized below after its policy is resolved. */
     wl_mem_ledger_init(&out_worker->mem_ledger, 0);

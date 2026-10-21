@@ -2073,6 +2073,7 @@ backend_src = files(
   '../wirelog/columnar/frontier_epoch.c',
   '../wirelog/columnar/mobius.c',
   '../wirelog/columnar/session.c',
+  '../wirelog/columnar/spill.c',
   '../wirelog/columnar/session_hash.c',
   '../wirelog/columnar/delta_pool.c',
   '../wirelog/columnar/delta_pool_admission.c',
@@ -6519,3 +6520,12 @@ test_spill_segments_exe = executable(
   c_args: ['-DWL_TEST_SPILL=1'],
 )
 test('spill_segments', test_spill_segments_exe, suite: ['unit', 'tsan'], timeout: 60)
+
+# Internal spill ownership through real coordinator/worker teardown.
+test_session_spill_exe = executable(
+  'test_session_spill', files('test_session_spill.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('session_spill', test_session_spill_exe, suite: ['unit', 'tsan'], timeout: 120)

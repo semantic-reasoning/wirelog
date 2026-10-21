@@ -17,7 +17,7 @@ typedef struct wl_columnar_memory_governor_ref
 
 typedef struct wl_evaluation_control wl_evaluation_control_t;
 
-#define WL_SESSION_OPTIONS_VERSION UINT32_C(3)
+#define WL_SESSION_OPTIONS_VERSION UINT32_C(4)
 
 /*
  * Options are valid only for the duration of session creation.  The Windows
@@ -38,6 +38,11 @@ typedef struct wl_evaluation_control wl_evaluation_control_t;
  * wrapper claims one logical owner; workers only borrow it. This is foundation
  * plumbing: controlled step/snapshot return ENOTSUP until engine enforcement
  * lands. Version 2 prefixes remain accepted, with no evaluation control.
+ *
+ * Version 4 (#1372) adds an optional numeric spill store. A NULL directory
+ * with zero limits disables it; otherwise the directory must be nonempty,
+ * quota positive, and max_row_bytes at least 32. The directory is copied.
+ * This is internal opt-in plumbing, not automatic evaluator spilling.
  */
 typedef struct {
     uint32_t size;
@@ -45,6 +50,9 @@ typedef struct {
     void *windows_job_handle;
     wl_columnar_memory_governor_ref_t *memory_governor;
     wl_evaluation_control_t *evaluation_control;
+    const char *spill_directory;
+    uint64_t spill_quota_bytes;
+    uint64_t spill_max_row_bytes;
 } wl_session_options_t;
 
 void

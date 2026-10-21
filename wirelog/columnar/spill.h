@@ -23,6 +23,7 @@ typedef enum {
     WL_COLUMNAR_SPILL_CANCELLED,
     WL_COLUMNAR_SPILL_BUSY,
     WL_COLUMNAR_SPILL_OVERFLOW,
+    WL_COLUMNAR_SPILL_CLOSED,
 } wl_columnar_spill_status_t;
 
 typedef struct {
@@ -58,6 +59,16 @@ wl_columnar_spill_status_t wl_columnar_spill_store_open(const char *directory,
     uint64_t max_row_bytes, wl_columnar_spill_store_t **out);
 wl_columnar_spill_status_t wl_columnar_spill_store_close(
     wl_columnar_spill_store_t *store);
+/* Relinquish the store owner and close admission (create/acquire => CLOSED).
+ * NULL is a no-op. An empty store is freed immediately: the owner pointer is
+ * invalid after retirement. Existing segment owners keep a retired store alive
+ * until their final release, and existing readers can still read. Each caller
+ * must release its readers, then its segments; BUSY still preserves ownership.
+ * A store pointer borrowed through a live segment may only inspect bytes or
+ * attempt create (CLOSED), never close/retire again. Lifecycle calls, including
+ * retirement, remain externally serialized. Numeric handles retain no session,
+ * callback context, intern table or compound arena. */
+void wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store);
 uint64_t wl_columnar_spill_store_bytes(const wl_columnar_spill_store_t *store);
 
 /* Scalar schemas only: logical and physical column types are identical.

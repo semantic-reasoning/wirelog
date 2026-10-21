@@ -34,7 +34,7 @@ fake_create_with_options(const wl_plan_t *plan, uint32_t num_workers,
     (void)plan;
     (void)num_workers;
     options_calls++;
-    observed = *options; /* ASan proves backend receives a complete v3. */
+    observed = *options; /* ASan proves backend receives a complete v4. */
     if (fail_creation)
         return ENOMEM;
     *out = calloc(1, sizeof(**out));
@@ -94,6 +94,12 @@ typedef struct {
     void *windows_job_handle;
     wl_columnar_memory_governor_ref_t *memory_governor;
 } legacy_options_t;
+typedef struct {
+    uint32_t size, version;
+    void *windows_job_handle;
+    wl_columnar_memory_governor_ref_t *memory_governor;
+    wl_evaluation_control_t *evaluation_control;
+} v3_options_t;
 
 static void
 compatibility(void)
@@ -102,12 +108,12 @@ compatibility(void)
     wl_session_options_t options;
     wl_session_t *session = NULL;
     wl_session_options_init(&options);
-    CHECK(options.version == 3 && options.size == sizeof(options));
+    CHECK(options.version == 4 && options.size == sizeof(options));
     CHECK(options.evaluation_control == NULL);
     options.windows_job_handle = &handle;
     CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
         &session) == 0);
-    CHECK(observed.windows_job_handle == &handle && observed.version == 3);
+    CHECK(observed.windows_job_handle == &handle && observed.version == 4);
     CHECK(wl_session_step(session) == 0);
     CHECK(wl_session_snapshot(session, NULL, NULL) == 0);
     CHECK(evaluation_calls == 2);
@@ -130,7 +136,7 @@ compatibility(void)
     };
     CHECK(wl_session_create_with_options(&options_backend, NULL, 1,
         (const wl_session_options_t *)legacy, &session) == 0);
-    CHECK(observed.version == 3 && observed.size == sizeof(observed));
+    CHECK(observed.version == 4 && observed.size == sizeof(observed));
     CHECK(observed.windows_job_handle == &handle);
     CHECK(observed.memory_governor == legacy->memory_governor);
     CHECK(observed.evaluation_control == NULL);
@@ -149,7 +155,25 @@ compatibility(void)
     free(oversized);
     wl_session_destroy(session);
 
-    /* First only size, then declared v2/v3 truncated buffers under ASan. */
+    /* Exact old v3 allocation and poisoned oversized tail are both bounded. */
+    for (unsigned extra = 0; extra <= 64; extra += 64) {
+        size_t length = sizeof(v3_options_t) + extra;
+        unsigned char *storage = malloc(length);
+        CHECK(storage);
+        memset(storage, 0xff, length);
+        v3_options_t v3 = { .size = (uint32_t)length, .version = 3,
+                            .windows_job_handle = &handle };
+        memcpy(storage, &v3, sizeof(v3));
+        CHECK(wl_session_create_with_options(&options_backend, NULL, 1,
+            (const wl_session_options_t *)storage, &session) == 0);
+        CHECK(observed.windows_job_handle == &handle);
+        CHECK(observed.spill_directory == NULL && !observed.spill_quota_bytes
+            && !observed.spill_max_row_bytes);
+        free(storage);
+        wl_session_destroy(session);
+    }
+
+    /* First only size, then declared v2/v3/v4 truncated buffers under ASan. */
     uint32_t *size_only = malloc(sizeof(*size_only));
     CHECK(size_only != NULL);
     *size_only = sizeof(*size_only);
@@ -158,8 +182,9 @@ compatibility(void)
         (const wl_session_options_t *)size_only,
         &session) != 0 && session == NULL);
     free(size_only);
-    for (unsigned version = 2; version <= 3; version++) {
-        size_t length = version == 2 ? sizeof(prefix) - 1 : sizeof(options) - 1;
+    for (unsigned version = 2; version <= 4; version++) {
+        size_t length = (version == 2 ? sizeof(prefix)
+            : version == 3 ? sizeof(v3_options_t) : sizeof(options)) - 1;
         unsigned char *short_options = calloc(1, length);
         CHECK(short_options != NULL);
         uint32_t size = (uint32_t)length;
@@ -172,10 +197,48 @@ compatibility(void)
             &session) != 0 && session == NULL);
         free(short_options);
     }
-    options.version = 4;
+    options.version = 5;
     CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
         &session) != 0 && session == NULL);
     CHECK(options_calls == calls_before);
+}
+
+static void
+spill_options(void)
+{
+    wl_session_options_t options;
+    wl_session_t *session;
+    wl_session_options_init(&options);
+    CHECK(!options.spill_directory && !options.spill_quota_bytes
+        && !options.spill_max_row_bytes);
+    int before = options_calls;
+    options.spill_quota_bytes = 1;
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == EINVAL && !session);
+    options.spill_directory = "";
+    options.spill_max_row_bytes = 32;
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == EINVAL && !session);
+    options.spill_directory = ".";
+    options.spill_quota_bytes = 0;
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == EINVAL && !session);
+    options.spill_quota_bytes = 1024;
+    options.spill_max_row_bytes = 31;
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == EINVAL && !session);
+    CHECK(options_calls == before);
+    options.spill_max_row_bytes = 32;
+    before = legacy_calls;
+    CHECK(wl_session_create_with_options(&legacy_backend, NULL, 1, &options,
+        &session) == ENOTSUP && !session);
+    CHECK(legacy_calls == before);
+    CHECK(wl_session_create_with_options(&options_backend, NULL, 1, &options,
+        &session) == 0);
+    CHECK(observed.spill_directory == options.spill_directory
+        && observed.spill_quota_bytes == 1024 &&
+        observed.spill_max_row_bytes == 32);
+    wl_session_destroy(session);
 }
 
 static void
@@ -225,6 +288,7 @@ int
 main(void)
 {
     compatibility();
+    spill_options();
     control_lifetime();
     puts("session_options: OK");
     return 0;
