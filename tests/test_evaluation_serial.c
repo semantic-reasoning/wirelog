@@ -5,6 +5,7 @@
 /* #1821 real backend fresh-head result bridge and retained ownership. */
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <math.h>
@@ -2031,6 +2032,242 @@ test_entry_generated_integer_crc(void)
     entry_destroy(&cancelled);
 }
 
+static const char entry_hash_map[] =
+    ".decl input(x:int64)\n.decl output(y:int64)\n"
+    "output(hash(x)) :- input(x).\n";
+static const char entry_hash_filter[] =
+    ".decl input(x:int64)\n.decl output(x:int64)\n"
+    "output(x) :- input(x), hash(x) >= 0.\n";
+static const char entry_hash_symbol_map[] =
+    ".decl input(x:symbol)\n.decl output(y:int64)\n"
+    "output(hash(x)) :- input(x).\n";
+
+typedef struct {
+    wl_evaluation_control_t *operation;
+    bool target_seen, cancel;
+    uint64_t target_hits;
+} entry_hash_probe_t;
+
+static entry_hash_probe_t *entry_hash_probe;
+
+static void
+entry_hash_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress, bool failed)
+{
+    (void)failed;
+    entry_hash_probe_t *probe = entry_hash_probe;
+    if (!probe || control != probe->operation || phase != 27 || progress != 1)
+        return;
+    probe->target_seen = true;
+    ++probe->target_hits;
+    if (probe->cancel) {
+        probe->cancel = false;
+        (void)wl_evaluation_control_request_cancel(control);
+    }
+}
+
+typedef struct {
+    uint64_t consumed;
+    int result;
+    bool target_seen;
+} entry_hash_trial_t;
+
+static entry_hash_trial_t
+entry_hash_limit_trial(uint64_t limit)
+{
+    static const int64_t rows[] = {0, 1, -1, INT64_MIN, INT64_MAX, 42, -42};
+    entry_fixture_t f;
+    entry_init(&f, entry_hash_map, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, limit);
+    const wl_plan_op_t *map = NULL;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_MAP) map = &f.relation->ops[i];
+    CHECK(map && map->map_exprs && map->map_exprs[0].size);
+    entry_assert_generated_crc(map, true, WL_PLAN_EXPR_ARITH_HASH);
+    col_rel_t **registry = f.session->rels;
+    uint32_t nrels = f.session->nrels;
+    col_rel_t *input = session_find_rel(f.session, "input");
+    CHECK(input && input->nrows == sizeof(rows) / sizeof(rows[0]));
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+    entry_hash_probe_t probe = {.operation = f.operation};
+    entry_hash_probe = &probe;
+    wl_columnar_expr_test_checkpoint = entry_hash_checkpoint;
+    entry_complete(&f);
+    wl_columnar_expr_test_checkpoint = NULL;
+    entry_hash_probe = NULL;
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        || (!f.reply.execution_result && f.reply.committed));
+    if (f.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        CHECK(!f.reply.committed && !session_rel_hash_lookup(f.session,
+            "output") && !f.session->cleanup_active
+            && !f.session->cleanup_pending
+            && !f.session->cleanup_reserved_bytes
+            && f.session->rels == registry && f.session->nrels == nrels
+            && session_find_rel(f.session, "input") == input
+            && input->nrows == sizeof(rows) / sizeof(rows[0])
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                f.session->memory_governor)) == reserved);
+        for (uint32_t r = 0; r < input->nrows; ++r)
+            CHECK(input->columns[0][r] == rows[r]);
+    }
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.result == f.reply.execution_result
+        && !report.cleanup_status);
+    entry_hash_trial_t trial = {
+        .consumed = report.consumed,
+        .result = report.result,
+        .target_seen = probe.target_seen
+    };
+    entry_destroy(&f);
+    return trial;
+}
+
+static void
+test_entry_generated_integer_hash(void)
+{
+    static const int64_t rows[] = {0, 1, -1, INT64_MIN, INT64_MAX, 42, -42};
+    const struct { int64_t value; uint64_t little, big; } vectors[] = {
+        {0, UINT64_C(14374147212387527897), UINT64_C(14374147212387527897)},
+        {1, UINT64_C(3439722301264460078), UINT64_C(17540194650411207667)},
+        {-1, UINT64_C(5841669975847748627), UINT64_C(5841669975847748627)},
+        {INT64_MIN, UINT64_C(9407778237848358495),
+         UINT64_C(13234421416632580310)},
+        {INT64_MAX, UINT64_C(11687913294787043142),
+         UINT64_C(17884634274034869649)},
+        {42, UINT64_C(15395265915043915720), UINT64_C(3337142596522283180)},
+        {-42, UINT64_C(4321076967882013291), UINT64_C(17120161371623954849)}
+    };
+    uint16_t endian = 1;
+    bool little_endian = *(uint8_t *)&endian != 0;
+    entry_fixture_t map_fixture;
+    entry_init(&map_fixture, entry_hash_map, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, 0);
+    int64_t collision_id = wl_intern_put(map_fixture.plan->intern, "zero");
+    CHECK(collision_id == 0 && !strcmp(wl_intern_reverse(
+            map_fixture.plan->intern, collision_id), "zero"));
+    const wl_plan_op_t *map = NULL;
+    for (uint32_t i = 0; i < map_fixture.relation->op_count; ++i)
+        if (map_fixture.relation->ops[i].op == WL_PLAN_OP_MAP)
+            map = &map_fixture.relation->ops[i];
+    CHECK(map && map->map_exprs && map->map_exprs[0].size);
+    entry_assert_generated_crc(map, true, WL_PLAN_EXPR_ARITH_HASH);
+    entry_complete(&map_fixture);
+    CHECK(!map_fixture.reply.execution_result && map_fixture.reply.committed);
+    const col_rel_t *out = session_rel_hash_lookup(map_fixture.session,
+            "output");
+    CHECK(out && out->nrows == sizeof(rows) / sizeof(rows[0])
+        && out->ncols == 1 && out->column_types
+        && out->column_types[0] == WIRELOG_TYPE_INT64);
+    for (uint32_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); ++i) {
+        uint64_t expected = little_endian ? vectors[i].little : vectors[i].big;
+        bool found = false;
+        for (uint32_t r = 0; r < out->nrows; ++r)
+            found |= out->columns[0][r] == (int64_t)expected;
+        CHECK(found);
+    }
+    entry_compare_crc_values(&map_fixture, entry_hash_map, rows,
+        sizeof(rows) / sizeof(rows[0]));
+    entry_destroy(&map_fixture);
+
+    entry_fixture_t filter_fixture;
+    entry_init(&filter_fixture, entry_hash_filter, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, 0);
+    const wl_plan_op_t *filter = NULL;
+    for (uint32_t i = 0; i < filter_fixture.relation->op_count; ++i)
+        if (filter_fixture.relation->ops[i].op == WL_PLAN_OP_FILTER)
+            filter = &filter_fixture.relation->ops[i];
+    CHECK(filter && filter->filter_expr.size);
+    entry_assert_generated_crc(filter, false, WL_PLAN_EXPR_ARITH_HASH);
+    entry_complete(&filter_fixture);
+    CHECK(!filter_fixture.reply.execution_result &&
+        filter_fixture.reply.committed);
+    entry_compare_crc_values(&filter_fixture, entry_hash_filter, rows,
+        sizeof(rows) / sizeof(rows[0]));
+    entry_destroy(&filter_fixture);
+
+    entry_fixture_t symbol;
+    entry_init(&symbol, entry_hash_symbol_map, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, 0);
+    const wl_plan_op_t *symbol_map = NULL;
+    for (uint32_t i = 0; i < symbol.relation->op_count; ++i)
+        if (symbol.relation->ops[i].op == WL_PLAN_OP_MAP)
+            symbol_map = &symbol.relation->ops[i];
+    CHECK(symbol_map);
+    entry_assert_generated_crc(symbol_map, true, WL_PLAN_EXPR_ARITH_HASH_S);
+    col_rel_t **old_rels = symbol.session->rels;
+    uint32_t old_nrels = symbol.session->nrels;
+    col_rel_t *old_input = session_find_rel(symbol.session, "input");
+    entry_complete(&symbol);
+    CHECK(symbol.reply.execution_result == ENOTSUP
+        && !symbol.reply.committed && !session_rel_hash_lookup(symbol.session,
+        "output") && symbol.session->rels == old_rels
+        && symbol.session->nrels == old_nrels
+        && session_find_rel(symbol.session, "input") == old_input);
+    entry_destroy(&symbol);
+
+    uint64_t low = 1, high = UINT64_C(1) << 20;
+    CHECK(entry_hash_limit_trial(high).result == 0);
+    while (low < high) {
+        uint64_t mid = low + (high - low) / 2;
+        if (entry_hash_limit_trial(mid).target_seen) high = mid;
+        else low = mid + 1;
+    }
+    entry_hash_trial_t below = entry_hash_limit_trial(low - 1);
+    entry_hash_trial_t exact = entry_hash_limit_trial(low);
+    entry_hash_trial_t repeat = entry_hash_limit_trial(low);
+    CHECK(!below.target_seen
+        && below.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && exact.target_seen && exact.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && repeat.target_seen && repeat.result == exact.result
+        && repeat.consumed == exact.consumed);
+
+    entry_fixture_t cancelled;
+    entry_init(&cancelled, entry_hash_map, rows,
+        sizeof(rows) / sizeof(rows[0]), 1, 0);
+    col_rel_t **registry = cancelled.session->rels;
+    uint32_t nrels = cancelled.session->nrels;
+    col_rel_t *input = session_find_rel(cancelled.session, "input");
+    uint64_t reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(
+            cancelled.session->memory_governor));
+    entry_hash_probe_t cancel_probe = {
+        .operation = cancelled.operation, .cancel = true
+    };
+    entry_hash_probe = &cancel_probe;
+    wl_columnar_expr_test_checkpoint = entry_hash_checkpoint;
+    entry_complete(&cancelled);
+    wl_columnar_expr_test_checkpoint = NULL;
+    entry_hash_probe = NULL;
+    CHECK(cancel_probe.target_hits == 1
+        && cancelled.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !cancelled.reply.committed
+        && !session_rel_hash_lookup(cancelled.session, "output")
+        && cancelled.session->rels == registry &&
+        cancelled.session->nrels == nrels
+        && session_find_rel(cancelled.session, "input") == input
+        && input->nrows == sizeof(rows) / sizeof(rows[0])
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            cancelled.session->memory_governor)) == reserved);
+    for (uint32_t r = 0; r < input->nrows; ++r)
+        CHECK(input->columns[0][r] == rows[r]);
+    entry_finish_original(&cancelled);
+    CHECK(!wl_evaluation_control_reset(cancelled.operation));
+    CHECK(!wl_evaluation_control_configure(cancelled.operation, 0));
+    CHECK(!wl_evaluation_control_begin(cancelled.operation,
+        cancelled.session->base.operation_admission));
+    cancelled.id = wl_evaluation_control_active_attempt_id(cancelled.operation);
+    CHECK(cancelled.id);
+    cancelled.previous.previous_valid = false;
+    memset(&cancelled.reply, 0, sizeof(cancelled.reply));
+    cancelled.reply.kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
+    entry_complete(&cancelled);
+    CHECK(!cancelled.reply.execution_result && cancelled.reply.committed);
+    entry_destroy(&cancelled);
+}
+
 static const char entry_simple[] =
     ".decl input(x:int64)\n.decl output(x:int64)\n"
     "output(x) :- input(x).\n";
@@ -2968,6 +3205,7 @@ test_entry_generated_operators(void)
     }
     test_entry_generated_map_work_limit();
     test_entry_generated_integer_crc();
+    test_entry_generated_integer_hash();
     test_entry_generated_reduce_work_limit();
     test_entry_generated_grouped_count_work_limit();
     test_entry_generated_grouped_numeric_reduce_work_limit();
