@@ -542,6 +542,55 @@ test_nullary_input_plain_step_matches_one_worker(void)
 }
 
 /*
+ * A stratum that derives no rows on the first plain step keeps its head's
+ * schema, so a later step that derives a row succeeds and matches one
+ * worker (#2134).  Before, the empty merge registered a zero-column head
+ * and every later step failed.  The large case uses the default knobs.
+ */
+static void
+test_empty_first_step_keeps_schema(void)
+{
+    static const char src[] =
+        ".decl e(x: int64, y: int64)\n.decl q(x: int64, y: int64)\n"
+        "q(x, y) :- e(x, y), x > 100000.\n";
+    static const int64_t later[] = { 200000, 1 };
+    static const int64_t two[] = { 1, 1, 2, 2 };
+    static const uint32_t widths[] = { 2, 4 };
+    enum { LARGE = 10000 };
+    int64_t *rows = (int64_t *)malloc(sizeof(int64_t) * 2 * LARGE);
+    bool ok = rows != NULL;
+
+    TEST("an empty first plain step keeps the head's schema");
+    for (uint32_t i = 0; rows && i < LARGE; i++) {
+        rows[2 * i] = (int64_t)i + 1;
+        rows[2 * i + 1] = (int64_t)i + 1;
+    }
+    for (size_t w = 0; rows && w < sizeof(widths) / sizeof(widths[0]); w++) {
+        const seq_op_t large[] = {
+            { OP_INSERT, "e", 2, LARGE, rows }, { OP_STEP, NULL, 0, 0, NULL },
+            { OP_INSERT, "e", 2, 1, later }, { OP_STEP, NULL, 0, 0, NULL },
+        };
+        const seq_op_t small_input[] = {
+            { OP_INSERT, "e", 2, 2, two }, { OP_STEP, NULL, 0, 0, NULL },
+            { OP_INSERT, "e", 2, 1, later }, { OP_STEP, NULL, 0, 0, NULL },
+        };
+        knob_set(NULL);
+        ok = matches_one_worker("large, default knobs", src, "q", widths[w],
+                large, 4) && ok;
+        knob_restore();
+        knob_set("1");
+        ok = matches_one_worker("two rows", src, "q", widths[w],
+                small_input, 4) && ok;
+        knob_restore();
+    }
+    free(rows);
+    if (ok)
+        PASS();
+    else
+        FAIL("a later plain step failed or differs from one worker");
+}
+
+/*
  * A stratum whose rule reads one row per derivation stays partitioned: the
  * projection still matches one worker, including a removal whose value
  * another row still derives, and the step ran on more than one worker.
@@ -862,6 +911,7 @@ main(void)
     test_multi_atom_plain_step_matches_one_worker();
     test_row_local_plain_step_stays_partitioned();
     test_nullary_input_plain_step_matches_one_worker();
+    test_empty_first_step_keeps_schema();
 
     printf("\n%d/%d tests passed", tests_passed, tests_run);
     if (tests_failed > 0)
