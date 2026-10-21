@@ -5961,6 +5961,9 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_relation_scalar_source_t source;
     bool source_mode, source_installed, source_empty, source_is_delta;
     bool source_initialized, source_slot_borrowed;
+    /* ABORT is available only for the audited operator closure. Ordinary
+    * composed execution retains its wider existing admission surface. */
+    bool abort_supported, abort_requested;
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
 #elif defined(_WIN32) || defined(_WIN64)
@@ -6125,6 +6128,11 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin(
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_composed_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* Latch a funded abort request without advancing an owner. The next step
+* observes cancellation through each operator's existing cleanup path. */
+int wl_columnar_eval_plan_numeric_composed_abort_request(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
 int wl_columnar_eval_plan_numeric_composed_consume_result(
