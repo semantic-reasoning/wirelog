@@ -2511,7 +2511,8 @@ wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_prepare(wl_col_session_t *sess)
 {
-    if (sess && sess->delta_observer_prepare)
+    if (!sess) return EINVAL;
+    if (sess->delta_observer_prepare)
         return EBUSY;
     wl_columnar_eval_delta_observer_t *observer = sess->delta_observer;
     if (!observer || observer->cancelled || observer->delivered)
