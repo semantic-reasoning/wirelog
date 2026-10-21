@@ -120,9 +120,13 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
     if (admission->closing || admission->active_operations != 0
         || admission->controlled_step_pending)
         rc = EBUSY;
-    else if (!admission->controlled_step_complete)
-        rc = ENOTSUP;
-    else
+    else if (!admission->controlled_step_complete) {
+        wl_controlled_step_state_t state =
+            session->backend && session->backend->session_controlled_step_state
+            ? session->backend->session_controlled_step_state(session)
+            : WL_CONTROLLED_STEP_IDLE;
+        rc = state == WL_CONTROLLED_STEP_PENDING ? EBUSY : ENOTSUP;
+    }else
         admission->active_operations++;
     wl_mutex_unlock(&admission->mutex);
     return rc;
@@ -519,6 +523,11 @@ wl_session_step(wl_session_t *session)
     if (!session)
         return -1;
     bool controlled = session->evaluation_control != NULL;
+    /* A non-columnar backend must opt in to the controlled STEP contract;
+     * otherwise invoking its raw callback could run unbounded work. */
+    if (controlled && (!session->backend
+        || !session->backend->session_controlled_step_state))
+        return ENOTSUP;
     rc = controlled ? wl_session_operation_begin_step(session)
                     : wl_session_operation_begin(session);
     if (rc != 0)
@@ -535,7 +544,8 @@ wl_session_step(wl_session_t *session)
         if (rc == EAGAIN && !pending)
             rc = EIO;
         wl_controlled_step_state_t state =
-            session->backend->session_controlled_step_state
+            session->backend
+            && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
         wl_session_operation_end_step(session, state, pending);
