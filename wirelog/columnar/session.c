@@ -3715,6 +3715,13 @@ col_session_destroy(wl_session_t *session)
         fputs("wirelog: observer construction cleanup failed\n", stderr);
         abort();
     }
+    do {
+        build_rc = wl_columnar_eval_delta_observer_prepare_discard(sess);
+    } while (build_rc == EAGAIN);
+    if (build_rc != 0) {
+        fputs("wirelog: observer preparation cleanup failed\n", stderr);
+        abort();
+    }
     int cleanup_rc = (sess->tdd_input_run || sess->cleanup_active
         || wl_columnar_eval_delta_rollback_active(sess)) ? EBUSY
         : wl_columnar_eval_stack_cleanup_retry(sess);
@@ -3886,7 +3893,9 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * teardown leaves ownership in place and permanently closes this worker. */
     if (out_worker->teardown_started || out_worker->tdd_input_run
         || coordinator->tdd_input_run || coordinator->delta_observer_build
-        || out_worker->delta_observer_build)
+        || coordinator->delta_observer_prepare
+        || out_worker->delta_observer_build
+        || out_worker->delta_observer_prepare)
         return EBUSY;
 
     /* #1661: the worker registry is heap-only, and this is the one registry
@@ -4225,6 +4234,11 @@ col_worker_session_destroy(wl_col_session_t *worker)
     int build_rc;
     do {
         build_rc = wl_columnar_eval_delta_observer_build_discard(worker);
+    } while (build_rc == EAGAIN);
+    if (build_rc != 0)
+        return build_rc;
+    do {
+        build_rc = wl_columnar_eval_delta_observer_prepare_discard(worker);
     } while (build_rc == EAGAIN);
     if (build_rc != 0)
         return build_rc;
@@ -5350,7 +5364,8 @@ col_session_step_impl(wl_session_t *session)
         return EBUSY;
     if (!sess->plain_step_completion_pending)
         sess->plain_step_completion_step_context = false;
-    if (sess->delta_publish_active || sess->cleanup_active
+    if (sess->delta_publish_active || sess->delta_observer_prepare
+        || sess->delta_observer_build || sess->cleanup_active
         || wl_columnar_eval_delta_rollback_active(sess)
         || wl_columnar_eval_delta_observer_active(sess))
         return EBUSY;

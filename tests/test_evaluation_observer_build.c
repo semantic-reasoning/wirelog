@@ -11,6 +11,17 @@ extern void (*wl_columnar_relation_test_before_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, uint64_t);
 extern void (*wl_columnar_relation_test_after_reader_cas)(
     wl_evaluation_control_t *, wl_columnar_source_access_gate_t *, bool);
+extern bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
+extern void (*wl_columnar_eval_delta_test_after_prepare_commit)(
+    wl_evaluation_control_t *);
+static bool prepare_commit_cutoff_seen;
+static void cutoff_after_prepare_commit(wl_evaluation_control_t *c)
+{
+    prepare_commit_cutoff_seen = true;
+    wl_columnar_eval_delta_test_after_prepare_commit = NULL;
+    assert(wl_evaluation_control_charge(c, 1)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+}
 
 static int owner;
 static unsigned events;
@@ -490,6 +501,171 @@ static void partial_cleanup(void)
     wl_columnar_memory_governor_ref_release(s.memory_governor);
     assert(!col_rel_destroy_checked(r));
 }
+static void resumable_prepare(void)
+{
+    wl_plan_relation_t head = { .name = "head" };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    col_rel_t *r = col_rel_new_auto("head", 1);
+    assert(r);
+    int64_t initial = 7;
+    assert(!col_rel_append_row(r, &initial));
+    col_rel_t *rels[] = { r };
+    wl_col_session_t s = { .plan = &plan, .rels = rels, .nrels = 1,
+                           .delta_cb = delta };
+    wl_columnar_memory_reservation_init(&s.delta_observer_retirement_metadata);
+    assert(!wl_columnar_eval_delta_observer_begin(&s, UINT64_MAX));
+    r->nrows = 0;
+    events = 0; total = 0;
+    assert(!wl_columnar_eval_delta_observer_prepare_start(&s));
+    assert(wl_columnar_eval_delta_observer_prepare(&s) == EBUSY);
+    assert(wl_columnar_eval_delta_observer_begin(&s, UINT64_MAX) == EBUSY);
+    wl_col_session_t worker = { 0 };
+    assert(col_worker_session_create(&s, 0, NULL, 0, &worker) == EBUSY);
+    wl_evaluation_control_t *c = control(1);
+    bool ready = false;
+    uint64_t stale_id = wl_evaluation_control_active_attempt_id(c);
+    unsigned calls = 0, stopped = 0;
+    prepare_commit_cutoff_seen = false;
+    wl_columnar_eval_delta_test_after_prepare_commit =
+        cutoff_after_prepare_commit;
+    while (!ready) {
+        int rc = wl_columnar_eval_delta_observer_prepare_advance(&s, c,
+                wl_evaluation_control_active_attempt_id(c), &ready);
+        assert(++calls < 1000);
+        if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+            stopped++;
+            if (prepare_commit_cutoff_seen) {
+                assert(!ready && s.delta_observer_prepare);
+                wl_columnar_eval_delta_observer_publish(&s);
+                assert(!events);
+            }
+            (void)wl_evaluation_control_finish(c, &owner, 0, 0);
+            assert(!wl_evaluation_control_reset(c));
+            assert(!wl_evaluation_control_begin(c, &owner));
+            assert(wl_columnar_eval_delta_observer_prepare_advance(&s, c,
+                stale_id, &ready) == EINVAL);
+        } else assert(rc == EAGAIN || (!rc && ready));
+        assert(!events);
+    }
+    assert(stopped > 1 && prepare_commit_cutoff_seen
+        && !s.delta_observer_prepare);
+    close_control(c);
+    wl_columnar_eval_delta_observer_publish(&s);
+    assert(events == 1 && total == 7);
+    assert(!wl_columnar_eval_delta_observer_discard(&s));
+    session_rel_free_hash(&s);
+    assert(!col_rel_destroy_checked(r));
+}
+
+static void resumable_prepare_discard_reader(void)
+{
+    wl_plan_relation_t head = { .name = "head" };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    col_rel_t *r = col_rel_new_auto("head", 1);
+    assert(r);
+    int64_t initial = 9;
+    assert(!col_rel_append_row(r, &initial));
+    col_rel_t *rels[] = { r };
+    wl_col_session_t s = { .plan = &plan, .rels = rels, .nrels = 1 };
+    wl_columnar_memory_reservation_init(&s.delta_observer_retirement_metadata);
+    assert(!wl_columnar_eval_delta_observer_begin(&s, UINT64_MAX));
+    assert(!wl_columnar_eval_delta_observer_prepare_start(&s));
+    wl_evaluation_control_t *c = control(0);
+    bool ready = false;
+    unsigned calls = 0;
+    while (!atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed)) {
+        assert(wl_columnar_eval_delta_observer_prepare_advance(&s, c,
+            wl_evaluation_control_active_attempt_id(c), &ready) == EAGAIN);
+        assert(!ready && ++calls < 100);
+    }
+    close_control(c);
+    int rc;
+    do {
+        rc = wl_columnar_eval_delta_observer_prepare_discard(&s);
+    } while (rc == EAGAIN);
+    assert(!rc && !s.delta_observer_prepare);
+    assert(!atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed));
+    assert(!wl_columnar_eval_delta_observer_discard(&s));
+    session_rel_free_hash(&s);
+    assert(!col_rel_destroy_checked(r));
+}
+
+static void resumable_prepare_allocation_failure_is_sticky(void)
+{
+    wl_plan_relation_t head = { .name = "head" };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    col_rel_t *r = col_rel_new_auto("head", 1);
+    assert(r);
+    int64_t initial = 5;
+    assert(!col_rel_append_row(r, &initial));
+    col_rel_t *rels[] = { r };
+    wl_col_session_t s = { .plan = &plan, .rels = rels, .nrels = 1,
+                           .delta_cb = delta };
+    wl_columnar_memory_reservation_init(&s.delta_observer_retirement_metadata);
+    assert(!wl_columnar_eval_delta_observer_begin(&s, UINT64_MAX));
+    assert(!wl_columnar_eval_delta_observer_prepare_start(&s));
+    wl_evaluation_control_t *c = control(0);
+    wl_columnar_eval_delta_test_fail_prepare_current_alloc = true;
+    bool ready = false;
+    int rc = EAGAIN;
+    unsigned calls = 0;
+    while (rc == EAGAIN) {
+        rc = wl_columnar_eval_delta_observer_prepare_advance(&s, c,
+                wl_evaluation_control_active_attempt_id(c), &ready);
+        assert(++calls < 1000);
+    }
+    assert(rc == ENOMEM && !ready
+        && !wl_columnar_eval_delta_test_fail_prepare_current_alloc
+        && atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed));
+    assert(wl_columnar_eval_delta_observer_prepare_advance(&s, c,
+        wl_evaluation_control_active_attempt_id(c), &ready) == ENOMEM);
+    assert(!ready);
+    close_control(c);
+    do {
+        rc = wl_columnar_eval_delta_observer_prepare_discard(&s);
+    } while (rc == EAGAIN);
+    assert(!rc && !atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed));
+    assert(!wl_columnar_eval_delta_observer_discard(&s));
+    session_rel_free_hash(&s);
+    assert(!col_rel_destroy_checked(r));
+}
+
+static void session_destroy_drains_live_prepare(void)
+{
+    wl_plan_relation_t head = { .name = "head" };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    wl_session_t *handle = NULL;
+    assert(!wl_session_create(wl_backend_columnar(), &plan, 1, &handle));
+    assert(handle);
+    wl_col_session_t *sess = (wl_col_session_t *)handle;
+    col_rel_t *r = col_rel_new_auto("head", 1);
+    assert(r);
+    int64_t row = 11;
+    assert(!col_rel_append_row(r, &row));
+    assert(!session_add_rel(sess, r));
+    assert(!wl_columnar_eval_delta_observer_begin(sess, UINT64_MAX));
+    assert(!wl_columnar_eval_delta_observer_prepare_start(sess));
+    wl_evaluation_control_t *c = control(0);
+    bool ready = false;
+    unsigned calls = 0;
+    while (!atomic_load_explicit(&r->descriptor_access.state,
+        memory_order_relaxed)) {
+        assert(wl_columnar_eval_delta_observer_prepare_advance(sess, c,
+            wl_evaluation_control_active_attempt_id(c), &ready) == EAGAIN);
+        assert(!ready && ++calls < 100);
+    }
+    close_control(c);
+    wl_session_destroy(handle);
+}
+
 int main(void)
 {
     reader_steps(); build(false); build(true);
@@ -497,6 +673,10 @@ int main(void)
     large_reverse_input_is_bounded(); unsupported();
     all_empty_supported_head(); malformed_plan_members();
     replaced_names_are_rejected();
+    resumable_prepare();
+    resumable_prepare_discard_reader();
+    resumable_prepare_allocation_failure_is_sticky();
+    session_destroy_drains_live_prepare();
     duplicate_heads_do_not_double_reserve(); partial_cleanup();
     puts("observer stepped construction PASS");
     return 0;

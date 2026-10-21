@@ -1952,6 +1952,8 @@ typedef struct wl_columnar_eval_delta_rollback wl_columnar_eval_delta_rollback_t
 typedef struct wl_columnar_eval_delta_observer wl_columnar_eval_delta_observer_t;
 typedef struct wl_columnar_eval_delta_observer_build
     wl_columnar_eval_delta_observer_build_t;
+typedef struct wl_columnar_eval_delta_observer_prepare
+    wl_columnar_eval_delta_observer_prepare_t;
 
 typedef enum {
     WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE = 0,
@@ -2399,6 +2401,7 @@ typedef struct wl_col_session_t {
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;
     wl_columnar_eval_delta_observer_build_t *delta_observer_build;
+    wl_columnar_eval_delta_observer_prepare_t *delta_observer_prepare;
     uint64_t delta_observer_reserved_bytes;
     /* Keep metadata credit alive after the observer allocation is freed if
      * its checked retirement refuses. A later serialized cleanup retries it. */
@@ -2666,6 +2669,10 @@ int wl_columnar_eval_delta_observer_build_start(wl_col_session_t *, uint64_t);
 int wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, bool *ready);
 int wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *);
+int wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *);
+int wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, bool *ready);
+int wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *);
 int
 wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess,
     uint64_t mask);
