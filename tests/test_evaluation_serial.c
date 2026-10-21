@@ -4292,16 +4292,26 @@ test_entry_authority(void)
 }
 
 static void
-test_entry_unsupported_generated(void)
+test_entry_generated_lftj(void)
 {
     static const char source[] =
         ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
         ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
-    entry_fixture_t f; entry_init(&f, source, entry_rows, 4, 1, 0);
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
     bool lftj = false;
-    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+    bool map = false, consolidate = false;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i) {
         lftj |= f.relation->ops[i].op == WL_PLAN_OP_LFTJ;
-    CHECK(lftj);
+        map |= f.relation->ops[i].op == WL_PLAN_OP_MAP;
+        consolidate |= f.relation->ops[i].op == WL_PLAN_OP_CONSOLIDATE;
+    }
+    CHECK(lftj && map && consolidate);
     uint64_t before = wl_columnar_memory_reserved(
         wl_columnar_memory_governor_ref_get(f.session->memory_governor));
     CHECK(!entry_turn(&f, false, 0));
@@ -4324,11 +4334,365 @@ test_entry_unsupported_generated(void)
         && f.previous.previous_funding == pending_funding
         && f.previous.previous_funding_id == pending_funding_id);
     entry_complete(&f);
-    CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed
-        && !session_rel_hash_lookup(f.session, "output")
-        && before == wl_columnar_memory_reserved(
-            wl_columnar_memory_governor_ref_get(f.session->memory_governor)));
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    col_rel_t *output = session_find_rel(f.session, "output");
+    CHECK(output && output->ncols == 1 && output->nrows == 3);
+    CHECK(col_rel_get(output, 0, 0) == 1
+        && col_rel_get(output, 1, 0) == 2
+        && col_rel_get(output, 2, 0) == 3);
     entry_destroy(&f);
+
+    entry_fixture_t measured;
+    entry_init_inputs(&measured, source, inputs, 3, 0);
+    entry_complete(&measured);
+    entry_finish_original(&measured);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(measured.operation, &report)
+        && report.consumed > 1);
+    uint64_t limit = report.consumed - 1;
+    uint64_t exact_limit = report.consumed;
+    entry_destroy(&measured);
+
+    entry_fixture_t exact;
+    entry_init_inputs(&exact, source, inputs, 3, exact_limit);
+    entry_complete(&exact);
+    CHECK(!exact.reply.execution_result && exact.reply.committed);
+    entry_destroy(&exact);
+
+    entry_fixture_t stopped;
+    entry_init_inputs(&stopped, source, inputs, 3, limit);
+    col_rel_t **rels_before = stopped.session->rels;
+    uint32_t nrels_before = stopped.session->nrels;
+    uint64_t reserved_before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(stopped.session->memory_governor));
+    entry_complete(&stopped);
+    CHECK(stopped.reply.execution_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT && !stopped.reply.committed
+        && !session_rel_hash_lookup(stopped.session, "output")
+        && stopped.session->rels == rels_before
+        && stopped.session->nrels == nrels_before
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            stopped.session->memory_governor)) == reserved_before);
+    entry_retry_after_stop(&stopped, source, inputs, 3);
+    entry_destroy(&stopped);
+}
+
+static void
+test_entry_generated_lftj_float_nonleading_duplicate_keys(void)
+{
+    static const char source[] =
+        ".decl input(k:float, x:int64)\n"
+        ".decl a(y:int64, k:float)\n"
+        ".decl b(z:int64, k:float)\n"
+        ".decl output(k:float, x:int64, y:int64, z:int64)\n"
+        "output(k,x,y,z) :- input(k,x), a(y,k), b(z,k).\n";
+    const int64_t input_rows[] = {
+        (int64_t)0x4004000000000000, 10,
+        (int64_t)0x3ff0000000000000, 11,
+        (int64_t)0x4004000000000000, 12,
+        (int64_t)0xc008000000000000, 13
+    };
+    const int64_t a_rows[] = {
+        20, (int64_t)0x4004000000000000,
+        21, (int64_t)0x3ff0000000000000,
+        22, (int64_t)0x4004000000000000,
+        23, (int64_t)0xc008000000000000
+    };
+    const int64_t b_rows[] = {
+        30, (int64_t)0x4004000000000000,
+        31, (int64_t)0x3ff0000000000000,
+        32, (int64_t)0x4004000000000000,
+        33, (int64_t)0xc008000000000000
+    };
+    const entry_input_t inputs[] = {
+        {"input", input_rows, 4, 2},
+        {"a", a_rows, 4, 2},
+        {"b", b_rows, 4, 2}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    const wl_plan_op_lftj_t *metadata = NULL;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_LFTJ)
+            metadata = f.relation->ops[i].opaque_data;
+    CHECK(metadata && metadata->k == 3
+        && metadata->key_cols[0] == 0
+        && metadata->key_cols[1] == 1
+        && metadata->key_cols[2] == 1);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(output && output->nrows == 10);
+    static const int64_t expected[][4] = {
+        {(int64_t)0xc008000000000000, 13, 23, 33},
+        {0x3ff0000000000000, 11, 21, 31},
+        {0x4004000000000000, 10, 20, 30},
+        {0x4004000000000000, 10, 20, 32},
+        {0x4004000000000000, 10, 22, 30},
+        {0x4004000000000000, 10, 22, 32},
+        {0x4004000000000000, 12, 20, 30},
+        {0x4004000000000000, 12, 20, 32},
+        {0x4004000000000000, 12, 22, 30},
+        {0x4004000000000000, 12, 22, 32}
+    };
+    bool seen[sizeof(expected) / sizeof(expected[0])] = {false};
+    CHECK(output->ncols == 4);
+    for (uint32_t row = 0; row < output->nrows; ++row) {
+        bool found = false;
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+            if (output->columns[0][row] == expected[i][0]
+                && output->columns[1][row] == expected[i][1]
+                && output->columns[2][row] == expected[i][2]
+                && output->columns[3][row] == expected[i][3]) {
+                CHECK(!seen[i]);
+                seen[i] = true;
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+    }
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i)
+        CHECK(seen[i]);
+    entry_compare_inputs(&f, source, inputs, 3);
+    entry_finish_original(&f);
+    entry_destroy(&f);
+}
+
+static void
+test_entry_generated_lftj_widest_output_row(void)
+{
+    enum { INPUT_COUNT = 8, INPUT_WIDTH = 8, OUTPUT_WIDTH = 64 };
+    char source[8192] = {0};
+    size_t used = 0;
+    int n = 0;
+    for (uint32_t r = 0; r < INPUT_COUNT; ++r) {
+        n = snprintf(source + used, sizeof(source) - used,
+                ".decl r%u(k:int64", r);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+        for (uint32_t c = 1; c < INPUT_WIDTH; ++c) {
+            n = snprintf(source + used, sizeof(source) - used,
+                    ",v%u_%u:int64", r, c);
+            CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+            used += (size_t)n;
+        }
+        n = snprintf(source + used, sizeof(source) - used, ")\n");
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, ".decl output(");
+    CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+    used += (size_t)n;
+    for (uint32_t c = 0; c < OUTPUT_WIDTH; ++c) {
+        n = snprintf(source + used, sizeof(source) - used, "%so%u:int64",
+                c ? "," : "", c);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, ")\noutput(");
+    CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+    used += (size_t)n;
+    for (uint32_t r = 0; r < INPUT_COUNT; ++r) {
+        for (uint32_t c = 0; c < INPUT_WIDTH; ++c) {
+            n = snprintf(source + used, sizeof(source) - used, "%s%s",
+                    r || c ? "," : "", c ? "v" : "k");
+            CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+            used += (size_t)n;
+            if (c) {
+                n = snprintf(source + used, sizeof(source) - used, "%u_%u",
+                        r, c);
+                CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+                used += (size_t)n;
+            }
+        }
+    }
+    n = snprintf(source + used, sizeof(source) - used, ") :- ");
+    CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+    used += (size_t)n;
+    for (uint32_t r = 0; r < INPUT_COUNT; ++r) {
+        n = snprintf(source + used, sizeof(source) - used, "%sr%u(k",
+                r ? "," : "", r);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+        for (uint32_t c = 1; c < INPUT_WIDTH; ++c) {
+            n = snprintf(source + used, sizeof(source) - used, ",v%u_%u",
+                    r, c);
+            CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+            used += (size_t)n;
+        }
+        n = snprintf(source + used, sizeof(source) - used, ")%s",
+                r + 1u == INPUT_COUNT ? ".\n" : "");
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+    }
+
+    char names[INPUT_COUNT][8];
+    int64_t rows[INPUT_COUNT][INPUT_WIDTH];
+    entry_input_t inputs[INPUT_COUNT];
+    for (uint32_t r = 0; r < INPUT_COUNT; ++r) {
+        n = snprintf(names[r], sizeof(names[r]), "r%u", r);
+        CHECK(n > 0 && (size_t)n < sizeof(names[r]));
+        rows[r][0] = 7;
+        for (uint32_t c = 1; c < INPUT_WIDTH; ++c)
+            rows[r][c] = 100 * (int64_t)r + c;
+        inputs[r] = (entry_input_t){names[r], rows[r], 1, INPUT_WIDTH};
+    }
+
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, INPUT_COUNT, 0);
+    const wl_plan_op_lftj_t *metadata = NULL;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        if (f.relation->ops[i].op == WL_PLAN_OP_LFTJ)
+            metadata = f.relation->ops[i].opaque_data;
+    CHECK(metadata && metadata->k == INPUT_COUNT);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(output && output->nrows == 1 && output->ncols == OUTPUT_WIDTH);
+    for (uint32_t r = 0; r < INPUT_COUNT; ++r) {
+        CHECK(output->columns[r * INPUT_WIDTH][0] == 7);
+        for (uint32_t c = 1; c < INPUT_WIDTH; ++c)
+            CHECK(output->columns[r * INPUT_WIDTH + c][0]
+                == 100 * (int64_t)r + c);
+    }
+    entry_destroy(&f);
+}
+
+static bool
+entry_lftj_phase_reached(entry_fixture_t *f,
+    wl_columnar_lftj_attempt_phase_t target,
+    wl_columnar_lftj_join_phase_t join_target)
+{
+    for (unsigned turns = 0; f->reply.kind !=
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL; ++turns) {
+        CHECK(turns < 200000);
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(f);
+        if (ctx && ctx->child.lftj.identity == &ctx->child.lftj
+            && ctx->child.lftj.phase == target
+            && (target != WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
+            || ctx->child.lftj.join_phase == join_target))
+            return true;
+        (void)entry_turn(f, false, 0);
+    }
+    return false;
+}
+
+static uint64_t
+entry_lftj_phase_minimum_limit(const char *source,
+    const entry_input_t *inputs, uint32_t input_count,
+    wl_columnar_lftj_attempt_phase_t target,
+    wl_columnar_lftj_join_phase_t join_target)
+{
+    entry_fixture_t baseline;
+    entry_init_inputs(&baseline, source, inputs, input_count, 0);
+    entry_complete(&baseline);
+    CHECK(!baseline.reply.execution_result && baseline.reply.committed);
+    entry_finish_original(&baseline);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(baseline.operation, &report)
+        && report.consumed > 0);
+    uint64_t low = 1, high = report.consumed;
+    entry_destroy(&baseline);
+
+    while (low < high) {
+        uint64_t middle = low + (high - low) / 2u;
+        entry_fixture_t trial;
+        entry_init_inputs(&trial, source, inputs, input_count, middle);
+        bool reached = entry_lftj_phase_reached(&trial, target, join_target);
+        entry_complete(&trial);
+        CHECK(trial.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            || (!trial.reply.execution_result && trial.reply.committed));
+        entry_finish_original(&trial);
+        entry_destroy(&trial);
+        if (reached) high = middle;
+        else low = middle + 1u;
+    }
+    return low;
+}
+
+static void
+entry_assert_lftj_inputs_unchanged(entry_fixture_t *f,
+    const entry_input_t *inputs, uint32_t input_count)
+{
+    for (uint32_t i = 0; i < input_count; ++i) {
+        const col_rel_t *rel = session_find_rel(f->session, inputs[i].name);
+        CHECK(rel && rel->nrows == inputs[i].count
+            && rel->ncols == inputs[i].width);
+        for (uint32_t r = 0; r < inputs[i].count; ++r)
+            for (uint32_t c = 0; c < inputs[i].width; ++c)
+                CHECK(rel->columns[c][r]
+                    == inputs[i].rows[(size_t)r * inputs[i].width + c]);
+    }
+}
+
+static void
+test_entry_generated_lftj_stops_inside_child(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    const struct {
+        wl_columnar_lftj_attempt_phase_t phase;
+        wl_columnar_lftj_join_phase_t join_phase;
+        bool cancel;
+    } targets[] = {
+        {WL_COLUMNAR_LFTJ_ATTEMPT_COPY, WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK,
+         false},
+        {WL_COLUMNAR_LFTJ_ATTEMPT_SORT, WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK,
+         false},
+        {WL_COLUMNAR_LFTJ_ATTEMPT_JOIN,
+         WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT, false},
+        {WL_COLUMNAR_LFTJ_ATTEMPT_SORT, WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK,
+         true}
+    };
+
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+        int expected_result = targets[i].cancel
+            ? WL_EVALUATION_CONTROL_CANCELLED
+            : WL_EVALUATION_CONTROL_WORK_LIMIT;
+        uint64_t limit = targets[i].cancel ? 0
+            : entry_lftj_phase_minimum_limit(source, inputs, 3,
+                targets[i].phase, targets[i].join_phase);
+        entry_fixture_t stopped;
+        entry_init_inputs(&stopped, source, inputs, 3, limit);
+        col_rel_t **old_rels = stopped.session->rels;
+        uint32_t old_nrels = stopped.session->nrels;
+        uint32_t old_arr_count = stopped.session->arr_count;
+        col_arr_entry_t *old_arr_entries = stopped.session->arr_entries;
+        uint64_t reserved = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(
+                stopped.session->memory_governor));
+        CHECK(entry_lftj_phase_reached(&stopped, targets[i].phase,
+            targets[i].join_phase));
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&stopped);
+        CHECK(ctx);
+        if (targets[i].cancel)
+            wl_evaluation_control_request_cancel(stopped.operation);
+        for (unsigned turns = 0; !ctx->child.lftj.semantic_result; ++turns) {
+            CHECK(turns < 100);
+            (void)entry_turn(&stopped, false, 0);
+        }
+        CHECK(ctx->child.lftj.semantic_result == expected_result);
+        entry_complete(&stopped);
+        CHECK(stopped.reply.execution_result == expected_result
+            && !stopped.reply.committed
+            && !session_rel_hash_lookup(stopped.session, "output")
+            && stopped.session->rels == old_rels
+            && stopped.session->nrels == old_nrels
+            && stopped.session->arr_count == old_arr_count
+            && stopped.session->arr_entries == old_arr_entries
+            && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                stopped.session->memory_governor)) == reserved);
+        entry_assert_lftj_inputs_unchanged(&stopped, inputs, 3);
+        entry_retry_after_stop(&stopped, source, inputs, 3);
+        entry_destroy(&stopped);
+    }
 }
 
 static const char entry_filter_large[] =
@@ -4528,7 +4892,10 @@ main(void)
     test_entry_bootstrap_failures();
     test_entry_refuses_join_batch_knob();
     test_entry_retained_publication(); test_entry_reverse();
-    test_entry_authority(); test_entry_unsupported_generated();
+    test_entry_authority(); test_entry_generated_lftj();
+    test_entry_generated_lftj_float_nonleading_duplicate_keys();
+    test_entry_generated_lftj_widest_output_row();
+    test_entry_generated_lftj_stops_inside_child();
     test_entry_generated_filter_work_boundary();
 
     test_shapes(); test_generated_union(); test_refusal_and_identity();

@@ -23,6 +23,7 @@
 #include "columnar/mem_ledger.h"
 #include "columnar/source_access.h"
 #include "columnar/memory_governor.h"
+#include "columnar/lftj.h"
 #include "columnar/spill.h"
 #include "columnar/continuation.h"
 #include "columnar/kfusion_adaptive.h"
@@ -5987,6 +5988,7 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE,
@@ -6009,6 +6011,82 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
 } wl_columnar_eval_plan_numeric_phase_t;
+
+/* Resumable ordinary LFTJ child owned by a composed numeric attempt.  The
+ * input and merge cursors are explicit so no framed host action copies or
+ * sorts an entire relation.  LFTJ reads named relations and pushes one result;
+ * it does not consume runtime stack entries. */
+#define WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS 64u
+typedef enum {
+    WL_COLUMNAR_LFTJ_ATTEMPT_INERT,
+    WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC,
+    WL_COLUMNAR_LFTJ_ATTEMPT_COPY,
+    WL_COLUMNAR_LFTJ_ATTEMPT_SORT,
+    WL_COLUMNAR_LFTJ_ATTEMPT_JOIN,
+    WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_CREATE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN,
+    WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_FILL,
+    WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_END,
+    WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_DONE
+} wl_columnar_lftj_attempt_phase_t;
+
+typedef enum {
+    WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK,
+    WL_COLUMNAR_LFTJ_JOIN_INITIAL_MAX,
+    WL_COLUMNAR_LFTJ_JOIN_SEEK_START,
+    WL_COLUMNAR_LFTJ_JOIN_SEEK_SEARCH,
+    WL_COLUMNAR_LFTJ_JOIN_RANGE_START,
+    WL_COLUMNAR_LFTJ_JOIN_RANGE_SEARCH,
+    WL_COLUMNAR_LFTJ_JOIN_PRODUCT_START,
+    WL_COLUMNAR_LFTJ_JOIN_PRODUCT_COUNT,
+    WL_COLUMNAR_LFTJ_JOIN_PRODUCT_EMIT,
+    WL_COLUMNAR_LFTJ_JOIN_PRODUCT_ADVANCE,
+    WL_COLUMNAR_LFTJ_JOIN_ADVANCE_KEY
+} wl_columnar_lftj_join_phase_t;
+
+typedef struct {
+    col_rel_t *relation;
+    wl_columnar_source_access_reader_t reader;
+    uint32_t nrows, ncols, key_col;
+    wirelog_column_type_t key_type;
+    int64_t *rows, *scratch;
+    uint64_t copy_cell;
+    uint32_t position, range_lo, range_hi, product_index;
+    uint32_t sort_width, sort_run, sort_mid, sort_end;
+    uint32_t sort_left, sort_right, sort_dest;
+    uint32_t sort_source_row, sort_source_col;
+    bool sort_copying, sort_take_left;
+} wl_columnar_lftj_input_attempt_t;
+
+typedef struct wl_columnar_lftj_attempt {
+    struct wl_columnar_lftj_attempt *identity;
+    const wl_plan_op_lftj_t *metadata;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    const void *numeric_owner;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_lftj_attempt_phase_t phase;
+    int semantic_result;
+    wl_columnar_lftj_input_attempt_t *inputs;
+    uint32_t input_count, cursor, total_columns;
+    uint32_t binary_offset[WL_LFTJ_MAX_K];
+    int64_t output_types[WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS];
+    int64_t *row;
+    uint64_t scratch_bytes, output_rows, output_written;
+    wl_columnar_memory_reservation_t scratch_reservation;
+    bool scratch_reserved, scratch_committed, output_pass;
+    col_rel_t *output;
+    col_rel_append_batch_t writer;
+    int64_t key, max_key;
+    wl_columnar_lftj_join_phase_t join_phase;
+    uint32_t join_index, seek_lo, seek_hi, seek_mid;
+    uint32_t range_index, product_depth, fill_input, fill_col;
+    int64_t fill_key;
+    bool writer_active, output_owned, registered;
+} wl_columnar_lftj_attempt_t;
 
 typedef struct wl_columnar_eval_plan_numeric_attempt {
     struct wl_columnar_eval_plan_numeric_attempt *identity;
@@ -6044,6 +6122,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     /* Appended composition state; original record address and prefix retained. */
     uint32_t preflight_depth, runtime_depth;
     bool composed_mode;
+    wl_columnar_lftj_attempt_t lftj;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
 typedef struct {
@@ -6196,6 +6275,13 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
+int wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *,
+    wl_col_session_t *);
+int wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *,
+    const wl_plan_op_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, wl_evaluation_control_t *, uint64_t, const void *);
+int wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *, bool *);
+int wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *, bool *);
 int wl_columnar_eval_plan_numeric_composed_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
