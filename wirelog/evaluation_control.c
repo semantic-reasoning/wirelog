@@ -214,13 +214,10 @@ wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
 }
 #endif
 
-int
-wl_evaluation_control_charge(wl_evaluation_control_t *control,
+static int
+wl_evaluation_control_charge_locked(wl_evaluation_control_t *control,
     uint64_t work)
 {
-    if (!control)
-        return EINVAL;
-    wl_mutex_lock(&control->mutex);
     int rc = 0;
     if (!control->active) {
         rc = EINVAL;
@@ -242,6 +239,30 @@ wl_evaluation_control_charge(wl_evaluation_control_t *control,
     } else {
         control->consumed += work;
     }
+    return rc;
+}
+
+int
+wl_evaluation_control_charge(wl_evaluation_control_t *control,
+    uint64_t work)
+{
+    if (!control)
+        return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = wl_evaluation_control_charge_locked(control, work);
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+
+int
+wl_evaluation_control_charge_attempt(wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id, uint64_t work)
+{
+    if (!control || !expected_attempt_id)
+        return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = control->active && control->attempt_id == expected_attempt_id
+        ? wl_evaluation_control_charge_locked(control, work) : EINVAL;
     wl_mutex_unlock(&control->mutex);
     return rc;
 }

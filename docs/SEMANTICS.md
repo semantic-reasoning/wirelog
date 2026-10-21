@@ -1018,7 +1018,21 @@ slice admits one native INT64 equality key and at most 64 output lanes. Hashing
 reads only that fixed eight-byte key; each chain candidate comparison and
 chain advance is a separate charged action. `cursor_get` reports only the
 last acknowledged producer position; peeked rows and speculative traversal
-do not advance it.
+do not advance it. The opt-in runner requires an already-built current right
+arrangement; a missing or stale arrangement is rejected without construction
+or rebuild. Start synchronously acquires source-reader leases and admits the
+fixed-capacity private result, so only `advance` is covered by its work
+allowance. An advance with zero allowance is a true no-op. If the allowance is
+too small for its next indivisible action, it returns resumable progress with
+`required_work` and changes no traversal or output state. Each accepted action
+is charged before execution and cannot exceed the call's allowance. The runner
+copies complete lanes and timestamp records under the same attempt, then
+validates the pending generation before publishing the private row count and
+acknowledging exactly once. A final saved-attempt and input-generation poll
+immediately before transfer is the completion linearization point. Only DONE
+transfers the relation; insufficient fixed output capacity is sticky `ENOSPC`.
+Ordinary plan dispatch and STEP remain unchanged, and arrangement construction
+and other JOIN families remain follow-on work.
 
 An ordinary controlled JOIN evaluates a supported numeric `right_filter_expr`
 over each present right row before key construction and output work. A failed

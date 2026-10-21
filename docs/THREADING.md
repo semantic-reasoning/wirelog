@@ -1490,7 +1490,7 @@ The test-only inactive generator seed does not publish an active ID.
 | `evaluation_control.c:wl_evaluation_control_release#2` | references | `atomic_fetch_add_explicit` | acquire | Last release acquires preceding release sequence before destruction |
 | `evaluation_control.c:wl_evaluation_control_reset` | cancelled | `atomic_exchange_explicit` | relaxed | Quiescent reset serialized with requests by atomic modification order |
 | `evaluation_control.c:wl_evaluation_control_request_cancel` | cancelled | `atomic_exchange_explicit` | relaxed | Sticky request, no payload or session lock dependency |
-| `evaluation_control.c:wl_evaluation_control_charge` | cancelled | `atomic_fetch_add_explicit` | relaxed | Poll using Interlocked-compatible atomic read; mutex protects resulting stop state |
+| `evaluation_control.c:wl_evaluation_control_charge_locked` | cancelled | `atomic_fetch_add_explicit` | relaxed | Shared locked charge path polls using Interlocked-compatible atomic read; attempt-scoped callers validate identity before mutation |
 | `evaluation_control.c:wl_evaluation_control_begin` | active_attempt_id | `atomic_exchange_explicit` | release | Publish identity after complete active initialization |
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id` | active_attempt_id | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked read preserves full unsigned identity |
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id#2` | active_attempt_id | `atomic_load_explicit` | acquire | C11 observation of active identity without mutex or attempt pin |
@@ -1710,11 +1710,23 @@ synchronize nothing, and tests read them after the operator call returns.
 
 The prepared producer-only col_join_batch_control_* API is confined to the
 native thread that binds it. Bind retains the active control and saved attempt
-ID, and one step/peek/ack call must finish before another begins. The producer
-claim blocks raw continuation publication for its lifetime; discard is the
-cleanup path for the lease and scratch. This does not make the existing JOIN
-caller or output sink cooperative: end-to-end caller control and publication
-remain follow-on integration.
+ID, and one step/peek/ack call must finish before another begins. The prepared
+runner owns that producer exclusively: raw publish and direct control calls
+are rejected while runner mode is active. Start requires a current prebuilt
+right arrangement, acquires and retains source-reader leases for both input
+storage owners, pins that exact arrangement, then synchronously admits the
+caller-sized private output. That bounded-by-capacity setup is outside the
+advance work allowance; no input scan or arrangement build occurs in start.
+Advance with zero allowance is a true no-op. An undersized positive allowance
+returns nonterminal progress and `required_work` without changing its cursor;
+every indivisible charged action fits within the allowance. Rows and complete
+timestamp records are copied only to private output. A fully copied batch is
+validated and ACKed once in a no-fail section. Before DONE transfers output,
+the runner polls the saved attempt and revalidates both source snapshots and
+the arrangement; this is the transfer linearization point. Discard destroys
+partial private output and releases both readers, arrangement lease and all
+reservations exactly once. This still does not change ordinary JOIN dispatch
+or make the existing general-purpose caller and sink cooperative.
 
 The controlled JOIN start and shared step/acknowledgement protocol serialize
 access to the original embedded operator context. The live context, left/right

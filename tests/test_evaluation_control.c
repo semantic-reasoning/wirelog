@@ -202,6 +202,38 @@ active_identity(void)
     wl_evaluation_control_release(c);
 }
 
+static void
+attempt_scoped_charge(void)
+{
+    int owner;
+    wl_evaluation_control_t *c;
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_create(100, &c) == 0);
+    CHECK(wl_evaluation_control_attach(c, &owner) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    uint64_t first = wl_evaluation_control_active_attempt_id(c);
+    CHECK(first != 0);
+    CHECK(wl_evaluation_control_charge_attempt(c, first + 1, 7) == EINVAL);
+    CHECK(wl_evaluation_control_charge_attempt(c, first, 7) == 0);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    uint64_t second = wl_evaluation_control_active_attempt_id(c);
+    CHECK(second != first);
+    CHECK(wl_evaluation_control_charge_attempt(c, first, 9) == EINVAL);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == second && report.consumed == 0);
+    CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    uint64_t third = wl_evaluation_control_active_attempt_id(c);
+    CHECK(third == second + 1);
+    CHECK(wl_evaluation_control_charge_attempt(c, third, 11) == 0);
+    CHECK(wl_evaluation_control_finish(c, &owner, 0, 0) == 0);
+    CHECK(wl_evaluation_control_report(c, &report) == 0);
+    CHECK(report.attempt_id == third && report.consumed == 11);
+    CHECK(wl_evaluation_control_detach(c, &owner) == 0);
+    wl_evaluation_control_release(c);
+}
+
 typedef struct {
     wl_mutex_t mutex;
     wl_cond_t changed;
@@ -308,6 +340,7 @@ main(void)
     boundaries();
     limits_and_errors();
     active_identity();
+    attempt_scoped_charge();
     cross_thread_cancel();
     shared_allowance();
     puts("evaluation_control: OK");
