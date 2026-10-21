@@ -1440,6 +1440,7 @@ wl_columnar_expr_result_producer(uint8_t op, uint32_t index, uint32_t *depth,
     case WL_PLAN_EXPR_BOOL:
         break;
     case WL_PLAN_EXPR_ARITH_BNOT:
+    case WL_PLAN_EXPR_ARITH_HASH:
         if (*depth) --*depth;
         break;
     default:
@@ -1508,6 +1509,7 @@ wl_columnar_expr_result_type(const expr_instr_t *instructions,
         case WL_PLAN_EXPR_ARITH_BNOT:
         case WL_PLAN_EXPR_ARITH_CRC32_ETH:
         case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+        case WL_PLAN_EXPR_ARITH_HASH:
             break;
         default:
             return false;
@@ -2107,6 +2109,7 @@ wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
     case WL_PLAN_EXPR_CMP_FLOAT_GT: case WL_PLAN_EXPR_CMP_FLOAT_GTE:
     case WL_PLAN_EXPR_ARITH_CRC32_ETH:
     case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+    case WL_PLAN_EXPR_ARITH_HASH:
     case WL_PLAN_EXPR_AGG_COUNT: case WL_PLAN_EXPR_AGG_SUM:
     case WL_PLAN_EXPR_AGG_MIN: case WL_PLAN_EXPR_AGG_MAX:
         break;
@@ -2408,7 +2411,15 @@ wl_columnar_expr_result_type_attempt_controlled(
  * pop/native copy, charge8 before initialization, eight repetitions of
  * charge17 plus eight bit steps and a guarded checkpoint, then final8. It
  * reads exactly sizeof(int64_t) bytes and polls between bytes; no symbol
- * lookup or input-sized fallback is admitted.
+ * lookup or input-sized fallback is admitted. Native HASH is one separate
+ * fixed 8-byte XXH3 lane: charge192 before pop/read/hash. In pinned xxHash
+ * 0.8.4, XXH3_64bits with len==8 follows XXH3_64bits_internal,
+ * XXH3_len_0to16_64b and XXH3_len_4to8_64b on every platform: two 4-byte
+ * loads, fixed secret loads, one 64x64 mix and fixed avalanche. It has no
+ * input-dependent loop, allocation, CPU-specific long-input dispatch or
+ * platform-specific variable traversal. The entry, precharge, pop/copy,
+ * fixed hash call, result push and guarded post-hash tail fit the 192-unit
+ * logical region. No HASH_S lookup or fallback is admitted.
  * STEP pays pre-ROW/refused-ROW caller work; admitted ROW pays its actual
  * lane and remaining step/eval continuation once. Initial invalid/first
  * refused read-only bootstrap <=28 can execute at consumed0. Only top and
@@ -2424,6 +2435,7 @@ enum {
     WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK = 224,
     WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK = 160,
     WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK = 96,
+    WL_COLUMNAR_EXPR_ATTEMPT_HASH_WORK = 192,
     WL_COLUMNAR_EXPR_ATTEMPT_STEP_PHASE = 20,
     WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_PHASE = 21,
     WL_COLUMNAR_EXPR_ATTEMPT_FINAL_PHASE = 22,
@@ -2435,7 +2447,8 @@ typedef char wl_columnar_expr_attempt_eval_tariffs_fit_quantum[
         && WL_COLUMNAR_EXPR_ATTEMPT_STEP_WORK <= WL_EVALUATION_CONTROL_QUANTUM
         && WL_COLUMNAR_EXPR_ATTEMPT_ROW_READ_WORK <=
         WL_EVALUATION_CONTROL_QUANTUM
-        && WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK <= WL_EVALUATION_CONTROL_QUANTUM)
+        && WL_COLUMNAR_EXPR_ATTEMPT_FINAL_WORK <= WL_EVALUATION_CONTROL_QUANTUM
+        && WL_COLUMNAR_EXPR_ATTEMPT_HASH_WORK <= WL_EVALUATION_CONTROL_QUANTUM)
     ? 1 : -1];
 typedef char wl_columnar_expr_attempt_eval_regions_fit_tariffs[
         (UINT64_C(64) <= WL_COLUMNAR_EXPR_ATTEMPT_EVAL_ENTRY_WORK
@@ -2526,6 +2539,20 @@ wl_columnar_expr_attempt_numeric_step(expr_stack_t *stack,
                 false);
         if (rc) return rc;
         expr_push(stack, result);
+    } else if (in->op == WL_PLAN_EXPR_ARITH_HASH) {
+        /* XXH3's fixed eight-byte path is noninterruptible; reserve its full
+         * source tariff before touching the operand or calling the library. */
+        rc = wl_columnar_expr_attempt_charge(control, attempt_id,
+                WL_COLUMNAR_EXPR_ATTEMPT_HASH_WORK);
+        if (rc) return rc;
+        int64_t operand = expr_pop(stack);
+        uint8_t native[sizeof(operand)];
+        memcpy(native, &operand, sizeof(native));
+        XXH64_hash_t hash = XXH3_64bits(native, sizeof(native));
+        rc = wl_columnar_expr_attempt_eval_tail(control, attempt_id, 27, 1,
+                false);
+        if (rc) return rc;
+        expr_push(stack, (int64_t)hash);
     } else if (in->op == WL_PLAN_EXPR_ARITH_BNOT) {
         int64_t a = expr_pop(stack); expr_push(stack, ~a);
     } else if (in->op == WL_PLAN_EXPR_AGG_COUNT ||
