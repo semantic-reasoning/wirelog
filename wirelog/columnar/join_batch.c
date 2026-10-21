@@ -410,7 +410,7 @@ col_join_batch_producer_create(wl_col_session_t *sess,
 {
     col_join_batch_producer_t *p;
     const col_rel_t *right;
-    wl_columnar_continuation_producer_t producer;
+    wl_columnar_continuation_producer_t producer = { 0 };
     wl_columnar_continuation_cursor_t initial;
     uint64_t row_bytes = 0;
     uint64_t descriptor_bytes = 0;
