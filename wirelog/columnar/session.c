@@ -5869,14 +5869,17 @@ col_controlled_step_target_exists(const wl_col_session_t *sess,
     return false;
 }
 
+/* Reject whole-session and recursive routes before opening an operation
+ * attempt.  This checks only immutable plan shape and session admission state;
+ * relation/operator validation and all evaluation work remain charged below. */
 static int
-col_controlled_step_preflight(wl_col_session_t *sess,
-    wl_columnar_controlled_step_t *step)
+col_controlled_step_static_preflight(wl_col_session_t *sess)
 {
     const wl_plan_t *plan = sess->plan;
-    wl_evaluation_control_t *control = sess->base.evaluation_control;
-    uint64_t id = step->operation_id;
-    if (!plan || !plan->strata || !control || !id || sess->delta_cb
+    if (sess->cleanup_active || sess->cleanup_pending)
+        return EBUSY;
+    if (!plan || !plan->strata || !sess->base.evaluation_control
+        || sess->delta_cb
         || sess->delta_observer || sess->current_iteration
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
@@ -5893,6 +5896,22 @@ col_controlled_step_preflight(wl_col_session_t *sess,
         if (stratum->is_recursive
             || (stratum->relation_count && !stratum->relations))
             return ENOTSUP;
+    }
+    return 0;
+}
+
+static int
+col_controlled_step_preflight(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    const wl_plan_t *plan = sess->plan;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint64_t id = step->operation_id;
+    if (wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+
+    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+        const wl_plan_stratum_t *stratum = &plan->strata[si];
         for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
             int rc = wl_evaluation_control_charge(control, 1);
             if (rc) return rc;
@@ -5954,7 +5973,8 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
     /* The relation host and nested framed transition each admit bounded
      * protocol work. Four fixed host quanta cover their finite call chain;
      * evaluator work uses the independent session operation control. */
-    int rc = wl_evaluation_control_create(4 * 384, &grant);
+    int rc = wl_evaluation_control_create(UINT64_C(4) * UINT64_C(384),
+            &grant);
     if (rc) return EAGAIN;
     rc = wl_evaluation_control_attach(grant, step);
     if (!rc) rc = wl_evaluation_control_begin(grant, step);
@@ -6230,7 +6250,12 @@ col_controlled_step_drive(wl_col_session_t *sess,
 static int
 col_controlled_step(wl_col_session_t *sess)
 {
-    if (!sess->controlled_step) {
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || (!step->operation_active && !step->complete)) {
+        int rc = col_controlled_step_static_preflight(sess);
+        if (rc) return rc;
+    }
+    if (!step) {
         sess->controlled_step = calloc(1, sizeof(*sess->controlled_step));
         if (!sess->controlled_step) return ENOMEM;
         /* The host identity persists while control attempt IDs may change. */
@@ -6273,6 +6298,8 @@ col_session_controlled_step_state(const wl_session_t *session)
 {
     const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (sess->cleanup_active || sess->cleanup_pending)
+        return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
     if (step->complete) return WL_CONTROLLED_STEP_COMPLETE;
     return step->refused ? WL_CONTROLLED_STEP_IDLE
