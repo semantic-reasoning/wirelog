@@ -3862,9 +3862,57 @@ complete final refunds. `session_options` covers bounded v2/v3 prefix reads,
 invalid configurations and unsupported legacy backend rejection.
 
 Remaining #1372 work: public opt-in API; intern/compound lifetime
-pins; continuation/batch payload integration for #1373; direct-column and
+pins; queue scheduling/integration for #1373; direct-column and
 arrangement/index consumer audits; supported relation/trace transitions; actual
 mixed resident/cold indexed execution under pressure. Retained index chains,
 session state and unavoidable scratch must be included in that execution's
 resident floor. This foundation does not close #1372 or qualify bounded DOOP
 (#1385), and it does not make unsupported materializing paths bounded.
+
+
+### Owned numeric batch payloads (#1372, partial)
+
+`columnar/batch_payload.h` captures the first N rows of a scalar relation as an
+immutable owned resident or spilled payload. Callers explicitly choose storage;
+this does not activate automatic eviction. Capture holds the relation source
+reader (descriptor and canonical owner) through schema validation and copying.
+It retains no relation, session, callback or producer scratch pointers. Missing
+physical types mean INT64; missing timestamps mean iteration/stratum/worker zero
+and multiplicity +1. Numeric lane bits, types and signed metadata are preserved.
+STRING, compounds, graph layouts and nullary relations are rejected. Encoding an
+intern ID or pointer as an integer does not make it a supported numeric value.
+
+Both modes expose schema, row count and stable ordinal reads. Readers pin their
+payload; release returns BUSY while a reader exists. Lifecycle operations remain
+externally serialized; independent acquired readers may read concurrently.
+Retiring a session store leaves already acquired spilled readers valid, but new
+spilled reader acquisition returns CLOSED. Resident readers remain acquirable.
+Caller-owned handles must be released explicitly. The final payload owns enough
+governor lifetime to refund every allocation after its storage is freed.
+
+`wl_columnar_batch_payload_floor` reports the payload descriptor, copied schema,
+resident rows (when selected), and reader descriptor. Spilled capture additionally
+requires the store and spill segment/writer floor; acquired spilled readers add
+the spill reader floor. The source relation, sink context and stack, governor,
+allocator overhead and OS resources remain additional costs. Retaining many
+small spilled batches still retains one metadata descriptor per batch. Spilled
+capture rejects a store governed by a different admission governor.
+
+`wl_columnar_join_batch_payload_sink_init` connects the existing relation-backed
+continuation contract to this representation. Reserve privately captures the
+batch; commit publishes one owned payload, and take transfers ownership. Abort
+releases only the private stage. An untaken committed payload rejects another
+publication without cursor advancement; cleanup releases untaken output. Detailed
+spill status remains available in the sink context even when the continuation
+returns a broader publication error. Existing FILTER/MAP and relation sinks keep
+their relation-backed payload convention.
+
+The real JOIN producer test alternates resident and spilled captures, retains
+old results while scratch is reused, destroys the producer and its fixture, and
+then checks each output row exactly once. It covers abort/retry, ambiguous commit,
+blocked overwrite and untaken-output cleanup. Payload tests cover numeric bits,
+signed metadata, partial cancellation, quota and allocation/admission failure,
+reader pins, concurrent reads during retirement, and session teardown. This is
+mixed batch storage evidence, not full mixed relation/index evaluation or a
+working-set pressure completion claim. Reference-bearing pins, automatic policy,
+public configuration and bounded relation/index consumers remain outstanding.

@@ -69,6 +69,10 @@ wl_columnar_spill_status_t wl_columnar_spill_store_close(
  * retirement, remain externally serialized. Numeric handles retain no session,
  * callback context, intern table or compound arena. */
 void wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store);
+/* Live-store identity check for adapters sharing admission with the store. */
+bool wl_columnar_spill_store_uses_governor(
+    const wl_columnar_spill_store_t *store,
+    const wl_columnar_memory_governor_ref_t *governor);
 uint64_t wl_columnar_spill_store_bytes(const wl_columnar_spill_store_t *store);
 
 /* Scalar schemas only: logical and physical column types are identical.
