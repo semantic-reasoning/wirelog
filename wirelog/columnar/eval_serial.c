@@ -139,15 +139,23 @@ int
 wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
-    uint64_t id, wl_evaluation_control_t *funding, uint64_t funding_id)
+    uint64_t id, uint64_t operation_identity,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!frame || !session || !plan || !plan->name || !plan->ops
-        || !plan->op_count || !control || !id) return EINVAL;
+        || !plan->op_count || !control || !id || !operation_identity)
+        return EINVAL;
     if (plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
         return ENOTSUP;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     int rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
     if (rc) return rc;
+    rc = wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
+            &ctx->cleanup_receipt_key);
+    if (rc) return rc;
+    if (ctx->cleanup_receipt_key.operation_attempt_id != id
+        || ctx->cleanup_receipt_key.operation_id != operation_identity)
+        return EINVAL;
     rc = wl_columnar_eval_stack_framed_fresh(frame, ctx);
     if (rc) return rc;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, control);
@@ -171,7 +179,8 @@ wl_columnar_eval_serial_framed_attempt_begin(
     /* The entire frame, including the embedded child, was already zeroed
      * before publication by the original frame allocator. */
     ctx->frame = frame; ctx->session = session; ctx->plan = plan;
-    ctx->control = control; ctx->attempt_id = id; ctx->pin_owned = true;
+    ctx->control = control; ctx->attempt_id = id;
+    ctx->operation_identity = operation_identity; ctx->pin_owned = true;
 #if defined(WL_HAVE_C11_THREADS)
     ctx->owner_thread = thrd_current();
 #elif defined(_WIN32) || defined(_WIN64)
@@ -718,16 +727,29 @@ wl_columnar_eval_serial_framed_attempt_close(
     if (rc) return rc;
     wl_evaluation_control_t *control = ctx->control;
     wl_columnar_eval_stack_cleanup_frame_t *frame = ctx->frame;
+    rc = wl_columnar_eval_stack_cleanup_receipt_prepare(frame,
+            &ctx->cleanup_receipt_key, ctx->primary_result, ctx->committed);
+    if (rc) return rc;
+    void *identity = ctx->identity;
+    bool pin_owned = ctx->pin_owned;
+    bool thread_valid = ctx->thread_valid;
+    wl_columnar_eval_serial_framed_phase_t phase = ctx->phase;
     *result = ctx->primary_result; *committed = ctx->committed;
     ctx->identity = NULL; ctx->control = NULL; ctx->pin_owned = false;
     ctx->thread_valid = false;
     ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
+    wl_columnar_eval_cleanup_outcome_t outcome
+        = WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE;
+    rc = wl_columnar_eval_stack_cleanup_finish_receipted(&frame,
+            &ctx->cleanup_receipt_key, &outcome);
+    if (outcome == WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_RETAINED_ACTIVE) {
+        ctx->identity = identity; ctx->control = control;
+        ctx->pin_owned = pin_owned; ctx->thread_valid = thread_valid;
+        ctx->phase = phase;
+        return rc;
+    }
     wl_evaluation_control_release(control);
-    /* Every entry and resource was drained before ACK. This known-empty
-     * close retains the existing mandatory physical/credit/ref invariant. */
-    rc = wl_columnar_eval_stack_cleanup_finish(&frame);
-    if (rc) abort();
-    return 0;
+    return rc;
 }
 
 /* Distributed (TDD) stratum evaluation is implemented in columnar/eval.c. */
@@ -976,8 +998,10 @@ wl_columnar_eval_serial_framed_bootstrap(const wl_plan_relation_t *rp,
         if (rc) return rc;
     }
     wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
-    int rc = wl_columnar_eval_stack_cleanup_begin_attempt_controlled(sess,
-            &frame, request->operation, request->operation_id);
+    wl_columnar_eval_cleanup_receipt_key_t receipt_key = {0};
+    int rc = wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+        sess, &frame, request->operation, request->operation_id,
+        request->operation_identity, &receipt_key);
     if (rc) return rc;
     /* The allocator return is not a poll. Split its actual final publication
      * tail from parent prevalidation with the original saved-ID checkpoint. */
@@ -987,13 +1011,17 @@ wl_columnar_eval_serial_framed_bootstrap(const wl_plan_relation_t *rp,
     if (!rc) rc = wl_columnar_eval_stack_framed_context(frame, sess, &ctx);
     if (!rc) rc = wl_columnar_eval_serial_framed_attempt_begin(frame, sess, rp,
                 request->operation, request->operation_id,
+                request->operation_identity,
                 request->funding, request->funding_id);
     if (ctx && ctx->identity == ctx) {
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+        request->reply->cleanup_receipt_key = receipt_key;
         return rc;
     }
     /* Only this invocation's genuinely fresh, never-activated frame. Every
      * entry/continuation remains inert; final physical/credit/ref is mandatory. */
+    if (wl_columnar_eval_stack_cleanup_receipt_cancel_begin(frame,
+        &receipt_key)) abort();
     if (wl_columnar_eval_stack_cleanup_finish(&frame)) abort();
     return rc;
 }
@@ -1033,6 +1061,8 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
         request->reply->execution_result = EINVAL;
         request->reply->committed = false;
+        memset(&request->reply->cleanup_receipt_key, 0,
+            sizeof(request->reply->cleanup_receipt_key));
         request->reply->status.phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT;
         request->reply->status.execution_result = 0;
         request->reply->status.cleanup_result = 0;
@@ -1045,7 +1075,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         if (!request->reply) return EINVAL;
         wl_columnar_eval_serial_framed_host_reply_t *reply = request->reply;
         if (request->operation != sess->base.evaluation_control
-            || !request->operation_id
+            || !request->operation_id || !request->operation_identity
             || (request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
             && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS))
             return EINVAL;
@@ -1062,7 +1092,10 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 sess->cleanup_active)) return EBUSY;
             if (ctx->plan != rp || ctx->session != sess
                 || ctx->control != request->operation
-                || ctx->attempt_id != request->operation_id) return EINVAL;
+                || ctx->attempt_id != request->operation_id
+                || ctx->operation_identity != request->operation_identity)
+                return EINVAL;
+            reply->cleanup_receipt_key = ctx->cleanup_receipt_key;
             /* Original may be stopped or turned over: its authenticated old
              * parent still owns cleanup. No fresh absence lookup is allowed. */
             if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {

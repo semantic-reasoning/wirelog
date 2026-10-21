@@ -3056,6 +3056,16 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         wl_columnar_memory_governor_ref_release(memory_governor);
         return ENOMEM;
     }
+    int receipt_generation_rc
+        = wl_columnar_eval_stack_cleanup_receipt_session_generation_new(
+            &sess->cleanup_receipt_session_generation);
+    if (receipt_generation_rc) {
+        free(sess);
+        wl_columnar_memory_governor_ref_release(memory_governor);
+        return receipt_generation_rc;
+    }
+    sess->cleanup_receipt_next_id = 1;
+    sess->cleanup_receipt_next_plan_epoch = 1;
     sess->memory_governor = memory_governor;
     wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     wl_columnar_memory_reservation_init(&sess->rels_reservation);
@@ -3734,6 +3744,7 @@ col_session_destroy(wl_session_t *session)
             stderr);
         abort();
     }
+    memset(sess->cleanup_receipts, 0, sizeof(sess->cleanup_receipts));
     /* Issue #1435: differential arrangements hold registry-entry leases and
      * row links into relation positions.  Reject teardown while any lease or
      * replacement transaction is still active, before any relation storage is
@@ -3898,6 +3909,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
         || out_worker->delta_observer_prepare)
         return EBUSY;
 
+    uint64_t receipt_session_generation = 0;
+    int receipt_generation_rc
+        = wl_columnar_eval_stack_cleanup_receipt_session_generation_new(
+            &receipt_session_generation);
+    if (receipt_generation_rc) return receipt_generation_rc;
+
     /* #1661: the worker registry is heap-only, and this is the one registry
      * population path that does not go through session_add_rel -- so it also
      * skips the pool->heap and arena->heap promotions that let an entry
@@ -3928,6 +3945,12 @@ col_worker_session_create(wl_col_session_t *coordinator,
     /* Step 1: Bitwise copy — copies all value fields (frontiers,
      * counters, booleans, plan pointer, frontier_ops). */
     wl_columnar_session_copy_without_ledger(out_worker, coordinator);
+    out_worker->cleanup_receipt_session_generation =
+        receipt_session_generation;
+    out_worker->cleanup_receipt_next_id = 1;
+    out_worker->cleanup_receipt_next_plan_epoch = 1;
+    memset(out_worker->cleanup_receipts, 0,
+        sizeof(out_worker->cleanup_receipts));
     out_worker->owns_spill_store = false; /* Borrow, including failure cleanup. */
     out_worker->delta_observer_build = NULL;
     /* Independent authority exists before any failure cleanup. The worker
@@ -4249,6 +4272,7 @@ col_worker_session_destroy(wl_col_session_t *worker)
         cleanup_rc = wl_columnar_eval_delta_observer_discard(worker);
     if (cleanup_rc != 0)
         return cleanup_rc;
+    memset(worker->cleanup_receipts, 0, sizeof(worker->cleanup_receipts));
     worker->teardown_started = true;
     wl_columnar_delta_events_clear(worker);
     if (worker->filt_cache_active_pins != 0)

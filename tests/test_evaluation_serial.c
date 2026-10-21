@@ -35,8 +35,9 @@ typedef struct {
     wl_col_session_t session;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
     wl_columnar_eval_serial_framed_attempt_t *ctx;
+    wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     wl_evaluation_control_t *operation;
-    uint64_t id;
+    uint64_t id, operation_identity;
     int owner, protocol;
     grant_t grants[2];
     unsigned next, calls, witnesses;
@@ -155,6 +156,7 @@ fixture_init(fixture_t *f, uint32_t width, uint32_t rows, bool floating,
     f->operation = control_new(limit, &f->owner);
     CHECK(!wl_evaluation_control_begin(f->operation, &f->owner));
     f->id = wl_evaluation_control_active_attempt_id(f->operation);
+    f->operation_identity = f->id + 1000;
     for (unsigned i = 0; i < 2; ++i)
         f->grants[i].control = control_new(0, &f->grants[i].owner);
     f->inputs[0] = source_new("a", width, rows, floating, 0);
@@ -173,7 +175,9 @@ fixture_init(fixture_t *f, uint32_t width, uint32_t rows, bool floating,
             wl_columnar_memory_governor_ref_create(&resolution);
         CHECK(f->session.memory_governor);
     }
-    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &f->frame));
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            &f->session, &f->frame, NULL, f->id, f->operation_identity,
+            &f->receipt_key));
     CHECK(!wl_columnar_eval_stack_framed_context(f->frame, &f->session,
         &f->ctx));
 }
@@ -182,7 +186,8 @@ static int
 host_begin(fixture_t *f, const wl_plan_relation_t *plan, grant_t *grant)
 {
     int rc = wl_columnar_eval_serial_framed_attempt_begin(f->frame,
-            &f->session, plan, f->operation, f->id, grant->control, grant->id);
+            &f->session, plan, f->operation, f->id, f->operation_identity,
+            grant->control, grant->id);
     grant->finish_status = wl_evaluation_control_finish(grant->control,
             &grant->owner, 0, 0);
     return rc;
@@ -232,6 +237,13 @@ close_frame(fixture_t *f)
     int result = EINVAL; bool committed = true;
     CHECK(!host_close(f, grant, &result, &committed));
     CHECK(!grant->finish_status && !committed);
+    wl_columnar_eval_cleanup_receipt_t receipt;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&f->session,
+        &f->receipt_key, &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+        && receipt.result == result && receipt.committed == committed);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(&f->session,
+        &f->receipt_key));
     f->ctx = NULL; f->frame = NULL;
     CHECK(!f->session.cleanup_active && !f->session.cleanup_active_count
         && !f->session.cleanup_reserved_bytes && !f->session.cleanup_pending);
@@ -582,7 +594,9 @@ test_growth_quota_and_retry(void)
     CHECK(f.inputs[0]->nrows == COL_REL_INIT_CAP + 1 &&
         f.inputs[0]->columns[0][0] == COL_REL_INIT_CAP &&
         f.inputs[0]->columns[0][COL_REL_INIT_CAP] == 0);
-    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f.session, &f.frame));
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            &f.session, &f.frame, NULL, f.id, f.operation_identity,
+            &f.receipt_key));
     CHECK(!wl_columnar_eval_stack_framed_context(f.frame, &f.session, &f.ctx));
     begin(&f, &plan); run(&f);
     CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY);
@@ -617,6 +631,8 @@ test_bootstrap_limits(void)
             CHECK(close_frame(&f) == WL_EVALUATION_CONTROL_WORK_LIMIT);
         } else {
             CHECK(!f.ctx->identity && !f.ctx->pin_owned);
+            CHECK(!wl_columnar_eval_stack_cleanup_receipt_cancel_begin(
+                    f.frame, &f.receipt_key));
             CHECK(!wl_columnar_eval_stack_cleanup_finish(&f.frame));
             f.ctx = NULL;
         }
@@ -627,6 +643,34 @@ test_bootstrap_limits(void)
         CHECK(report.consumed == consumed[i]);
         fixture_destroy(&f);
     }
+}
+
+static void
+test_cleanup_receipt_attempt_identity(void)
+{
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a",
+         .delta_mode = WL_DELTA_FORCE_FULL},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t plan = {.name = "output", .ops = ops, .op_count = 2};
+    fixture_t f;
+    fixture_init(&f, 1, 2, false, false, 0);
+    grant_t *grant = grant_begin(&f, 0);
+    CHECK(wl_columnar_eval_serial_framed_attempt_begin(f.frame, &f.session,
+        &plan, f.operation, f.id + 1, f.operation_identity, grant->control,
+        grant->id) == EINVAL);
+    CHECK(wl_columnar_eval_serial_framed_attempt_begin(f.frame, &f.session,
+        &plan, f.operation, f.id, f.operation_identity + 1,
+        grant->control, grant->id) == EINVAL);
+    grant->finish_status = wl_evaluation_control_finish(grant->control,
+            &grant->owner, 0, 0);
+    CHECK(!grant->finish_status && f.frame && !f.ctx->identity);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_cancel_begin(f.frame,
+        &f.receipt_key));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f.frame));
+    f.ctx = NULL;
+    fixture_destroy(&f);
 }
 
 /* Publication fixtures own real heap arrays and actual RESERVED credits.
@@ -1177,7 +1221,7 @@ typedef struct {
     const wl_plan_stratum_t *stratum;
     wl_evaluation_control_t *operation;
     wl_columnar_memory_governor_ref_t *governor;
-    uint64_t id;
+    uint64_t id, operation_identity;
     grant_t grants[3];
     wl_columnar_eval_serial_framed_host_request_t previous;
     wl_columnar_eval_serial_framed_host_reply_t reply;
@@ -1248,6 +1292,7 @@ entry_init_inputs(entry_fixture_t *f, const char *source,
     CHECK(!wl_evaluation_control_begin(f->operation,
         base->operation_admission));
     f->id = wl_evaluation_control_active_attempt_id(f->operation);
+    f->operation_identity = f->id + 1000;
     for (unsigned i = 0; i < 3; ++i)
         f->grants[i].control = control_new(0, &f->grants[i].owner);
 }
@@ -1327,6 +1372,7 @@ entry_turn(entry_fixture_t *f, bool status, uint64_t limit)
     wl_columnar_eval_serial_framed_host_request_t request = f->previous;
     request.funding = grant->control; request.funding_id = grant->id;
     request.operation = f->operation; request.operation_id = f->id;
+    request.operation_identity = f->operation_identity;
     request.action = status ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
         : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
     request.reply = &f->reply;
@@ -1386,6 +1432,14 @@ entry_complete(entry_fixture_t *f)
     }
     CHECK(!f->session->cleanup_active && !f->session->cleanup_pending
         && !f->session->cleanup_reserved_bytes);
+    if (f->reply.cleanup_receipt_key.receipt_id) {
+        wl_columnar_eval_cleanup_receipt_t receipt;
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(f->session,
+            &f->reply.cleanup_receipt_key, &receipt));
+        CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED);
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(f->session,
+            &f->reply.cleanup_receipt_key));
+    }
 }
 
 static void
@@ -2910,6 +2964,7 @@ test_entry_refuses_join_batch_knob(void)
     wl_columnar_eval_serial_framed_host_request_t request = f.previous;
     request.funding = grant->control; request.funding_id = grant->id;
     request.operation = f.operation; request.operation_id = f.id;
+    request.operation_identity = f.operation_identity;
     request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
     request.reply = &f.reply;
     CHECK(entry_host(&f, &request, grant) == ENOTSUP);
@@ -2979,6 +3034,118 @@ test_entry_receipts(void)
     entry_complete(&f);
     CHECK(f.reply.committed && !f.reply.execution_result);
     entry_compare(&f, entry_simple, entry_rows, 4, 1); entry_destroy(&f);
+}
+
+static void
+test_cleanup_receipt_transfer_retry(void)
+{
+    wl_col_session_t session = {0};
+    wl_mem_ledger_init(&session.mem_ledger, 0);
+    wl_columnar_eval_stack_cleanup_frame_t *frame1 = NULL, *frame2 = NULL;
+    wl_columnar_eval_cleanup_receipt_key_t key1, key2;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            &session, &frame1, NULL, 17, 99, &key1));
+    col_rel_t *relation1 = source_new("held1", 1, 2, false, 0);
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(frame1),
+        relation1, true));
+    wl_columnar_source_access_reader_t reader1 = {0};
+    CHECK(!col_rel_source_reader_acquire(relation1, &reader1));
+    CHECK(!wl_columnar_eval_stack_cleanup_begin_receipted_attempt_controlled(
+            &session, &frame2, NULL, 18, 100, &key2));
+    col_rel_t *relation2 = source_new("held2", 1, 2, false, 0);
+    CHECK(!eval_stack_push(wl_columnar_eval_stack_cleanup_stack(frame2),
+        relation2, true));
+    wl_columnar_source_access_reader_t reader2 = {0};
+    CHECK(!col_rel_source_reader_acquire(relation2, &reader2));
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame2) == EBUSY && frame2);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(frame2, &key2, 8,
+        false));
+    wl_columnar_eval_cleanup_outcome_t outcome;
+    CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frame2, &key2,
+        &outcome) == EBUSY && !frame2
+        && outcome == WL_COLUMNAR_EVAL_CLEANUP_OUTCOME_TRANSFERRED_TO_PENDING
+        && session.cleanup_pending_count == 1);
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&frame1) == EBUSY && frame1);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_prepare(frame1, &key1, 7,
+        true));
+    CHECK(wl_columnar_eval_stack_cleanup_finish_receipted(&frame1, &key1,
+        &outcome) == EBUSY && !frame1 && session.cleanup_pending_count == 2);
+    wl_columnar_eval_cleanup_receipt_t receipt;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&session, &key1,
+        &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED
+        && receipt.result == 7 && receipt.committed
+        && receipt.cleanup_result == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_ack(&session, &key1) == EBUSY);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_retry(&session, &key1)
+        == EBUSY && session.cleanup_pending_count == 2);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&session, &key1,
+        &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED
+        && receipt.cleanup_result == EBUSY);
+    CHECK(!col_rel_source_reader_release(&reader1));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_retry(&session, &key1)
+        && session.cleanup_pending_count == 1);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&session, &key1,
+        &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+        && !receipt.cleanup_result && receipt.result == 7 && receipt.committed);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&session, &key2,
+        &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED
+        && receipt.result == 8 && !receipt.committed);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(&session, &key1));
+    CHECK(!col_rel_source_reader_release(&reader2));
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_retry(&session, &key2)
+        && !session.cleanup_pending && !session.cleanup_pending_count);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_read(&session, &key2,
+        &receipt));
+    CHECK(receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+        && receipt.result == 8 && !receipt.committed);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_ack(&session, &key2));
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_read(&session, &key2,
+        &receipt) == ENOENT);
+    wl_col_session_t other_session = {0};
+    wl_columnar_eval_cleanup_receipt_key_t other_key;
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(&other_session,
+        17, 99, &other_key));
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_read(&other_session, &key1,
+        &receipt) == ENOENT);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_read(&session, &other_key,
+        &receipt) == ENOENT);
+    CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(&other_session,
+        &other_key));
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    wl_columnar_eval_cleanup_receipt_key_t keys[
+        WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES];
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i)
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_reserve(&session, 17,
+            99, &keys[i]));
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_reserve(&session, 17, 99,
+        &key) == ENOBUFS);
+    for (unsigned i = 0; i < WL_COLUMNAR_EVAL_STACK_CLEANUP_MAX_FRAMES; ++i)
+        CHECK(!wl_columnar_eval_stack_cleanup_receipt_release(&session,
+            &keys[i]));
+    session.cleanup_receipt_next_id = UINT64_MAX;
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_reserve(&session, 17, 99,
+        &key) == EOVERFLOW && key.receipt_id == 0);
+    session.cleanup_receipt_next_id = 101;
+    session.cleanup_receipt_next_plan_epoch = UINT64_MAX;
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_reserve(&session, 17, 99,
+        &key) == EOVERFLOW && key.receipt_id == 0);
+    session.cleanup_receipt_next_plan_epoch = 101;
+}
+
+static void
+test_cleanup_receipt_generation_overflow(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    wl_col_session_t session = {0};
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    wl_columnar_eval_stack_test_receipt_next_session_generation(UINT64_MAX);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_reserve(&session, 17, 99,
+        &key) == EOVERFLOW);
+#endif
 }
 
 static void
@@ -3734,6 +3901,7 @@ entry_request(entry_fixture_t *f, grant_t *grant)
     wl_columnar_eval_serial_framed_host_request_t request = f->previous;
     request.funding = grant->control; request.funding_id = grant->id;
     request.operation = f->operation; request.operation_id = f->id;
+    request.operation_identity = f->operation_identity;
     request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
     request.reply = &f->reply;
     return request;
@@ -4040,7 +4208,8 @@ main(void)
     test_entry_generated_right_filter_large();
     test_entry_generated_right_filter_collisions_and_stop();
     test_entry_generated_right_filter_product_work_boundary();
-    test_entry_receipts(); test_entry_bootstrap_failures();
+    test_entry_receipts(); test_cleanup_receipt_transfer_retry();
+    test_entry_bootstrap_failures();
     test_entry_refuses_join_batch_knob();
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_unsupported_generated();
@@ -4049,8 +4218,10 @@ main(void)
     test_shapes(); test_generated_union(); test_refusal_and_identity();
     test_failures(); test_retained_and_consume_refusal();
     test_growth_quota_and_retry(); test_bootstrap_limits();
+    test_cleanup_receipt_attempt_identity();
     test_publication_shapes(); test_publication_reverse();
     test_publication_failures();
+    test_cleanup_receipt_generation_overflow();
     puts("evaluation_serial: real result bridge, publication and drain passed");
     return 0;
 }
