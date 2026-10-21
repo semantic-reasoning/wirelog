@@ -1276,6 +1276,35 @@ knob is set) turns a fallback into an `ENOTSUP` failure, which is the
 explicit bounded-mode result for unsupported shapes.  Differential keyed
 joins have the separate producer described below.
 
+The internal col_join_batch_control_* interface can bind an already prepared
+ordinary JOIN continuation to one active evaluation-control attempt. Binding
+retains that control, saves its attempt ID, claims the continuation's producer,
+and refuses generic continuation publication until the continuation is
+discarded. Step calls are serialized on the bind thread and admit at most the
+requested work units. This controlled slice admits only one native INT64
+equality key and at most 64 output lanes. Key setup and one collision-chain
+advance cost one unit; hashing costs nine units (fixed setup plus the eight
+canonical key bytes); comparing one collision candidate costs two units;
+writing a complete output row costs output_width + 1. Hashing never walks the
+collision chain: its row cursor persists across step calls, so a long collision
+bucket cannot become one unbounded operation. The checked ordinal advances
+only after successful charges. WORK_LIMIT, CANCELLED, STALE_ATTEMPT, STALE_INPUT,
+and execution errors are sticky and retain the exact execution errno where
+applicable.
+
+The controlled producer never grows its scratch: its batch row ceiling is the
+smaller of the prepared rows-per-batch and the already admitted scratch
+capacity. Each ready batch contains complete private rows. Repeated peek
+returns the same relation and generation; only acknowledgement of that exact
+generation advances the producer-local acknowledged cursor. `cursor_get`
+reports that acknowledged cursor while bound; speculative scan progress and
+peek do not change it. Generic cancellation after bind is sticky before the
+arrangement lease is released. Discard releases the continuation's
+arrangement pin, scratch and descriptor reservations, and retained control
+reference. This is a producer-only prerequisite: the existing ordinary JOIN
+caller, output sink, publication boundary and end-to-end cancellation lifecycle
+are not routed through this API yet and remain follow-on work.
+
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the
 operators after it that are row-local FILTERs or consumable SEMIJOIN and
