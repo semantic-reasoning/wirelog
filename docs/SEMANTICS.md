@@ -1323,7 +1323,9 @@ one flat INT64 column (implicit INT64 is accepted), no timestamps, and initializ
 canonical self-owned storage. All heads, seed shadows and retired shadows are
 preflighted before any reader is acquired. Unsupported schema returns ENOTSUP;
 there is no raw fallback. The host must keep the plan, registry and relation
-contents stable throughout construction and serialize all calls.
+contents stable throughout construction and serialize all calls. Plan/name
+pointers are checked for replacement across resumable phases; the host must
+also keep the plan structure and name-string contents immutable in place.
 
 Advance accepts a live control and its current nonzero attempt ID. One charged
 unit advances one persistent cursor, allocation, name byte, captured cell,

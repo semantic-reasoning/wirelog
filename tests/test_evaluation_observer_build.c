@@ -257,6 +257,132 @@ static void unsupported(void)
     assert(!wl_columnar_eval_delta_observer_build_discard(&s));
     close_control(c); assert(!col_rel_destroy_checked(r));
 }
+static void all_empty_supported_head(void)
+{
+    wl_plan_relation_t head = { .name = "head" };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+    col_rel_t *rels[] = { col_rel_new_auto("head", 1),
+                          col_rel_new_auto("$out$head", 1),
+                          col_rel_new_auto("$in$head", 1) };
+    assert(rels[0] && rels[1] && rels[2]);
+    wl_col_session_t s = { .plan = &plan, .rels = rels, .nrels = 3,
+                           .delta_cb = delta };
+    wl_columnar_memory_reservation_init(&s.delta_observer_retirement_metadata);
+    assert(!rels[0]->nrows && !rels[1]->nrows && !rels[2]->nrows);
+    assert(!wl_columnar_eval_delta_observer_build_start(&s, UINT64_MAX));
+    wl_evaluation_control_t *c = control(0);
+    bool ready = false;
+    unsigned calls = 0;
+    while (!ready) {
+        int rc = wl_columnar_eval_delta_observer_build_advance(&s, c,
+                wl_evaluation_control_active_attempt_id(c), &ready);
+        assert((rc == EAGAIN || (!rc && ready)) && ++calls < 1000);
+    }
+    assert(s.delta_observer && !s.delta_observer_build);
+    close_control(c);
+    events = 0;
+    assert(!wl_columnar_eval_delta_observer_prepare(&s));
+    assert(!events);
+    wl_columnar_eval_delta_observer_publish(&s);
+    assert(!events);
+    assert(!wl_columnar_eval_delta_observer_discard(&s));
+    session_rel_free_hash(&s);
+    for (unsigned i = 0; i < 3; i++)
+        assert(!col_rel_destroy_checked(rels[i]));
+}
+static void malformed_plan_members(void)
+{
+    for (unsigned kind = 0; kind < 3; kind++) {
+        wl_plan_relation_t relation = { .name = "head" };
+        wl_plan_stratum_t stratum = { .relations = &relation,
+                                      .relation_count = 1 };
+        wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+        wl_col_session_t s = { .plan = &plan };
+        wl_evaluation_control_t *c = control(0);
+        bool ready = false;
+        assert(!wl_columnar_eval_delta_observer_build_start(&s, 1));
+        if (kind == 0)
+            plan.strata = NULL;
+        else if (kind == 1)
+            stratum.relations = NULL;
+        else {
+            assert(wl_columnar_eval_delta_observer_build_advance(&s, c,
+                wl_evaluation_control_active_attempt_id(c), &ready) == EAGAIN);
+            relation.name = NULL;
+        }
+        assert(wl_columnar_eval_delta_observer_build_advance(&s, c,
+            wl_evaluation_control_active_attempt_id(c), &ready) == EINVAL);
+        assert(!ready && s.delta_observer_build && !s.delta_observer);
+        plan.strata = &stratum;
+        stratum.relations = &relation;
+        relation.name = "head";
+        assert(!wl_columnar_eval_delta_observer_build_discard(&s));
+        close_control(c);
+    }
+}
+static void replaced_names_are_rejected(void)
+{
+    {
+        wl_plan_relation_t head = { .name = "long-head-name" };
+        wl_plan_stratum_t stratum = { .relations = &head,
+                                      .relation_count = 1 };
+        wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+        wl_col_session_t s = { .plan = &plan };
+        wl_evaluation_control_t *c = control(0);
+        bool ready = false;
+        assert(!wl_columnar_eval_delta_observer_build_start(&s, 1));
+        assert(wl_columnar_eval_delta_observer_build_advance(&s, c,
+            wl_evaluation_control_active_attempt_id(c), &ready) == EAGAIN);
+        head.name = "x";
+        assert(wl_columnar_eval_delta_observer_build_advance(&s, c,
+            wl_evaluation_control_active_attempt_id(c), &ready) == EINVAL);
+        assert(!ready);
+        head.name = "long-head-name";
+        assert(!wl_columnar_eval_delta_observer_build_discard(&s));
+        close_control(c);
+    }
+    bool prior_replacement_rejected = false;
+    /* The continuation is intentionally opaque; exercise each short resume
+     * boundary until the prior-name bytewise comparison is active. */
+    for (unsigned cut = 0; cut < 128 && !prior_replacement_rejected; cut++) {
+        wl_plan_relation_t heads[] = { { .name = "prior" },
+                                       { .name = "current" } };
+        wl_plan_stratum_t stratum = { .relations = heads,
+                                      .relation_count = 2 };
+        wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
+        col_rel_t *rels[] = { col_rel_new_auto("prior", 1),
+                              col_rel_new_auto("current", 1) };
+        assert(rels[0] && rels[1]);
+        wl_col_session_t s = { .plan = &plan, .rels = rels, .nrels = 2 };
+        wl_evaluation_control_t *c = control(0);
+        bool ready = false, active = true;
+        assert(!wl_columnar_eval_delta_observer_build_start(&s, 1));
+        for (unsigned i = 0; i < cut; i++) {
+            int rc = wl_columnar_eval_delta_observer_build_advance(&s, c,
+                    wl_evaluation_control_active_attempt_id(c), &ready);
+            if (rc != EAGAIN) {
+                active = false;
+                break;
+            }
+        }
+        if (active && s.delta_observer_build) {
+            heads[0].name = "p";
+            int rc = wl_columnar_eval_delta_observer_build_advance(&s, c,
+                    wl_evaluation_control_active_attempt_id(c), &ready);
+            prior_replacement_rejected = rc == EINVAL;
+            heads[0].name = "prior";
+        }
+        if (s.delta_observer_build)
+            assert(!wl_columnar_eval_delta_observer_build_discard(&s));
+        else if (s.delta_observer)
+            assert(!wl_columnar_eval_delta_observer_discard(&s));
+        close_control(c);
+        for (unsigned i = 0; i < 2; i++)
+            assert(!col_rel_destroy_checked(rels[i]));
+    }
+    assert(prior_replacement_rejected);
+}
 static uint64_t baseline_reservation(unsigned head_count)
 {
     wl_plan_relation_t heads[2] = { { .name = "head" }, { .name = "head" } };
@@ -369,6 +495,8 @@ int main(void)
     reader_steps(); build(false); build(true);
     byte_order_no_change(false); byte_order_no_change(true);
     large_reverse_input_is_bounded(); unsupported();
+    all_empty_supported_head(); malformed_plan_members();
+    replaced_names_are_rejected();
     duplicate_heads_do_not_double_reserve(); partial_cleanup();
     puts("observer stepped construction PASS");
     return 0;
