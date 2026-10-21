@@ -147,8 +147,12 @@ wl_columnar_eval_serial_framed_attempt_begin(
         return EINVAL;
     if (plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
         return ENOTSUP;
+    bool abort_supported = false;
+    int rc = wl_columnar_eval_plan_numeric_composed_abort_supported(plan, 0,
+            plan->op_count, &abort_supported);
+    if (rc) return rc;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
-    int rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
+    rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
     if (rc) return rc;
     rc = wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
             &ctx->cleanup_receipt_key);
@@ -181,6 +185,7 @@ wl_columnar_eval_serial_framed_attempt_begin(
     ctx->frame = frame; ctx->session = session; ctx->plan = plan;
     ctx->control = control; ctx->attempt_id = id;
     ctx->operation_identity = operation_identity; ctx->pin_owned = true;
+    ctx->abort_supported = abort_supported;
 #if defined(WL_HAVE_C11_THREADS)
     ctx->owner_thread = thrd_current();
 #elif defined(_WIN32) || defined(_WIN64)
@@ -1052,6 +1057,162 @@ wl_columnar_eval_serial_framed_bootstrap_receipt(
     return 0;
 }
 
+static bool
+wl_columnar_eval_serial_framed_key_equal(
+    const wl_columnar_eval_cleanup_receipt_key_t *a,
+    const wl_columnar_eval_cleanup_receipt_key_t *b)
+{
+    return a->session_generation == b->session_generation
+           && a->receipt_id == b->receipt_id && a->plan_epoch == b->plan_epoch
+           && a->operation_attempt_id == b->operation_attempt_id
+           && a->operation_id == b->operation_id;
+}
+
+static int
+wl_columnar_eval_serial_framed_receipt_action(
+    wl_col_session_t *session,
+    const wl_columnar_eval_serial_framed_host_request_t *request)
+{
+    wl_columnar_eval_serial_framed_host_reply_t *reply = request->reply;
+    const wl_columnar_eval_cleanup_receipt_key_t *key = &request->receipt_key;
+    if (!key->session_generation || !key->receipt_id || !key->plan_epoch
+        || key->operation_attempt_id != request->operation_id
+        || key->operation_id != request->operation_identity)
+        return EINVAL;
+    wl_columnar_eval_cleanup_receipt_t receipt;
+    int rc = wl_columnar_eval_stack_cleanup_receipt_read(session, key,
+            &receipt);
+    if (rc) return rc;
+    if (!wl_columnar_eval_serial_framed_key_equal(key, &receipt.key))
+        return ENOENT;
+    rc = wl_columnar_eval_serial_framed_fund(request->funding,
+            request->funding_id, request->operation);
+    if (rc) return rc;
+    if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK) {
+        if (receipt.state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+            return EBUSY;
+        reply->execution_result = receipt.result;
+        reply->cleanup_result = receipt.cleanup_result;
+        reply->committed = receipt.committed;
+        reply->cleanup_receipt_key = receipt.key;
+        rc = wl_columnar_eval_stack_cleanup_receipt_ack(session, key);
+        if (!rc) reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+        return rc;
+    }
+    if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+        || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT) {
+        if (receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)
+            rc = wl_columnar_eval_stack_cleanup_receipt_retry(session, key);
+        else if (receipt.state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED)
+            return EBUSY;
+        /* A transferred receipt without its pending frame has no continuation
+         * to report. Keep ENOENT distinct from cleanup that is still pending. */
+        if (rc == ENOENT) return rc;
+        if (rc && rc != ENOENT) {
+            int read_rc = wl_columnar_eval_stack_cleanup_receipt_read(session,
+                    key, &receipt);
+            if (read_rc) return read_rc;
+            reply->execution_result = receipt.result;
+            reply->cleanup_result = receipt.cleanup_result;
+            reply->committed = receipt.committed;
+            reply->cleanup_receipt_key = receipt.key;
+            reply->kind =
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING;
+            return rc;
+        }
+        rc = wl_columnar_eval_stack_cleanup_receipt_read(session, key,
+                &receipt);
+        if (rc) return rc;
+    } else if (request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+        return EINVAL;
+    }
+    if (receipt.state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+        && receipt.state != WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_TRANSFERRED)
+        return EBUSY;
+    reply->execution_result = receipt.result;
+    reply->cleanup_result = receipt.cleanup_result;
+    reply->committed = receipt.committed;
+    reply->cleanup_receipt_key = receipt.key;
+    reply->kind = receipt.state == WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_FREED
+        ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+        : WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING;
+    return 0;
+}
+
+static int
+wl_columnar_eval_serial_framed_abort_step(
+    wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!ctx->abort_requested) {
+        if (!ctx->abort_supported) return ENOTSUP;
+        if (!ctx->primary_result)
+            ctx->primary_result = WL_EVALUATION_CONTROL_CANCELLED;
+        ctx->abort_requested = true;
+        wl_evaluation_control_request_cancel(ctx->control);
+        (void)wl_evaluation_control_charge(ctx->control, 0);
+    }
+    if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) return EBUSY;
+    if (ctx->child_bound &&
+        ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD) {
+        if (ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE)
+            return wl_columnar_eval_serial_framed_attempt_step(ctx, funding,
+                       funding_id);
+        if (ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+            return wl_columnar_eval_serial_framed_attempt_step(ctx, funding,
+                       funding_id);
+        if (!ctx->child.abort_requested) {
+            if (ctx->child.phase < WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY)
+                return wl_columnar_eval_serial_framed_attempt_step(ctx,
+                           funding, funding_id);
+            int rc = wl_columnar_eval_plan_numeric_composed_abort_request(
+                &ctx->child, funding, funding_id);
+            if (rc == EBUSY) return rc;
+            return rc;
+        }
+        return wl_columnar_eval_serial_framed_attempt_step(ctx, funding,
+                   funding_id);
+    }
+    switch (ctx->phase) {
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD:
+        if (ctx->child_bound) return EBUSY;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CLAIM;
+        return 0;
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY:
+        return wl_columnar_eval_serial_framed_attempt_discard(ctx, funding,
+                   funding_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_IMAGE:
+        if (!ctx->publication.committed
+            && ctx->publication.phase <
+            WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE) {
+            ctx->publication.phase = WL_COLUMNAR_SESSION_HASH_REGISTRY_REVERSE;
+            ctx->publication.move = 4;
+        }
+        return wl_columnar_eval_serial_framed_attempt_step(ctx, funding,
+                   funding_id);
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_VALIDATE:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_PREPARE:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_INIT:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SOURCE_HOLD:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_NEW:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SCRATCH:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_BEGIN:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_GATHER:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_APPEND:
+    case WL_COLUMNAR_EVAL_SERIAL_FRAMED_SORTED:
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_BATCH_END;
+        return 0;
+    default:
+        /* Cleanup phases own their exact cursor/receipt; resume one cell. */
+        return wl_columnar_eval_serial_framed_attempt_step(ctx, funding,
+                   funding_id);
+    }
+}
+
 int
 wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive,
@@ -1060,6 +1221,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     if (request && request->reply) {
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
         request->reply->execution_result = EINVAL;
+        request->reply->cleanup_result = 0;
         request->reply->committed = false;
         memset(&request->reply->cleanup_receipt_key, 0,
             sizeof(request->reply->cleanup_receipt_key));
@@ -1077,12 +1239,13 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         if (request->operation != sess->base.evaluation_control
             || !request->operation_id || !request->operation_identity
             || (request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
-            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS))
+            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+            && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK))
             return EINVAL;
         if (recursive) return ENOTSUP;
-        int protocol = wl_columnar_eval_serial_framed_fund(request->funding,
-                request->funding_id, request->operation);
-        if (protocol) return protocol;
+        int protocol = 0;
         if (sess->cleanup_active) {
             wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
             protocol = wl_columnar_eval_stack_framed_context(
@@ -1095,6 +1258,15 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 || ctx->attempt_id != request->operation_id
                 || ctx->operation_identity != request->operation_identity)
                 return EINVAL;
+            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+                && !ctx->abort_supported) return ENOTSUP;
+            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+                || request->action ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
+                return EBUSY;
+            protocol = wl_columnar_eval_serial_framed_fund(request->funding,
+                    request->funding_id, request->operation);
+            if (protocol) return protocol;
             reply->cleanup_receipt_key = ctx->cleanup_receipt_key;
             /* Original may be stopped or turned over: its authenticated old
              * parent still owns cleanup. No fresh absence lookup is allowed. */
@@ -1112,11 +1284,28 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                     || request->previous_funding_id != ctx->pending_funding_id)
                     return EINVAL;
                 reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
-                return wl_columnar_eval_serial_framed_consume_result(ctx,
-                           request->previous_protocol, request->funding,
-                           request->funding_id);
+                protocol = wl_columnar_eval_serial_framed_consume_result(ctx,
+                        request->previous_protocol, request->funding,
+                        request->funding_id);
+                if (!protocol && request->action ==
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT) {
+                    ctx->abort_requested = true;
+                    if (!ctx->primary_result)
+                        ctx->primary_result =
+                            WL_EVALUATION_CONTROL_CANCELLED;
+                    wl_evaluation_control_request_cancel(ctx->control);
+                    (void)wl_evaluation_control_charge(ctx->control, 0);
+                }
+                return protocol;
             }
             reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+                || ctx->abort_requested) {
+                protocol = wl_columnar_eval_serial_framed_abort_step(ctx,
+                        request->funding, request->funding_id);
+                if (protocol || ctx->phase !=
+                    WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) return protocol;
+            }
             if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY)
                 return wl_columnar_eval_serial_framed_attempt_publish(ctx,
                            request->funding, request->funding_id);
@@ -1124,15 +1313,41 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 protocol = wl_columnar_eval_serial_framed_attempt_close(ctx,
                         &reply->execution_result, &reply->committed,
                         request->funding, request->funding_id);
-                if (!protocol)
+                if (!protocol) {
                     reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL;
+                } else {
+                    wl_columnar_eval_cleanup_receipt_t receipt;
+                    int receipt_rc =
+                        wl_columnar_eval_stack_cleanup_receipt_read(sess,
+                            &reply->cleanup_receipt_key, &receipt);
+                    if (receipt_rc) return receipt_rc;
+                    reply->execution_result = receipt.result;
+                    reply->committed = receipt.committed;
+                    reply->cleanup_result = receipt.cleanup_result;
+                    if (receipt.state ==
+                        WL_COLUMNAR_EVAL_CLEANUP_RECEIPT_PREPARED) {
+                        reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
+                    } else {
+                        reply->kind =
+                            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING;
+                        return 0;
+                    }
+                }
                 return protocol;
             }
             return wl_columnar_eval_serial_framed_attempt_step(ctx,
                        request->funding, request->funding_id);
         }
-        if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS)
-            return ENOENT;
+        if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
+            || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
+            || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
+            || request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK) {
+            if (!request->receipt_key.receipt_id) return ENOENT;
+            return wl_columnar_eval_serial_framed_receipt_action(sess, request);
+        }
+        protocol = wl_columnar_eval_serial_framed_fund(request->funding,
+                request->funding_id, request->operation);
+        if (protocol) return protocol;
         if (sess->cleanup_pending) return EBUSY;
         if (request->previous_valid && request->previous_kind ==
             WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT)
