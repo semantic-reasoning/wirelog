@@ -532,8 +532,11 @@ col_op_k_fusion_worker(void *ctx)
  *   clone / arena / delta_pool machinery exists purely to isolate concurrent
  *   workers that no longer exist. Arrangements and mat_cache are stateful
  *   caches that the engine rebuilds on demand, so executing K branches
- *   sequentially against the parent sess cannot race and cannot change the
- *   computed result. Skipping the 375-per-iter arrangement clones is pure
+ *   sequentially against the parent sess cannot race. The branches share
+ *   the parent's mat_cache; that keeps the result unchanged only because a
+ *   cache entry is keyed by the join operation as well as by its inputs,
+ *   since two branches can join the same inputs on different columns
+ *   (Issue #2127). Skipping the 375-per-iter arrangement clones is pure
  *   profit for workloads like DOOP at W=1.
  *
  * The parallel path deliberately drops any mat_cache entries its workers
