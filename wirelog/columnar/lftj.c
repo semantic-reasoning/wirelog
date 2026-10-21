@@ -570,9 +570,9 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
 /* PRODUCT_EMIT charges total_columns + 8 around the row append. The widest
  * supported output has 64 columns, so every atomic append fits this quantum. */
 enum { WL_COLUMNAR_LFTJ_ACTION_UNITS = 72u };
-_Static_assert(WL_COLUMNAR_LFTJ_ACTION_UNITS
-    >= WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 8u,
-    "LFTJ row append must fit within one action quantum");
+typedef char wl_columnar_lftj_action_quantum[
+        (WL_COLUMNAR_LFTJ_ACTION_UNITS
+        >= WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 8u) ? 1 : -1];
 
 static int
 wl_columnar_lftj_attempt_charge(wl_columnar_lftj_attempt_t *a, uint64_t work)
