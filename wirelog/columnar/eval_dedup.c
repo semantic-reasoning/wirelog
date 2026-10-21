@@ -62,9 +62,8 @@ wl_dedup_token_valid(const col_rel_t *r)
 }
 
 int
-wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
+wl_columnar_eval_dedup_set_metadata_bytes(const col_rel_t *r, uint64_t *bytes)
 {
-    uint32_t occupied = 0;
     if (!r || !bytes)
         return EINVAL;
     if (!r->dedup_cap) {
@@ -81,15 +80,24 @@ wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
         || r->dedup_count > r->dedup_cap)
         return EINVAL;
     *bytes = (uint64_t)r->dedup_cap * sizeof(*r->dedup_slots);
-    for (uint32_t i = 0; i < r->dedup_cap; i++)
-        occupied += r->dedup_slots[i] != 0;
-    if (occupied != r->dedup_count)
-        return EINVAL;
     if (!r->memory_governor)
         return !r->dedup_reserved_bytes ? 0 : EINVAL;
     if (!wl_dedup_token_valid(r))
         return EBUSY;
     return 0;
+}
+
+int
+wl_columnar_eval_dedup_set_bytes(const col_rel_t *r, uint64_t *bytes)
+{
+    uint32_t occupied = 0;
+    int rc = wl_columnar_eval_dedup_set_metadata_bytes(r, bytes);
+
+    if (rc != 0 || !r->dedup_cap)
+        return rc;
+    for (uint32_t i = 0; i < r->dedup_cap; i++)
+        occupied += r->dedup_slots[i] != 0;
+    return occupied == r->dedup_count ? 0 : EINVAL;
 }
 
 void
@@ -161,6 +169,62 @@ wl_columnar_eval_dedup_set_clone_exact(col_rel_t *dst, const col_rel_t *src)
     dst->dedup_cap = src->dedup_cap;
     dst->dedup_count = src->dedup_count;
     dst->dedup_reserved_bytes = dst->memory_governor ? bytes : 0;
+    return 0;
+}
+
+/* Allocate governed clone storage without copying its slots. The private
+ * controlled consolidation attempt copies the table in charged slices, so a
+ * large existing evaluator set cannot hide work in this admission step. */
+int
+wl_columnar_eval_dedup_set_clone_begin(col_rel_t *dst, const col_rel_t *src)
+{
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_admission_status_t status;
+    uint64_t bytes;
+    int rc = wl_columnar_eval_dedup_set_metadata_bytes(src, &bytes);
+
+    if (rc != 0 || !dst || dst->dedup_slots || dst->dedup_reserved_bytes)
+        return rc != 0 ? rc : EINVAL;
+    if (bytes == 0)
+        return 0;
+#if SIZE_MAX < UINT64_MAX
+    if (bytes > SIZE_MAX)
+        return EOVERFLOW;
+#endif
+    wl_columnar_memory_reservation_init(&pending);
+    if (dst->memory_governor) {
+        status = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(dst->memory_governor),
+            bytes, &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return wl_dedup_admission_rc(dst, status);
+    }
+    uint64_t *slots = malloc((size_t)bytes);
+    if (!slots) {
+        if (pending.bytes && !wl_columnar_memory_rollback(&pending))
+            abort();
+        return ENOMEM;
+    }
+    if (pending.bytes && (!wl_columnar_memory_commit(&pending, dst)
+        || !wl_columnar_memory_reservation_move(&dst->dedup_reservation,
+        &pending)))
+        abort();
+    dst->dedup_slots = slots;
+    dst->dedup_cap = src->dedup_cap;
+    dst->dedup_count = src->dedup_count;
+    dst->dedup_reserved_bytes = dst->memory_governor ? bytes : 0;
+    return 0;
+}
+
+int
+wl_columnar_eval_dedup_set_clone_slot(col_rel_t *dst, const col_rel_t *src,
+    uint32_t slot)
+{
+    if (!dst || !src || !dst->dedup_slots || !src->dedup_slots
+        || dst->dedup_cap != src->dedup_cap || slot >= src->dedup_cap)
+        return EINVAL;
+    dst->dedup_slots[slot] = src->dedup_slots[slot];
     return 0;
 }
 

@@ -17019,7 +17019,8 @@ col_rel_image_token_valid(const wl_columnar_memory_reservation_t *token,
 }
 
 static int
-col_rel_mutable_image_validate(const col_rel_t *r, bool source)
+col_rel_mutable_image_validate(const col_rel_t *r, bool source,
+    bool scan_dedup_slots)
 {
     uint64_t payload, metadata, dedup, descriptor, named_descriptor;
     if (!r || !r->memory_governor || r->pool_owned || r->arena_owned
@@ -17045,7 +17046,9 @@ col_rel_mutable_image_validate(const col_rel_t *r, bool source)
     if (!col_rel_retained_live_bytes(r, &payload)
         || !col_rel_current_metadata_bytes(r, &metadata))
         return EINVAL;
-    int rc = wl_columnar_eval_dedup_set_bytes(r, &dedup);
+    int rc = scan_dedup_slots
+        ? wl_columnar_eval_dedup_set_bytes(r, &dedup)
+        : wl_columnar_eval_dedup_set_metadata_bytes(r, &dedup);
     if (rc != 0)
         return rc;
     /* wl_columnar_relation_alloc_governed and col_rel_attach_memory_governor
@@ -17096,7 +17099,11 @@ col_rel_mutable_image_validate(const col_rel_t *r, bool source)
             return EINVAL;
         end = r->run_ends[i];
     }
-    return r->run_count && end != r->nrows ? EINVAL : 0;
+    /* A published source may have an appended, not-yet-consolidated tail;
+     * its run metadata then covers only the canonical prefix.  A private
+     * replacement image must describe every row. */
+    return r->run_count && (source ? end > r->nrows : end != r->nrows)
+        ? EINVAL : 0;
 }
 
 int
@@ -17113,7 +17120,7 @@ col_rel_mutable_image_prepare(col_rel_t *source,
     if (rc != 0)
         return rc;
     transaction->source = source;
-    rc = col_rel_mutable_image_validate(source, true);
+    rc = col_rel_mutable_image_validate(source, true, true);
     if (rc == 0)
         rc = col_rel_deep_copy_governed_impl(source, &transaction->image,
                 source->memory_governor, true);
@@ -17124,6 +17131,90 @@ col_rel_mutable_image_prepare(col_rel_t *source,
         memset(transaction, 0, sizeof(*transaction));
     }
     return rc;
+}
+
+int
+wl_columnar_relation_new_empty_governed_like_locked(col_rel_t *source,
+    col_rel_t **out)
+{
+    col_rel_t *image = NULL;
+    int rc;
+
+    if (!source || !out || !source->memory_governor)
+        return EINVAL;
+    *out = NULL;
+    if (source->storage_owner != source || source->col_shared
+        || col_rel_storage_alias_borrow_count(source) != 0
+        || source->pool_owned || source->arena_owned)
+        return EBUSY;
+
+    /* The caller holds source's canonical writer, so schema and compound
+     * metadata remain stable while this private descriptor is constructed.
+     * Passing a NULL name is intentional: mutable-image publication keeps
+     * the source's existing name and descriptor credit. */
+    rc = wl_columnar_relation_alloc_governed(&image, NULL,
+            source->memory_governor);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_set_schema(image, source->ncols,
+            (const char *const *)source->col_names);
+    if (rc == 0 && source->column_types)
+        rc = col_rel_set_column_types(image, source->column_types,
+                source->ncols);
+    if (rc == 0 && source->compound_arity_len > 0) {
+        int clone_rc = col_rel_clone_compound_meta(image, source, false);
+        rc = clone_rc == 0 ? 0 : clone_rc == -1 ? EINVAL
+            : clone_rc == -3 ? EOVERFLOW
+            : image->memory_budget_denial_pending ? ENOSPC : ENOMEM;
+    }
+    if (rc == 0) {
+        image->declared_ncols = source->declared_ncols;
+        image->has_graph_column = source->has_graph_column;
+        image->graph_col_idx = source->graph_col_idx;
+        image->base_nrows = 0;
+        *out = image;
+        return 0;
+    }
+    col_rel_destroy(image);
+    return rc;
+}
+
+int
+wl_columnar_relation_mutable_image_prepare_empty(col_rel_t *source,
+    col_rel_mutable_image_t *transaction, uint32_t capacity)
+{
+    int rc;
+
+    if (!source || !transaction)
+        return EINVAL;
+    if (transaction->source || transaction->image)
+        return EBUSY;
+    memset(transaction, 0, sizeof(*transaction));
+    rc = col_rel_published_writer_acquire(source, &transaction->writer);
+    if (rc != 0)
+        return rc;
+    rc = col_rel_mutable_image_validate(source, true, false);
+    if (rc == 0)
+        rc = wl_columnar_relation_new_empty_governed_like_locked(source,
+                &transaction->image);
+    if (rc == 0 && capacity > 0) {
+        bool denied = false;
+        rc = col_rel_reserve_capacity_admitted(transaction->image, capacity,
+                &denied);
+        if (rc == ENOMEM && denied)
+            rc = ENOSPC;
+    }
+    if (rc != 0) {
+        if (transaction->image)
+            col_rel_destroy(transaction->image);
+        if (wl_columnar_source_access_writer_release(
+                &transaction->writer) != 0)
+            abort();
+        memset(transaction, 0, sizeof(*transaction));
+        return rc;
+    }
+    transaction->source = source;
+    return 0;
 }
 
 col_rel_t *
@@ -17182,8 +17273,8 @@ col_rel_mutable_image_commit(col_rel_mutable_image_t *transaction)
         || !wl_columnar_source_access_writer_thread_equal(
             &transaction->writer))
         return EINVAL;
-    if (col_rel_mutable_image_validate(source, true) != 0
-        || col_rel_mutable_image_validate(image, false) != 0
+    if (col_rel_mutable_image_validate(source, true, false) != 0
+        || col_rel_mutable_image_validate(image, false, false) != 0
         || image->name || image->pool_owned || image->memory_governor
         != source->memory_governor)
         return EBUSY;
