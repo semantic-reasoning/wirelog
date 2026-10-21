@@ -92,6 +92,9 @@ int wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
  */
 int wl_evaluation_control_charge(wl_evaluation_control_t *control,
     uint64_t work);
+/* Charge only if expected_attempt_id is still active; stale calls mutate nothing. */
+int wl_evaluation_control_charge_attempt(wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id, uint64_t work);
 /*
  * Finish does not poll: the integration must make its final charge(0) check
  * before committing publication. Late cancellation remains sticky for the

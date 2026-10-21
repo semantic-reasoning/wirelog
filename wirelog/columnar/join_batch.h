@@ -151,6 +151,7 @@ typedef struct {
     int execution_status; /* errno-style code only for EXECUTION_ERROR */
     uint64_t work_ordinal; /* cumulative admitted logical work */
     uint64_t batch_generation; /* nonzero only for BATCH_READY */
+    uint64_t required_work; /* current indivisible action cost when stalled */
 } col_join_batch_control_result_t;
 
 /* Bind the prepared producer to one active operation attempt and transfer
@@ -176,10 +177,37 @@ int
 col_join_batch_control_ack(wl_columnar_continuation_t *cont,
     uint64_t generation);
 
+/* Validate the exact pending generation and attempt/input state before a
+ * caller's private output commit. This does not acknowledge or advance the
+ * producer; only the runner's module-private post-commit transition can do so. */
+int
+col_join_batch_control_precommit(wl_columnar_continuation_t *cont,
+    uint64_t generation);
+
 /* Discard and destroy the continuation, releasing its arrangement lease,
  * admitted scratch, and retained control reference; clears *cont. */
 int
 col_join_batch_control_discard(wl_columnar_continuation_t **cont);
+
+/* Attempt-controlled private JOIN runner. start requires an already-built
+ * current arrangement, holds readers for both inputs, then synchronously
+ * admits a fixed-capacity result; this setup is outside advance's work bound.
+ * advance(0) is a true no-op. An underfunded positive quantum returns
+ * resumable PROGRESS with required_work and no state change. Every call
+ * consumes at most max_work; DONE transfers output and destroys the runner.
+ * Capacity exhaustion is sticky ENOSPC. Ordinary JOIN dispatch is unchanged. */
+int
+col_join_batch_runner_start(wl_col_session_t *sess, const wl_plan_op_t *op,
+    const col_rel_t *left, bool left_is_delta, const uint32_t *lk,
+    const uint32_t *rk, uint32_t key_count, uint64_t batch_bytes,
+    uint32_t output_row_capacity, wl_evaluation_control_t *control,
+    uint64_t attempt_id, wl_columnar_continuation_t **out);
+col_join_batch_control_status_t
+col_join_batch_runner_advance(wl_columnar_continuation_t **runner,
+    uint64_t max_work, col_join_batch_control_result_t *result,
+    col_rel_t **completed_output);
+int
+col_join_batch_runner_discard(wl_columnar_continuation_t **runner);
 
 /* Synchronous all-or-nothing sink that appends each committed batch to a
  * heap-owned relation admitted under the session governor.  The relation's

@@ -1038,6 +1038,80 @@ col_arrangement_pin_entry(wl_col_session_t *session, col_arr_entry_t *entry,
     return 0;
 }
 
+static bool
+col_session_has_exact_relation(const wl_col_session_t *session,
+    const col_rel_t *source, const char *name);
+
+int
+col_session_pin_existing_arrangement(wl_session_t *sess,
+    const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_pin_t *pin,
+    wl_columnar_source_access_reader_t *source_reader)
+{
+    if (pin)
+        memset(pin, 0, sizeof(*pin));
+    if (source_reader)
+        memset(source_reader, 0, sizeof(*source_reader));
+    if (!sess || !source || !key_cols || !key_count || !pin || !source_reader)
+        return EINVAL;
+
+    int rc = col_rel_source_reader_acquire(source, source_reader);
+    if (rc)
+        return rc;
+
+    wl_col_session_t *session = COL_SESSION(sess);
+    col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(source);
+    if (!source->name || !col_session_has_exact_relation(session, source,
+        source->name) || !arr_key_cols_valid(source, key_cols, key_count)
+        || !wl_columnar_relation_snapshot_valid(snapshot)) {
+        rc = EBUSY;
+        goto failed;
+    }
+
+    col_arr_entry_t *entry = NULL;
+    for (uint32_t i = 0; i < session->arr_count; i++) {
+        col_arr_entry_t *candidate = &session->arr_entries[i];
+        if (col_arr_entry_key_match(candidate, source->name, key_cols,
+            key_count)) {
+            entry = candidate;
+            break;
+        }
+    }
+    if (!entry) {
+        rc = ENOENT;
+        goto failed;
+    }
+    if (!wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot) || arr_entry_unbuilt(entry)
+        || entry->arr.indexed_rows != source->nrows
+        || entry->rebuild_deferred) {
+        rc = EBUSY;
+        goto failed;
+    }
+    rc = col_arrangement_pin_entry(session, entry, &entry->arr, pin);
+    if (rc)
+        goto failed;
+
+    /* The source reader freezes the storage while the exact entry is pinned.
+     * Recheck identity and snapshot after pinning before handing either lease
+     * to a long-lived continuation. */
+    if (!col_session_has_exact_relation(session, source, entry->rel_name)
+        || col_arr_entry_for_arr(session, &entry->arr) != entry
+        || !wl_columnar_relation_snapshot_equal(
+            wl_columnar_relation_snapshot(source), snapshot)
+        || !wl_columnar_relation_snapshot_equal(entry->source_snapshot,
+        snapshot)) {
+        rc = EBUSY;
+        col_arrangement_pin_release(pin);
+        goto failed;
+    }
+    return 0;
+
+failed:
+    (void)col_rel_source_reader_release(source_reader);
+    return rc;
+}
+
 int
 col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count, col_arrangement_pin_t *pin)

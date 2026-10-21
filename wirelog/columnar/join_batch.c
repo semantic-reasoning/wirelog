@@ -138,6 +138,8 @@ typedef struct {
     uint32_t *rk;
     uint32_t kc;
     col_arrangement_pin_t pin;
+    wl_columnar_source_access_reader_t runner_left_reader;
+    wl_columnar_source_access_reader_t runner_right_reader;
     const col_arrangement_t *arr;
     /* The union keeps the raw allocation tail aligned for key_row on
      * compilers without C11 _Alignof support. */
@@ -159,6 +161,7 @@ typedef struct {
     col_join_batch_control_status_t controlled_status;
     int controlled_execution_status;
     uint64_t controlled_work_ordinal;
+    uint64_t controlled_required_work;
     uint64_t controlled_batch_generation;
     uint64_t controlled_attempt_id;
     wl_evaluation_control_t *controlled_control;
@@ -177,6 +180,21 @@ typedef struct {
     uint32_t controlled_batch_rows;
     col_join_batch_pos_t controlled_next;
     col_join_batch_pos_t controlled_ready_next;
+    bool runner_mode;
+    bool runner_internal;
+    col_rel_t *runner_output;
+    uint32_t runner_output_row_capacity;
+    uint32_t runner_copy_base;
+    uint32_t runner_copy_row;
+    uint32_t runner_copy_col;
+    uint32_t runner_copy_timestamp_bytes;
+    const col_rel_t *runner_pending_batch;
+    uint64_t runner_pending_generation;
+    uint64_t runner_work_ordinal;
+    uint64_t runner_required_work;
+    uint64_t runner_observed_producer_ordinal;
+    col_join_batch_control_status_t runner_status;
+    int runner_execution_status;
     enum {
         COL_JOIN_BATCH_SCAN_LEFT = 0,
         COL_JOIN_BATCH_BUILD_KEY,
@@ -292,7 +310,11 @@ controlled_poll(col_join_batch_producer_t *p)
         != p->controlled_attempt_id)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
                    EINVAL);
-    int rc = wl_evaluation_control_charge(p->controlled_control, 0);
+    int rc = wl_evaluation_control_charge_attempt(p->controlled_control,
+            p->controlled_attempt_id, 0);
+    if (rc == EINVAL)
+        return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
+                   EINVAL);
     if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_WORK_LIMIT, 0);
     if (rc == WL_EVALUATION_CONTROL_CANCELLED)
@@ -324,7 +346,11 @@ controlled_charge(col_join_batch_producer_t *p, uint64_t work,
         != p->controlled_attempt_id)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
                    EINVAL);
-    int rc = wl_evaluation_control_charge(p->controlled_control, work);
+    int rc = wl_evaluation_control_charge_attempt(p->controlled_control,
+            p->controlled_attempt_id, work);
+    if (rc == EINVAL)
+        return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
+                   EINVAL);
     if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_WORK_LIMIT, 0);
     if (rc == WL_EVALUATION_CONTROL_CANCELLED)
@@ -373,13 +399,13 @@ controlled_step(col_join_batch_producer_t *p, uint64_t max_work)
                    ENOTSUP);
 
     while (turn_work < max_work) {
-        col_join_batch_control_status_t status = controlled_poll(p);
-        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
-            return status;
         uint64_t cost = 1;
         switch (p->controlled_phase) {
         case COL_JOIN_BATCH_SCAN_LEFT:
             if (p->controlled_left_row >= p->left->nrows) {
+                col_join_batch_control_status_t status = controlled_poll(p);
+                if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+                    return status;
                 if (p->controlled_batch_rows)
                     return controlled_make_ready(p, true);
                 p->controlled_complete = true;
@@ -404,8 +430,14 @@ controlled_step(col_join_batch_producer_t *p, uint64_t max_work)
             return controlled_stop(p,
                        COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
         }
-        if (cost > max_work - turn_work)
+        if (cost > max_work - turn_work) {
+            p->controlled_required_work = cost;
             return COL_JOIN_BATCH_CONTROL_PROGRESS;
+        }
+        p->controlled_required_work = 0;
+        col_join_batch_control_status_t status = controlled_poll(p);
+        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+            return status;
         status = controlled_charge(p, cost, &turn_work, max_work);
         if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
             return status;
@@ -635,6 +667,12 @@ producer_release_lease(col_join_batch_producer_t *p)
 {
     if (p->pin.active)
         col_arrangement_pin_release(&p->pin);
+    if (p->runner_left_reader.owner)
+        if (col_rel_source_reader_release(&p->runner_left_reader) != 0)
+            abort();
+    if (p->runner_right_reader.owner)
+        if (col_rel_source_reader_release(&p->runner_right_reader) != 0)
+            abort();
     p->arr = NULL;
 }
 
@@ -672,6 +710,8 @@ producer_destroy(void *context)
     producer_release_lease(p);
     if (p->batch)
         col_rel_destroy(p->batch); /* releases the scratch token and ref */
+    if (p->runner_output)
+        col_rel_destroy(p->runner_output);
     free(p);
     if (reservation.governor) {
         if (committed){
@@ -684,11 +724,11 @@ producer_destroy(void *context)
     wl_evaluation_control_release(control);
 }
 
-int
-col_join_batch_producer_create(wl_col_session_t *sess,
+static int
+col_join_batch_producer_create_internal(wl_col_session_t *sess,
     const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
     const uint32_t *lk, const uint32_t *rk, uint32_t kc,
-    uint64_t batch_bytes, wl_columnar_continuation_t **out)
+    uint64_t batch_bytes, bool runner, wl_columnar_continuation_t **out)
 {
     col_join_batch_producer_t *p;
     const col_rel_t *right;
@@ -701,6 +741,9 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     uint32_t ocols;
     wl_columnar_memory_governor_ref_t *descriptor_governor = NULL;
     wl_columnar_memory_reservation_t descriptor_reservation;
+    wl_columnar_source_access_reader_t left_reader = { 0 };
+    wl_columnar_source_access_reader_t right_reader = { 0 };
+    col_arrangement_pin_t existing_pin = { 0 };
     int rc;
 
     if (out)
@@ -711,9 +754,20 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     right = session_find_rel(sess, op->right_relation);
     if (!right)
         return ENOENT;
+    if (runner) {
+        rc = col_rel_source_reader_acquire(left, &left_reader);
+        if (rc)
+            return rc;
+        rc = col_session_pin_existing_arrangement(&sess->base, right, rk, kc,
+                &existing_pin, &right_reader);
+        if (rc)
+            goto fail_early;
+    }
     for (uint32_t k = 0; k < kc; k++)
-        if (lk[k] >= left->ncols || rk[k] >= right->ncols)
-            return EINVAL;
+        if (lk[k] >= left->ncols || rk[k] >= right->ncols) {
+            rc = EINVAL;
+            goto fail_early;
+        }
     if (!wl_columnar_memory_size_mul(kc, 2u * sizeof(uint32_t),
         &key_bytes)
         || !wl_columnar_memory_size_mul(
@@ -723,8 +777,10 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         &descriptor_bytes)
         || !wl_columnar_memory_size_add(descriptor_bytes,
         row_storage_bytes, &descriptor_bytes)
-        || descriptor_bytes > SIZE_MAX)
-        return EOVERFLOW;
+        || descriptor_bytes > SIZE_MAX) {
+        rc = EOVERFLOW;
+        goto fail_early;
+    }
     descriptor_governor = sess->memory_governor
         ? sess->memory_governor
         : left->memory_governor ? left->memory_governor
@@ -740,10 +796,11 @@ col_join_batch_producer_create(wl_col_session_t *sess,
             if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
                 sess->memory_budget_denied = true;
             wl_columnar_memory_governor_ref_release(descriptor_governor);
-            return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+            rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
                 ? ENOSPC
                 : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
                 ? EOVERFLOW : ENOMEM;
+            goto fail_early;
         }
     }
     p = (col_join_batch_producer_t *)calloc(1, (size_t)descriptor_bytes);
@@ -752,7 +809,8 @@ col_join_batch_producer_create(wl_col_session_t *sess,
             if (!wl_columnar_memory_rollback(&descriptor_reservation)) abort();
         }
         wl_columnar_memory_governor_ref_release(descriptor_governor);
-        return ENOMEM;
+        rc = ENOMEM;
+        goto fail_early;
     }
     wl_columnar_memory_reservation_init(&p->descriptor_reservation);
     p->descriptor_governor = descriptor_governor;
@@ -763,13 +821,32 @@ col_join_batch_producer_create(wl_col_session_t *sess,
         if (!wl_columnar_memory_rollback(&descriptor_reservation))
             abort();
         wl_columnar_memory_governor_ref_release(descriptor_governor);
-        return EINVAL;
+        rc = EINVAL;
+        goto fail_early;
     }
     p->sess = sess;
     p->op = op;
     p->left = left;
     p->right = right;
     p->kc = kc;
+    if (runner) {
+        p->pin = existing_pin;
+        memset(&existing_pin, 0, sizeof(existing_pin));
+        /* Source-reader tokens are address-bound and cannot be copied.  Take
+         * leases directly in their final storage before dropping the
+         * temporary admission leases. */
+        rc = col_rel_source_reader_acquire(left, &p->runner_left_reader);
+        if (rc)
+            goto fail;
+        rc = col_rel_source_reader_acquire(right, &p->runner_right_reader);
+        if (rc)
+            goto fail;
+        int left_release_rc = col_rel_source_reader_release(&left_reader);
+        int right_release_rc = col_rel_source_reader_release(&right_reader);
+        if (left_release_rc != 0 || right_release_rc != 0)
+            abort();
+        p->arr = p->pin.arr;
+    }
     /* The allocation tail is raw storage.  Its first two regions hold the
      * uint32_t key-column arrays; the final int64_t region is naturally
      * aligned because its offset is 2 * kc * sizeof(uint32_t). */
@@ -791,14 +868,16 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     /* One lease for the whole continuation.  The registry refuses to
      * relocate entries while any lease is active, so the arrangement
      * pointer stays valid until destroy or cancel. */
-    rc = col_session_pin_arrangement(&sess->base, op->right_relation, rk, kc,
-            &p->pin);
-    if (rc != 0 || !p->pin.arr) {
-        if (rc == 0)
-            rc = ENOENT;
-        goto fail;
+    if (!runner) {
+        rc = col_session_pin_arrangement(&sess->base, op->right_relation,
+                rk, kc, &p->pin);
+        if (rc != 0 || !p->pin.arr) {
+            if (rc == 0)
+                rc = ENOENT;
+            goto fail;
+        }
+        p->arr = p->pin.arr;
     }
-    p->arr = p->pin.arr;
     if (p->arr->indexed_rows == 0 && right->nrows > 0) {
         rc = ENOENT;
         goto fail;
@@ -890,7 +969,32 @@ col_join_batch_producer_create(wl_col_session_t *sess,
 
 fail:
     producer_destroy(p);
+    if (existing_pin.active)
+        col_arrangement_pin_release(&existing_pin);
+    if (left_reader.owner)
+        (void)col_rel_source_reader_release(&left_reader);
+    if (right_reader.owner)
+        (void)col_rel_source_reader_release(&right_reader);
     return rc;
+
+fail_early:
+    if (existing_pin.active)
+        col_arrangement_pin_release(&existing_pin);
+    if (left_reader.owner)
+        (void)col_rel_source_reader_release(&left_reader);
+    if (right_reader.owner)
+        (void)col_rel_source_reader_release(&right_reader);
+    return rc;
+}
+
+int
+col_join_batch_producer_create(wl_col_session_t *sess,
+    const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
+    const uint32_t *lk, const uint32_t *rk, uint32_t kc,
+    uint64_t batch_bytes, wl_columnar_continuation_t **out)
+{
+    return col_join_batch_producer_create_internal(sess, op, left,
+               left_is_delta, lk, rk, kc, batch_bytes, false, out);
 }
 
 static const col_join_batch_producer_t *
@@ -1015,15 +1119,18 @@ col_join_batch_control_step(wl_columnar_continuation_t *cont,
                 ? p->controlled_execution_status : EINVAL;
             result->work_ordinal = p ? p->controlled_work_ordinal : 0;
             result->batch_generation = 0;
+            result->required_work = p ? p->controlled_required_work : 0;
         }
         return COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
     }
-    if (!controlled_thread_is_owner(p) || p->controlled_busy) {
+    if (!controlled_thread_is_owner(p) || p->controlled_busy
+        || (p->runner_mode && !p->runner_internal)) {
         result->status = COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
         result->execution_status = EBUSY;
         result->work_ordinal = p->controlled_work_ordinal;
         result->batch_generation = p->controlled_ready
             ? p->controlled_batch_generation : 0;
+        result->required_work = 0;
         return result->status;
     }
     p->controlled_busy = true;
@@ -1034,6 +1141,7 @@ col_join_batch_control_step(wl_columnar_continuation_t *cont,
     result->work_ordinal = p->controlled_work_ordinal;
     result->batch_generation = status == COL_JOIN_BATCH_CONTROL_BATCH_READY
         ? p->controlled_batch_generation : 0;
+    result->required_work = p->controlled_required_work;
     return status;
 }
 
@@ -1046,7 +1154,8 @@ col_join_batch_control_peek(wl_columnar_continuation_t *cont,
 
     if (!p || !p->controlled_bound || !batch || !generation)
         return EINVAL;
-    if (!controlled_thread_is_owner(p) || p->controlled_busy)
+    if (!controlled_thread_is_owner(p) || p->controlled_busy
+        || (p->runner_mode && !p->runner_internal))
         return EBUSY;
     col_join_batch_control_status_t status = controlled_poll(p);
     if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
@@ -1063,6 +1172,9 @@ col_join_batch_control_peek(wl_columnar_continuation_t *cont,
     return 0;
 }
 
+static void col_join_batch_control_ack_validated(
+    wl_columnar_continuation_t *cont, uint64_t generation);
+
 int
 col_join_batch_control_ack(wl_columnar_continuation_t *cont,
     uint64_t generation)
@@ -1072,7 +1184,8 @@ col_join_batch_control_ack(wl_columnar_continuation_t *cont,
 
     if (!p || !p->controlled_bound || !generation)
         return EINVAL;
-    if (!controlled_thread_is_owner(p) || p->controlled_busy)
+    if (!controlled_thread_is_owner(p) || p->controlled_busy
+        || (p->runner_mode && !p->runner_internal))
         return EBUSY;
     /* A bad token is a caller error and must not latch a concurrent stop. */
     if (!p->controlled_ready || generation != p->controlled_batch_generation)
@@ -1084,6 +1197,51 @@ col_join_batch_control_ack(wl_columnar_continuation_t *cont,
     if (p->cursor.sequence == UINT64_MAX)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR,
                    EOVERFLOW), EOVERFLOW;
+    col_join_batch_control_ack_validated(cont, generation);
+    return 0;
+}
+
+int
+col_join_batch_control_precommit(wl_columnar_continuation_t *cont,
+    uint64_t generation)
+{
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(cont);
+
+    if (!p || !p->controlled_bound || !generation)
+        return EINVAL;
+    if (!controlled_thread_is_owner(p) || p->controlled_busy
+        || (p->runner_mode && !p->runner_internal))
+        return EBUSY;
+    if (!p->controlled_ready || generation != p->controlled_batch_generation)
+        return EINVAL;
+    col_join_batch_control_status_t status = controlled_poll(p);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+        return status == COL_JOIN_BATCH_CONTROL_WORK_LIMIT ? EAGAIN
+            : status == COL_JOIN_BATCH_CONTROL_CANCELLED ? ECANCELED
+            : p->controlled_execution_status ? p->controlled_execution_status
+            : EINVAL;
+    if (p->cursor.sequence == UINT64_MAX)
+        return controlled_stop(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR,
+                   EOVERFLOW), EOVERFLOW;
+    return 0;
+}
+
+static void
+col_join_batch_control_ack_validated(wl_columnar_continuation_t *cont,
+    uint64_t generation)
+{
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(cont);
+
+    /* The preceding precommit validation plus same-thread runner ownership
+     * makes this a callback-free, no-fail state update. */
+    if (!p || !p->controlled_bound || !controlled_thread_is_owner(p)
+        || (p->runner_mode && !p->runner_internal)
+        || !p->controlled_ready || !generation
+        || generation != p->controlled_batch_generation
+        || p->cursor.sequence == UINT64_MAX)
+        abort();
     bool complete = p->controlled_complete;
     p->cursor.next = p->controlled_ready_next;
     ++p->cursor.sequence;
@@ -1092,9 +1250,7 @@ col_join_batch_control_ack(wl_columnar_continuation_t *cont,
     p->controlled_ready = false;
     if (complete) {
         p->controlled_status = COL_JOIN_BATCH_CONTROL_DONE;
-        return 0;
     }
-    return 0;
 }
 
 int
@@ -1105,10 +1261,375 @@ col_join_batch_control_discard(wl_columnar_continuation_t **cont)
     col_join_batch_producer_t *p = (col_join_batch_producer_t *)
         wl_columnar_continuation_producer_context(*cont);
     if (!p || !p->controlled_bound || !controlled_thread_is_owner(p)
+        || (p->runner_mode && !p->runner_internal)
         || p->controlled_busy)
         return EBUSY;
     wl_columnar_continuation_destroy(*cont);
     *cont = NULL;
+    return 0;
+}
+
+static col_join_batch_control_status_t
+runner_fail(col_join_batch_producer_t *p,
+    col_join_batch_control_status_t status, int execution_status)
+{
+    if (p->runner_status == COL_JOIN_BATCH_CONTROL_PROGRESS) {
+        p->runner_status = status;
+        p->runner_execution_status = execution_status;
+    }
+    return p->runner_status;
+}
+
+static void
+runner_result(const col_join_batch_producer_t *p,
+    col_join_batch_control_result_t *result)
+{
+    result->status = p->runner_status;
+    result->execution_status = p->runner_execution_status;
+    result->work_ordinal = p->runner_work_ordinal;
+    result->batch_generation = p->runner_pending_batch
+        ? p->runner_pending_generation : 0;
+    result->required_work = p->runner_required_work;
+}
+
+static col_join_batch_control_status_t
+runner_validate_transfer(col_join_batch_producer_t *p, int *error)
+{
+    if (error)
+        *error = 0;
+    if (!p->pin.active || !p->runner_left_reader.owner
+        || !p->runner_right_reader.owner) {
+        if (error)
+            *error = EAGAIN;
+        return COL_JOIN_BATCH_CONTROL_STALE_INPUT;
+    }
+    if (wl_evaluation_control_active_attempt_id(p->controlled_control)
+        != p->controlled_attempt_id) {
+        if (error)
+            *error = EINVAL;
+        return COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT;
+    }
+    int rc = wl_evaluation_control_charge_attempt(p->controlled_control,
+            p->controlled_attempt_id, 0);
+    if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return COL_JOIN_BATCH_CONTROL_WORK_LIMIT;
+    if (rc == WL_EVALUATION_CONTROL_CANCELLED)
+        return COL_JOIN_BATCH_CONTROL_CANCELLED;
+    if (rc != 0) {
+        if (error)
+            *error = rc;
+        return rc == EINVAL ? COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT
+            : COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
+    }
+
+    wl_columnar_continuation_cursor_t cursor = { 0 };
+    cursor.input_identity = p->left->relation_identity;
+    cursor.arrangement_identity = p->right->relation_identity;
+    cursor.generation = p->arr->generation;
+    cursor.position = pos_pack(p->controlled_left_row,
+            p->controlled_right_row);
+    cursor.sequence = p->cursor.sequence;
+    if (!producer_validate(p, &cursor)) {
+        if (error)
+            *error = EAGAIN;
+        return COL_JOIN_BATCH_CONTROL_STALE_INPUT;
+    }
+    return COL_JOIN_BATCH_CONTROL_PROGRESS;
+}
+
+int
+col_join_batch_runner_start(wl_col_session_t *sess, const wl_plan_op_t *op,
+    const col_rel_t *left, bool left_is_delta, const uint32_t *lk,
+    const uint32_t *rk, uint32_t key_count, uint64_t batch_bytes,
+    uint32_t output_row_capacity, wl_evaluation_control_t *control,
+    uint64_t attempt_id, wl_columnar_continuation_t **out)
+{
+    if (out)
+        *out = NULL;
+    if (!out || !control || !attempt_id)
+        return EINVAL;
+    int rc = col_join_batch_producer_create_internal(sess, op, left,
+            left_is_delta, lk, rk, key_count, batch_bytes, true, out);
+    if (rc)
+        return rc;
+    rc = col_join_batch_control_bind(*out, control, attempt_id);
+    if (rc)
+        goto failed;
+
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(*out);
+    bool denied = false;
+    rc = wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+        "$join_controlled_output", p->batch, p->descriptor_governor, true,
+        &p->runner_output, control, attempt_id);
+    if (rc)
+        goto failed;
+    if (output_row_capacity > p->runner_output->capacity) {
+        rc = wl_columnar_relation_reserve_capacity_admitted_controlled(
+            p->runner_output, output_row_capacity, &denied, control);
+        if (rc) {
+            if (rc == ENOMEM && denied)
+                rc = ENOSPC;
+            goto failed;
+        }
+    }
+    if (p->runner_output->capacity < output_row_capacity
+        || ((p->runner_output->timestamps != NULL)
+        != (left->timestamps != NULL))) {
+        rc = ENOTSUP;
+        goto failed;
+    }
+    p->runner_mode = true;
+    p->runner_output_row_capacity = output_row_capacity;
+    p->runner_status = COL_JOIN_BATCH_CONTROL_PROGRESS;
+    return 0;
+
+failed:
+    wl_columnar_continuation_destroy(*out);
+    *out = NULL;
+    return rc;
+}
+
+static col_join_batch_control_status_t
+runner_charge(wl_columnar_continuation_t *cont,
+    col_join_batch_producer_t *p, uint64_t work)
+{
+    if (work > UINT64_MAX - p->runner_work_ordinal)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR,
+                   EOVERFLOW);
+    int rc = wl_evaluation_control_charge_attempt(p->controlled_control,
+            p->controlled_attempt_id, work);
+    if (rc == EINVAL)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT, EINVAL);
+    if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_WORK_LIMIT, 0);
+    if (rc == WL_EVALUATION_CONTROL_CANCELLED)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_CANCELLED, 0);
+    if (rc != 0)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, rc);
+    if (wl_evaluation_control_active_attempt_id(p->controlled_control)
+        != p->controlled_attempt_id)
+        return runner_fail(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT, EINVAL);
+    p->runner_work_ordinal += work;
+    (void)cont;
+    return COL_JOIN_BATCH_CONTROL_PROGRESS;
+}
+
+col_join_batch_control_status_t
+col_join_batch_runner_advance(wl_columnar_continuation_t **runner,
+    uint64_t max_work, col_join_batch_control_result_t *result,
+    col_rel_t **completed_output)
+{
+    if (completed_output)
+        *completed_output = NULL;
+    if (!runner || !*runner || !result || !completed_output
+        || max_work > WL_EVALUATION_CONTROL_QUANTUM) {
+        if (result) {
+            result->status = COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
+            result->execution_status = EINVAL;
+            result->work_ordinal = 0;
+            result->batch_generation = 0;
+            result->required_work = 0;
+        }
+        return COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
+    }
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(*runner);
+    if (!p || !p->runner_mode || !p->controlled_bound
+        || !controlled_thread_is_owner(p)) {
+        result->status = COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR;
+        result->execution_status = EINVAL;
+        result->work_ordinal = 0;
+        result->batch_generation = 0;
+        result->required_work = 0;
+        return result->status;
+    }
+    if (max_work == 0) {
+        runner_result(p, result);
+        return p->runner_status;
+    }
+    if (p->runner_status != COL_JOIN_BATCH_CONTROL_PROGRESS) {
+        runner_result(p, result);
+        return p->runner_status;
+    }
+    if (p->controlled_busy) {
+        runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EBUSY);
+        runner_result(p, result);
+        return p->runner_status;
+    }
+
+    p->runner_required_work = 0;
+
+    uint64_t remaining = max_work;
+    if (!p->runner_pending_batch) {
+        uint64_t before = p->controlled_work_ordinal;
+        col_join_batch_control_result_t producer_result;
+        p->runner_internal = true;
+        col_join_batch_control_status_t status = col_join_batch_control_step(
+            *runner, remaining, &producer_result);
+        p->runner_internal = false;
+        uint64_t used = producer_result.work_ordinal - before;
+        if (used > remaining) {
+            runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EOVERFLOW);
+            runner_result(p, result);
+            return p->runner_status;
+        }
+        if (used > UINT64_MAX - p->runner_work_ordinal) {
+            runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EOVERFLOW);
+            runner_result(p, result);
+            return p->runner_status;
+        }
+        p->runner_work_ordinal += used;
+        p->runner_observed_producer_ordinal = producer_result.work_ordinal;
+        remaining -= used;
+        if (status == COL_JOIN_BATCH_CONTROL_DONE) {
+            int final_error = 0;
+            col_join_batch_control_status_t final_status
+                = runner_validate_transfer(p, &final_error);
+            if (final_status != COL_JOIN_BATCH_CONTROL_PROGRESS) {
+                runner_fail(p, final_status, final_error);
+                runner_result(p, result);
+                return p->runner_status;
+            }
+            uint64_t completed_work = p->runner_work_ordinal;
+            *completed_output = p->runner_output;
+            p->runner_output = NULL;
+            wl_columnar_continuation_destroy(*runner);
+            *runner = NULL;
+            result->status = COL_JOIN_BATCH_CONTROL_DONE;
+            result->execution_status = 0;
+            result->work_ordinal = completed_work;
+            result->batch_generation = 0;
+            result->required_work = 0;
+            return result->status;
+        }
+        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS
+            && status != COL_JOIN_BATCH_CONTROL_BATCH_READY) {
+            runner_fail(p, status, producer_result.execution_status);
+            runner_result(p, result);
+            return p->runner_status;
+        }
+        if (status == COL_JOIN_BATCH_CONTROL_PROGRESS) {
+            p->runner_required_work = producer_result.required_work;
+            runner_result(p, result);
+            return COL_JOIN_BATCH_CONTROL_PROGRESS;
+        }
+        /* STEP returned BATCH_READY on this owner thread. Capture its stable
+         * descriptor directly; calling peek here would add a second poll and
+         * could strand a ready batch at the exact work limit. */
+        p->runner_pending_batch = p->batch;
+        p->runner_pending_generation = p->controlled_batch_generation;
+        if (!p->runner_pending_generation || !p->controlled_ready) {
+            runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            runner_result(p, result);
+            return p->runner_status;
+        }
+        p->runner_copy_base = p->runner_output->nrows;
+        p->runner_copy_row = 0;
+        p->runner_copy_col = 0;
+        p->runner_copy_timestamp_bytes = 0;
+        if (p->runner_pending_batch->nrows
+            > p->runner_output_row_capacity - p->runner_copy_base) {
+            runner_fail(p, COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, ENOSPC);
+            runner_result(p, result);
+            return p->runner_status;
+        }
+    }
+
+    const col_rel_t *batch = p->runner_pending_batch;
+    col_rel_t *output = p->runner_output;
+    while (p->runner_copy_row < batch->nrows) {
+        while (p->runner_copy_col < batch->ncols) {
+            if (!remaining) {
+                p->runner_required_work = 1u;
+                goto progress;
+            }
+            col_join_batch_control_status_t status = runner_charge(*runner,
+                    p, 1u);
+            if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+                goto stopped;
+            output->columns[p->runner_copy_col]
+            [p->runner_copy_base + p->runner_copy_row]
+                = batch->columns[p->runner_copy_col][p->runner_copy_row];
+            --remaining;
+            ++p->runner_copy_col;
+        }
+        if (batch->timestamps) {
+            const uint32_t bytes = (uint32_t)sizeof(*batch->timestamps);
+            if (p->runner_copy_timestamp_bytes < bytes) {
+                uint32_t left = bytes - p->runner_copy_timestamp_bytes;
+                if (left > remaining) {
+                    p->runner_required_work = left;
+                    goto progress;
+                }
+                col_join_batch_control_status_t status = runner_charge(
+                    *runner, p, left);
+                if (status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+                    goto stopped;
+                memcpy(&output->timestamps[p->runner_copy_base
+                    + p->runner_copy_row],
+                    &batch->timestamps[p->runner_copy_row],
+                    bytes);
+                remaining -= left;
+                p->runner_copy_timestamp_bytes = bytes;
+            }
+        }
+        ++p->runner_copy_row;
+        p->runner_copy_col = 0;
+        p->runner_copy_timestamp_bytes = 0;
+    }
+
+    {
+        if (!remaining) {
+            p->runner_required_work = 1u;
+            goto progress;
+        }
+        col_join_batch_control_status_t charged = runner_charge(*runner, p,
+                1u);
+        if (charged != COL_JOIN_BATCH_CONTROL_PROGRESS)
+            goto stopped;
+        --remaining;
+        p->runner_internal = true;
+        int rc = col_join_batch_control_precommit(*runner,
+                p->runner_pending_generation);
+        p->runner_internal = false;
+        if (rc) {
+            runner_fail(p, p->controlled_status,
+                p->controlled_execution_status ? p->controlled_execution_status
+                : rc);
+            goto stopped;
+        }
+        /* Both operations are prevalidated, same-thread, and non-failing.
+         * The output relation is still private until DONE transfers ownership. */
+        output->nrows = p->runner_copy_base + batch->nrows;
+        wl_columnar_relation_touch_view(output);
+        p->runner_internal = true;
+        col_join_batch_control_ack_validated(*runner,
+            p->runner_pending_generation);
+        p->runner_internal = false;
+        p->runner_pending_batch = NULL;
+        p->runner_pending_generation = 0;
+    }
+progress:
+    runner_result(p, result);
+    return COL_JOIN_BATCH_CONTROL_PROGRESS;
+stopped:
+    runner_result(p, result);
+    return p->runner_status;
+}
+
+int
+col_join_batch_runner_discard(wl_columnar_continuation_t **runner)
+{
+    if (!runner || !*runner)
+        return EINVAL;
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(*runner);
+    if (!p || !p->runner_mode || !controlled_thread_is_owner(p)
+        || p->controlled_busy)
+        return EBUSY;
+    wl_columnar_continuation_destroy(*runner);
+    *runner = NULL;
     return 0;
 }
 

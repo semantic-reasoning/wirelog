@@ -3056,6 +3056,13 @@ int
 col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     const uint32_t *key_cols, uint32_t key_count,
     col_arrangement_pin_t *pin);
+/* Acquire the exact source reader and pin an already-built current primary
+ * arrangement. This function never builds/rebuilds an arrangement. */
+int
+col_session_pin_existing_arrangement(wl_session_t *sess,
+    const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
+    col_arrangement_pin_t *pin,
+    wl_columnar_source_access_reader_t *source_reader);
 void
 col_arrangement_pin_release(col_arrangement_pin_t *pin);
 /* Bind an already-built primary arrangement to its exact current source.

@@ -5868,6 +5868,82 @@ out:
 }
 
 static void
+test_controlled_join_runner_start_refusal_releases_inputs(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_evaluation_control_t *control = NULL;
+    int owner = 0;
+    wl_columnar_continuation_t *runner = NULL;
+    int rc;
+
+    TEST(
+        "runner start rejects missing arrangements and releases leases on refusal");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 3)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &owner) != 0
+        || wl_evaluation_control_begin(control, &owner) != 0) {
+        FAIL("fixture or control setup");
+        goto out;
+    }
+    rc = col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 2u * 32u, 6u, control,
+            wl_evaluation_control_active_attempt_id(control), &runner);
+    if (rc != ENOENT || runner || f.sess->arr_count != 0) {
+        FAIL("runner built a missing arrangement or retained a runner");
+        goto out;
+    }
+    if (!col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)) {
+        FAIL("arrangement warmup");
+        goto out;
+    }
+    rc = col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 2u * 32u, 1u << 20, control,
+            wl_evaluation_control_active_attempt_id(control), &runner);
+    if (rc != ENOSPC || runner) {
+        FAIL("capacity refusal was not reported without retaining a runner");
+        goto out;
+    }
+    if (col_rel_set(f.left, 0, 0, 99) != 0
+        || col_rel_set(f.right, 0, 0, 99) != 0) {
+        FAIL("partial start refusal leaked an input reader");
+        goto out;
+    }
+    if (!col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)) {
+        FAIL("arrangement rebuild after refusal");
+        goto out;
+    }
+    rc = col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 2u * 32u, 6u, control,
+            wl_evaluation_control_active_attempt_id(control), &runner);
+    if (rc != 0 || !runner
+        || col_rel_set(f.left, 0, 0, 100) != EBUSY
+        || col_rel_set(f.right, 0, 0, 100) != EBUSY) {
+        FAIL("active runner did not hold both source reader leases");
+        goto out;
+    }
+    if (col_join_batch_runner_discard(&runner) != 0 || runner
+        || col_rel_set(f.left, 0, 0, 100) != 0
+        || col_rel_set(f.right, 0, 0, 100) != 0) {
+        FAIL("discard did not release both source reader leases");
+        goto out;
+    }
+    PASS();
+out:
+    if (runner)
+        col_join_batch_runner_discard(&runner);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
 test_controlled_producer_work_limit(void)
 {
     fixture_t f;
@@ -5903,6 +5979,358 @@ test_controlled_producer_work_limit(void)
 out:
     if (cont)
         col_join_batch_control_discard(&cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_join_runner_copy_and_publish(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *runner = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status = COL_JOIN_BATCH_CONTROL_PROGRESS;
+    col_rel_t *completed = NULL, *oracle = NULL;
+    col_join_batch_cursor_t cursor;
+    uint64_t previous_work = 0;
+    uint64_t next_quantum = 1;
+    uint64_t expected_sequence = 0;
+    bool pending_batch = false;
+
+    TEST("controlled JOIN runner privately copies lanes and timestamps");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 3)
+        || col_rel_enable_timestamps(f.left) != 0
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_runner_start(f.sess, &f.op, f.left, true,
+        KEY0, KEY0, 1, 2u * 32u, 6u, control,
+        wl_evaluation_control_active_attempt_id(control), &runner) != 0) {
+        FAIL("fixture or runner start");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 0, &result, &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 0
+        || result.required_work != 0 || completed || f.out->nrows != 0) {
+        FAIL("zero quantum was not a true no-op");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 1, &result, &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 1
+        || completed) {
+        FAIL("one-unit scan did not make exactly bounded progress");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 1, &result, &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || result.work_ordinal != 2
+        || completed) {
+        FAIL("one-unit key setup did not make exactly bounded progress");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 1, &result, &completed);
+    uint64_t underfunded_ordinal = result.work_ordinal;
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS
+        || result.required_work != 9u || completed) {
+        FAIL("underfunded hash quantum did not report its action cost");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 1, &result, &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS
+        || result.work_ordinal != underfunded_ordinal
+        || result.required_work != 9u || completed) {
+        FAIL("repeated underfunded quantum changed runner state");
+        goto out;
+    }
+    previous_work = result.work_ordinal;
+    for (unsigned turns = 0; turns < 10000u; ++turns) {
+        next_quantum = result.required_work ? result.required_work : 1u;
+        status = col_join_batch_runner_advance(&runner, next_quantum, &result,
+                &completed);
+        if (result.work_ordinal < previous_work
+            || result.work_ordinal - previous_work > next_quantum) {
+            FAIL("advance exceeded its work allowance");
+            goto out;
+        }
+        previous_work = result.work_ordinal;
+        if (result.batch_generation)
+            pending_batch = true;
+        else if (pending_batch && runner) {
+            if (!col_join_batch_cursor_get(runner, &cursor)
+                || cursor.sequence != ++expected_sequence) {
+                FAIL("batch generation did not acknowledge exactly once");
+                goto out;
+            }
+            pending_batch = false;
+        }
+        if (status == COL_JOIN_BATCH_CONTROL_DONE)
+            break;
+        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || completed) {
+            FAIL("runner stopped before a complete private result");
+            goto out;
+        }
+        if (f.out->nrows != 0) {
+            FAIL("runner exposed output before DONE");
+            goto out;
+        }
+    }
+    oracle = run_oracle(f.sess, f.left, &f.op);
+    if (status != COL_JOIN_BATCH_CONTROL_DONE || runner || !completed
+        || !completed->timestamps || completed->nrows != 6u || !oracle
+        || !same_rows(oracle, completed) || f.out->nrows != 0
+        || expected_sequence == 0 || pending_batch
+        || result.work_ordinal == 0) {
+        FAIL("runner output differs from raw JOIN or lost timestamp shape");
+        goto out;
+    }
+    for (uint32_t row = 0; row < completed->nrows; ++row) {
+        col_delta_timestamp_t zero = { 0 };
+        if (memcmp(&completed->timestamps[row], &zero, sizeof(zero)) != 0) {
+            FAIL("runner did not preserve the producer's timestamp payload");
+            goto out;
+        }
+    }
+    PASS();
+out:
+    if (oracle)
+        col_rel_destroy(oracle);
+    if (completed)
+        col_rel_destroy(completed);
+    if (runner)
+        col_join_batch_runner_discard(&runner);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_join_runner_capacity_sticky(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0 };
+    wl_columnar_continuation_t *runner = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    col_rel_t *completed = NULL;
+
+    TEST("controlled JOIN runner capacity exhaustion is sticky ENOSPC");
+    if (!fixture_init(&f, 1u << 24, keys, 1, 1, 2)
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, 1u, control,
+        wl_evaluation_control_active_attempt_id(control), &runner) != 0) {
+        FAIL("fixture or runner start");
+        goto out;
+    }
+    status = COL_JOIN_BATCH_CONTROL_PROGRESS;
+    for (unsigned turns = 0; turns < 1000u
+        && status == COL_JOIN_BATCH_CONTROL_PROGRESS; ++turns)
+        status = col_join_batch_runner_advance(&runner, 32u, &result,
+                &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR
+        || result.execution_status != ENOSPC || completed
+        || col_join_batch_runner_advance(&runner, 32u, &result, &completed)
+        != COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR
+        || result.execution_status != ENOSPC || f.out->nrows != 0) {
+        FAIL("insufficient output capacity was not sticky and private");
+        goto out;
+    }
+    PASS();
+out:
+    if (completed)
+        col_rel_destroy(completed);
+    if (runner)
+        col_join_batch_runner_discard(&runner);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_join_runner_discard_partial_private_output(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *runner = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    col_rel_t *completed = NULL;
+    uint32_t visible_rows;
+
+    TEST("discard drops partial controlled JOIN output without publication");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 3)
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, 16u, control,
+        wl_evaluation_control_active_attempt_id(control), &runner) != 0) {
+        FAIL("fixture or runner start");
+        goto out;
+    }
+    visible_rows = f.out->nrows;
+    status = col_join_batch_runner_advance(&runner, 32u, &result,
+            &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || !runner || completed
+        || f.out->nrows != visible_rows
+        || col_join_batch_runner_discard(&runner) != 0 || runner
+        || f.out->nrows != visible_rows) {
+        FAIL("partial runner output escaped or survived discard");
+        goto out;
+    }
+    PASS();
+out:
+    if (completed)
+        col_rel_destroy(completed);
+    if (runner)
+        col_join_batch_runner_discard(&runner);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_join_runner_stale_attempt_charge(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *runner = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    wl_evaluation_control_report_t report;
+    col_rel_t *completed = NULL;
+    uint64_t second_attempt_id;
+
+    TEST("stale controlled JOIN runner cannot charge a successor attempt");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 3)
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, 16u, control,
+        wl_evaluation_control_active_attempt_id(control), &runner) != 0) {
+        FAIL("fixture or runner start");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 32u, &result,
+            &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || completed
+        || wl_evaluation_control_finish(control, &control_owner, 0, 0) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0) {
+        FAIL("could not move runner to a successor attempt");
+        goto out;
+    }
+    second_attempt_id = wl_evaluation_control_active_attempt_id(control);
+    status = col_join_batch_runner_advance(&runner, 32u, &result,
+            &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT
+        || result.execution_status != EINVAL || completed
+        || wl_evaluation_control_finish(control, &control_owner, 0, 0) != 0
+        || wl_evaluation_control_report(control, &report) != 0
+        || report.consumed != 0 || report.attempt_id != second_attempt_id) {
+        FAIL("stale runner changed successor attempt accounting");
+        goto out;
+    }
+    PASS();
+out:
+    if (completed)
+        col_rel_destroy(completed);
+    if (runner)
+        col_join_batch_runner_discard(&runner);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    fixture_fini(&f);
+}
+
+static void
+test_controlled_join_runner_cancel(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    wl_columnar_continuation_t *runner = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    col_join_batch_control_result_t result;
+    col_join_batch_control_status_t status;
+    col_rel_t *completed = NULL;
+
+    TEST("controlled JOIN runner observes cancellation between advances");
+    if (!fixture_init(&f, 1u << 24, keys, 2, 2, 3)
+        || !col_session_get_arrangement(&f.sess->base, "right", KEY0, 1)
+        || wl_evaluation_control_create(100000u, &control) != 0
+        || wl_evaluation_control_attach(control, &control_owner) != 0
+        || wl_evaluation_control_begin(control, &control_owner) != 0
+        || col_join_batch_runner_start(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 32u, 16u, control,
+        wl_evaluation_control_active_attempt_id(control), &runner) != 0) {
+        FAIL("fixture or runner start");
+        goto out;
+    }
+    status = col_join_batch_runner_advance(&runner, 32u, &result,
+            &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_PROGRESS || completed) {
+        FAIL("runner did not make initial progress");
+        goto out;
+    }
+    wl_evaluation_control_request_cancel(control);
+    status = col_join_batch_runner_advance(&runner, 32u, &result,
+            &completed);
+    if (status != COL_JOIN_BATCH_CONTROL_CANCELLED || completed
+        || f.out->nrows != 0) {
+        FAIL("runner did not stop privately after cancellation");
+        goto out;
+    }
+    PASS();
+out:
+    if (completed)
+        col_rel_destroy(completed);
+    if (runner)
+        col_join_batch_runner_discard(&runner);
     if (control) {
         if (wl_evaluation_control_active_attempt_id(control))
             (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
@@ -6339,6 +6767,12 @@ main(void)
     test_sink_denied_doubling_falls_back_to_exact();
     test_cross_key_collision_boundary();
     test_controlled_prepared_producer();
+    test_controlled_join_runner_copy_and_publish();
+    test_controlled_join_runner_capacity_sticky();
+    test_controlled_join_runner_discard_partial_private_output();
+    test_controlled_join_runner_stale_attempt_charge();
+    test_controlled_join_runner_cancel();
+    test_controlled_join_runner_start_refusal_releases_inputs();
     test_controlled_producer_work_limit();
     test_controlled_producer_cancel_and_stale_input();
     test_controlled_producer_cross_key_collision();

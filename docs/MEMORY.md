@@ -1292,6 +1292,28 @@ only after successful charges. WORK_LIMIT, CANCELLED, STALE_ATTEMPT, STALE_INPUT
 and execution errors are sticky and retain the exact execution errno where
 applicable.
 
+`col_join_batch_runner_start/advance/discard` is the opt-in caller for this
+producer. Start accepts only an already-built current arrangement and rejects
+a cache miss or stale entry without building/rebuilding it. It acquires source
+readers for both inputs, pins the exact right arrangement, then synchronously
+allocates and admits fixed-capacity private output. That capacity-proportional
+setup is outside the `advance` work allowance; start performs no input-row scan
+or hash construction. Each advance charges complete indivisible actions
+before work. Zero allowance is a true no-op. If a positive allowance cannot
+cover the next action, advance returns resumable progress with `required_work`
+and leaves cursors/output unchanged. Each ready batch is copied into the
+private result under the same attempt; no capacity growth is allowed. A batch
+remains unpublished while its copy is partial. Once complete, the runner
+validates input/attempt state, then publishes the private row count and
+generation-checked producer ACK in one no-fail section. The final attempt/input
+poll immediately before transfer is the completion linearization point; only
+DONE transfers the relation. Exceeding the fixed row capacity latches
+`EXECUTION_ERROR/ENOSPC`; discard is then required. Discard releases both
+source readers, arrangement lease, scratch/governor reservations, retained
+control reference, and private output exactly once. This runner is not wired
+into ordinary plan dispatch or STEP; arrangement construction and other JOIN
+families remain follow-on work.
+
 The controlled producer never grows its scratch: its batch row ceiling is the
 smaller of the prepared rows-per-batch and the already admitted scratch
 capacity. Each ready batch contains complete private rows. Repeated peek
@@ -1301,9 +1323,9 @@ reports that acknowledged cursor while bound; speculative scan progress and
 peek do not change it. Generic cancellation after bind is sticky before the
 arrangement lease is released. Discard releases the continuation's
 arrangement pin, scratch and descriptor reservations, and retained control
-reference. This is a producer-only prerequisite: the existing ordinary JOIN
-caller, output sink, publication boundary and end-to-end cancellation lifecycle
-are not routed through this API yet and remain follow-on work.
+reference. The runner remains an explicit opt-in prerequisite: ordinary JOIN
+dispatch, STEP publication and end-to-end cancellation lifecycle remain
+follow-on work.
 
 A non-differential eligible join is consumed batch by batch on the eval
 stack together with its tail (#1475, #1370): the longest prefix of the
