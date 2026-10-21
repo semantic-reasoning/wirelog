@@ -1354,6 +1354,20 @@ if it cannot finish. Worker cloning refuses a live constructor at either end.
 Whole controlled STEP and observer delivery remain disabled; this API does not
 claim complete #1821 coverage or enable public dispatch.
 
+### Attempt-controlled integer HASH in generated MAP/FILTER (#1821 increment)
+
+The internal attempt-controlled scalar path admits the generated unary
+`hash(int64)` opcode through framed relation MAP and FILTER. It hashes exactly
+the operand's native eight-byte `int64_t` representation with xxHash 0.8.4
+XXH3-64 and retains the established unsigned-hash-to-int64 lane behavior.
+The fixed eight-byte XXH3 implementation path has a 192-unit logical source
+tariff, charged before popping or reading the operand. A guarded poll follows
+the noninterruptible library call before the value is pushed. The tariff covers
+the fixed length-eight path and load/mix/avalanche operations; it is not a
+wall-clock or CPU-time guarantee. `hash(symbol)` / `HASH_S`, other digest
+opcodes, and variable-length operands remain unsupported by this attempt path.
+This narrow operator increment does not enable public STEP or complete #1821.
+
 ### Resumable signed-delta observer preparation (internal opt-in)
 
 `wl_columnar_eval_delta_observer_prepare_start`, `_prepare_advance` and
