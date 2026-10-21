@@ -28,10 +28,14 @@ typedef enum {
      * unambiguous successful return to its caller.  The cursor has already
      * advanced; retrying the batch would duplicate the side effect. */
     WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS,
+    /* Producer advanced private scan state without producing a batch. */
+    WL_COLUMNAR_CONTINUATION_PROGRESS,
 } wl_columnar_continuation_status_t;
 
 /* The identity and generation are opaque to this contract, but are copied
- * into every continuation so a producer can reject stale input explicitly. */
+ * into every continuation so a producer can reject stale input explicitly.
+ * Protocol producers may advance a private scan cursor through PROGRESS;
+ * wl_columnar_continuation_cursor() continues to report the published cursor. */
 typedef struct {
     uint64_t input_identity;
     uint64_t arrangement_identity;
@@ -61,6 +65,10 @@ typedef bool (*wl_columnar_continuation_validate_fn)(
 
 typedef void (*wl_columnar_continuation_destroy_fn)(void *context);
 typedef void (*wl_columnar_continuation_cancel_fn)(void *context);
+/* Infallible ownership handoff. committed=true acknowledges a durable batch;
+ * false disposes a batch that will not be retried. */
+typedef void (*wl_columnar_continuation_disposition_fn)(void *context,
+    const wl_columnar_continuation_batch_t *batch, bool committed);
 
 typedef struct {
     void *context;
@@ -68,13 +76,22 @@ typedef struct {
     wl_columnar_continuation_validate_fn validate;
     wl_columnar_continuation_destroy_fn destroy;
     wl_columnar_continuation_cancel_fn cancel;
+    /* Enables resumable scan/publish cursors and frozen pending batches.
+     * Omit to retain the legacy one-call producer contract. */
+    wl_columnar_continuation_disposition_fn disposition;
 } wl_columnar_continuation_producer_t;
+
+/* Producers with a disposition callback use the resumable protocol:
+ * PROGRESS carries no payload and advances only private scan state; an OK
+ * non-empty batch remains frozen until disposition receives exactly one
+ * committed or dropped outcome. Producers without disposition retain the
+ * legacy one-call/rebuild behavior. */
 
 /* begin/append/abort are synchronous.  abort must release the reservation
  * made by the current begin/reserve transaction.  reserve must account for
  * all bytes that become visible at append time (payload, metadata and sink scratch).
  * commit reports whether its side effects became durable even when it returns
- * COMMIT_FAILURE.  A committed side effect advances the cursor and is
+ * COMMIT_FAILURE.  A committed side effect advances the published cursor and is
  * reported as COMMIT_AMBIGUOUS when the return status is not OK; callers must
  * not retry that batch. */
 typedef wl_columnar_continuation_status_t
