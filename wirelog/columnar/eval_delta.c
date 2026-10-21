@@ -794,6 +794,7 @@ wl_columnar_eval_delta_reserve(wl_col_session_t *sess, uint64_t bytes,
 typedef struct {
     const char *capture_name;
     char *name;
+    size_t name_length;
     int64_t *rows;
     int64_t *current;
     uint32_t nrows, ncols;
@@ -1037,15 +1038,20 @@ enum wl_columnar_eval_delta_build_phase {
 struct wl_columnar_eval_delta_observer_build {
     uintptr_t identity;
     wl_col_session_t *session;
+    const wl_plan_t *plan;
+    uint32_t plan_stratum_count;
     wl_columnar_eval_delta_observer_t *observer;
     wl_columnar_memory_reservation_t metadata;
     wl_columnar_relation_reader_step_t reader;
     wl_columnar_memory_governor_ref_t *governor;
     int error;
     col_rel_t *sources[3];
+    const char *current_name;
+    const char *prior_name;
+    const char *duplicate_name;
     uint64_t mask, metadata_bytes, payload_bytes, entry_rows;
     size_t length, offset, zero;
-    uint32_t si, ri, registry, kind, count, duplicate;
+    uint32_t si, ri, current_relation_count, registry, kind, count, duplicate;
     uint32_t duplicate_si, duplicate_ri;
     uint32_t row, copied, sort_begin, sort_end, heap_size, heap_root,
         heap_child, i, j, out;
@@ -1097,6 +1103,8 @@ wl_columnar_eval_delta_observer_build_start(wl_col_session_t *sess,
         return ENOMEM;
     b->identity = (uintptr_t)b;
     b->session = sess;
+    b->plan = sess->plan;
+    b->plan_stratum_count = sess->plan->stratum_count;
     b->mask = mask;
     b->preflight = true;
     wl_columnar_memory_reservation_init(&b->metadata);
@@ -1105,17 +1113,85 @@ wl_columnar_eval_delta_observer_build_start(wl_col_session_t *sess,
 }
 
 static int
+wl_columnar_eval_delta_build_current_name(
+    const wl_columnar_eval_delta_observer_build_t *b,
+    const wl_plan_t *plan, const char **name)
+{
+    if (!plan || plan != b->plan
+        || plan->stratum_count != b->plan_stratum_count
+        || (plan->stratum_count && !plan->strata)
+        || b->si >= plan->stratum_count)
+        return EINVAL;
+    const wl_plan_stratum_t *stratum = &plan->strata[b->si];
+    if ((stratum->relation_count && !stratum->relations)
+        || stratum->relation_count != b->current_relation_count
+        || b->ri >= stratum->relation_count)
+        return EINVAL;
+    *name = stratum->relations[b->ri].name;
+    return *name && *name == b->current_name ? 0 : EINVAL;
+}
+
+static int
 wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
     wl_columnar_eval_delta_observer_build_t *b)
 {
     const wl_plan_t *plan = sess->plan;
     wl_columnar_eval_delta_observer_t *o = b->observer;
-    wl_columnar_eval_delta_observer_entry_t *e =
-        o && b->phase > WL_COLUMNAR_DELTA_BUILD_ZERO && o->count
-        ? &o->entries[o->count - 1] : NULL;
-    const char *name = b->si < plan->stratum_count
-        && b->ri < plan->strata[b->si].relation_count
-        ? plan->strata[b->si].relations[b->ri].name : NULL;
+    wl_columnar_eval_delta_observer_entry_t *e = NULL;
+    const char *name = NULL;
+    bool observer_phase = b->phase == WL_COLUMNAR_DELTA_BUILD_ZERO
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_PAYLOAD
+        || (b->phase >= WL_COLUMNAR_DELTA_BUILD_DUP
+        && b->phase <= WL_COLUMNAR_DELTA_BUILD_READY
+        && b->phase != WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP);
+    bool observer_initialized = observer_phase
+        && b->phase != WL_COLUMNAR_DELTA_BUILD_ZERO;
+    if (b->identity != (uintptr_t)b || b->session != sess
+        || !plan || plan != b->plan
+        || plan->stratum_count != b->plan_stratum_count
+        || (plan->stratum_count && !plan->strata)
+        || b->phase > WL_COLUMNAR_DELTA_BUILD_READY)
+        return EINVAL;
+    if (observer_phase) {
+        if (!o || o != b->observer)
+            return EINVAL;
+        if (observer_initialized && o->count > b->count)
+            return EINVAL;
+        if (observer_initialized && o->count)
+            e = &o->entries[o->count - 1];
+    }
+    switch (b->phase) {
+    case WL_COLUMNAR_DELTA_BUILD_NAME:
+    case WL_COLUMNAR_DELTA_BUILD_LOOKUP:
+    case WL_COLUMNAR_DELTA_BUILD_SCHEMA:
+    case WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP:
+    case WL_COLUMNAR_DELTA_BUILD_DUP:
+    case WL_COLUMNAR_DELTA_BUILD_ENTRY:
+    case WL_COLUMNAR_DELTA_BUILD_NAME_COPY:
+    case WL_COLUMNAR_DELTA_BUILD_ROWS:
+    case WL_COLUMNAR_DELTA_BUILD_ACQUIRE:
+    case WL_COLUMNAR_DELTA_BUILD_COPY:
+    case WL_COLUMNAR_DELTA_BUILD_RELEASE:
+    case WL_COLUMNAR_DELTA_BUILD_SORT:
+    case WL_COLUMNAR_DELTA_BUILD_SUBTRACT:
+    case WL_COLUMNAR_DELTA_BUILD_UNIQUE:
+        if (wl_columnar_eval_delta_build_current_name(b, plan, &name) != 0)
+            return EINVAL;
+        break;
+    default:
+        break;
+    }
+    if ((b->phase == WL_COLUMNAR_DELTA_BUILD_NAME_COPY
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_ROWS
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_ACQUIRE
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_COPY
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_RELEASE
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_SORT
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_SUBTRACT
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_UNIQUE)
+        && (!o || !o->count || !e || !e->name
+        || e->name_length != b->length))
+        return EINVAL;
     switch (b->phase) {
     case WL_COLUMNAR_DELTA_BUILD_HEAD:
         if (b->si == plan->stratum_count) {
@@ -1126,13 +1202,17 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         if (!plan->strata || (plan->strata[b->si].relation_count
             && !plan->strata[b->si].relations))
             return EINVAL;
-        if (b->ri == plan->strata[b->si].relation_count) {
+        b->current_relation_count = plan->strata[b->si].relation_count;
+        if (b->ri > b->current_relation_count)
+            return EINVAL;
+        if (b->ri == b->current_relation_count) {
             b->si++;
             b->ri = 0;
             return 0;
         }
-        if (!name)
+        if (!plan->strata[b->si].relations[b->ri].name)
             return EINVAL;
+        b->current_name = plan->strata[b->si].relations[b->ri].name;
         b->length = 0;
         b->kind = 0;
         b->sources[0] = b->sources[1] = b->sources[2] = NULL;
@@ -1153,6 +1233,9 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         /* Raw seed/retired lookup uses a 256-byte prefixed name. Preserve
          * that absence rule without snprintf or an unbounded string scan. */
         size_t prefix = b->kind == 1 ? 5 : b->kind == 2 ? 4 : 0;
+        if (b->kind >= 3 || b->length == SIZE_MAX
+            || b->offset > prefix + b->length || (sess->nrels && !sess->rels))
+            return EINVAL;
         if (b->registry == sess->nrels ||
             (prefix && b->length >= 256 - prefix)){
             b->phase = WL_COLUMNAR_DELTA_BUILD_SCHEMA;
@@ -1201,6 +1284,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         if (b->preflight) {
             b->duplicate_si = 0;
             b->duplicate_ri = 0;
+            b->prior_name = NULL;
             b->offset = 0;
             b->phase = WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP;
         } else {
@@ -1212,11 +1296,17 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
     }
     case WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP:
         while (b->duplicate_si < plan->stratum_count) {
+            if (!plan->strata)
+                return EINVAL;
             const wl_plan_stratum_t *previous_stratum =
                 &plan->strata[b->duplicate_si];
+            if (previous_stratum->relation_count
+                && !previous_stratum->relations)
+                return EINVAL;
             if (b->duplicate_ri >= previous_stratum->relation_count) {
                 b->duplicate_si++;
                 b->duplicate_ri = 0;
+                b->prior_name = NULL;
                 return 0;
             }
             if (b->duplicate_si > b->si
@@ -1225,6 +1315,10 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
                 break;
             const char *previous =
                 previous_stratum->relations[b->duplicate_ri].name;
+            if (!previous || (b->prior_name && previous != b->prior_name)
+                || b->offset > b->length)
+                return EINVAL;
+            b->prior_name = previous;
             char current_char = name[b->offset];
             char previous_char = previous[b->offset];
             if (current_char != previous_char) {
@@ -1235,11 +1329,14 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
                     b->duplicate_si++;
                     b->duplicate_ri = 0;
                 }
+                b->prior_name = NULL;
                 b->offset = 0;
                 return 0;
             }
             if (!current_char) {
                 b->ri++;
+                b->current_name = NULL;
+                b->prior_name = NULL;
                 b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
                 return 0;
             }
@@ -1255,10 +1352,14 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
                 return EOVERFLOW;
             b->count++;
             b->ri++;
+            b->current_name = NULL;
+            b->prior_name = NULL;
             b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
         }
         return 0;
     case WL_COLUMNAR_DELTA_BUILD_ALLOC: {
+        if (o || b->observer)
+            return EINVAL;
         uint64_t bytes;
         if (!wl_columnar_memory_size_mul(b->count, sizeof(*e), &bytes)
             || !wl_columnar_memory_size_add(bytes, sizeof(*o), &bytes)
@@ -1275,6 +1376,8 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         return 0;
     }
     case WL_COLUMNAR_DELTA_BUILD_ZERO:
+        if (!o || b->zero >= b->metadata_bytes)
+            return EINVAL;
         ((unsigned char *)o)[b->zero++] = 0;
         if (b->zero == b->metadata_bytes) {
             wl_columnar_memory_reservation_init(&o->metadata);
@@ -1294,6 +1397,8 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         }
         return 0;
     case WL_COLUMNAR_DELTA_BUILD_PAYLOAD: {
+        if (!o || o->count || o->metadata_bytes != b->metadata_bytes)
+            return EINVAL;
         int rc = wl_columnar_eval_delta_reserve(sess, b->payload_bytes,
                 &o->payload);
         if (rc) return rc;
@@ -1304,22 +1409,46 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         return 0;
     }
     case WL_COLUMNAR_DELTA_BUILD_DUP:
+        if (!o || o->count > b->count || b->duplicate > o->count
+            || b->offset > b->length)
+            return EINVAL;
         if (b->duplicate == o->count) {
+            b->duplicate_name = NULL;
             b->phase = WL_COLUMNAR_DELTA_BUILD_ENTRY;
         } else {
+            wl_columnar_eval_delta_observer_entry_t *previous =
+                &o->entries[b->duplicate];
+            if (!previous->name || (b->duplicate_name
+                && previous->name != b->duplicate_name)
+                || b->offset > previous->name_length)
+                return EINVAL;
+            b->duplicate_name = previous->name;
             char a = name[b->offset];
-            char c = o->entries[b->duplicate].name[b->offset];
+            char c = previous->name[b->offset];
             if (a != c) {
                 b->duplicate++; b->offset = 0;
+                b->duplicate_name = NULL;
             }else if (!a) {
-                b->ri++; b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+                b->ri++; b->current_name = NULL;
+                b->duplicate_name = NULL;
+                b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
             }else b->offset++;
         }
         return 0;
     case WL_COLUMNAR_DELTA_BUILD_ENTRY:
+        if (!o || o->count >= b->count || b->length == SIZE_MAX)
+            return EINVAL;
+        if (!b->sources[0]
+            || !wl_columnar_eval_delta_build_schema(b->sources[0])
+            || (b->sources[1]
+            && !wl_columnar_eval_delta_build_schema(b->sources[1]))
+            || (b->sources[2]
+            && !wl_columnar_eval_delta_build_schema(b->sources[2])))
+            return ENOTSUP;
         e = &o->entries[o->count];
         e->name = malloc(b->length + 1);
         if (!e->name) return ENOMEM;
+        e->name_length = b->length;
         o->count++;
         e->ncols = 1;
         e->nrows = b->sources[0]->nrows
@@ -1330,10 +1459,19 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         b->phase = WL_COLUMNAR_DELTA_BUILD_NAME_COPY;
         return 0;
     case WL_COLUMNAR_DELTA_BUILD_NAME_COPY:
+        if (!e || !e->name || b->offset > b->length)
+            return EINVAL;
         e->name[b->offset] = name[b->offset];
         if (b->offset++ == b->length) b->phase = WL_COLUMNAR_DELTA_BUILD_ROWS;
         return 0;
-    case WL_COLUMNAR_DELTA_BUILD_ROWS:
+    case WL_COLUMNAR_DELTA_BUILD_ROWS: {
+        uint64_t row_bytes;
+        if (!e || !e->name || e->rows)
+            return EINVAL;
+        if (e->nrows > UINT32_MAX - e->pending_nrows
+            || !wl_columnar_eval_delta_observer_row_bytes(
+                e->nrows + e->pending_nrows, 1, &row_bytes))
+            return EOVERFLOW;
         if (e->nrows + e->pending_nrows) {
             e->rows = malloc((size_t)(e->nrows + e->pending_nrows) *
                     sizeof(int64_t));
@@ -1342,12 +1480,23 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         b->kind = b->row = b->copied = 0;
         b->phase = WL_COLUMNAR_DELTA_BUILD_ACQUIRE;
         return 0;
+    }
     case WL_COLUMNAR_DELTA_BUILD_COPY: {
+        if (!e || b->kind >= 3 || !b->sources[b->kind])
+            return EINVAL;
         col_rel_t *r = b->sources[b->kind];
+        if (!wl_columnar_eval_delta_build_schema(r))
+            return ENOTSUP;
         uint32_t start = b->kind == 2 ? r->base_nrows : 0;
-        if (b->row ==
-            r->nrows - start) b->phase = WL_COLUMNAR_DELTA_BUILD_RELEASE;
-        else e->rows[b->copied++] = r->columns[0][start + b->row++];
+        if (start > r->nrows || b->row > r->nrows - start
+            || b->copied > e->nrows + e->pending_nrows)
+            return EINVAL;
+        if (b->row == r->nrows - start)
+            b->phase = WL_COLUMNAR_DELTA_BUILD_RELEASE;
+        else {
+            if (!e->rows) return EINVAL;
+            e->rows[b->copied++] = r->columns[0][start + b->row++];
+        }
         return 0;
     }
     case WL_COLUMNAR_DELTA_BUILD_SORT:
@@ -1421,6 +1570,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
     case WL_COLUMNAR_DELTA_BUILD_UNIQUE:
         if (b->i == e->nrows) {
             e->nrows = b->out; b->ri++;
+            b->current_name = NULL;
             b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
         } else {
             int64_t v = e->rows[b->i++];
@@ -1428,6 +1578,10 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         }
         return 0;
     case WL_COLUMNAR_DELTA_BUILD_COMMIT:
+        if (!o || o->count != b->count
+            || o->metadata_bytes != b->metadata_bytes
+            || o->payload_bytes != b->payload_bytes)
+            return EINVAL;
         if (o->governor && (!wl_columnar_memory_commit(&o->metadata, o)
             || (o->payload_bytes && !wl_columnar_memory_commit(&o->payload,
             o))))
@@ -1449,7 +1603,9 @@ wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
     *ready = false;
     wl_columnar_eval_delta_observer_build_t *b = sess->delta_observer_build;
     if (!b || b->identity != (uintptr_t)b || b->session != sess
-        || sess->delta_observer)
+        || sess->delta_observer || sess->plan != b->plan
+        || !b->plan || b->plan->stratum_count != b->plan_stratum_count
+        || (b->plan->stratum_count && !b->plan->strata))
         return EINVAL;
     if (b->error) return b->error;
     int rc;
