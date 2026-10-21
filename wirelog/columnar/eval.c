@@ -7883,9 +7883,52 @@ done:
 }
 
 /*
+ * tdd_nonrec_stratum_row_local:
+ * Whether every relation plan of @sp is built only from operators that
+ * derive each output row from one input row, plus CONSOLIDATE, whose
+ * duplicates across workers the merge removes.  tdd_init_workers partitions
+ * every coordinator relation by column 0, so a derivation stays on one
+ * worker only when it reads one row.  A stratum with a join, antijoin,
+ * semijoin, aggregate or LFTJ can give results different from one worker
+ * under that partition (#2134), so it is evaluated as a snapshot evaluates
+ * it.  An EXCHANGE counts only when it does not redistribute
+ * (num_workers <= 1).
+ */
+static bool
+tdd_nonrec_stratum_row_local(const wl_plan_stratum_t *sp)
+{
+    for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+        const wl_plan_relation_t *rp = &sp->relations[ri];
+        for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+            const wl_plan_op_t *op = &rp->ops[oi];
+            switch (op->op) {
+            case WL_PLAN_OP_VARIABLE:
+            case WL_PLAN_OP_MAP:
+            case WL_PLAN_OP_FILTER:
+            case WL_PLAN_OP_CONCAT:
+            case WL_PLAN_OP_CONSOLIDATE:
+                break;
+            case WL_PLAN_OP_EXCHANGE: {
+                const wl_plan_op_exchange_t *meta
+                    = (const wl_plan_op_exchange_t *)op->opaque_data;
+                if (!meta || meta->num_workers > 1)
+                    return false;
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/*
  * col_eval_stratum_tdd_nonrecursive:
  * Non-recursive distributed path: PARTITION → DISPATCH → BARRIER →
- * CONSOLIDATE (no exchange needed for non-recursive rules).
+ * CONSOLIDATE (no exchange needed for non-recursive rules).  Only a stratum
+ * that tdd_nonrec_stratum_row_local accepts is partitioned; any other is
+ * evaluated by col_eval_stratum on the coordinator (#2134).
  */
 static int
 col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
@@ -7894,7 +7937,8 @@ col_eval_stratum_tdd_nonrecursive(const wl_plan_stratum_t *sp,
     uint32_t W = coord->num_workers;
     int rc;
 
-    W = tdd_choose_active_workers(sp, coord, W, false);
+    W = tdd_nonrec_stratum_row_local(sp)
+        ? tdd_choose_active_workers(sp, coord, W, false) : 1;
     if (W <= 1) {
         tdd_record_active_workers(coord, 1);
         return col_eval_stratum(sp, coord, stratum_idx);

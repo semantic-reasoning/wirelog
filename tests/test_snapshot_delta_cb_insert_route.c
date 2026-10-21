@@ -20,16 +20,18 @@
  * left.  The reference model at each read comes from a new session with no
  * callback and one worker, given the values added so far, less any
  * removed, and read by one snapshot, so it evaluates in full.  One worker,
- * because plain steps and snapshots at more workers are not yet a sound
- * reference for these programs (#2134, #2135).  The case requires
+ * so the reference never shares the multi-worker code path under test.
+ * The case requires
  *   - each snapshot after an add to take the insert route or not, as the
  *     case's route field says;
  *   - the reference model after every snapshot;
  *   - no delta events from a snapshot, and from each step the difference
  *     between the reference models before and after it, or none once the
  *     callback is cleared.
- * Cases with clear set clear the callback after adding 9.  Every case runs
- * with the callback session created with one worker and with four.
+ * Cases with clear set clear the callback after adding 9, so the steps
+ * that follow are plain steps, which every such case checks at four
+ * workers; the two joins among them failed there before #2134.  Every case
+ * runs with the callback session created with one worker and with four.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -184,6 +186,13 @@ static const case_t CASES[] = {
     { "callback cleared with a removal staged", false,
       E_R ".decl p(a: int64, b: int64)\np(x, x) :- r(x).\n", false, true,
       true },
+    { "join of two rule heads, callback cleared", false,
+      E_R ".decl q(x: int64)\n.decl p(a: int64, b: int64)\n"
+      "q(x) :- e(x), x > 7.\np(x, y) :- r(x), q(y).\n", true, false, true },
+    { "join of a rule head with a compound, callback cleared", true,
+      F_DECL ".decl r(x: int64)\n.decl m(a: int64, b: int64)\n"
+      "r(A) :- __compound_f_1(H, A).\n"
+      "m(A, B) :- r(A), __compound_f_1(G, B), A > B.\n", true, false, true },
 };
 
 static char message[256];
