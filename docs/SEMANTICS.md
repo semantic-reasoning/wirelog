@@ -623,7 +623,7 @@ testing the actual optimizer pipeline.
 - `tests/test_optimizer_equivalence.c` — 16-combination equivalence matrix.
 - `stable-release-plan.md` — v0.43 milestone scope.
 
-## Evaluation-control foundation (#1819; engine integration pending)
+## Evaluation-control foundation and controlled initial STEP (#1819, #1821)
 
 `wirelog/evaluation_control.h` is internal and uninstalled. It provides a
 retained control, exclusive logical-session ownership, attempt accounting,
@@ -633,12 +633,31 @@ memory-governor/Windows-handle behavior. Creation normalizes a verified prefix
 into a full v3 object; v2 unknown tails are ignored. Options storage is borrowed
 only during creation. A control on a backend without the options hook is refused.
 
-**Controlled evaluation is not implemented yet.** An attached control makes
-`wl_session_step()` and `wl_session_snapshot()` return `ENOTSUP` before backend
-evaluation, even when its limit is zero. Calls without a control retain existing
-behavior. #1820 owns recovery, #1821/#1822 own engine instrumentation, and #1823
-owns installed APIs. This foundation does not close #1817 or expose a partially
-enforced public option.
+An attached control enables a limited controlled initial `wl_session_step()`
+for an acyclic plan using the columnar backend. Before evaluation, the session
+checks every stratum, rule head, and operator kind. Recursive plans, callbacks,
+parallel execution, differential/retraction state, unsupported operator kinds,
+and pre-existing rule-head relations return `ENOTSUP` without evaluation. The
+framed evaluator validates each operator's detailed metadata before executing
+that operator; a later execution error can therefore follow an already
+published rule prefix. A work stop at a rule boundary preserves that committed
+prefix, and a fresh STEP attempt resumes at the first unfinished rule.
+Repeated STEP after full completion is a semantic no-op. Because incremental
+re-evaluation is not implemented in this slice, session mutations remain
+`EBUSY` after completion until the session is destroyed. Snapshot is
+`ENOTSUP` before a controlled STEP, and `EBUSY` while it is pending or complete.
+Uncontrolled sessions retain existing behavior.
+
+When framed host setup or cleanup must be retried, STEP returns `EAGAIN` with
+the original operation attempt active. Only another `wl_session_step()` may
+resume it; other session operations and control reset/configure return `EBUSY`
+while that attempt is active. Once a work stop finishes the attempt, control
+reset/configure may raise or remove its limit, but other session operations
+remain `EBUSY` until the logical STEP completes. Session destruction drains an
+active framed continuation before releasing session storage. This controlled
+initial-step slice does not complete whole-session recovery, observer delivery,
+recursive, differential, weighted, TDD/parallel, or every fallback path, and
+does not close #1817 or expose an installed public option.
 
 ### Implemented primitive contract
 
@@ -1375,8 +1394,8 @@ under external serialization. Invalid or corrupted authority remains reachable
 and returns an error; it is not cleared to manufacture successful cleanup.
 Session destruction drains this continuation before relation storage and aborts
 if it cannot finish. Worker cloning refuses a live constructor at either end.
-Whole controlled STEP and observer delivery remain disabled; this API does not
-claim complete #1821 coverage or enable public dispatch.
+This baseline constructor is an internal preparation primitive; by itself it
+does not claim complete #1821 coverage or enable unrestricted public dispatch.
 
 ### Attempt-controlled integer HASH in generated MAP/FILTER (#1821 increment)
 
@@ -1417,5 +1436,10 @@ discard drains the continuation. Only EAGAIN and WORK_LIMIT retain a resumable
 cursor; cancellation is sticky and requires discard.
 If a work-limit stop lands after staging credit commits, that completion state
 is retained and a fresh attempt completes READY without committing twice.
-This is still a preparation primitive, not whole controlled STEP or callback
-scheduling, and does not complete #1821 acceptance coverage.
+This is still a preparation primitive, not whole-plan observer delivery or
+callback scheduling, and does not complete #1821 acceptance coverage.
+
+Whole-plan observer delivery, recursive STEP, and other unsupported controlled
+execution paths remain disabled. The controlled initial single-rule STEP
+entrypoint is documented above; this increment does not claim complete #1821
+coverage or enable unrestricted public dispatch.

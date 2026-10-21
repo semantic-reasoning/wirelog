@@ -32,6 +32,8 @@ struct wl_session_admission {
     wl_mutex_t mutex;
     wl_cond_t idle;
     size_t active_operations;
+    bool controlled_step_pending;
+    bool controlled_step_complete;
     bool closing;
 };
 
@@ -72,13 +74,56 @@ wl_session_operation_begin(wl_session_t *session)
         return 0;
 
     wl_mutex_lock(&admission->mutex);
-    if (admission->closing) {
+    if (admission->closing || admission->controlled_step_pending
+        || admission->controlled_step_complete) {
         wl_mutex_unlock(&admission->mutex);
         return EBUSY;
     }
     admission->active_operations++;
     wl_mutex_unlock(&admission->mutex);
     return 0;
+}
+
+/* A controlled step owns the session across calls while its framed host
+ * continuation is pending. Admit the first call only from a quiescent
+ * session; a resume is the only public operation allowed through the gate. */
+static int
+wl_session_operation_begin_step(wl_session_t *session)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    if (!admission)
+        return 0;
+
+    wl_mutex_lock(&admission->mutex);
+    if (admission->closing || admission->active_operations != 0) {
+        wl_mutex_unlock(&admission->mutex);
+        return EBUSY;
+    }
+    admission->controlled_step_pending = true;
+    admission->active_operations++;
+    wl_mutex_unlock(&admission->mutex);
+    return 0;
+}
+
+static void
+wl_session_operation_end_step(wl_session_t *session,
+    wl_controlled_step_state_t state, bool continuation_pending)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    if (!admission)
+        return;
+
+    wl_mutex_lock(&admission->mutex);
+    admission->active_operations--;
+    admission->controlled_step_pending = continuation_pending
+        || state == WL_CONTROLLED_STEP_PENDING;
+    if (state == WL_CONTROLLED_STEP_COMPLETE)
+        admission->controlled_step_complete = true;
+    else if (state == WL_CONTROLLED_STEP_IDLE)
+        admission->controlled_step_complete = false;
+    if (admission->closing && admission->active_operations == 0)
+        wl_cond_signal(&admission->idle);
+    wl_mutex_unlock(&admission->mutex);
 }
 
 static void
@@ -450,17 +495,30 @@ wl_session_step(wl_session_t *session)
     int rc;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    bool controlled = session->evaluation_control != NULL;
+    rc = controlled ? wl_session_operation_begin_step(session)
+                    : wl_session_operation_begin(session);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_step
         || session->input_load_failed)
         rc = -1;
-    else if (session->evaluation_control)
-        rc = ENOTSUP; /* #1820-#1822 replace after complete enforcement. */
     else
         rc = session->backend->session_step(session);
-    wl_session_operation_end(session);
+    if (controlled) {
+        bool pending = rc == EAGAIN
+            && wl_evaluation_control_active_attempt_id(
+            session->evaluation_control) != 0;
+        if (rc == EAGAIN && !pending)
+            rc = EIO;
+        wl_controlled_step_state_t state =
+            session->backend->session_controlled_step_state
+            ? session->backend->session_controlled_step_state(session)
+            : WL_CONTROLLED_STEP_IDLE;
+        wl_session_operation_end_step(session, state, pending);
+    } else {
+        wl_session_operation_end(session);
+    }
     return rc;
 }
 

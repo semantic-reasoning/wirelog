@@ -25,6 +25,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+struct wl_columnar_controlled_step {
+    wl_columnar_eval_serial_framed_host_reply_t reply;
+    wl_evaluation_control_t *previous_funding;
+    uint64_t operation_id, operation_identity;
+    uint64_t previous_funding_id;
+    uint32_t stratum_index;
+    uint32_t relation_index;
+    wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
+    int previous_protocol;
+    int primary_result;
+    bool operation_active;
+    bool relation_active;
+    bool previous_valid;
+    bool refused;
+    bool complete;
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+int wl_columnar_session_test_fail_framed_funding_before_stop;
+int wl_columnar_session_test_fail_framed_funding_after_stop;
+int wl_columnar_session_test_exhaust_after_relation;
+#endif
+
+static int wl_columnar_session_controlled_step_drain_for_destroy(
+    wl_col_session_t *sess);
+
 /* Platform-specific memory detection headers (Issue #221) */
 #ifdef __linux__
 #include <sys/sysinfo.h>
@@ -3595,6 +3621,13 @@ col_session_destroy(wl_session_t *session)
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->controlled_step
+        && wl_columnar_session_controlled_step_drain_for_destroy(sess) != 0) {
+        fputs(
+            "wirelog: controlled step cleanup failed during session destroy\n",
+            stderr);
+        abort();
+    }
     if (sess->kfusion_pending_cohort
         && wl_columnar_kfusion_retry_pending(sess) != 0) {
         fputs(
@@ -5797,15 +5830,453 @@ col_session_reset_snapshot_profile(wl_col_session_t *sess)
     sess->tdd_decision_tracking_active = false;
 }
 
-/* Whole-session wrappers cannot carry a framed progress receipt. Reject
- * attached controls before begin/impl/finish; aware relation hosts own those
- * operation boundaries themselves. Raw session behavior remains synchronous. */
+static bool
+col_controlled_step_controlled_op(const wl_plan_op_t *op)
+{
+    switch (op->op) {
+    case WL_PLAN_OP_VARIABLE:
+    case WL_PLAN_OP_MAP:
+    case WL_PLAN_OP_FILTER:
+    case WL_PLAN_OP_JOIN:
+    case WL_PLAN_OP_ANTIJOIN:
+    case WL_PLAN_OP_REDUCE:
+    case WL_PLAN_OP_CONCAT:
+    case WL_PLAN_OP_CONSOLIDATE:
+    case WL_PLAN_OP_SEMIJOIN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool
+col_controlled_step_target_exists(const wl_col_session_t *sess,
+    const char *name, wl_evaluation_control_t *control, uint64_t id,
+    int *error)
+{
+    for (uint32_t i = 0; i < sess->nrels; ++i) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc) {
+            *error = rc;
+            return false;
+        }
+        const col_rel_t *rel = sess->rels ? sess->rels[i] : NULL;
+        if (rel && rel->name && name && strcmp(rel->name, name) == 0)
+            return true;
+    }
+    *error = wl_evaluation_control_active_attempt_id(control) ==
+        id ? 0 : EINVAL;
+    return false;
+}
+
+static int
+col_controlled_step_preflight(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    const wl_plan_t *plan = sess->plan;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint64_t id = step->operation_id;
+    if (!plan || !plan->strata || !control || !id || sess->delta_cb
+        || sess->delta_observer || sess->current_iteration
+        || sess->retraction_seeded || sess->retraction_right_pass
+        || sess->tdd_input_run || sess->tdd_subpass_active
+        || sess->tdd_outbound_only_active || sess->diff_operators_active
+        || sess->join_batch_bytes || sess->join_output_shared_count
+        || sess->coordinator || sess->num_workers > 1
+        || sess->cleanup_active || sess->cleanup_pending
+        || wl_columnar_eval_delta_rollback_active(sess)
+        || wl_columnar_eval_delta_observer_active(sess))
+        return ENOTSUP;
+
+    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+        const wl_plan_stratum_t *stratum = &plan->strata[si];
+        if (stratum->is_recursive
+            || (stratum->relation_count && !stratum->relations))
+            return ENOTSUP;
+        for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
+            int rc = wl_evaluation_control_charge(control, 1);
+            if (rc) return rc;
+            const wl_plan_relation_t *relation = &stratum->relations[ri];
+            if (!relation->name || !relation->ops || !relation->op_count
+                || relation->ops[relation->op_count - 1].op
+                != WL_PLAN_OP_CONSOLIDATE)
+                return ENOTSUP;
+            for (uint32_t oi = 0; oi < relation->op_count; ++oi) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) return rc;
+                if (!col_controlled_step_controlled_op(&relation->ops[oi]))
+                    return ENOTSUP;
+            }
+            int lookup_error = 0;
+            bool exists = col_controlled_step_target_exists(sess,
+                    relation->name, control, id, &lookup_error);
+            if (lookup_error) return lookup_error;
+            bool committed_prefix = si < step->stratum_index
+                || (si == step->stratum_index
+                && ri < step->relation_index) || step->complete;
+            if (exists != committed_prefix) return ENOTSUP;
+        }
+    }
+    return wl_evaluation_control_active_attempt_id(control) == id ? 0 : EINVAL;
+}
+
+static void
+col_controlled_step_grant_release(wl_columnar_controlled_step_t *step,
+    wl_evaluation_control_t **grant)
+{
+    if (!grant || !*grant) return;
+    if (wl_evaluation_control_active_attempt_id(*grant))
+        (void)wl_evaluation_control_finish(*grant, step, 0, 0);
+    (void)wl_evaluation_control_detach(*grant, step);
+    wl_evaluation_control_release(*grant);
+    *grant = NULL;
+}
+
+static int
+col_controlled_step_grant_begin(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, wl_evaluation_control_t **out,
+    uint64_t *out_id)
+{
+    *out = NULL; *out_id = 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if ((!step->primary_result
+        && wl_columnar_session_test_fail_framed_funding_before_stop > 0)
+        || (step->primary_result
+        && wl_columnar_session_test_fail_framed_funding_after_stop > 0)) {
+        if (step->primary_result)
+            --wl_columnar_session_test_fail_framed_funding_after_stop;
+        else
+            --wl_columnar_session_test_fail_framed_funding_before_stop;
+        return EAGAIN;
+    }
+#endif
+    wl_evaluation_control_t *grant = NULL;
+    /* The relation host and nested framed transition each admit bounded
+     * protocol work. Four fixed host quanta cover their finite call chain;
+     * evaluator work uses the independent session operation control. */
+    int rc = wl_evaluation_control_create(4 * 384, &grant);
+    if (rc) return EAGAIN;
+    rc = wl_evaluation_control_attach(grant, step);
+    if (!rc) rc = wl_evaluation_control_begin(grant, step);
+    if (rc) {
+        if (wl_evaluation_control_active_attempt_id(grant))
+            (void)wl_evaluation_control_finish(grant, step, rc, 0);
+        (void)wl_evaluation_control_detach(grant, step);
+        wl_evaluation_control_release(grant);
+        return EAGAIN;
+    }
+    *out = grant;
+    *out_id = wl_evaluation_control_active_attempt_id(grant);
+    return *out_id ? 0 : EAGAIN;
+}
+
+static bool
+col_controlled_step_receipt_consumed(wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->previous_valid) return false;
+    if (sess->cleanup_active) {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        if (wl_columnar_eval_stack_framed_context(sess->cleanup_active, sess,
+            &ctx) == 0 && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING)
+            return true;
+    }
+    return !sess->cleanup_active
+           && step->previous_kind ==
+           WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT;
+}
+
+static int
+col_controlled_step_host_action(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, const wl_plan_relation_t *relation,
+    wl_columnar_eval_serial_framed_host_action_t action)
+{
+    wl_evaluation_control_t *grant = NULL;
+    uint64_t grant_id = 0;
+    int rc = col_controlled_step_grant_begin(sess, step, &grant, &grant_id);
+    if (rc) return rc;
+    bool consume = action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        && col_controlled_step_receipt_consumed(sess, step);
+    wl_columnar_eval_serial_framed_host_request_t request = {
+        .funding = grant,
+        .funding_id = grant_id,
+        .operation = sess->base.evaluation_control,
+        .operation_id = step->operation_id,
+        .operation_identity = step->operation_identity,
+        .action = action,
+        .previous_valid = step->previous_valid,
+        .previous_kind = step->previous_kind,
+        .previous_protocol = step->previous_protocol,
+        .previous_funding = step->previous_funding,
+        .previous_funding_id = step->previous_funding_id,
+        .reply = &step->reply
+    };
+    int protocol = wl_columnar_eval_serial_framed_relation(relation, sess,
+            false, &request);
+    int finish_rc = wl_evaluation_control_finish(grant, step, 0, 0);
+    if (finish_rc && !protocol) protocol = finish_rc;
+
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+        col_controlled_step_grant_release(step, &grant);
+        return protocol;
+    }
+
+    if (!consume || !protocol) {
+        col_controlled_step_grant_release(step,
+            &step->previous_funding);
+        step->previous_valid = !consume
+            && (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
+            || step->reply.kind ==
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT);
+        step->previous_kind = step->reply.kind;
+        step->previous_protocol = protocol;
+        step->previous_funding_id = grant_id;
+        if (step->previous_valid) {
+            step->previous_funding = grant;
+            grant = NULL;
+        }
+    }
+    col_controlled_step_grant_release(step, &grant);
+    return protocol;
+}
+
+static void
+col_controlled_step_advance_cursor(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    const wl_plan_t *plan = sess->plan;
+    if (++step->relation_index <
+        plan->strata[step->stratum_index].relation_count)
+        goto advanced;
+    step->relation_index = 0;
+    while (++step->stratum_index < plan->stratum_count)
+        if (plan->strata[step->stratum_index].relation_count)
+            goto advanced;
+    step->complete = true;
+advanced:
+    ;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!step->complete &&
+        wl_columnar_session_test_exhaust_after_relation > 0) {
+        --wl_columnar_session_test_exhaust_after_relation;
+        /* A finite configured test limit makes this a real sticky stop at
+         * the exact publication boundary, without timing or worker races. */
+        (void)wl_evaluation_control_charge(sess->base.evaluation_control,
+            UINT64_MAX);
+    }
+#endif
+}
+
+static int
+col_controlled_step_finish(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, int result)
+{
+    int rc = wl_evaluation_control_finish(sess->base.evaluation_control,
+            sess->base.operation_admission, result, 0);
+    step->operation_active = false;
+    step->operation_id = 0;
+    step->relation_active = false;
+    step->primary_result = 0;
+    return rc;
+}
+
+static const wl_plan_relation_t *
+col_controlled_step_current_relation(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    while (step->stratum_index < sess->plan->stratum_count) {
+        const wl_plan_stratum_t *stratum
+            = &sess->plan->strata[step->stratum_index];
+        if (step->relation_index < stratum->relation_count)
+            return &stratum->relations[step->relation_index];
+        step->stratum_index++; step->relation_index = 0;
+    }
+    step->complete = true;
+    return NULL;
+}
+
+static int
+col_controlled_step_drive(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step, bool teardown)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    const void *owner = sess->base.operation_admission;
+    if (!step->operation_active) {
+        step->refused = false;
+        int rc = wl_evaluation_control_begin(control, owner);
+        if (rc) return rc;
+        step->operation_id = wl_evaluation_control_active_attempt_id(control);
+        if (!step->operation_id) return EINVAL;
+        step->operation_active = true;
+        step->primary_result = 0;
+        if (!step->complete) {
+            rc = col_controlled_step_preflight(sess, step);
+            if (rc) {
+                step->refused = rc == ENOTSUP;
+                return col_controlled_step_finish(sess, step, rc);
+            }
+        }
+    } else if (wl_evaluation_control_active_attempt_id(control)
+        != step->operation_id) {
+        return EINVAL;
+    }
+
+    if (teardown) {
+        wl_evaluation_control_request_cancel(control);
+        if (!step->relation_active) {
+            int rc = col_controlled_step_finish(sess, step,
+                    step->primary_result ? step->primary_result
+                    : WL_EVALUATION_CONTROL_CANCELLED);
+            return rc == WL_EVALUATION_CONTROL_CANCELLED ? 0 : rc;
+        }
+    }
+
+    if (step->complete) {
+        int rc = wl_evaluation_control_charge(control, 0);
+        return col_controlled_step_finish(sess, step, rc);
+    }
+
+    for (;;) {
+        const wl_plan_relation_t *relation
+            = col_controlled_step_current_relation(sess, step);
+        if (!relation) {
+            int rc = col_controlled_step_finish(sess, step, 0);
+            return rc;
+        }
+        step->relation_active = true;
+        for (;;) {
+            int protocol = col_controlled_step_host_action(sess, step,
+                    relation, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
+            if (protocol == EAGAIN) return EAGAIN;
+            if (protocol && step->reply.kind
+                == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
+                && !sess->cleanup_active) {
+                step->relation_active = false;
+                int result = protocol;
+                int finish_rc = col_controlled_step_finish(sess, step, result);
+                return finish_rc;
+            }
+            if (protocol && step->reply.kind
+                == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT
+                && !sess->cleanup_active) {
+                step->relation_active = false;
+                return col_controlled_step_finish(sess, step, protocol);
+            }
+            if (step->reply.kind ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
+                int result = step->reply.execution_result;
+                if (step->reply.committed)
+                    col_controlled_step_advance_cursor(sess, step);
+                step->relation_active = false;
+                col_controlled_step_grant_release(step,
+                    &step->previous_funding);
+                if (result) {
+                    step->primary_result = result;
+                    int finish_rc = col_controlled_step_finish(sess, step,
+                            result);
+                    return finish_rc;
+                }
+                if (!step->reply.committed) {
+                    int finish_rc = col_controlled_step_finish(sess, step,
+                            EINVAL);
+                    return finish_rc;
+                }
+                if (teardown) {
+                    int finish_rc = col_controlled_step_finish(sess, step,
+                            WL_EVALUATION_CONTROL_CANCELLED);
+                    return finish_rc == WL_EVALUATION_CONTROL_CANCELLED
+                        ? 0 : finish_rc;
+                }
+                int boundary_stop = wl_evaluation_control_charge(control, 0);
+                if (boundary_stop) {
+                    int finish_rc = col_controlled_step_finish(sess, step,
+                            boundary_stop);
+                    return finish_rc;
+                }
+                break;
+            }
+            if (step->reply.kind ==
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED) {
+                int finish_rc = col_controlled_step_finish(sess, step,
+                        protocol ? protocol : ENOTSUP);
+                return finish_rc;
+            }
+
+            int status_rc = col_controlled_step_host_action(sess, step,
+                    relation, WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS);
+            if (status_rc == EAGAIN) return EAGAIN;
+            if (status_rc) {
+                int finish_rc = col_controlled_step_finish(sess, step,
+                        status_rc);
+                return finish_rc;
+            }
+            if (step->reply.status.execution_result
+                && !step->primary_result)
+                step->primary_result = step->reply.status.execution_result;
+            if (step->reply.status.retained
+                || step->reply.status.cleanup_result)
+                return EAGAIN;
+            if (teardown && !sess->cleanup_active) {
+                int finish_rc = col_controlled_step_finish(sess, step,
+                        step->primary_result ? step->primary_result
+                        : WL_EVALUATION_CONTROL_CANCELLED);
+                return finish_rc == WL_EVALUATION_CONTROL_CANCELLED
+                    ? 0 : finish_rc;
+            }
+        }
+    }
+}
+
+static int
+col_controlled_step(wl_col_session_t *sess)
+{
+    if (!sess->controlled_step) {
+        sess->controlled_step = calloc(1, sizeof(*sess->controlled_step));
+        if (!sess->controlled_step) return ENOMEM;
+        /* The host identity persists while control attempt IDs may change. */
+        sess->controlled_step->operation_identity =
+            (uint64_t)(uintptr_t)sess->controlled_step;
+    }
+    return col_controlled_step_drive(sess, sess->controlled_step, false);
+}
+
+static int
+wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
+{
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step) return 0;
+    int rc = 0;
+    if (step->operation_active)
+        rc = col_controlled_step_drive(sess, step, true);
+    if (rc == EAGAIN || step->operation_active) return EBUSY;
+    col_controlled_step_grant_release(step, &step->previous_funding);
+    free(step);
+    sess->controlled_step = NULL;
+    /* Destroy consumes the terminal outcome from the caller-owned control
+     * report; a stopped operation is safe to tear down once its frame drains. */
+    return 0;
+}
+
+/* Controlled initial STEP uses the framed relation host; raw session
+ * behavior keeps the established synchronous evaluator. */
 static int
 col_session_step(wl_session_t *session)
 {
     if (!session) return EINVAL;
-    if (session->evaluation_control) return ENOTSUP;
+    if (session->evaluation_control)
+        return col_controlled_step(COL_SESSION(session));
     return col_session_step_impl(session);
+}
+
+static wl_controlled_step_state_t
+col_session_controlled_step_state(const wl_session_t *session)
+{
+    const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step) return WL_CONTROLLED_STEP_IDLE;
+    if (step->complete) return WL_CONTROLLED_STEP_COMPLETE;
+    return step->refused ? WL_CONTROLLED_STEP_IDLE
+        : WL_CONTROLLED_STEP_PENDING;
 }
 
 static int
@@ -6572,6 +7043,7 @@ static const wl_compute_backend_t col_backend = {
     .session_create_with_options = col_session_create_with_options,
     .session_budget_denied = wl_columnar_session_budget_denied,
     .session_budget_denial_clear = col_session_budget_denial_clear,
+    .session_controlled_step_state = col_session_controlled_step_state,
 };
 
 const wl_compute_backend_t *

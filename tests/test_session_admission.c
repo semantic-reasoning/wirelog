@@ -147,6 +147,17 @@ static int
 fake_step(wl_session_t *base)
 {
     record_operation((fake_session_t *)base, TEST_OP_STEP);
+    if (base->evaluation_control) {
+        uint64_t id = wl_evaluation_control_active_attempt_id(
+            base->evaluation_control);
+        if (!id) {
+            int rc = wl_evaluation_control_begin(base->evaluation_control,
+                    base->operation_admission);
+            return rc ? rc : EAGAIN;
+        }
+        return wl_evaluation_control_finish(base->evaluation_control,
+                   base->operation_admission, 0, 0);
+    }
     return 0;
 }
 
@@ -452,6 +463,94 @@ release_threads:
     return failures;
 }
 
+static int
+run_controlled_step_gate(void)
+{
+    int failures = 0;
+    test_sync_t sync = {0};
+    wl_mutex_init(&sync.mutex);
+    wl_cond_init(&sync.changed);
+    sync.blocked_operation = TEST_OP_INSERT;
+    creation_sync = &sync;
+
+    wl_evaluation_control_t *control = NULL;
+    failures += expect(wl_evaluation_control_create(0, &control) == 0,
+            "create controlled admission control");
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    failures += expect(wl_session_create_with_options(&fake_backend, NULL, 1,
+            &options, &session) == 0, "create controlled fake session");
+    if (!session) goto done;
+
+    thread_context_t operation_ctx = {
+        .session = session, .sync = &sync, .operation = TEST_OP_INSERT
+    };
+    wl_thread_t operation_tid;
+    int thread_rc = wl_thread_create(&operation_tid, operation_thread,
+            &operation_ctx);
+    failures += expect(thread_rc == 0, "start admitted insert");
+    if (thread_rc != 0) goto destroy_session;
+    wl_mutex_lock(&sync.mutex);
+    while (!sync.operation_entered)
+        wl_cond_wait(&sync.changed, &sync.mutex);
+    wl_mutex_unlock(&sync.mutex);
+    failures += expect(wl_session_step(session) == EBUSY,
+            "controlled step rejects an in-flight session operation");
+    wl_mutex_lock(&sync.mutex);
+    sync.release_operation = true;
+    wl_cond_broadcast(&sync.changed);
+    wl_mutex_unlock(&sync.mutex);
+    wl_thread_join(&operation_tid);
+    failures += expect(operation_ctx.rc == 0,
+            "in-flight insert completes before controlled step");
+
+    sync.blocked_operation = TEST_OP_COUNT;
+    failures += expect(wl_session_step(session) == EAGAIN,
+            "controlled step exposes its retained continuation");
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    failures += expect(id != 0, "pending step keeps its original attempt");
+    int64_t row = 1;
+    wirelog_compound_arg_t arg = {.type = WIRELOG_TYPE_INT64, .value = 1};
+    uint64_t handle = 0;
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
+            "pending step blocks insert");
+    failures += expect(wl_session_make_compound(session, "f", 1, &arg,
+            &handle) == EBUSY, "pending step blocks compound creation");
+    failures += expect(wl_session_remove(session, "r", &row, 1, 1) == EBUSY,
+            "pending step blocks remove");
+    unsigned set_delta_calls = sync.calls[TEST_OP_SET_DELTA_CB];
+    wl_session_set_delta_cb(session, noop_delta, NULL);
+    failures += expect(sync.calls[TEST_OP_SET_DELTA_CB] == set_delta_calls,
+            "pending step blocks callback changes");
+    failures += expect(wl_session_snapshot(session, NULL, NULL) == EBUSY,
+            "pending step blocks snapshot");
+    unsigned governor_calls = sync.calls[TEST_OP_MEMORY_GOVERNOR];
+    failures += expect(wl_session_memory_governor(session) == NULL,
+            "pending step blocks governor observation");
+    failures += expect(sync.calls[TEST_OP_MEMORY_GOVERNOR] == governor_calls,
+            "pending step does not enter backend governor hook");
+    failures += expect(wl_evaluation_control_reset(control) == EBUSY
+            && wl_evaluation_control_configure(control, 100) == EBUSY,
+            "pending step blocks control reconfiguration");
+
+    failures += expect(wl_session_step(session) == 0,
+            "resume is the sole operation admitted through the gate");
+    failures += expect(!wl_evaluation_control_active_attempt_id(control),
+            "resume finishes the retained attempt");
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == 0,
+            "session APIs reopen after terminal completion");
+destroy_session:
+    wl_session_destroy(session);
+done:
+    if (control) wl_evaluation_control_release(control);
+    creation_sync = NULL;
+    wl_cond_destroy(&sync.changed);
+    wl_mutex_destroy(&sync.mutex);
+    return failures;
+}
+
 int
 main(void)
 {
@@ -463,6 +562,7 @@ main(void)
     failures += run_destroy_race(TEST_OP_SNAPSHOT, false, true);
     failures += run_destroy_race(TEST_OP_STEP, false, true);
     failures += run_destroy_race(TEST_OP_INSERT, true, true);
+    failures += run_controlled_step_gate();
     if (failures)
         fprintf(stderr, "session_admission: %d failure(s)\n", failures);
     return failures != 0;
