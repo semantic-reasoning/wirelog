@@ -799,6 +799,34 @@ it.
 | Delta transport payload | Producer, then queue, then consumer | Ownership transfers at enqueue | Consumer matrix | Reconstruction deduplicates malformed aliases | `eval_tdd_queue.c:tdd_destroy_delta_payload` on reject and discard; the queue's registered destructor is a **same-named static** in `eval.c`, and matrix slots are destroyed by `eval.c:tdd_destroy_delta_slots` and by several open-coded sites in `eval.c` | No | reviewer-read |
 | Continuation scratch and published batches | Producer owns scratch; sink owns committed output | `continuation.c:wl_columnar_continuation_create` for the continuation; `continuation.c:wl_columnar_continuation_publish` for each batch | The sink's append, before the cursor advances | Cursor advance at publication commit | `continuation.c:wl_columnar_continuation_destroy` | No | reviewer-read |
 
+Continuation producers that install the optional disposition callback use two
+cursors: the private producer-scan cursor and the externally reported
+published cursor. A zero-payload PROGRESS outcome may advance scan state while
+the public cursor stays at the last committed endpoint. A non-empty batch
+descriptor returned with OK is copied into continuation-owned pending state
+and is passed unchanged to every sink retry. The producer is not called again
+until that payload is acknowledged after a durable commit or dropped on
+terminal cleanup.
+A refused begin means no transaction started, so it is retried without abort.
+Reserve, append, or uncommitted commit refusal aborts the transaction once and
+retains the same payload. A committed result, including an ambiguous status,
+acknowledges once and advances both cursors. Stale validation, explicit
+cancellation, or destruction disposes a pending payload without acknowledgment
+and retires the producer once. Existing producers without disposition retain
+the legacy one-call/rebuild behavior; the real JOIN producer is not wired to
+this protocol yet. Callbacks are synchronous: reentrant publish is rejected,
+and cancellation requested from a callback is applied after that callback
+returns. An active uncommitted sink transaction is aborted once; a durable
+commit is published and acknowledged before cancellation retires the producer.
+Callbacks may reenter publish, cancel, or destroy. Nested publication is
+rejected; cancellation and destruction are deferred until the active publish
+finishes. A requested destroy also requests cancellation: an uncommitted
+transaction aborts and drops its pending payload, while a durable commit is
+acknowledged before the producer is retired and the continuation is freed.
+Recursive destroy from the producer's destroy callback is ignored.
+PROGRESS must preserve input, arrangement, and generation identity, keep its
+position monotonic, and advance its sequence.
+
 One row carries two assertions the code already makes, so it is checked at
 runtime rather than only by reading: `cache.c` asserts `pin_count == 0` before
 destroying an entry and `pin_count > 0` before decrementing.  No other row has
