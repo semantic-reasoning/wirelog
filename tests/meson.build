@@ -6529,3 +6529,14 @@ test_session_spill_exe = executable(
   link_with: [testlib_prod],
 )
 test('session_spill', test_session_spill_exe, suite: ['unit', 'tsan'], timeout: 120)
+
+# Production resumable observer baseline and transferable reader transitions.
+test_evaluation_observer_build_exe = executable(
+  'test_evaluation_observer_build',
+  files('test_evaluation_observer_build.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('evaluation_observer_build', test_evaluation_observer_build_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

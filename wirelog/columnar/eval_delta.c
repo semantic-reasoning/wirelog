@@ -1009,6 +1009,552 @@ wl_columnar_eval_delta_observer_clear_stage(wl_col_session_t *sess)
     return rc;
 }
 
+/* Persistent construction is separate from the published raw observer. All
+ * registry/name/cell traversal below has a persistent cursor. */
+enum wl_columnar_eval_delta_build_phase {
+    WL_COLUMNAR_DELTA_BUILD_HEAD,
+    WL_COLUMNAR_DELTA_BUILD_NAME,
+    WL_COLUMNAR_DELTA_BUILD_LOOKUP,
+    WL_COLUMNAR_DELTA_BUILD_SCHEMA,
+    WL_COLUMNAR_DELTA_BUILD_ALLOC,
+    WL_COLUMNAR_DELTA_BUILD_ZERO,
+    WL_COLUMNAR_DELTA_BUILD_PAYLOAD,
+    WL_COLUMNAR_DELTA_BUILD_DUP,
+    WL_COLUMNAR_DELTA_BUILD_ENTRY,
+    WL_COLUMNAR_DELTA_BUILD_NAME_COPY,
+    WL_COLUMNAR_DELTA_BUILD_ROWS,
+    WL_COLUMNAR_DELTA_BUILD_ACQUIRE,
+    WL_COLUMNAR_DELTA_BUILD_COPY,
+    WL_COLUMNAR_DELTA_BUILD_RELEASE,
+    WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP,
+    WL_COLUMNAR_DELTA_BUILD_SORT,
+    WL_COLUMNAR_DELTA_BUILD_SUBTRACT,
+    WL_COLUMNAR_DELTA_BUILD_UNIQUE,
+    WL_COLUMNAR_DELTA_BUILD_COMMIT,
+    WL_COLUMNAR_DELTA_BUILD_READY
+};
+
+struct wl_columnar_eval_delta_observer_build {
+    uintptr_t identity;
+    wl_col_session_t *session;
+    wl_columnar_eval_delta_observer_t *observer;
+    wl_columnar_memory_reservation_t metadata;
+    wl_columnar_relation_reader_step_t reader;
+    wl_columnar_memory_governor_ref_t *governor;
+    int error;
+    col_rel_t *sources[3];
+    uint64_t mask, metadata_bytes, payload_bytes, entry_rows;
+    size_t length, offset, zero;
+    uint32_t si, ri, registry, kind, count, duplicate;
+    uint32_t duplicate_si, duplicate_ri;
+    uint32_t row, copied, sort_begin, sort_end, heap_size, heap_root,
+        heap_child, i, j, out;
+    int64_t value;
+    unsigned phase;
+    bool preflight, metadata_held, sorting_pending, heap_build, heap_sifting,
+        heap_child_selected;
+};
+
+/* The published observer's merge compares normalized rows with memcmp. Keep
+ * the resumable baseline in that same native-byte order. */
+static int
+wl_columnar_eval_delta_build_value_cmp(int64_t left, int64_t right)
+{
+    return memcmp(&left, &right, sizeof(left));
+}
+
+static bool
+wl_columnar_eval_delta_build_schema(const col_rel_t *r)
+{
+    return r && r->storage_owner == r && r->relation_identity
+           && r->relation_identity != UINT64_MAX
+           && r->storage_owner_identity == r->relation_identity
+           && r->storage_generation && r->storage_generation != UINT64_MAX
+           && r->storage_owner_generation == r->storage_generation
+           && r->ncols == 1 && r->nrows <= r->capacity
+           && (!r->nrows || (r->columns && r->columns[0]))
+           && (!r->column_types || r->column_types[0] == WIRELOG_TYPE_INT64)
+           && !r->timestamps && r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
+           && !r->compound_count && !r->compound_arity_map
+           && !r->compound_arity_len && !r->inline_physical_offset;
+}
+
+int
+wl_columnar_eval_delta_observer_build_start(wl_col_session_t *sess,
+    uint64_t mask)
+{
+    if (!sess || !sess->plan
+        || (sess->plan->stratum_count && !sess->plan->strata)
+        || (sess->nrels && !sess->rels))
+        return EINVAL;
+    if (sess->delta_observer_build || sess->delta_observer
+        || sess->delta_publish_active || sess->coordinator
+        || sess->delta_observer_retirement
+        != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_NONE)
+        return EBUSY;
+    wl_columnar_eval_delta_observer_build_t *b = calloc(1, sizeof(*b));
+    if (!b)
+        return ENOMEM;
+    b->identity = (uintptr_t)b;
+    b->session = sess;
+    b->mask = mask;
+    b->preflight = true;
+    wl_columnar_memory_reservation_init(&b->metadata);
+    sess->delta_observer_build = b;
+    return 0;
+}
+
+static int
+wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
+    wl_columnar_eval_delta_observer_build_t *b)
+{
+    const wl_plan_t *plan = sess->plan;
+    wl_columnar_eval_delta_observer_t *o = b->observer;
+    wl_columnar_eval_delta_observer_entry_t *e =
+        o && b->phase > WL_COLUMNAR_DELTA_BUILD_ZERO && o->count
+        ? &o->entries[o->count - 1] : NULL;
+    const char *name = b->si < plan->stratum_count
+        && b->ri < plan->strata[b->si].relation_count
+        ? plan->strata[b->si].relations[b->ri].name : NULL;
+    switch (b->phase) {
+    case WL_COLUMNAR_DELTA_BUILD_HEAD:
+        if (b->si == plan->stratum_count) {
+            b->phase = b->preflight ? WL_COLUMNAR_DELTA_BUILD_ALLOC
+                : WL_COLUMNAR_DELTA_BUILD_COMMIT;
+            return 0;
+        }
+        if (!plan->strata || (plan->strata[b->si].relation_count
+            && !plan->strata[b->si].relations))
+            return EINVAL;
+        if (b->ri == plan->strata[b->si].relation_count) {
+            b->si++;
+            b->ri = 0;
+            return 0;
+        }
+        if (!name)
+            return EINVAL;
+        b->length = 0;
+        b->kind = 0;
+        b->sources[0] = b->sources[1] = b->sources[2] = NULL;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_NAME;
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_NAME:
+        if (name[b->length]) {
+            if (b->length == SIZE_MAX - 1)
+                return EOVERFLOW;
+            b->length++;
+        } else {
+            b->registry = 0;
+            b->offset = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_LOOKUP;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_LOOKUP: {
+        /* Raw seed/retired lookup uses a 256-byte prefixed name. Preserve
+         * that absence rule without snprintf or an unbounded string scan. */
+        size_t prefix = b->kind == 1 ? 5 : b->kind == 2 ? 4 : 0;
+        if (b->registry == sess->nrels ||
+            (prefix && b->length >= 256 - prefix)){
+            b->phase = WL_COLUMNAR_DELTA_BUILD_SCHEMA;
+            return 0;
+        }
+        col_rel_t *r = sess->rels[b->registry];
+        if (!r || !r->name) {
+            b->registry++;
+            b->offset = 0;
+            return 0;
+        }
+        const char *p = b->kind == 1 ? "$out$" : "$in$";
+        char expected = b->offset < prefix ? p[b->offset]
+            : name[b->offset - prefix];
+        char actual = r->name[b->offset];
+        if (expected != actual) {
+            b->registry++;
+            b->offset = 0;
+        } else if (!actual) {
+            b->sources[b->kind] = r;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_SCHEMA;
+        } else {
+            b->offset++;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_DELTA_BUILD_SCHEMA: {
+        col_rel_t *r = b->sources[b->kind];
+        if ((!b->kind && !r) || (r && !wl_columnar_eval_delta_build_schema(r)))
+            return ENOTSUP;
+        if (r && b->kind == 2 && r->base_nrows > r->nrows)
+            return EINVAL;
+        if (++b->kind != 3) {
+            b->registry = 0;
+            b->offset = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_LOOKUP;
+            return 0;
+        }
+        uint64_t rows = b->sources[0]->nrows;
+        if (b->sources[1]) rows += b->sources[1]->nrows;
+        if (b->sources[2]) rows += b->sources[2]->nrows -
+                b->sources[2]->base_nrows;
+        if (rows > UINT32_MAX || rows > SIZE_MAX / sizeof(int64_t))
+            return EOVERFLOW;
+        b->entry_rows = rows;
+        if (b->preflight) {
+            b->duplicate_si = 0;
+            b->duplicate_ri = 0;
+            b->offset = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP;
+        } else {
+            b->duplicate = 0;
+            b->offset = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_DUP;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP:
+        while (b->duplicate_si < plan->stratum_count) {
+            const wl_plan_stratum_t *previous_stratum =
+                &plan->strata[b->duplicate_si];
+            if (b->duplicate_ri >= previous_stratum->relation_count) {
+                b->duplicate_si++;
+                b->duplicate_ri = 0;
+                return 0;
+            }
+            if (b->duplicate_si > b->si
+                || (b->duplicate_si == b->si
+                && b->duplicate_ri >= b->ri))
+                break;
+            const char *previous =
+                previous_stratum->relations[b->duplicate_ri].name;
+            char current_char = name[b->offset];
+            char previous_char = previous[b->offset];
+            if (current_char != previous_char) {
+                if (b->duplicate_ri + 1
+                    < previous_stratum->relation_count) {
+                    b->duplicate_ri++;
+                } else {
+                    b->duplicate_si++;
+                    b->duplicate_ri = 0;
+                }
+                b->offset = 0;
+                return 0;
+            }
+            if (!current_char) {
+                b->ri++;
+                b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+                return 0;
+            }
+            b->offset++;
+            return 0;
+        }
+        {
+            uint64_t add = b->entry_rows * sizeof(int64_t);
+            if (b->count == UINT32_MAX || b->length == SIZE_MAX
+                || !wl_columnar_memory_size_add(add, b->length + 1, &add)
+                || !wl_columnar_memory_size_add(b->payload_bytes, add,
+                &b->payload_bytes))
+                return EOVERFLOW;
+            b->count++;
+            b->ri++;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_ALLOC: {
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(b->count, sizeof(*e), &bytes)
+            || !wl_columnar_memory_size_add(bytes, sizeof(*o), &bytes)
+            || bytes > SIZE_MAX || b->payload_bytes > UINT64_MAX - bytes)
+            return EOVERFLOW;
+        int rc = wl_columnar_eval_delta_reserve(sess, bytes, &b->metadata);
+        if (rc) return rc;
+        b->metadata_held = sess->memory_governor != NULL;
+        b->metadata_bytes = bytes;
+        b->observer = malloc((size_t)bytes);
+        if (!b->observer) return ENOMEM;
+        b->zero = 0;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_ZERO;
+        return 0;
+    }
+    case WL_COLUMNAR_DELTA_BUILD_ZERO:
+        ((unsigned char *)o)[b->zero++] = 0;
+        if (b->zero == b->metadata_bytes) {
+            wl_columnar_memory_reservation_init(&o->metadata);
+            wl_columnar_memory_reservation_init(&o->payload);
+            wl_columnar_memory_reservation_init(&o->staging);
+            if (b->metadata_held) {
+                if (!wl_columnar_memory_reservation_move(&o->metadata,
+                    &b->metadata))
+                    return EINVAL;
+                b->metadata_held = false;
+                o->governor = sess->memory_governor;
+                wl_columnar_memory_governor_ref_retain(o->governor);
+            }
+            o->metadata_bytes = b->metadata_bytes;
+            o->affected_mask = b->mask;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_PAYLOAD;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_PAYLOAD: {
+        int rc = wl_columnar_eval_delta_reserve(sess, b->payload_bytes,
+                &o->payload);
+        if (rc) return rc;
+        o->payload_bytes = b->payload_bytes;
+        b->preflight = false;
+        b->si = b->ri = 0;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+        return 0;
+    }
+    case WL_COLUMNAR_DELTA_BUILD_DUP:
+        if (b->duplicate == o->count) {
+            b->phase = WL_COLUMNAR_DELTA_BUILD_ENTRY;
+        } else {
+            char a = name[b->offset];
+            char c = o->entries[b->duplicate].name[b->offset];
+            if (a != c) {
+                b->duplicate++; b->offset = 0;
+            }else if (!a) {
+                b->ri++; b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+            }else b->offset++;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_ENTRY:
+        e = &o->entries[o->count];
+        e->name = malloc(b->length + 1);
+        if (!e->name) return ENOMEM;
+        o->count++;
+        e->ncols = 1;
+        e->nrows = b->sources[0]->nrows
+            + (b->sources[1] ? b->sources[1]->nrows : 0);
+        e->pending_nrows = b->sources[2]
+            ? b->sources[2]->nrows - b->sources[2]->base_nrows : 0;
+        b->offset = 0;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_NAME_COPY;
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_NAME_COPY:
+        e->name[b->offset] = name[b->offset];
+        if (b->offset++ == b->length) b->phase = WL_COLUMNAR_DELTA_BUILD_ROWS;
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_ROWS:
+        if (e->nrows + e->pending_nrows) {
+            e->rows = malloc((size_t)(e->nrows + e->pending_nrows) *
+                    sizeof(int64_t));
+            if (!e->rows) return ENOMEM;
+        }
+        b->kind = b->row = b->copied = 0;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_ACQUIRE;
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_COPY: {
+        col_rel_t *r = b->sources[b->kind];
+        uint32_t start = b->kind == 2 ? r->base_nrows : 0;
+        if (b->row ==
+            r->nrows - start) b->phase = WL_COLUMNAR_DELTA_BUILD_RELEASE;
+        else e->rows[b->copied++] = r->columns[0][start + b->row++];
+        return 0;
+    }
+    case WL_COLUMNAR_DELTA_BUILD_SORT:
+        if (b->sort_end - b->sort_begin < 2
+            || (!b->heap_build && !b->heap_sifting && b->heap_size <= 1)) {
+            if (!b->sorting_pending && e->pending_nrows) {
+                b->sorting_pending = true;
+                b->sort_begin = e->nrows;
+                b->sort_end = e->nrows + e->pending_nrows;
+                b->heap_size = b->sort_end - b->sort_begin;
+                b->i = b->heap_size / 2;
+                b->heap_build = true;
+                b->heap_sifting = b->heap_child_selected = false;
+            } else {
+                b->i = b->j = b->out = 0;
+                b->phase = WL_COLUMNAR_DELTA_BUILD_SUBTRACT;
+            }
+        } else if (b->heap_build && !b->heap_sifting && !b->i) {
+            b->heap_build = false;
+            b->heap_size = b->sort_end - b->sort_begin;
+        } else if (b->heap_build && !b->heap_sifting) {
+            b->heap_root = --b->i;
+            b->heap_sifting = true;
+            b->heap_child_selected = false;
+        } else if (!b->heap_build && !b->heap_sifting) {
+            wl_columnar_eval_delta_observer_swap(e->rows, b->sort_begin,
+                b->sort_begin + b->heap_size - 1, 1);
+            b->heap_size--;
+            if (b->heap_size > 1) {
+                b->heap_root = 0;
+                b->heap_sifting = true;
+            }
+        } else if (b->heap_root >= b->heap_size / 2) {
+            b->heap_sifting = false;
+            b->heap_child_selected = false;
+        } else if (!b->heap_child_selected) {
+            b->heap_child = b->heap_root * 2 + 1;
+            if (b->heap_child + 1 < b->heap_size
+                && wl_columnar_eval_delta_build_value_cmp(
+                    e->rows[b->sort_begin + b->heap_child],
+                    e->rows[b->sort_begin + b->heap_child + 1]) < 0)
+                b->heap_child++;
+            b->heap_child_selected = true;
+        } else {
+            if (wl_columnar_eval_delta_build_value_cmp(
+                    e->rows[b->sort_begin + b->heap_root],
+                    e->rows[b->sort_begin + b->heap_child]) >= 0) {
+                b->heap_sifting = false;
+            } else {
+                wl_columnar_eval_delta_observer_swap(e->rows,
+                    b->sort_begin + b->heap_root,
+                    b->sort_begin + b->heap_child, 1);
+                b->heap_root = b->heap_child;
+            }
+            b->heap_child_selected = false;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_SUBTRACT:
+        if (b->i == e->nrows) {
+            e->nrows = b->out; b->i = b->out = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_UNIQUE;
+        } else if (b->j < e->pending_nrows
+            && wl_columnar_eval_delta_build_value_cmp(
+                e->rows[e->nrows + b->j], e->rows[b->i]) < 0) b->j++;
+        else if (b->j < e->pending_nrows
+            && wl_columnar_eval_delta_build_value_cmp(
+                e->rows[e->nrows + b->j], e->rows[b->i]) == 0) {
+            b->i++; b->j++;
+        }else e->rows[b->out++] = e->rows[b->i++];
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_UNIQUE:
+        if (b->i == e->nrows) {
+            e->nrows = b->out; b->ri++;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+        } else {
+            int64_t v = e->rows[b->i++];
+            if (!b->out || e->rows[b->out - 1] != v) e->rows[b->out++] = v;
+        }
+        return 0;
+    case WL_COLUMNAR_DELTA_BUILD_COMMIT:
+        if (o->governor && (!wl_columnar_memory_commit(&o->metadata, o)
+            || (o->payload_bytes && !wl_columnar_memory_commit(&o->payload,
+            o))))
+            return EINVAL;
+        b->phase = WL_COLUMNAR_DELTA_BUILD_READY;
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
+int
+wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id, bool *ready)
+{
+    if (!sess || !control || !ready || !id
+        || wl_evaluation_control_active_attempt_id(control) != id)
+        return EINVAL;
+    *ready = false;
+    wl_columnar_eval_delta_observer_build_t *b = sess->delta_observer_build;
+    if (!b || b->identity != (uintptr_t)b || b->session != sess
+        || sess->delta_observer)
+        return EINVAL;
+    if (b->error) return b->error;
+    int rc;
+    if (b->phase == WL_COLUMNAR_DELTA_BUILD_ACQUIRE
+        || b->phase == WL_COLUMNAR_DELTA_BUILD_RELEASE) {
+        col_rel_t *r = b->sources[b->kind];
+        bool release = b->phase == WL_COLUMNAR_DELTA_BUILD_RELEASE;
+        rc = r ? wl_columnar_relation_reader_step(r, &b->reader, release,
+                control, id)
+            : wl_evaluation_control_charge(control, 1);
+        if (rc) return rc;
+        if (!release && r) {
+            b->row = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_COPY;
+        } else if (++b->kind == 3) {
+            b->sort_begin = 0;
+            b->sort_end = b->observer->entries[b->observer->count - 1].nrows;
+            b->heap_size = b->sort_end;
+            b->i = b->heap_size / 2;
+            b->heap_build = true;
+            b->heap_sifting = b->heap_child_selected = false;
+            b->sorting_pending = false;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_SORT;
+        } else b->phase = WL_COLUMNAR_DELTA_BUILD_ACQUIRE;
+        if (wl_evaluation_control_active_attempt_id(control) !=
+            id) return EINVAL;
+        rc = wl_evaluation_control_charge(control, 0);
+        return rc ? rc : EAGAIN;
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) return rc;
+    if (b->phase == WL_COLUMNAR_DELTA_BUILD_READY) {
+        rc = wl_evaluation_control_charge(control, 0);
+        if (rc) return rc;
+        sess->delta_observer = b->observer;
+        sess->delta_observer_reserved_bytes = b->metadata_bytes +
+            b->payload_bytes;
+        sess->delta_observer_build = NULL;
+        free(b);
+        *ready = true;
+        return 0;
+    }
+    int action = wl_columnar_eval_delta_build_action(sess, b);
+    if (action > 0) b->error = action;
+    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    rc = wl_evaluation_control_charge(control, 0);
+    return rc > 0 ? rc : action ? action : rc ? rc : EAGAIN;
+}
+
+int
+wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *sess)
+{
+    if (!sess) return EINVAL;
+    wl_columnar_eval_delta_observer_build_t *b = sess->delta_observer_build;
+    if (!b) return 0;
+    if (b->identity != (uintptr_t)b || b->session != sess) return EINVAL;
+    if (b->reader.identity || b->reader.descriptor_held || b->reader.token.owner
+        || b->reader.token.secondary_owner || b->reader.token.identity
+        || b->reader.token.transferable || b->reader.token.thread_valid) {
+        int rc = wl_columnar_relation_reader_step(b->sources[b->kind],
+                &b->reader, true, NULL, 0);
+        return rc ? rc : EAGAIN;
+    }
+    wl_columnar_eval_delta_observer_t *o = b->observer;
+    if (o && b->zero < b->metadata_bytes) {
+        free(o); b->observer = NULL;
+        return EAGAIN;
+    }
+    if (o && o->count) {
+        wl_columnar_eval_delta_observer_entry_t *e = &o->entries[o->count - 1];
+        free(e->rows); free(e->name); o->count--;
+        return EAGAIN;
+    }
+    if (o) {
+        int rc = wl_columnar_eval_delta_observer_release_credit(sess,
+                WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_PAYLOAD, &o->payload);
+        if (rc) return rc;
+        if (o->governor) {
+            if (!wl_columnar_memory_reservation_move(&b->metadata,
+                &o->metadata))
+                return EINVAL;
+            b->metadata_held = true;
+            b->governor = o->governor;
+            o->governor = NULL;
+        }
+        free(o); b->observer = NULL;
+        return EAGAIN;
+    }
+    if (b->metadata_held) {
+        int rc = wl_columnar_eval_delta_observer_release_credit(sess,
+                WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_METADATA, &b->metadata);
+        if (rc) return rc;
+        b->metadata_held = false;
+        return EAGAIN;
+    }
+    if (b->governor) {
+        wl_columnar_memory_governor_ref_release(b->governor);
+        b->governor = NULL;
+        return EAGAIN;
+    }
+    sess->delta_observer_build = NULL;
+    free(b);
+    return 0;
+}
+
 bool
 wl_columnar_eval_delta_observer_active(const wl_col_session_t *sess)
 {
@@ -1132,6 +1678,8 @@ wl_columnar_eval_delta_observer_discard(wl_col_session_t *sess)
 int
 wl_columnar_eval_delta_observer_begin(wl_col_session_t *sess, uint64_t mask)
 {
+    if (sess->delta_observer_build)
+        return EBUSY;
     if (sess->delta_observer) {
         if (sess->delta_observer->retirement
             != WL_COLUMNAR_EVAL_DELTA_OBSERVER_RETIRE_BEGIN_ABORT)
