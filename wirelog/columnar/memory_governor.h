@@ -298,6 +298,47 @@ int wl_columnar_memory_growth_refund_attempt_begin(
 int wl_columnar_memory_growth_refund_attempt_advance(
     wl_columnar_memory_growth_refund_attempt_t *attempt);
 
+/* Bounded post-retirement reduction of a committed reservation. Zero-init
+ * the receipt. The caller must have physically retired exactly
+ * old_bytes - target_bytes before begin; target_bytes must be positive and
+ * smaller than old_bytes because zero-byte tokens use release. The first
+ * advance claims the token before reading its mutable payload. Each advance
+ * performs at most one strong CAS. The receipt is address/thread-bound; DONE
+ * acknowledgment remains valid after the owner later reuses the token. */
+typedef enum {
+    WL_COLUMNAR_MEMORY_DOWNSIZE_INERT = 0,
+    WL_COLUMNAR_MEMORY_DOWNSIZE_CLAIM,
+    WL_COLUMNAR_MEMORY_DOWNSIZE_CREDIT,
+    WL_COLUMNAR_MEMORY_DOWNSIZE_DONE,
+    WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED,
+} wl_columnar_memory_downsize_phase_t;
+
+typedef struct wl_columnar_memory_downsize_attempt {
+    struct wl_columnar_memory_downsize_attempt *identity;
+    wl_columnar_memory_reservation_t *token;
+    wl_columnar_memory_governor_t *governor;
+    const void *owner;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    uint64_t old_bytes;
+    uint64_t target_bytes;
+    wl_columnar_memory_downsize_phase_t phase;
+    bool thread_valid;
+} wl_columnar_memory_downsize_attempt_t;
+
+int wl_columnar_memory_downsize_attempt_begin(
+    wl_columnar_memory_reservation_t *token, const void *owner,
+    uint64_t target_bytes, wl_columnar_memory_downsize_attempt_t *attempt);
+/* EAGAIN advances the claim phase or retains DOWNSIZING after aggregate-credit
+ * CAS contention. A pre-claim CAS loss is terminal EBUSY. */
+int wl_columnar_memory_downsize_attempt_advance(
+    wl_columnar_memory_downsize_attempt_t *attempt);
+
 /* rc0 makes ready authoritative; shape/claim refusal yields false. Invalid
  * pointers/record/attempt yield EINVAL. Stops preserve original reservations.
  * Preparation admits a conservative228 units once (including finish44), then
@@ -367,6 +408,8 @@ extern void (*wl_columnar_memory_governor_test_after_total_cas)(
 extern void (*wl_columnar_memory_governor_test_admitted)(
     wl_columnar_memory_governor_t *, uint64_t);
 extern void (*wl_columnar_memory_growth_refund_test_before_credit_cas)(
+    wl_columnar_memory_governor_t *);
+extern void (*wl_columnar_memory_downsize_test_before_credit_cas)(
     wl_columnar_memory_governor_t *);
 #endif
 
