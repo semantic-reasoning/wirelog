@@ -71,6 +71,7 @@ struct wl_columnar_controlled_step {
     uint32_t default_preflight_registry_slot;
     uint32_t default_preflight_name_byte;
     uint32_t default_preflight_registry_count;
+    uint32_t default_preflight_call_actions;
     uint64_t default_preflight_charged_actions;
     col_rel_t *preflight_variable_full;
     col_rel_t *preflight_variable_delta;
@@ -83,6 +84,7 @@ struct wl_columnar_controlled_step {
     bool controlled_materialized_batch_fallback;
     bool default_preflight_target_found;
     bool default_preflight_entry_charged;
+    bool cursor_advance_pending;
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
@@ -6091,6 +6093,9 @@ col_controlled_step_default_preflight_action(wl_col_session_t *sess,
             < step->stratum_index
             || (step->default_preflight_stratum == step->stratum_index
             && step->default_preflight_relation < step->relation_index)
+            || (step->cursor_advance_pending
+            && step->default_preflight_stratum == step->stratum_index
+            && step->default_preflight_relation == step->relation_index)
             || step->complete;
         if (step->default_preflight_target_found != committed_prefix)
             return ENOTSUP;
@@ -6150,6 +6155,7 @@ col_controlled_step_default_preflight(wl_col_session_t *sess,
         if (rc) return rc;
         actions++;
     }
+    step->default_preflight_call_actions = actions;
     int poll_rc = wl_evaluation_control_charge_attempt(control,
             step->operation_id, 0);
     if (poll_rc) return poll_rc;
@@ -6174,9 +6180,13 @@ wl_columnar_session_test_preflight_snapshot(wl_session_t *session,
         .op = step->default_preflight_op,
         .registry_slot = step->default_preflight_registry_slot,
         .name_byte = step->default_preflight_name_byte,
+        .eval_stratum = step->stratum_index,
+        .eval_relation = step->relation_index,
+        .call_actions = step->default_preflight_call_actions,
         .charged_actions = step->default_preflight_charged_actions,
         .ready = step->default_preflight_phase
             == COL_CONTROLLED_DEFAULT_PREFLIGHT_READY,
+        .cursor_advance_pending = step->cursor_advance_pending,
         .target_name_byte_active = step->default_preflight_phase
             == COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_BYTE,
         .entry_charged = step->default_preflight_entry_charged
@@ -6507,16 +6517,17 @@ col_controlled_step_advance_cursor(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
     const wl_plan_t *plan = sess->plan;
-    if (++step->relation_index <
-        plan->strata[step->stratum_index].relation_count)
-        goto advanced;
-    step->relation_index = 0;
-    while (++step->stratum_index < plan->stratum_count)
-        if (plan->strata[step->stratum_index].relation_count)
-            goto advanced;
-    step->complete = true;
-advanced:
-    ;
+    if (!sess->join_batch_bytes) {
+        /* Publication is complete, but the next relation cursor is advanced
+         * by the charged scheduler. Preserve this marker if that charge stops. */
+        step->cursor_advance_pending = true;
+    } else if (++step->relation_index
+        >= plan->strata[step->stratum_index].relation_count) {
+        /* The admitted batch shape has exactly one relation in one stratum. */
+        step->relation_index = 0;
+        step->stratum_index = plan->stratum_count;
+        step->complete = true;
+    }
 #ifdef WL_SESSION_TEST_HOOKS
     if (!step->complete &&
         wl_columnar_session_test_exhaust_after_relation > 0) {
@@ -6559,6 +6570,7 @@ col_controlled_step_finish(wl_col_session_t *sess,
     step->default_preflight_registry_slot = 0;
     step->default_preflight_name_byte = 0;
     step->default_preflight_registry_count = 0;
+    step->default_preflight_call_actions = 0;
     step->default_preflight_charged_actions = 0;
     step->default_preflight_target_found = false;
     step->default_preflight_entry_charged = false;
@@ -6569,19 +6581,67 @@ col_controlled_step_finish(wl_col_session_t *sess,
     return rc;
 }
 
-static const wl_plan_relation_t *
-col_controlled_step_current_relation(wl_col_session_t *sess,
+static int
+col_controlled_step_schedule(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
-    while (step->stratum_index < sess->plan->stratum_count) {
-        const wl_plan_stratum_t *stratum
-            = &sess->plan->strata[step->stratum_index];
-        if (step->relation_index < stratum->relation_count)
-            return &stratum->relations[step->relation_index];
-        step->stratum_index++; step->relation_index = 0;
+    if (sess->join_batch_bytes) return 0;
+    const wl_plan_t *plan = sess->plan;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint32_t actions = step->default_preflight_call_actions;
+    uint32_t quantum = col_controlled_step_default_preflight_quantum();
+
+    while (actions < quantum && !step->complete) {
+        if (step->cursor_advance_pending) {
+            int rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id, 1);
+            if (rc) return rc;
+            actions++;
+            step->default_preflight_call_actions = actions;
+            step->relation_index++;
+            step->cursor_advance_pending = false;
+            if (actions == quantum) break;
+        }
+        if (step->stratum_index >= plan->stratum_count) {
+            step->complete = true;
+            break;
+        }
+        const wl_plan_stratum_t *stratum =
+            &plan->strata[step->stratum_index];
+        if (step->relation_index < stratum->relation_count) break;
+        if (step->relation_index != stratum->relation_count)
+            return EINVAL;
+        int rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id, 1);
+        if (rc) return rc;
+        actions++;
+        step->default_preflight_call_actions = actions;
+        step->stratum_index++;
+        step->relation_index = 0;
     }
-    step->complete = true;
-    return NULL;
+    int poll_rc = wl_evaluation_control_charge_attempt(control,
+            step->operation_id, 0);
+    if (poll_rc) return poll_rc;
+    return actions == quantum && !step->complete ? EAGAIN : 0;
+}
+
+static int
+col_controlled_step_current_relation(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    const wl_plan_relation_t **out)
+{
+    *out = NULL;
+    if (step->stratum_index >= sess->plan->stratum_count) {
+        step->complete = true;
+        return 0;
+    }
+    const wl_plan_stratum_t *stratum =
+        &sess->plan->strata[step->stratum_index];
+    if (step->relation_index >= stratum->relation_count
+        || !stratum->relations)
+        return EINVAL;
+    *out = &stratum->relations[step->relation_index];
+    return 0;
 }
 
 static int
@@ -6590,6 +6650,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     const void *owner = sess->base.operation_admission;
+    step->default_preflight_call_actions = 0;
     if (!step->operation_active) {
         step->refused = false;
         int rc = wl_evaluation_control_begin(control, owner);
@@ -6637,8 +6698,28 @@ col_controlled_step_drive(wl_col_session_t *sess,
     }
 
     for (;;) {
-        const wl_plan_relation_t *relation
-            = col_controlled_step_current_relation(sess, step);
+        int schedule_rc = col_controlled_step_schedule(sess, step);
+        if (schedule_rc == EAGAIN &&
+            wl_evaluation_control_active_attempt_id(control)
+            == step->operation_id)
+            return EAGAIN;
+        if (schedule_rc) {
+            int finish_rc = col_controlled_step_finish(sess, step,
+                    schedule_rc);
+            return finish_rc;
+        }
+        if (step->complete) {
+            int finish_rc = col_controlled_step_finish(sess, step, 0);
+            return finish_rc;
+        }
+        const wl_plan_relation_t *relation = NULL;
+        int relation_rc = col_controlled_step_current_relation(sess, step,
+                &relation);
+        if (relation_rc) {
+            int finish_rc = col_controlled_step_finish(sess, step,
+                    relation_rc);
+            return finish_rc;
+        }
         if (!relation) {
             int rc = col_controlled_step_finish(sess, step, 0);
             return rc;
