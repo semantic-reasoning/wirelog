@@ -82,6 +82,202 @@ typedef struct wl_columnar_source_access_writer {
     bool thread_valid;
 } wl_columnar_source_access_writer_t;
 
+/* A resumable two-gate lease for private relation growth. Unlike the general
+ * reader/writer helpers below, each advance performs at most one strong CAS.
+ * The record is address- and thread-bound and must stay alive until DONE. */
+typedef enum wl_columnar_source_access_growth_gate_phase {
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_INERT = 0,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_SOURCE,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_DESTINATION,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_HELD,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_DESTINATION,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_SOURCE,
+    WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE
+} wl_columnar_source_access_growth_gate_phase_t;
+
+typedef struct wl_columnar_source_access_growth_gate_attempt {
+    struct wl_columnar_source_access_growth_gate_attempt *identity;
+    wl_columnar_source_access_gate_t *source;
+    wl_columnar_source_access_gate_t *destination;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    wl_columnar_source_access_growth_gate_phase_t phase;
+    bool thread_valid;
+    bool source_held;
+    bool destination_held;
+} wl_columnar_source_access_growth_gate_attempt_t;
+
+static inline bool
+wl_columnar_source_access_growth_gate_thread_equal(
+    const wl_columnar_source_access_growth_gate_attempt_t *attempt)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return attempt->thread_valid
+           && thrd_equal(attempt->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return attempt->thread_valid
+           && attempt->owner_thread == GetCurrentThreadId();
+#else
+    return attempt->thread_valid
+           && pthread_equal(attempt->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static inline bool
+wl_columnar_source_access_growth_gate_shape_valid(
+    const wl_columnar_source_access_growth_gate_attempt_t *attempt)
+{
+    if (!attempt || !attempt->source || !attempt->destination
+        || attempt->source == attempt->destination)
+        return false;
+    switch (attempt->phase) {
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_SOURCE:
+        return !attempt->source_held && !attempt->destination_held;
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_DESTINATION:
+        return attempt->source_held && !attempt->destination_held;
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_HELD:
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_DESTINATION:
+        return attempt->source_held && attempt->destination_held;
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_SOURCE:
+        return attempt->source_held && !attempt->destination_held;
+    case WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE:
+        return !attempt->source_held && !attempt->destination_held;
+    default:
+        return false;
+    }
+}
+
+static inline int
+wl_columnar_source_access_growth_gate_attempt_begin(
+    wl_columnar_source_access_growth_gate_attempt_t *attempt,
+    wl_columnar_source_access_gate_t *source,
+    wl_columnar_source_access_gate_t *destination)
+{
+    if (!attempt || !source || !destination || source == destination
+        || attempt->identity || attempt->source || attempt->destination
+        || attempt->phase || attempt->thread_valid || attempt->source_held
+        || attempt->destination_held)
+        return EINVAL;
+    attempt->identity = attempt;
+    attempt->source = source;
+    attempt->destination = destination;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
+    attempt->thread_valid = true;
+    attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_SOURCE;
+    return 0;
+}
+
+/* EAGAIN means the single gate transition raced or is temporarily blocked;
+ * retry this same address-bound attempt. No call spins or decrements a gate
+ * more than once. */
+static inline int
+wl_columnar_source_access_growth_gate_attempt_advance(
+    wl_columnar_source_access_growth_gate_attempt_t *attempt)
+{
+    if (!attempt || attempt->identity != attempt
+        || !wl_columnar_source_access_growth_gate_shape_valid(attempt)
+        || !wl_columnar_source_access_growth_gate_thread_equal(attempt))
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE
+        || attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_HELD)
+        return 0;
+    if (attempt->phase
+        == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_SOURCE) {
+        uint64_t observed = atomic_load_explicit(&attempt->source->state,
+                memory_order_acquire);
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EAGAIN;
+        if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+            return EOVERFLOW;
+        uint64_t expected = observed;
+        if (!atomic_compare_exchange_strong_explicit(&attempt->source->state,
+            &expected, observed + 1u, memory_order_acquire,
+            memory_order_relaxed))
+            return EAGAIN;
+        attempt->source_held = true;
+        attempt->phase =
+            WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_DESTINATION;
+        return EAGAIN;
+    }
+    if (attempt->phase
+        == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_ACQUIRE_DESTINATION) {
+        uint64_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(
+                &attempt->destination->state, &expected,
+                WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_acquire,
+                memory_order_relaxed))
+            return EAGAIN;
+        attempt->destination_held = true;
+        attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_HELD;
+        return 0;
+    }
+    if (attempt->phase
+        == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_DESTINATION) {
+        uint64_t expected = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+        if (!attempt->destination_held
+            || !atomic_compare_exchange_strong_explicit(
+                &attempt->destination->state, &expected, 0,
+                memory_order_release,
+                memory_order_relaxed))
+            return EAGAIN;
+        attempt->destination_held = false;
+        attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_SOURCE;
+        return EAGAIN;
+    }
+    if (attempt->phase
+        == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_SOURCE) {
+        uint64_t observed;
+        if (!attempt->source_held)
+            return EINVAL;
+        observed = atomic_load_explicit(&attempt->source->state,
+                memory_order_acquire);
+        if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EAGAIN;
+        uint64_t expected = observed;
+        if (!atomic_compare_exchange_strong_explicit(&attempt->source->state,
+            &expected, observed - 1u, memory_order_release,
+            memory_order_relaxed))
+            return EAGAIN;
+        attempt->source_held = false;
+        attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE;
+        return 0;
+    }
+    return EINVAL;
+}
+
+/* Begin reverse retirement. It is safe after partial acquisition or release;
+ * each successful gate decrement is recorded before the next call. */
+static inline int
+wl_columnar_source_access_growth_gate_attempt_release(
+    wl_columnar_source_access_growth_gate_attempt_t *attempt)
+{
+    if (!attempt || attempt->identity != attempt
+        || !wl_columnar_source_access_growth_gate_shape_valid(attempt)
+        || !wl_columnar_source_access_growth_gate_thread_equal(attempt))
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE)
+        return 0;
+    if (attempt->destination_held)
+        attempt->phase =
+            WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_DESTINATION;
+    else if (attempt->source_held)
+        attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_SOURCE;
+    else
+        attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE;
+    return 0;
+}
+
 typedef struct wl_columnar_source_access_cohort_entry {
     wl_columnar_source_access_gate_t *gate;
     uint64_t readers;
