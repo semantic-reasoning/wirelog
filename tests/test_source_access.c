@@ -274,6 +274,88 @@ test_paired_cohort_rejections(void)
         "original reader release after denials");
 }
 
+struct growth_gate_thread_arg {
+    wl_columnar_source_access_growth_gate_attempt_t *attempt;
+    int result;
+};
+
+static void *
+growth_gate_advance_on_thread(void *opaque)
+{
+    struct growth_gate_thread_arg *arg = opaque;
+    arg->result = wl_columnar_source_access_growth_gate_attempt_advance(
+        arg->attempt);
+    return NULL;
+}
+
+static void
+test_growth_gate_attempt(void)
+{
+    wl_columnar_source_access_gate_t source = { 0 }, destination = { 0 };
+    wl_columnar_source_access_growth_gate_attempt_t attempt = { 0 }, copy;
+    wl_columnar_source_access_reader_t destination_reader = { 0 };
+    struct growth_gate_thread_arg arg = { &attempt, 0 };
+    wl_thread_t thread;
+    wl_columnar_source_access_gate_init(&source);
+    wl_columnar_source_access_gate_init(&destination);
+    CHECK(wl_columnar_source_access_reader_acquire(&destination,
+        &destination_reader) == 0, "growth destination contention setup");
+    CHECK(wl_columnar_source_access_growth_gate_attempt_begin(&attempt,
+        &source, &destination) == 0, "growth gate attempt begin");
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt)
+        == EAGAIN && attempt.source_held && !attempt.destination_held
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 1,
+        "one strong CAS acquires source and records partial progress");
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt)
+        == EAGAIN && attempt.source_held && !attempt.destination_held
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 1
+        && atomic_load_explicit(&destination.state, memory_order_acquire) == 1,
+        "busy destination retains source without repeated acquisition");
+    CHECK(wl_columnar_source_access_reader_release(&destination_reader) == 0,
+        "growth destination contention release");
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt) == 0
+        && attempt.source_held && attempt.destination_held
+        && atomic_load_explicit(&destination.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "same attempt acquires destination after contention clears");
+    copy = attempt;
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&copy)
+        == EINVAL, "copied growth gate receipt rejected");
+    if (wl_thread_create(&thread, growth_gate_advance_on_thread, &arg) != 0)
+        CHECK(0, "growth gate cross-thread setup");
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == EINVAL,
+        "growth gate receipt remains on acquiring thread");
+
+    CHECK(wl_columnar_source_access_growth_gate_attempt_release(&attempt) == 0
+        && attempt.phase
+        == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_RELEASE_DESTINATION,
+        "release begins with destination");
+    atomic_store_explicit(&destination.state, 1, memory_order_release);
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt)
+        == EAGAIN && attempt.destination_held && attempt.source_held,
+        "refused destination release retains exact authority");
+    atomic_store_explicit(&destination.state,
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_release);
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt)
+        == EAGAIN && !attempt.destination_held && attempt.source_held
+        && atomic_load_explicit(&destination.state, memory_order_acquire) == 0,
+        "destination release recorded before source release");
+    atomic_store_explicit(&source.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt)
+        == EAGAIN && attempt.source_held,
+        "refused source release does not decrement twice");
+    atomic_store_explicit(&source.state, 1, memory_order_release);
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt) == 0
+        && !attempt.source_held
+        && attempt.phase == WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 0,
+        "source gate released exactly once");
+    CHECK(wl_columnar_source_access_growth_gate_attempt_advance(&attempt) == 0
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 0,
+        "completed release is idempotent");
+}
+
 static void
 test_paired_cohort_partial_unwind(void)
 {
@@ -766,6 +848,7 @@ main(void)
     test_paired_cohort(true);
     test_paired_cohort_rejections();
     test_paired_cohort_partial_unwind();
+    test_growth_gate_attempt();
     printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }
