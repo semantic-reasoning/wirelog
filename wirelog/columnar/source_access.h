@@ -65,6 +65,7 @@ typedef struct wl_columnar_source_access_reader {
 #endif
     bool thread_valid;
     bool transferable;
+    uint8_t release_stage;
 } wl_columnar_source_access_reader_t;
 
 typedef struct wl_columnar_source_access_writer {
@@ -707,7 +708,8 @@ wl_columnar_source_access_cohort_validate(
         if (!reader || reader->identity != (uintptr_t)reader
             || reader->owner != cohort->source || !reader->transferable
             || reader->thread_valid || !reader->secondary_owner
-            || reader->secondary_owner == cohort->source)
+            || reader->secondary_owner == cohort->source
+            || reader->release_stage != 0)
             return EINVAL;
         for (size_t j = 0; j < i; j++)
             if (cohort->reader_refs[j] == reader)
@@ -782,6 +784,7 @@ wl_columnar_source_access_reader_initialize(
     token->owner = owner_gate;
     token->secondary_owner = NULL;
     token->identity = (uintptr_t)token;
+    token->release_stage = 0;
     if (transferable) {
         token->thread_valid = false;
     } else {
@@ -805,7 +808,8 @@ wl_columnar_source_access_reader_acquire_common(
     int rc;
 
     if (!owner_gate || !token || token->owner || token->secondary_owner
-        || token->identity != 0 || token->thread_valid || token->transferable)
+        || token->identity != 0 || token->thread_valid || token->transferable
+        || token->release_stage != 0)
         return EINVAL;
     rc = wl_columnar_source_access_gate_reader_acquire(owner_gate);
     if (rc != 0)
@@ -836,36 +840,67 @@ wl_columnar_source_access_reader_acquire_transferable(
     return wl_columnar_source_access_reader_acquire_common(gate, token, true);
 }
 
-static inline int
-wl_columnar_source_access_reader_release(
+static inline void
+wl_columnar_source_access_reader_clear(
     wl_columnar_source_access_reader_t *token)
 {
-    wl_columnar_source_access_gate_t *gate;
-    uint64_t observed;
-    if (!token || token->identity != (uintptr_t)token || !token->owner
-        || (!token->transferable
-        && !wl_columnar_source_access_reader_thread_equal(token))
-        || (token->transferable && token->thread_valid))
-        return EINVAL;
-    gate = token->owner;
-    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
-    if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
-        return EINVAL;
-    if (token->secondary_owner
-        && !wl_columnar_source_access_gate_busy(token->secondary_owner))
-        return EINVAL;
-    if (wl_columnar_source_access_gate_reader_release(gate) != 0)
-        return EINVAL;
-    if (token->secondary_owner
-        && wl_columnar_source_access_gate_reader_release(
-            token->secondary_owner) != 0)
-        return EINVAL;
     token->owner = NULL;
     token->secondary_owner = NULL;
     token->identity = 0;
     token->thread_valid = false;
     token->transferable = false;
+    token->release_stage = 0;
+}
+
+/* Perform at most one source-gate reference decrement. Contention returns
+ * EAGAIN with the token retaining its remaining release stage. */
+static inline int
+wl_columnar_source_access_reader_release_step(
+    wl_columnar_source_access_reader_t *token, bool *done)
+{
+    wl_columnar_source_access_gate_t *gate;
+    uint64_t observed;
+    if (!done)
+        return EINVAL;
+    *done = false;
+    if (!token || token->identity != (uintptr_t)token || !token->owner
+        || token->release_stage > 1
+        || (!token->transferable
+        && !wl_columnar_source_access_reader_thread_equal(token))
+        || (token->transferable && token->thread_valid))
+        return EINVAL;
+    gate = token->release_stage == 0 ? token->owner
+        : token->secondary_owner;
+    if (!gate)
+        return EINVAL;
+    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
+    if (observed == 0 || observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EINVAL;
+    if (token->release_stage == 0 && token->secondary_owner
+        && !wl_columnar_source_access_gate_busy(token->secondary_owner))
+        return EINVAL;
+    if (!atomic_compare_exchange_strong_explicit(&gate->state, &observed,
+        observed - 1u, memory_order_release, memory_order_relaxed))
+        return EAGAIN;
+    if (token->release_stage == 0 && token->secondary_owner) {
+        token->release_stage = 1;
+        return 0;
+    }
+    wl_columnar_source_access_reader_clear(token);
+    *done = true;
     return 0;
+}
+
+static inline int
+wl_columnar_source_access_reader_release(
+    wl_columnar_source_access_reader_t *token)
+{
+    bool done = false;
+    int rc;
+    do {
+        rc = wl_columnar_source_access_reader_release_step(token, &done);
+    } while (rc == EAGAIN || (!rc && !done));
+    return rc;
 }
 
 static inline void

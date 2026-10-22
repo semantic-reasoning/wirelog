@@ -146,6 +146,9 @@ typedef struct {
     uint64_t replacement_bytes;
     /* Private overlap discriminator; read only after claiming REPLACING. */
     uint8_t transition_kind;
+    uint64_t release_bytes;
+    uint8_t release_from_state;
+    uint8_t release_mode;
     wl_atomic_u64 owner_bits;
     wl_atomic_u64 state;
     /* Tokens are caller-owned and intentionally non-copyable.  A copied
@@ -557,6 +560,13 @@ wl_columnar_memory_reservation_downsize(
 bool
 wl_columnar_memory_rollback(
     wl_columnar_memory_reservation_t *reservation);
+
+/* Release or roll back a reservation with at most one reservation-state or
+ * governor-accounting CAS per call. EAGAIN and done=false retain the token. */
+int
+wl_columnar_memory_reservation_finish_step(
+    wl_columnar_memory_reservation_t *reservation, bool rollback,
+    bool *done);
 
 bool
 wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation);

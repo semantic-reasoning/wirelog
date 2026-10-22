@@ -214,6 +214,29 @@ test_paired_cohort(bool shared_descriptor)
 }
 
 static void
+test_reader_release_steps(void)
+{
+    wl_columnar_source_access_gate_t source = { 0 }, descriptor = { 0 };
+    wl_columnar_source_access_reader_t reader = { 0 };
+    bool done = false;
+    wl_columnar_source_access_gate_init(&source);
+    wl_columnar_source_access_gate_init(&descriptor);
+    CHECK(paired_reader_acquire(&source, &descriptor, &reader) == 0,
+        "stepped reader acquire");
+    CHECK(wl_columnar_source_access_reader_release_step(&reader, &done) == 0
+        && !done && reader.owner == &source && reader.secondary_owner
+        == &descriptor && reader.release_stage == 1
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 0
+        && atomic_load_explicit(&descriptor.state, memory_order_acquire) == 1,
+        "first release step drops only source reference");
+    CHECK(wl_columnar_source_access_reader_release_step(&reader, &done) == 0
+        && done && !reader.owner && !reader.secondary_owner
+        && atomic_load_explicit(&source.state, memory_order_acquire) == 0
+        && atomic_load_explicit(&descriptor.state, memory_order_acquire) == 0,
+        "second release step drops descriptor and clears token");
+}
+
+static void
 test_paired_cohort_rejections(void)
 {
     wl_columnar_source_access_gate_t source = { 0 }, descriptor = { 0 };
@@ -1031,6 +1054,7 @@ main(void)
     test_writer_publication();
     test_paired_cohort(false);
     test_paired_cohort(true);
+    test_reader_release_steps();
     test_paired_cohort_rejections();
     test_paired_cohort_partial_unwind();
     test_growth_gate_attempt();

@@ -2380,6 +2380,89 @@ wl_columnar_memory_downsize_attempt_advance(
     return EINVAL;
 }
 
+enum {
+    WL_MEMORY_RELEASE_MODE_NONE = 0,
+    WL_MEMORY_RELEASE_MODE_RELEASE = 1,
+    WL_MEMORY_RELEASE_MODE_ROLLBACK = 2,
+};
+
+int
+wl_columnar_memory_reservation_finish_step(
+    wl_columnar_memory_reservation_t *reservation, bool rollback,
+    bool *done)
+{
+    if (!done)
+        return EINVAL;
+    *done = false;
+    if (!reservation_identity_valid(reservation))
+        return EINVAL;
+
+    uint64_t state = atomic_load_explicit(&reservation->state,
+            memory_order_acquire);
+    uint8_t requested_mode = rollback ? WL_MEMORY_RELEASE_MODE_ROLLBACK
+        : WL_MEMORY_RELEASE_MODE_RELEASE;
+    if (state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASING) {
+        if ((rollback && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+            || (!rollback && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+            && state != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING))
+            return EINVAL;
+        uint64_t bytes = reservation->bytes;
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
+            if (reservation->replacement_bytes > UINT64_MAX - bytes)
+                return EOVERFLOW;
+            bytes += reservation->replacement_bytes;
+        }
+        if (!reservation->governor || !bytes)
+            return EINVAL;
+        reservation->release_bytes = bytes;
+        reservation->release_from_state = (uint8_t)state;
+        reservation->release_mode = requested_mode;
+        uint64_t expected = state;
+        if (!atomic_compare_exchange_strong_explicit(&reservation->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_RELEASING,
+            memory_order_acq_rel, memory_order_acquire)) {
+            reservation->release_bytes = 0;
+            reservation->release_from_state = 0;
+            reservation->release_mode = WL_MEMORY_RELEASE_MODE_NONE;
+            return EAGAIN;
+        }
+        return 0;
+    }
+
+    if (reservation->release_mode != requested_mode
+        || !reservation->release_bytes || !reservation->governor
+        || (reservation->release_from_state
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && reservation->release_from_state
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        && reservation->release_from_state
+        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING))
+        return EBUSY;
+    uint64_t old = atomic_load_explicit(
+        &reservation->governor->reserved_bytes, memory_order_relaxed);
+    if (reservation->release_bytes > old)
+        return EINVAL;
+    uint64_t next = old - reservation->release_bytes;
+    if (!atomic_compare_exchange_strong_explicit(
+            &reservation->governor->reserved_bytes, &old, next,
+            memory_order_release, memory_order_relaxed))
+        return EAGAIN;
+    if (reservation->release_from_state
+        == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+        reservation->replacement_bytes = 0;
+    reservation->bytes = 0;
+    reservation->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    reservation->release_bytes = 0;
+    reservation->release_from_state = 0;
+    reservation->release_mode = WL_MEMORY_RELEASE_MODE_NONE;
+    atomic_store_explicit(&reservation->owner_bits, 0, memory_order_relaxed);
+    atomic_store_explicit(&reservation->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RELEASED, memory_order_release);
+    *done = true;
+    return 0;
+}
+
 static wl_columnar_memory_admission_status_t
 reserve_replacement_overlap(wl_columnar_memory_governor_t *governor,
     uint64_t bytes)
