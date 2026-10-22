@@ -1135,12 +1135,12 @@ batch-configured STEP shapes remain unsupported. Its published counter counts
 only candidates that cross the registry cutoff.
 
 For non-batch controlled STEP, the initial plan and registry proof is also
-resumable. A call charges at most 64 proof actions. Each action advances a
-bounded proof cursor, processing at most one plan descriptor, registry slot,
-or relation-name byte. When the bound is reached, STEP returns `EAGAIN` with
-the same attempt and proof cursors, and continues on the next call. Name
-matching advances byte by byte, so a long shared prefix cannot hide an
-unbounded string comparison. The proof checks
+resumable. A call charges at most 64 plan-proof and scheduler actions combined.
+Each action advances a bounded cursor, processing at most one plan descriptor,
+registry slot, relation-name byte, or empty-stratum skip. When the bound is
+reached, STEP returns `EAGAIN` with the same attempt and cursors, and continues
+on the next call. Name matching advances byte by byte, so a long shared prefix
+cannot hide an unbounded string comparison. The proof checks
 supported nonrecursive plan operators and confirms that registry heads match
 the already committed relation prefix before evaluation starts. A terminal
 stop discards the proof; a fresh attempt starts it again while preserving

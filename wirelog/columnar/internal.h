@@ -6864,8 +6864,12 @@ typedef struct {
     uint32_t op;
     uint32_t registry_slot;
     uint32_t name_byte;
+    uint32_t eval_stratum;
+    uint32_t eval_relation;
+    uint32_t call_actions;
     uint64_t charged_actions;
     bool ready;
+    bool cursor_advance_pending;
     bool target_name_byte_active;
     bool entry_charged;
 } wl_columnar_session_test_preflight_state_t;

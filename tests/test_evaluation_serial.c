@@ -2096,6 +2096,89 @@ test_controlled_step_preflight_work_limit_boundary(void)
 }
 
 static void
+test_controlled_step_scheduler_empty_strata(void)
+{
+    enum { EMPTY_STRATA = 70 };
+    const char *source =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    CHECK(plan->stratum_count > 0);
+    uint32_t total_strata = EMPTY_STRATA + plan->stratum_count;
+    wl_plan_stratum_t *strata = calloc(total_strata, sizeof(*strata));
+    CHECK(strata);
+    memcpy(strata + EMPTY_STRATA, plan->strata,
+        plan->stratum_count * sizeof(*strata));
+    for (uint32_t i = EMPTY_STRATA; i < total_strata; ++i)
+        strata[i].stratum_id += EMPTY_STRATA;
+    wl_plan_t expanded = *plan;
+    expanded.strata = strata;
+    expanded.stratum_count = total_strata;
+
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(UINT64_C(1000000), &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *base = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), &expanded, 1,
+        &options, &base));
+    const int64_t row[] = {7};
+    CHECK(!wl_session_insert(base, "input", row, 1, 1));
+    wl_col_session_t *session = (wl_col_session_t *)base;
+    wl_columnar_session_test_preflight_quantum = 64;
+
+    uint64_t operation_id = 0;
+    uint32_t previous_eval_stratum = 0;
+    bool previous_ready = false;
+    bool scheduler_yielded = false;
+    int rc = EAGAIN;
+    for (unsigned turn = 0; turn < 1000 && rc == EAGAIN; ++turn) {
+        rc = wl_session_step(base);
+        wl_columnar_session_test_preflight_state_t state;
+        CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
+        if (!operation_id) {
+            operation_id = wl_evaluation_control_active_attempt_id(control);
+            CHECK(operation_id);
+        }
+        CHECK(state.call_actions <= 64);
+        CHECK(state.eval_stratum <= total_strata);
+        CHECK(!session_find_rel(session, "output")
+            || state.eval_stratum == total_strata);
+        if (previous_ready && state.ready
+            && state.eval_stratum > previous_eval_stratum) {
+            CHECK(state.eval_stratum - previous_eval_stratum <= 64);
+        }
+        if (state.ready && state.eval_stratum > 0
+            && state.eval_stratum < EMPTY_STRATA) {
+            CHECK(state.call_actions == 64);
+            scheduler_yielded = true;
+        }
+        previous_eval_stratum = state.eval_stratum;
+        previous_ready = state.ready;
+        if (rc == EAGAIN) {
+            CHECK(wl_evaluation_control_active_attempt_id(control)
+                == operation_id);
+            CHECK(!session_find_rel(session, "output"));
+        }
+    }
+    CHECK(!rc && scheduler_yielded);
+    const col_rel_t *output = session_find_rel(session, "output");
+    CHECK(output && output->nrows == 1 && output->columns[0][0] == 7);
+
+    wl_session_destroy(base);
+    wl_evaluation_control_release(control);
+    free(strata);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
 test_controlled_batch_join_filter_map_step(void)
 {
     char a_name[101], b_name[101], source[1024];
@@ -2551,6 +2634,10 @@ test_controlled_session_step_prefix_resume(void)
     }
     CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && yields > 1);
     wl_columnar_session_test_exhaust_after_relation = 0;
+    wl_columnar_session_test_preflight_state_t stopped_state;
+    CHECK(!wl_columnar_session_test_preflight_snapshot(session,
+        &stopped_state));
+    CHECK(stopped_state.cursor_advance_pending);
     wl_columnar_session_test_preflight_quantum = 64;
     CHECK(!wl_evaluation_control_active_attempt_id(control));
     const col_rel_t *left = session_find_rel((wl_col_session_t *)session,
@@ -5975,6 +6062,7 @@ main(void)
     test_controlled_session_join_step();
     test_controlled_step_preflight_byte_cursor();
     test_controlled_step_preflight_work_limit_boundary();
+    test_controlled_step_scheduler_empty_strata();
     test_controlled_batch_join_filter_map_step();
     test_controlled_batch_delta_selectors();
     test_controlled_batch_child_domain_rejection();
