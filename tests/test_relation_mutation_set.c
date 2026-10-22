@@ -3003,8 +3003,89 @@ attempt_single_authority_tests(void)
 }
 
 static void
+append_growth_zero_capacity_footprint_test(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = NULL;
+    wl_columnar_memory_governor_ref_t *governor = enforcing_governor(4096);
+    col_rel_t dst, src;
+    root_init(&dst, 994);
+    root_init(&src, 995);
+    dst.ncols = src.ncols = 2;
+    dst.capacity = 0;
+    src.capacity = 1;
+    src.nrows = 1;
+    dst.columns = calloc(dst.ncols, sizeof(*dst.columns));
+    src.columns = calloc(src.ncols, sizeof(*src.columns));
+    assert(dst.columns && src.columns);
+    for (uint32_t c = 0; c < dst.ncols; c++) {
+        dst.columns[c] = calloc(1, sizeof(int64_t));
+        src.columns[c] = calloc(src.capacity, sizeof(int64_t));
+        assert(dst.columns[c] && src.columns[c]);
+        src.columns[c][0] = 20 + c;
+    }
+    dst.memory_governor = governor;
+    dst.retained_reserved_bytes = 2 * sizeof(int64_t *)
+        + 2 * sizeof(int64_t);
+    wl_columnar_memory_reservation_init(&dst.retained_reservation);
+    uint64_t exact_bytes;
+    assert(col_rel_retained_live_bytes(&dst, &exact_bytes));
+    assert(exact_bytes == dst.retained_reserved_bytes);
+    assert(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            governor), dst.retained_reserved_bytes, &dst.retained_reservation));
+    assert(wl_columnar_memory_commit(&dst.retained_reservation, &dst));
+    assert(wl_evaluation_control_create(0, &control) == 0);
+    assert(wl_evaluation_control_attach(control, &owner) == 0);
+    assert(wl_evaluation_control_begin(control, &owner) == 0);
+
+    wl_columnar_relation_append_growth_attempt_t attempt = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&attempt, &dst,
+        &src, 0, 1, control) == 0);
+    int rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+    assert(rc == 0 && wl_columnar_relation_append_growth_attempt_ready(
+            &attempt));
+    assert(attempt.old_reserved_bytes == 2 * sizeof(int64_t *)
+        + 2 * sizeof(int64_t));
+    assert(attempt.destination_ledger_before == 0
+        && attempt.destination_ledger_after == 2 * 64 * sizeof(int64_t));
+    assert(dst.capacity == 0 && dst.nrows == 0);
+    rc = wl_columnar_relation_append_growth_attempt_commit(&attempt);
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+    assert(rc == 0 && dst.capacity == 64 && dst.nrows == 1);
+    assert(dst.columns[0][0] == 20 && dst.columns[1][0] == 21);
+    assert(dst.retained_reserved_bytes == 2 * sizeof(int64_t *)
+        + 2 * 64 * sizeof(int64_t));
+    assert(col_rel_retained_live_bytes(&dst, &exact_bytes)
+        && exact_bytes == dst.retained_reserved_bytes);
+    assert_open(&dst);
+    assert_open(&src);
+
+    assert(wl_evaluation_control_finish(control, &owner, 0, 0) == 0);
+    assert(wl_evaluation_control_detach(control, &owner) == 0);
+    wl_evaluation_control_release(control);
+    assert(wl_columnar_memory_release(&dst.retained_reservation));
+    wl_columnar_memory_governor_ref_release(governor);
+    for (uint32_t c = 0; c < dst.ncols; c++) {
+        free(dst.columns[c]);
+        free(src.columns[c]);
+    }
+    free(dst.columns);
+    free(src.columns);
+}
+
+static void
 append_growth_attempt_tests(void)
 {
+    uint64_t grid_bytes;
+    assert(wl_columnar_relation_payload_grid_bytes(3, 3, 0, true,
+        &grid_bytes));
+    assert(grid_bytes == 3 * sizeof(int64_t *) + 3 * sizeof(int64_t));
+    assert(!wl_columnar_relation_payload_grid_bytes(UINT32_MAX, UINT32_MAX,
+        UINT32_MAX, true, &grid_bytes));
+
     int owner;
     wl_evaluation_control_t *control = NULL;
     wl_columnar_memory_governor_ref_t *governor = enforcing_governor(4096);
@@ -3029,6 +3110,9 @@ append_growth_attempt_tests(void)
     dst.memory_governor = governor;
     dst.retained_reserved_bytes = 24;
     wl_columnar_memory_reservation_init(&dst.retained_reservation);
+    uint64_t exact_bytes;
+    assert(col_rel_retained_live_bytes(&dst, &exact_bytes));
+    assert(exact_bytes == dst.retained_reserved_bytes);
     assert(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
             governor), dst.retained_reserved_bytes, &dst.retained_reservation));
     assert(wl_columnar_memory_commit(&dst.retained_reservation, &dst));
@@ -3134,6 +3218,10 @@ append_growth_attempt_tests(void)
         && dst.columns[0][2] == 20 && dst.columns[0][3] == 21);
     assert(dst.retained_reserved_bytes == 40
         && governor_reserved(governor) == 40);
+    assert(attempt.destination_ledger_before == 16
+        && attempt.destination_ledger_after == 32);
+    assert(col_rel_retained_live_bytes(&dst, &exact_bytes)
+        && exact_bytes == dst.retained_reserved_bytes);
     assert_open(&dst);
     assert_open(&src);
     src.pool_owned = true;
@@ -3173,6 +3261,7 @@ int
 main(void)
 {
     attempt_single_authority_tests();
+    append_growth_zero_capacity_footprint_test();
     append_growth_attempt_tests();
     lease_tests();
     writer_token_liveness_tests();
