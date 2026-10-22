@@ -16,6 +16,7 @@ struct wl_evaluation_control {
     wl_atomic_u64 references;
     wl_atomic_u64 cancelled;
     wl_atomic_u64 active_attempt_id;
+    uint64_t identity;
     const void *owner;
     uint64_t configured_limit;
     uint64_t attempt_id;
@@ -27,12 +28,45 @@ struct wl_evaluation_control {
     wl_evaluation_control_report_t completed;
 };
 
+static wl_atomic_u64 wl_next_evaluation_control_identity = 1;
+
+static int
+wl_evaluation_control_next_identity(uint64_t *identity)
+{
+    uint64_t observed = atomic_load_explicit(
+        &wl_next_evaluation_control_identity, memory_order_relaxed);
+    for (;;) {
+        if (!observed || observed == UINT64_MAX)
+            return EOVERFLOW;
+        if (atomic_compare_exchange_weak_explicit(
+                &wl_next_evaluation_control_identity, &observed,
+                observed + 1, memory_order_relaxed, memory_order_relaxed)) {
+            *identity = observed;
+            return 0;
+        }
+    }
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_evaluation_control_test_seed_next_identity(uint64_t value)
+{
+    atomic_store_explicit(&wl_next_evaluation_control_identity, value,
+        memory_order_relaxed);
+    return 0;
+}
+#endif
+
 int
 wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out)
 {
     if (!out)
         return EINVAL;
     *out = NULL;
+    uint64_t identity;
+    int rc = wl_evaluation_control_next_identity(&identity);
+    if (rc != 0)
+        return rc;
     wl_evaluation_control_t *control = calloc(1, sizeof(*control));
     if (!control)
         return ENOMEM;
@@ -43,9 +77,16 @@ wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out)
     atomic_init(&control->references, 1);
     atomic_init(&control->cancelled, 0);
     atomic_init(&control->active_attempt_id, 0);
+    control->identity = identity;
     control->configured_limit = limit;
     *out = control;
     return 0;
+}
+
+uint64_t
+wl_evaluation_control_identity(const wl_evaluation_control_t *control)
+{
+    return control ? control->identity : 0;
 }
 
 int

@@ -3693,12 +3693,15 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
 
 /* Resumable private INT64 append growth. The zero-initialized attempt and both
  * descriptors remain at stable addresses, alive, and on the creating thread
- * through DONE. The caller keeps the control's active attempt alive and does
- * not mutate either relation outside its gates. Before publication, stop or
- * abort preserves the destination image. After publication, advance must
- * continue until DONE so old storage is retired and governed credit is
- * reduced; `published` distinguishes this committed-cleanup interval from a
- * prepublication failure. EAGAIN means advance the same attempt again. */
+ * through DONE. The caller keeps the operation control active while forwarding
+ * and committing. Once abort or commit enters cleanup, the operation control
+ * may be released; cleanup uses its captured process-unique identity only.
+ * The caller does not mutate either relation outside its gates. Before
+ * publication, stop or abort preserves the destination image. After
+ * publication, cleanup_step must continue until DONE so old storage is retired
+ * and governed credit is reduced; `published` distinguishes this committed
+ * cleanup interval from prepublication failure. EAGAIN means retry the
+ * forward attempt or fund one cleanup step, according to the current phase. */
 typedef enum wl_columnar_relation_append_growth_phase {
     WL_COLUMNAR_RELATION_APPEND_GROWTH_INERT = 0,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_ACQUIRE,
@@ -3713,6 +3716,9 @@ typedef enum wl_columnar_relation_append_growth_phase {
     WL_COLUMNAR_RELATION_APPEND_GROWTH_READY,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_COMMIT_PUBLISH,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD_TABLE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD_LEDGER,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_DOWNSIZE_BEGIN,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_DOWNSIZE,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE,
     WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE,
@@ -3726,8 +3732,9 @@ typedef struct wl_columnar_relation_append_growth_attempt {
     struct wl_columnar_relation_append_growth_attempt *identity;
     col_rel_t *destination;
     const col_rel_t *source;
-    wl_evaluation_control_t *control;
+    wl_evaluation_control_t *control; /* Forward/commit only; may then expire. */
     uint64_t active_attempt_id;
+    uint64_t control_identity; /* Stable identity, safe after release. */
 #if defined(WL_HAVE_C11_THREADS)
     thrd_t owner_thread;
 #elif defined(_WIN32) || defined(_WIN64)
@@ -3780,8 +3787,19 @@ int wl_columnar_relation_append_growth_attempt_begin(
     const col_rel_t *, uint32_t, uint32_t, wl_evaluation_control_t *);
 int wl_columnar_relation_append_growth_attempt_advance(
     wl_columnar_relation_append_growth_attempt_t *);
+/* Cleanup requires a distinct live control and its currently active matching
+ * attempt ID on each nonterminal call. Each successful call pays for one
+ * bounded cleanup action and retains no funding-control state. Funding refusal
+ * preserves the pending action. The owner keeps the receipt, descriptors,
+ * reservation and storage alive at stable addresses on the creating thread
+ * until DONE. `cleanup_result` records cleanup diagnostics; successful DONE
+ * returns the latched primary operation result. DONE acknowledgment is
+ * receipt-local and needs no funding. */
+int wl_columnar_relation_append_growth_attempt_cleanup_step(
+    wl_columnar_relation_append_growth_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
 /* Advance returns 0 at READY without publishing. Commit crosses the
- * irreversible boundary; afterward keep advancing mandatory cleanup. */
+ * irreversible boundary; afterward call cleanup_step until DONE. */
 int wl_columnar_relation_append_growth_attempt_commit(
     wl_columnar_relation_append_growth_attempt_t *);
 bool wl_columnar_relation_append_growth_attempt_ready(

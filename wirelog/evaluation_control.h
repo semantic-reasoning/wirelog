@@ -37,6 +37,10 @@ typedef struct {
 int wl_evaluation_control_create(uint64_t limit, wl_evaluation_control_t **out);
 int wl_evaluation_control_retain(wl_evaluation_control_t *control);
 void wl_evaluation_control_release(wl_evaluation_control_t *control);
+/* Stable, never-reused process identity; create returns EOVERFLOW on
+ * exhaustion. The caller holds a live reference. */
+uint64_t wl_evaluation_control_identity(
+    const wl_evaluation_control_t *control);
 
 /*
  * Attach retains one reference and claims a non-NULL, stable logical owner.
@@ -84,6 +88,8 @@ uint64_t wl_evaluation_control_active_attempt_id(
 /* Inactive attached owner only; advance the generator without changing report. */
 int wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
     const void *owner, uint64_t value);
+/* Isolated test process only; seeds the next process-wide control identity. */
+int wl_evaluation_control_test_seed_next_identity(uint64_t value);
 #endif
 /*
  * Charge before work; charge(0) is a poll. Denial does not consume work.
