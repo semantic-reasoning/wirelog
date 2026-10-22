@@ -3566,7 +3566,8 @@ The remaining activation boundary is explicit:
 | Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
 | Initial scalar REDUCE | Supported in the documented scalar numeric child domain |
 | Initial scalar CONCAT/UNION | Supported as a two-input child and complete private composed numeric body through terminal CONSOLIDATE |
-| LFTJ/fused alternatives | Further implementation and path-specific qualification required |
+| Generated LFTJ | Supported in serial controlled composition with a 64-column cap; source discovery, merge-sort, traversal, and output-cell actions are bounded. Relation destruction, allocator/Arrow release, and stack publication/disposal remain synchronous cleanup boundaries. |
+| LFTJ fallbacks/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |
 | Public/default admission, production scheduling and session publication | Further bounded dispatch/publication and complete reachable-path audit required |
@@ -3839,7 +3840,8 @@ single-worker acceptance allowance; it does not define a source tariff or the
 callback. These tests cover this generated ordinary right-filter route only.
 Bounded default serial preflight for supported nonrecursive STEP plans is
 described in `docs/SEMANTICS.md`; recursive, differential, weighted,
-TDD/parallel, LFTJ/K-fusion, and controlled SNAPSHOT coverage remain open.
+TDD/parallel, remaining LFTJ fallback/fused paths, K-fusion, and controlled
+SNAPSHOT coverage remain open.
 
 The generated product route also pins an empirical original-work boundary at
 pair 128. An unlimited attempt is cancelled at that JOIN checkpoint; its

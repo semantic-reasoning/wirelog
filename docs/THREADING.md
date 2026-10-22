@@ -394,8 +394,11 @@ reaches released exactly once; owner identity is stored as an atomic pointer
 representation so transfer cannot race a release with a data race.
 Downsize, release, and transfer claim the token before accessing mutable payload;
 contending operations return false when the token is busy. Accounting completes
-before publishing the updated committed or released state. Move, reinitialization,
-and direct non-atomic payload reads require external synchronization.
+before publishing the updated committed or released state. The controlled
+`wl_columnar_memory_reservation_finish_step` path separates reservation-state
+claim from one governor-credit CAS; `EAGAIN` retains its release cursor and
+accounting amount for a newly funded retry. Move, reinitialization, and direct
+non-atomic payload reads require external synchronization.
 
 | Anchor (file:function[#N]) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -447,6 +450,12 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_reservation_downsize` | `reservation->state` | `atomic_store_explicit` | `release` | Publish updated bytes after crediting the delta, or restore committed state on failure |
 | `memory_governor.c:finish_reservation` | `reservation->state` | `atomic_load_explicit` | `acquire` | Observe an eligible stable state before claiming release; reject a busy token |
 | `memory_governor.c:finish_reservation#2` | `reservation->state` | `atomic_store_explicit` | `release` | Publish released state only after accounting, or restore the prior state on failure |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step` | `reservation->state` | `atomic_load_explicit` | `acquire` | Resume or admit a staged release using the token's current state |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#2` | `reservation->state` | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim one release transition; contention returns without retrying or altering accounting |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#3` | `governor->reserved_bytes` | `atomic_load_explicit` | relaxed | Read the aggregate before one checked credit CAS |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#4` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Return this token's credit once; contention preserves RELEASING and the credit amount for retry |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#5` | `reservation->owner_bits` | `atomic_store_explicit` | relaxed | Clear ownership after governor credit succeeds |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#6` | `reservation->state` | `atomic_store_explicit` | release | Publish RELEASED only after the single accounting CAS completes |
 | `memory_governor.c:wl_columnar_memory_reserve_growth` | `reservation->state` | `atomic_load_explicit` | `acquire` | Validate the source token before creating a distinct growth reservation |
 | `memory_governor.c:wl_columnar_memory_reserved` | `reserved_bytes` | `atomic_load_explicit` | `acquire` | Read a coherent observable reservation total |
 | `memory_governor.c:wl_columnar_memory_reservation_move` | `destination->state` | `atomic_load_explicit` | `acquire` | Validate the destination token before moving ownership |
@@ -534,6 +543,12 @@ Reader and writer tokens are caller-owned and address-bound; ordinary operation 
 are thread-confined, while session-owned source leases are transferable across serialized teardown.
 Relation readers pin the descriptor before resolving and pinning the canonical owner.
 Release drops the owner first, then the optional descriptor pin.
+The controlled `wl_columnar_source_access_reader_release_step` consumes at
+most one gate reference decrement per call. With a secondary descriptor pin,
+the token records whether the source or descriptor decrement remains; a
+contended single CAS returns `EAGAIN` without losing that token. The legacy
+synchronous release API loops this primitive for callers outside the
+controlled cleanup path.
 Controlled scalar schema cloning uses two separate original reader tokens,
 each with no secondary gate. It drains the owner token and then the descriptor
 token before publishing its owned result. Unexpected mandatory release failure
@@ -574,7 +589,8 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_cohort_validate#2` | `cohort->entries[i].gate->state` | `atomic_load_explicit` | acquire | Verify every descriptor WRITER in the same read-only snapshot |
 | `source_access.h:wl_columnar_source_access_cohort_restore` | `cohort->entries[i].gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Republish each descriptor's exact reader multiplicity before reopening the source gate |
 | `source_access.h:wl_columnar_source_access_cohort_restore#2` | `cohort->source->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Republish the source reader count after all descriptors are restored |
-| `source_access.h:wl_columnar_source_access_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Observe the active gate before releasing this reader |
+| `source_access.h:wl_columnar_source_access_reader_release_step` | `gate->state` | `atomic_load_explicit` | acquire | Observe exactly the source or descriptor gate selected by the retained release cursor |
+| `source_access.h:wl_columnar_source_access_reader_release_step#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Decrement one gate reference; contention returns to the caller with the reader token and next gate intact |
 | `source_access.h:wl_columnar_source_access_writer_acquire` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize exclusive writer admission and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_validate` | `gate->state` | `atomic_load_explicit` | acquire | Validate that the address-bound, same-thread token still owns the exact writer sentinel before authorizing mutation without consuming the token |
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
@@ -635,8 +651,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-112 + 21 + 30 = **163 atomic call sites** in those summarized groups; the full
-symbol-anchored inventory below covers 376 sites.
+112 + 21 + 37 = **170 atomic call sites**.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1428,16 +1443,19 @@ delegates to internal `wl_session_destroy`, which closes operation admission
 and waits for admitted operations before backend teardown; the public facade
 then releases its wrapper. Reader lifetimes must end within those boundaries.
 Internal controlled attempts that yield between calls hold a persistent
-exclusive admission lease. While parked, ordinary mutation, STEP, snapshot,
-and callback replacement are refused, and only the lease owner may enter the
-session for the next action. The lease remains held through discard and
-retirement and releases only at ACK. Its caller must externally serialize
+exclusive admission lease. A pending controlled STEP continuation also blocks
+checked and unchecked destruction until it completes. While parked, ordinary
+mutation, STEP, snapshot, and callback replacement are refused, and only the
+lease owner may enter the session for the next action. The lease remains held
+through discard and retirement and releases only at ACK. Its caller must
+externally serialize
 every session call entry against destruction; the admission mutex does not
 pin a raw session handle before the call begins. Such callers use the checked
 internal `wl_session_try_destroy` API: it returns `EBUSY` without consuming
-the session slot while a lease remains, then destroys and clears a quiescent
-slot after ACK. Calling the legacy internal `wl_session_destroy` with a parked
-lease is a fatal contract violation. Neither API makes arbitrary writes
+the session slot while a lease or controlled STEP continuation remains, then
+destroys and clears a quiescent slot after ACK/completion. Calling the legacy
+internal `wl_session_destroy` with either parked state is a fatal contract
+violation. Neither API makes arbitrary writes
 through borrowed internal relation or plan pointers safe; those retain their
 existing immutability contract.
 Refused evaluator-stack ownership and K-Fusion cleanup remain open in #1647,
@@ -2033,6 +2051,22 @@ advance to resume, while cancellation also requires discard.
 The READY handoff records staging-credit commit completion before its final
 poll, so a fresh attempt can finish publication eligibility without repeating
 the commit.
+
+### Controlled LFTJ cleanup boundary
+
+The controlled LFTJ continuation charges each cleanup action to its original
+funding control and attempt ID. A refusal leaves the cursor and owned handles
+available for a later call; every retry must validate a fresh funding grant
+before it performs one reader-gate or governor-credit CAS. Intermediate release
+states are retained in their original reader or reservation tokens if the host
+stops between actions. The synchronous compatibility APIs may still loop over
+these stepped primitives when called outside the continuation.
+
+This continuation does not yet bound every cleanup operation. Relation
+destruction (`col_rel_destroy_checked`), writer finalization, allocator/Arrow
+release, and evaluator-stack publication or disposal can still perform
+synchronous cooperative cleanup. They remain explicit boundaries for future
+work; this slice does not claim a hard cleanup quantum or complete issue #1821.
 
 | Site | Atomic field | Operation | Order | Purpose |
 | --- | --- | --- | --- | --- |
