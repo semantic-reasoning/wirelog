@@ -760,6 +760,17 @@ and literal rows. That result is limited to this fixture; it does not establish 
 universal FILTER cost, FLOAT coverage, cancellation behavior, or coverage of
 other evaluator routes.
 
+The controlled session STEP fixture additionally drives 64-by-513 product and
+same-key JOIN candidate sets through `wl_session_step`. A deterministic hook
+stops the first attempt after 128 phase-17 candidate checkpoints; a measured
+one-unit-short allowance then produces a work-limit stop after 127 checkpoints.
+Neither stop publishes the rule head. Resetting the control and resuming yields
+all product rows, while 32,832 matching keyed candidates rejected by the
+following predicate produce an empty head. This proves those two acyclic JOIN
+shapes through the session driver, including substantial candidate work and a
+no-output case; it does not extend support to recursive, differential,
+batch/pipeline, or fallback routes.
+
 Synchronous allocator/runtime calls, whole-input library sorts/copies, host
 scalar addons, and output callback bodies cannot be preempted by this token.
 Downstream integration must split engine-owned large sorts/copies into bounded
