@@ -9,12 +9,16 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include <time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 typedef enum {
@@ -53,7 +57,14 @@ typedef struct {
     int rc;
 } thread_context_t;
 
+typedef struct {
+    wl_session_exclusive_attempt_t *attempt;
+    int enter_rc;
+    int release_rc;
+} attempt_thread_context_t;
+
 static test_sync_t *creation_sync;
+static bool fail_unlock_after_insert;
 
 static void
 record_operation(fake_session_t *session, test_operation_t operation)
@@ -116,6 +127,10 @@ fake_insert(wl_session_t *base, const char *relation, const int64_t *data,
     (void)num_rows;
     (void)num_cols;
     record_operation((fake_session_t *)base, TEST_OP_INSERT);
+    if (fail_unlock_after_insert) {
+        fail_unlock_after_insert = false;
+        wl_session_testhook_fail_next_admission_unlock();
+    }
     return 0;
 }
 
@@ -230,6 +245,15 @@ operation_thread(void *opaque)
         ctx->rc = wl_session_step(ctx->session);
     else
         ctx->rc = wl_session_snapshot(ctx->session, noop_tuple, NULL);
+    return NULL;
+}
+
+static void *
+attempt_wrong_thread(void *opaque)
+{
+    attempt_thread_context_t *ctx = (attempt_thread_context_t *)opaque;
+    ctx->enter_rc = wl_session_exclusive_attempt_enter(ctx->attempt);
+    ctx->release_rc = wl_session_exclusive_attempt_release(ctx->attempt);
     return NULL;
 }
 
@@ -538,6 +562,9 @@ run_controlled_step_gate(void)
             "in-flight insert completes before controlled step");
 
     sync.blocked_operation = TEST_OP_COUNT;
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_step(session) == EIO,
+            "controlled STEP admission lock failure fails closed");
     failures += expect(wl_session_step(session) == EAGAIN,
             "controlled step exposes its retained continuation");
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
@@ -576,6 +603,9 @@ run_controlled_step_gate(void)
     sync.release_operation = false;
     operation_ctx.operation = TEST_OP_SNAPSHOT;
     operation_ctx.rc = -1;
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL) == EIO,
+            "controlled snapshot admission lock failure fails closed");
     thread_rc = wl_thread_create(&operation_tid, operation_thread,
             &operation_ctx);
     failures += expect(thread_rc == 0,
@@ -610,6 +640,178 @@ done:
     return failures;
 }
 
+static int
+run_exclusive_attempt_gate(void)
+{
+    test_sync_t sync = { 0 };
+    wl_session_options_t options;
+    wl_session_t *session = NULL;
+    wl_session_exclusive_attempt_t attempt = { 0 };
+    wl_session_exclusive_attempt_t competing_attempt = { 0 };
+    wl_session_exclusive_attempt_t copied_attempt;
+    attempt_thread_context_t thread_ctx = { 0 };
+    wl_session_t borrowed = { 0 };
+    wl_session_t *borrowed_slot = &borrowed;
+    int failures = 0;
+    int64_t row = 1;
+
+    if (wl_mutex_init(&sync.mutex) != 0 || wl_cond_init(&sync.changed) != 0)
+        return 1;
+    creation_sync = &sync;
+    failures += expect(wl_session_try_destroy(&borrowed_slot) == EINVAL
+            && borrowed_slot == &borrowed,
+            "checked destroy rejects borrowed session handles");
+    wl_session_options_init(&options);
+    failures += expect(wl_session_create_with_options(&fake_backend, NULL, 1,
+            &options, &session) == 0 && session != NULL,
+            "create fake session for exclusive attempt");
+    if (!session) goto done;
+    unsigned insert_calls = sync.calls[TEST_OP_INSERT];
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EIO
+            && sync.calls[TEST_OP_INSERT] == insert_calls,
+            "admission lock failure refuses before backend mutation");
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_exclusive_attempt_acquire(session,
+            &attempt) == EIO && !attempt.held,
+            "lease acquisition lock failure leaves record inert");
+    failures += expect(wl_session_exclusive_attempt_acquire(session, &attempt)
+            == 0, "acquire persistent exclusive attempt");
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
+            "exclusive attempt blocks ordinary mutation while parked");
+    failures += expect(wl_session_step(session) == EBUSY,
+            "exclusive attempt blocks STEP while parked");
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL) == EBUSY,
+            "exclusive attempt blocks snapshot while parked");
+    unsigned callback_calls = sync.calls[TEST_OP_SET_DELTA_CB];
+    wl_session_set_delta_cb(session, noop_delta, NULL);
+    failures += expect(sync.calls[TEST_OP_SET_DELTA_CB] == callback_calls,
+            "exclusive attempt blocks callback replacement while parked");
+    wl_session_t *same_session = session;
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_try_destroy(&session) == EIO
+            && session == same_session,
+            "checked destroy lock failure preserves session slot");
+    failures += expect(wl_session_try_destroy(&session) == EBUSY
+            && session == same_session,
+            "checked destroy preserves session while attempt is parked");
+    copied_attempt = attempt;
+    failures += expect(wl_session_exclusive_attempt_enter(&copied_attempt)
+            == EINVAL, "copied lease cannot enter");
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_exclusive_attempt_enter(&attempt) == EIO
+            && !attempt.entered,
+            "lease enter lock failure leaves action unentered");
+    failures += expect(wl_session_exclusive_attempt_enter(&attempt) == 0,
+            "enter exclusive attempt action");
+    failures += expect(wl_session_exclusive_attempt_acquire(session,
+            &competing_attempt) == EBUSY,
+            "another lease cannot acquire during an admitted action");
+    failures += expect(wl_session_exclusive_attempt_enter(&attempt) == EINVAL,
+            "nested lease entry is refused");
+    failures += expect(wl_session_exclusive_attempt_release(&attempt) == EINVAL,
+            "entered lease cannot release");
+    failures += expect(wl_session_exclusive_attempt_mark_exit_pending(&attempt)
+            == 0, "mark exclusive action before leave");
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_exclusive_attempt_leave(&attempt) == EIO
+            && attempt.entered && attempt.exit_pending,
+            "leave lock failure preserves EXIT_PENDING without replay");
+    failures += expect(wl_session_exclusive_attempt_leave(&attempt) == 0,
+            "retry leave without rerunning the action");
+    thread_ctx.attempt = &attempt;
+    wl_thread_t attempt_tid;
+    int attempt_thread_rc = wl_thread_create(&attempt_tid,
+            attempt_wrong_thread, &thread_ctx);
+    failures += expect(attempt_thread_rc == 0,
+            "start wrong-thread lease probes");
+    if (attempt_thread_rc == 0)
+        wl_thread_join(&attempt_tid);
+    failures += expect(thread_ctx.enter_rc == EINVAL
+            && thread_ctx.release_rc == EINVAL,
+            "wrong thread cannot enter or release a parked lease");
+    wl_session_testhook_fail_next_admission_lock();
+    failures += expect(wl_session_exclusive_attempt_release(&attempt) == EIO
+            && attempt.held,
+            "release lock failure preserves parked lease");
+    failures += expect(wl_session_exclusive_attempt_release(&attempt) == 0,
+            "release lease after draining attempt ownership");
+    failures += expect(wl_session_try_destroy(&session) == 0 && session == NULL,
+            "checked destroy consumes quiescent session slot");
+    failures += expect(wl_session_try_destroy(&session) == 0,
+            "checked destroy accepts an empty slot");
+done:
+    creation_sync = NULL;
+    wl_cond_destroy(&sync.changed);
+    wl_mutex_destroy(&sync.mutex);
+    return failures;
+}
+
+#if !defined(_WIN32)
+static int
+run_admission_unlock_fail_stop(void)
+{
+    pid_t child = fork();
+    if (child < 0)
+        return 1;
+    if (child == 0) {
+        test_sync_t sync = { 0 };
+        wl_session_options_t options;
+        wl_session_t *session = NULL;
+        int64_t row = 1;
+        if (wl_mutex_init(&sync.mutex) != 0
+            || wl_cond_init(&sync.changed) != 0)
+            _exit(3);
+        sync.blocked_operation = TEST_OP_COUNT;
+        sync.release_operation = true;
+        creation_sync = &sync;
+        wl_session_options_init(&options);
+        if (wl_session_create_with_options(&fake_backend, NULL, 1,
+            &options, &session) != 0 || !session)
+            _exit(4);
+        fail_unlock_after_insert = true;
+        (void)wl_session_insert(session, "r", &row, 1, 1);
+        _exit(5);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child)
+        return 1;
+    return expect(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+               "admission unlock failure after backend action fail-stops");
+}
+
+static int
+run_destroy_lock_fail_stop(void)
+{
+    pid_t child = fork();
+    if (child < 0)
+        return 1;
+    if (child == 0) {
+        test_sync_t sync = { 0 };
+        wl_session_options_t options;
+        wl_session_t *session = NULL;
+        if (wl_mutex_init(&sync.mutex) != 0
+            || wl_cond_init(&sync.changed) != 0)
+            _exit(3);
+        sync.blocked_operation = TEST_OP_COUNT;
+        sync.release_operation = true;
+        creation_sync = &sync;
+        wl_session_options_init(&options);
+        if (wl_session_create_with_options(&fake_backend, NULL, 1,
+            &options, &session) != 0 || !session)
+            _exit(4);
+        wl_session_testhook_fail_next_admission_lock();
+        wl_session_destroy(session);
+        _exit(5);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child)
+        return 1;
+    return expect(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT,
+               "destroy admission lock failure fail-stops before teardown");
+}
+#endif
+
 int
 main(void)
 {
@@ -622,6 +824,11 @@ main(void)
     failures += run_destroy_race(TEST_OP_STEP, false, true);
     failures += run_destroy_race(TEST_OP_INSERT, true, true);
     failures += run_controlled_step_gate();
+    failures += run_exclusive_attempt_gate();
+#if !defined(_WIN32)
+    failures += run_admission_unlock_fail_stop();
+    failures += run_destroy_lock_fail_stop();
+#endif
     if (failures)
         fprintf(stderr, "session_admission: %d failure(s)\n", failures);
     return failures != 0;

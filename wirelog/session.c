@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 struct wl_session_admission {
     wl_mutex_t mutex;
@@ -35,7 +36,65 @@ struct wl_session_admission {
     bool controlled_step_pending;
     bool controlled_step_complete;
     bool closing;
+    wl_session_exclusive_attempt_t *exclusive_attempt;
 };
+
+#if defined(_MSC_VER)
+#define WL_SESSION_THREAD_LOCAL __declspec(thread)
+#else
+#define WL_SESSION_THREAD_LOCAL _Thread_local
+#endif
+static WL_SESSION_THREAD_LOCAL unsigned char wl_session_thread_cookie;
+#ifdef WL_SESSION_TEST_HOOKS
+static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_lock;
+static WL_SESSION_THREAD_LOCAL bool wl_session_fail_next_admission_unlock;
+#endif
+#undef WL_SESSION_THREAD_LOCAL
+
+static void
+wl_session_gate_fatal(void)
+{
+    abort();
+}
+
+static void
+wl_session_checked_unlock(wl_session_admission_t *admission)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_session_fail_next_admission_unlock) {
+        wl_session_fail_next_admission_unlock = false;
+        wl_session_gate_fatal();
+    }
+#endif
+    if (wl_mutex_unlock(&admission->mutex) != 0)
+        wl_session_gate_fatal();
+}
+
+static int
+wl_session_admission_lock(wl_session_admission_t *admission)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_session_fail_next_admission_lock) {
+        wl_session_fail_next_admission_lock = false;
+        return -1;
+    }
+#endif
+    return wl_mutex_lock(&admission->mutex);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void
+wl_session_testhook_fail_next_admission_lock(void)
+{
+    wl_session_fail_next_admission_lock = true;
+}
+
+void
+wl_session_testhook_fail_next_admission_unlock(void)
+{
+    wl_session_fail_next_admission_unlock = true;
+}
+#endif
 
 static wl_session_admission_t *
 wl_session_admission_create(void)
@@ -73,14 +132,16 @@ wl_session_operation_begin(wl_session_t *session)
     if (!admission)
         return 0;
 
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
     if (admission->closing || admission->controlled_step_pending
-        || admission->controlled_step_complete) {
-        wl_mutex_unlock(&admission->mutex);
+        || admission->controlled_step_complete ||
+        admission->exclusive_attempt) {
+        wl_session_checked_unlock(admission);
         return EBUSY;
     }
     admission->active_operations++;
-    wl_mutex_unlock(&admission->mutex);
+    wl_session_checked_unlock(admission);
     return 0;
 }
 
@@ -94,14 +155,16 @@ wl_session_operation_begin_step(wl_session_t *session)
     if (!admission)
         return 0;
 
-    wl_mutex_lock(&admission->mutex);
-    if (admission->closing || admission->active_operations != 0) {
-        wl_mutex_unlock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->closing || admission->active_operations != 0
+        || admission->exclusive_attempt) {
+        wl_session_checked_unlock(admission);
         return EBUSY;
     }
     admission->controlled_step_pending = true;
     admission->active_operations++;
-    wl_mutex_unlock(&admission->mutex);
+    wl_session_checked_unlock(admission);
     return 0;
 }
 
@@ -115,10 +178,11 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
     if (!admission)
         return ENOTSUP;
 
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
     int rc = 0;
     if (admission->closing || admission->active_operations != 0
-        || admission->controlled_step_pending)
+        || admission->controlled_step_pending || admission->exclusive_attempt)
         rc = EBUSY;
     else if (!admission->controlled_step_complete) {
         wl_controlled_step_state_t state =
@@ -128,7 +192,7 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
         rc = state == WL_CONTROLLED_STEP_PENDING ? EBUSY : ENOTSUP;
     }else
         admission->active_operations++;
-    wl_mutex_unlock(&admission->mutex);
+    wl_session_checked_unlock(admission);
     return rc;
 }
 
@@ -140,7 +204,8 @@ wl_session_operation_end_step(wl_session_t *session,
     if (!admission)
         return;
 
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        wl_session_gate_fatal();
     admission->active_operations--;
     admission->controlled_step_pending = continuation_pending
         || state == WL_CONTROLLED_STEP_PENDING;
@@ -149,8 +214,9 @@ wl_session_operation_end_step(wl_session_t *session,
     else if (state == WL_CONTROLLED_STEP_IDLE)
         admission->controlled_step_complete = false;
     if (admission->closing && admission->active_operations == 0)
-        wl_cond_signal(&admission->idle);
-    wl_mutex_unlock(&admission->mutex);
+        if (wl_cond_signal(&admission->idle) != 0)
+            wl_session_gate_fatal();
+    wl_session_checked_unlock(admission);
 }
 
 static void
@@ -160,27 +226,147 @@ wl_session_operation_end(wl_session_t *session)
     if (!admission)
         return;
 
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        wl_session_gate_fatal();
     admission->active_operations--;
     if (admission->closing && admission->active_operations == 0)
-        wl_cond_signal(&admission->idle);
-    wl_mutex_unlock(&admission->mutex);
+        if (wl_cond_signal(&admission->idle) != 0)
+            wl_session_gate_fatal();
+    wl_session_checked_unlock(admission);
 }
 
 static void
 wl_session_admission_close_and_wait(wl_session_t *session,
     wl_session_admission_t *admission)
 {
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        wl_session_gate_fatal();
     admission->closing = true;
-    wl_mutex_unlock(&admission->mutex);
+    wl_session_checked_unlock(admission);
 #ifdef WL_SESSION_TEST_HOOKS
     wl_session_testhook_admission_closed(session);
 #endif
-    wl_mutex_lock(&admission->mutex);
+    if (wl_session_admission_lock(admission) != 0)
+        wl_session_gate_fatal();
     while (admission->active_operations != 0)
-        wl_cond_wait(&admission->idle, &admission->mutex);
-    wl_mutex_unlock(&admission->mutex);
+        if (wl_cond_wait(&admission->idle, &admission->mutex) != 0)
+            wl_session_gate_fatal();
+    wl_session_checked_unlock(admission);
+}
+
+static bool
+wl_session_exclusive_owner(const wl_session_exclusive_attempt_t *attempt)
+{
+    return attempt && attempt->self == attempt
+           && attempt->owner_cookie == &wl_session_thread_cookie;
+}
+
+int
+wl_session_exclusive_attempt_acquire(wl_session_t *session,
+    wl_session_exclusive_attempt_t *attempt)
+{
+    wl_session_admission_t *admission;
+    if (!session || !attempt || attempt->self || attempt->session
+        || attempt->held || attempt->entered || attempt->exit_pending
+        || !session->owns_operation_admission)
+        return EINVAL;
+    admission = session->operation_admission;
+    if (!admission) return EINVAL;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->closing || admission->active_operations != 0
+        || admission->controlled_step_pending
+        || admission->controlled_step_complete ||
+        admission->exclusive_attempt) {
+        wl_session_checked_unlock(admission);
+        return EBUSY;
+    }
+    attempt->self = attempt;
+    attempt->session = session;
+    attempt->owner_cookie = &wl_session_thread_cookie;
+    attempt->held = true;
+    admission->exclusive_attempt = attempt;
+    wl_session_checked_unlock(admission);
+    return 0;
+}
+
+int
+wl_session_exclusive_attempt_enter(wl_session_exclusive_attempt_t *attempt)
+{
+    wl_session_admission_t *admission;
+    if (!wl_session_exclusive_owner(attempt) || !attempt->held
+        || attempt->entered || attempt->exit_pending
+        || !attempt->session->operation_admission)
+        return EINVAL;
+    admission = attempt->session->operation_admission;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->closing || admission->exclusive_attempt != attempt
+        || admission->active_operations != 0) {
+        wl_session_checked_unlock(admission);
+        return EBUSY;
+    }
+    admission->active_operations = 1;
+    attempt->entered = true;
+    wl_session_checked_unlock(admission);
+    return 0;
+}
+
+int
+wl_session_exclusive_attempt_mark_exit_pending(
+    wl_session_exclusive_attempt_t *attempt)
+{
+    if (!wl_session_exclusive_owner(attempt) || !attempt->held
+        || !attempt->entered || attempt->exit_pending)
+        return EINVAL;
+    attempt->exit_pending = true;
+    return 0;
+}
+
+int
+wl_session_exclusive_attempt_leave(wl_session_exclusive_attempt_t *attempt)
+{
+    wl_session_admission_t *admission;
+    if (!wl_session_exclusive_owner(attempt) || !attempt->held
+        || !attempt->entered || !attempt->exit_pending
+        || !attempt->session->operation_admission)
+        return EINVAL;
+    admission = attempt->session->operation_admission;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->exclusive_attempt != attempt
+        || admission->active_operations != 1)
+        wl_session_gate_fatal();
+    admission->active_operations = 0;
+    attempt->entered = false;
+    attempt->exit_pending = false;
+    if (admission->closing)
+        wl_session_gate_fatal();
+    wl_session_checked_unlock(admission);
+    return 0;
+}
+
+int
+wl_session_exclusive_attempt_release(wl_session_exclusive_attempt_t *attempt)
+{
+    wl_session_admission_t *admission;
+    if (!wl_session_exclusive_owner(attempt) || !attempt->held
+        || attempt->entered || attempt->exit_pending
+        || !attempt->session->operation_admission)
+        return EINVAL;
+    admission = attempt->session->operation_admission;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->exclusive_attempt != attempt
+        || admission->active_operations != 0)
+        wl_session_gate_fatal();
+    admission->exclusive_attempt = NULL;
+    attempt->held = false;
+    attempt->session = NULL;
+    attempt->owner_cookie = NULL;
+    attempt->self = NULL;
+    wl_session_checked_unlock(admission);
+    return 0;
 }
 
 void
@@ -411,17 +597,15 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     return rc;
 }
 
-void
-wl_session_destroy(wl_session_t *session)
+static void
+wl_session_destroy_owned(wl_session_t *session,
+    wl_session_admission_t *admission)
 {
     const wl_compute_backend_t *backend;
     wirelog_extension_snapshot_t *snapshot;
-    wl_session_admission_t *admission;
     wl_evaluation_control_t *control;
     if (!session)
         return;
-    admission = session->owns_operation_admission
-        ? session->operation_admission : NULL;
     if (admission)
         wl_session_admission_close_and_wait(session, admission);
     backend = session->backend;
@@ -435,6 +619,56 @@ wl_session_destroy(wl_session_t *session)
     if (control)
         (void)wl_evaluation_control_detach(control, admission);
     wl_session_admission_destroy(admission);
+}
+
+int
+wl_session_try_destroy(wl_session_t **session_slot)
+{
+    wl_session_t *session;
+    wl_session_admission_t *admission;
+    if (!session_slot)
+        return EINVAL;
+    session = *session_slot;
+    if (!session)
+        return 0;
+    if (!session->owns_operation_admission)
+        return EINVAL;
+    admission = session->operation_admission;
+    if (!admission) return EINVAL;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->closing || admission->active_operations != 0
+        || admission->exclusive_attempt) {
+        wl_session_checked_unlock(admission);
+        return EBUSY;
+    }
+    admission->closing = true;
+    wl_session_checked_unlock(admission);
+    *session_slot = NULL;
+    wl_session_destroy_owned(session, admission);
+    return 0;
+}
+
+void
+wl_session_destroy(wl_session_t *session)
+{
+    wl_session_admission_t *admission;
+    if (!session)
+        return;
+    admission = session->owns_operation_admission
+        ? session->operation_admission : NULL;
+    if (admission) {
+        if (wl_session_admission_lock(admission) != 0)
+            wl_session_gate_fatal();
+        bool parked = admission->exclusive_attempt != NULL;
+        wl_session_checked_unlock(admission);
+        if (parked) {
+            fputs("wl_session_destroy: live exclusive attempt; use "
+                "wl_session_try_destroy after ACK\n", stderr);
+            wl_session_gate_fatal();
+        }
+    }
+    wl_session_destroy_owned(session, admission);
 }
 
 int
