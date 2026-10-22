@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **376**).
+match the script's count (currently **383**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -407,8 +407,8 @@ and direct non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_governor_ref_release` | `references` | `atomic_fetch_sub_explicit` | `release` | Release one coordinator or worker ownership reference |
 | `memory_governor.c:wl_columnar_memory_governor_ref_release#2` | `references` | `atomic_load_explicit` | `acquire` | Synchronize final reference destruction |
 | `memory_governor.c:wl_columnar_memory_governor_ref_is_sole` | `references` | `atomic_load_explicit` | `acquire` | Observe that only the intern table still holds the governor before rebinding it |
-| `memory_governor.c:wl_columnar_memory_governor_strong` | `state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
-| `memory_governor.c:wl_columnar_memory_governor_strong#2` | `state` | `atomic_compare_exchange_strong_explicit` | `acq_rel`/`acquire` | Single bounded token/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
+| `memory_governor.c:wl_columnar_memory_governor_strong` | `state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Single bounded owner-state/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
+| `memory_governor.c:wl_columnar_memory_governor_strong#2` | `state` | `atomic_compare_exchange_strong_explicit` | `acq_rel`/`acquire` | Single bounded owner-state/total CAS claims transition authority; success acq_rel and failure acquire preserve competing published state. |
 | `memory_governor.c:wl_columnar_memory_governor_snapshot` | `token->owner_bits` | `atomic_load_explicit` | `relaxed` | Exclusively caller-owned original token snapshots owner bits, including before a claim; no new cross-thread publication is acquired. |
 | `memory_governor.c:wl_columnar_memory_governor_restore` | `token->owner_bits` | `atomic_store_explicit` | `relaxed` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
 | `memory_governor.c:wl_columnar_memory_governor_restore#2` | `token->state` | `atomic_store_explicit` | `release` | Mandatory exclusive restoration publishes owner before release state, retaining genuine outstanding credit on refusal. |
@@ -1607,8 +1607,15 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#5` | governor reserved bytes | `atomic_load_explicit` | relaxed | Read current aggregate before subtracting the retired footprint |
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce committed credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#7` | token state | `atomic_store_explicit` | release | Publish the downsized token after aggregate credit succeeds |
+| `memory_governor.c:credit_reservation_try` | reserved bytes | `atomic_load_explicit` | relaxed | Read aggregate before reserving bounded credit |
+| `memory_governor.c:wl_columnar_memory_release_try` | reservation state | `atomic_load_explicit` | acquire | Observe the reservation's current owner state |
+| `memory_governor.c:wl_columnar_memory_release_try#2` | reservation state | `atomic_store_explicit` | release | Publish retryable release state after a failed refund |
+| `memory_governor.c:wl_columnar_memory_release_try#3` | reservation state | `atomic_store_explicit` | release | Restore RESERVED state when release cannot complete |
+| `memory_governor.c:wl_columnar_memory_release_try#4` | reservation state | `atomic_store_explicit` | release | Preserve retryable ownership after bounded release refusal |
+| `memory_governor.c:wl_columnar_memory_release_try#5` | reservation state | `atomic_store_explicit` | release | Restore reservation state after a stopped release attempt |
+| `memory_governor.c:wl_columnar_memory_release_try#6` | reservation state | `atomic_store_explicit` | release | Publish RELEASED after owned credit is refunded |
 
-The complete current atomic-source inventory contains 376 call sites.
+The complete current atomic-source inventory contains 383 call sites.
 
 ### Caller-attempt-bound single mutation admission
 

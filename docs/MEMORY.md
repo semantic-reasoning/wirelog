@@ -2166,6 +2166,22 @@ not activate operators or expose enforceable public configuration.
 
 ### Caller-attempt-bound governor admission
 
+`wl_columnar_memory_release_try` is the one-shot counterpart used when a
+retirement cursor must not spin while returning a reservation. It makes at
+most one strong CAS attempt to claim the token and one to credit the governor.
+It supports `RESERVED`, `COMMITTED`, and `REPLACING` tokens; replacing tokens
+return both the committed and overlap footprints. Retryable contention leaves
+the original token live with its owner, bytes, transition metadata, and credit
+intact. The result distinguishes successful release, retryable contention,
+invalid token/accounting state, and replacement-size overflow. The token and
+governor must remain alive and the caller must retain exclusive ownership of
+the token for the call. Concurrent changes to other tokens can make the
+aggregate CAS fail;
+the caller retains its cursor and retries in a later slice. A successful return
+releases the whole token. It does not free storage, perform a work poll, or make
+cleanup safe while readers still hold the storage. The ordinary release API
+remains available when retrying is permitted by its caller.
+
 The private `wl_columnar_memory_governor_*_attempt_controlled` reserve, growth
 and commit APIs require a live control and the caller's original nonzero
 attempt ID. NULL control returns EINVAL; legacy APIs retain their raw delegation
