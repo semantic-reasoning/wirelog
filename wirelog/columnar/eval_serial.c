@@ -140,6 +140,7 @@ wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
     uint64_t id, uint64_t operation_identity,
+    bool controlled_materialized_batch_fallback,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!frame || !session || !plan || !plan->name || !plan->ops
@@ -160,6 +161,16 @@ wl_columnar_eval_serial_framed_attempt_begin(
     if (ctx->cleanup_receipt_key.operation_attempt_id != id
         || ctx->cleanup_receipt_key.operation_id != operation_identity)
         return EINVAL;
+    if (controlled_materialized_batch_fallback
+        && (!session->join_batch_bytes || session->join_batch_strict
+        || session->join_output_limit
+        || !wl_columnar_session_controlled_batch_authorized(session, control,
+        id, operation_identity)
+        || plan->op_count != 5 || plan->ops[0].op != WL_PLAN_OP_VARIABLE
+        || plan->ops[1].op != WL_PLAN_OP_JOIN
+        || plan->ops[2].op != WL_PLAN_OP_FILTER
+        || plan->ops[3].op != WL_PLAN_OP_MAP
+        || plan->ops[4].op != WL_PLAN_OP_CONSOLIDATE)) return ENOTSUP;
     rc = wl_columnar_eval_stack_framed_fresh(frame, ctx);
     if (rc) return rc;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, control);
@@ -186,6 +197,8 @@ wl_columnar_eval_serial_framed_attempt_begin(
     ctx->control = control; ctx->attempt_id = id;
     ctx->operation_identity = operation_identity; ctx->pin_owned = true;
     ctx->abort_supported = abort_supported;
+    ctx->controlled_materialized_batch_fallback =
+        controlled_materialized_batch_fallback;
 #if defined(WL_HAVE_C11_THREADS)
     ctx->owner_thread = thrd_current();
 #elif defined(_WIN32) || defined(_WIN64)
@@ -312,6 +325,13 @@ wl_columnar_eval_serial_framed_attempt_step(
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->controlled_materialized_batch_fallback)
+            return
+                wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback
+                (
+                &ctx->child, ctx->plan, 0, ctx->plan->op_count, ctx->frame,
+                ctx->session, 0, ctx->control, ctx->attempt_id, funding,
+                funding_id);
         return wl_columnar_eval_plan_numeric_composed_attempt_begin(
             &ctx->child, ctx->plan, 0, ctx->plan->op_count, ctx->frame,
             ctx->session, 0, ctx->control, ctx->attempt_id, funding,
@@ -1017,6 +1037,7 @@ wl_columnar_eval_serial_framed_bootstrap(const wl_plan_relation_t *rp,
     if (!rc) rc = wl_columnar_eval_serial_framed_attempt_begin(frame, sess, rp,
                 request->operation, request->operation_id,
                 request->operation_identity,
+                request->controlled_materialized_batch_fallback,
                 request->funding, request->funding_id);
     if (ctx && ctx->identity == ctx) {
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE;
@@ -1256,7 +1277,9 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             if (ctx->plan != rp || ctx->session != sess
                 || ctx->control != request->operation
                 || ctx->attempt_id != request->operation_id
-                || ctx->operation_identity != request->operation_identity)
+                || ctx->operation_identity != request->operation_identity
+                || ctx->controlled_materialized_batch_fallback
+                != request->controlled_materialized_batch_fallback)
                 return EINVAL;
             if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
                 && !ctx->abort_supported) return ENOTSUP;
@@ -1359,12 +1382,25 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             || sess->retraction_seeded || sess->retraction_right_pass
             || sess->tdd_input_run || sess->tdd_subpass_active
             || sess->tdd_outbound_only_active || sess->diff_operators_active
-            || sess->join_batch_bytes || sess->join_output_shared_count
+            || (sess->join_batch_bytes
+            && !request->controlled_materialized_batch_fallback)
+            || sess->join_output_shared_count
             || sess->coordinator || sess->num_workers > 1)
             return ENOTSUP;
         if (!rp->name || !rp->ops || !rp->op_count) return EINVAL;
         if (rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
             return ENOTSUP;
+        if (request->controlled_materialized_batch_fallback
+            && (!sess->join_batch_bytes || sess->join_batch_strict
+            || sess->join_output_limit
+            || !wl_columnar_session_controlled_batch_authorized(sess,
+            request->operation, request->operation_id,
+            request->operation_identity)
+            || rp->op_count != 5 || rp->ops[0].op != WL_PLAN_OP_VARIABLE
+            || rp->ops[1].op != WL_PLAN_OP_JOIN
+            || rp->ops[2].op != WL_PLAN_OP_FILTER
+            || rp->ops[3].op != WL_PLAN_OP_MAP
+            || rp->ops[4].op != WL_PLAN_OP_CONSOLIDATE)) return ENOTSUP;
         return wl_columnar_eval_serial_framed_bootstrap(rp, sess, request);
     }
     if (request) return EINVAL;

@@ -1164,6 +1164,10 @@ wl_columnar_session_hash_registry_attempt_step(
         image->rels = NULL; image->hash_head = NULL; image->hash_next = NULL;
         parent->candidate = NULL; parent->candidate_owned = false;
         parent->materialized = false; parent->committed = true;
+        if (parent->controlled_materialized_batch_fallback
+            && session->controlled_materialized_batch_published_count
+            != UINT64_MAX)
+            ++session->controlled_materialized_batch_published_count;
         attempt->committed = true;
         attempt->journal[0] = 0; attempt->journal[1] = 0;
         attempt->journal[2] = 0; attempt->journal[3] = 0;

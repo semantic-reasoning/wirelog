@@ -1746,6 +1746,15 @@ inputs, which is safe only because it is drained synchronously before the
 operator returns; that must change before #1383 publishes batches
 asynchronously.
 
+Controlled initial STEP also has a deliberately narrow #1821 compatibility
+route for `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE`. It materializes the
+whole private JOIN relation before applying FILTER and MAP, so the configured
+batch size is an admission signal for this route, not a memory bound on the
+joined intermediate or the end-to-end evaluation. The governor and existing
+output limits still apply. Only successful registry publication increments
+the dedicated controlled-fallback counter; refusal, cancellation and cleanup
+retry do not.
+
 Where bounded mode runs, as the program-level test
 `test_join_batch_program_{default,nofusion}` measures it in both planner
 builds at one and four workers:

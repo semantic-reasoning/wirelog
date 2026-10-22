@@ -25,6 +25,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+    COL_CONTROLLED_PREFLIGHT_IDLE = 0,
+    COL_CONTROLLED_PREFLIGHT_SHAPE,
+    COL_CONTROLLED_PREFLIGHT_TARGET,
+    COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL,
+    COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA,
+    COL_CONTROLLED_PREFLIGHT_JOIN_FULL,
+    COL_CONTROLLED_PREFLIGHT_JOIN_DELTA,
+    COL_CONTROLLED_PREFLIGHT_READY
+} col_controlled_preflight_phase_t;
+
 struct wl_columnar_controlled_step {
     wl_columnar_eval_serial_framed_host_reply_t reply;
     wl_evaluation_control_t *previous_funding;
@@ -32,6 +43,21 @@ struct wl_columnar_controlled_step {
     uint64_t previous_funding_id;
     uint32_t stratum_index;
     uint32_t relation_index;
+    uint32_t preflight_op;
+    uint32_t preflight_registry_slot;
+    uint32_t preflight_name_byte;
+    uint32_t preflight_registry_count;
+    col_controlled_preflight_phase_t preflight_phase;
+    col_rel_t **preflight_registry;
+    col_rel_t *preflight_variable_full;
+    col_rel_t *preflight_variable_delta;
+    col_rel_t *preflight_join_full;
+    col_rel_t *preflight_join_delta;
+    uint32_t preflight_variable_full_rows;
+    uint32_t preflight_variable_delta_rows;
+    uint32_t preflight_join_full_rows;
+    uint32_t preflight_join_delta_rows;
+    bool controlled_materialized_batch_fallback;
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
@@ -41,6 +67,21 @@ struct wl_columnar_controlled_step {
     bool refused;
     bool complete;
 };
+
+bool
+wl_columnar_session_controlled_batch_authorized(
+    const wl_col_session_t *sess, const wl_evaluation_control_t *control,
+    uint64_t id, uint64_t identity)
+{
+    const wl_columnar_controlled_step_t *step = sess
+        ? sess->controlled_step : NULL;
+    return step && (uint64_t)(uintptr_t)step == identity
+           && step->operation_active && step->operation_id == id
+           && step->preflight_phase == COL_CONTROLLED_PREFLIGHT_READY
+           && step->controlled_materialized_batch_fallback
+           && control == sess->base.evaluation_control
+           && wl_evaluation_control_active_attempt_id(control) == id;
+}
 
 #ifdef WL_SESSION_TEST_HOOKS
 int wl_columnar_session_test_fail_framed_funding_before_stop;
@@ -3999,6 +4040,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * them into the coordinator (#1382); the warned mask stays inherited
      * so a reason the coordinator already warned about is not repeated. */
     out_worker->join_batch_fallback_count = 0;
+    out_worker->controlled_materialized_batch_published_count = 0;
     out_worker->join_batch_last_reason = 0;
     out_worker->memory_governor = coordinator->memory_governor;
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
@@ -5850,23 +5892,16 @@ col_controlled_step_controlled_op(const wl_plan_op_t *op)
 }
 
 static bool
-col_controlled_step_target_exists(const wl_col_session_t *sess,
-    const char *name, wl_evaluation_control_t *control, uint64_t id,
-    int *error)
+col_controlled_step_batch_shape(const wl_col_session_t *sess)
 {
-    for (uint32_t i = 0; i < sess->nrels; ++i) {
-        int rc = wl_evaluation_control_charge(control, 1);
-        if (rc) {
-            *error = rc;
-            return false;
-        }
-        const col_rel_t *rel = sess->rels ? sess->rels[i] : NULL;
-        if (rel && rel->name && name && strcmp(rel->name, name) == 0)
-            return true;
-    }
-    *error = wl_evaluation_control_active_attempt_id(control) ==
-        id ? 0 : EINVAL;
-    return false;
+    const wl_plan_t *plan = sess->plan;
+    if (!sess->join_batch_bytes || sess->join_batch_strict || !plan
+        || plan->stratum_count != 1 || !plan->strata
+        || plan->strata[0].is_recursive
+        || plan->strata[0].relation_count != 1
+        || !plan->strata[0].relations)
+        return false;
+    return true;
 }
 
 /* Reject whole-session and recursive routes before opening an operation
@@ -5884,7 +5919,8 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->diff_operators_active
-        || sess->join_batch_bytes || sess->join_output_shared_count
+        || (sess->join_batch_bytes && sess->join_batch_strict)
+        || sess->join_output_shared_count || sess->join_output_limit
         || sess->coordinator || sess->num_workers > 1
         || sess->cleanup_active || sess->cleanup_pending
         || wl_columnar_eval_delta_rollback_active(sess)
@@ -5907,36 +5943,226 @@ col_controlled_step_preflight(wl_col_session_t *sess,
     const wl_plan_t *plan = sess->plan;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     uint64_t id = step->operation_id;
-    if (wl_evaluation_control_active_attempt_id(control) != id)
-        return EINVAL;
-
-    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
-        const wl_plan_stratum_t *stratum = &plan->strata[si];
-        for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
-            int rc = wl_evaluation_control_charge(control, 1);
-            if (rc) return rc;
-            const wl_plan_relation_t *relation = &stratum->relations[ri];
-            if (!relation->name || !relation->ops || !relation->op_count
-                || relation->ops[relation->op_count - 1].op
-                != WL_PLAN_OP_CONSOLIDATE)
-                return ENOTSUP;
-            for (uint32_t oi = 0; oi < relation->op_count; ++oi) {
-                rc = wl_evaluation_control_charge(control, 1);
-                if (rc) return rc;
-                if (!col_controlled_step_controlled_op(&relation->ops[oi]))
-                    return ENOTSUP;
-            }
-            int lookup_error = 0;
-            bool exists = col_controlled_step_target_exists(sess,
-                    relation->name, control, id, &lookup_error);
-            if (lookup_error) return lookup_error;
-            bool committed_prefix = si < step->stratum_index
-                || (si == step->stratum_index
-                && ri < step->relation_index) || step->complete;
-            if (exists != committed_prefix) return ENOTSUP;
-        }
+    int initial_charge = wl_evaluation_control_charge_attempt(control, id, 1);
+    if (initial_charge) return initial_charge;
+    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_IDLE) {
+        step->preflight_registry = sess->rels;
+        step->preflight_registry_count = sess->nrels;
+    } else if (step->preflight_registry != sess->rels
+        || step->preflight_registry_count != sess->nrels) {
+        return ENOTSUP;
     }
-    return wl_evaluation_control_active_attempt_id(control) == id ? 0 : EINVAL;
+    const wl_plan_relation_t *relation = plan->stratum_count == 1
+        && plan->strata[0].relation_count == 1
+        ? &plan->strata[0].relations[0] : NULL;
+    bool batch = sess->join_batch_bytes != 0;
+    if (!batch) {
+        for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+            const wl_plan_stratum_t *stratum = &plan->strata[si];
+            for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
+                int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+                if (rc) return rc;
+                const wl_plan_relation_t *item = &stratum->relations[ri];
+                if (!item->name || !item->ops || !item->op_count
+                    || item->ops[item->op_count - 1].op
+                    != WL_PLAN_OP_CONSOLIDATE) return ENOTSUP;
+                for (uint32_t oi = 0; oi < item->op_count; ++oi) {
+                    rc = wl_evaluation_control_charge_attempt(control, id, 1);
+                    if (rc) return rc;
+                    if (!col_controlled_step_controlled_op(&item->ops[oi]))
+                        return ENOTSUP;
+                }
+                bool exists = false;
+                for (uint32_t i = 0; i < sess->nrels; ++i) {
+                    rc = wl_evaluation_control_charge_attempt(control, id, 1);
+                    if (rc) return rc;
+                    const col_rel_t *candidate = sess->rels
+                        ? sess->rels[i] : NULL;
+                    if (candidate && candidate->name
+                        && strcmp(candidate->name, item->name) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                bool committed_prefix = si < step->stratum_index
+                    || (si == step->stratum_index
+                    && ri < step->relation_index) || step->complete;
+                if (exists != committed_prefix) return ENOTSUP;
+            }
+        }
+        return 0;
+    }
+    if (!relation || !col_controlled_step_batch_shape(sess)) return ENOTSUP;
+    if (!relation->name || !relation->ops || relation->op_count != 5)
+        return ENOTSUP;
+    const char *lookup_name = NULL;
+    bool delta_name = false;
+    for (uint32_t action = 1; action < 64; ++action) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+        if (rc) return rc;
+        if (wl_evaluation_control_active_attempt_id(control) != id)
+            return EINVAL;
+        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_IDLE)
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_SHAPE;
+        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_SHAPE) {
+            if (step->preflight_op < relation->op_count) {
+                const wl_plan_op_t *op = &relation->ops[step->preflight_op];
+                if (!col_controlled_step_controlled_op(op)) return ENOTSUP;
+                if (step->preflight_op == 0
+                    && (op->op != WL_PLAN_OP_VARIABLE
+                    || (op->delta_mode != WL_DELTA_AUTO
+                    && op->delta_mode != WL_DELTA_FORCE_FULL)))
+                    return ENOTSUP;
+                if (step->preflight_op == 1
+                    && (op->op != WL_PLAN_OP_JOIN || op->materialized
+                    || !op->right_relation || !op->key_count
+                    || !op->left_keys || !op->right_keys)) return ENOTSUP;
+                if (step->preflight_op == 1
+                    && op->delta_mode != WL_DELTA_AUTO
+                    && op->delta_mode != WL_DELTA_FORCE_FULL)
+                    return ENOTSUP;
+                if (step->preflight_op == 2
+                    && (op->op != WL_PLAN_OP_FILTER
+                    || !op->filter_expr.data || !op->filter_expr.size))
+                    return ENOTSUP;
+                if (step->preflight_op == 3
+                    && op->op != WL_PLAN_OP_MAP) return ENOTSUP;
+                if (step->preflight_op == 4
+                    && op->op != WL_PLAN_OP_CONSOLIDATE) return ENOTSUP;
+                ++step->preflight_op;
+                continue;
+            }
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_TARGET;
+            continue;
+        }
+        switch (step->preflight_phase) {
+        case COL_CONTROLLED_PREFLIGHT_TARGET:
+            lookup_name = relation->name;
+            break;
+        case COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL:
+            lookup_name = relation->ops[0].relation_name;
+            break;
+        case COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA:
+            lookup_name = relation->ops[0].relation_name;
+            delta_name = true;
+            break;
+        case COL_CONTROLLED_PREFLIGHT_JOIN_FULL:
+            lookup_name = relation->ops[1].right_relation;
+            break;
+        case COL_CONTROLLED_PREFLIGHT_JOIN_DELTA:
+            lookup_name = relation->ops[1].right_relation;
+            delta_name = true;
+            break;
+        case COL_CONTROLLED_PREFLIGHT_READY:
+            if (step->preflight_registry != sess->rels
+                || step->preflight_registry_count != sess->nrels
+                || step->preflight_variable_full == NULL
+                || step->preflight_join_full == NULL
+                || step->preflight_variable_full->nrows
+                != step->preflight_variable_full_rows
+                || (step->preflight_variable_delta
+                && step->preflight_variable_delta->nrows
+                != step->preflight_variable_delta_rows)
+                || step->preflight_join_full->nrows
+                != step->preflight_join_full_rows
+                || (step->preflight_join_delta
+                && step->preflight_join_delta->nrows
+                != step->preflight_join_delta_rows)) return ENOTSUP;
+            return 0;
+        default:
+            return ENOTSUP;
+        }
+        if (!lookup_name || !lookup_name[0] || lookup_name[0] == '$')
+            return ENOTSUP;
+        col_rel_t *found = NULL;
+        bool finished = false;
+        while (step->preflight_registry_slot < sess->nrels) {
+            col_rel_t *candidate = sess->rels
+                ? sess->rels[step->preflight_registry_slot] : NULL;
+            const char *candidate_name = candidate ? candidate->name : NULL;
+            if (!candidate_name) {
+                ++step->preflight_registry_slot;
+                step->preflight_name_byte = 0;
+                break;
+            }
+            uint32_t offset = step->preflight_name_byte;
+            char wanted;
+            if (delta_name && offset < 3) {
+                wanted = offset == 0 ? '$' : 'd';
+                if (offset == 2) wanted = '$';
+            } else {
+                uint32_t base_offset = delta_name ? offset - 3 : offset;
+                if (base_offset > 252) return ENOTSUP;
+                wanted = lookup_name[base_offset];
+                if (base_offset == 252 && wanted) return ENOTSUP;
+            }
+            char actual = candidate_name[offset];
+            if (actual != wanted) {
+                ++step->preflight_registry_slot;
+                step->preflight_name_byte = 0;
+                break;
+            }
+            if (!wanted) {
+                found = candidate;
+                ++step->preflight_registry_slot;
+                finished = true;
+                break;
+            }
+            ++step->preflight_name_byte;
+            break;
+        }
+        if (step->preflight_registry_slot == sess->nrels)
+            finished = true;
+        if (!finished) continue;
+        step->preflight_registry_slot = 0;
+        step->preflight_name_byte = 0;
+        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_TARGET) {
+            if (found) return ENOTSUP;
+            step->preflight_phase = batch
+                ? COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL
+                : COL_CONTROLLED_PREFLIGHT_READY;
+        } else if (step->preflight_phase ==
+            COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL) {
+            step->preflight_variable_full = found;
+            if (!found) return ENOTSUP;
+            step->preflight_variable_full_rows = found->nrows;
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA;
+        } else if (step->preflight_phase ==
+            COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA) {
+            step->preflight_variable_delta = found;
+            step->preflight_variable_delta_rows = found ? found->nrows : 0;
+            wl_delta_mode_t mode = relation->ops[0].delta_mode;
+            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
+                return ENOTSUP;
+            if (mode == WL_DELTA_AUTO && found && found->nrows
+                && found->nrows < step->preflight_variable_full->nrows)
+                return ENOTSUP;
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_FULL;
+        } else if (step->preflight_phase ==
+            COL_CONTROLLED_PREFLIGHT_JOIN_FULL) {
+            step->preflight_join_full = found;
+            if (!found) return ENOTSUP;
+            step->preflight_join_full_rows = found->nrows;
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_DELTA;
+        } else if (step->preflight_phase ==
+            COL_CONTROLLED_PREFLIGHT_JOIN_DELTA) {
+            step->preflight_join_delta = found;
+            step->preflight_join_delta_rows = found ? found->nrows : 0;
+            wl_delta_mode_t mode = relation->ops[1].delta_mode;
+            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
+                return ENOTSUP;
+            if (mode == WL_DELTA_AUTO && found && found->nrows
+                && found->nrows < step->preflight_join_full->nrows)
+                return ENOTSUP;
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_READY;
+            step->controlled_materialized_batch_fallback = true;
+        }
+        delta_name = false;
+    }
+    if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_READY) return 0;
+    int poll_rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return poll_rc ? poll_rc : EAGAIN;
 }
 
 static void
@@ -6023,6 +6249,8 @@ col_controlled_step_host_action(wl_col_session_t *sess,
         .operation = sess->base.evaluation_control,
         .operation_id = step->operation_id,
         .operation_identity = step->operation_identity,
+        .controlled_materialized_batch_fallback =
+            step->controlled_materialized_batch_fallback,
         .action = action,
         .previous_valid = step->previous_valid,
         .previous_kind = step->previous_kind,
@@ -6093,6 +6321,21 @@ col_controlled_step_finish(wl_col_session_t *sess,
 {
     int rc = wl_evaluation_control_finish(sess->base.evaluation_control,
             sess->base.operation_admission, result, 0);
+    step->preflight_phase = COL_CONTROLLED_PREFLIGHT_IDLE;
+    step->preflight_op = 0;
+    step->preflight_registry_slot = 0;
+    step->preflight_name_byte = 0;
+    step->preflight_registry_count = 0;
+    step->preflight_registry = NULL;
+    step->preflight_variable_full = NULL;
+    step->preflight_variable_delta = NULL;
+    step->preflight_join_full = NULL;
+    step->preflight_join_delta = NULL;
+    step->preflight_variable_full_rows = 0;
+    step->preflight_variable_delta_rows = 0;
+    step->preflight_join_full_rows = 0;
+    step->preflight_join_delta_rows = 0;
+    step->controlled_materialized_batch_fallback = false;
     step->operation_active = false;
     step->operation_id = 0;
     step->relation_active = false;
@@ -6129,16 +6372,24 @@ col_controlled_step_drive(wl_col_session_t *sess,
         if (!step->operation_id) return EINVAL;
         step->operation_active = true;
         step->primary_result = 0;
-        if (!step->complete) {
-            rc = col_controlled_step_preflight(sess, step);
-            if (rc) {
-                step->refused = rc == ENOTSUP;
-                return col_controlled_step_finish(sess, step, rc);
-            }
-        }
     } else if (wl_evaluation_control_active_attempt_id(control)
         != step->operation_id) {
         return EINVAL;
+    }
+
+    if (teardown) wl_evaluation_control_request_cancel(control);
+
+    if (!step->complete && !step->relation_active
+        && step->preflight_phase != COL_CONTROLLED_PREFLIGHT_READY) {
+        int rc = col_controlled_step_preflight(sess, step);
+        if (rc == EAGAIN && wl_evaluation_control_active_attempt_id(control)
+            == step->operation_id) return EAGAIN;
+        if (rc) {
+            step->refused = rc == ENOTSUP;
+            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_IDLE;
+            step->controlled_materialized_batch_fallback = false;
+            return col_controlled_step_finish(sess, step, rc);
+        }
     }
 
     if (teardown) {
