@@ -3916,3 +3916,38 @@ reader pins, concurrent reads during retirement, and session teardown. This is
 mixed batch storage evidence, not full mixed relation/index evaluation or a
 working-set pressure completion claim. Reference-bearing pins, automatic policy,
 public configuration and bounded relation/index consumers remain outstanding.
+
+### Reclaiming owned resident batches (#1372, partial)
+
+`wl_columnar_batch_payload_spill` takes an exclusive owner pointer and streams
+an already-owned resident numeric payload into the same governor's spill store.
+Success replaces the owner and frees its old resident allocation. Schema, lane
+bits, signed metadata and row ordinals are unchanged, but old owner/schema
+pointers become invalid. Active readers return BUSY; already-spilled payloads
+and mismatched governors return INVALID. Lifecycle operations remain externally
+serialized, and cancellation callbacks must not reenter them.
+
+The old payload stays live until the complete private segment is published.
+Quota, admission, allocation, I/O, cancellation and closed-store errors preserve
+the original owner and contents and release the private replacement. A retired
+store pointer may only be used while a surviving segment keeps it alive.
+
+Transition peak managed memory is the existing resident payload plus
+`batch_payload_floor(..., SPILLED)`'s descriptor/schema and `spill_floor`'s
+segment and writer allocations, including one-row and path scratch. Existing
+store, source/index state, other payloads and readers remain additional costs.
+Callers must leave this transition slack available; demotion cannot rescue an
+already exhausted budget without it. Small or empty payloads may cost more
+metadata after demotion. Reading adds the payload and spill reader floors.
+
+The real JOIN regression admits source relations, arrangements, producer state
+and owned outputs through a fixed 256 KiB governor. Keeping all outputs resident
+is denied without cursor advancement. Demoting each completed 256-row batch
+allows all 16,384 rows (512 KiB of lanes) to remain available and be checked after
+producer teardown. The hand-built session shell, delta pool, governor object,
+test stack, allocator overhead and OS file cache are outside this managed
+measurement. This proves bounded batch reclamation, not whole-process RSS or
+cold relation/index execution. A separate boundary test denies a transition
+one byte below its calculated floor and succeeds exactly at the floor.
+Automatic scheduling, reference-bearing lifetimes, public spill configuration
+and the remaining #1372/#1385 acceptance criteria are still outstanding.

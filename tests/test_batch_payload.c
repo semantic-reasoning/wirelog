@@ -239,10 +239,176 @@ session_lifetime(void)
     wl_columnar_memory_governor_ref_release(g);
 }
 
+static void
+check_payload(wl_columnar_batch_payload_t *p)
+{
+    uint32_t cols, rows;
+    const wirelog_column_type_t *types =
+        wl_columnar_batch_payload_schema(p, &cols, &rows);
+    CHECK(cols == 3 && rows == 8 && types[0] == WIRELOG_TYPE_INT64 &&
+        types[1] == WIRELOG_TYPE_FLOAT && types[2] == WIRELOG_TYPE_BOOL);
+    wl_columnar_batch_payload_reader_t *reader;
+    CHECK(wl_columnar_batch_payload_acquire(p, &reader) == OK);
+    const unsigned order[] = {7, 0, 3, 1, 6, 2, 5, 4};
+    for (unsigned i = 0; i < 8; i++) check_row(reader, order[i]);
+    wl_columnar_batch_payload_reader_release(reader);
+}
+
+static void
+demotion(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1<<24);
+    wl_columnar_spill_store_t *store, *quota_store, *other_store;
+    wl_columnar_memory_governor_ref_t *other = governor(1<<20);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 48,
+        &store) == OK);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1, 48,
+        &quota_store) == OK);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), other, 4096, 48,
+        &other_store) == OK);
+    col_rel_t *r = source();
+    wl_columnar_batch_payload_t *p;
+    CHECK(wl_columnar_batch_payload_capture(g, NULL, r, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, NULL, NULL, &p) == OK);
+    col_rel_destroy(r);
+    wl_columnar_batch_payload_t *original = p;
+    uint64_t baseline = reserved(g);
+    CHECK(wl_columnar_batch_payload_spill(NULL, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_INVALID);
+    CHECK(wl_columnar_batch_payload_spill(&p, other_store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_INVALID);
+    CHECK(wl_columnar_batch_payload_spill(&p, quota_store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_QUOTA);
+    wl_columnar_batch_payload_test_fail_allocation(1);
+    CHECK(wl_columnar_batch_payload_spill(&p, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_ALLOCATION);
+    CHECK(p == original && reserved(g) == baseline &&
+        wl_columnar_spill_store_bytes(store) == 0);
+    check_payload(p);
+    wl_columnar_batch_payload_reader_t *a, *b;
+    CHECK(wl_columnar_batch_payload_acquire(p, &a) == OK);
+    CHECK(wl_columnar_batch_payload_acquire(p, &b) == OK);
+    CHECK(wl_columnar_batch_payload_spill(&p, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_BUSY);
+    check_row(a, 0); check_row(b, 7);
+    wl_columnar_batch_payload_reader_release(a);
+    CHECK(wl_columnar_batch_payload_spill(&p, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_BUSY);
+    wl_columnar_batch_payload_reader_release(b);
+    /* Sweep every cancellation point, including after private publication.
+     * Each failed attempt must be retryable with the same original owner. */
+    bool completed = false;
+    for (unsigned point = 0; point < 128; point++) {
+        unsigned remaining = point;
+        wl_columnar_spill_status_t rc =
+            wl_columnar_batch_payload_spill(&p, store, cancel, &remaining);
+        if (rc == OK) {
+            completed = true; break;
+        }
+        CHECK(rc == WL_COLUMNAR_SPILL_CANCELLED && p == original &&
+            reserved(g) == baseline &&
+            wl_columnar_spill_store_bytes(store) == 0);
+        check_payload(p);
+    }
+    CHECK(completed && wl_columnar_spill_store_bytes(store) > 0);
+    uint64_t resident_bytes, spilled_bytes, reader_bytes;
+    wl_columnar_spill_floor_t floor;
+    CHECK(wl_columnar_spill_floor(test_tmpdir(), 3, &floor) == OK);
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+        &resident_bytes, &reader_bytes) == OK);
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+        &spilled_bytes, &reader_bytes) == OK);
+    CHECK(reserved(g) ==
+        baseline - resident_bytes + spilled_bytes + floor.segment_bytes);
+    CHECK(reserved(g) < baseline);
+    check_payload(p);
+    original = p;
+    CHECK(wl_columnar_batch_payload_spill(&p, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_INVALID && p == original);
+    CHECK(wl_columnar_batch_payload_acquire(p, &a) == OK);
+    wl_columnar_spill_store_retire(store);
+    check_row(a, 7);
+    /* The existing spilled payload keeps the retired store pointer valid. */
+    r = source();
+    wl_columnar_batch_payload_t *resident;
+    CHECK(wl_columnar_batch_payload_capture(g, NULL, r, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, NULL, NULL, &resident) == OK);
+    original = resident; baseline = reserved(g);
+    CHECK(wl_columnar_batch_payload_spill(&resident, store, NULL, NULL) ==
+        WL_COLUMNAR_SPILL_CLOSED && resident == original &&
+        reserved(g) == baseline);
+    check_payload(resident);
+    col_rel_destroy(r);
+    CHECK(wl_columnar_batch_payload_release(resident) == OK);
+    wl_columnar_batch_payload_reader_release(a);
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    CHECK(wl_columnar_spill_store_close(quota_store) == OK && reserved(g) == 0);
+    CHECK(wl_columnar_spill_store_close(other_store) == OK &&
+        reserved(other) == 0);
+    wl_columnar_memory_governor_ref_release(other);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void
+demotion_floor(void)
+{
+    wl_columnar_spill_floor_t floor;
+    uint64_t resident_bytes, descriptor, reader_bytes;
+    CHECK(wl_columnar_spill_floor(test_tmpdir(), 3, &floor) == OK);
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+        &resident_bytes, &reader_bytes) == OK);
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+        &descriptor, &reader_bytes) == OK);
+    for (unsigned fits = 0; fits < 2; fits++) {
+        uint64_t budget = floor.store_bytes + resident_bytes + descriptor +
+            floor.segment_bytes + floor.writer_bytes - 1 + fits;
+        wl_columnar_memory_governor_ref_t *g = governor(budget);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 48,
+            &store) == OK);
+        col_rel_t *r = source();
+        wl_columnar_batch_payload_t *p;
+        CHECK(wl_columnar_batch_payload_capture(g, NULL, r, 8,
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, NULL, NULL, &p) == OK);
+        col_rel_destroy(r);
+        wl_columnar_batch_payload_t *original = p;
+        uint64_t baseline = reserved(g);
+        wl_columnar_spill_status_t rc = wl_columnar_batch_payload_spill(&p,
+                store, NULL, NULL);
+        if (fits) CHECK(rc == OK);
+        else CHECK(rc == WL_COLUMNAR_SPILL_MEMORY && p == original &&
+                reserved(g) == baseline &&
+                wl_columnar_spill_store_bytes(store) == 0);
+        check_payload(p);
+        CHECK(wl_columnar_batch_payload_release(p) == OK);
+        CHECK(wl_columnar_spill_store_close(store) == OK && reserved(g) == 0);
+        wl_columnar_memory_governor_ref_release(g);
+    }
+    /* Empty demotion is valid but makes no promise of a memory reduction. */
+    wl_columnar_memory_governor_ref_t *g = governor(1<<20);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 48,
+        &store) == OK);
+    col_rel_t *r = source(); wl_columnar_batch_payload_t *p;
+    CHECK(wl_columnar_batch_payload_capture(g, NULL, r, 0,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, NULL, NULL, &p) == OK);
+    col_rel_destroy(r);
+    CHECK(wl_columnar_batch_payload_spill(&p, store, NULL, NULL) == OK);
+    uint32_t rows;
+    CHECK(wl_columnar_batch_payload_schema(p, NULL, &rows) && rows == 0);
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    CHECK(wl_columnar_spill_store_close(store) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT);
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_SPILLED);
-    failures(); session_lifetime();
+    failures(); session_lifetime(); demotion(); demotion_floor();
     puts("batch_payload: OK"); return 0;
 }

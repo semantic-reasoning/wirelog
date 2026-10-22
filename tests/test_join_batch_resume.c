@@ -6834,6 +6834,102 @@ test_owned_mixed_payloads(void)
     wl_columnar_memory_governor_ref_release(g);
     PASS();
 }
+static void
+test_owned_payload_demotion_budget(void)
+{
+    TEST("owned JOIN batches exceed a fixed RAM allowance through demotion");
+    const uint64_t budget = 256u * 1024u;
+    const int64_t keys[32] = {0};
+    for (unsigned demote = 0; demote < 2; demote++) {
+        fixture_t f;
+        PAYLOAD_CHECK(fixture_init(&f, budget, keys, 32, 1, 512));
+        wl_columnar_memory_governor_ref_t *g = f.sess->memory_governor;
+        wl_columnar_memory_governor_ref_retain(g);
+        /* Admit input/output relations as well as producer/index state. The
+         * hand-built session shell, delta pool and test stack remain outside
+         * this managed budget; this is not whole-process RSS qualification. */
+        PAYLOAD_CHECK(col_rel_attach_memory_governor(f.left, g) == 0);
+        PAYLOAD_CHECK(col_rel_attach_memory_governor(f.right, g) == 0);
+        PAYLOAD_CHECK(col_rel_attach_memory_governor(f.out, g) == 0);
+        wl_columnar_spill_store_t *store;
+        PAYLOAD_CHECK(wl_columnar_spill_store_open(test_tmpdir(), g,
+            2u * 1024u * 1024u, 56, &store) == WL_COLUMNAR_SPILL_OK);
+        wl_columnar_continuation_t *cont = NULL;
+        PAYLOAD_CHECK(col_join_batch_producer_create(f.sess, &f.op, f.left,
+            false, KEY0, KEY0, 1, 256u * 32u, &cont) == 0);
+        wl_columnar_join_batch_payload_sink_t context;
+        wl_columnar_continuation_sink_t sink;
+        wl_columnar_join_batch_payload_sink_init(&context, &sink, g, store,
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT);
+        wl_columnar_batch_payload_t *payloads[64];
+        unsigned count = 0;
+        bool denied = false;
+        while (!wl_columnar_continuation_is_done(cont)) {
+            wl_columnar_continuation_cursor_t cursor =
+                *wl_columnar_continuation_cursor(cont);
+            wl_columnar_continuation_status_t rc =
+                wl_columnar_continuation_publish(cont, &sink);
+            if (rc == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED) {
+                PAYLOAD_CHECK(!demote &&
+                    context.error == WL_COLUMNAR_SPILL_MEMORY);
+                PAYLOAD_CHECK(same_continuation_cursor(&cursor,
+                    wl_columnar_continuation_cursor(cont)));
+                denied = true; break;
+            }
+            PAYLOAD_CHECK(rc == WL_COLUMNAR_CONTINUATION_OK ||
+                rc == WL_COLUMNAR_CONTINUATION_DONE);
+            wl_columnar_batch_payload_t *p =
+                wl_columnar_join_batch_payload_sink_take(&context);
+            if (p) {
+                PAYLOAD_CHECK(count < 64);
+                if (demote) {
+                    uint64_t before = reserved_of(f.sess);
+                    PAYLOAD_CHECK(wl_columnar_batch_payload_spill(&p, store,
+                        NULL, NULL) == WL_COLUMNAR_SPILL_OK);
+                    PAYLOAD_CHECK(reserved_of(f.sess) < before);
+                }
+                payloads[count++] = p;
+            }
+            PAYLOAD_CHECK(reserved_of(f.sess) <= budget);
+        }
+        PAYLOAD_CHECK(demote ? (!denied && count == 64) : (denied &&
+            count < 64));
+        PAYLOAD_CHECK(wl_columnar_spill_store_bytes(store) > 0 || !demote);
+        wl_columnar_continuation_destroy(cont);
+        wl_columnar_join_batch_payload_sink_cleanup(&context);
+        fixture_fini(&f);
+        bool seen[32 * 512] = {false};
+        unsigned total = 0;
+        for (unsigned i = 0; i < count; i++) {
+            wl_columnar_batch_payload_reader_t *reader;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_acquire(payloads[i],
+                &reader) ==
+                WL_COLUMNAR_SPILL_OK);
+            uint32_t rows;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_schema(payloads[i], NULL,
+                &rows));
+            for (uint32_t row = 0; row < rows; row++) {
+                const uint64_t *lanes; wl_columnar_spill_metadata_t metadata;
+                PAYLOAD_CHECK(wl_columnar_batch_payload_read(reader, row, NULL,
+                    NULL, &lanes, &metadata) == WL_COLUMNAR_SPILL_OK);
+                PAYLOAD_CHECK(lanes[0] == 0 && lanes[2] == 0 && lanes[1] < 32 &&
+                    lanes[3] < 512 && metadata.multiplicity == 1);
+                unsigned index = (unsigned)(lanes[1] * 512 + lanes[3]);
+                PAYLOAD_CHECK(!seen[index]); seen[index] = true; total++;
+            }
+            wl_columnar_batch_payload_reader_release(reader);
+            PAYLOAD_CHECK(wl_columnar_batch_payload_release(payloads[i]) ==
+                WL_COLUMNAR_SPILL_OK);
+        }
+        if (demote) PAYLOAD_CHECK(total == 32u * 512u && total * 32u > budget);
+        PAYLOAD_CHECK(wl_columnar_spill_store_close(store) ==
+            WL_COLUMNAR_SPILL_OK);
+        PAYLOAD_CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(g)) == 0);
+        wl_columnar_memory_governor_ref_release(g);
+    }
+    PASS();
+}
 #undef PAYLOAD_CHECK
 
 int
@@ -6841,6 +6937,7 @@ main(void)
 {
     printf("test_join_batch_resume: bounded keyed-join sub-batches (#1446)\n");
     test_owned_mixed_payloads();
+    test_owned_payload_demotion_budget();
     test_high_fanout_spans_batches();
     test_boundaries_collision_and_last_match();
     test_boundary_mid_chain();

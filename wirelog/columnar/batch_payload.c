@@ -200,6 +200,59 @@ done:
     return rc;
 }
 
+static wl_columnar_spill_status_t
+wl_columnar_batch_payload_resident_row(void *context, uint64_t ordinal,
+    uint64_t *lanes, wl_columnar_spill_metadata_t *metadata)
+{
+    const wl_columnar_batch_payload_t *p = context;
+    const char *row = (const char *)p + p->data_offset + ordinal * p->row_bytes;
+    memcpy(lanes, row, (size_t)p->ncols * sizeof(*lanes));
+    memcpy(metadata, row + (size_t)p->ncols * sizeof(*lanes),
+        sizeof(*metadata));
+    return WL_COLUMNAR_SPILL_OK;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_spill(wl_columnar_batch_payload_t **owner,
+    wl_columnar_spill_store_t *store, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context)
+{
+    if (!owner || !*owner) return WL_COLUMNAR_SPILL_INVALID;
+    wl_columnar_batch_payload_t *old = *owner;
+    if (old->segment || !wl_columnar_spill_store_uses_governor(store,
+        old->governor)) return WL_COLUMNAR_SPILL_INVALID;
+    if (old->readers) return WL_COLUMNAR_SPILL_BUSY;
+    if (cancel && cancel(cancel_context)) return WL_COLUMNAR_SPILL_CANCELLED;
+    uint64_t bytes, reader_bytes;
+    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_floor(old->ncols,
+            old->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, &bytes,
+            &reader_bytes);
+    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    void *allocation = NULL;
+    rc = wl_columnar_batch_payload_allocate(old->governor, bytes, &allocation);
+    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    wl_columnar_batch_payload_t *replacement = allocation;
+    replacement->governor = old->governor;
+    wl_columnar_memory_governor_ref_retain(replacement->governor);
+    replacement->ncols = old->ncols;
+    replacement->nrows = old->nrows;
+    memcpy(replacement->types, old->types,
+        (size_t)old->ncols * sizeof(*old->types));
+    rc = wl_columnar_spill_create(store, old->types, old->ncols, old->nrows,
+            wl_columnar_batch_payload_resident_row, old, cancel, cancel_context,
+            &replacement->segment);
+    if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(cancel_context))
+        rc = WL_COLUMNAR_SPILL_CANCELLED;
+    if (rc != WL_COLUMNAR_SPILL_OK) {
+        if (wl_columnar_batch_payload_release(replacement) !=
+            WL_COLUMNAR_SPILL_OK) abort();
+        return rc;
+    }
+    *owner = replacement;
+    if (wl_columnar_batch_payload_release(old) != WL_COLUMNAR_SPILL_OK) abort();
+    return WL_COLUMNAR_SPILL_OK;
+}
+
 wl_columnar_spill_status_t
 wl_columnar_batch_payload_release(wl_columnar_batch_payload_t *p)
 {
