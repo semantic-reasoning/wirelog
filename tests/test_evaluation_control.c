@@ -19,6 +19,8 @@ boundaries(void)
     wl_evaluation_control_t *c = NULL;
     wl_evaluation_control_report_t report;
     CHECK(wl_evaluation_control_create(3, &c) == 0);
+    uint64_t identity = wl_evaluation_control_identity(c);
+    CHECK(identity != 0);
     CHECK(wl_evaluation_control_report(c, &report) == ENOENT);
     CHECK(wl_evaluation_control_begin(c, &owner) == EINVAL);
     CHECK(wl_evaluation_control_attach(c, &owner) == 0);
@@ -26,6 +28,7 @@ boundaries(void)
     CHECK(wl_evaluation_control_attach(c, &other) == EBUSY);
     CHECK(wl_evaluation_control_begin(c, &other) == EINVAL);
     CHECK(wl_evaluation_control_begin(c, &owner) == 0);
+    CHECK(wl_evaluation_control_identity(c) == identity);
     CHECK(wl_evaluation_control_begin(c, &owner) == EBUSY);
     CHECK(wl_evaluation_control_detach(c, &owner) == EBUSY);
     CHECK(wl_evaluation_control_transfer(c, &owner, &other) == EBUSY);
@@ -56,6 +59,7 @@ boundaries(void)
 
     CHECK(wl_evaluation_control_configure(c, 4) == 0);
     CHECK(wl_evaluation_control_reset(c) == 0);
+    CHECK(wl_evaluation_control_identity(c) == identity);
     CHECK(wl_evaluation_control_report(c,
         &report) == 0 && report.attempt_id == 2);
     CHECK(wl_evaluation_control_begin(c, &owner) == 0);
@@ -334,6 +338,40 @@ shared_allowance(void)
     wl_evaluation_control_release(c);
 }
 
+typedef struct {
+    uint64_t identity;
+    int result;
+} identity_context_t;
+
+static void *
+create_identity(void *opaque)
+{
+    identity_context_t *ctx = opaque;
+    wl_evaluation_control_t *control = NULL;
+    ctx->result = wl_evaluation_control_create(0, &control);
+    if (ctx->result == 0) {
+        ctx->identity = wl_evaluation_control_identity(control);
+        wl_evaluation_control_release(control);
+    }
+    return NULL;
+}
+
+static void
+identity_generation(void)
+{
+    wl_thread_t threads[8];
+    identity_context_t contexts[8] = { 0 };
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(wl_thread_create(&threads[i], create_identity,
+            &contexts[i]) == 0);
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(wl_thread_join(&threads[i]) == 0);
+        CHECK(contexts[i].result == 0 && contexts[i].identity != 0);
+        for (unsigned j = 0; j < i; j++)
+            CHECK(contexts[i].identity != contexts[j].identity);
+    }
+}
+
 int
 main(void)
 {
@@ -343,6 +381,15 @@ main(void)
     attempt_scoped_charge();
     cross_thread_cancel();
     shared_allowance();
+    identity_generation();
+    CHECK(wl_evaluation_control_test_seed_next_identity(UINT64_MAX - 1) == 0);
+    wl_evaluation_control_t *last = NULL;
+    CHECK(wl_evaluation_control_create(0, &last) == 0);
+    CHECK(wl_evaluation_control_identity(last) == UINT64_MAX - 1);
+    wl_evaluation_control_release(last);
+    wl_evaluation_control_t *exhausted = NULL;
+    CHECK(wl_evaluation_control_create(0, &exhausted) == EOVERFLOW);
+    CHECK(exhausted == NULL);
     puts("evaluation_control: OK");
     return 0;
 }

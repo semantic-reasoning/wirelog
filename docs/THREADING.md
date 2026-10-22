@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **369**).
+match the script's count (currently **376**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -635,7 +635,8 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-112 + 21 + 30 = **163 atomic call sites**.
+112 + 21 + 30 = **163 atomic call sites** in those summarized groups; the full
+symbol-anchored inventory below covers 376 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1471,7 +1472,7 @@ pointer. Reset is quiescent relative to evaluation; a request racing reset is
 ordered by the atomic exchange, and hosts must coordinate reset if that request
 must not be cleared.
 
-The fourteen sites below extend the existing exact inventory. RMW reads use the
+The seventeen sites below extend the existing exact inventory. RMW reads use the
 existing MSVC Interlocked shim instead of assuming volatile loads publish state.
 Cancellation carries no payload, so relaxed ordering suffices. References use
 release decrement plus acquire RMW at last release before destruction. The
@@ -1483,7 +1484,9 @@ and cleared at finish. Its acquire observation uses a C11 load or a neutral
 MSVC Interlocked RMW; the latter logically const read preserves all unsigned
 64-bit IDs. Zero alone means inactive. This observation neither pins the
 attempt nor changes the host serialization and worker-drain requirements.
-The test-only inactive generator seed does not publish an active ID.
+The process-wide control identity generator uses relaxed atomics because it
+only allocates never-reused identities. The test-only seed is used in its
+isolated test process.
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
@@ -1497,6 +1500,9 @@ The test-only inactive generator seed does not publish an active ID.
 | `evaluation_control.c:wl_evaluation_control_reset` | cancelled | `atomic_exchange_explicit` | relaxed | Quiescent reset serialized with requests by atomic modification order |
 | `evaluation_control.c:wl_evaluation_control_request_cancel` | cancelled | `atomic_exchange_explicit` | relaxed | Sticky request, no payload or session lock dependency |
 | `evaluation_control.c:wl_evaluation_control_charge_locked` | cancelled | `atomic_fetch_add_explicit` | relaxed | Shared locked charge path polls using Interlocked-compatible atomic read; attempt-scoped callers validate identity before mutation |
+| `evaluation_control.c:wl_evaluation_control_next_identity` | next_evaluation_control_identity | `atomic_load_explicit` | relaxed | Read the next process-unique control identity before checked allocation |
+| `evaluation_control.c:wl_evaluation_control_next_identity#2` | next_evaluation_control_identity | `atomic_compare_exchange_weak_explicit` | relaxed/relaxed | Allocate one identity without reuse or wrap; retry with the observed next value |
+| `evaluation_control.c:wl_evaluation_control_test_seed_next_identity` | next_evaluation_control_identity | `atomic_store_explicit` | relaxed | Isolated test-only exhaustion setup after concurrent identity tests complete |
 | `evaluation_control.c:wl_evaluation_control_begin` | active_attempt_id | `atomic_exchange_explicit` | release | Publish identity after complete active initialization |
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id` | active_attempt_id | `atomic_fetch_add_explicit` | acquire | Neutral MSVC Interlocked read preserves full unsigned identity |
 | `evaluation_control.c:wl_evaluation_control_active_attempt_id#2` | active_attempt_id | `atomic_load_explicit` | acquire | C11 observation of active identity without mutex or attempt pin |
@@ -1602,7 +1608,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce committed credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#7` | token state | `atomic_store_explicit` | release | Publish the downsized token after aggregate credit succeeds |
 
-The complete current atomic-source inventory contains 369 call sites.
+The complete current atomic-source inventory contains 376 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2012,3 +2018,7 @@ the commit.
 | `relation.c:wl_columnar_relation_reader_step` | `gate->state` | `atomic_load_explicit` | acquire | Observe one admission or release transition without a retry loop |
 | `relation.c:wl_columnar_relation_reader_step#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire or release/relaxed | MSVC single strong Interlocked transition; failed ownership remains retryable |
 | `relation.c:wl_columnar_relation_reader_step#3` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire or release/relaxed | One original descriptor/owner acquisition or release per call |
+| `source_access.h:wl_columnar_source_access_gate_set_attempt_advance` | `gate->state` | `atomic_load_explicit` | acquire | Observe the current gate state before one admitted acquire action |
+| `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Acquire one gate in the ordered set with a single non-spurious transition |
+| `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#3` | `gate->state` | `atomic_load_explicit` | acquire | Read one reader gate before its bounded release transition |
+| `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#4` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Release one gate in reverse order with a single non-spurious transition |

@@ -2955,6 +2955,35 @@ attempt_single_wrong_thread_finish(void *arg)
     return NULL;
 }
 
+static bool
+append_growth_test_cleanup_phase(
+    wl_columnar_relation_append_growth_phase_t phase)
+{
+    return phase >= WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD
+           && phase < WL_COLUMNAR_RELATION_APPEND_GROWTH_DONE;
+}
+
+/* The driver uses a distinct one-unit active grant for every cleanup action,
+ * so all ordinary lifecycle tests exercise the public funding contract. */
+static int
+append_growth_test_step(wl_columnar_relation_append_growth_attempt_t *attempt)
+{
+    if (!append_growth_test_cleanup_phase(attempt->phase))
+        return wl_columnar_relation_append_growth_attempt_advance(attempt);
+    int owner;
+    wl_evaluation_control_t *funding = NULL;
+    assert(wl_evaluation_control_create(1, &funding) == 0);
+    assert(wl_evaluation_control_attach(funding, &owner) == 0);
+    assert(wl_evaluation_control_begin(funding, &owner) == 0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    int rc = wl_columnar_relation_append_growth_attempt_cleanup_step(attempt,
+            funding, id);
+    assert(wl_evaluation_control_finish(funding, &owner, 0, 0) == 0);
+    assert(wl_evaluation_control_detach(funding, &owner) == 0);
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
 static void
 attempt_single_authority_tests(void)
 {
@@ -3043,7 +3072,7 @@ append_growth_zero_capacity_footprint_test(void)
         &src, 0, 1, control) == 0);
     int rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+        rc = append_growth_test_step(&attempt);
     assert(rc == 0 && wl_columnar_relation_append_growth_attempt_ready(
             &attempt));
     assert(attempt.old_reserved_bytes == 2 * sizeof(int64_t *)
@@ -3053,7 +3082,7 @@ append_growth_zero_capacity_footprint_test(void)
     assert(dst.capacity == 0 && dst.nrows == 0);
     rc = wl_columnar_relation_append_growth_attempt_commit(&attempt);
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+        rc = append_growth_test_step(&attempt);
     assert(rc == 0 && dst.capacity == 64 && dst.nrows == 1);
     assert(dst.columns[0][0] == 20 && dst.columns[1][0] == 21);
     assert(dst.retained_reserved_bytes == 2 * sizeof(int64_t *)
@@ -3120,14 +3149,88 @@ append_growth_attempt_tests(void)
     assert(wl_evaluation_control_attach(control, &owner) == 0);
     assert(wl_evaluation_control_begin(control, &owner) == 0);
     wl_columnar_relation_append_growth_attempt_t cancelled = {0};
+    wl_evaluation_control_t *cancel_control = NULL;
+    int cancel_owner;
+    assert(wl_evaluation_control_create(0, &cancel_control) == 0);
+    assert(wl_evaluation_control_attach(cancel_control, &cancel_owner) == 0);
+    assert(wl_evaluation_control_begin(cancel_control, &cancel_owner) == 0);
     assert(wl_columnar_relation_append_growth_attempt_begin(&cancelled, &dst,
-        &src, 0, 2, control) == 0);
+        &src, 0, 2, cancel_control) == 0);
+    assert(cancelled.control_identity
+        == wl_evaluation_control_identity(cancel_control));
     assert(wl_columnar_relation_append_growth_attempt_abort(&cancelled,
         ECANCELED) == EAGAIN);
+    /* Cleanup must use a distinct, currently active grant and remain
+     * resumable when the grant is stale, mismatched, or exhausted. The
+     * operation control can be released before funded cleanup begins. */
+    assert(wl_evaluation_control_finish(cancel_control, &cancel_owner,
+        ECANCELED, 0)
+        == ECANCELED);
+    assert(wl_evaluation_control_reset(cancel_control) == 0);
+    assert(wl_evaluation_control_begin(cancel_control, &cancel_owner) == 0);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, cancel_control,
+            wl_evaluation_control_active_attempt_id(cancel_control)) == EINVAL);
+    assert(wl_evaluation_control_finish(cancel_control, &cancel_owner,
+        ECANCELED, 0)
+        == ECANCELED);
+    assert(wl_evaluation_control_detach(cancel_control, &cancel_owner) == 0);
+    wl_evaluation_control_release(cancel_control);
+    assert(cancelled.control == NULL);
+    wl_evaluation_control_t *funding = NULL;
+    int funding_owner;
+    assert(wl_evaluation_control_create(1, &funding) == 0);
+    assert(wl_evaluation_control_identity(funding)
+        != cancelled.control_identity);
+    assert(wl_evaluation_control_attach(funding, &funding_owner) == 0);
+    assert(wl_evaluation_control_begin(funding, &funding_owner) == 0);
+    uint64_t funding_id = wl_evaluation_control_active_attempt_id(funding);
+    uint32_t cursor_before = cancelled.allocated_lanes;
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, funding, funding_id + 1) == EINVAL);
+    assert(cancelled.allocated_lanes == cursor_before
+        && cancelled.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, funding, funding_id) == EAGAIN);
+    assert(cancelled.allocated_lanes == cursor_before
+        && cancelled.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, funding, funding_id)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    assert(cancelled.allocated_lanes == cursor_before
+        && cancelled.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND);
+    assert(wl_evaluation_control_finish(funding, &funding_owner,
+        WL_EVALUATION_CONTROL_WORK_LIMIT, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_evaluation_control_report_t cleanup_report;
+    assert(wl_evaluation_control_report(funding, &cleanup_report) == 0);
+    assert(cleanup_report.consumed == 1);
+    assert(wl_evaluation_control_reset(funding) == 0);
+    assert(wl_evaluation_control_begin(funding, &funding_owner) == 0);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, funding, funding_id) == EINVAL);
+    assert(cancelled.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND
+        && cancelled.allocated_lanes == cursor_before);
+    assert(wl_evaluation_control_finish(funding, &funding_owner, 0, 0) == 0);
+    assert(wl_evaluation_control_report(funding, &cleanup_report) == 0);
+    assert(cleanup_report.consumed == 0);
+    assert(wl_evaluation_control_reset(funding) == 0);
+    assert(wl_evaluation_control_begin(funding, &funding_owner) == 0);
     int rc = EAGAIN;
-    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&cancelled);
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++) {
+        rc = wl_columnar_relation_append_growth_attempt_cleanup_step(
+            &cancelled, funding,
+            wl_evaluation_control_active_attempt_id(funding));
+        assert(wl_evaluation_control_finish(funding, &funding_owner, 0, 0)
+            == 0);
+        if (rc == EAGAIN) {
+            assert(wl_evaluation_control_reset(funding) == 0);
+            assert(wl_evaluation_control_begin(funding, &funding_owner) == 0);
+        }
+    }
     assert(rc == ECANCELED);
+    assert(wl_evaluation_control_detach(funding, &funding_owner) == 0);
+    wl_evaluation_control_release(funding);
     assert(!wl_columnar_relation_append_growth_attempt_published(&cancelled));
     assert(dst.nrows == 2 && dst.capacity == 2
         && dst.columns[0][0] == 10 && dst.columns[0][1] == 11);
@@ -3140,7 +3243,7 @@ append_growth_attempt_tests(void)
         &src, 0, 2, control) == 0);
     rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&denied);
+        rc = append_growth_test_step(&denied);
     assert(rc == ENOMEM && dst.memory_budget_denial_pending);
     assert(dst.nrows == 2 && dst.capacity == 2
         && governor_reserved(governor) == 24);
@@ -3154,7 +3257,7 @@ append_growth_attempt_tests(void)
             &allocation_failed, &dst, &src, 0, 2, control) == 0);
     rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(
+        rc = append_growth_test_step(
             &allocation_failed);
     assert(rc == ENOMEM && !allocation_failed.published);
     assert(dst.nrows == 2 && dst.capacity == 2
@@ -3168,20 +3271,20 @@ append_growth_attempt_tests(void)
     for (unsigned i = 0; i < 128 && rc == EAGAIN
         && cancelled_after_copy.phase
         != WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(
+        rc = append_growth_test_step(
             &cancelled_after_copy);
     assert(rc == EAGAIN && cancelled_after_copy.phase
         == WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE);
     assert(governor_reserved(governor) == 64);
-    rc = wl_columnar_relation_append_growth_attempt_advance(
+    rc = append_growth_test_step(
         &cancelled_after_copy);
     assert(rc == EAGAIN && cancelled_after_copy.row_cursor == 2);
     wl_evaluation_control_request_cancel(control);
-    rc = wl_columnar_relation_append_growth_attempt_advance(
+    rc = append_growth_test_step(
         &cancelled_after_copy);
     assert(rc == EAGAIN);
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(
+        rc = append_growth_test_step(
             &cancelled_after_copy);
     assert(rc == WL_EVALUATION_CONTROL_CANCELLED);
     assert(!wl_columnar_relation_append_growth_attempt_published(
@@ -3201,7 +3304,7 @@ append_growth_attempt_tests(void)
         &src, 0, 2, control) == 0);
     rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+        rc = append_growth_test_step(&attempt);
     assert(rc == 0 &&
         wl_columnar_relation_append_growth_attempt_ready(&attempt));
     assert(!wl_columnar_relation_append_growth_attempt_published(&attempt));
@@ -3209,8 +3312,64 @@ append_growth_attempt_tests(void)
         && dst.columns[0][0] == 10 && dst.columns[0][1] == 11);
     rc = wl_columnar_relation_append_growth_attempt_commit(&attempt);
     assert(rc == EAGAIN);
+    assert(attempt.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD);
+    int64_t **retired_table = attempt.retired_columns;
+    uint64_t postpublish_reserved = dst.retained_reserved_bytes;
+    uint64_t postpublish_governed = governor_reserved(governor);
+    wl_evaluation_control_t *postpublish_funding = NULL;
+    int postpublish_owner;
+    assert(wl_evaluation_control_create(1, &postpublish_funding) == 0);
+    assert(wl_evaluation_control_attach(postpublish_funding,
+        &postpublish_owner) == 0);
+    assert(wl_evaluation_control_begin(postpublish_funding,
+        &postpublish_owner) == 0);
+    uint64_t postpublish_id
+        = wl_evaluation_control_active_attempt_id(postpublish_funding);
+    assert(wl_evaluation_control_charge_attempt(postpublish_funding,
+        postpublish_id, 1) == 0);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(&attempt,
+        postpublish_funding, postpublish_id)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    assert(attempt.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD
+        && attempt.lane_cursor == 0
+        && attempt.retired_columns == retired_table);
+    assert(dst.nrows == 4 && dst.capacity == 4
+        && dst.columns[0][0] == 10 && dst.columns[0][1] == 11
+        && dst.columns[0][2] == 20 && dst.columns[0][3] == 21);
+    assert(dst.retained_reserved_bytes == postpublish_reserved
+        && governor_reserved(governor) == postpublish_governed);
+    assert(wl_evaluation_control_finish(postpublish_funding,
+        &postpublish_owner, WL_EVALUATION_CONTROL_WORK_LIMIT, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    assert(wl_evaluation_control_reset(postpublish_funding) == 0);
+    assert(wl_evaluation_control_begin(postpublish_funding,
+        &postpublish_owner) == 0);
+    postpublish_id = wl_evaluation_control_active_attempt_id(
+        postpublish_funding);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(&attempt,
+        postpublish_funding, postpublish_id) == EAGAIN);
+    assert(attempt.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD
+        && attempt.lane_cursor == 1
+        && attempt.retired_columns == retired_table);
+    assert(dst.retained_reserved_bytes == postpublish_reserved
+        && governor_reserved(governor) == postpublish_governed);
+    assert(dst.nrows == 4 && dst.capacity == 4
+        && dst.columns[0][2] == 20 && dst.columns[0][3] == 21);
+    assert(wl_columnar_relation_append_growth_attempt_cleanup_step(&attempt,
+        postpublish_funding, postpublish_id)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    assert(attempt.phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD
+        && attempt.lane_cursor == 1
+        && attempt.retired_columns == retired_table);
+    assert(wl_evaluation_control_finish(postpublish_funding,
+        &postpublish_owner, WL_EVALUATION_CONTROL_WORK_LIMIT, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    assert(wl_evaluation_control_detach(postpublish_funding,
+        &postpublish_owner) == 0);
+    wl_evaluation_control_release(postpublish_funding);
+    rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+        rc = append_growth_test_step(&attempt);
     assert(rc == 0);
     assert(wl_columnar_relation_append_growth_attempt_published(&attempt));
     assert(dst.nrows == 4 && dst.capacity == 4);
@@ -3230,7 +3389,7 @@ append_growth_attempt_tests(void)
         &src, 0, 2, control) == 0);
     rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&pooled);
+        rc = append_growth_test_step(&pooled);
     assert(rc == ENOTSUP);
     assert(dst.nrows == 4 && dst.capacity == 4);
     assert_open(&dst);
@@ -3241,7 +3400,7 @@ append_growth_attempt_tests(void)
         &src, 0, 0, control) == 0);
     rc = EAGAIN;
     for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
-        rc = wl_columnar_relation_append_growth_attempt_advance(&zero_count);
+        rc = append_growth_test_step(&zero_count);
     assert(rc == EINVAL);
     assert(dst.nrows == 4 && dst.capacity == 4);
     assert_open(&dst);
