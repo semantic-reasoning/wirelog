@@ -534,6 +534,21 @@ static struct {
     bool valid;
 } schedule;
 
+struct finish_step_thread_arg {
+    wl_columnar_memory_reservation_t *token;
+    bool done;
+    int result;
+};
+
+static void *
+finish_step_on_thread(void *opaque)
+{
+    struct finish_step_thread_arg *arg = opaque;
+    arg->result = wl_columnar_memory_reservation_finish_step(arg->token,
+            false, &arg->done);
+    return NULL;
+}
+
 void
 wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
     unsigned phase)
@@ -543,6 +558,28 @@ wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
     /* One-shot nesting models a competing operation while this call is paused. */
     schedule.armed = false;
     schedule.hits++;
+    if (phase == WL_COLUMNAR_MEMORY_TEST_FINISH_PREPARING
+        || phase == WL_COLUMNAR_MEMORY_TEST_FINISH_RELEASING) {
+        wl_thread_t competitor;
+        struct finish_step_thread_arg arg = { token, true, 0 };
+        uint64_t expected_state = phase
+            == WL_COLUMNAR_MEMORY_TEST_FINISH_PREPARING
+            ? WL_COLUMNAR_MEMORY_RESERVATION_RELEASE_PREPARING
+            : WL_COLUMNAR_MEMORY_RESERVATION_RELEASING;
+        schedule.valid = atomic_load_explicit(&token->state,
+                memory_order_acquire)
+            == expected_state;
+        if (wl_thread_create(&competitor, finish_step_on_thread, &arg) != 0
+            || wl_thread_join(&competitor) != 0) {
+            schedule.valid = false;
+            return;
+        }
+        schedule.valid = schedule.valid && arg.result == EBUSY && !arg.done
+            && atomic_load_explicit(&token->state, memory_order_acquire)
+            == expected_state
+            && wl_columnar_memory_reserved(token->governor) == 600;
+        return;
+    }
     if (phase == WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM) {
         schedule.valid = wl_columnar_memory_reservation_downsize(token, 200)
             && wl_columnar_memory_reserved(token->governor) == 1200;
@@ -569,6 +606,57 @@ wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
         && !reserve && wl_columnar_memory_reserved(token->governor) == total
         && atomic_load_explicit(&token->owner_bits, memory_order_acquire)
         == (uint64_t)(uintptr_t)token->governor;
+}
+
+static int
+test_finish_step_claim_before_receipt(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    const int owner = 1;
+    bool done = false;
+
+    TEST("stepped finish claims before publishing receipt");
+    make_resolution(&resolution, 5000, 4500);
+    wl_columnar_memory_governor_init(&governor, &resolution);
+    wl_columnar_memory_reservation_init(&token);
+    if (!wl_columnar_memory_reserve(&governor, 600, &token)
+        || !wl_columnar_memory_commit(&token, &owner)) {
+        FAIL("stepped finish claim setup");
+        return 1;
+    }
+    schedule.token = &token;
+    schedule.phase = WL_COLUMNAR_MEMORY_TEST_FINISH_PREPARING;
+    schedule.hits = 0;
+    schedule.armed = true;
+    schedule.valid = false;
+    int rc = wl_columnar_memory_reservation_finish_step(&token, false, &done);
+    schedule.armed = false;
+    if (rc || done || !schedule.valid || schedule.hits != 1
+        || token.release_bytes != 600
+        || token.release_from_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || token.release_mode != 1
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RELEASING
+        || wl_columnar_memory_reserved(&governor) != 600) {
+        FAIL("competing finish observed an incomplete receipt");
+        return 1;
+    }
+    schedule.token = &token;
+    schedule.phase = WL_COLUMNAR_MEMORY_TEST_FINISH_RELEASING;
+    schedule.hits = 0;
+    schedule.armed = true;
+    schedule.valid = false;
+    rc = wl_columnar_memory_reservation_finish_step(&token, false, &done);
+    schedule.armed = false;
+    if (rc || !done || !schedule.valid || schedule.hits != 1
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("same-thread receipt resume did not credit exactly once");
+        return 1;
+    }
+    PASS();
+    return 0;
 }
 
 static int
@@ -3033,6 +3121,7 @@ main(void)
     test_automatic_sources();
     test_headroom_boundaries();
     test_reservation_lifecycle();
+    test_finish_step_claim_before_receipt();
     test_concurrent_admission();
     test_checked_admission();
     test_downsize();

@@ -2385,6 +2385,36 @@ enum {
     WL_MEMORY_RELEASE_MODE_ROLLBACK = 2,
 };
 
+static void
+reservation_release_thread_capture(
+    wl_columnar_memory_reservation_t *reservation)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    reservation->release_owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    reservation->release_owner_thread = GetCurrentThreadId();
+#else
+    reservation->release_owner_thread = pthread_self();
+#endif
+    reservation->release_thread_valid = true;
+}
+
+static bool
+reservation_release_thread_equal(
+    const wl_columnar_memory_reservation_t *reservation)
+{
+    if (!reservation->release_thread_valid)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(reservation->release_owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return reservation->release_owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(reservation->release_owner_thread,
+               pthread_self()) != 0;
+#endif
+}
+
 int
 wl_columnar_memory_reservation_finish_step(
     wl_columnar_memory_reservation_t *reservation, bool rollback,
@@ -2401,35 +2431,51 @@ wl_columnar_memory_reservation_finish_step(
     uint8_t requested_mode = rollback ? WL_MEMORY_RELEASE_MODE_ROLLBACK
         : WL_MEMORY_RELEASE_MODE_RELEASE;
     if (state != WL_COLUMNAR_MEMORY_RESERVATION_RELEASING) {
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASE_PREPARING)
+            return EBUSY;
         if ((rollback && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
             || (!rollback && state != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
             && state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
             && state != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING))
             return EINVAL;
+
+        uint64_t expected = state;
+        if (!atomic_compare_exchange_strong_explicit(&reservation->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_RELEASE_PREPARING,
+            memory_order_acq_rel, memory_order_acquire))
+            return EAGAIN;
+        reservation_release_thread_capture(reservation);
+        WL_MEMORY_TEST_POINT(reservation,
+            WL_COLUMNAR_MEMORY_TEST_FINISH_PREPARING);
+
         uint64_t bytes = reservation->bytes;
         if (state == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING) {
-            if (reservation->replacement_bytes > UINT64_MAX - bytes)
+            if (reservation->replacement_bytes > UINT64_MAX - bytes) {
+                reservation->release_thread_valid = false;
+                atomic_store_explicit(&reservation->state, state,
+                    memory_order_release);
                 return EOVERFLOW;
+            }
             bytes += reservation->replacement_bytes;
         }
-        if (!reservation->governor || !bytes)
+        if (!reservation->governor || !bytes) {
+            reservation->release_thread_valid = false;
+            atomic_store_explicit(&reservation->state, state,
+                memory_order_release);
             return EINVAL;
+        }
         reservation->release_bytes = bytes;
         reservation->release_from_state = (uint8_t)state;
         reservation->release_mode = requested_mode;
-        uint64_t expected = state;
-        if (!atomic_compare_exchange_strong_explicit(&reservation->state,
-            &expected, WL_COLUMNAR_MEMORY_RESERVATION_RELEASING,
-            memory_order_acq_rel, memory_order_acquire)) {
-            reservation->release_bytes = 0;
-            reservation->release_from_state = 0;
-            reservation->release_mode = WL_MEMORY_RELEASE_MODE_NONE;
-            return EAGAIN;
-        }
+        atomic_store_explicit(&reservation->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_RELEASING, memory_order_release);
         return 0;
     }
 
-    if (reservation->release_mode != requested_mode
+    WL_MEMORY_TEST_POINT(reservation,
+        WL_COLUMNAR_MEMORY_TEST_FINISH_RELEASING);
+    if (!reservation_release_thread_equal(reservation)
+        || reservation->release_mode != requested_mode
         || !reservation->release_bytes || !reservation->governor
         || (reservation->release_from_state
         != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
@@ -2455,6 +2501,7 @@ wl_columnar_memory_reservation_finish_step(
     reservation->release_bytes = 0;
     reservation->release_from_state = 0;
     reservation->release_mode = WL_MEMORY_RELEASE_MODE_NONE;
+    reservation->release_thread_valid = false;
     atomic_store_explicit(&reservation->owner_bits, 0, memory_order_relaxed);
     atomic_store_explicit(&reservation->state,
         WL_COLUMNAR_MEMORY_RESERVATION_RELEASED, memory_order_release);

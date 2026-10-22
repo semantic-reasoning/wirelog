@@ -117,6 +117,7 @@ typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING = 9,
     WL_COLUMNAR_MEMORY_RESERVATION_REPLACING = 10,
     WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING = 11,
+    WL_COLUMNAR_MEMORY_RESERVATION_RELEASE_PREPARING = 12,
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
@@ -142,6 +143,14 @@ typedef struct {
     uint64_t release_bytes;
     uint8_t release_from_state;
     uint8_t release_mode;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t release_owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD release_owner_thread;
+#else
+    pthread_t release_owner_thread;
+#endif
+    bool release_thread_valid;
     wl_atomic_u64 owner_bits;
     wl_atomic_u64 state;
     /* Tokens are caller-owned and intentionally non-copyable.  A copied
@@ -159,6 +168,8 @@ enum {
     WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED,
     WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED,
     WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED,
+    WL_COLUMNAR_MEMORY_TEST_FINISH_PREPARING,
+    WL_COLUMNAR_MEMORY_TEST_FINISH_RELEASING,
 };
 void
 wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *reservation,
@@ -554,7 +565,11 @@ wl_columnar_memory_rollback(
     wl_columnar_memory_reservation_t *reservation);
 
 /* Release or roll back a reservation with at most one reservation-state or
- * governor-accounting CAS per call. EAGAIN and done=false retain the token. */
+ * governor-accounting CAS per call. The first call claims RELEASE_PREPARING,
+ * snapshots a receipt, and publishes RELEASING without crediting the governor;
+ * later calls perform one credit CAS each. The continuation is thread-affine
+ * to the thread that claimed it, and callers must serialize calls for a token.
+ * EAGAIN and done=false retain the token. */
 int
 wl_columnar_memory_reservation_finish_step(
     wl_columnar_memory_reservation_t *reservation, bool rollback,
