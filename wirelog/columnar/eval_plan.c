@@ -532,6 +532,19 @@ wl_columnar_eval_plan_numeric_owner_valid(const void *owner,
            && wl_columnar_eval_plan_numeric_thread(record);
 }
 
+bool
+wl_columnar_eval_plan_numeric_batch_fallback_authorized(const void *owner,
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_col_session_t *session, const wl_evaluation_control_t *control,
+    uint64_t attempt_id)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    return wl_columnar_eval_plan_numeric_owner_valid(owner, frame)
+           && record->session == session && record->control == control
+           && record->attempt_id == attempt_id && record->composed_mode
+           && record->controlled_materialized_batch_fallback;
+}
+
 static int
 wl_columnar_eval_plan_numeric_fund(wl_evaluation_control_t *funding,
     uint64_t id, const wl_evaluation_control_t *operation)
@@ -1196,22 +1209,41 @@ wl_columnar_eval_plan_composed_validate(
     return 0;
 }
 
-int
-wl_columnar_eval_plan_numeric_composed_attempt_begin(
+static int
+wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
-    wl_evaluation_control_t *funding, uint64_t funding_id)
+    wl_evaluation_control_t *funding, uint64_t funding_id,
+    bool controlled_materialized_batch_fallback)
 {
     if (!record || record->identity || record->phase || !plan || !plan->ops
         || begin >= end || end > plan->op_count || !frame || !session
         || !control || !id || initial_depth > COL_STACK_MAX
         || (session->nrels && !session->rels)) return EINVAL;
+    if (controlled_materialized_batch_fallback) {
+        if (!session->join_batch_bytes || session->join_batch_strict
+            || begin != 0 || end != plan->op_count || initial_depth != 0
+            || plan->op_count != 4
+            || plan->ops[0].op != WL_PLAN_OP_VARIABLE
+            || plan->ops[1].op != WL_PLAN_OP_JOIN
+            || plan->ops[2].op != WL_PLAN_OP_FILTER
+            || !plan->ops[2].filter_expr.data
+            || !plan->ops[2].filter_expr.size
+            || plan->ops[plan->op_count - 1].op
+            != WL_PLAN_OP_CONSOLIDATE
+            || plan->ops[1].materialized || !plan->ops[1].right_relation
+            || !plan->ops[1].key_count || !plan->ops[1].left_keys
+            || !plan->ops[1].right_keys)
+            return ENOTSUP;
+    }
     if (session->current_iteration || session->retraction_seeded
         || session->retraction_right_pass || session->tdd_input_run
         || session->tdd_subpass_active || session->tdd_outbound_only_active
-        || session->diff_operators_active || session->join_batch_bytes
+        || session->diff_operators_active
+        || (session->join_batch_bytes
+        && !controlled_materialized_batch_fallback)
         || session->join_output_shared_count || session->coordinator
         || session->num_workers > 1) return ENOTSUP;
     int rc = wl_columnar_eval_plan_composed_fund(funding, funding_id, control);
@@ -1243,6 +1275,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin(
     record->source_full = NULL; record->source_delta = NULL;
     record->source_selected = NULL; record->source_output = NULL;
     record->composed_mode = true;
+    record->controlled_materialized_batch_fallback =
+        controlled_materialized_batch_fallback;
     record->preflight_depth = initial_depth;
     record->runtime_depth = initial_depth;
     record->phase = initial_depth ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
@@ -1266,10 +1300,37 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin(
         record->session = NULL; record->plan = NULL;
         record->source_registry = NULL; record->source_mode = false;
         record->composed_mode = false;
+        record->controlled_materialized_batch_fallback = false;
         record->preflight_depth = 0; record->runtime_depth = 0;
         wl_evaluation_control_release(control);
     }
     return rc;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
+        record, plan, begin, end, frame, session, initial_depth, control, id,
+        funding, funding_id, false);
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
+        record, plan, begin, end, frame, session, initial_depth, control, id,
+        funding, funding_id, true);
 }
 
 static void
@@ -1876,6 +1937,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->thread_valid = false; record->attempt_id = 0;
     record->composed_mode = false; record->preflight_depth = 0;
     record->runtime_depth = 0;
+    record->controlled_materialized_batch_fallback = false;
     record->abort_supported = false; record->abort_requested = false;
     memset(&record->lftj, 0, sizeof(record->lftj));
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;

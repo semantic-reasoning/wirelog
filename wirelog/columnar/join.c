@@ -4697,6 +4697,9 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
     ctx->thread_valid = true; ctx->busy = true;
     ctx->join_initialized = true; ctx->join_decision_pending = true;
     ctx->stage = WL_COLUMNAR_FILTER_STAGE_RUNNING;
+    bool controlled_batch_fallback =
+        wl_columnar_eval_plan_numeric_batch_fallback_authorized(owner, frame,
+            session, control, id);
     bool supported = op->op == WL_PLAN_OP_JOIN
         && !op->materialized
         && (!op->project_count || op->project_indices)
@@ -4704,7 +4707,8 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
         && !session->retraction_seeded
         && !session->retraction_right_pass && !session->tdd_input_run
         && !session->tdd_subpass_active && !session->tdd_outbound_only_active
-        && !session->join_batch_bytes && !session->join_output_shared_count
+        && (!session->join_batch_bytes || controlled_batch_fallback)
+        && !session->join_output_shared_count
         && !session->coordinator && session->num_workers <= 1;
     rc = wl_columnar_join_attempt_tail(control, id, 1, 0);
     if (rc > 0 || supported) {

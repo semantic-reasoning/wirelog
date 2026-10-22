@@ -2478,12 +2478,16 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     rc = wl_columnar_filter_attempt_tail(control, attempt_id, 1, 0);
     if (rc)
         goto done;
+    bool controlled_batch_fallback =
+        wl_columnar_eval_plan_numeric_batch_fallback_authorized(owner, frame,
+            sess, control, attempt_id);
     if (op->op != WL_PLAN_OP_CONSOLIDATE || !stack->top
         || stack->items[stack->top - 1].is_delta
         || sess->current_iteration || sess->diff_operators_active
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
-        || sess->tdd_outbound_only_active || sess->join_batch_bytes
+        || sess->tdd_outbound_only_active
+        || (sess->join_batch_bytes && !controlled_batch_fallback)
         || sess->join_output_shared_count || sess->coordinator
         || sess->num_workers > 1) {
         rc = ENOTSUP; goto done;
