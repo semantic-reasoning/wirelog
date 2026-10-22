@@ -35,9 +35,10 @@ typedef struct wl_evaluation_control wl_evaluation_control_t;
  * are ignored.
  *
  * Version 3 (#1819) adds a retained evaluation-control reference. The common
- * wrapper claims one logical owner; workers only borrow it. This is foundation
- * plumbing: controlled step/snapshot return ENOTSUP until engine enforcement
- * lands. Version 2 prefixes remain accepted, with no evaluation control.
+ * wrapper claims one logical owner; workers only borrow it. Supported
+ * nonrecursive controlled STEP plans use bounded resumable preflight;
+ * controlled SNAPSHOT and unsupported STEP routes may still return ENOTSUP.
+ * Version 2 prefixes remain accepted, with no evaluation control.
  *
  * Version 4 (#1372) adds an optional numeric spill store. A NULL directory
  * with zero limits disables it; otherwise the directory must be nonempty,
