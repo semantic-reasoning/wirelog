@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **339**).
+match the script's count (currently **369**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -526,7 +526,7 @@ measured by `bench/bench_intern.c`; baselines are in `docs/INTERN_PERF.md`
 21 + 4 + 9 + 20 + 2 + 2 + 3 + 37 + 5 + 7 + 3 = **113 atomic call sites**
 before the source-access contract below.
 
-### 5.13 `wirelog/columnar/source_access.h` — relation source gate (21 rows)
+### 5.13 `wirelog/columnar/source_access.h` — relation source gate (27 rows)
 
 This header-only gate protects relation descriptors and canonical source storage.
 It is linked into the production relation lifecycle and its gate state is zero-initialized.
@@ -580,6 +580,12 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_writer_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate the writer state before terminal publication |
 | `source_access.h:wl_columnar_source_access_writer_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish writer payload completion and retry spurious failure |
 | `source_access.h:wl_columnar_source_access_writer_move` | `src->owner->state` | `atomic_load_explicit` | acquire | Confirm that the source token still holds WRITER before moving its address-bound ownership to another token |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance` | `attempt->source->state` | `atomic_load_explicit` | acquire | Observe source reader availability before one bounded receipt transition |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance#2` | `attempt->source->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Acquire one source reader without retrying a failed compare |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance#3` | `attempt->destination->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Acquire the destination writer once after source authority is retained |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance#4` | `attempt->destination->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Release the destination writer once during reverse cleanup |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance#5` | `attempt->source->state` | `atomic_load_explicit` | acquire | Verify a live source reader count before the final release transition |
+| `source_access.h:wl_columnar_source_access_growth_gate_attempt_advance#6` | `attempt->source->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Release one source reader once and record completion in the receipt |
 
 ### 5.14 `wirelog/columnar/relation.c` and `session.c` — alias ownership and pool promotion (30 rows)
 
@@ -1577,8 +1583,26 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_governor_begin_growth_attempt_controlled` | token state | `atomic_exchange_explicit` | release | Publish reversible REPLACING after recording added credit and growth kind |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled` | owner bits | `atomic_exchange_explicit` | release | Install raw-compatible owner in finite terminal after final checkpoint |
 | `memory_governor.c:wl_columnar_memory_governor_commit_attempt_controlled#2` | token state | `atomic_exchange_explicit` | release | Publish COMMITTED without later callback or negative poll |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_begin` | token owner | `atomic_load_explicit` | acquire | Validate matching owner before creating the overlap-refund receipt |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_begin#2` | token state | `atomic_load_explicit` | acquire | Require a replacing token before receipt creation |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance` | token owner | `atomic_load_explicit` | acquire | Revalidate original owner while the receipt remains live |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#2` | token state | `atomic_load_explicit` | acquire | Validate replacing state before advancing the persistent cursor |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#3` | token state | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim the token so ordinary mutation cannot race overlap refund |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#4` | token state | `atomic_load_explicit` | acquire | Confirm ownership of the growth-refund state |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#5` | governor reserved bytes | `atomic_load_explicit` | relaxed | Read the current aggregate before subtracting only the owned overlap |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Refund overlap with one retryable aggregate CAS |
+| `memory_governor.c:wl_columnar_memory_growth_refund_attempt_advance#7` | token state | `atomic_store_explicit` | release | Restore COMMITTED after overlap credit and token metadata are finalized |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_begin` | token owner | `atomic_load_explicit` | acquire | Match the committed token owner before creating a downsize receipt |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_begin#2` | token state | `atomic_load_explicit` | acquire | Require COMMITTED without reading mutable token payload |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance` | token owner | `atomic_load_explicit` | acquire | Revalidate owner authority before claiming the committed token |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#2` | token state | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim DOWNSIZING before reading or changing mutable token payload |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#3` | token state | `atomic_store_explicit` | release | Restore COMMITTED after rejecting an invalid target without changing credit |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#4` | token state | `atomic_load_explicit` | acquire | Verify DOWNSIZING ownership before credit reduction |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#5` | governor reserved bytes | `atomic_load_explicit` | relaxed | Read current aggregate before subtracting the retired footprint |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce committed credit with one retryable aggregate CAS |
+| `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#7` | token state | `atomic_store_explicit` | release | Publish the downsized token after aggregate credit succeeds |
 
-The complete current atomic-source inventory contains 339 call sites.
+The complete current atomic-source inventory contains 369 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
