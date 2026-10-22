@@ -584,6 +584,8 @@ void (*wl_columnar_memory_governor_test_after_total_cas)(
     wl_columnar_memory_governor_t *, bool, bool);
 void (*wl_columnar_memory_governor_test_admitted)(
     wl_columnar_memory_governor_t *, uint64_t);
+void (*wl_columnar_memory_growth_refund_test_before_credit_cas)(
+    wl_columnar_memory_governor_t *);
 #define WL_COLUMNAR_MEMORY_GOVERNOR_TEST_POINT(c, r, p) do { \
             if (wl_columnar_memory_governor_test_checkpoint) \
             wl_columnar_memory_governor_test_checkpoint(c, r, p); \
@@ -2113,6 +2115,126 @@ credit_reservation(wl_columnar_memory_governor_t *governor, uint64_t bytes)
             break;
     }
     return true;
+}
+
+static bool
+wl_columnar_memory_growth_refund_thread_equal(
+    const wl_columnar_memory_growth_refund_attempt_t *attempt)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return attempt->thread_valid
+           && thrd_equal(attempt->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return attempt->thread_valid
+           && attempt->owner_thread == GetCurrentThreadId();
+#else
+    return attempt->thread_valid
+           && pthread_equal(attempt->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+int
+wl_columnar_memory_growth_refund_attempt_begin(
+    wl_columnar_memory_reservation_t *token, const void *owner,
+    wl_columnar_memory_growth_refund_attempt_t *attempt)
+{
+    if (!token || !owner || !attempt || attempt->identity || attempt->token
+        || attempt->governor || attempt->owner || attempt->old_bytes
+        || attempt->overlap_bytes || attempt->phase || attempt->thread_valid
+        || !reservation_identity_valid(token) || !token->governor
+        || !token->bytes || !token->replacement_bytes
+        || token->replacement_bytes > UINT64_MAX - token->bytes
+        || token->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+        || atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+        != (uint64_t)(uintptr_t)owner
+        || atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+        return EINVAL;
+    attempt->identity = attempt;
+    attempt->token = token;
+    attempt->governor = token->governor;
+    attempt->owner = owner;
+    attempt->old_bytes = token->bytes;
+    attempt->overlap_bytes = token->replacement_bytes;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
+    attempt->thread_valid = true;
+    attempt->phase = WL_COLUMNAR_MEMORY_GROWTH_REFUND_VALIDATE;
+    return 0;
+}
+
+int
+wl_columnar_memory_growth_refund_attempt_advance(
+    wl_columnar_memory_growth_refund_attempt_t *attempt)
+{
+    if (!attempt || attempt->identity != attempt || !attempt->token
+        || !attempt->governor || !attempt->owner
+        || !wl_columnar_memory_growth_refund_thread_equal(attempt)
+        || !reservation_identity_valid(attempt->token)
+        || attempt->token->governor != attempt->governor
+        || atomic_load_explicit(&attempt->token->owner_bits,
+        memory_order_acquire) != (uint64_t)(uintptr_t)attempt->owner
+        || attempt->token->bytes != attempt->old_bytes
+        || attempt->overlap_bytes == 0)
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE)
+        return 0;
+    if (attempt->phase == WL_COLUMNAR_MEMORY_GROWTH_REFUND_VALIDATE) {
+        if (attempt->token->replacement_bytes != attempt->overlap_bytes
+            || attempt->token->transition_kind
+            != WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+            || atomic_load_explicit(&attempt->token->state,
+            memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING)
+            return EINVAL;
+        attempt->phase = WL_COLUMNAR_MEMORY_GROWTH_REFUND_CLAIM;
+        return EAGAIN;
+    }
+    if (attempt->phase == WL_COLUMNAR_MEMORY_GROWTH_REFUND_CLAIM) {
+        uint64_t expected = WL_COLUMNAR_MEMORY_RESERVATION_REPLACING;
+        if (!atomic_compare_exchange_strong_explicit(&attempt->token->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING,
+            memory_order_acq_rel, memory_order_acquire))
+            return EAGAIN;
+        attempt->phase = WL_COLUMNAR_MEMORY_GROWTH_REFUND_CREDIT;
+        return EAGAIN;
+    }
+    if (attempt->phase == WL_COLUMNAR_MEMORY_GROWTH_REFUND_CREDIT) {
+        uint64_t total, expected;
+        if (attempt->token->replacement_bytes != attempt->overlap_bytes
+            || attempt->token->transition_kind
+            != WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+            || atomic_load_explicit(&attempt->token->state,
+            memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING)
+            return EINVAL;
+        total = atomic_load_explicit(&attempt->governor->reserved_bytes,
+                memory_order_relaxed);
+        if (total < attempt->overlap_bytes)
+            return EINVAL;
+#ifdef WL_COLUMNAR_MEMORY_TEST_HOOKS
+        if (wl_columnar_memory_growth_refund_test_before_credit_cas)
+            wl_columnar_memory_growth_refund_test_before_credit_cas(
+                attempt->governor);
+#endif
+        expected = total;
+        if (!atomic_compare_exchange_strong_explicit(
+                &attempt->governor->reserved_bytes, &expected,
+                total - attempt->overlap_bytes, memory_order_acq_rel,
+                memory_order_acquire))
+            return EAGAIN;
+        attempt->token->replacement_bytes = 0;
+        attempt->token->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+        atomic_store_explicit(&attempt->token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED, memory_order_release);
+        attempt->phase = WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE;
+        return 0;
+    }
+    return EINVAL;
 }
 
 static wl_columnar_memory_admission_status_t

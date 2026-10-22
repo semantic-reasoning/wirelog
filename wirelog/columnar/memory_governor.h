@@ -116,6 +116,7 @@ typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_RELEASING = 8,
     WL_COLUMNAR_MEMORY_RESERVATION_REPLACEMENT_ADMITTING = 9,
     WL_COLUMNAR_MEMORY_RESERVATION_REPLACING = 10,
+    WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING = 11,
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
@@ -260,6 +261,43 @@ typedef struct {
     wl_columnar_memory_governor_growth_commit_phase_t phase;
 } wl_columnar_memory_governor_growth_commit_prepared_t;
 
+/* Bounded rollback receipt for one admitted growth overlap. Each advance
+ * performs at most one strong CAS. The receipt and token are noncopyable and
+ * remain live until DONE; callers free incoming storage before beginning. */
+typedef enum {
+    WL_COLUMNAR_MEMORY_GROWTH_REFUND_INERT = 0,
+    WL_COLUMNAR_MEMORY_GROWTH_REFUND_VALIDATE,
+    WL_COLUMNAR_MEMORY_GROWTH_REFUND_CLAIM,
+    WL_COLUMNAR_MEMORY_GROWTH_REFUND_CREDIT,
+    WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE,
+} wl_columnar_memory_growth_refund_phase_t;
+
+typedef struct wl_columnar_memory_growth_refund_attempt {
+    struct wl_columnar_memory_growth_refund_attempt *identity;
+    wl_columnar_memory_reservation_t *token;
+    wl_columnar_memory_governor_t *governor;
+    const void *owner;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    uint64_t old_bytes;
+    uint64_t overlap_bytes;
+    wl_columnar_memory_growth_refund_phase_t phase;
+    bool thread_valid;
+} wl_columnar_memory_growth_refund_attempt_t;
+
+int wl_columnar_memory_growth_refund_attempt_begin(
+    wl_columnar_memory_reservation_t *token, const void *owner,
+    wl_columnar_memory_growth_refund_attempt_t *attempt);
+/* EAGAIN retains the same receipt phase after gate/token/aggregate contention.
+ * Success is idempotent only after the receipt reaches DONE. */
+int wl_columnar_memory_growth_refund_attempt_advance(
+    wl_columnar_memory_growth_refund_attempt_t *attempt);
+
 /* rc0 makes ready authoritative; shape/claim refusal yields false. Invalid
  * pointers/record/attempt yield EINVAL. Stops preserve original reservations.
  * Preparation admits a conservative228 units once (including finish44), then
@@ -328,6 +366,8 @@ extern void (*wl_columnar_memory_governor_test_after_total_cas)(
  * the governor. */
 extern void (*wl_columnar_memory_governor_test_admitted)(
     wl_columnar_memory_governor_t *, uint64_t);
+extern void (*wl_columnar_memory_growth_refund_test_before_credit_cas)(
+    wl_columnar_memory_governor_t *);
 #endif
 
 /* Initialize a caller-owned token before its first reserve or reuse.
