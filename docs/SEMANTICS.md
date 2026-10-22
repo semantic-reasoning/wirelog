@@ -771,8 +771,15 @@ a bottom-up merge sort with at most 256 compare/copy units per action. Join
 seek, candidate traversal, output-row construction and output-cell writes are
 charged before work; the controlled LFTJ route refuses schemas wider than 64
 columns. Each cleanup retry validates and charges its own live funding grant;
-reader-gate and governor-credit releases perform at most one CAS per action.
-Relation destruction, append-writer finalization, allocator/Arrow release and
+source-reader admission and release perform at most one gate CAS per action.
+Admission retains the descriptor pin while it waits for the storage-owner gate;
+it returns EAGAIN without advancing the input cursor, and snapshots relation
+shape only after both gates are held. Descriptor admission precedes storage
+owner admission, matching relation mutation lock order. Reservation finishing
+first claims a preparation state and publishes an immutable receipt; later
+same-thread calls return governor credit with at most one CAS per action.
+Writer-finalization refusals retain the successful semantic result and the
+draining writer for retry. Relation destruction, allocator/Arrow release and
 stack publication remain synchronous cooperative cleanup boundaries. This
 route does not make other LFTJ entry points or fallback paths controlled.
 

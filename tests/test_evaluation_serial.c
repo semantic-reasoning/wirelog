@@ -6035,6 +6035,168 @@ test_entry_generated_lftj_writer_end_retry(void)
 }
 
 static void
+test_entry_generated_lftj_successful_writer_end_retry(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    CHECK(entry_lftj_phase_reached(&f, WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.writer_active
+        && !ctx->child.lftj.semantic_result
+        && ctx->child.lftj.writer.raw.active
+        && !session_rel_hash_lookup(f.session, "output"));
+
+    lftj_writer_release_failures = 0;
+    wl_columnar_relation_test_single_release = lftj_writer_release_fail_once;
+    int rc = 0;
+    for (unsigned turn = 0; turn < 32 && !lftj_writer_release_failures;
+        ++turn)
+        rc = entry_turn(&f, false, 0);
+    wl_columnar_relation_test_single_release = NULL;
+    CHECK(!rc && lftj_writer_release_failures == 1);
+    ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        && ctx->child.lftj.writer_active
+        && ctx->child.lftj.writer.raw.active
+        && ctx->child.lftj.writer.phase ==
+        WL_COLUMNAR_RELATION_BATCH_DRAINING
+        && !ctx->child.lftj.semantic_result
+        && !session_rel_hash_lookup(f.session, "output"));
+
+    entry_complete(&f);
+    const col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(!f.reply.execution_result && f.reply.committed
+        && output && output->nrows == 3 && output->ncols == 1
+        && output->columns[0][0] == 1 && output->columns[0][1] == 2
+        && output->columns[0][2] == 3);
+    entry_assert_lftj_inputs_unchanged(&f, inputs, 3);
+    entry_destroy(&f);
+}
+
+static void
+test_entry_generated_lftj_resumable_reader_acquire(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    col_rel_t *input = session_find_rel(f.session, "input");
+    CHECK(input);
+    CHECK(entry_lftj_phase_reached(&f, WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+
+    wl_columnar_source_access_writer_t descriptor_writer = { 0 };
+    CHECK(!wl_columnar_source_access_writer_acquire(
+            &input->descriptor_access, &descriptor_writer));
+    CHECK(!entry_turn(&f, false, 0));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.cursor == 0
+        && ctx->child.lftj.inputs[0].reader.acquire_stage == 0
+        && !ctx->child.lftj.semantic_result);
+    CHECK(!wl_columnar_source_access_writer_release(&descriptor_writer));
+
+    CHECK(!entry_turn(&f, false, 0));
+    ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.cursor == 0
+        && ctx->child.lftj.inputs[0].reader.acquire_stage == 1
+        && ctx->child.lftj.inputs[0].reader.owner
+        == &input->descriptor_access
+        && !ctx->child.lftj.inputs[0].reader.secondary_owner);
+
+    wl_columnar_source_access_writer_t storage_writer = { 0 };
+    CHECK(!wl_columnar_source_access_writer_acquire(&input->source_access,
+        &storage_writer));
+    for (unsigned retry = 0; retry < 2; ++retry) {
+        CHECK(!entry_turn(&f, false, 0));
+        ctx = entry_context(&f);
+        CHECK(ctx && ctx->child.lftj.cursor == 0
+            && ctx->child.lftj.inputs[0].reader.acquire_stage == 1
+            && ctx->child.lftj.inputs[0].reader.owner
+            == &input->descriptor_access
+            && !ctx->child.lftj.semantic_result);
+    }
+    CHECK(!wl_columnar_source_access_writer_release(&storage_writer));
+    for (unsigned retry = 0; retry < 16; ++retry) {
+        ctx = entry_context(&f);
+        if (ctx && ctx->child.lftj.cursor == 1)
+            break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.cursor == 1
+        && ctx->child.lftj.inputs[0].reader.acquire_stage == 0
+        && ctx->child.lftj.inputs[0].reader.owner == &input->source_access
+        && ctx->child.lftj.inputs[0].reader.secondary_owner
+        == &input->descriptor_access);
+
+    entry_complete(&f);
+    const col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(!f.reply.execution_result && f.reply.committed
+        && output && output->nrows == 3);
+    entry_assert_lftj_inputs_unchanged(&f, inputs, 3);
+    CHECK(atomic_load_explicit(&input->source_access.state,
+        memory_order_acquire) == 0
+        && atomic_load_explicit(&input->descriptor_access.state,
+        memory_order_acquire) == 0);
+    entry_destroy(&f);
+}
+
+static void
+test_entry_generated_lftj_partial_reader_acquire_abort(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    col_rel_t *input = session_find_rel(f.session, "input");
+    CHECK(input && entry_lftj_phase_reached(&f,
+        WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    for (unsigned retry = 0; retry < 16; ++retry) {
+        ctx = entry_context(&f);
+        if (ctx && ctx->child.lftj.inputs[0].reader.acquire_stage == 1)
+            break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    ctx = entry_context(&f);
+    CHECK(ctx && ctx->child.lftj.inputs[0].reader.acquire_stage == 1
+        && ctx->child.lftj.inputs[0].reader.owner
+        == &input->descriptor_access);
+    CHECK(!entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !f.reply.committed && !session_rel_hash_lookup(f.session, "output")
+        && atomic_load_explicit(&input->descriptor_access.state,
+        memory_order_acquire) == 0
+        && atomic_load_explicit(&input->source_access.state,
+        memory_order_acquire) == 0);
+    entry_assert_lftj_inputs_unchanged(&f, inputs, 3);
+    entry_destroy(&f);
+}
+
+static void
 test_entry_generated_lftj_abort_cleanup_retry(void)
 {
     static const char source[] =
@@ -6460,6 +6622,9 @@ main(void)
     test_entry_generated_lftj_oversized_source_rejected();
     test_entry_generated_lftj_widest_output_row();
     test_entry_generated_lftj_writer_end_retry();
+    test_entry_generated_lftj_successful_writer_end_retry();
+    test_entry_generated_lftj_resumable_reader_acquire();
+    test_entry_generated_lftj_partial_reader_acquire_abort();
     test_entry_generated_lftj_abort_cleanup_retry();
     test_entry_generated_lftj_stops_inside_child();
     test_entry_generated_filter_work_boundary();
