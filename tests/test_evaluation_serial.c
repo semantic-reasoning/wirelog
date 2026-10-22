@@ -5587,6 +5587,213 @@ test_entry_generated_lftj_float_nonleading_duplicate_keys(void)
 }
 
 static void
+test_entry_generated_lftj_bounded_source_resolution(void)
+{
+    enum { FILLER_COUNT = 16, INPUT_COUNT = 3 };
+    static const int64_t one[] = {7};
+    static const char prefix[] =
+        "shared_lftj_registry_name_prefix_for_bounded_resolution_";
+    char names[INPUT_COUNT][96];
+    char fillers[FILLER_COUNT][96];
+    char source[8192] = {0};
+    size_t used = 0;
+    int n = 0;
+    for (uint32_t i = 0; i < INPUT_COUNT; ++i) {
+        n = snprintf(names[i], sizeof(names[i]), "%sinput_%u", prefix, i);
+        CHECK(n > 0 && (size_t)n < sizeof(names[i]));
+        n = snprintf(source + used, sizeof(source) - used,
+                ".decl %s(k:int64)\n", names[i]);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used,
+            ".decl output(k:int64)\noutput(k) :- %s(k), %s(k), %s(k).\n",
+            names[0], names[1], names[2]);
+    CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+    used += (size_t)n;
+
+    entry_input_t inputs[INPUT_COUNT + FILLER_COUNT];
+    for (uint32_t i = 0; i < INPUT_COUNT; ++i)
+        inputs[i] = (entry_input_t){names[i], one, 1, 1};
+    for (uint32_t i = 0; i < FILLER_COUNT; ++i) {
+        n = snprintf(fillers[i], sizeof(fillers[i]), "%sunused_%02u", prefix,
+                i);
+        CHECK(n > 0 && (size_t)n < sizeof(fillers[i]));
+        n = snprintf(source + used, sizeof(source) - used,
+                ".decl %s(k:int64)\n", fillers[i]);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+        inputs[INPUT_COUNT + i] = (entry_input_t){fillers[i], one, 1, 1};
+    }
+
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, INPUT_COUNT + FILLER_COUNT, 0);
+    bool has_lftj = false;
+    for (uint32_t i = 0; i < f.relation->op_count; ++i)
+        has_lftj |= f.relation->ops[i].op == WL_PLAN_OP_LFTJ;
+    CHECK(has_lftj);
+    /* Resolution must leave the normal registry hash untouched while it
+     * scans long shared prefixes in the captured relation array. */
+    CHECK(f.session->rel_hash_head && f.session->rel_hash_next);
+    void *hash_head = f.session->rel_hash_head;
+    void *hash_next = f.session->rel_hash_next;
+
+    bool partial_lookup = false;
+    for (unsigned turns = 0; turns < 200000; ++turns) {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+        if (ctx && ctx->child.lftj.identity == &ctx->child.lftj
+            && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE
+            && ctx->child.lftj.inputs
+            && (ctx->child.lftj.inputs[0].lookup_slot
+            || ctx->child.lftj.inputs[0].lookup_name_byte)) {
+            wl_columnar_lftj_attempt_t *attempt = &ctx->child.lftj;
+            CHECK(attempt->inputs[0].lookup_slot == 0);
+            CHECK(attempt->inputs[0].lookup_name_byte > 0);
+            CHECK(attempt->input_count == 0);
+            CHECK(f.session->rel_hash_head == hash_head
+                && f.session->rel_hash_next == hash_next);
+            for (uint32_t i = 0; i < INPUT_COUNT + FILLER_COUNT; ++i)
+                CHECK(atomic_load_explicit(
+                        &f.session->rels[i]->source_access.state,
+                        memory_order_acquire) == 0);
+            partial_lookup = true;
+            break;
+        }
+        CHECK(f.reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL);
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(partial_lookup);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    const col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(output && output->nrows == 1 && output->ncols == 1
+        && output->columns[0][0] == 7);
+    entry_destroy(&f);
+}
+
+static void
+test_entry_generated_lftj_empty_sources(void)
+{
+    static const char source[] =
+        ".decl input(k:int64)\n.decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\n"
+        "output(k) :- input(k), a(k), b(k).\n";
+    static const int64_t one[] = {7};
+    for (uint32_t empty = 0; empty < 3; ++empty) {
+        entry_input_t inputs[] = {
+            {"input", one, 1, 1}, {"a", one, 1, 1}, {"b", one, 1, 1}
+        };
+        inputs[empty].rows = NULL;
+        inputs[empty].count = 0;
+        entry_fixture_t f;
+        entry_init_inputs(&f, source, inputs, 3, 0);
+        col_rel_t *empty_relation = col_rel_new_auto(inputs[empty].name, 1);
+        CHECK(empty_relation && !session_add_rel(f.session, empty_relation));
+        entry_complete(&f);
+        CHECK(!f.reply.execution_result && f.reply.committed);
+        const col_rel_t *output = session_rel_hash_lookup(f.session,
+                "output");
+        CHECK(output && output->ncols == 1 && output->nrows == 0);
+        entry_destroy(&f);
+    }
+}
+
+static void
+test_entry_generated_lftj_duplicate_names_rejected(void)
+{
+    static const char source[] =
+        ".decl input(k:int64)\n.decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\n"
+        "output(k) :- input(k), a(k), b(k).\n";
+    static const int64_t rows[] = {7};
+    static const int64_t different_rows[] = {99};
+    const entry_input_t inputs[] = {
+        {"input", rows, 1, 1}, {"a", rows, 1, 1}, {"b", rows, 1, 1}
+    };
+    for (unsigned cached_hash = 0; cached_hash < 2; ++cached_hash) {
+        for (unsigned duplicate_later_input = 0;
+            duplicate_later_input < 2; ++duplicate_later_input) {
+            uint32_t duplicate_slot = duplicate_later_input ? 2u : 0u;
+            entry_fixture_t f;
+            entry_init_inputs(&f, source, inputs, 3, 0);
+            CHECK(f.session->nrels < f.session->rel_cap);
+            col_rel_t *duplicate = col_rel_new_like(
+                inputs[duplicate_slot].name, f.session->rels[duplicate_slot]);
+            bool denied = false;
+            CHECK(duplicate && !col_rel_append_rows_atomic(duplicate,
+                different_rows, 1, 1, &denied) && !denied);
+            uint32_t original_count = f.session->nrels;
+            f.session->rels[f.session->nrels++] = duplicate;
+            if (cached_hash)
+                CHECK(!session_rel_build_hash(f.session));
+            else
+                session_rel_free_hash(f.session);
+
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(!wl_columnar_source_access_writer_acquire(
+                    &f.session->rels[0]->source_access, &writer));
+            entry_complete(&f);
+            CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed);
+            CHECK(atomic_load_explicit(&f.session->rels[0]->source_access.state,
+                memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+            bool output_present = false;
+            for (uint32_t i = 0; i < f.session->nrels; ++i)
+                output_present |= f.session->rels[i]
+                    && !strcmp(f.session->rels[i]->name, "output");
+            CHECK(!output_present);
+            CHECK(!wl_columnar_source_access_writer_release(&writer));
+
+            f.session->rels[original_count] = NULL;
+            f.session->nrels = original_count;
+            col_rel_destroy(duplicate);
+            if (cached_hash) {
+                session_rel_free_hash(f.session);
+                CHECK(!session_rel_build_hash(f.session));
+            } else {
+                CHECK(!f.session->rel_hash_head && !f.session->rel_hash_next);
+            }
+            entry_destroy(&f);
+        }
+    }
+}
+
+static void
+test_entry_generated_lftj_oversized_source_rejected(void)
+{
+    static const char source[] =
+        ".decl input(k:int64)\n.decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\n"
+        "output(k) :- input(k), a(k), b(k).\n";
+    static const int64_t one[] = {7};
+    entry_fixture_t f;
+    entry_init(&f, source, one, 1, 1, 0);
+    col_rel_t *wide = col_rel_new_auto("input",
+            WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 1u);
+    CHECK(wide);
+    uint32_t input_slot = f.session->nrels;
+    for (uint32_t i = 0; i < f.session->nrels; ++i)
+        if (!strcmp(f.session->rels[i]->name, "input")) {
+            input_slot = i;
+            break;
+        }
+    CHECK(input_slot < f.session->nrels);
+    col_rel_t *old = f.session->rels[input_slot];
+    f.session->rels[input_slot] = wide;
+    col_rel_destroy(old);
+
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed);
+    CHECK(atomic_load_explicit(&wide->source_access.state,
+        memory_order_acquire) == 0);
+    bool output_present = false;
+    for (uint32_t i = 0; i < f.session->nrels; ++i)
+        output_present |= f.session->rels[i]
+            && !strcmp(f.session->rels[i]->name, "output");
+    CHECK(!output_present);
+    entry_destroy(&f);
+}
+
+static void
 test_entry_generated_lftj_widest_output_row(void)
 {
     enum { INPUT_COUNT = 8, INPUT_WIDTH = 8, OUTPUT_WIDTH = 64 };
@@ -6083,6 +6290,10 @@ main(void)
     test_entry_retained_publication(); test_entry_reverse();
     test_entry_authority(); test_entry_generated_lftj();
     test_entry_generated_lftj_float_nonleading_duplicate_keys();
+    test_entry_generated_lftj_bounded_source_resolution();
+    test_entry_generated_lftj_empty_sources();
+    test_entry_generated_lftj_duplicate_names_rejected();
+    test_entry_generated_lftj_oversized_source_rejected();
     test_entry_generated_lftj_widest_output_row();
     test_entry_generated_lftj_abort_cleanup_retry();
     test_entry_generated_lftj_stops_inside_child();
