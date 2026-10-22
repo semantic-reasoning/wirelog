@@ -806,16 +806,24 @@ typedef enum wl_columnar_merge_incremental_delta_phase {
 typedef struct wl_columnar_merge_incremental_delta_attempt {
     uintptr_t identity;
     col_rel_mutable_image_t transaction;
+    const col_rel_t *candidate;
+    wl_columnar_source_access_reader_t candidate_reader;
     col_rel_t *delta;
     wl_evaluation_control_t *control;
     uint64_t control_attempt_id;
     col_relation_snapshot_t source_snapshot;
+    col_relation_snapshot_t candidate_snapshot;
     uint32_t old_nrows;
     uint32_t source_nrows;
+    uint32_t candidate_nrows;
+    uint32_t input_nrows;
     uint32_t run_count;
     uint32_t run_ends[COL_MAX_RUNS];
     wl_columnar_merge_incremental_delta_phase_t phase;
     bool no_op;
+    bool external_candidate;
+    bool candidate_reader_held;
+    bool candidate_first;
     uint32_t dedup_copy_cursor, dedup_copy_count, dedup_copy_occupied;
     uint32_t copy_row, copy_column;
     uint32_t max_old_row, fast_scan_row;
@@ -851,6 +859,17 @@ int wl_columnar_relation_mutable_image_prepare_empty(col_rel_t *source,
 
 int wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
     uint32_t old_nrows, wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    wl_evaluation_control_t *control);
+/* Merge separately staged positive-arity INT64 tuples without modifying
+ * candidate. The source must be a canonical sorted relation; candidate may
+ * be unsorted. Zero-column, timestamped, and compound relations are unsupported.
+ * On commit, source becomes set(source U candidate) and delta is
+ * set(candidate) - set(source). Inputs are held stable through commit/abort.
+ * EAGAIN from advance is a same-control-attempt slice; terminal stops discard
+ * the attempt, so a retry begins fresh from unchanged inputs. */
+int wl_columnar_merge_incremental_delta_attempt_begin_candidate(
+    col_rel_t *source, const col_rel_t *candidate,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt,
     wl_evaluation_control_t *control);
 int wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
     wl_columnar_merge_incremental_delta_attempt_t *attempt,
