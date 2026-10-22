@@ -1747,6 +1747,151 @@ test_controlled_session_step_resume(void)
     wirelog_program_free(program);
 }
 
+static bool controlled_session_join_stop;
+static unsigned controlled_session_join_stop_phase;
+static uint64_t controlled_session_join_phase17_hits;
+static uint64_t controlled_session_join_cancel_after;
+
+static void
+controlled_session_join_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)progress;
+    if (phase == 17)
+        ++controlled_session_join_phase17_hits;
+    if (!controlled_session_join_stop && phase == 17
+        && controlled_session_join_phase17_hits
+        == controlled_session_join_cancel_after){
+        controlled_session_join_stop = true;
+        controlled_session_join_stop_phase = phase;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+test_controlled_session_join_step(void)
+{
+    static const char product[] =
+        ".decl left(x:int64)\n"
+        ".decl right(y:int64)\n"
+        ".decl output(x:int64,y:int64)\n"
+        "output(x,y) :- left(x), right(y).\n";
+    static const char keyed_rejected[] =
+        ".decl left(k:int64,x:int64)\n"
+        ".decl right(k:int64,y:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- left(k,x), right(k,y), y < 0.\n";
+    enum { LEFT_COUNT = 64, RIGHT_COUNT = 513 };
+    int64_t product_left[LEFT_COUNT];
+    int64_t product_right[RIGHT_COUNT];
+    int64_t keyed_left[LEFT_COUNT * 2];
+    int64_t keyed_right[RIGHT_COUNT * 2];
+    const char *sources[] = { product, keyed_rejected };
+    const int64_t *left_rows[] = { product_left, keyed_left };
+    const int64_t *right_rows[] = { product_right, keyed_right };
+    const uint32_t left_width[] = { 1, 2 };
+    const uint32_t right_width[] = { 1, 2 };
+    const uint32_t left_count[] = { LEFT_COUNT, LEFT_COUNT };
+    const uint32_t right_count[] = { RIGHT_COUNT, RIGHT_COUNT };
+
+    for (uint32_t i = 0; i < LEFT_COUNT; ++i) {
+        product_left[i] = (int64_t)i + 1;
+        keyed_left[i * 2] = 1;
+        keyed_left[i * 2 + 1] = (int64_t)i + 1;
+    }
+    for (uint32_t i = 0; i < RIGHT_COUNT; ++i) {
+        product_right[i] = (int64_t)i + 1;
+        keyed_right[i * 2] = 1;
+        keyed_right[i * 2 + 1] = (int64_t)i + 1;
+    }
+
+    for (unsigned fixture = 0; fixture < 2; ++fixture) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(sources[fixture],
+                &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        bool has_join = false;
+        for (uint32_t si = 0; si < plan->stratum_count; ++si)
+            for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri)
+                for (uint32_t oi = 0;
+                    oi < plan->strata[si].relations[ri].op_count; ++oi)
+                    has_join |= plan->strata[si].relations[ri].ops[oi].op
+                        == WL_PLAN_OP_JOIN;
+        CHECK(has_join);
+
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        CHECK(!wl_session_insert(session, "left", left_rows[fixture],
+            left_count[fixture], left_width[fixture]));
+        CHECK(!wl_session_insert(session, "right", right_rows[fixture],
+            right_count[fixture], right_width[fixture]));
+        controlled_session_join_stop = false;
+        controlled_session_join_stop_phase = 0;
+        controlled_session_join_phase17_hits = 0;
+        controlled_session_join_cancel_after = 128;
+        wl_columnar_join_test_attempt_checkpoint =
+            controlled_session_join_checkpoint;
+        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_columnar_join_test_attempt_checkpoint = NULL;
+        CHECK(controlled_session_join_stop
+            && controlled_session_join_stop_phase == 17);
+        CHECK(controlled_session_join_phase17_hits == 128);
+        CHECK(!session_find_rel((wl_col_session_t *)session, "output"));
+        wl_evaluation_control_report_t stopped;
+        CHECK(!wl_evaluation_control_report(control, &stopped)
+            && stopped.result == WL_EVALUATION_CONTROL_CANCELLED
+            && stopped.consumed > 0);
+        uint64_t allowance = stopped.consumed;
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, allowance - 1));
+        controlled_session_join_stop = false;
+        controlled_session_join_phase17_hits = 0;
+        controlled_session_join_cancel_after = UINT64_MAX;
+        wl_columnar_join_test_attempt_checkpoint =
+            controlled_session_join_checkpoint;
+        CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_columnar_join_test_attempt_checkpoint = NULL;
+        CHECK(controlled_session_join_phase17_hits == 127);
+        CHECK(!session_find_rel((wl_col_session_t *)session, "output"));
+        wl_evaluation_control_report_t limited;
+        CHECK(!wl_evaluation_control_report(control, &limited)
+            && limited.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && limited.consumed > 0);
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!wl_session_step(session));
+        const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
+                "output");
+        CHECK(output && output->ncols == (fixture == 0 ? 2 : 1));
+        if (fixture == 0) {
+            CHECK(output->nrows == LEFT_COUNT * RIGHT_COUNT);
+            for (uint32_t i = 0; i < output->nrows; ++i) {
+                CHECK(output->columns[0][i]
+                    == (int64_t)(i / RIGHT_COUNT) + 1);
+                CHECK(output->columns[1][i]
+                    == (int64_t)(i % RIGHT_COUNT) + 1);
+            }
+        } else {
+            CHECK(output->nrows == 0);
+        }
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.result == 0 && report.consumed > 0);
+        wl_session_destroy(session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
 static void
 test_controlled_session_step_prefix_resume(void)
 {
@@ -5195,6 +5340,7 @@ int
 main(void)
 {
     test_controlled_session_step_resume();
+    test_controlled_session_join_step();
     test_controlled_session_step_prefix_resume();
     test_controlled_session_step_destroy_drain();
     test_controlled_session_snapshot_publication();
