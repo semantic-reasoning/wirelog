@@ -9622,6 +9622,588 @@ done:
     return rc;
 }
 
+/* The private-growth attempt deliberately supports a narrow, auditable shape:
+ * two distinct self-owned INT64 heap relations with no auxiliary payload. */
+static bool
+wl_columnar_relation_append_growth_thread_equal(
+    const wl_columnar_relation_append_growth_attempt_t *a)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return a->thread_valid && thrd_equal(a->owner_thread, thrd_current());
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->thread_valid && a->owner_thread == GetCurrentThreadId();
+#else
+    return a->thread_valid && pthread_equal(a->owner_thread, pthread_self());
+#endif
+}
+
+static int
+wl_columnar_relation_append_growth_charge(
+    wl_columnar_relation_append_growth_attempt_t *a, uint64_t work)
+{
+    return wl_evaluation_control_charge_attempt(a->control,
+               a->active_attempt_id, work);
+}
+
+static int
+wl_columnar_relation_append_growth_tail(
+    wl_columnar_relation_append_growth_attempt_t *a, uint64_t work)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_work_checkpoint)
+        wl_columnar_relation_test_work_checkpoint(a->control, work);
+#else
+    (void)work;
+#endif
+    return wl_evaluation_control_charge_attempt(a->control,
+               a->active_attempt_id, 0);
+}
+
+static int
+wl_columnar_relation_append_growth_abort_to(
+    wl_columnar_relation_append_growth_attempt_t *a, int result)
+{
+    if (!a->result)
+        a->result = result ? result : ECANCELED;
+    if (a->published)
+        return EINVAL;
+    if (a->commit.identity
+        && (a->commit.phase == WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CLAIMED
+        || a->commit.phase ==
+        WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_READY)) {
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_COMMIT;
+        return EAGAIN;
+    }
+    if (a->phase < WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE)
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE;
+    return EAGAIN;
+}
+
+int
+wl_columnar_relation_append_growth_attempt_begin(
+    wl_columnar_relation_append_growth_attempt_t *a, col_rel_t *dst,
+    const col_rel_t *src, uint32_t first, uint32_t count,
+    wl_evaluation_control_t *control)
+{
+    wl_columnar_source_access_gate_t *descriptors[2];
+    wl_columnar_source_access_gate_t *storage[2];
+    wl_columnar_source_access_gate_t *gates[4];
+    wl_columnar_source_access_gate_mode_t modes[4];
+    uint64_t active;
+    if (!a || !dst || !src || !control || a->identity || a->phase
+        || a->destination || a->source || dst == src)
+        return EINVAL;
+    active = wl_evaluation_control_active_attempt_id(control);
+    if (!active)
+        return EINVAL;
+    a->identity = a;
+    a->destination = dst;
+    a->source = src;
+    a->control = control;
+    a->active_attempt_id = active;
+#if defined(WL_HAVE_C11_THREADS)
+    a->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->owner_thread = GetCurrentThreadId();
+#else
+    a->owner_thread = pthread_self();
+#endif
+    a->thread_valid = true;
+    a->source_first = first;
+    a->source_count = count;
+    descriptors[0] = &dst->descriptor_access;
+    descriptors[1] =
+        (wl_columnar_source_access_gate_t *)&src->descriptor_access;
+    storage[0] = &dst->source_access;
+    storage[1] = (wl_columnar_source_access_gate_t *)&src->source_access;
+    for (size_t i = 0; i < 2; i++)
+        for (size_t j = i + 1; j < 2; j++)
+            if ((uintptr_t)descriptors[j] < (uintptr_t)descriptors[i]) {
+                wl_columnar_source_access_gate_t *tmp = descriptors[i];
+                descriptors[i] = descriptors[j];
+                descriptors[j] = tmp;
+            }
+    for (size_t i = 0; i < 2; i++)
+        for (size_t j = i + 1; j < 2; j++)
+            if ((uintptr_t)storage[j] < (uintptr_t)storage[i]) {
+                wl_columnar_source_access_gate_t *tmp = storage[i];
+                storage[i] = storage[j];
+                storage[j] = tmp;
+            }
+    gates[0] = descriptors[0];
+    gates[1] = descriptors[1];
+    gates[2] = storage[0];
+    gates[3] = storage[1];
+    for (size_t i = 0; i < 4; i++)
+        modes[i] = (gates[i] == &dst->descriptor_access
+            || gates[i] == &dst->source_access)
+            ? WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+            : WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER;
+    int rc = wl_columnar_source_access_gate_set_attempt_begin(&a->gates,
+            gates, modes, 4, 2);
+    if (rc != 0) {
+        memset(a, 0, sizeof(*a));
+        return rc;
+    }
+    a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ACQUIRE;
+    return 0;
+}
+
+int
+wl_columnar_relation_append_growth_attempt_advance(
+    wl_columnar_relation_append_growth_attempt_t *a)
+{
+    if (!a || a->identity != a ||
+        !wl_columnar_relation_append_growth_thread_equal(a)
+        || !a->control || !a->destination || !a->source)
+        return EINVAL;
+    if (a->phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_DONE)
+        return a->terminal_result;
+    if (a->phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_READY)
+        return 0;
+    int rc;
+    if (!a->published
+        && a->phase < WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE) {
+        rc = wl_columnar_relation_append_growth_charge(a, 0);
+        if (rc != 0)
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+    }
+    switch (a->phase) {
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ACQUIRE:
+    {
+        int gate_rc;
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        gate_rc = wl_columnar_source_access_gate_set_attempt_advance(&a->gates);
+        if (gate_rc && gate_rc != EAGAIN)
+            return wl_columnar_relation_append_growth_abort_to(a, gate_rc);
+        rc = wl_columnar_relation_append_growth_tail(a, 1);
+        if (rc != 0)
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+        if (!gate_rc) a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_VALIDATE;
+        return EAGAIN;
+    }
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_VALIDATE: {
+        col_rel_t *d = a->destination;
+        const col_rel_t *s = a->source;
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        if (d->storage_owner != d || s->storage_owner != s
+            || d->col_shared || s->col_shared || d->arena_owned ||
+            s->arena_owned || d->pool_owned || s->pool_owned
+            || d->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || s->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || d->compound_count || s->compound_count || d->compound_arity_map
+            || s->compound_arity_map || d->compound_arity_len ||
+            s->compound_arity_len
+            || d->timestamps || s->timestamps || d->merge_columns
+            || s->merge_columns || d->retract_backup_columns
+            || s->retract_backup_columns || d->row_scratch || s->row_scratch
+            || d->timestamp_capacity || s->timestamp_capacity
+            || d->merge_buf_cap || s->merge_buf_cap
+            || d->retract_backup_capacity || s->retract_backup_capacity
+            || d->retract_backup_timestamp_capacity
+            || s->retract_backup_timestamp_capacity
+            || d->retract_backup_nrows || s->retract_backup_nrows
+            || !d->ncols || d->ncols != s->ncols || !d->columns || !s->columns
+            || d->nrows > d->capacity || s->nrows > s->capacity
+            || a->source_first > s->nrows
+            || a->source_count > s->nrows - a->source_first
+            || a->source_count > UINT32_MAX - d->nrows
+            || d->capacity >= UINT32_MAX
+            || !wl_columnar_relation_generation_valid(d->relation_identity)
+            || !wl_columnar_relation_generation_valid(d->view_generation)
+            || !wl_columnar_relation_generation_valid(d->storage_generation)
+            || !wl_columnar_relation_generation_valid(s->relation_identity)
+            || !wl_columnar_relation_generation_valid(s->view_generation)
+            || !wl_columnar_relation_generation_valid(s->storage_generation)
+            || d->view_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+            || d->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u
+            || d->storage_owner_identity != d->relation_identity
+            || s->storage_owner_identity != s->relation_identity
+            || d->storage_owner_generation != d->storage_generation
+            || s->storage_owner_generation != s->storage_generation
+            || col_rel_storage_alias_borrow_count(d))
+            return wl_columnar_relation_append_growth_abort_to(a, ENOTSUP);
+        if (!a->source_count)
+            return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
+        a->ncols = d->ncols;
+        a->destination_rows = d->nrows;
+        a->destination_capacity = d->capacity;
+        a->source_rows = s->nrows;
+        a->source_capacity = s->capacity;
+        a->required_rows = d->nrows + a->source_count;
+        a->new_capacity = d->capacity ? d->capacity : COL_REL_INIT_CAP;
+        a->destination_relation_identity = d->relation_identity;
+        a->destination_view_generation = d->view_generation;
+        a->destination_storage_generation = d->storage_generation;
+        a->destination_owner_generation = d->storage_owner_generation;
+        a->source_relation_identity = s->relation_identity;
+        a->source_view_generation = s->view_generation;
+        a->source_storage_generation = s->storage_generation;
+        a->source_owner_generation = s->storage_owner_generation;
+        if (a->required_rows <= d->capacity)
+            return wl_columnar_relation_append_growth_abort_to(a, ENOTSUP);
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_CAPACITY;
+        return EAGAIN;
+    }
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_CAPACITY:
+        if (a->new_capacity >= a->required_rows) {
+            a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_TYPES;
+            a->lane_cursor = 0;
+            return EAGAIN;
+        }
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        if (a->new_capacity > UINT32_MAX / 2u)
+            return wl_columnar_relation_append_growth_abort_to(a, EOVERFLOW);
+        a->new_capacity *= 2u;
+        rc = wl_columnar_relation_append_growth_tail(a, 1);
+        return rc ? wl_columnar_relation_append_growth_abort_to(a, rc) : EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_TYPES:
+        if (a->lane_cursor == a->ncols) {
+            uint64_t grid;
+            if (!col_rel_payload_grid_bytes(a->ncols, a->ncols,
+                a->new_capacity, true, &grid) || grid > SIZE_MAX)
+                return wl_columnar_relation_append_growth_abort_to(a,
+                           EOVERFLOW);
+            a->incoming_bytes = grid;
+            uint64_t old_exact;
+            if (!col_rel_retained_live_bytes(a->destination, &old_exact))
+                return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
+            a->old_reserved_bytes = a->destination->retained_reserved_bytes;
+            if (a->destination->memory_governor
+                && (a->old_reserved_bytes != old_exact
+                || !a->old_reserved_bytes))
+                return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
+            a->destination_ledger_before =
+                col_rel_owned_ledger_bytes(a->destination);
+            a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ADMIT;
+            return EAGAIN;
+        }
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        if (a->destination->column_types
+            && a->destination->column_types[a->lane_cursor] !=
+            WIRELOG_TYPE_INT64)
+            return wl_columnar_relation_append_growth_abort_to(a, ENOTSUP);
+        if (a->source->column_types
+            && a->source->column_types[a->lane_cursor] != WIRELOG_TYPE_INT64)
+            return wl_columnar_relation_append_growth_abort_to(a, ENOTSUP);
+        if (!a->destination->columns[a->lane_cursor]
+            || !a->source->columns[a->lane_cursor])
+            return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
+        a->lane_cursor++;
+        rc = wl_columnar_relation_append_growth_tail(a, 1);
+        return rc ? wl_columnar_relation_append_growth_abort_to(a, rc) : EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ADMIT:
+        if (a->destination->memory_governor && !a->growth_active) {
+            wl_columnar_memory_admission_status_t status;
+            a->destination->memory_budget_denial_pending = false;
+            rc = wl_columnar_memory_governor_begin_growth_attempt_controlled(
+                &a->destination->retained_reservation, a->incoming_bytes,
+                &status, a->control, a->active_attempt_id);
+            if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a,
+                           rc);
+            if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+                    a->destination->memory_budget_denial_pending = true;
+                    return wl_columnar_relation_append_growth_abort_to(a,
+                               ENOMEM);
+                }
+                return wl_columnar_relation_append_growth_abort_to(a,
+                           status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EINVAL);
+            }
+            a->growth_active = true;
+        }
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_TABLE;
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_TABLE:
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        size_t table_bytes;
+        if (!wl_columnar_memory_size_mul(a->ncols,
+            sizeof(*a->replacement_columns), &table_bytes))
+            return wl_columnar_relation_append_growth_abort_to(a, EOVERFLOW);
+        a->replacement_columns = wl_columnar_relation_growth_malloc(
+            table_bytes);
+        if (!a->replacement_columns)
+            return wl_columnar_relation_append_growth_abort_to(a, ENOMEM);
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_LANES;
+        rc = wl_columnar_relation_append_growth_tail(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_LANES:
+        if (a->allocated_lanes == a->ncols) {
+            a->lane_cursor = 0;
+            a->row_cursor = 0;
+            a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_DESTINATION;
+            return EAGAIN;
+        }
+        rc = wl_columnar_relation_append_growth_charge(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        a->replacement_columns[a->allocated_lanes] =
+            wl_columnar_relation_growth_malloc((size_t)a->new_capacity *
+                sizeof(int64_t));
+        if (!a->replacement_columns[a->allocated_lanes])
+            return wl_columnar_relation_append_growth_abort_to(a, ENOMEM);
+        a->allocated_lanes++;
+        rc = wl_columnar_relation_append_growth_tail(a, 1);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_DESTINATION:
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE: {
+        bool source = a->phase ==
+            WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE;
+        uint32_t rows = source ? a->source_count : a->destination_rows;
+        if (a->lane_cursor == a->ncols) {
+            if (!source) {
+                a->lane_cursor = 0; a->row_cursor = 0;
+                a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE;
+                return EAGAIN;
+            }
+            a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_READY;
+            return 0;
+        }
+        if (a->row_cursor == rows) {
+            a->lane_cursor++; a->row_cursor = 0;
+            return EAGAIN;
+        }
+        uint32_t n = rows - a->row_cursor;
+        if (n > WL_EVALUATION_CONTROL_QUANTUM)
+            n = WL_EVALUATION_CONTROL_QUANTUM;
+        rc = wl_columnar_relation_append_growth_charge(a, n);
+        if (rc != 0) return wl_columnar_relation_append_growth_abort_to(a, rc);
+        const int64_t *from = source
+            ? a->source->columns[a->lane_cursor] + a->source_first +
+            a->row_cursor
+            : a->destination->columns[a->lane_cursor] + a->row_cursor;
+        uint32_t to = source ? a->destination_rows +
+            a->row_cursor : a->row_cursor;
+        memcpy(a->replacement_columns[a->lane_cursor] + to, from,
+            (size_t)n * sizeof(int64_t));
+        a->row_cursor += n;
+        rc = wl_columnar_relation_append_growth_tail(a, n);
+        return rc ? wl_columnar_relation_append_growth_abort_to(a, rc) : EAGAIN;
+    }
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_COMMIT_PUBLISH:
+        return EINVAL; /* Commit is an explicit API boundary from READY. */
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD:
+        if (a->lane_cursor < a->ncols) {
+            free(a->retired_columns[a->lane_cursor++]);
+            return EAGAIN;
+        }
+        free(a->retired_columns);
+        a->retired_columns = NULL;
+        wl_columnar_relation_ledger_reconcile_known(a->destination,
+            a->destination_ledger_before,
+            col_rel_owned_ledger_bytes(a->destination));
+        if (a->destination->memory_governor) {
+            uint64_t target;
+            if (!col_rel_retained_live_bytes(a->destination, &target)) {
+                a->cleanup_result = EINVAL;
+                return EAGAIN;
+            }
+            if (target == a->destination->retained_reserved_bytes) {
+                a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE;
+                return EAGAIN;
+            }
+            rc = wl_columnar_memory_downsize_attempt_begin(
+                &a->destination->retained_reservation, a->destination, target,
+                &a->downsize);
+            if (rc != 0) {
+                a->cleanup_result = rc; return EAGAIN;
+            }
+            a->target_bytes = target;
+            a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_DOWNSIZE;
+            return EAGAIN;
+        }
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE;
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_DOWNSIZE:
+        rc = wl_columnar_memory_downsize_attempt_advance(&a->downsize);
+        if (rc == EAGAIN) return EAGAIN;
+        if (rc != 0) {
+            a->cleanup_result = rc;
+            return rc; /* Keep the receipt and gates reachable for diagnosis. */
+        }
+        a->destination->retained_reserved_bytes = a->target_bytes;
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE;
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE:
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_RELEASE:
+        if (a->gates.phase != WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_RELEASE
+            && a->gates.phase != WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE) {
+            rc = wl_columnar_source_access_gate_set_attempt_release(&a->gates);
+            if (rc != 0) {
+                a->cleanup_result = rc; return EAGAIN;
+            }
+        }
+        rc = wl_columnar_source_access_gate_set_attempt_advance(&a->gates);
+        if (rc == EAGAIN) return EAGAIN;
+        if (rc != 0) {
+            a->cleanup_result = rc; return EAGAIN;
+        }
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_DONE;
+        if (a->published) {
+            a->terminal_result = a->cleanup_result;
+            return a->terminal_result;
+        }
+        a->terminal_result = a->result ? a->result : a->cleanup_result;
+        return a->terminal_result;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE:
+        if (a->allocated_lanes) {
+            free(a->replacement_columns[--a->allocated_lanes]);
+            return EAGAIN;
+        }
+        free(a->replacement_columns);
+        a->replacement_columns = NULL;
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND;
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_COMMIT:
+        rc = wl_columnar_memory_governor_growth_commit_cancel(&a->commit);
+        if (rc != 0) {
+            a->cleanup_result = rc;
+            return rc;
+        }
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE;
+        return EAGAIN;
+    case WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND:
+        if (a->growth_active) {
+            if (!a->refund.identity) {
+                rc = wl_columnar_memory_growth_refund_attempt_begin(
+                    &a->destination->retained_reservation, a->destination,
+                    &a->refund);
+                if (rc != 0) {
+                    a->cleanup_result = rc;
+                    return rc;
+                }
+            }
+            rc = wl_columnar_memory_growth_refund_attempt_advance(&a->refund);
+            if (rc == EAGAIN) return EAGAIN;
+            if (rc != 0) {
+                a->cleanup_result = rc;
+                return rc;
+            }
+            a->growth_active = false;
+        }
+        a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_RELEASE;
+        return EAGAIN;
+    default:
+        return EINVAL;
+    }
+}
+
+int
+wl_columnar_relation_append_growth_attempt_commit(
+    wl_columnar_relation_append_growth_attempt_t *a)
+{
+    if (!a || a->identity != a ||
+        !wl_columnar_relation_append_growth_thread_equal(a)
+        || a->phase != WL_COLUMNAR_RELATION_APPEND_GROWTH_READY
+        || !a->control || !a->destination || !a->source)
+        return EINVAL;
+    int rc = wl_columnar_relation_append_growth_charge(a, 0);
+    if (rc != 0)
+        return wl_columnar_relation_append_growth_abort_to(a, rc);
+    col_rel_t *d = a->destination;
+    const col_rel_t *s = a->source;
+    if (d->relation_identity != a->destination_relation_identity
+        || d->view_generation != a->destination_view_generation
+        || d->storage_generation != a->destination_storage_generation
+        || d->storage_owner_generation != a->destination_owner_generation
+        || d->nrows != a->destination_rows
+        || d->capacity != a->destination_capacity
+        || s->relation_identity != a->source_relation_identity
+        || s->view_generation != a->source_view_generation
+        || s->storage_generation != a->source_storage_generation
+        || s->storage_owner_generation != a->source_owner_generation
+        || s->nrows != a->source_rows || s->capacity != a->source_capacity)
+        return wl_columnar_relation_append_growth_abort_to(a, EBUSY);
+
+    if (a->growth_active) {
+        bool ready = false;
+        rc =
+            wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled
+            (
+            &d->retained_reservation,
+            wl_columnar_memory_governor_ref_get(d->memory_governor), d,
+            &a->commit, &ready, a->control, a->active_attempt_id);
+        if (rc != 0)
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+        if (!ready)
+            return wl_columnar_relation_append_growth_abort_to(a, ENOMEM);
+        rc = wl_columnar_relation_append_growth_charge(a, 0);
+        if (rc != 0) {
+            int cancel = wl_columnar_memory_governor_growth_commit_cancel(
+                &a->commit);
+            if (cancel != 0) {
+                a->cleanup_result = cancel;
+                return cancel;
+            }
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+        }
+        rc = wl_columnar_memory_governor_growth_commit_finish(&a->commit);
+        if (rc != 0) {
+            int cancel = wl_columnar_memory_governor_growth_commit_cancel(
+                &a->commit);
+            if (cancel != 0) {
+                a->cleanup_result = cancel;
+                return cancel;
+            }
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+        }
+        d->retained_reserved_bytes += a->incoming_bytes;
+        a->growth_active = false;
+    } else {
+        rc = wl_columnar_relation_append_growth_charge(a, 0);
+        if (rc != 0)
+            return wl_columnar_relation_append_growth_abort_to(a, rc);
+    }
+
+    /* The final attempt-bound cutoff precedes this no-fail publication. */
+    a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_COMMIT_PUBLISH;
+    a->retired_columns = d->columns;
+    d->columns = a->replacement_columns;
+    a->replacement_columns = NULL;
+    d->capacity = a->new_capacity;
+    d->nrows = a->required_rows;
+    wl_columnar_relation_touch_storage(d);
+    wl_columnar_relation_touch_view(d);
+    a->published = true;
+    a->lane_cursor = 0;
+    a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD;
+    return EAGAIN;
+}
+
+bool
+wl_columnar_relation_append_growth_attempt_ready(
+    const wl_columnar_relation_append_growth_attempt_t *a)
+{
+    return a && a->identity == a
+           && a->phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_READY;
+}
+
+int
+wl_columnar_relation_append_growth_attempt_abort(
+    wl_columnar_relation_append_growth_attempt_t *a, int result)
+{
+    if (!a || a->identity != a ||
+        !wl_columnar_relation_append_growth_thread_equal(a)
+        || a->published || a->phase == WL_COLUMNAR_RELATION_APPEND_GROWTH_DONE)
+        return EINVAL;
+    return wl_columnar_relation_append_growth_abort_to(a, result);
+}
+
+bool
+wl_columnar_relation_append_growth_attempt_published(
+    const wl_columnar_relation_append_growth_attempt_t *a)
+{
+    return a && a->identity == a && a->published;
+}
+
 /* Timestamp padding is unspecified; initialize the five observable fields. */
 static int
 wl_columnar_relation_zero_timestamp_tail_controlled(

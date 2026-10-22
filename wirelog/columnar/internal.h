@@ -3686,6 +3686,105 @@ int
 wl_columnar_relation_append_all_controlled(col_rel_t *dst,
     const col_rel_t *src, wl_arena_t *arena,
     wl_evaluation_control_t *control);
+
+/* Resumable private INT64 append growth. The zero-initialized attempt and both
+ * descriptors remain at stable addresses, alive, and on the creating thread
+ * through DONE. The caller keeps the control's active attempt alive and does
+ * not mutate either relation outside its gates. Before publication, stop or
+ * abort preserves the destination image. After publication, advance must
+ * continue until DONE so old storage is retired and governed credit is
+ * reduced; `published` distinguishes this committed-cleanup interval from a
+ * prepublication failure. EAGAIN means advance the same attempt again. */
+typedef enum wl_columnar_relation_append_growth_phase {
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_INERT = 0,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ACQUIRE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_VALIDATE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_CAPACITY,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_TYPES,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ADMIT,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_TABLE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_LANES,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_DESTINATION,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_READY,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_COMMIT_PUBLISH,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_RETIRE_OLD,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_DOWNSIZE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_FREE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_COMMIT,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_REFUND,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_ABORT_RELEASE,
+    WL_COLUMNAR_RELATION_APPEND_GROWTH_DONE
+} wl_columnar_relation_append_growth_phase_t;
+
+typedef struct wl_columnar_relation_append_growth_attempt {
+    struct wl_columnar_relation_append_growth_attempt *identity;
+    col_rel_t *destination;
+    const col_rel_t *source;
+    wl_evaluation_control_t *control;
+    uint64_t active_attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    bool published;
+    bool growth_active;
+    wl_columnar_relation_append_growth_phase_t phase;
+    wl_columnar_source_access_gate_set_attempt_t gates;
+    wl_columnar_memory_downsize_attempt_t downsize;
+    wl_columnar_memory_growth_refund_attempt_t refund;
+    wl_columnar_memory_governor_growth_commit_prepared_t commit;
+    uint32_t source_first;
+    uint32_t source_count;
+    uint32_t source_rows;
+    uint32_t source_capacity;
+    uint32_t destination_rows;
+    uint32_t destination_capacity;
+    uint32_t ncols;
+    uint32_t required_rows;
+    uint32_t new_capacity;
+    uint64_t destination_relation_identity;
+    uint64_t destination_view_generation;
+    uint64_t destination_storage_generation;
+    uint64_t source_relation_identity;
+    uint64_t source_view_generation;
+    uint64_t source_storage_generation;
+    uint64_t source_owner_generation;
+    uint64_t destination_owner_generation;
+    uint64_t incoming_bytes;
+    uint64_t target_bytes;
+    uint64_t destination_ledger_before;
+    uint64_t old_reserved_bytes;
+    int64_t **replacement_columns;
+    uint32_t allocated_lanes;
+    uint32_t lane_cursor;
+    uint32_t row_cursor;
+    int64_t **retired_columns;
+    int result;
+    int cleanup_result;
+    int terminal_result;
+} wl_columnar_relation_append_growth_attempt_t;
+
+int wl_columnar_relation_append_growth_attempt_begin(
+    wl_columnar_relation_append_growth_attempt_t *, col_rel_t *,
+    const col_rel_t *, uint32_t, uint32_t, wl_evaluation_control_t *);
+int wl_columnar_relation_append_growth_attempt_advance(
+    wl_columnar_relation_append_growth_attempt_t *);
+/* Advance returns 0 at READY without publishing. Commit crosses the
+ * irreversible boundary; afterward keep advancing mandatory cleanup. */
+int wl_columnar_relation_append_growth_attempt_commit(
+    wl_columnar_relation_append_growth_attempt_t *);
+bool wl_columnar_relation_append_growth_attempt_ready(
+    const wl_columnar_relation_append_growth_attempt_t *);
+int wl_columnar_relation_append_growth_attempt_abort(
+    wl_columnar_relation_append_growth_attempt_t *, int);
+bool wl_columnar_relation_append_growth_attempt_published(
+    const wl_columnar_relation_append_growth_attempt_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 extern uint32_t wl_columnar_relation_test_metadata_fail_allocation;
 extern bool wl_columnar_relation_test_metadata_fail_commit;
