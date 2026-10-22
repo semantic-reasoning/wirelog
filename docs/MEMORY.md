@@ -2348,6 +2348,59 @@ impossible retirement failure aborts with original authority reachable. Stopped
 nongrowth can change unpublished spare cells, but rows/view/storage remain
 unchanged. This API alone does not enable evaluation operators.
 
+### Resumable private relation append growth (#1821 foundation)
+
+`wl_columnar_relation_append_growth_attempt_t` is an internal, opt-in transaction
+for two distinct self-owned heap relations with the same positive number of
+INT64 columns. It rejects aliases, arena/pool relations, shared views,
+compounds, timestamps and other auxiliary payload, zero-row appends, and
+appends that fit the existing capacity. This narrow shape keeps the staged
+footprint exact: the replacement image is one pointer table plus
+`ncols * new_capacity` INT64 cells. For a governed destination, its existing
+reservation must exactly cover the old image. Staging admits the full new
+image beside the old one, so peak relation credit and physical payload include
+both images; after publication, the old image is retired before the reservation
+is downsized to the new image. This API does not reserve source, alias, scratch
+or auxiliary-owner payload.
+
+Begin binds a zero-initialized receipt to its original address, creating
+thread, active control identity and attempt ID. After acquiring both
+relations' gates, the first validation step snapshots their generations and
+shape for commit-time revalidation. Keep the receipt and both relations at
+stable addresses. The original
+control must remain live for forward `advance` calls and explicit `commit`;
+READY means only that private staging is complete. It has not changed the
+destination. Commit is the publication cutoff. An abort before that cutoff
+frees staged storage and refunds only this attempt's credit, preserving the
+old destination. After publication, cleanup retires the old image and
+downsizes credit. Keep descriptors, reservation and all referenced storage
+alive until the receipt reaches DONE.
+
+Each forward phase transition, lane allocation and lane/type check is admitted
+before mutation. Row copies charge the number of rows and are capped at the
+256-unit evaluation quantum per call; allocator latency is outside that work
+bound. Cancellation or work-limit refusal before publication enters mandatory
+cleanup. Once cleanup begins, the receipt no longer uses its original control:
+each nonterminal `cleanup_step` needs a distinct live control with a currently
+active matching attempt ID and charges one cleanup unit before one bounded
+phase action. A refusal leaves that action and its resources pending. Cleanup
+may continue after the original control is finished and released, but callers
+must not abandon a pending receipt. DONE returns the latched primary result;
+`cleanup_result` retains cleanup diagnostics.
+
+Zero count returns `EINVAL`; unsupported shape or nongrowth returns
+`ENOTSUP`; checked capacity/byte overflow returns `EOVERFLOW`; governor denial
+and allocation failure return `ENOMEM`; commit generation drift returns
+`EBUSY`. Work exhaustion and cancellation retain their distinct control
+results. Governor denial sets `memory_budget_denial_pending`; allocator failure
+does not claim that provenance. These failures are not interchangeable, and
+none implicitly publishes a partial destination. The focused mutation-set
+tests cover denied admission, partial allocation failure at the table and
+lane stages, unsupported types and shapes, capacity overflow, stale commit,
+prepublication cancellation/abort, funded cleanup refusal, and postpublication
+refusal/retry. This foundation does not instrument JOIN or activate the append
+path in the evaluator.
+
 ### Controlled private held batches
 
 `wl_columnar_relation_append_batch_t` is a distinct internal wrapper around

@@ -3801,6 +3801,14 @@ typedef struct wl_columnar_relation_append_growth_attempt {
     int terminal_result;
 } wl_columnar_relation_append_growth_attempt_t;
 
+/* Internal opt-in transaction for bounded relation growth. It supports only
+ * distinct self-owned heap relations with the same positive INT64 column
+ * count, no auxiliary/compound payload, and a positive append that exceeds
+ * destination capacity. Initialize the receipt to zero and keep it at one
+ * address on its creating thread. The original operation control must remain
+ * live through forward advance and commit, or until abort has entered cleanup.
+ * READY is private staging; only commit publishes. Keep both relations and
+ * their storage alive until cleanup reaches DONE. */
 int wl_columnar_relation_append_growth_attempt_begin(
     wl_columnar_relation_append_growth_attempt_t *, col_rel_t *,
     const col_rel_t *, uint32_t, uint32_t, wl_evaluation_control_t *);

@@ -3105,6 +3105,186 @@ append_growth_zero_capacity_footprint_test(void)
     free(src.columns);
 }
 
+static int
+append_growth_test_drive(wl_columnar_relation_append_growth_attempt_t *attempt)
+{
+    for (unsigned i = 0; i < 1024; i++) {
+        int rc = append_growth_test_step(attempt);
+        if (rc != EAGAIN)
+            return rc;
+    }
+    assert(!"append-growth attempt did not reach a terminal result");
+    return ELOOP;
+}
+
+static void
+append_growth_partial_allocation_failure_tests(
+    wl_evaluation_control_t *control)
+{
+    for (uint32_t fail_at = 1; fail_at <= 3; fail_at++) {
+        col_rel_t dst, src;
+        root_init(&dst, 994 + fail_at * 2);
+        root_init(&src, 995 + fail_at * 2);
+        dst.ncols = src.ncols = 2;
+        dst.capacity = src.capacity = 2;
+        dst.nrows = src.nrows = 2;
+        dst.columns = calloc(dst.ncols, sizeof(*dst.columns));
+        src.columns = calloc(src.ncols, sizeof(*src.columns));
+        assert(dst.columns && src.columns);
+        for (uint32_t c = 0; c < dst.ncols; c++) {
+            dst.columns[c] = calloc(dst.capacity, sizeof(int64_t));
+            src.columns[c] = calloc(src.capacity, sizeof(int64_t));
+            assert(dst.columns[c] && src.columns[c]);
+            dst.columns[c][0] = 10 + c;
+            dst.columns[c][1] = 11 + c;
+            src.columns[c][0] = 20 + c;
+            src.columns[c][1] = 21 + c;
+        }
+        int64_t **old_columns = dst.columns;
+        int64_t *old_lane0 = dst.columns[0];
+        int64_t *old_lane1 = dst.columns[1];
+        uint64_t old_view = dst.view_generation;
+        uint64_t old_storage = dst.storage_generation;
+        wl_columnar_relation_append_growth_attempt_t attempt = { 0 };
+        assert(wl_columnar_relation_append_growth_attempt_begin(&attempt,
+            &dst, &src, 0, 2, control) == 0);
+        wl_columnar_relation_test_growth_fail_allocation = fail_at;
+        int rc = append_growth_test_drive(&attempt);
+        assert(rc == ENOMEM
+            && attempt.terminal_result == ENOMEM
+            && attempt.cleanup_result == 0
+            && attempt.allocated_lanes == 0
+            && attempt.replacement_columns == NULL);
+        assert(dst.columns == old_columns && dst.columns[0] == old_lane0
+            && dst.columns[1] == old_lane1 && dst.capacity == 2
+            && dst.nrows == 2 && dst.view_generation == old_view
+            && dst.storage_generation == old_storage);
+        assert(dst.columns[0][0] == 10 && dst.columns[0][1] == 11
+            && dst.columns[1][0] == 11 && dst.columns[1][1] == 12);
+        assert_open(&dst);
+        assert_open(&src);
+        assert(wl_columnar_relation_append_growth_attempt_cleanup_step(
+                &attempt, NULL, 0) == ENOMEM);
+        for (uint32_t c = 0; c < dst.ncols; c++) {
+            free(dst.columns[c]);
+            free(src.columns[c]);
+        }
+        free(dst.columns);
+        free(src.columns);
+    }
+}
+
+static void
+append_growth_failure_matrix_tests(wl_evaluation_control_t *control,
+    col_rel_t *dst, col_rel_t *src, wl_columnar_memory_governor_ref_t *governor)
+{
+    int64_t **old_columns = dst->columns;
+    int64_t *old_lane = dst->columns[0];
+    uint32_t old_capacity = dst->capacity;
+    uint32_t old_rows = dst->nrows;
+    uint64_t old_view = dst->view_generation;
+    uint64_t old_storage = dst->storage_generation;
+    uint64_t old_reserved = dst->retained_reserved_bytes;
+    int64_t old_values[4];
+    memcpy(old_values, dst->columns[0], sizeof(old_values));
+
+    /* A valid non-INT64 type fails before admission or staging allocation. */
+    src->column_types = calloc(src->ncols, sizeof(*src->column_types));
+    assert(src->column_types);
+    src->column_types[0] = WIRELOG_TYPE_FLOAT;
+    wl_columnar_relation_append_growth_attempt_t typed = { 0 };
+    assert(wl_columnar_relation_append_growth_attempt_begin(&typed, dst, src,
+        0, 1, control) == 0);
+    assert(append_growth_test_drive(&typed) == ENOTSUP);
+    assert(typed.terminal_result == ENOTSUP && typed.cleanup_result == 0);
+    free(src->column_types);
+    src->column_types = NULL;
+    assert(dst->columns == old_columns && dst->columns[0] == old_lane
+        && dst->capacity == old_capacity && dst->nrows == old_rows
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && dst->retained_reserved_bytes == old_reserved
+        && governor_reserved(governor) == old_reserved);
+    assert(memcmp(dst->columns[0], old_values, sizeof(old_values)) == 0);
+
+    /* Capacity doubling refuses before reading the synthetic large image. */
+    dst->capacity = UINT32_MAX / 2u + 1u;
+    dst->nrows = dst->capacity;
+    wl_columnar_relation_append_growth_attempt_t overflow = { 0 };
+    assert(wl_columnar_relation_append_growth_attempt_begin(&overflow, dst,
+        src, 0, 1, control) == 0);
+    assert(append_growth_test_drive(&overflow) == EOVERFLOW);
+    assert(overflow.terminal_result == EOVERFLOW
+        && overflow.cleanup_result == 0);
+    dst->capacity = old_capacity;
+    dst->nrows = old_rows;
+    assert(dst->columns == old_columns && dst->columns[0] == old_lane
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && dst->retained_reserved_bytes == old_reserved
+        && governor_reserved(governor) == old_reserved);
+    assert(memcmp(dst->columns[0], old_values, sizeof(old_values)) == 0);
+
+    /* A source generation change after READY refuses publication and keeps
+     * cleanup authority until private storage and provisional credit drain. */
+    wl_columnar_relation_append_growth_attempt_t stale_commit = { 0 };
+    assert(wl_columnar_relation_append_growth_attempt_begin(&stale_commit,
+        dst, src, 0, 2, control) == 0);
+    int rc = EAGAIN;
+    for (unsigned i = 0; i < 1024 && rc == EAGAIN; i++)
+        rc = append_growth_test_step(&stale_commit);
+    assert(rc == 0
+        && wl_columnar_relation_append_growth_attempt_ready(&stale_commit));
+    uint64_t source_view = src->view_generation;
+    src->view_generation++;
+    assert(wl_columnar_relation_append_growth_attempt_commit(&stale_commit)
+        == EAGAIN);
+    src->view_generation = source_view;
+    assert(!wl_columnar_relation_append_growth_attempt_published(
+            &stale_commit));
+    assert(append_growth_test_drive(&stale_commit) == EBUSY);
+    assert(stale_commit.terminal_result == EBUSY
+        && stale_commit.cleanup_result == 0);
+    assert(dst->columns == old_columns && dst->columns[0] == old_lane
+        && dst->capacity == old_capacity && dst->nrows == old_rows
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && dst->retained_reserved_bytes == old_reserved
+        && governor_reserved(governor) == old_reserved);
+    assert(memcmp(dst->columns[0], old_values, sizeof(old_values)) == 0);
+
+    /* READY is private. Explicit abort retires staging and restores credit. */
+    wl_columnar_relation_append_growth_attempt_t ready_abort = { 0 };
+    assert(wl_columnar_relation_append_growth_attempt_begin(&ready_abort, dst,
+        src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 1024 && rc == EAGAIN; i++)
+        rc = append_growth_test_step(&ready_abort);
+    assert(rc == 0
+        && wl_columnar_relation_append_growth_attempt_ready(&ready_abort)
+        && !wl_columnar_relation_append_growth_attempt_published(&ready_abort));
+    assert(dst->columns == old_columns && dst->capacity == old_capacity
+        && dst->nrows == old_rows && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && governor_reserved(governor) > old_reserved);
+    assert(wl_columnar_relation_append_growth_attempt_abort(&ready_abort,
+        ECANCELED) == EAGAIN);
+    assert(append_growth_test_drive(&ready_abort) == ECANCELED);
+    assert(ready_abort.terminal_result == ECANCELED
+        && ready_abort.cleanup_result == 0);
+    assert(dst->columns == old_columns && dst->columns[0] == old_lane
+        && dst->capacity == old_capacity && dst->nrows == old_rows
+        && dst->view_generation == old_view
+        && dst->storage_generation == old_storage
+        && dst->retained_reserved_bytes == old_reserved
+        && governor_reserved(governor) == old_reserved);
+    assert(memcmp(dst->columns[0], old_values, sizeof(old_values)) == 0);
+    assert(wl_columnar_relation_append_growth_attempt_advance(&ready_abort)
+        == ECANCELED);
+    assert_open(dst);
+    assert_open(src);
+}
+
 static void
 append_growth_attempt_tests(void)
 {
@@ -3383,6 +3563,8 @@ append_growth_attempt_tests(void)
         && exact_bytes == dst.retained_reserved_bytes);
     assert_open(&dst);
     assert_open(&src);
+    append_growth_failure_matrix_tests(control, &dst, &src, governor);
+    append_growth_partial_allocation_failure_tests(control);
     src.pool_owned = true;
     wl_columnar_relation_append_growth_attempt_t pooled = {0};
     assert(wl_columnar_relation_append_growth_attempt_begin(&pooled, &dst,
