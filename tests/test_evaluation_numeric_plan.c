@@ -5047,10 +5047,73 @@ test_composed_domain_and_repeated_source(void)
     }
 }
 
+static void
+test_composed_controlled_batch_fallback_owner(void)
+{
+    static const char program_text[] =
+        ".decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\noutput(k) :- a(k), b(k).\n";
+    uint8_t filter_expr[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+        WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0,
+        WL_PLAN_EXPR_CMP_GT
+    };
+    const double left_values[] = {3, 1, 3, -2};
+    const double right_values[] = {1, 4, 0};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(program_text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *body = composed_find_relation(plan, "output");
+    CHECK(body && body->op_count == 3
+        && body->ops[0].op == WL_PLAN_OP_VARIABLE
+        && body->ops[1].op == WL_PLAN_OP_JOIN
+        && body->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+    wl_plan_op_t ops[] = {
+        body->ops[0], body->ops[1],
+        {.op = WL_PLAN_OP_FILTER,
+         .filter_expr = {filter_expr, sizeof(filter_expr)}},
+        body->ops[2]
+    };
+    wl_plan_relation_t controlled_body = *body;
+    controlled_body.ops = ops;
+    controlled_body.op_count = 4;
+
+    col_rel_t *left = composed_source("a", 1, left_values, 4, false);
+    col_rel_t *right = composed_source("b", 1, right_values, 3, false);
+    col_rel_t *registry[] = {left, right};
+    fixture_t f;
+    composed_fixture(&f, left, 0);
+    f.session.rels = registry; f.session.nrels = 2; f.session.rel_cap = 2;
+    f.session.join_batch_bytes = 224;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
+            &f.record, &controlled_body, 0, controlled_body.op_count, f.frame,
+            &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id));
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 0);
+    CHECK(wl_columnar_eval_plan_numeric_batch_fallback_authorized(
+            &f.record, f.frame, &f.session, f.operation, f.operation_id));
+    wl_columnar_eval_plan_numeric_attempt_t copied = f.record;
+    CHECK(!wl_columnar_eval_plan_numeric_batch_fallback_authorized(
+            &copied, f.frame, &f.session, f.operation, f.operation_id));
+    CHECK(!wl_columnar_eval_plan_numeric_batch_fallback_authorized(
+            &f.record, f.frame, &f.session, f.operation, f.operation_id + 1));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == controlled_body.op_count);
+    composed_raw_parity(&f, &controlled_body, 0);
+    composed_close(&f);
+    CHECK(!f.record.controlled_materialized_batch_fallback);
+    col_rel_destroy(right);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 int
 main(void)
 {
     test_composed_domain_and_repeated_source();
+    test_composed_controlled_batch_fallback_owner();
     test_composed_abort_request();
     test_composed_generated_union(); test_composed_nested_and_wide();
     test_composed_branch_children(); test_composed_grammar();

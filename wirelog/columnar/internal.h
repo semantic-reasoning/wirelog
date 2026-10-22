@@ -6390,6 +6390,8 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     /* Appended composition state; original record address and prefix retained. */
     uint32_t preflight_depth, runtime_depth;
     bool composed_mode;
+    /* Set only by the exact framed controlled STEP fallback preflight. */
+    bool controlled_materialized_batch_fallback;
     wl_columnar_lftj_attempt_t lftj;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
@@ -6404,6 +6406,9 @@ void wl_columnar_eval_plan_numeric_attempt_init(
     wl_columnar_eval_plan_numeric_attempt_t *);
 bool wl_columnar_eval_plan_numeric_owner_valid(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *);
+bool wl_columnar_eval_plan_numeric_batch_fallback_authorized(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    const wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_attempt_begin(
     wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
@@ -6539,6 +6544,11 @@ extern void (*wl_columnar_eval_stack_test_binary_checkpoint)(
  * Successful completed counts every opcode, including each VARIABLE.
  * Old step/consume/ACK cannot operate these distinct lifecycle phases. */
 int wl_columnar_eval_plan_numeric_composed_attempt_begin(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
