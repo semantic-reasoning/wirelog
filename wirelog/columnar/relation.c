@@ -1637,6 +1637,7 @@ wl_columnar_relation_reader_step(const col_rel_t *rel,
         (record->identity != (uintptr_t)record || record->relation != rel))
         || (!live && (record->identity || record->relation))
         || token->thread_valid
+        || token->release_stage != 0
         || (token->owner && (!live || token->owner != owner
         || token->identity != (uintptr_t)token || !token->transferable
         || token->secondary_owner != descriptor))

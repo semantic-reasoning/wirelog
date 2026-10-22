@@ -263,6 +263,30 @@ test_reservation_lifecycle(void)
         FAIL("rollback lifecycle is not enforced");
         return 1;
     }
+    bool done = false;
+    if (!wl_columnar_memory_reserve(&governor, 600, &first)
+        || !wl_columnar_memory_commit(&first, &owner_a)
+        || wl_columnar_memory_reservation_finish_step(&first, false, &done)
+        || done
+        || atomic_load_explicit(&first.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RELEASING
+        || wl_columnar_memory_reserved(&governor) != 600
+        || wl_columnar_memory_reservation_finish_step(&first, false, &done)
+        || !done || wl_columnar_memory_reserved(&governor) != 0
+        || atomic_load_explicit(&first.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED) {
+        FAIL("stepped committed release did not retain and retire its token");
+        return 1;
+    }
+    done = false;
+    if (!wl_columnar_memory_reserve(&governor, 600, &second)
+        || wl_columnar_memory_reservation_finish_step(&second, true, &done)
+        || done
+        || wl_columnar_memory_reservation_finish_step(&second, true, &done)
+        || !done || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("stepped reservation rollback did not restore accounting");
+        return 1;
+    }
     PASS();
     return 0;
 }
