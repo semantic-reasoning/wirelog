@@ -518,28 +518,15 @@ wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
     if (!op || op->op != WL_PLAN_OP_LFTJ || !op->opaque_data || !session)
         return EINVAL;
     if (session->tdd_input_run || session->diff_operators_active
-        || session->current_iteration != 0)
+        || session->current_iteration != 0) {
         return ENOTSUP;
+    }
     const wl_plan_op_lftj_t *meta = op->opaque_data;
     if (meta->k < 2 || meta->k > WL_LFTJ_MAX_K || !meta->rel_names
         || !meta->key_cols)
         return EINVAL;
-    uint32_t ncols = 0;
-    wirelog_column_type_t key_type = WIRELOG_TYPE_INT64;
     for (uint32_t i = 0; i < meta->k; i++) {
         if (!meta->rel_names[i]) return EINVAL;
-        col_rel_t *rel = session_find_rel(session, meta->rel_names[i]);
-        if (!rel) return ENOENT;
-        if (!rel->ncols || meta->key_cols[i] >= rel->ncols || rel->timestamps
-            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
-            return ENOTSUP;
-        if (rel->ncols > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS - ncols)
-            return ENOTSUP;
-        ncols += rel->ncols;
-        wirelog_column_type_t type = rel->column_types
-            ? rel->column_types[meta->key_cols[i]] : WIRELOG_TYPE_INT64;
-        if (i && type != key_type) return EINVAL;
-        key_type = type;
     }
     return 0;
 }
@@ -560,6 +547,8 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     attempt->frame = frame;
     attempt->numeric_owner = numeric_owner;
     attempt->session = session;
+    attempt->registry = session->rels;
+    attempt->registry_count = session->nrels;
     attempt->control = control;
     attempt->attempt_id = attempt_id;
     attempt->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE;
@@ -618,17 +607,57 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         return 0;
     }
     if (a->cursor < a->metadata->k) {
-        int rc = wl_columnar_lftj_attempt_charge(a, 24);
-        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        int rc;
         uint32_t i = a->cursor;
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[i];
-        col_rel_t *rel = session_find_rel(a->session,
-                a->metadata->rel_names[i]);
+        if (a->session->rels != a->registry
+            || a->session->nrels != a->registry_count)
+            return wl_columnar_lftj_attempt_fail(a, EBUSY);
+        if (in->lookup_slot < a->registry_count) {
+            rc = wl_columnar_lftj_attempt_charge(a, 1);
+            if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+            col_rel_t *candidate = a->registry[in->lookup_slot];
+            const char *wanted = a->metadata->rel_names[i];
+            const char *registered = candidate ? candidate->name : NULL;
+            if (!registered) {
+                ++in->lookup_slot;
+                in->lookup_name_byte = 0;
+                return 0;
+            }
+            unsigned char expected = (unsigned char)
+                wanted[in->lookup_name_byte];
+            unsigned char actual = (unsigned char)
+                registered[in->lookup_name_byte];
+            if (expected != actual) {
+                ++in->lookup_slot;
+                in->lookup_name_byte = 0;
+                return 0;
+            }
+            if (!expected) {
+                if (in->lookup_matches++)
+                    return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
+                in->lookup_match_slot = in->lookup_slot;
+                ++in->lookup_slot;
+                in->lookup_name_byte = 0;
+                return 0;
+            }
+            if (in->lookup_name_byte == SIZE_MAX)
+                return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+            ++in->lookup_name_byte;
+            return 0;
+        }
+        if (!in->lookup_matches)
+            return wl_columnar_lftj_attempt_fail(a, ENOENT);
+        rc = wl_columnar_lftj_attempt_charge(a,
+                WL_COLUMNAR_LFTJ_ACTION_UNITS);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        col_rel_t *rel = a->registry[in->lookup_match_slot];
         if (!rel) return wl_columnar_lftj_attempt_fail(a, ENOENT);
         uint32_t key = a->metadata->key_cols[i];
         if (!rel->ncols || key >= rel->ncols || rel->timestamps
-            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
             return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
+        }
         in->relation = rel;
         in->nrows = rel->nrows;
         in->ncols = rel->ncols;
@@ -638,34 +667,73 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         if (i && in->key_type != a->inputs[0].key_type)
             return wl_columnar_lftj_attempt_fail(a, EINVAL);
         if (a->total_columns > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-            - in->ncols)
+            || in->ncols > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
+            - a->total_columns)
             return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
         a->binary_offset[i] = a->total_columns;
         for (uint32_t c = 0; c < in->ncols; c++)
             a->output_types[a->total_columns + c] = rel->column_types
                 ? (int64_t)rel->column_types[c] : WIRELOG_TYPE_INT64;
         a->total_columns += in->ncols;
-        rc = col_rel_source_reader_acquire(rel, &in->reader);
-        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         a->input_count = ++a->cursor;
         return 0;
     }
-    uint64_t bytes = (uint64_t)a->metadata->k * sizeof(*a->inputs);
-    uint64_t row_bytes;
-    if (!wl_columnar_memory_size_mul(a->total_columns, sizeof(*a->row),
-        &row_bytes)
-        || !wl_columnar_memory_size_add(bytes, row_bytes, &bytes))
-        return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
-    for (uint32_t i = 0; i < a->input_count; i++) {
+    a->cursor = 0;
+    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_attempt_acquire(wl_columnar_lftj_attempt_t *a)
+{
+    if (a->cursor < a->input_count) {
+        int rc = wl_columnar_lftj_attempt_charge(a,
+                WL_COLUMNAR_LFTJ_ACTION_UNITS);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        wl_columnar_lftj_input_attempt_t *in = &a->inputs[a->cursor];
+        rc = col_rel_source_reader_acquire(in->relation, &in->reader);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        ++a->cursor;
+        return 0;
+    }
+    a->cursor = 0;
+    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_SIZE;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
+{
+    if (!a->scratch_size_initialized) {
+        int rc = wl_columnar_lftj_attempt_charge(a, 8);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(a->metadata->k,
+            sizeof(*a->inputs), &bytes)
+            || !wl_columnar_memory_size_mul(a->total_columns,
+            sizeof(*a->row), &a->row_bytes)
+            || !wl_columnar_memory_size_add(bytes, a->row_bytes, &bytes))
+            return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        a->scratch_bytes = bytes;
+        a->scratch_size_initialized = true;
+        return 0;
+    }
+    if (a->scratch_size_cursor < a->input_count) {
+        int rc = wl_columnar_lftj_attempt_charge(a, 8);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        uint32_t i = a->scratch_size_cursor;
         uint64_t cells, pair_bytes;
         if (!wl_columnar_memory_size_mul(a->inputs[i].nrows,
             a->inputs[i].ncols, &cells)
             || !wl_columnar_memory_size_mul(cells, 2u * sizeof(int64_t),
             &pair_bytes)
-            || !wl_columnar_memory_size_add(bytes, pair_bytes, &bytes))
+            || !wl_columnar_memory_size_add(a->scratch_bytes, pair_bytes,
+            &a->scratch_bytes))
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        ++a->scratch_size_cursor;
+        return 0;
     }
-    a->scratch_bytes = bytes;
+    uint64_t bytes = a->scratch_bytes;
     if (a->session->memory_governor && bytes) {
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(a->session->memory_governor);
@@ -683,7 +751,8 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         }
         a->scratch_reserved = true;
     }
-    a->row = malloc((size_t)(row_bytes ? row_bytes : sizeof(int64_t)));
+    a->row = malloc((size_t)(a->row_bytes ? a->row_bytes
+        : sizeof(int64_t)));
     if (!a->row) return wl_columnar_lftj_attempt_fail(a, ENOMEM);
     a->cursor = 0;
     a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC;
@@ -1128,6 +1197,10 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done)
     switch (a->phase) {
     case WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE:
         return wl_columnar_lftj_attempt_resolve(a);
+    case WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE:
+        return wl_columnar_lftj_attempt_acquire(a);
+    case WL_COLUMNAR_LFTJ_ATTEMPT_SIZE:
+        return wl_columnar_lftj_attempt_size(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC:
         return wl_columnar_lftj_attempt_alloc(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_COPY:
