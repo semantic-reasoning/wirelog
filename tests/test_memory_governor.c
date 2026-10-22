@@ -17,6 +17,10 @@ static int tests_run;
 static int tests_failed;
 static wl_columnar_memory_reservation_t growth_refund_peer;
 static bool growth_refund_peer_created;
+static bool force_release_credit_cas_interference;
+static wl_columnar_memory_reservation_t release_credit_interference;
+static bool force_release_claim_cas_interference;
+static wl_columnar_memory_reservation_t *release_claim_interference_token;
 
 #define TEST(name) do { tests_run++; printf("  [%d] %s", tests_run, name); \
 } while (0)
@@ -366,10 +370,52 @@ test_checked_admission(void)
         return 1;
     }
     copied = reservation;
-    if (wl_columnar_memory_release(&copied)
-        || !wl_columnar_memory_release(&reservation)
+    if (wl_columnar_memory_release_try(&copied)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_INVALID
+        || wl_columnar_memory_release(&copied)
+        || wl_columnar_memory_reserved(&governor) != 400) {
+        FAIL("copied reservation token released capacity");
+        return 1;
+    }
+    atomic_store_explicit(&reservation.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING, memory_order_release);
+    if (wl_columnar_memory_release_try(&reservation)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_RETRY
+        || atomic_load_explicit(&reservation.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING
+        || wl_columnar_memory_reserved(&governor) != 400) {
+        FAIL("transient token state was not reported as retryable");
+        return 1;
+    }
+    atomic_store_explicit(&reservation.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RESERVED, memory_order_release);
+    force_release_claim_cas_interference = true;
+    release_claim_interference_token = &reservation;
+    if (wl_columnar_memory_release_try(&reservation)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_RETRY) {
+        FAIL("competing token claim was not reported as retryable");
+        return 1;
+    }
+    if (atomic_load_explicit(&reservation.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING
+        || reservation.bytes != 400 || reservation.replacement_bytes != 0
+        || reservation.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || reservation.identity != &reservation
+        || atomic_load_explicit(&reservation.owner_bits, memory_order_acquire)
+        != 0
+        || wl_columnar_memory_reserved(&governor) != 400) {
+        FAIL("losing token claim changed winner state or aggregate credit");
+        return 1;
+    }
+    atomic_store_explicit(&reservation.state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RESERVED, memory_order_release);
+    release_claim_interference_token = NULL;
+    if (wl_columnar_memory_release_try(&reservation)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_OK
+        || wl_columnar_memory_release_try(&reservation)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_INVALID
         || wl_columnar_memory_reserved(&governor) != 0) {
-        FAIL("copied reservation token was able to release capacity");
+        FAIL("released token could not be retried exactly once");
         return 1;
     }
     wl_columnar_memory_reservation_init(&old_reservation);
@@ -514,6 +560,28 @@ void
 wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
     unsigned phase)
 {
+    if (force_release_claim_cas_interference
+        && token == release_claim_interference_token
+        && phase == WL_COLUMNAR_MEMORY_TEST_RELEASE_BEFORE_CLAIM) {
+        uint64_t expected;
+        force_release_claim_cas_interference = false;
+        do {
+            expected = WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+            schedule.valid = atomic_compare_exchange_weak_explicit(
+                &token->state, &expected,
+                WL_COLUMNAR_MEMORY_RESERVATION_COMMITTING,
+                memory_order_acq_rel, memory_order_acquire);
+        } while (!schedule.valid
+            && expected == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED);
+        return;
+    }
+    if (force_release_credit_cas_interference
+        && phase == WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDIT_CAS) {
+        force_release_credit_cas_interference = false;
+        schedule.valid = wl_columnar_memory_reserve(token->governor, 1,
+                &release_credit_interference);
+        return;
+    }
     if (!schedule.armed || token != schedule.token || phase != schedule.phase)
         return;
     /* One-shot nesting models a competing operation while this call is paused. */
@@ -545,6 +613,111 @@ wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *token,
         && !reserve && wl_columnar_memory_reserved(token->governor) == total
         && atomic_load_explicit(&token->owner_bits, memory_order_acquire)
         == (uint64_t)(uintptr_t)token->governor;
+}
+
+static int
+test_release_try_credit_cas_race(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+
+    TEST("one-shot release restores token after aggregate CAS interference");
+    make_resolution(&resolution, 1000, 900);
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&release_credit_interference);
+    memset(&schedule, 0, sizeof(schedule));
+    if (wl_columnar_memory_governor_init(&governor, &resolution) != 0
+        || !wl_columnar_memory_reserve(&governor, 400, &token)) {
+        FAIL("could not create release race fixture");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 399, memory_order_release);
+    if (wl_columnar_memory_release_try(&token)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_INVALID
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || token.bytes != 400 || token.replacement_bytes != 0
+        || token.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || wl_columnar_memory_reserved(&governor) != 399) {
+        FAIL("insufficient aggregate credit consumed the retryable token");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 400, memory_order_release);
+    force_release_credit_cas_interference = true;
+    if (wl_columnar_memory_release_try(&token)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_RETRY
+        || force_release_credit_cas_interference || !schedule.valid
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || token.bytes != 400 || token.replacement_bytes != 0
+        || token.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || token.identity != &token
+        || wl_columnar_memory_reserved(&governor) != 401
+        || wl_columnar_memory_release_try(&token)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_OK
+        || wl_columnar_memory_reserved(&governor) != 1
+        || wl_columnar_memory_release_try(&release_credit_interference)
+        != WL_COLUMNAR_MEMORY_RELEASE_TRY_OK
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("credit CAS refusal did not preserve retryable token accounting");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_release_try_replacing_token(void)
+{
+    TEST("one-shot release returns both replacement footprints");
+    for (unsigned transition = 0; transition < 2; transition++) {
+        wl_columnar_memory_resolution_t resolution;
+        wl_columnar_memory_governor_t governor;
+        wl_columnar_memory_reservation_t token;
+        uint8_t expected_kind = transition == 0
+            ? WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+            : WL_COLUMNAR_MEMORY_TRANSITION_REPLACEMENT;
+
+        make_resolution(&resolution, 1000, 900);
+        wl_columnar_memory_reservation_init(&token);
+        if (wl_columnar_memory_governor_init(&governor, &resolution) != 0
+            || !wl_columnar_memory_reserve(&governor, 400, &token)
+            || !wl_columnar_memory_commit(&token, &governor)
+            || (transition == 0
+            ? wl_columnar_memory_begin_growth(&token, 100)
+            : wl_columnar_memory_begin_replacement(&token, 100))
+            != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            || wl_columnar_memory_reserved(&governor) != 500) {
+            FAIL("could not create replacing-token release fixture");
+            return 1;
+        }
+        token.replacement_bytes = UINT64_MAX;
+        if (wl_columnar_memory_release_try(&token)
+            != WL_COLUMNAR_MEMORY_RELEASE_TRY_OVERFLOW
+            || atomic_load_explicit(&token.state, memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_REPLACING
+            || token.bytes != 400 || token.replacement_bytes != UINT64_MAX
+            || token.transition_kind != expected_kind
+            || wl_columnar_memory_reserved(&governor) != 500) {
+            FAIL("replacement overflow changed token or aggregate credit");
+            return 1;
+        }
+        token.replacement_bytes = 100;
+        if (wl_columnar_memory_release_try(&token)
+            != WL_COLUMNAR_MEMORY_RELEASE_TRY_OK
+            || token.replacement_bytes != 0
+            || token.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+            || atomic_load_explicit(&token.state, memory_order_acquire)
+            != WL_COLUMNAR_MEMORY_RESERVATION_RELEASED
+            || wl_columnar_memory_reserved(&governor) != 0) {
+            FAIL(
+                "replacement release lost or double-credited reservation bytes");
+            return 1;
+        }
+    }
+    PASS();
+    return 0;
 }
 
 static int
@@ -3013,6 +3186,8 @@ main(void)
     test_checked_admission();
     test_downsize();
     test_downsize_interleavings();
+    test_release_try_credit_cas_race();
+    test_release_try_replacing_token();
     test_downsize_races();
     test_replacement_reservation();
     test_growth_reservation();
