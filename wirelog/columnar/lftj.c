@@ -1066,7 +1066,7 @@ wl_columnar_lftj_attempt_join(wl_columnar_lftj_attempt_t *a)
             int rc = wl_columnar_lftj_attempt_charge(a,
                     (uint64_t)a->total_columns + 8u);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-            rc = col_rel_append_batch_row(&a->writer, a->row);
+            rc = col_rel_append_batch_row(&a->writer.raw, a->row);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             ++a->output_written;
             a->join_phase = WL_COLUMNAR_LFTJ_JOIN_PRODUCT_ADVANCE;
@@ -1118,58 +1118,107 @@ wl_columnar_lftj_attempt_join(wl_columnar_lftj_attempt_t *a)
 }
 
 static int
-wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done)
+wl_columnar_lftj_attempt_cleanup_charge(wl_evaluation_control_t *funding,
+    uint64_t funding_id)
+{
+    return wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+}
+
+static int
+wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (a->writer_active) {
-        int rc = col_rel_append_batch_end(&a->writer,
-                a->semantic_result == 0);
-        a->writer_active = false;
+        int charge_rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (charge_rc) return charge_rc;
+        int rc = wl_columnar_relation_append_batch_end_controlled(&a->writer,
+                a->semantic_result);
+        if (!a->writer.raw.active) a->writer_active = false;
         if (rc && !a->semantic_result) a->semantic_result = rc;
         return 0;
     }
     if (a->output_owned && a->semantic_result) {
-        if (col_rel_destroy_checked(a->output) != 0) return 0;
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        rc = col_rel_destroy_checked(a->output);
+        if (rc) return rc;
         a->output = NULL;
         a->output_owned = false;
         return 0;
     }
-    for (uint32_t i = 0; a->inputs && i < a->input_count; i++) {
+    for (uint32_t i = a->cleanup_cursor; a->inputs && i < a->input_count; i++) {
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[i];
-        if (in->reader.owner) {
-            if (col_rel_source_reader_release(&in->reader) != 0) return 0;
+        if (a->cleanup_input_stage == 0 && in->reader.owner) {
+            int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                    funding_id);
+            if (rc) return rc;
+            bool released = false;
+            rc = wl_columnar_source_access_reader_release_step(&in->reader,
+                    &released);
+            if (rc) return rc;
+            if (!released) return 0;
+            a->cleanup_input_stage = 1;
             return 0;
         }
-        if (in->rows || in->scratch) {
+        if (a->cleanup_input_stage <= 1 && in->rows) {
+            int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                    funding_id);
+            if (rc) return rc;
             free(in->rows); in->rows = NULL;
-            free(in->scratch); in->scratch = NULL;
+            a->cleanup_input_stage = 2;
             return 0;
         }
+        if (a->cleanup_input_stage <= 2 && in->scratch) {
+            int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                    funding_id);
+            if (rc) return rc;
+            free(in->scratch); in->scratch = NULL;
+            a->cleanup_input_stage = 3;
+            return 0;
+        }
+        a->cleanup_cursor = i + 1;
+        a->cleanup_input_stage = 0;
     }
     if (a->scratch_reserved) {
-        bool released = a->scratch_committed
-            ? wl_columnar_memory_release(&a->scratch_reservation)
-            : wl_columnar_memory_rollback(&a->scratch_reservation);
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        bool released = false;
+        rc = wl_columnar_memory_reservation_finish_step(
+            &a->scratch_reservation, !a->scratch_committed, &released);
+        if (rc) return rc;
         if (!released) return 0;
         a->scratch_reserved = a->scratch_committed = false;
         return 0;
     }
-    free(a->row); a->row = NULL;
-    free(a->inputs); a->inputs = NULL;
+    if (a->row) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        free(a->row); a->row = NULL;
+        return 0;
+    }
+    if (a->inputs) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        free(a->inputs); a->inputs = NULL;
+        return 0;
+    }
     if (!a->semantic_result && a->output_owned) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
         eval_stack_t *stack = NULL;
-        int rc = wl_columnar_eval_stack_operator_stack_owned(a->frame,
+        rc = wl_columnar_eval_stack_operator_stack_owned(a->frame,
                 a->session, &stack, a->numeric_owner);
-        if (rc) {
-            a->semantic_result = rc;
-            return 0;
-        }
+        if (rc) return rc;
         eval_entry_t entry = { .rel = a->output, .owned = true,
                                .kind = WL_COLUMNAR_EVAL_ENTRY_RELATION };
         rc = eval_stack_repush_entry(stack, &entry);
-        if (rc) {
-            a->semantic_result = rc;
-            return 0;
-        }
+        if (rc) return rc;
         a->output = NULL;
         a->output_owned = false;
         a->registered = true;
@@ -1180,7 +1229,8 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done)
 }
 
 int
-wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done)
+wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!done) return EINVAL;
     *done = false;
@@ -1191,7 +1241,8 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done)
         return 0;
     }
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE)
-        return wl_columnar_lftj_attempt_release(a, done);
+        return wl_columnar_lftj_attempt_release(a, done, funding,
+                   funding_id);
     int rc = wl_columnar_lftj_attempt_charge(a, 0);
     if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
     switch (a->phase) {
@@ -1219,7 +1270,8 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done)
         a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN;
         return 0;
     case WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN:
-        rc = col_rel_append_batch_begin(&a->writer, a->output);
+        rc = wl_columnar_relation_append_batch_begin_controlled(&a->writer,
+                a->output, a->control);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         a->writer_active = true;
         a->output_pass = true;
@@ -1246,7 +1298,8 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done)
 }
 
 int
-wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done)
+wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!done) return EINVAL;
     *done = false;
@@ -1258,8 +1311,15 @@ wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done)
         *done = true;
         return 0;
     }
+    if (funding == a->control)
+        return EINVAL;
+    if (a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+    }
     if (!a->semantic_result)
         a->semantic_result = WL_EVALUATION_CONTROL_CANCELLED;
     a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE;
-    return wl_columnar_lftj_attempt_release(a, done);
+    return wl_columnar_lftj_attempt_release(a, done, funding, funding_id);
 }

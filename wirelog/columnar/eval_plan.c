@@ -1729,10 +1729,12 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         return wl_columnar_filter_op_attempt_ack_owned(record->frame, record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD: {
         bool done = false;
-        rc = wl_columnar_ops_lftj_attempt_step(&record->lftj, &done);
+        rc = wl_columnar_ops_lftj_attempt_step(&record->lftj, &done,
+                funding, funding_id);
         if (rc) {
-            record->semantic_result = rc;
-            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            record->pending_action = record->phase;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+            return rc;
         } else if (done) {
             if (record->lftj.semantic_result) {
                 record->semantic_result = record->lftj.semantic_result;
@@ -1799,7 +1801,13 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         if (record->lftj.identity
             && record->lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
             bool done = false;
-            (void)wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done);
+            rc = wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done,
+                    funding, funding_id);
+            if (rc) {
+                record->pending_action = record->phase;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+                return rc;
+            }
             if (!done) return 0;
             if (!record->semantic_result && record->lftj.semantic_result)
                 record->semantic_result = record->lftj.semantic_result;

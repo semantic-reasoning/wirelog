@@ -6578,6 +6578,8 @@ col_controlled_step_finish(wl_col_session_t *sess,
     step->operation_id = 0;
     step->relation_active = false;
     step->primary_result = 0;
+    step->refused = result != 0
+        && result != WL_EVALUATION_CONTROL_WORK_LIMIT;
     return rc;
 }
 

@@ -764,6 +764,17 @@ both input protections. Retrying after either terminal stop starts a fresh
 merge from the unchanged input relations under a new control attempt. The
 primitive does not yet connect to recursive evaluator dispatch or enable
 controlled recursive STEP.
+Generated LFTJ operators in the supported serial controlled composition now
+use an internal resumable attempt. It charges source-name bytes and candidate
+lookups during discovery, copies at most 256 scalar cells per action, and uses
+a bottom-up merge sort with at most 256 compare/copy units per action. Join
+seek, candidate traversal, output-row construction and output-cell writes are
+charged before work; the controlled LFTJ route refuses schemas wider than 64
+columns. Each cleanup retry validates and charges its own live funding grant;
+reader-gate and governor-credit releases perform at most one CAS per action.
+Relation destruction, append-writer finalization, allocator/Arrow release and
+stack publication remain synchronous cooperative cleanup boundaries. This
+route does not make other LFTJ entry points or fallback paths controlled.
 
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
@@ -1441,7 +1452,8 @@ Raw references and coverage for those routes remain, with this split:
 
 This adds bounded preflight for supported serial nonrecursive controlled STEP
 plans. It does not complete recursive/differential/weighted execution,
-TDD/parallel, LFTJ/K-fusion, controlled SNAPSHOT, or full issue #1821.
+TDD/parallel, remaining LFTJ fallback paths, K-fusion, controlled SNAPSHOT, or
+full issue #1821.
 
 ### Resumable observer baseline construction (internal opt-in)
 

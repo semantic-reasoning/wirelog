@@ -6347,6 +6347,8 @@ typedef struct wl_columnar_lftj_attempt {
     wl_col_session_t *session;
     col_rel_t **registry;
     uint32_t registry_count;
+    uint32_t cleanup_cursor;
+    uint8_t cleanup_input_stage;
     wl_evaluation_control_t *control;
     uint64_t attempt_id;
     wl_columnar_lftj_attempt_phase_t phase;
@@ -6363,7 +6365,7 @@ typedef struct wl_columnar_lftj_attempt {
     wl_columnar_memory_reservation_t scratch_reservation;
     bool scratch_reserved, scratch_committed, output_pass;
     col_rel_t *output;
-    col_rel_append_batch_t writer;
+    wl_columnar_relation_append_batch_t writer;
     int64_t key, max_key;
     wl_columnar_lftj_join_phase_t join_phase;
     uint32_t join_index, seek_lo, seek_hi, seek_mid;
@@ -6555,7 +6557,8 @@ extern void (*wl_columnar_eval_stack_test_binary_checkpoint)(
  * Every action uses fresh independent, exclusively host-owned funding. Its
  * control/active generation/lifetime cannot finish/reset/begin/transfer until
  * the complete host action returns; cancellation may latch normally. Own384,
- * nested CONCAT maximum1152 (parent+B+A). A deeper funding refusal may leave
+ * nested CONCAT maximum1152 (parent+B+A); each LFTJ cleanup action costs one
+ * additional unit. A deeper funding refusal may leave
  * genuine PENDING; consume its protocol on a later grant without promotion.
  * Successful completed counts every opcode, including each VARIABLE.
  * Old step/consume/ACK cannot operate these distinct lifecycle phases. */
@@ -6574,8 +6577,10 @@ int wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *,
 int wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *,
     const wl_plan_op_t *, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, wl_evaluation_control_t *, uint64_t, const void *);
-int wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *, bool *);
-int wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *, bool *);
+int wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *, bool *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *, bool *,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_composed_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);

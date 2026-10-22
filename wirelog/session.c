@@ -207,8 +207,11 @@ wl_session_operation_end_step(wl_session_t *session,
     if (wl_session_admission_lock(admission) != 0)
         wl_session_gate_fatal();
     admission->active_operations--;
-    admission->controlled_step_pending = continuation_pending
-        || state == WL_CONTROLLED_STEP_PENDING;
+    /* Only a STEP that returned EAGAIN with its live operation identity has
+     * transferred a continuation to this caller. A backend EBUSY caused by a
+     * separately parked frame must not poison session admission as though it
+     * were a continuation created by this STEP call. */
+    admission->controlled_step_pending = continuation_pending;
     if (state == WL_CONTROLLED_STEP_COMPLETE)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_IDLE)
@@ -638,7 +641,7 @@ wl_session_try_destroy(wl_session_t **session_slot)
     if (wl_session_admission_lock(admission) != 0)
         return EIO;
     if (admission->closing || admission->active_operations != 0
-        || admission->exclusive_attempt) {
+        || admission->exclusive_attempt || admission->controlled_step_pending) {
         wl_session_checked_unlock(admission);
         return EBUSY;
     }
@@ -660,11 +663,12 @@ wl_session_destroy(wl_session_t *session)
     if (admission) {
         if (wl_session_admission_lock(admission) != 0)
             wl_session_gate_fatal();
-        bool parked = admission->exclusive_attempt != NULL;
+        bool parked = admission->exclusive_attempt != NULL
+            || admission->controlled_step_pending;
         wl_session_checked_unlock(admission);
         if (parked) {
-            fputs("wl_session_destroy: live exclusive attempt; use "
-                "wl_session_try_destroy after ACK\n", stderr);
+            fputs("wl_session_destroy: live attempt; use "
+                "wl_session_try_destroy after completion/ACK\n", stderr);
             wl_session_gate_fatal();
         }
     }
@@ -772,16 +776,18 @@ wl_session_step(wl_session_t *session)
     else
         rc = session->backend->session_step(session);
     if (controlled) {
-        bool pending = rc == EAGAIN
-            && wl_evaluation_control_active_attempt_id(
-            session->evaluation_control) != 0;
-        if (rc == EAGAIN && !pending)
-            rc = EIO;
         wl_controlled_step_state_t state =
             session->backend
             && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
+        bool pending = (rc == EAGAIN
+            && wl_evaluation_control_active_attempt_id(
+                session->evaluation_control) != 0)
+            || (rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && state == WL_CONTROLLED_STEP_PENDING);
+        if (rc == EAGAIN && !pending)
+            rc = EIO;
         wl_session_operation_end_step(session, state, pending);
     } else {
         wl_session_operation_end(session);

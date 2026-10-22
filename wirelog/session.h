@@ -174,8 +174,9 @@ wl_session_testhook_after_worker_lease_release(wl_session_t *session);
  * tuple/delta callback; such reentrant destruction is unsupported.  The
  * operation admission guard waits for admitted work to finish before backend
  * teardown and therefore cannot safely wait for the operation that called it.
- * Calling this with a parked internal exclusive attempt is a fatal contract
- * violation; use wl_session_try_destroy() and retry after attempt ACK.
+ * Calling this with a parked internal exclusive attempt or controlled STEP
+ * continuation is a fatal contract violation; use wl_session_try_destroy()
+ * and retry after the continuation completes and is acknowledged.
  */
 void
 wl_session_destroy(wl_session_t *session);
