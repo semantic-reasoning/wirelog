@@ -2724,6 +2724,24 @@ wl_columnar_merge_incremental_delta_attempt_validate(col_rel_t *source,
         != attempt->source_snapshot.storage_generation
         || source->nrows != attempt->source_nrows)
         return EBUSY;
+    if (attempt->external_candidate) {
+        if (!attempt->candidate || !attempt->candidate_reader_held
+            || attempt->candidate_reader.identity
+            != (uintptr_t)&attempt->candidate_reader
+            || attempt->candidate_reader.owner
+            != &attempt->candidate->source_access
+            || attempt->candidate_reader.secondary_owner
+            != &attempt->candidate->descriptor_access
+            || source->sorted_nrows < source->nrows
+            || (source->nrows && (!source->columns || !source->columns[0]))
+            || (attempt->candidate->nrows
+            && (!attempt->candidate->columns
+            || !attempt->candidate->columns[0]))
+            || !wl_columnar_relation_snapshot_equal(
+                attempt->candidate_snapshot,
+                wl_columnar_relation_snapshot(attempt->candidate)))
+            return EBUSY;
+    }
     return 0;
 }
 
@@ -2734,7 +2752,24 @@ wl_columnar_merge_incremental_delta_attempt_discard_live(
     if (attempt->delta)
         col_rel_destroy(attempt->delta);
     attempt->delta = NULL;
-    col_rel_mutable_image_discard(&attempt->transaction);
+    /* Release the two relation protections in reverse acquisition order. */
+    if (attempt->candidate_first) {
+        if (attempt->transaction.source)
+            col_rel_mutable_image_discard(&attempt->transaction);
+        if (attempt->candidate_reader_held) {
+            if (col_rel_source_reader_release(&attempt->candidate_reader) != 0)
+                abort();
+            attempt->candidate_reader_held = false;
+        }
+    } else {
+        if (attempt->candidate_reader_held) {
+            if (col_rel_source_reader_release(&attempt->candidate_reader) != 0)
+                abort();
+            attempt->candidate_reader_held = false;
+        }
+        if (attempt->transaction.source)
+            col_rel_mutable_image_discard(&attempt->transaction);
+    }
     memset(attempt, 0, sizeof(*attempt));
 }
 
@@ -2757,6 +2792,7 @@ enum {
     WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SOURCE_GRID = 0,
     WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_IMAGE_GRID = 1,
     WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_MERGE_GRID = 2,
+    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID = 3,
 };
 
 static int
@@ -2784,14 +2820,18 @@ wl_columnar_merge_incremental_delta_compare_step(
 
     const col_rel_t *image = attempt->transaction.image;
     if (source->ncols != image->ncols
-        || left_grid > WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_MERGE_GRID
-        || right_grid > WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_MERGE_GRID
+        || left_grid > WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
+        || right_grid > WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
         || left_row >=
         (left_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SOURCE_GRID
-            ? source->nrows : image->nrows)
+            ? source->nrows
+            : left_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
+                ? attempt->candidate_nrows : image->nrows)
         || right_row >=
         (right_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SOURCE_GRID
-            ? source->nrows : image->nrows))
+            ? source->nrows
+            : right_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
+                ? attempt->candidate_nrows : image->nrows))
         return EINVAL;
     while (attempt->compare_column < source->ncols) {
         int rc = wl_columnar_merge_incremental_delta_charge(attempt, remaining,
@@ -2804,13 +2844,15 @@ wl_columnar_merge_incremental_delta_compare_step(
             ? source->columns
             : left_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_IMAGE_GRID
                 ? image->columns
-            : image->merge_columns;
+            : left_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
+                ? attempt->candidate->columns : image->merge_columns;
         int64_t **right = right_grid ==
             WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SOURCE_GRID
             ? source->columns
             : right_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_IMAGE_GRID
                 ? image->columns
-            : image->merge_columns;
+            : right_grid == WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_CANDIDATE_GRID
+                ? attempt->candidate->columns : image->merge_columns;
         if (!left || !right)
             return EINVAL;
         int64_t a = left[c][left_row];
@@ -2881,9 +2923,81 @@ wl_columnar_merge_incremental_delta_run_advance(
     *high = attempt->run_ends[*run];
 }
 
-int
-wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
-    uint32_t old_nrows, wl_columnar_merge_incremental_delta_attempt_t *attempt,
+static bool
+wl_columnar_merge_staged_arrow_schema_equal(
+    const struct ArrowSchema *left, const struct ArrowSchema *right,
+    uint32_t depth)
+{
+    if (depth > 8 || !left || !right
+        || ((left->format == NULL) != (right->format == NULL))
+        || ((left->name == NULL) != (right->name == NULL))
+        || ((left->metadata == NULL) != (right->metadata == NULL))
+        || left->metadata != NULL || right->metadata != NULL
+        || left->flags != right->flags
+        || left->n_children != right->n_children
+        || (left->n_children && (!left->children || !right->children)))
+        return false;
+    if ((left->format && strcmp(left->format, right->format) != 0)
+        || (left->name && strcmp(left->name, right->name) != 0))
+        return false;
+    if ((left->dictionary == NULL) != (right->dictionary == NULL))
+        return false;
+    if (left->dictionary
+        && !wl_columnar_merge_staged_arrow_schema_equal(left->dictionary,
+        right->dictionary, depth + 1u))
+        return false;
+    for (int64_t i = 0; i < left->n_children; i++)
+        if (!wl_columnar_merge_staged_arrow_schema_equal(left->children[i],
+            right->children[i], depth + 1u))
+            return false;
+    return true;
+}
+
+static bool
+wl_columnar_merge_staged_metadata_equal(const col_rel_t *source,
+    const col_rel_t *candidate)
+{
+    if (source->ncols != candidate->ncols
+        || source->declared_ncols != candidate->declared_ncols
+        || source->schema_ok != candidate->schema_ok
+        || source->has_graph_column != candidate->has_graph_column
+        || source->graph_col_idx != candidate->graph_col_idx
+        || source->compound_kind != candidate->compound_kind
+        || source->compound_count != candidate->compound_count
+        || source->compound_arity_len != candidate->compound_arity_len
+        || source->inline_physical_offset != candidate->inline_physical_offset
+        || (source->compound_arity_len
+        && (!source->compound_arity_map
+        || !candidate->compound_arity_map))
+        || (source->schema_ok
+        && !wl_columnar_merge_staged_arrow_schema_equal(&source->schema,
+        &candidate->schema, 0)))
+        return false;
+    for (uint32_t c = 0; c < source->ncols; c++) {
+        wirelog_column_type_t source_type = source->column_types
+            ? source->column_types[c] : WIRELOG_TYPE_INT64;
+        wirelog_column_type_t candidate_type = candidate->column_types
+            ? candidate->column_types[c] : WIRELOG_TYPE_INT64;
+        const char *source_name = source->col_names
+            ? source->col_names[c] : NULL;
+        const char *candidate_name = candidate->col_names
+            ? candidate->col_names[c] : NULL;
+        if (source_type != candidate_type
+            || ((source_name == NULL) != (candidate_name == NULL))
+            || (source_name && strcmp(source_name, candidate_name) != 0))
+            return false;
+    }
+    for (uint32_t i = 0; i < source->compound_arity_len; i++)
+        if (source->compound_arity_map[i]
+            != candidate->compound_arity_map[i])
+            return false;
+    return true;
+}
+
+static int
+wl_columnar_merge_incremental_delta_attempt_begin_internal(col_rel_t *source,
+    const col_rel_t *candidate, uint32_t old_nrows,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt,
     wl_evaluation_control_t *control)
 {
     uint64_t control_id;
@@ -2905,22 +3019,81 @@ wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
     attempt->identity = (uintptr_t)attempt;
     attempt->control = control;
     attempt->control_attempt_id = control_id;
+    attempt->candidate = candidate;
+    attempt->external_candidate = candidate != NULL;
+    if (candidate) {
+        /* Pointer identity is immutable and can be rejected without reading
+        * relation metadata. Other admission checks run under both gates. */
+        if (candidate == source) {
+            rc = EINVAL;
+            goto fail;
+        }
+        attempt->candidate_first = (uintptr_t)candidate < (uintptr_t)source;
+    }
+
+    /* Gates are nonblocking. A stable address order prevents reciprocal
+     * source/candidate attempts from each retaining the other's needed gate. */
+    if (candidate && attempt->candidate_first) {
+        rc = col_rel_source_reader_acquire(candidate,
+                &attempt->candidate_reader);
+        if (rc != 0)
+            goto fail;
+        attempt->candidate_reader_held = true;
+    }
     rc = wl_columnar_relation_mutable_image_prepare_empty(source,
             &attempt->transaction, 0);
     if (rc != 0)
         goto fail;
+    if (candidate && !attempt->candidate_first) {
+        rc = col_rel_source_reader_acquire(candidate,
+                &attempt->candidate_reader);
+        if (rc != 0)
+            goto fail;
+        attempt->candidate_reader_held = true;
+    }
+    bool all_int64 = source->ncols > 0;
+    for (uint32_t c = 0; candidate && c < source->ncols; c++)
+        if (source->column_types
+            && source->column_types[c] != WIRELOG_TYPE_INT64)
+            all_int64 = false;
+    if (candidate && (source->storage_owner != source
+        || candidate->storage_owner != candidate
+        || !all_int64
+        || source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || source->compound_arity_len != 0 || source->has_graph_column
+        || !wl_columnar_merge_staged_metadata_equal(source, candidate)
+        || source->timestamps || candidate->timestamps
+        || source->dedup_slots || candidate->dedup_slots
+        || candidate->pool_owned || candidate->arena_owned
+        || candidate->col_shared || source->sorted_nrows < source->nrows
+        || (source->nrows && (!source->columns || !source->columns[0]))
+        || (candidate->nrows
+        && (!candidate->columns || !candidate->columns[0])))) {
+        rc = ENOTSUP;
+        goto fail;
+    }
+    if (candidate && candidate->nrows > UINT32_MAX - source->nrows) {
+        rc = EOVERFLOW;
+        goto fail;
+    }
     attempt->source_snapshot = wl_columnar_relation_snapshot(source);
+    if (candidate)
+        attempt->candidate_snapshot = wl_columnar_relation_snapshot(candidate);
     attempt->source_nrows = source->nrows;
-    attempt->old_nrows = old_nrows;
-    attempt->no_op = old_nrows >= source->nrows;
+    attempt->old_nrows = candidate ? source->nrows : old_nrows;
+    attempt->candidate_nrows = candidate ? candidate->nrows : 0;
+    attempt->input_nrows = candidate
+        ? source->nrows + candidate->nrows : source->nrows;
+    attempt->no_op = candidate
+        ? candidate->nrows == 0 : old_nrows >= source->nrows;
     attempt->phase = attempt->no_op ? WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DONE
         : WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY;
     attempt->fast_path = attempt->no_op;
     attempt->sort_width = 1;
     attempt->sort_source_primary = true;
 
-    capacity = !attempt->no_op && source->nrows
-        ? source->nrows : source->ncols ? 1u : 0u;
+    capacity = !attempt->no_op && attempt->input_nrows
+        ? attempt->input_nrows : source->ncols ? 1u : 0u;
     if (capacity > 0) {
         bool denied = false;
         rc = col_rel_reserve_capacity_admitted(attempt->transaction.image,
@@ -2931,23 +3104,24 @@ wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
             goto fail;
     }
 
-    if (old_nrows > 0 && !attempt->no_op) {
+    if (attempt->old_nrows > 0 && !attempt->no_op) {
         uint32_t end = 0;
         if (source->run_count > 0 && source->run_count <= COL_MAX_RUNS
-            && source->run_ends[source->run_count - 1] == old_nrows) {
+            && source->run_ends[source->run_count - 1]
+            == attempt->old_nrows) {
             attempt->run_count = source->run_count;
             for (uint32_t i = 0; i < source->run_count; i++) {
                 uint32_t next = source->run_ends[i];
-                if (next <= end || next > old_nrows) {
+                if (next <= end || next > attempt->old_nrows) {
                     rc = EINVAL;
                     goto fail;
                 }
                 attempt->run_ends[i] = next;
                 end = next;
             }
-        } else if (source->sorted_nrows >= old_nrows) {
+        } else if (source->sorted_nrows >= attempt->old_nrows) {
             attempt->run_count = 1;
-            attempt->run_ends[0] = old_nrows;
+            attempt->run_ends[0] = attempt->old_nrows;
         } else {
             rc = EINVAL;
             goto fail;
@@ -2963,8 +3137,8 @@ wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
         if (attempt->dedup_copy_count != 0)
             attempt->phase = WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY_DEDUP;
     }
-    if (!attempt->no_op && source->nrows > 0 && source->ncols > 0) {
-        rc = col_rel_reserve_merge_grid(image, source->nrows);
+    if (!attempt->no_op && attempt->input_nrows > 0 && source->ncols > 0) {
+        rc = col_rel_reserve_merge_grid(image, attempt->input_nrows);
         if (rc != 0)
             goto fail;
     }
@@ -2988,11 +3162,32 @@ wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
     return 0;
 
 fail:
-    if (attempt->transaction.source)
+    if (attempt->transaction.source || attempt->candidate_reader_held)
         wl_columnar_merge_incremental_delta_attempt_discard_live(attempt);
     else
         memset(attempt, 0, sizeof(*attempt));
     return rc;
+}
+
+int
+wl_columnar_merge_incremental_delta_attempt_begin(col_rel_t *source,
+    uint32_t old_nrows, wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    wl_evaluation_control_t *control)
+{
+    return wl_columnar_merge_incremental_delta_attempt_begin_internal(source,
+               NULL, old_nrows, attempt, control);
+}
+
+int
+wl_columnar_merge_incremental_delta_attempt_begin_candidate(col_rel_t *source,
+    const col_rel_t *candidate,
+    wl_columnar_merge_incremental_delta_attempt_t *attempt,
+    wl_evaluation_control_t *control)
+{
+    if (!candidate)
+        return EINVAL;
+    return wl_columnar_merge_incremental_delta_attempt_begin_internal(source,
+               candidate, 0, attempt, control);
 }
 
 int
@@ -3042,11 +3237,12 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
             continue;
 
         case WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_COPY:
-            if (attempt->copy_row >= attempt->source_nrows) {
-                image->nrows = attempt->source_nrows;
+            if (attempt->copy_row >= attempt->input_nrows) {
+                image->nrows = attempt->input_nrows;
                 image->base_nrows = source->base_nrows;
-                attempt->phase =
-                    WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_FAST_OLD_MAX;
+                attempt->phase = attempt->external_candidate
+                    ? WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SORT
+                    : WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_FAST_OLD_MAX;
                 attempt->max_old_row = 0;
                 attempt->fast_scan_row = 1;
                 continue;
@@ -3063,10 +3259,15 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
                     1);
             if (rc != 0)
                 goto sliced_or_terminal;
-            int64_t value = source->columns[attempt->copy_column]
-                [attempt->copy_row];
-            if (source->column_types
-                && source->column_types[attempt->copy_column]
+            const col_rel_t *copy_source = attempt->external_candidate
+                && attempt->copy_row >= attempt->source_nrows
+                ? attempt->candidate : source;
+            uint32_t source_row = copy_source == source
+                ? attempt->copy_row : attempt->copy_row - attempt->source_nrows;
+            int64_t value = copy_source->columns[attempt->copy_column]
+                [source_row];
+            if (copy_source->column_types
+                && copy_source->column_types[attempt->copy_column]
                 == WIRELOG_TYPE_FLOAT) {
                 if (!wl_columnar_float_bits_valid(value)) {
                     rc = EINVAL;
@@ -3130,14 +3331,14 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
             continue;
 
         case WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_SORT: {
-            if (attempt->source_nrows <= 1) {
-                attempt->dedup_input = attempt->source_nrows ? 1u : 0u;
+            if (attempt->input_nrows <= 1) {
+                attempt->dedup_input = attempt->input_nrows ? 1u : 0u;
                 attempt->dedup_write = attempt->dedup_input;
                 attempt->phase = WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DEDUP;
                 continue;
             }
-            if (attempt->sort_left >= attempt->source_nrows) {
-                if (attempt->sort_width >= attempt->source_nrows
+            if (attempt->sort_left >= attempt->input_nrows) {
+                if (attempt->sort_width >= attempt->input_nrows
                     - attempt->sort_width) {
                     attempt->sort_source_primary
                         = !attempt->sort_source_primary;
@@ -3159,10 +3360,10 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
                 uint64_t mid = (uint64_t)attempt->sort_left
                     + attempt->sort_width;
                 uint64_t right = mid + attempt->sort_width;
-                attempt->sort_mid = mid < attempt->source_nrows
-                    ? (uint32_t)mid : attempt->source_nrows;
-                attempt->sort_right = right < attempt->source_nrows
-                    ? (uint32_t)right : attempt->source_nrows;
+                attempt->sort_mid = mid < attempt->input_nrows
+                    ? (uint32_t)mid : attempt->input_nrows;
+                attempt->sort_right = right < attempt->input_nrows
+                    ? (uint32_t)right : attempt->input_nrows;
                 attempt->sort_i = attempt->sort_left;
                 attempt->sort_j = attempt->sort_mid;
                 attempt->sort_out = attempt->sort_left;
@@ -3233,7 +3434,7 @@ wl_columnar_merge_incremental_delta_attempt_advance(col_rel_t *source,
         }
 
         case WL_COLUMNAR_MERGE_INCREMENTAL_DELTA_DEDUP:
-            if (attempt->dedup_input >= attempt->source_nrows) {
+            if (attempt->dedup_input >= attempt->input_nrows) {
                 image->nrows = attempt->dedup_write;
                 image->base_nrows = source->base_nrows > image->nrows
                     ? image->nrows : source->base_nrows;
@@ -3518,8 +3719,16 @@ wl_columnar_merge_incremental_delta_attempt_commit(col_rel_t *source,
         col_rel_mutable_image_discard(&attempt->transaction);
     } else {
         rc = col_rel_mutable_image_commit(&attempt->transaction);
-        if (rc != 0)
+        if (rc != 0) {
+            wl_columnar_merge_incremental_delta_attempt_discard_live(attempt);
             return rc;
+        }
+    }
+    if (attempt->candidate_reader_held) {
+        rc = col_rel_source_reader_release(&attempt->candidate_reader);
+        if (rc != 0)
+            abort();
+        attempt->candidate_reader_held = false;
     }
     *delta_out = attempt->delta;
     attempt->delta = NULL;
