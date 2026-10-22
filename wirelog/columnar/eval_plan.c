@@ -1224,15 +1224,20 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         || (session->nrels && !session->rels)) return EINVAL;
     if (controlled_materialized_batch_fallback) {
         if (!session->join_batch_bytes || session->join_batch_strict
+            || session->join_output_limit
             || begin != 0 || end != plan->op_count || initial_depth != 0
-            || plan->op_count != 4
+            || plan->op_count != 5
             || plan->ops[0].op != WL_PLAN_OP_VARIABLE
+            || (plan->ops[0].delta_mode != WL_DELTA_AUTO
+            && plan->ops[0].delta_mode != WL_DELTA_FORCE_FULL)
             || plan->ops[1].op != WL_PLAN_OP_JOIN
+            || (plan->ops[1].delta_mode != WL_DELTA_AUTO
+            && plan->ops[1].delta_mode != WL_DELTA_FORCE_FULL)
             || plan->ops[2].op != WL_PLAN_OP_FILTER
             || !plan->ops[2].filter_expr.data
             || !plan->ops[2].filter_expr.size
-            || plan->ops[plan->op_count - 1].op
-            != WL_PLAN_OP_CONSOLIDATE
+            || plan->ops[3].op != WL_PLAN_OP_MAP
+            || plan->ops[4].op != WL_PLAN_OP_CONSOLIDATE
             || plan->ops[1].materialized || !plan->ops[1].right_relation
             || !plan->ops[1].key_count || !plan->ops[1].left_keys
             || !plan->ops[1].right_keys)

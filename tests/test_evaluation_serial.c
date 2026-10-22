@@ -225,7 +225,7 @@ host_begin(fixture_t *f, const wl_plan_relation_t *plan, grant_t *grant)
 {
     int rc = wl_columnar_eval_serial_framed_attempt_begin(f->frame,
             &f->session, plan, f->operation, f->id, f->operation_identity,
-            grant->control, grant->id);
+            false, grant->control, grant->id);
     grant->finish_status = wl_evaluation_control_finish(grant->control,
             &grant->owner, 0, 0);
     return rc;
@@ -696,10 +696,11 @@ test_cleanup_receipt_attempt_identity(void)
     fixture_init(&f, 1, 2, false, false, 0);
     grant_t *grant = grant_begin(&f, 0);
     CHECK(wl_columnar_eval_serial_framed_attempt_begin(f.frame, &f.session,
-        &plan, f.operation, f.id + 1, f.operation_identity, grant->control,
+        &plan, f.operation, f.id + 1, f.operation_identity, false,
+        grant->control,
         grant->id) == EINVAL);
     CHECK(wl_columnar_eval_serial_framed_attempt_begin(f.frame, &f.session,
-        &plan, f.operation, f.id, f.operation_identity + 1,
+        &plan, f.operation, f.id, f.operation_identity + 1, false,
         grant->control, grant->id) == EINVAL);
     grant->finish_status = wl_evaluation_control_finish(grant->control,
             &grant->owner, 0, 0);
@@ -1890,6 +1891,419 @@ test_controlled_session_join_step(void)
         wl_plan_free(plan);
         wirelog_program_free(program);
     }
+}
+
+static void
+test_controlled_batch_join_filter_map_step(void)
+{
+    char a_name[101], b_name[101], source[1024];
+    memset(a_name, 'a', sizeof(a_name) - 1); a_name[100] = '\0';
+    memset(b_name, 'b', sizeof(b_name) - 1); b_name[100] = '\0';
+    int written = snprintf(source, sizeof(source),
+            ".decl %s(k:int64,x:int64)\n"
+            ".decl %s(k:int64,y:int64)\n"
+            ".decl output(k:int64,x:int64,k2:int64,y:int64)\n"
+            "output(k,x,k,y) :- %s(k,x), %s(k,y), x < y.\n",
+            a_name, b_name, a_name, b_name);
+    CHECK(written > 0 && (size_t)written < sizeof(source));
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *output = NULL;
+    for (uint32_t si = 0; si < plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri)
+            if (!strcmp(plan->strata[si].relations[ri].name, "output"))
+                output = &plan->strata[si].relations[ri];
+    CHECK(output && output->op_count == 5
+        && output->ops[0].op == WL_PLAN_OP_VARIABLE
+        && output->ops[1].op == WL_PLAN_OP_JOIN
+        && output->ops[2].op == WL_PLAN_OP_FILTER
+        && output->ops[3].op == WL_PLAN_OP_MAP
+        && output->ops[4].op == WL_PLAN_OP_CONSOLIDATE);
+
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(1, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    columnar->join_batch_bytes = 224;
+    const int64_t left[] = {1, 1};
+    const int64_t right[] = {1, 2};
+    CHECK(!wl_session_insert(session, a_name, left, 1, 2));
+    CHECK(!wl_session_insert(session, b_name, right, 1, 2));
+
+    int rc = wl_session_step(session);
+    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_evaluation_control_report_t stopped_report;
+    CHECK(!wl_evaluation_control_report(control, &stopped_report)
+        && stopped_report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && stopped_report.attempt_id);
+    CHECK(!wl_evaluation_control_active_attempt_id(control)
+        && !columnar->cleanup_active
+        && !session_find_rel(columnar, "output")
+        && !columnar->controlled_materialized_batch_published_count);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
+
+    rc = wl_session_step(session);
+    CHECK(rc == EAGAIN);
+    uint64_t operation_id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(operation_id && !columnar->cleanup_active);
+    CHECK(wl_session_snapshot(session, NULL, NULL) == EBUSY);
+    wl_evaluation_control_request_cancel(control);
+    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!wl_evaluation_control_active_attempt_id(control)
+        && !columnar->cleanup_active
+        && !session_find_rel(columnar, "output")
+        && !columnar->controlled_materialized_batch_published_count);
+    uint64_t cancelled_id = operation_id;
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
+
+    rc = wl_session_step(session);
+    CHECK(rc == EAGAIN);
+    operation_id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(operation_id > cancelled_id && !columnar->cleanup_active);
+    bool finished = false;
+    for (unsigned turn = 0; turn < 10000; ++turn) {
+        rc = wl_session_step(session);
+        if (rc == EAGAIN) {
+            CHECK(wl_evaluation_control_active_attempt_id(control)
+                == operation_id);
+            continue;
+        }
+        CHECK(!rc);
+        finished = true;
+        break;
+    }
+    CHECK(finished && !wl_evaluation_control_active_attempt_id(control));
+    const col_rel_t *result = session_find_rel(columnar, "output");
+    CHECK(result && result->nrows == 1 && result->ncols == 4);
+    CHECK(result->columns[0][0] == 1 && result->columns[1][0] == 1
+        && result->columns[2][0] == 1 && result->columns[3][0] == 2);
+    CHECK(columnar->controlled_materialized_batch_published_count == 1);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+typedef struct {
+    bool present;
+    uint32_t rows;
+} controlled_batch_delta_t;
+
+static void
+controlled_batch_add_delta(wl_col_session_t *session, const char *name,
+    const col_rel_t *schema, const int64_t *rows, uint32_t row_count)
+{
+    col_rel_t *delta = col_rel_new_like(name, schema);
+    CHECK(delta);
+    delta->nrows = 0;
+    delta->base_nrows = 0;
+    delta->sorted_nrows = 0;
+    delta->run_count = 0;
+    bool denied = false;
+    CHECK(!col_rel_append_rows_atomic(delta, rows, row_count, schema->ncols,
+        &denied));
+    CHECK(!session_add_rel(session, delta));
+}
+
+static int
+controlled_batch_run_to_terminal(wl_session_t *session,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_session_step(session);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    for (unsigned turn = 0; rc == EAGAIN && id && turn < 10000; ++turn) {
+        rc = wl_session_step(session);
+        if (rc == EAGAIN)
+            CHECK(wl_evaluation_control_active_attempt_id(control) == id);
+    }
+    return rc;
+}
+
+static uint32_t controlled_batch_join_scan_checkpoints;
+
+static void
+controlled_batch_join_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)progress;
+    /* Ordinary JOIN phase 17 fires after a candidate pair is selected. */
+    if (phase == 17) {
+        ++controlled_batch_join_scan_checkpoints;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+test_controlled_batch_delta_selectors(void)
+{
+    static const char source[] =
+        ".decl a(k:int64,x:int64)\n"
+        ".decl b(k:int64,y:int64)\n"
+        ".decl output(k:int64,x:int64,k2:int64,y:int64)\n"
+        "output(k,x,k,y) :- a(k,x), b(k,y), x < y.\n";
+    const int64_t left_rows[] = {1, 1, 1, 2};
+    const int64_t right_rows[] = {1, 3, 1, 4};
+    const int64_t left_delta_equal[] = {7, 70, 8, 80};
+    const int64_t left_delta_larger[] = {7, 70, 8, 80, 9, 90};
+    const int64_t left_delta_smaller[] = {7, 70};
+    const int64_t right_delta_equal[] = {7, 70, 8, 80};
+    const int64_t right_delta_larger[] = {7, 70, 8, 80, 9, 90};
+    const int64_t right_delta_smaller[] = {7, 70};
+    struct selector_case {
+        controlled_batch_delta_t left, right;
+        wl_delta_mode_t left_mode, right_mode;
+        bool reject;
+    } cases[] = {
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{true, 0}, {true, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{true, 2}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{true, 3}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{false, 0}, {true, 2}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{false, 0}, {true, 3}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{true, 1}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, true},
+        {{false, 0}, {true, 1}, WL_DELTA_AUTO, WL_DELTA_AUTO, true},
+        {{true, 1}, {true, 1}, WL_DELTA_FORCE_FULL,
+         WL_DELTA_FORCE_FULL, false},
+        {{false, 0}, {false, 0}, WL_DELTA_FORCE_DELTA,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, WL_DELTA_FORCE_EMPTY,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, WL_DELTA_FORCE_EMPTY_AFTER_SEED,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, (wl_delta_mode_t)99,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_AUTO, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_AUTO, false},
+        {{true, 2}, {true, 3}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_FORCE_DELTA, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_FORCE_EMPTY, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         WL_DELTA_FORCE_EMPTY_AFTER_SEED, true},
+        {{false, 0}, {false, 0}, WL_DELTA_AUTO,
+         (wl_delta_mode_t)99, true}
+    };
+
+    for (unsigned ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        const wl_plan_relation_t *output_const = NULL;
+        for (uint32_t si = 0; si < plan->stratum_count; ++si)
+            for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri)
+                if (!strcmp(plan->strata[si].relations[ri].name, "output"))
+                    output_const = &plan->strata[si].relations[ri];
+        wl_plan_relation_t *output = (wl_plan_relation_t *)output_const;
+        CHECK(output && output->op_count == 5);
+        wl_plan_op_t *mutable_ops = (wl_plan_op_t *)output->ops;
+        mutable_ops[0].delta_mode = cases[ci].left_mode;
+        mutable_ops[1].delta_mode = cases[ci].right_mode;
+        if (ci == 14) output->op_count = 4;
+
+        wl_evaluation_control_t *control = NULL;
+        uint64_t limit = UINT64_C(1000000);
+        CHECK(!wl_evaluation_control_create(limit, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *base = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &base));
+        wl_col_session_t *session = (wl_col_session_t *)base;
+        session->join_batch_bytes = 224;
+        if (ci == 13) session->join_batch_strict = true;
+        const int64_t *left_delta_rows = cases[ci].left.rows == 1
+            ? left_delta_smaller : cases[ci].left.rows == 2
+            ? left_delta_equal : left_delta_larger;
+        const int64_t *right_delta_rows = cases[ci].right.rows == 1
+            ? right_delta_smaller : cases[ci].right.rows == 2
+            ? right_delta_equal : right_delta_larger;
+        const int64_t no_output_left[] = {1, 4, 1, 5};
+        const int64_t no_output_right[] = {1, 3, 1, 3};
+        const int64_t *selected_left = ci == 15
+            ? no_output_left : left_rows;
+        const int64_t *selected_right = ci == 15
+            ? no_output_right : right_rows;
+        CHECK(!wl_session_insert(base, "a", selected_left, 2, 2));
+        CHECK(!wl_session_insert(base, "b", selected_right, 2, 2));
+        const col_rel_t *left_full = session_find_rel(session, "a");
+        const col_rel_t *right_full = session_find_rel(session, "b");
+        CHECK(left_full && right_full);
+        if (cases[ci].left.present)
+            controlled_batch_add_delta(session, "$d$a", left_full,
+                left_delta_rows, cases[ci].left.rows);
+        if (cases[ci].right.present)
+            controlled_batch_add_delta(session, "$d$b", right_full,
+                right_delta_rows, cases[ci].right.rows);
+
+        if (ci == 15) {
+            controlled_batch_join_scan_checkpoints = 0;
+            wl_columnar_join_test_attempt_checkpoint =
+                controlled_batch_join_checkpoint;
+        }
+        int rc = ci == 15
+            ? controlled_batch_run_to_terminal(base, control)
+            : wl_session_step(base);
+        if (ci == 15)
+            wl_columnar_join_test_attempt_checkpoint = NULL;
+        if (cases[ci].reject) {
+            CHECK(rc == ENOTSUP);
+            CHECK(!wl_evaluation_control_active_attempt_id(control)
+                && !session->cleanup_active
+                && !session_find_rel(session, "output")
+                && !session->controlled_materialized_batch_published_count);
+        } else {
+            if (ci == 15) {
+                CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED
+                    && controlled_batch_join_scan_checkpoints > 0);
+                CHECK(!session_find_rel(session, "output")
+                    && !session->controlled_materialized_batch_published_count
+                    && !wl_evaluation_control_active_attempt_id(control));
+                wl_evaluation_control_report_t cancelled_report;
+                CHECK(!wl_evaluation_control_report(control,
+                    &cancelled_report)
+                    && cancelled_report.result
+                    == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(!wl_evaluation_control_reset(control));
+                CHECK(!wl_evaluation_control_configure(control,
+                    UINT64_C(1000000)));
+                rc = wl_session_step(base);
+            }
+            uint64_t id = wl_evaluation_control_active_attempt_id(control);
+            CHECK((rc == 0 || (rc == EAGAIN && id))
+                && !session->cleanup_active);
+            bool done = rc == 0;
+            for (unsigned turn = 0; turn < 10000; ++turn) {
+                rc = wl_session_step(base);
+                if (rc == EAGAIN) {
+                    CHECK(wl_evaluation_control_active_attempt_id(control)
+                        == id);
+                    continue;
+                }
+                CHECK(!rc);
+                done = true;
+                break;
+            }
+            CHECK(done && !wl_evaluation_control_active_attempt_id(control));
+            const col_rel_t *result = session_find_rel(session, "output");
+            /* Full inputs produce the four key-1 combinations. Equal/larger
+             * delta contents are
+             * deliberately disjoint so accidental delta selection differs. */
+            CHECK(result && result->nrows == (ci == 15 ? 0u : 4u)
+                && result->ncols == 4);
+            if (ci != 15) CHECK(result->columns[1][0] == 1
+                    && result->columns[3][0] == 3
+                    && result->columns[1][1] == 1 && result->columns[3][1] == 4
+                    && result->columns[1][2] == 2 && result->columns[3][2] == 3
+                    && result->columns[1][3] == 2 &&
+                    result->columns[3][3] == 4);
+            CHECK(session->controlled_materialized_batch_published_count
+                == 1);
+        }
+        wl_session_destroy(base);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
+static void
+test_controlled_batch_child_domain_rejection(void)
+{
+    static const char source[] =
+        ".decl a(k:int64,x:int64)\n"
+        ".decl b(k:int64,y:int64)\n"
+        ".decl output(k:int64,x:int64,k2:int64,y:int64)\n"
+        "output(k,x,k,y) :- a(k,x), b(k,y), x < y.\n";
+    const int64_t matching_left[] = {1, 1, 1, 2};
+    const int64_t matching_right[] = {1, 3, 1, 4};
+    const int64_t empty_left[] = {1, 1};
+    const int64_t empty_right[] = {2, 3};
+
+    for (unsigned child = 0; child < 2; ++child)
+        for (unsigned empty = 0; empty < 2; ++empty) {
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_plan_relation_t *output = NULL;
+            for (uint32_t si = 0; si < plan->stratum_count; ++si)
+                for (uint32_t ri = 0;
+                    ri < plan->strata[si].relation_count; ++ri)
+                    if (!strcmp(plan->strata[si].relations[ri].name,
+                        "output"))
+                        output = (wl_plan_relation_t *)&plan->strata[si].
+                            relations[ri];
+            CHECK(output && output->op_count == 5);
+            wl_plan_op_t *ops = (wl_plan_op_t *)output->ops;
+            uint8_t *byte = child == 0 ? ops[2].filter_expr.data
+                : ops[3].map_exprs && ops[3].map_expr_count
+                ? ops[3].map_exprs[0].data : NULL;
+            CHECK(byte && (child == 0 ? ops[2].filter_expr.size
+                : ops[3].map_exprs[0].size));
+            uint8_t original = byte[0];
+            byte[0] = UINT8_C(0xff);
+
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(UINT64_C(1000000),
+                &control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            wl_session_t *base = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                plan, 1, &options, &base));
+            wl_col_session_t *session = (wl_col_session_t *)base;
+            session->join_batch_bytes = 224;
+            CHECK(!wl_session_insert(base, "a", empty
+                ? empty_left : matching_left, empty ? 1 : 2, 2));
+            CHECK(!wl_session_insert(base, "b", empty
+                ? empty_right : matching_right, empty ? 1 : 2, 2));
+
+            CHECK(controlled_batch_run_to_terminal(base, control)
+                == ENOTSUP);
+            CHECK(!wl_evaluation_control_active_attempt_id(control)
+                && !session->cleanup_active && !session->cleanup_pending
+                && !session->cleanup_active_count
+                && !session->cleanup_reserved_bytes
+                && !session_find_rel(session, "output")
+                && !session->controlled_materialized_batch_published_count);
+            CHECK(session_find_rel(session, "a")->nrows == (empty ? 1u : 2u)
+                && session_find_rel(session, "b")->nrows == (empty ? 1u : 2u));
+
+            byte[0] = original;
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control,
+                UINT64_C(1000000)));
+            CHECK(!controlled_batch_run_to_terminal(base, control));
+            const col_rel_t *result = session_find_rel(session, "output");
+            CHECK(result && result->ncols == 4
+                && result->nrows == (empty ? 0u : 4u)
+                && session->controlled_materialized_batch_published_count
+                == 1);
+            wl_session_destroy(base);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan);
+            wirelog_program_free(program);
+        }
 }
 
 static void
@@ -5341,6 +5755,9 @@ main(void)
 {
     test_controlled_session_step_resume();
     test_controlled_session_join_step();
+    test_controlled_batch_join_filter_map_step();
+    test_controlled_batch_delta_selectors();
+    test_controlled_batch_child_domain_rejection();
     test_controlled_session_step_prefix_resume();
     test_controlled_session_step_destroy_drain();
     test_controlled_session_snapshot_publication();

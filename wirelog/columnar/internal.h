@@ -2119,6 +2119,9 @@ struct wl_columnar_retained_eval_entry;
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_controlled_step wl_columnar_controlled_step_t;
+bool wl_columnar_session_controlled_batch_authorized(
+    const struct wl_col_session_t *, const wl_evaluation_control_t *,
+    uint64_t, uint64_t);
 typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
     uint32_t relation_count;
@@ -2391,6 +2394,8 @@ typedef struct wl_col_session_t {
     bool join_batch_strict;
     uint32_t join_batch_fallback_count;
     uint8_t join_batch_last_reason;
+    /* Published, authorized controlled materializing fallback count. */
+    uint64_t controlled_materialized_batch_published_count;
     uint16_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
@@ -6737,6 +6742,7 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool source_initialized, batch_initialized, batch_done;
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
+    bool controlled_materialized_batch_fallback;
     wl_columnar_session_hash_registry_attempt_t publication;
 } wl_columnar_eval_serial_framed_attempt_t;
 
@@ -6799,6 +6805,8 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t operation_id;
     /* Stable host operation identity, distinct from the control attempt ID. */
     uint64_t operation_identity;
+    /* Frozen authorization from the controlled initial-STEP classifier. */
+    bool controlled_materialized_batch_fallback;
     wl_columnar_eval_serial_framed_host_action_t action;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     bool previous_valid;
@@ -6835,7 +6843,7 @@ bool wl_columnar_eval_serial_framed_owner_valid(
 int wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
-    uint64_t, wl_evaluation_control_t *, uint64_t);
+    uint64_t, bool, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_serial_framed_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
