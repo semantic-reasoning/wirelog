@@ -112,6 +112,235 @@ typedef struct wl_columnar_source_access_growth_gate_attempt {
     bool destination_held;
 } wl_columnar_source_access_growth_gate_attempt_t;
 
+/* A bounded, address-bound relation lease. The receipt must be zero-initialized
+ * and remain alive at its original address on its creating thread until
+ * RELEASE reaches DONE. The first descriptor_count gates are descriptor
+ * gates sorted by address; the remaining gates are storage gates sorted by
+ * address. This matches relation mutation order: all descriptors before any
+ * storage owner. Each advance performs at most one strong CAS. Partial
+ * acquisitions remain owned across retries; callers enter RELEASE exactly
+ * once on stop/abort and drain one gate per advance before discarding it. */
+#define WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_MAX 4u
+typedef enum wl_columnar_source_access_gate_mode {
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER = 1,
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER = 2
+} wl_columnar_source_access_gate_mode_t;
+
+typedef enum wl_columnar_source_access_gate_set_phase {
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_INERT = 0,
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_ACQUIRE,
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD,
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_RELEASE,
+    WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE
+} wl_columnar_source_access_gate_set_phase_t;
+
+typedef struct wl_columnar_source_access_gate_set_attempt {
+    struct wl_columnar_source_access_gate_set_attempt *identity;
+    wl_columnar_source_access_gate_t *gates[
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_MAX];
+    wl_columnar_source_access_gate_mode_t modes[
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_MAX];
+    size_t count;
+    size_t descriptor_count;
+    size_t cursor;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    wl_columnar_source_access_gate_set_phase_t phase;
+    bool thread_valid;
+} wl_columnar_source_access_gate_set_attempt_t;
+
+static inline bool
+wl_columnar_source_access_gate_set_thread_equal(
+    const wl_columnar_source_access_gate_set_attempt_t *attempt)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return attempt->thread_valid
+           && thrd_equal(attempt->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return attempt->thread_valid
+           && attempt->owner_thread == GetCurrentThreadId();
+#else
+    return attempt->thread_valid
+           && pthread_equal(attempt->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static inline bool
+wl_columnar_source_access_gate_set_shape_valid(
+    const wl_columnar_source_access_gate_set_attempt_t *attempt)
+{
+    if (!attempt || attempt->identity != attempt || !attempt->count
+        || attempt->count > WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_MAX
+        || !attempt->descriptor_count
+        || attempt->descriptor_count >= attempt->count
+        || attempt->cursor > attempt->count)
+        return false;
+    for (size_t i = 0; i < attempt->count; i++) {
+        if (!attempt->gates[i]
+            || (attempt->modes[i]
+            != WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+            && attempt->modes[i]
+            != WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER)
+            || ((i > 0 && i < attempt->descriptor_count)
+            && (uintptr_t)attempt->gates[i - 1]
+            >= (uintptr_t)attempt->gates[i])
+            || (i > attempt->descriptor_count
+            && (uintptr_t)attempt->gates[i - 1]
+            >= (uintptr_t)attempt->gates[i]))
+            return false;
+        for (size_t j = 0; j < i; j++)
+            if (attempt->gates[j] == attempt->gates[i])
+                return false;
+    }
+    switch (attempt->phase) {
+    case WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_ACQUIRE:
+        return attempt->cursor < attempt->count;
+    case WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD:
+        return attempt->cursor == attempt->count;
+    case WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_RELEASE:
+        return true;
+    case WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE:
+        return attempt->cursor == 0;
+    default:
+        return false;
+    }
+}
+
+static inline int
+wl_columnar_source_access_gate_set_attempt_begin(
+    wl_columnar_source_access_gate_set_attempt_t *attempt,
+    wl_columnar_source_access_gate_t *const *gates,
+    const wl_columnar_source_access_gate_mode_t *modes, size_t count,
+    size_t descriptor_count)
+{
+    if (!attempt || !gates || !modes || count == 0
+        || count > WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_MAX
+        || descriptor_count == 0 || descriptor_count >= count
+        || attempt->identity || attempt->count || attempt->cursor
+        || attempt->descriptor_count || attempt->phase
+        || attempt->thread_valid)
+        return EINVAL;
+    for (size_t i = 0; i < count; i++) {
+        if (!gates[i]
+            || (modes[i] != WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+            && modes[i] != WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER)
+            || ((i > 0 && i < descriptor_count)
+            && (uintptr_t)gates[i - 1] >= (uintptr_t)gates[i])
+            || (i > descriptor_count
+            && (uintptr_t)gates[i - 1] >= (uintptr_t)gates[i]))
+            return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (gates[j] == gates[i])
+                return EINVAL;
+        attempt->gates[i] = gates[i];
+        attempt->modes[i] = modes[i];
+    }
+    attempt->identity = attempt;
+    attempt->count = count;
+    attempt->descriptor_count = descriptor_count;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
+    attempt->thread_valid = true;
+    attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_ACQUIRE;
+    return 0;
+}
+
+/* Returns EAGAIN for one contended gate or after a successful intermediate
+ * acquisition/release. Returns 0 when all gates are held or fully released. */
+static inline int
+wl_columnar_source_access_gate_set_attempt_advance(
+    wl_columnar_source_access_gate_set_attempt_t *attempt)
+{
+    if (!wl_columnar_source_access_gate_set_shape_valid(attempt)
+        || !wl_columnar_source_access_gate_set_thread_equal(attempt))
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD
+        || attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE)
+        return 0;
+    if (attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_ACQUIRE) {
+        if (attempt->cursor >= attempt->count)
+            return EINVAL;
+        wl_columnar_source_access_gate_t *gate =
+            attempt->gates[attempt->cursor];
+        uint64_t observed = atomic_load_explicit(&gate->state,
+                memory_order_acquire);
+        uint64_t desired;
+        if (attempt->modes[attempt->cursor]
+            == WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER) {
+            if (observed != 0)
+                return EAGAIN;
+            desired = WL_COLUMNAR_SOURCE_ACCESS_WRITER;
+        } else {
+            if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+                return EAGAIN;
+            if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+                return EOVERFLOW;
+            desired = observed + 1u;
+        }
+        if (!atomic_compare_exchange_strong_explicit(&gate->state, &observed,
+            desired, memory_order_acquire, memory_order_relaxed))
+            return EAGAIN;
+        attempt->cursor++;
+        if (attempt->cursor == attempt->count) {
+            attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD;
+            return 0;
+        }
+        return EAGAIN;
+    }
+    if (attempt->phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_RELEASE) {
+        if (attempt->cursor == 0) {
+            attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE;
+            return 0;
+        }
+        size_t i = attempt->cursor - 1u;
+        wl_columnar_source_access_gate_t *gate = attempt->gates[i];
+        uint64_t expected = attempt->modes[i]
+            == WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+            ? WL_COLUMNAR_SOURCE_ACCESS_WRITER
+            : atomic_load_explicit(&gate->state, memory_order_acquire);
+        if (attempt->modes[i]
+            == WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+            && (expected == 0 || expected == WL_COLUMNAR_SOURCE_ACCESS_WRITER))
+            return EBUSY;
+        if (!atomic_compare_exchange_strong_explicit(&gate->state, &expected,
+            attempt->modes[i]
+            == WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+                    ? 0 : expected - 1u,
+            memory_order_release, memory_order_relaxed))
+            return EAGAIN;
+        attempt->cursor--;
+        if (attempt->cursor == 0) {
+            attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE;
+            return 0;
+        }
+        return EAGAIN;
+    }
+    return EINVAL;
+}
+
+static inline int
+wl_columnar_source_access_gate_set_attempt_release(
+    wl_columnar_source_access_gate_set_attempt_t *attempt)
+{
+    if (!wl_columnar_source_access_gate_set_shape_valid(attempt)
+        || !wl_columnar_source_access_gate_set_thread_equal(attempt)
+        || (attempt->phase != WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_ACQUIRE
+        && attempt->phase != WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD))
+        return EINVAL;
+    attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_RELEASE;
+    return 0;
+}
+
 static inline bool
 wl_columnar_source_access_growth_gate_thread_equal(
     const wl_columnar_source_access_growth_gate_attempt_t *attempt)

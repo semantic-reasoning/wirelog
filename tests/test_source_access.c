@@ -357,6 +357,191 @@ test_growth_gate_attempt(void)
 }
 
 static void
+test_gate_set_attempt(void)
+{
+    wl_columnar_source_access_gate_t gates_storage[4] = { 0 };
+    wl_columnar_source_access_gate_t *gates[4];
+    wl_columnar_source_access_gate_mode_t modes[4];
+    wl_columnar_source_access_gate_set_attempt_t attempt = { 0 }, copy;
+    wl_columnar_source_access_reader_t blocker = { 0 };
+    for (size_t i = 0; i < 4; i++) {
+        wl_columnar_source_access_gate_init(&gates_storage[i]);
+        gates[i] = &gates_storage[i];
+        modes[i] = (i == 1 || i == 3)
+            ? WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+            : WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER;
+    }
+    /* Descriptor gates are ordered first, followed by separately ordered
+     * storage gates, matching existing relation mutation sets. */
+    for (size_t first = 0; first < 4; first += 2) {
+        for (size_t i = first; i < first + 2; i++) {
+            for (size_t j = i + 1; j < first + 2; j++) {
+                if ((uintptr_t)gates[i] > (uintptr_t)gates[j]) {
+                    wl_columnar_source_access_gate_t *gate = gates[i];
+                    gates[i] = gates[j]; gates[j] = gate;
+                }
+            }
+        }
+    }
+    modes[0] = WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER;
+    modes[1] = WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER;
+    modes[2] = WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER;
+    modes[3] = WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER;
+    CHECK(wl_columnar_source_access_reader_acquire(gates[2], &blocker) == 0,
+        "gate set contention setup");
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&attempt, gates,
+        modes, 4, 2) == 0, "gate set attempt begin");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 1,
+        "gate set acquires at most one gate per advance");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 2,
+        "gate set retains ordered partial authority");
+    copy = attempt;
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&copy) == EINVAL,
+        "copied gate set receipt rejected");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 2,
+        "contended gate leaves cursor and earlier leases unchanged");
+    CHECK(wl_columnar_source_access_gate_set_attempt_release(&attempt) == 0,
+        "partial gate set begins release");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt) == EAGAIN
+        && attempt.cursor == 1,
+        "partial cleanup releases one gate per advance in reverse order");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt) == 0
+        && attempt.cursor == 0
+        && attempt.phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE,
+        "partial cleanup releases the final gate");
+    CHECK(wl_columnar_source_access_reader_release(&blocker) == 0,
+        "gate set blocker release");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt) == 0,
+        "completed gate set cleanup is idempotent");
+
+    wl_columnar_source_access_gate_set_attempt_t full = { 0 };
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&full, gates,
+        modes, 4, 2) == 0, "full gate set attempt begin");
+    for (size_t i = 0; i < 3; i++)
+        CHECK(wl_columnar_source_access_gate_set_attempt_advance(&full)
+            == EAGAIN, "full gate set bounded intermediate acquisition");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&full) == 0
+        && full.phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_HELD,
+        "full gate set held after four bounded acquisitions");
+    CHECK(wl_columnar_source_access_gate_set_attempt_release(&full) == 0,
+        "full gate set release begins");
+    for (size_t i = 0; i < 3; i++)
+        CHECK(wl_columnar_source_access_gate_set_attempt_advance(&full)
+            == EAGAIN, "full gate set bounded intermediate release");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&full) == 0
+        && full.phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE,
+        "full gate set released in reverse acquisition order");
+
+    wl_columnar_source_access_gate_t *unsorted[4] = {
+        gates[1], gates[0], gates[2], gates[3]
+    };
+    wl_columnar_source_access_gate_t *duplicate[4] = {
+        gates[0], gates[0], gates[2], gates[3]
+    };
+    wl_columnar_source_access_gate_mode_t reader_modes[4] = {
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+    };
+    wl_columnar_source_access_gate_set_attempt_t invalid = { 0 };
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&invalid,
+        unsorted, reader_modes, 4, 2) == EINVAL,
+        "gate set rejects noncanonical descriptor ordering");
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&invalid,
+        duplicate, reader_modes, 4, 2) == EINVAL,
+        "gate set rejects duplicate gate authority");
+}
+
+struct gate_set_thread_arg {
+    wl_columnar_source_access_gate_set_attempt_t *attempt;
+    int result;
+};
+
+static void *
+gate_set_advance_on_thread(void *opaque)
+{
+    struct gate_set_thread_arg *arg = opaque;
+    arg->result = wl_columnar_source_access_gate_set_attempt_advance(
+        arg->attempt);
+    return NULL;
+}
+
+static void
+test_gate_set_rejections(void)
+{
+    wl_columnar_source_access_gate_t gate = { 0 }, storage = { 0 };
+    wl_columnar_source_access_gate_t *gates[] = { &gate, &storage };
+    wl_columnar_source_access_gate_mode_t writer[] = {
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+    };
+    wl_columnar_source_access_gate_mode_t reader[] = {
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+    };
+    wl_columnar_source_access_gate_set_attempt_t attempt = { 0 };
+    struct gate_set_thread_arg arg = { &attempt, 0 };
+    wl_thread_t thread;
+    wl_columnar_source_access_gate_init(&gate);
+    wl_columnar_source_access_gate_init(&storage);
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&attempt, gates,
+        writer, 2, 1) == 0, "two-phase gate set begin");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 1,
+        "descriptor gate is acquired before any storage gate");
+    if (wl_thread_create(&thread, gate_set_advance_on_thread, &arg) != 0)
+        CHECK(0, "gate set cross-thread setup");
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == EINVAL
+        && attempt.cursor == 1
+        && atomic_load_explicit(&gate.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&storage.state, memory_order_acquire) == 0,
+        "gate set rejects cross-thread advance without changing ownership");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt) == 0,
+        "gate set acquires storage after descriptor on owner thread");
+    CHECK(wl_columnar_source_access_gate_set_attempt_release(&attempt) == 0,
+        "gate set release request accepted once");
+    CHECK(wl_columnar_source_access_gate_set_attempt_release(&attempt)
+        == EINVAL && attempt.cursor == 2,
+        "repeated release request preserves exact authority");
+    atomic_store_explicit(&storage.state, 1, memory_order_release);
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 2,
+        "release CAS refusal retains cursor for retry");
+    atomic_store_explicit(&storage.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_release);
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt)
+        == EAGAIN && attempt.cursor == 1,
+        "storage release retries before descriptor release");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&attempt) == 0
+        && attempt.phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE
+        && atomic_load_explicit(&gate.state, memory_order_acquire) == 0,
+        "release CAS retry relinquishes the writer exactly once");
+
+    atomic_store_explicit(&storage.state, WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u,
+        memory_order_release);
+    wl_columnar_source_access_gate_set_attempt_t overflow = { 0 };
+    CHECK(wl_columnar_source_access_gate_set_attempt_begin(&overflow, gates,
+        reader, 2, 1) == 0, "overflow reader receipt begin");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&overflow)
+        == EAGAIN && overflow.cursor == 1,
+        "reader overflow setup advances only descriptor gate");
+    CHECK(wl_columnar_source_access_gate_set_attempt_advance(&overflow)
+        == EOVERFLOW && overflow.cursor == 1,
+        "reader-count overflow does not acquire or advance storage gate");
+    atomic_store_explicit(&storage.state, 0, memory_order_release);
+    CHECK(wl_columnar_source_access_gate_set_attempt_release(&overflow) == 0
+        && wl_columnar_source_access_gate_set_attempt_advance(&overflow)
+        == 0
+        && overflow.phase == WL_COLUMNAR_SOURCE_ACCESS_GATE_SET_DONE,
+        "overflow receipt can be safely retired without a lease");
+}
+
+static void
 test_paired_cohort_partial_unwind(void)
 {
     wl_columnar_source_access_gate_t source = { 0 }, first = { 0 };
@@ -849,6 +1034,8 @@ main(void)
     test_paired_cohort_rejections();
     test_paired_cohort_partial_unwind();
     test_growth_gate_attempt();
+    test_gate_set_attempt();
+    test_gate_set_rejections();
     printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }
