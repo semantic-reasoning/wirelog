@@ -356,6 +356,14 @@ int wl_columnar_memory_governor_growth_commit_prepare_controlled(
     const void *expected_owner,
     wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
     wl_evaluation_control_t *control);
+/* Caller-attempt-bound form. Every forward charge and checkpoint uses the
+ * supplied ID so a stale receipt cannot debit a later control attempt. */
+int wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
 /* Mandatory cleanup, also legal after attempt end. Restores REPLACING only:
  * free incoming physical storage before the existing rollback_growth refund.
  */

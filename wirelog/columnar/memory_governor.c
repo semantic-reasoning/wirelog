@@ -721,10 +721,7 @@ wl_columnar_memory_governor_growth_commit_checkpoint(
     (void)phase;
     (void)interval;
 #endif
-    uint64_t active = wl_evaluation_control_active_attempt_id(control);
-    if (!active || active != saved_id)
-        return EINVAL;
-    return wl_evaluation_control_charge(control, 0);
+    return wl_evaluation_control_charge_attempt(control, saved_id, 0);
 }
 
 int
@@ -767,18 +764,20 @@ wl_columnar_memory_governor_growth_commit_finish(
 }
 
 int
-wl_columnar_memory_governor_growth_commit_prepare_controlled(
+wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled(
     wl_columnar_memory_reservation_t *token,
     wl_columnar_memory_governor_t *expected_governor,
     const void *expected_owner,
     wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
-    wl_evaluation_control_t *control)
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
 {
-    int rc = wl_evaluation_control_charge(control,
+    int rc = wl_evaluation_control_charge_attempt(control,
+            expected_attempt_id,
             WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_TOTAL_WORK);
     if (rc)
         return rc;
-    if (!token || !expected_governor || !expected_owner || !prepared || !ready
+    if (!control || !expected_attempt_id || !token || !expected_governor
+        || !expected_owner || !prepared || !ready
         || prepared->identity || prepared->token || prepared->governor
         || prepared->control || prepared->thread_valid || prepared->owner_bits
         || prepared->active_attempt_id || prepared->prior_bytes
@@ -787,9 +786,7 @@ wl_columnar_memory_governor_growth_commit_prepare_controlled(
         || prepared->phase != WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_INERT)
         return EINVAL;
     *ready = false;
-    uint64_t saved_id = wl_evaluation_control_active_attempt_id(control);
-    if (!saved_id)
-        return EINVAL;
+    uint64_t saved_id = expected_attempt_id;
     rc = wl_columnar_memory_governor_growth_commit_checkpoint(control, token,
             saved_id,
             WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_ARGUMENTS, 41);
@@ -872,6 +869,22 @@ claimed:
 unclaimed:
     prepared->phase = WL_COLUMNAR_MEMORY_GOVERNOR_GROWTH_COMMIT_CONSUMED;
     return rc;
+}
+
+int
+wl_columnar_memory_governor_growth_commit_prepare_controlled(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_governor_growth_commit_prepared_t *prepared, bool *ready,
+    wl_evaluation_control_t *control)
+{
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    if (!attempt_id)
+        return EINVAL;
+    return wl_columnar_memory_governor_growth_commit_prepare_attempt_controlled(
+        token, expected_governor, expected_owner, prepared, ready, control,
+        attempt_id);
 }
 
 typedef struct {

@@ -3002,10 +3002,178 @@ attempt_single_authority_tests(void)
     wl_evaluation_control_release(control);
 }
 
+static void
+append_growth_attempt_tests(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = NULL;
+    wl_columnar_memory_governor_ref_t *governor = enforcing_governor(4096);
+    col_rel_t dst, src;
+    root_init(&dst, 992);
+    root_init(&src, 993);
+    dst.ncols = src.ncols = 1;
+    dst.capacity = 2;
+    src.capacity = 2;
+    dst.nrows = 2;
+    src.nrows = 2;
+    dst.columns = calloc(1, sizeof(*dst.columns));
+    src.columns = calloc(1, sizeof(*src.columns));
+    assert(dst.columns && src.columns);
+    dst.columns[0] = calloc(dst.capacity, sizeof(int64_t));
+    src.columns[0] = calloc(src.capacity, sizeof(int64_t));
+    assert(dst.columns[0] && src.columns[0]);
+    dst.columns[0][0] = 10;
+    dst.columns[0][1] = 11;
+    src.columns[0][0] = 20;
+    src.columns[0][1] = 21;
+    dst.memory_governor = governor;
+    dst.retained_reserved_bytes = 24;
+    wl_columnar_memory_reservation_init(&dst.retained_reservation);
+    assert(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+            governor), dst.retained_reserved_bytes, &dst.retained_reservation));
+    assert(wl_columnar_memory_commit(&dst.retained_reservation, &dst));
+    assert(wl_evaluation_control_create(0, &control) == 0);
+    assert(wl_evaluation_control_attach(control, &owner) == 0);
+    assert(wl_evaluation_control_begin(control, &owner) == 0);
+    wl_columnar_relation_append_growth_attempt_t cancelled = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&cancelled, &dst,
+        &src, 0, 2, control) == 0);
+    assert(wl_columnar_relation_append_growth_attempt_abort(&cancelled,
+        ECANCELED) == EAGAIN);
+    int rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&cancelled);
+    assert(rc == ECANCELED);
+    assert(!wl_columnar_relation_append_growth_attempt_published(&cancelled));
+    assert(dst.nrows == 2 && dst.capacity == 2
+        && dst.columns[0][0] == 10 && dst.columns[0][1] == 11);
+    assert_open(&dst);
+    assert_open(&src);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(governor)
+        ->usable_bytes, 24, memory_order_release);
+    wl_columnar_relation_append_growth_attempt_t denied = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&denied, &dst,
+        &src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&denied);
+    assert(rc == ENOMEM && dst.memory_budget_denial_pending);
+    assert(dst.nrows == 2 && dst.capacity == 2
+        && governor_reserved(governor) == 24);
+    assert_open(&dst);
+    assert_open(&src);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(governor)
+        ->usable_bytes, 4096, memory_order_release);
+    wl_columnar_relation_test_growth_fail_allocation = 1;
+    wl_columnar_relation_append_growth_attempt_t allocation_failed = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(
+            &allocation_failed, &dst, &src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(
+            &allocation_failed);
+    assert(rc == ENOMEM && !allocation_failed.published);
+    assert(dst.nrows == 2 && dst.capacity == 2
+        && governor_reserved(governor) == 24);
+    assert_open(&dst);
+    assert_open(&src);
+    wl_columnar_relation_append_growth_attempt_t cancelled_after_copy = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(
+            &cancelled_after_copy, &dst, &src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN
+        && cancelled_after_copy.phase
+        != WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(
+            &cancelled_after_copy);
+    assert(rc == EAGAIN && cancelled_after_copy.phase
+        == WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE);
+    assert(governor_reserved(governor) == 64);
+    rc = wl_columnar_relation_append_growth_attempt_advance(
+        &cancelled_after_copy);
+    assert(rc == EAGAIN && cancelled_after_copy.row_cursor == 2);
+    wl_evaluation_control_request_cancel(control);
+    rc = wl_columnar_relation_append_growth_attempt_advance(
+        &cancelled_after_copy);
+    assert(rc == EAGAIN);
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(
+            &cancelled_after_copy);
+    assert(rc == WL_EVALUATION_CONTROL_CANCELLED);
+    assert(!wl_columnar_relation_append_growth_attempt_published(
+            &cancelled_after_copy));
+    assert(dst.nrows == 2 && dst.capacity == 2
+        && dst.columns[0][0] == 10 && dst.columns[0][1] == 11);
+    assert(governor_reserved(governor) == 24);
+    assert_open(&dst);
+    assert_open(&src);
+    assert(wl_evaluation_control_finish(control, &owner,
+        WL_EVALUATION_CONTROL_CANCELLED, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    assert(wl_evaluation_control_reset(control) == 0);
+    assert(wl_evaluation_control_begin(control, &owner) == 0);
+    wl_columnar_relation_append_growth_attempt_t attempt = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&attempt, &dst,
+        &src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+    assert(rc == 0 &&
+        wl_columnar_relation_append_growth_attempt_ready(&attempt));
+    assert(!wl_columnar_relation_append_growth_attempt_published(&attempt));
+    assert(dst.nrows == 2 && dst.capacity == 2
+        && dst.columns[0][0] == 10 && dst.columns[0][1] == 11);
+    rc = wl_columnar_relation_append_growth_attempt_commit(&attempt);
+    assert(rc == EAGAIN);
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&attempt);
+    assert(rc == 0);
+    assert(wl_columnar_relation_append_growth_attempt_published(&attempt));
+    assert(dst.nrows == 4 && dst.capacity == 4);
+    assert(dst.columns[0][0] == 10 && dst.columns[0][1] == 11
+        && dst.columns[0][2] == 20 && dst.columns[0][3] == 21);
+    assert(dst.retained_reserved_bytes == 40
+        && governor_reserved(governor) == 40);
+    assert_open(&dst);
+    assert_open(&src);
+    src.pool_owned = true;
+    wl_columnar_relation_append_growth_attempt_t pooled = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&pooled, &dst,
+        &src, 0, 2, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&pooled);
+    assert(rc == ENOTSUP);
+    assert(dst.nrows == 4 && dst.capacity == 4);
+    assert_open(&dst);
+    assert_open(&src);
+    src.pool_owned = false;
+    wl_columnar_relation_append_growth_attempt_t zero_count = {0};
+    assert(wl_columnar_relation_append_growth_attempt_begin(&zero_count, &dst,
+        &src, 0, 0, control) == 0);
+    rc = EAGAIN;
+    for (unsigned i = 0; i < 128 && rc == EAGAIN; i++)
+        rc = wl_columnar_relation_append_growth_attempt_advance(&zero_count);
+    assert(rc == EINVAL);
+    assert(dst.nrows == 4 && dst.capacity == 4);
+    assert_open(&dst);
+    assert_open(&src);
+    assert(wl_evaluation_control_finish(control, &owner, 0, 0) == 0);
+    assert(wl_evaluation_control_detach(control, &owner) == 0);
+    wl_evaluation_control_release(control);
+    assert(wl_columnar_memory_release(&dst.retained_reservation));
+    wl_columnar_memory_governor_ref_release(governor);
+    free(dst.columns[0]);
+    free(dst.columns);
+    free(src.columns[0]);
+    free(src.columns);
+}
+
 int
 main(void)
 {
     attempt_single_authority_tests();
+    append_growth_attempt_tests();
     lease_tests();
     writer_token_liveness_tests();
     overlapping_storage_tests();
