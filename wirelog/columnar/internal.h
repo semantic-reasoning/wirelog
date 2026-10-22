@@ -6293,6 +6293,8 @@ typedef enum {
 typedef enum {
     WL_COLUMNAR_LFTJ_ATTEMPT_INERT,
     WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_SIZE,
     WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC,
     WL_COLUMNAR_LFTJ_ATTEMPT_COPY,
     WL_COLUMNAR_LFTJ_ATTEMPT_SORT,
@@ -6324,6 +6326,10 @@ typedef struct {
     wl_columnar_source_access_reader_t reader;
     uint32_t nrows, ncols, key_col;
     wirelog_column_type_t key_type;
+    /* Bounded, side-effect-free registry discovery.  A candidate slot is
+    * only an index until the complete registry scan proves it unique. */
+    uint32_t lookup_slot, lookup_match_slot, lookup_matches;
+    size_t lookup_name_byte;
     int64_t *rows, *scratch;
     uint64_t copy_cell;
     uint32_t position, range_lo, range_hi, product_index;
@@ -6339,12 +6345,17 @@ typedef struct wl_columnar_lftj_attempt {
     wl_columnar_eval_stack_cleanup_frame_t *frame;
     const void *numeric_owner;
     wl_col_session_t *session;
+    col_rel_t **registry;
+    uint32_t registry_count;
     wl_evaluation_control_t *control;
     uint64_t attempt_id;
     wl_columnar_lftj_attempt_phase_t phase;
     int semantic_result;
     wl_columnar_lftj_input_attempt_t *inputs;
     uint32_t input_count, cursor, total_columns;
+    uint32_t scratch_size_cursor;
+    uint64_t row_bytes;
+    bool scratch_size_initialized;
     uint32_t binary_offset[WL_LFTJ_MAX_K];
     int64_t output_types[WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS];
     int64_t *row;
