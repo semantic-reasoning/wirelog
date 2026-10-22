@@ -746,6 +746,25 @@ synchronous regions. The legacy recursive evaluator still calls the
 synchronous consolidation entry point, so this opt-in attempt is a bounded
 operator building block and does not yet claim recursive STEP coverage.
 
+`wl_columnar_merge_incremental_delta_attempt_begin_candidate` extends that
+primitive for a sorted private working relation and a separate staged
+candidate relation. It currently accepts positive-arity, all-`INT64` relations
+without timestamps, compound/graph metadata, evaluator-dedup tables, or Arrow
+schema metadata. Zero-column relations remain unsupported. The working
+relation must already be canonical and sorted; candidate rows may be unsorted
+and repeated. A successful commit publishes
+`set(working U candidate)` and returns exactly
+`set(candidate) - set(working)`. The candidate is never mutated. A working
+writer and candidate reader are acquired without waiting, in relation-address
+order, and held through publication or cleanup. Every copied cell and tuple
+comparison is charged before access, including candidate sorting and duplicate
+removal. A same-attempt `EAGAIN` retains the continuation for the next slice;
+cancellation or global work exhaustion discards private output and releases
+both input protections. Retrying after either terminal stop starts a fresh
+merge from the unchanged input relations under a new control attempt. The
+primitive does not yet connect to recursive evaluator dispatch or enable
+controlled recursive STEP.
+
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
 iteration/count equality is not promised. Parsing, planning and input ingestion
