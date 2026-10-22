@@ -435,10 +435,22 @@ col_kfusion_cleanup_cohort(struct wl_columnar_kfusion_cohort *cohort)
             entry->rel_name = NULL;
             free(entry->filter_data);
             entry->filter_data = NULL;
+            if (entry->metadata_reservation) {
+                (void)wl_columnar_memory_rollback(
+                    entry->metadata_reservation);
+                free(entry->metadata_reservation);
+                entry->metadata_reservation = NULL;
+            }
         }
         free(worker->filt_cache);
         worker->filt_cache = NULL;
         worker->filt_cache_count = worker->filt_cache_cap = 0;
+        if (worker->filt_cache_array_reservation) {
+            (void)wl_columnar_memory_rollback(
+                worker->filt_cache_array_reservation);
+            free(worker->filt_cache_array_reservation);
+            worker->filt_cache_array_reservation = NULL;
+        }
     }
 
     for (uint32_t d = 0; d < cohort->initialized_count; d++) {
@@ -1081,6 +1093,10 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
         worker_sess[d].filt_cache_count = 0;
         worker_sess[d].filt_cache_cap = 0;
         worker_sess[d].filt_cache_active_pins = 0; /* Issue #1435 */
+        /* Issue #2129: the array token belongs to the coordinator.  A branch
+         * that grows its own cache reserves a token of its own, which
+         * col_kfusion_cleanup_cohort releases. */
+        worker_sess[d].filt_cache_array_reservation = NULL;
         /* Issue #196: Workers start with empty mat_cache.  Divergent rule
          * copies have ~0% cache hit rate, so inheriting parent entries
          * wastes memory without benefit. */
