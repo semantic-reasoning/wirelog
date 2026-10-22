@@ -2999,6 +2999,10 @@ void
 col_rel_free_contents(col_rel_t *r);
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
+/* Checked flat-grid size for ncols pointer slots and owned INT64 lanes. */
+bool
+wl_columnar_relation_payload_grid_bytes(uint32_t ncols,
+    uint32_t owned_columns, uint32_t capacity, bool table, uint64_t *out);
 /*
  * col_rel_timestamp_ledger_bytes: bytes held by r->timestamps (timestamp_capacity
  * entries of col_delta_timestamp_t), or 0 when timestamps are disabled.
@@ -3778,6 +3782,7 @@ typedef struct wl_columnar_relation_append_growth_attempt {
     uint64_t incoming_bytes;
     uint64_t target_bytes;
     uint64_t destination_ledger_before;
+    uint64_t destination_ledger_after;
     uint64_t old_reserved_bytes;
     int64_t **replacement_columns;
     uint32_t allocated_lanes;

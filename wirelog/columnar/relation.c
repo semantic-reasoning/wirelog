@@ -1976,8 +1976,9 @@ typedef struct {
     bool scratch;
 } col_rel_payload_shape_t;
 
-static bool
-col_rel_payload_grid_bytes(uint32_t ncols, uint32_t owned_columns,
+bool
+wl_columnar_relation_payload_grid_bytes(uint32_t ncols,
+    uint32_t owned_columns,
     uint32_t capacity, bool table, uint64_t *out)
 {
     uint64_t lanes, pointers = 0;
@@ -1999,13 +2000,13 @@ col_rel_payload_shape_bytes(const col_rel_payload_shape_t *shape,
     uint64_t active, merge, backup, timestamps, backup_timestamps;
     uint64_t scratch = 0, sum;
     if (!shape || !out
-        || !col_rel_payload_grid_bytes(shape->ncols,
+        || !wl_columnar_relation_payload_grid_bytes(shape->ncols,
         shape->owned_columns, shape->column_capacity,
         shape->active_table, &active)
-        || !col_rel_payload_grid_bytes(shape->ncols,
+        || !wl_columnar_relation_payload_grid_bytes(shape->ncols,
         shape->merge_table ? shape->ncols : 0,
         shape->merge_capacity, shape->merge_table, &merge)
-        || !col_rel_payload_grid_bytes(shape->ncols,
+        || !wl_columnar_relation_payload_grid_bytes(shape->ncols,
         shape->backup_table ? shape->ncols : 0,
         shape->backup_capacity, shape->backup_table, &backup)
         || !wl_columnar_memory_size_mul(shape->timestamp_capacity,
@@ -2149,7 +2150,7 @@ col_rel_reserve_merge_grid(col_rel_t *r, uint32_t capacity)
         r->merge_buf_cap = capacity;
         return 0;
     }
-    if (!col_rel_payload_grid_bytes(r->ncols, r->ncols, capacity,
+    if (!wl_columnar_relation_payload_grid_bytes(r->ncols, r->ncols, capacity,
         true, &incoming) || incoming > SIZE_MAX)
         return EOVERFLOW;
     if (r->memory_governor) {
@@ -2536,7 +2537,7 @@ col_rel_reserve_retained_shape(col_rel_t *r, uint32_t capacity,
     }
     if (!col_rel_payload_private_bytes(r, r->ncols, capacity,
         timestamp_capacity, r->ncols != 0, &final_bytes)
-        || (allocate_grid && !col_rel_payload_grid_bytes(r->ncols,
+        || (allocate_grid && !wl_columnar_relation_payload_grid_bytes(r->ncols,
         r->ncols, capacity, r->ncols != 0, &incoming))
         || (allocate_timestamps && (!wl_columnar_memory_size_mul(
             timestamp_capacity, sizeof(col_delta_timestamp_t), &part)
@@ -2698,7 +2699,7 @@ col_rel_reserve_transition(col_rel_t *r, uint32_t capacity,
         return -EOVERFLOW;
     }
     *bytes_out = bytes;
-    if (!col_rel_payload_grid_bytes(r->ncols, r->ncols, capacity,
+    if (!wl_columnar_relation_payload_grid_bytes(r->ncols, r->ncols, capacity,
         r->ncols != 0, &incoming)
         || !wl_columnar_memory_size_mul(allocate_timestamps
             ? timestamp_capacity : 0,
@@ -3991,7 +3992,8 @@ col_rel_set_schema_impl_capacity(col_rel_t *r, uint32_t ncols,
     if (!col_rel_payload_private_bytes(r, ncols, image.capacity,
         image.timestamp_capacity, r->memory_governor && ncols != 0,
         &retained_bytes)
-        || !col_rel_payload_grid_bytes(ncols, ncols, image.capacity,
+        || !wl_columnar_relation_payload_grid_bytes(ncols, ncols,
+        image.capacity,
         ncols != 0, &incoming_grid)
         || !wl_columnar_memory_size_mul(ncols, sizeof(int64_t),
         &incoming_scratch)
@@ -7638,11 +7640,11 @@ wl_columnar_relation_row_body(col_rel_t *r, const int64_t *input,
         uint64_t bytes = 0;
         bool valid = true;
         if (component == 0)
-            valid = col_rel_payload_grid_bytes(r->ncols,
+            valid = wl_columnar_relation_payload_grid_bytes(r->ncols,
                     r->merge_columns ? r->ncols : 0, r->merge_buf_cap,
                     r->merge_columns != NULL, &bytes);
         else if (component == 1)
-            valid = col_rel_payload_grid_bytes(r->ncols,
+            valid = wl_columnar_relation_payload_grid_bytes(r->ncols,
                     r->retract_backup_columns ? r->ncols : 0,
                     r->retract_backup_capacity,
                     r->retract_backup_columns != NULL, &bytes);
@@ -9455,7 +9457,8 @@ wl_columnar_relation_append_all_controlled(col_rel_t *dst,
         final_shape.active_table = dst->ncols != 0;
         if (!col_rel_payload_shape_bytes(&old_shape, &old_bytes)
             || !col_rel_payload_shape_bytes(&final_shape, &final_bytes)
-            || !col_rel_payload_grid_bytes(dst->ncols, owned_columns,
+            || !wl_columnar_relation_payload_grid_bytes(dst->ncols,
+            owned_columns,
             new_capacity, dst->ncols != 0, &incoming)
             || !wl_columnar_memory_size_mul(new_capacity ? new_capacity : 1u,
             sizeof(int64_t), &lane_bytes)
@@ -9849,8 +9852,14 @@ wl_columnar_relation_append_growth_attempt_advance(
     }
     case WL_COLUMNAR_RELATION_APPEND_GROWTH_CAPACITY:
         if (a->new_capacity >= a->required_rows) {
+            rc = wl_columnar_relation_append_growth_charge(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_TYPES;
             a->lane_cursor = 0;
+            rc = wl_columnar_relation_append_growth_tail(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             return EAGAIN;
         }
         rc = wl_columnar_relation_append_growth_charge(a, 1);
@@ -9863,22 +9872,43 @@ wl_columnar_relation_append_growth_attempt_advance(
     case WL_COLUMNAR_RELATION_APPEND_GROWTH_TYPES:
         if (a->lane_cursor == a->ncols) {
             uint64_t grid;
-            if (!col_rel_payload_grid_bytes(a->ncols, a->ncols,
-                a->new_capacity, true, &grid) || grid > SIZE_MAX)
+            rc = wl_columnar_relation_append_growth_charge(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
+            uint64_t old_grid;
+            uint64_t ledger_cells;
+            uint64_t ledger_before;
+            uint64_t ledger_after;
+            if (!wl_columnar_relation_payload_grid_bytes(a->ncols, a->ncols,
+                a->new_capacity, true, &grid)
+                || grid > SIZE_MAX
+                || !wl_columnar_relation_payload_grid_bytes(a->ncols, a->ncols,
+                a->destination_capacity, true, &old_grid)
+                || old_grid > SIZE_MAX
+                || !wl_columnar_memory_size_mul(a->ncols,
+                a->destination_capacity, &ledger_cells)
+                || !wl_columnar_memory_size_mul(ledger_cells,
+                sizeof(int64_t), &ledger_before)
+                || !wl_columnar_memory_size_mul(a->ncols, a->new_capacity,
+                &ledger_cells)
+                || !wl_columnar_memory_size_mul(ledger_cells,
+                sizeof(int64_t), &ledger_after))
                 return wl_columnar_relation_append_growth_abort_to(a,
                            EOVERFLOW);
             a->incoming_bytes = grid;
-            uint64_t old_exact;
-            if (!col_rel_retained_live_bytes(a->destination, &old_exact))
-                return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
-            a->old_reserved_bytes = a->destination->retained_reserved_bytes;
+            a->target_bytes = grid;
+            a->old_reserved_bytes = old_grid;
+            a->destination_ledger_before = ledger_before;
+            a->destination_ledger_after = ledger_after;
             if (a->destination->memory_governor
-                && (a->old_reserved_bytes != old_exact
+                && (a->old_reserved_bytes
+                != a->destination->retained_reserved_bytes
                 || !a->old_reserved_bytes))
                 return wl_columnar_relation_append_growth_abort_to(a, EINVAL);
-            a->destination_ledger_before =
-                col_rel_owned_ledger_bytes(a->destination);
             a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_ADMIT;
+            rc = wl_columnar_relation_append_growth_tail(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             return EAGAIN;
         }
         rc = wl_columnar_relation_append_growth_charge(a, 1);
@@ -9937,9 +9967,15 @@ wl_columnar_relation_append_growth_attempt_advance(
         return EAGAIN;
     case WL_COLUMNAR_RELATION_APPEND_GROWTH_ALLOC_LANES:
         if (a->allocated_lanes == a->ncols) {
+            rc = wl_columnar_relation_append_growth_charge(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             a->lane_cursor = 0;
             a->row_cursor = 0;
             a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_DESTINATION;
+            rc = wl_columnar_relation_append_growth_tail(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             return EAGAIN;
         }
         rc = wl_columnar_relation_append_growth_charge(a, 1);
@@ -9959,16 +9995,31 @@ wl_columnar_relation_append_growth_attempt_advance(
             WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE;
         uint32_t rows = source ? a->source_count : a->destination_rows;
         if (a->lane_cursor == a->ncols) {
+            rc = wl_columnar_relation_append_growth_charge(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             if (!source) {
                 a->lane_cursor = 0; a->row_cursor = 0;
                 a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_COPY_SOURCE;
+                rc = wl_columnar_relation_append_growth_tail(a, 1);
+                if (rc != 0)
+                    return wl_columnar_relation_append_growth_abort_to(a, rc);
                 return EAGAIN;
             }
             a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_READY;
+            rc = wl_columnar_relation_append_growth_tail(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             return 0;
         }
         if (a->row_cursor == rows) {
+            rc = wl_columnar_relation_append_growth_charge(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             a->lane_cursor++; a->row_cursor = 0;
+            rc = wl_columnar_relation_append_growth_tail(a, 1);
+            if (rc != 0)
+                return wl_columnar_relation_append_growth_abort_to(a, rc);
             return EAGAIN;
         }
         uint32_t n = rows - a->row_cursor;
@@ -9998,14 +10049,9 @@ wl_columnar_relation_append_growth_attempt_advance(
         free(a->retired_columns);
         a->retired_columns = NULL;
         wl_columnar_relation_ledger_reconcile_known(a->destination,
-            a->destination_ledger_before,
-            col_rel_owned_ledger_bytes(a->destination));
+            a->destination_ledger_before, a->destination_ledger_after);
         if (a->destination->memory_governor) {
-            uint64_t target;
-            if (!col_rel_retained_live_bytes(a->destination, &target)) {
-                a->cleanup_result = EINVAL;
-                return EAGAIN;
-            }
+            uint64_t target = a->target_bytes;
             if (target == a->destination->retained_reserved_bytes) {
                 a->phase = WL_COLUMNAR_RELATION_APPEND_GROWTH_RELEASE;
                 return EAGAIN;
@@ -10328,7 +10374,8 @@ wl_columnar_relation_reserve_capacity_admitted_controlled(col_rel_t *r,
     uint64_t timestamp_bytes = 0;
     uint64_t ledger_before, ledger_after;
     if (!col_rel_payload_shape_bytes(&final_shape, &final_bytes)
-        || !col_rel_payload_grid_bytes(r->ncols, r->ncols, requested,
+        || !wl_columnar_relation_payload_grid_bytes(r->ncols, r->ncols,
+        requested,
         true, &incoming)
         || !wl_columnar_memory_size_mul(requested, sizeof(int64_t), &lane_bytes)
         || !wl_columnar_memory_size_mul(r->ncols, sizeof(int64_t *),
@@ -10452,7 +10499,8 @@ col_rel_compaction_incoming_bytes(const col_rel_t *r, uint32_t tight,
     uint64_t *out)
 {
     uint64_t grid, timestamps;
-    if (!col_rel_payload_grid_bytes(r->ncols, r->ncols, tight, true, &grid)
+    if (!wl_columnar_relation_payload_grid_bytes(r->ncols, r->ncols, tight,
+        true, &grid)
         || !wl_columnar_memory_size_mul(r->timestamps ? tight : 0,
         sizeof(col_delta_timestamp_t), &timestamps))
         return false;
@@ -15532,11 +15580,11 @@ wl_columnar_relation_row_body_operator(col_rel_t *r, const int64_t *input,
         uint64_t bytes = 0;
         bool valid = true;
         if (component == 0)
-            valid = col_rel_payload_grid_bytes(r->ncols,
+            valid = wl_columnar_relation_payload_grid_bytes(r->ncols,
                     r->merge_columns ? r->ncols : 0, r->merge_buf_cap,
                     r->merge_columns != NULL, &bytes);
         else if (component == 1)
-            valid = col_rel_payload_grid_bytes(r->ncols,
+            valid = wl_columnar_relation_payload_grid_bytes(r->ncols,
                     r->retract_backup_columns ? r->ncols : 0,
                     r->retract_backup_capacity,
                     r->retract_backup_columns != NULL, &bytes);
