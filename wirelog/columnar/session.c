@@ -36,6 +36,19 @@ typedef enum {
     COL_CONTROLLED_PREFLIGHT_READY
 } col_controlled_preflight_phase_t;
 
+typedef enum {
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE = 0,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_PLAN,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_STRATUM,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_RELATION,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_OPERATOR,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_SLOT,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_BYTE,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_EXPECTATION,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_NEXT_RELATION,
+    COL_CONTROLLED_DEFAULT_PREFLIGHT_READY
+} col_controlled_default_preflight_phase_t;
+
 struct wl_columnar_controlled_step {
     wl_columnar_eval_serial_framed_host_reply_t reply;
     wl_evaluation_control_t *previous_funding;
@@ -48,7 +61,17 @@ struct wl_columnar_controlled_step {
     uint32_t preflight_name_byte;
     uint32_t preflight_registry_count;
     col_controlled_preflight_phase_t preflight_phase;
+    col_controlled_default_preflight_phase_t default_preflight_phase;
     col_rel_t **preflight_registry;
+    col_rel_t **default_preflight_registry;
+    const wl_plan_t *default_preflight_plan;
+    uint32_t default_preflight_stratum;
+    uint32_t default_preflight_relation;
+    uint32_t default_preflight_op;
+    uint32_t default_preflight_registry_slot;
+    uint32_t default_preflight_name_byte;
+    uint32_t default_preflight_registry_count;
+    uint64_t default_preflight_charged_actions;
     col_rel_t *preflight_variable_full;
     col_rel_t *preflight_variable_delta;
     col_rel_t *preflight_join_full;
@@ -58,6 +81,8 @@ struct wl_columnar_controlled_step {
     uint32_t preflight_join_full_rows;
     uint32_t preflight_join_delta_rows;
     bool controlled_materialized_batch_fallback;
+    bool default_preflight_target_found;
+    bool default_preflight_entry_charged;
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
@@ -87,6 +112,7 @@ wl_columnar_session_controlled_batch_authorized(
 int wl_columnar_session_test_fail_framed_funding_before_stop;
 int wl_columnar_session_test_fail_framed_funding_after_stop;
 int wl_columnar_session_test_exhaust_after_relation;
+unsigned wl_columnar_session_test_preflight_quantum = 64;
 #endif
 
 static int wl_columnar_session_controlled_step_drain_for_destroy(
@@ -5927,14 +5953,237 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
         || wl_columnar_eval_delta_observer_active(sess))
         return ENOTSUP;
 
-    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
-        const wl_plan_stratum_t *stratum = &plan->strata[si];
+    /* Preserve the constant-time rejection for the common single-stratum
+     * recursive route; multi-stratum recursion is discovered by the charged
+     * resumable proof below. */
+    if (plan->stratum_count == 1 && plan->strata[0].is_recursive)
+        return ENOTSUP;
+
+    return 0;
+}
+
+static uint32_t
+col_controlled_step_default_preflight_quantum(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    unsigned quantum = wl_columnar_session_test_preflight_quantum;
+    if (!quantum || quantum > 64) return 64;
+    return quantum;
+#else
+    return 64;
+#endif
+}
+
+static int
+col_controlled_step_default_preflight_action(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    const wl_plan_t *plan = step->default_preflight_plan;
+    const wl_plan_stratum_t *stratum;
+    const wl_plan_relation_t *relation;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+            1);
+    if (rc) return rc;
+    step->default_preflight_charged_actions++;
+
+    switch (step->default_preflight_phase) {
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_PLAN:
+        if (!plan || !plan->strata || (step->default_preflight_registry_count
+            && !step->default_preflight_registry))
+            return ENOTSUP;
+        step->default_preflight_phase = plan->stratum_count
+            ? COL_CONTROLLED_DEFAULT_PREFLIGHT_STRATUM
+            : COL_CONTROLLED_DEFAULT_PREFLIGHT_READY;
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_STRATUM:
+        if (step->default_preflight_stratum >= plan->stratum_count) {
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_READY;
+            return 0;
+        }
+        stratum = &plan->strata[step->default_preflight_stratum];
         if (stratum->is_recursive
             || (stratum->relation_count && !stratum->relations))
             return ENOTSUP;
+        step->default_preflight_relation = 0;
+        step->default_preflight_phase = stratum->relation_count
+            ? COL_CONTROLLED_DEFAULT_PREFLIGHT_RELATION
+            : COL_CONTROLLED_DEFAULT_PREFLIGHT_NEXT_RELATION;
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_RELATION:
+        stratum = &plan->strata[step->default_preflight_stratum];
+        if (step->default_preflight_relation >= stratum->relation_count) {
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_NEXT_RELATION;
+            return 0;
+        }
+        relation = &stratum->relations[step->default_preflight_relation];
+        if (!relation->name || !relation->ops || !relation->op_count
+            || relation->ops[relation->op_count - 1].op
+            != WL_PLAN_OP_CONSOLIDATE)
+            return ENOTSUP;
+        step->default_preflight_op = 0;
+        step->default_preflight_phase =
+            COL_CONTROLLED_DEFAULT_PREFLIGHT_OPERATOR;
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_OPERATOR:
+        stratum = &plan->strata[step->default_preflight_stratum];
+        relation = &stratum->relations[step->default_preflight_relation];
+        if (step->default_preflight_op >= relation->op_count) {
+            step->default_preflight_registry_slot = 0;
+            step->default_preflight_name_byte = 0;
+            step->default_preflight_target_found = false;
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_SLOT;
+            return 0;
+        }
+        if (!col_controlled_step_controlled_op(
+                &relation->ops[step->default_preflight_op]))
+            return ENOTSUP;
+        step->default_preflight_op++;
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_SLOT:
+        if (step->default_preflight_registry_slot
+            >= step->default_preflight_registry_count) {
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_EXPECTATION;
+            return 0;
+        }
+        if (!step->default_preflight_registry
+            || !step->default_preflight_registry[
+                step->default_preflight_registry_slot]
+            || !step->default_preflight_registry[
+                step->default_preflight_registry_slot]->name) {
+            step->default_preflight_registry_slot++;
+            step->default_preflight_name_byte = 0;
+            return 0;
+        }
+        step->default_preflight_phase =
+            COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_BYTE;
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_BYTE: {
+        stratum = &plan->strata[step->default_preflight_stratum];
+        relation = &stratum->relations[step->default_preflight_relation];
+        col_rel_t *candidate = step->default_preflight_registry[
+            step->default_preflight_registry_slot];
+        if (step->default_preflight_name_byte == UINT32_MAX)
+            return ENOTSUP;
+        uint32_t offset = step->default_preflight_name_byte;
+        char wanted = relation->name[offset];
+        char actual = candidate->name[offset];
+        if (wanted != actual) {
+            step->default_preflight_registry_slot++;
+            step->default_preflight_name_byte = 0;
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_SLOT;
+        } else if (!wanted) {
+            step->default_preflight_target_found = true;
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_EXPECTATION;
+        } else {
+            step->default_preflight_name_byte++;
+        }
+        return 0;
     }
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_EXPECTATION: {
+        bool committed_prefix = step->default_preflight_stratum
+            < step->stratum_index
+            || (step->default_preflight_stratum == step->stratum_index
+            && step->default_preflight_relation < step->relation_index)
+            || step->complete;
+        if (step->default_preflight_target_found != committed_prefix)
+            return ENOTSUP;
+        step->default_preflight_phase =
+            COL_CONTROLLED_DEFAULT_PREFLIGHT_NEXT_RELATION;
+        return 0;
+    }
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_NEXT_RELATION:
+        stratum = &plan->strata[step->default_preflight_stratum];
+        if (++step->default_preflight_relation < stratum->relation_count) {
+            step->default_preflight_op = 0;
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_RELATION;
+        } else {
+            step->default_preflight_stratum++;
+            step->default_preflight_relation = 0;
+            step->default_preflight_phase =
+                COL_CONTROLLED_DEFAULT_PREFLIGHT_STRATUM;
+        }
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_READY:
+        return 0;
+    case COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE:
+    default:
+        return EINVAL;
+    }
+}
+
+static int
+col_controlled_step_default_preflight(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint32_t actions = 0;
+    uint32_t quantum = col_controlled_step_default_preflight_quantum();
+    if (step->default_preflight_phase ==
+        COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE) {
+        int rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id, 1);
+        if (rc) return rc;
+        step->default_preflight_charged_actions++;
+        actions++;
+        step->default_preflight_entry_charged = true;
+        step->default_preflight_plan = sess->plan;
+        step->default_preflight_registry = sess->rels;
+        step->default_preflight_registry_count = sess->nrels;
+        step->default_preflight_phase =
+            COL_CONTROLLED_DEFAULT_PREFLIGHT_PLAN;
+    } else if (step->default_preflight_plan != sess->plan
+        || step->default_preflight_registry != sess->rels
+        || step->default_preflight_registry_count != sess->nrels) {
+        return ENOTSUP;
+    }
+    while (actions < quantum && step->default_preflight_phase
+        != COL_CONTROLLED_DEFAULT_PREFLIGHT_READY) {
+        int rc = col_controlled_step_default_preflight_action(sess, step);
+        if (rc) return rc;
+        actions++;
+    }
+    int poll_rc = wl_evaluation_control_charge_attempt(control,
+            step->operation_id, 0);
+    if (poll_rc) return poll_rc;
+    if (actions == quantum) return EAGAIN;
+    return step->default_preflight_phase
+           == COL_CONTROLLED_DEFAULT_PREFLIGHT_READY ? 0 : EAGAIN;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_test_preflight_snapshot(wl_session_t *session,
+    wl_columnar_session_test_preflight_state_t *out)
+{
+    if (!session || !out) return EINVAL;
+    const wl_col_session_t *sess = COL_SESSION(session);
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step) return ENOENT;
+    *out = (wl_columnar_session_test_preflight_state_t){
+        .phase = (uint32_t)step->default_preflight_phase,
+        .stratum = step->default_preflight_stratum,
+        .relation = step->default_preflight_relation,
+        .op = step->default_preflight_op,
+        .registry_slot = step->default_preflight_registry_slot,
+        .name_byte = step->default_preflight_name_byte,
+        .charged_actions = step->default_preflight_charged_actions,
+        .ready = step->default_preflight_phase
+            == COL_CONTROLLED_DEFAULT_PREFLIGHT_READY,
+        .target_name_byte_active = step->default_preflight_phase
+            == COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_BYTE,
+        .entry_charged = step->default_preflight_entry_charged
+    };
     return 0;
 }
+#endif
 
 static int
 col_controlled_step_preflight(wl_col_session_t *sess,
@@ -5943,6 +6192,8 @@ col_controlled_step_preflight(wl_col_session_t *sess,
     const wl_plan_t *plan = sess->plan;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     uint64_t id = step->operation_id;
+    bool batch = sess->join_batch_bytes != 0;
+    if (!batch) return col_controlled_step_default_preflight(sess, step);
     int initial_charge = wl_evaluation_control_charge_attempt(control, id, 1);
     if (initial_charge) return initial_charge;
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
@@ -5956,43 +6207,6 @@ col_controlled_step_preflight(wl_col_session_t *sess,
     const wl_plan_relation_t *relation = plan->stratum_count == 1
         && plan->strata[0].relation_count == 1
         ? &plan->strata[0].relations[0] : NULL;
-    bool batch = sess->join_batch_bytes != 0;
-    if (!batch) {
-        for (uint32_t si = 0; si < plan->stratum_count; ++si) {
-            const wl_plan_stratum_t *stratum = &plan->strata[si];
-            for (uint32_t ri = 0; ri < stratum->relation_count; ++ri) {
-                int rc = wl_evaluation_control_charge_attempt(control, id, 1);
-                if (rc) return rc;
-                const wl_plan_relation_t *item = &stratum->relations[ri];
-                if (!item->name || !item->ops || !item->op_count
-                    || item->ops[item->op_count - 1].op
-                    != WL_PLAN_OP_CONSOLIDATE) return ENOTSUP;
-                for (uint32_t oi = 0; oi < item->op_count; ++oi) {
-                    rc = wl_evaluation_control_charge_attempt(control, id, 1);
-                    if (rc) return rc;
-                    if (!col_controlled_step_controlled_op(&item->ops[oi]))
-                        return ENOTSUP;
-                }
-                bool exists = false;
-                for (uint32_t i = 0; i < sess->nrels; ++i) {
-                    rc = wl_evaluation_control_charge_attempt(control, id, 1);
-                    if (rc) return rc;
-                    const col_rel_t *candidate = sess->rels
-                        ? sess->rels[i] : NULL;
-                    if (candidate && candidate->name
-                        && strcmp(candidate->name, item->name) == 0) {
-                        exists = true;
-                        break;
-                    }
-                }
-                bool committed_prefix = si < step->stratum_index
-                    || (si == step->stratum_index
-                    && ri < step->relation_index) || step->complete;
-                if (exists != committed_prefix) return ENOTSUP;
-            }
-        }
-        return 0;
-    }
     if (!relation || !col_controlled_step_batch_shape(sess)) return ENOTSUP;
     if (!relation->name || !relation->ops || relation->op_count != 5)
         return ENOTSUP;
@@ -6336,6 +6550,18 @@ col_controlled_step_finish(wl_col_session_t *sess,
     step->preflight_join_full_rows = 0;
     step->preflight_join_delta_rows = 0;
     step->controlled_materialized_batch_fallback = false;
+    step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
+    step->default_preflight_plan = NULL;
+    step->default_preflight_registry = NULL;
+    step->default_preflight_stratum = 0;
+    step->default_preflight_relation = 0;
+    step->default_preflight_op = 0;
+    step->default_preflight_registry_slot = 0;
+    step->default_preflight_name_byte = 0;
+    step->default_preflight_registry_count = 0;
+    step->default_preflight_charged_actions = 0;
+    step->default_preflight_target_found = false;
+    step->default_preflight_entry_charged = false;
     step->operation_active = false;
     step->operation_id = 0;
     step->relation_active = false;
@@ -6380,7 +6606,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
     if (teardown) wl_evaluation_control_request_cancel(control);
 
     if (!step->complete && !step->relation_active
-        && step->preflight_phase != COL_CONTROLLED_PREFLIGHT_READY) {
+        && (sess->join_batch_bytes
+            ? step->preflight_phase != COL_CONTROLLED_PREFLIGHT_READY
+            : step->default_preflight_phase
+        != COL_CONTROLLED_DEFAULT_PREFLIGHT_READY)) {
         int rc = col_controlled_step_preflight(sess, step);
         if (rc == EAGAIN && wl_evaluation_control_active_attempt_id(control)
             == step->operation_id) return EAGAIN;

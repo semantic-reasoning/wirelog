@@ -6857,6 +6857,21 @@ int wl_columnar_session_hash_registry_attempt_begin(
 int wl_columnar_session_hash_registry_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *);
 #ifdef WL_SESSION_TEST_HOOKS
+typedef struct {
+    uint32_t phase;
+    uint32_t stratum;
+    uint32_t relation;
+    uint32_t op;
+    uint32_t registry_slot;
+    uint32_t name_byte;
+    uint64_t charged_actions;
+    bool ready;
+    bool target_name_byte_active;
+    bool entry_charged;
+} wl_columnar_session_test_preflight_state_t;
+extern unsigned wl_columnar_session_test_preflight_quantum;
+int wl_columnar_session_test_preflight_snapshot(wl_session_t *,
+    wl_columnar_session_test_preflight_state_t *);
 /* Fail one controlled STEP funding creation before it reaches the host. */
 extern int wl_columnar_session_test_fail_framed_funding_before_stop;
 extern int wl_columnar_session_test_fail_framed_funding_after_stop;

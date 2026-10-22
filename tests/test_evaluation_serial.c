@@ -1894,6 +1894,208 @@ test_controlled_session_join_step(void)
 }
 
 static void
+test_controlled_step_preflight_byte_cursor(void)
+{
+    uint64_t common_overhead = UINT64_MAX;
+    const unsigned quanta[] = {1, 7, 64};
+    for (unsigned qi = 0; qi < sizeof(quanta) / sizeof(quanta[0]); ++qi) {
+        char candidate_name[253], target_name[253], source[2048];
+        memset(candidate_name, 'a', 251);
+        memset(target_name, 'a', 251);
+        candidate_name[251] = 'y';
+        target_name[251] = 'z';
+        candidate_name[252] = '\0';
+        target_name[252] = '\0';
+        int written = snprintf(source, sizeof(source),
+                ".decl %s(x:int64)\n"
+                ".decl %s(x:int64)\n"
+                "%s(x) :- %s(x).\n",
+                candidate_name, target_name, target_name, candidate_name);
+        CHECK(written > 0 && (size_t)written < sizeof(source));
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(UINT64_C(1000000), &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *base = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &base));
+        wl_col_session_t *session = (wl_col_session_t *)base;
+        const int64_t row[] = {7};
+        CHECK(!wl_session_insert(base, candidate_name, row, 1, 1));
+        wl_columnar_session_test_preflight_quantum = quanta[qi];
+
+        uint64_t operation_id = 0;
+        bool observed_long_prefix = false;
+        for (unsigned turn = 0; turn < 1000; ++turn) {
+            wl_columnar_session_test_preflight_state_t before = {0}, after;
+            int before_rc = wl_columnar_session_test_preflight_snapshot(base,
+                    &before);
+            int rc = wl_session_step(base);
+            CHECK(rc == EAGAIN);
+            uint64_t active_id = wl_evaluation_control_active_attempt_id(
+                control);
+            CHECK(active_id);
+            if (!operation_id) operation_id = active_id;
+            CHECK(active_id == operation_id);
+            CHECK(!wl_columnar_session_test_preflight_snapshot(base, &after));
+            CHECK(after.entry_charged);
+            if (before_rc == 0)
+                CHECK(after.charged_actions - before.charged_actions
+                    <= quanta[qi]);
+            else
+                CHECK(after.charged_actions <= quanta[qi]);
+            if (before_rc == 0 && before.target_name_byte_active
+                && after.target_name_byte_active
+                && before.registry_slot == after.registry_slot) {
+                CHECK(after.name_byte > before.name_byte);
+                CHECK(after.charged_actions - before.charged_actions
+                    == after.name_byte - before.name_byte);
+            }
+            CHECK(!session_find_rel(session, target_name));
+            if (after.target_name_byte_active && after.registry_slot == 0
+                && after.name_byte >= 192 && after.name_byte < 251) {
+                uint64_t overhead = after.charged_actions - after.name_byte;
+                if (common_overhead == UINT64_MAX)
+                    common_overhead = overhead;
+                else
+                    CHECK(overhead == common_overhead);
+                observed_long_prefix = true;
+                break;
+            }
+        }
+        CHECK(observed_long_prefix && operation_id);
+
+        wl_evaluation_control_request_cancel(control);
+        CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!wl_evaluation_control_active_attempt_id(control)
+            && !session_find_rel(session, target_name));
+        wl_evaluation_control_report_t stopped;
+        CHECK(!wl_evaluation_control_report(control, &stopped)
+            && stopped.attempt_id == operation_id
+            && stopped.result == WL_EVALUATION_CONTROL_CANCELLED);
+
+        wl_columnar_session_test_preflight_quantum = 64;
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
+        int rc = wl_session_step(base);
+        uint64_t fresh_id = wl_evaluation_control_active_attempt_id(control);
+        CHECK(rc == EAGAIN && fresh_id > operation_id);
+        bool done = false;
+        for (unsigned turn = 0; turn < 10000; ++turn) {
+            rc = wl_session_step(base);
+            if (rc == EAGAIN) {
+                CHECK(wl_evaluation_control_active_attempt_id(control)
+                    == fresh_id);
+                continue;
+            }
+            CHECK(!rc);
+            done = true;
+            break;
+        }
+        CHECK(done && !wl_evaluation_control_active_attempt_id(control));
+        const col_rel_t *output = session_find_rel(session, target_name);
+        CHECK(output && output->nrows == 1 && output->ncols == 1
+            && output->columns[0][0] == 7);
+
+        wl_session_destroy(base);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+    wl_columnar_session_test_preflight_quantum = 64;
+}
+
+static void
+test_controlled_step_preflight_work_limit_boundary(void)
+{
+    const char *source =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(UINT64_C(1000000), &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *base = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &base));
+    const int64_t row[] = {7};
+    CHECK(!wl_session_insert(base, "input", row, 1, 1));
+    wl_col_session_t *session = (wl_col_session_t *)base;
+    wl_columnar_session_test_preflight_quantum = 1;
+
+    uint64_t needed = 0;
+    for (unsigned turn = 0; turn < 1000; ++turn) {
+        int rc = wl_session_step(base);
+        CHECK(rc == EAGAIN);
+        wl_columnar_session_test_preflight_state_t state;
+        CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
+        if (state.ready) {
+            needed = state.charged_actions;
+            break;
+        }
+    }
+    CHECK(needed > 1);
+    wl_evaluation_control_request_cancel(control);
+    CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!session_find_rel(session, "output"));
+
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, needed - 1));
+    int rc = EAGAIN;
+    for (unsigned turn = 0; turn < 1000 && rc == EAGAIN; ++turn)
+        rc = wl_session_step(base);
+    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && report.consumed == needed - 1);
+    CHECK(!session_find_rel(session, "output"));
+
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, needed));
+    rc = EAGAIN;
+    bool ready = false;
+    for (unsigned turn = 0; turn < 1000 && rc == EAGAIN; ++turn) {
+        rc = wl_session_step(base);
+        if (rc == EAGAIN) {
+            wl_columnar_session_test_preflight_state_t state;
+            CHECK(!wl_columnar_session_test_preflight_snapshot(base, &state));
+            if (state.ready) {
+                ready = true;
+                CHECK(state.charged_actions == needed);
+                break;
+            }
+        }
+    }
+    CHECK(ready && rc == EAGAIN && !session_find_rel(session, "output"));
+    wl_evaluation_control_request_cancel(control);
+    CHECK(wl_session_step(base) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.consumed == needed);
+    CHECK(!session_find_rel(session, "output"));
+
+    wl_columnar_session_test_preflight_quantum = 64;
+    wl_session_destroy(base);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
 test_controlled_batch_join_filter_map_step(void)
 {
     char a_name[101], b_name[101], source[1024];
@@ -2331,9 +2533,25 @@ test_controlled_session_step_prefix_resume(void)
         &options, &session));
     CHECK(!wl_session_insert(session, "input", rows, 3, 1));
 
+    wl_columnar_session_test_preflight_quantum = 7;
     wl_columnar_session_test_exhaust_after_relation = 1;
-    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    int rc = wl_session_step(session);
+    uint64_t operation_id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(rc == EAGAIN && operation_id);
+    unsigned yields = 0;
+    for (unsigned turn = 0; turn < 10000; ++turn) {
+        rc = wl_session_step(session);
+        if (rc == EAGAIN) {
+            CHECK(wl_evaluation_control_active_attempt_id(control)
+                == operation_id);
+            yields++;
+            continue;
+        }
+        break;
+    }
+    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && yields > 1);
     wl_columnar_session_test_exhaust_after_relation = 0;
+    wl_columnar_session_test_preflight_quantum = 64;
     CHECK(!wl_evaluation_control_active_attempt_id(control));
     const col_rel_t *left = session_find_rel((wl_col_session_t *)session,
             "left");
@@ -5755,6 +5973,8 @@ main(void)
 {
     test_controlled_session_step_resume();
     test_controlled_session_join_step();
+    test_controlled_step_preflight_byte_cursor();
+    test_controlled_step_preflight_work_limit_boundary();
     test_controlled_batch_join_filter_map_step();
     test_controlled_batch_delta_selectors();
     test_controlled_batch_child_domain_rejection();
