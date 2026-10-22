@@ -1070,10 +1070,11 @@ wirelog is **not async-signal-safe**.
 There is currently no installed `wirelog_session_*` cancellation API.
 The internal #1819 evaluation-control foundation offers an independently retained
 control whose cancellation request uses an atomic operation without acquiring a
-session/control mutex. Controlled STEP/SNAPSHOT are still refused with `ENOTSUP`
-until engine integration lands; setting that internal flag does not interrupt an
-ordinary uncontrolled evaluation. Future host signal integration must forward a
-request to a normal host thread; no control operation is async-signal-safe.
+session/control mutex. Supported serial nonrecursive controlled STEP uses a
+bounded resumable preflight; unsupported STEP routes and controlled SNAPSHOT
+can still return `ENOTSUP`. Setting the internal flag does not interrupt an
+ordinary uncontrolled evaluation. Future host signal integration must forward
+a request to a normal host thread; no control operation is async-signal-safe.
 
 Cross-reference: Risk C6, issue #709 (consolidated in
 `docs/ERROR_MODEL.md`).

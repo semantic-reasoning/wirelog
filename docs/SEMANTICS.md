@@ -1134,6 +1134,23 @@ route; it does not bound its intermediate memory. Strict mode and other
 batch-configured STEP shapes remain unsupported. Its published counter counts
 only candidates that cross the registry cutoff.
 
+For non-batch controlled STEP, the initial plan and registry proof is also
+resumable. A call charges at most 64 proof actions. Each action advances a
+bounded proof cursor, processing at most one plan descriptor, registry slot,
+or relation-name byte. When the bound is reached, STEP returns `EAGAIN` with
+the same attempt and proof cursors, and continues on the next call. Name
+matching advances byte by byte, so a long shared prefix cannot hide an
+unbounded string comparison. The proof checks
+supported nonrecursive plan operators and confirms that registry heads match
+the already committed relation prefix before evaluation starts. A terminal
+stop discards the proof; a fresh attempt starts it again while preserving
+already committed output. The established batch proof remains separate.
+
+This enables the bounded preflight for supported serial nonrecursive STEP
+plans. Recursive, delta-observer, differential, multiworker/TDD, strict-batch,
+and unsupported operator routes remain fail-closed. Controlled SNAPSHOT is
+still unsupported.
+
 
 ### COUNT operand and result domains
 
@@ -1332,8 +1349,8 @@ the actual child runtime depth until genuine child ACK. A bounded spare-slot
 proof then permits top-zero normalization. After all recoverable owners drain,
 parent ACK and known-empty frame close form one final mandatory action. The
 existing physical-free/credit/reference invariant remains in force. Generic
-cleanup cannot close a live parent. Public STEP/SNAPSHOT control gates remain
-unchanged.
+cleanup cannot close a live parent. This publication protocol remains limited
+to its validated one-head shape.
 
 The private framed result can be published as one absent head. A separately
 prepared registry fills the first hole or appends and builds exact FNV1a hash
@@ -1344,8 +1361,9 @@ head absence again. Before cutoff every completed credit move is reversed on
 failure and the old registry remains authoritative. Publication currently
 supports canonical EMPTY/positive RESERVED old tokens, and genuinely noGov
 all-zero tokens without writes; a RELEASED old-token history is unsupported.
-This internal publication protocol still does not enable public STEP/SNAPSHOT,
-whole-stratum controlled evaluation, or existing-head append/reevaluation.
+This internal publication protocol does not enable unsupported controlled
+routes or existing-head append/reevaluation; bounded default STEP preflight is
+described in the #1821 section above.
 
 ### Private aware-host relation entry
 
@@ -1409,21 +1427,21 @@ allowance reaches callback 128 and returns the deliberately requested
 cancellation. Output cells and B2 append work contribute between pair
 checkpoints, so this fixture measurement is not a general source tariff.
 
-Whole serial/TDD/multiworker strata and backend STEP/SNAPSHOT now reject attached
-controls before their first mutation, queue submission, original begin or finish.
-The public gates remain. The former direct-vtable controlled tests described
-above exercised an unbounded internal route; that route is deliberately closed.
-Their raw references and test registrations remain, with this coverage migration:
+Supported serial nonrecursive STEP now uses the bounded default proof described
+above. STEP still rejects recursive plans and unsupported whole-session routes
+before evaluation; controlled SNAPSHOT remains unsupported. TDD/multiworker,
+differential, and whole controlled observer delivery remain outside this slice.
+Raw references and coverage for those routes remain, with this split:
 
 | Former whole controlled expectation | Replacement or remaining scope |
 |---|---|
-| STEP/SNAPSHOT wrapper accepts the admission owner and polls pre-cancellation | Direct lower control owner/report checks; actual aware entry begins the real admission owner and exercises cancellation/turnover; outer gates preserve control reports |
-| STEP observer cutoff emits nothing, retains evaluated observer, and retry delivers the same events without recomputation | Raw observer reference and untouched-state/no-callback controlled gate; aware one-head pre-cutoff reverse plus canonical retry. Whole controlled observer delivery/resume remains deferred |
-| Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence over compaction | Raw evaluating/stable references, controlled gate with unchanged registry/progress/stable/pending/report state, and a direct lower quiescent/reclaimer check. Aware one-head retained-reader and committed cleanup are separate coverage; whole controlled snapshot bookkeeping/precedence remains deferred |
+| STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive/observer routes remain fail-closed |
+| STEP observer cutoff and retry | Raw observer reference and unchanged-state refusal coverage; whole controlled observer delivery/resume remains deferred |
+| Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence | Raw evaluating/stable references and direct lower quiescent/reclaimer checks; whole controlled snapshot bookkeeping/precedence remains deferred |
 
-This is initial nonrecursive scalar one-relation publication for an aware internal
-host. It does not complete whole-session control, recursive/differential/weighted
-execution, TDD/parallel, LFTJ/K-fusion, or default/public activation under #1821.
+This adds bounded preflight for supported serial nonrecursive controlled STEP
+plans. It does not complete recursive/differential/weighted execution,
+TDD/parallel, LFTJ/K-fusion, controlled SNAPSHOT, or full issue #1821.
 
 ### Resumable observer baseline construction (internal opt-in)
 
