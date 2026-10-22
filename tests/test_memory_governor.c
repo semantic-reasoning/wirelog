@@ -15,12 +15,64 @@
 
 static int tests_run;
 static int tests_failed;
+static wl_columnar_memory_reservation_t growth_refund_peer;
+static bool growth_refund_peer_created;
 
 #define TEST(name) do { tests_run++; printf("  [%d] %s", tests_run, name); \
 } while (0)
 #define PASS() do { printf(" ... PASS\n"); } while (0)
 #define FAIL(msg) do { printf(" ... FAIL: %s\n", msg); tests_failed++; \
 } while (0)
+
+static int
+test_strong_atomic_compare_exchange(void)
+{
+    wl_atomic_u64 value = 7;
+    uint64_t expected = 6;
+
+    TEST("strong atomic compare exchange compatibility");
+    if (atomic_compare_exchange_strong_explicit(&value, &expected, 9,
+        memory_order_acq_rel, memory_order_acquire)
+        || expected != 7 || value != 7) {
+        FAIL("mismatch did not report the observed value");
+        return 1;
+    }
+    expected = 7;
+    if (!atomic_compare_exchange_strong_explicit(&value, &expected, 9,
+        memory_order_acq_rel, memory_order_acquire)
+        || value != 9) {
+        FAIL("matching compare exchange failed");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static void
+growth_refund_add_peer_reservation(wl_columnar_memory_governor_t *governor)
+{
+    if (!growth_refund_peer_created) {
+        wl_columnar_memory_reservation_init(&growth_refund_peer);
+        if (wl_columnar_memory_reserve(governor, 10, &growth_refund_peer)
+            && wl_columnar_memory_commit(&growth_refund_peer,
+            &growth_refund_peer))
+            growth_refund_peer_created = true;
+    }
+}
+
+struct growth_refund_thread_arg {
+    wl_columnar_memory_growth_refund_attempt_t *attempt;
+    int result;
+};
+
+static void *
+growth_refund_advance_on_thread(void *opaque)
+{
+    struct growth_refund_thread_arg *arg = opaque;
+    arg->result = wl_columnar_memory_growth_refund_attempt_advance(
+        arg->attempt);
+    return NULL;
+}
 
 static int
 test_explicit_values(void)
@@ -827,6 +879,98 @@ test_growth_reservation(void)
         || !wl_columnar_memory_rollback(&other)
         || wl_columnar_memory_reserved(&governor) != 0) {
         FAIL("global arithmetic overflow changed credit");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_growth_refund_attempt(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_growth_refund_attempt_t attempt = { 0 }, copy;
+    wl_columnar_memory_growth_refund_attempt_t wrong_owner_attempt = { 0 };
+    struct growth_refund_thread_arg thread_arg = { &attempt, 0 };
+    wl_thread_t thread;
+
+    TEST(
+        "bounded growth overlap refund resumes after aggregate CAS contention");
+    make_resolution(&resolution, 1000, 900);
+    wl_columnar_memory_governor_init(&governor, &resolution);
+    wl_columnar_memory_reservation_init(&token);
+    growth_refund_peer_created = false;
+    wl_columnar_memory_reservation_init(&growth_refund_peer);
+    if (!wl_columnar_memory_reserve(&governor, 100, &token)
+        || !wl_columnar_memory_commit(&token, &token)
+        || wl_columnar_memory_begin_growth(&token, 20)
+        != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || wl_columnar_memory_reserved(&governor) != 120
+        || wl_columnar_memory_growth_refund_attempt_begin(&token,
+        &governor, &wrong_owner_attempt) != EINVAL
+        || wl_columnar_memory_reserved(&governor) != 120
+        || wl_columnar_memory_growth_refund_attempt_begin(&token, &token,
+        &attempt) != 0) {
+        FAIL("growth refund setup or admission failed");
+        return 1;
+    }
+    copy = attempt;
+    if (wl_columnar_memory_growth_refund_attempt_advance(&copy) != EINVAL
+        || wl_thread_create(&thread, growth_refund_advance_on_thread,
+        &thread_arg) != 0
+        || wl_thread_join(&thread) != 0 || thread_arg.result != EINVAL
+        || wl_columnar_memory_growth_refund_attempt_advance(&attempt) != EAGAIN
+        || attempt.phase != WL_COLUMNAR_MEMORY_GROWTH_REFUND_CLAIM
+        || wl_columnar_memory_growth_refund_attempt_advance(&attempt) != EAGAIN
+        || attempt.phase != WL_COLUMNAR_MEMORY_GROWTH_REFUND_CREDIT
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING
+        || wl_columnar_memory_rollback_growth(&token)
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING) {
+        FAIL("refund receipt validation/claim phases failed");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 10, memory_order_release);
+    if (wl_columnar_memory_growth_refund_attempt_advance(&attempt) != EINVAL
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING
+        || token.replacement_bytes != 20) {
+        FAIL("refund underflow did not retain the claimed token");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 120, memory_order_release);
+    wl_columnar_memory_growth_refund_test_before_credit_cas
+        = growth_refund_add_peer_reservation;
+    int rc = wl_columnar_memory_growth_refund_attempt_advance(&attempt);
+    wl_columnar_memory_growth_refund_test_before_credit_cas = NULL;
+    if (rc != EAGAIN || !growth_refund_peer_created
+        || wl_columnar_memory_reserved(&governor) != 130
+        || token.bytes != 100 || token.replacement_bytes != 20
+        || token.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_GROWTH
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING) {
+        FAIL("aggregate interference lost or duplicated overlap credit");
+        return 1;
+    }
+    if (wl_columnar_memory_growth_refund_attempt_advance(&attempt) != 0
+        || attempt.phase != WL_COLUMNAR_MEMORY_GROWTH_REFUND_DONE
+        || token.bytes != 100 || token.replacement_bytes != 0
+        || token.transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || wl_columnar_memory_reserved(&governor) != 110
+        || wl_columnar_memory_growth_refund_attempt_advance(&attempt) != 0
+        || wl_columnar_memory_reserved(&governor) != 110) {
+        FAIL("refund did not restore old credit exactly once");
+        return 1;
+    }
+    if (!wl_columnar_memory_release(&growth_refund_peer)
+        || !wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("refund test reservations did not retire");
         return 1;
     }
     PASS();
@@ -2734,6 +2878,7 @@ main(void)
 {
     printf("Memory Governor Unit Tests (Issue #1368)\n");
     printf("=========================================\n");
+    test_strong_atomic_compare_exchange();
     test_explicit_values();
     test_automatic_sources();
     test_headroom_boundaries();
@@ -2745,6 +2890,7 @@ main(void)
     test_downsize_races();
     test_replacement_reservation();
     test_growth_reservation();
+    test_growth_refund_attempt();
     test_growth_races();
     wl_columnar_memory_governor_test_work_checkpoint = controlled_work_point;
     wl_columnar_memory_governor_test_checkpoint = controlled_point;

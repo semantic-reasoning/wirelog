@@ -166,6 +166,13 @@ wl_atomic_compare_exchange_weak_internal(volatile void *ptr, void *expected,
         wl_atomic_compare_exchange_weak_internal((ptr), (expected),           \
             (__int64)(desired), sizeof(*(ptr)))
 
+/* InterlockedCompareExchange cannot fail spuriously, so the weak-spelled
+ * shim above also provides the strong C11 compare-exchange contract. */
+#define atomic_compare_exchange_strong_explicit(ptr, expected, desired,     \
+            succ_order, fail_order)        \
+        wl_atomic_compare_exchange_weak_internal((ptr), (expected),           \
+            (__int64)(desired), sizeof(*(ptr)))
+
 static inline __int64
 wl_atomic_exchange_internal(volatile void *ptr, __int64 val, size_t width)
 {
@@ -188,6 +195,7 @@ wl_atomic_exchange_internal(volatile void *ptr, __int64 val, size_t width)
 #define memory_order_relaxed 0
 #define memory_order_release 1
 #define memory_order_acquire 2
+#define memory_order_acq_rel 3
 #else
 #include <stdatomic.h>
 /* Portable atomic uint64 type for struct fields */
