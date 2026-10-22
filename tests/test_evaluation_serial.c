@@ -9,9 +9,15 @@
 #include "../wirelog/wirelog.h"
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -1735,14 +1741,17 @@ test_controlled_session_step_resume(void)
         && output->columns[0][2] == 11);
 
     /* Completed controlled STEP is a stable no-op on later calls. */
-    CHECK(!wl_session_step(session));
+    int step_rc = EAGAIN;
+    for (unsigned turn = 0; turn < 1000 && step_rc == EAGAIN; ++turn)
+        step_rc = wl_session_step(session);
+    CHECK(!step_rc);
     CHECK(!wl_evaluation_control_report(control, &report));
     CHECK(report.attempt_id == first_id + 1 && report.result == 0
         && report.consumed == 0);
     output = session_find_rel((wl_col_session_t *)session, "output");
     CHECK(output && output->nrows == 3);
 
-    wl_session_destroy(session);
+    CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
@@ -2003,7 +2012,7 @@ test_controlled_step_preflight_byte_cursor(void)
         CHECK(output && output->nrows == 1 && output->ncols == 1
             && output->columns[0][0] == 7);
 
-        wl_session_destroy(base);
+        CHECK(!wl_session_try_destroy(&base) && !base);
         wl_evaluation_control_release(control);
         wl_plan_free(plan);
         wirelog_program_free(program);
@@ -2089,7 +2098,7 @@ test_controlled_step_preflight_work_limit_boundary(void)
     CHECK(!session_find_rel(session, "output"));
 
     wl_columnar_session_test_preflight_quantum = 64;
-    wl_session_destroy(base);
+    CHECK(!wl_session_try_destroy(&base) && !base);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
@@ -2171,7 +2180,7 @@ test_controlled_step_scheduler_empty_strata(void)
     const col_rel_t *output = session_find_rel(session, "output");
     CHECK(output && output->nrows == 1 && output->columns[0][0] == 7);
 
-    wl_session_destroy(base);
+    CHECK(!wl_session_try_destroy(&base) && !base);
     wl_evaluation_control_release(control);
     free(strata);
     wl_plan_free(plan);
@@ -2273,7 +2282,7 @@ test_controlled_batch_join_filter_map_step(void)
     CHECK(result->columns[0][0] == 1 && result->columns[1][0] == 1
         && result->columns[2][0] == 1 && result->columns[3][0] == 2);
     CHECK(columnar->controlled_materialized_batch_published_count == 1);
-    wl_session_destroy(session);
+    CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
@@ -2502,7 +2511,7 @@ test_controlled_batch_delta_selectors(void)
             CHECK(session->controlled_materialized_batch_published_count
                 == 1);
         }
-        wl_session_destroy(base);
+        CHECK(!wl_session_try_destroy(&base) && !base);
         wl_evaluation_control_release(control);
         wl_plan_free(plan);
         wirelog_program_free(program);
@@ -2584,7 +2593,7 @@ test_controlled_batch_child_domain_rejection(void)
                 && result->nrows == (empty ? 0u : 4u)
                 && session->controlled_materialized_batch_published_count
                 == 1);
-            wl_session_destroy(base);
+            CHECK(!wl_session_try_destroy(&base) && !base);
             wl_evaluation_control_release(control);
             wl_plan_free(plan);
             wirelog_program_free(program);
@@ -2667,14 +2676,14 @@ test_controlled_session_step_prefix_resume(void)
         && right->columns[0][2] == 9);
     CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
 
-    wl_session_destroy(session);
+    CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
 }
 
 static void
-test_controlled_session_step_destroy_drain(void)
+test_controlled_session_step_destroy_refusal(void)
 {
     static const char source[] =
         ".decl input(x:int64)\n"
@@ -2693,21 +2702,64 @@ test_controlled_session_step_destroy_drain(void)
     wl_session_t *session = NULL;
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
         &options, &session));
+    const int64_t input_rows[] = {3, 7, 11};
+    CHECK(!wl_session_insert(session, "input", input_rows, 3, 1));
 
     wl_columnar_session_test_fail_framed_funding_before_stop = 1;
     CHECK(wl_session_step(session) == EAGAIN);
-    CHECK(wl_evaluation_control_active_attempt_id(control) != 0);
-    wl_session_destroy(session);
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(attempt_id != 0);
+    wl_session_t *same_session = session;
+    CHECK(wl_session_try_destroy(&session) == EBUSY
+        && session == same_session
+        && wl_evaluation_control_active_attempt_id(control) == attempt_id);
+    CHECK(wl_session_step(session) == 0);
     CHECK(!wl_evaluation_control_active_attempt_id(control));
+    CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report));
-    CHECK(report.result == WL_EVALUATION_CONTROL_CANCELLED
-        && report.stop_reason == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(report.attempt_id == attempt_id && report.result == 0);
 
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
 }
+
+#if !defined(_WIN32)
+static void
+test_controlled_session_step_void_destroy_precondition(void)
+{
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        static const char source[] =
+            ".decl input(x:int64)\n"
+            ".decl output(x:int64)\n"
+            "output(x) :- input(x).\n";
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        if (!program) _exit(3);
+        wl_plan_t *plan = NULL;
+        if (wl_plan_from_program(program, &plan) != 0) _exit(4);
+        wl_evaluation_control_t *control = NULL;
+        if (wl_evaluation_control_create(100000, &control) != 0) _exit(5);
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        if (wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session) != 0)
+            _exit(6);
+        wl_columnar_session_test_fail_framed_funding_before_stop = 1;
+        if (wl_session_step(session) != EAGAIN) _exit(7);
+        wl_session_destroy(session);
+        _exit(8);
+    }
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+}
+#endif
 
 static void
 test_controlled_session_snapshot_publication(void)
@@ -2783,7 +2835,7 @@ test_controlled_session_snapshot_publication(void)
     check_snapshot_equal(&actual, &expected);
     CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
 
-    wl_session_destroy(session);
+    CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);
     wl_session_destroy(reference);
     wl_plan_free(plan);
@@ -3033,7 +3085,7 @@ entry_compare_crc_values(entry_fixture_t *f, const char *source,
         for (uint32_t r = 0; r < a->nrows; ++r)
             CHECK(a->columns[c][r] == b->columns[c][r]);
     }
-    wl_session_destroy(base);
+    CHECK(!wl_session_try_destroy(&base) && !base);
     wl_plan_free(plan);
     wirelog_program_free(program);
 }
@@ -5916,6 +5968,72 @@ static void
 entry_assert_lftj_inputs_unchanged(entry_fixture_t *f,
     const entry_input_t *inputs, uint32_t input_count);
 
+static unsigned lftj_writer_release_failures;
+static int
+lftj_writer_release_fail_once(
+    wl_columnar_relation_mutation_single_t *single, unsigned slot)
+{
+    (void)single;
+    if (slot == 0 && lftj_writer_release_failures++ == 0)
+        return EIO;
+    return 0;
+}
+
+static void
+test_entry_generated_lftj_writer_end_retry(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    uint64_t reserved_before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    for (unsigned turn = 0; turn < 200000; ++turn) {
+        ctx = entry_context(&f);
+        if (ctx && ctx->child.lftj.identity == &ctx->child.lftj
+            && ctx->child.lftj.writer_active)
+            break;
+        CHECK(f.reply.kind != WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL);
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(ctx && ctx->child.lftj.identity == &ctx->child.lftj
+        && ctx->child.lftj.writer_active
+        && ctx->child.lftj.writer.raw.active);
+    lftj_writer_release_failures = 0;
+    wl_columnar_relation_test_single_release = lftj_writer_release_fail_once;
+    int rc = 0;
+    for (unsigned turn = 0; turn < 32 && !lftj_writer_release_failures;
+        ++turn)
+        rc = entry_turn_action(&f,
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0);
+    wl_columnar_relation_test_single_release = NULL;
+    CHECK(!rc && lftj_writer_release_failures == 1);
+    ctx = entry_context(&f);
+    CHECK(ctx && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->child.lftj.writer_active
+        && ctx->child.lftj.writer.raw.active
+        && ctx->child.lftj.writer.phase ==
+        WL_COLUMNAR_RELATION_BATCH_DRAINING);
+
+    /* The next host call supplies a fresh grant, consumes the child refusal,
+     * then retries the same retained writer-finalization stage. */
+    CHECK(!entry_turn(&f, false, 0));
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !f.reply.committed && !session_rel_hash_lookup(f.session, "output")
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            f.session->memory_governor)) == reserved_before);
+    entry_destroy(&f);
+}
+
 static void
 test_entry_generated_lftj_abort_cleanup_retry(void)
 {
@@ -5942,8 +6060,51 @@ test_entry_generated_lftj_abort_cleanup_retry(void)
     CHECK(ctx && ctx->abort_supported
         && ctx->child.lftj.identity == &ctx->child.lftj
         && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT);
+    bool lftj_done = false;
+    CHECK(wl_columnar_ops_lftj_attempt_abort(&ctx->child.lftj, &lftj_done,
+        f.operation, f.id) == EINVAL
+        && !lftj_done
+        && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT
+        && !ctx->child.lftj.semantic_result);
+    grant_t *denied = entry_grant(&f, 1);
+    CHECK(!wl_evaluation_control_charge_attempt(denied->control, denied->id,
+        1));
+    CHECK(wl_columnar_ops_lftj_attempt_abort(&ctx->child.lftj, &lftj_done,
+        denied->control, denied->id)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !lftj_done
+        && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT
+        && !ctx->child.lftj.semantic_result);
+    CHECK(wl_evaluation_control_finish(denied->control, &denied->owner,
+        0, 0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
     CHECK(!entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
     CHECK(ctx->abort_requested);
+
+    for (unsigned turn = 0; turn < 16
+        && ctx->child.lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE; ++turn)
+        CHECK(!entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE);
+    for (unsigned turn = 0; turn < 16
+        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING; ++turn)
+        CHECK(!entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING);
+    uint64_t reserved_at_refusal = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+    int cleanup_refusal = entry_turn_action(&f,
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 1152);
+    CHECK(cleanup_refusal == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && ctx->child.pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        && ctx->child.lftj.semantic_result
+        == WL_EVALUATION_CONTROL_CANCELLED
+        && ctx->child.lftj.inputs[0].reader.owner
+        && f.session->rels == old_rels && f.session->nrels == old_nrels
+        && !session_rel_hash_lookup(f.session, "output")
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            f.session->memory_governor)) == reserved_at_refusal);
 
     entry_complete(&f);
     CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
@@ -6274,7 +6435,10 @@ main(void)
     test_controlled_batch_delta_selectors();
     test_controlled_batch_child_domain_rejection();
     test_controlled_session_step_prefix_resume();
-    test_controlled_session_step_destroy_drain();
+    test_controlled_session_step_destroy_refusal();
+#if !defined(_WIN32)
+    test_controlled_session_step_void_destroy_precondition();
+#endif
     test_controlled_session_snapshot_publication();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
@@ -6295,6 +6459,7 @@ main(void)
     test_entry_generated_lftj_duplicate_names_rejected();
     test_entry_generated_lftj_oversized_source_rejected();
     test_entry_generated_lftj_widest_output_row();
+    test_entry_generated_lftj_writer_end_retry();
     test_entry_generated_lftj_abort_cleanup_retry();
     test_entry_generated_lftj_stops_inside_child();
     test_entry_generated_filter_work_boundary();

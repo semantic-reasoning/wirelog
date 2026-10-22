@@ -567,6 +567,10 @@ run_controlled_step_gate(void)
             "controlled STEP admission lock failure fails closed");
     failures += expect(wl_session_step(session) == EAGAIN,
             "controlled step exposes its retained continuation");
+    wl_session_t *pending_session = session;
+    failures += expect(wl_session_try_destroy(&session) == EBUSY
+            && session == pending_session,
+            "checked destroy preserves a parked controlled STEP session");
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
     failures += expect(id != 0, "pending step keeps its original attempt");
     int64_t row = 1;
