@@ -35,6 +35,19 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out);
 
+/* Demote an exclusively owned resident payload. On success replaces *owner,
+ * invalidating the old address and borrowed schema pointers; ordinals, types,
+ * lane bits and metadata remain identical. Active readers return BUSY; an
+ * already spilled payload or mismatched governor returns INVALID.
+ * Every error preserves *owner and its contents. Callbacks must not reenter
+ * payload/store lifecycle operations. The store must remain live through this
+ * call. Peak admission includes the old payload plus a spilled payload floor,
+ * spill segment and writer floor (including path scratch); reserve that slack
+ * before pressure exhausts it. Small/empty payloads may not save memory. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_spill(
+    wl_columnar_batch_payload_t **owner, wl_columnar_spill_store_t *store,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context);
+
 /* Lifecycle operations are externally serialized. Readers pin the payload;
  * release returns BUSY unchanged while readers exist. Independently acquired
  * readers may read concurrently (one active read per reader). Never release a
