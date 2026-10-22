@@ -1426,6 +1426,19 @@ Checked internal cleanup can refuse with `EBUSY`, but synchronous public
 delegates to internal `wl_session_destroy`, which closes operation admission
 and waits for admitted operations before backend teardown; the public facade
 then releases its wrapper. Reader lifetimes must end within those boundaries.
+Internal controlled attempts that yield between calls hold a persistent
+exclusive admission lease. While parked, ordinary mutation, STEP, snapshot,
+and callback replacement are refused, and only the lease owner may enter the
+session for the next action. The lease remains held through discard and
+retirement and releases only at ACK. Its caller must externally serialize
+every session call entry against destruction; the admission mutex does not
+pin a raw session handle before the call begins. Such callers use the checked
+internal `wl_session_try_destroy` API: it returns `EBUSY` without consuming
+the session slot while a lease remains, then destroys and clears a quiescent
+slot after ACK. Calling the legacy internal `wl_session_destroy` with a parked
+lease is a fatal contract violation. Neither API makes arbitrary writes
+through borrowed internal relation or plan pointers safe; those retain their
+existing immutability contract.
 Refused evaluator-stack ownership and K-Fusion cleanup remain open in #1647,
 #1648 and #1765. K-Fusion is the one evaluator that still drains an unframed
 stack; the framed callers retain their entries in cleanup frames. On the serial

@@ -5914,7 +5914,7 @@ test_session_admission_exe = executable(
         '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
-  c_args: ['-DWIRELOG_BUILDING'],
+  c_args: ['-DWIRELOG_BUILDING', '-DWL_SESSION_TEST_HOOKS=1'],
   dependencies: [threads_dep],
   install: false,
 )

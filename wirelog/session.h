@@ -33,6 +33,17 @@ extern "C" {
 
 typedef struct wl_session_admission wl_session_admission_t;
 
+/* Internal persistent exclusion lease used by controlled attempts. Zero-init
+ * before first acquire and retain at the same address through release. */
+typedef struct wl_session_exclusive_attempt {
+    struct wl_session *session;
+    const void *owner_cookie;
+    struct wl_session_exclusive_attempt *self;
+    bool held;
+    bool entered;
+    bool exit_pending;
+} wl_session_exclusive_attempt_t;
+
 /*
  * Note: concrete session types embed wl_session_t as their first field,
  * or allocate a struct where the backend pointer is tracked. For our purposes,
@@ -61,6 +72,21 @@ struct wl_session {
     wl_evaluation_control_t *evaluation_control;
     bool owns_evaluation_control;
 };
+
+/* Internal: lease protects the session between controlled attempt calls.
+ * Zero-initialize and retain the record at the same address. Acquire through
+ * ACK/release and every action must use the acquiring thread. After an action
+ * completes, mark exit pending before leave; retrying leave never repeats the
+ * action. The caller may release only after all attempt resources have
+ * retired or moved; this gate cannot inspect columnar attempt ownership. */
+int wl_session_exclusive_attempt_acquire(wl_session_t *session,
+    wl_session_exclusive_attempt_t *attempt);
+int wl_session_exclusive_attempt_enter(wl_session_exclusive_attempt_t *attempt);
+int wl_session_exclusive_attempt_mark_exit_pending(
+    wl_session_exclusive_attempt_t *attempt);
+int wl_session_exclusive_attempt_leave(wl_session_exclusive_attempt_t *attempt);
+int wl_session_exclusive_attempt_release(
+    wl_session_exclusive_attempt_t *attempt);
 
 /* Wrapper functions that delegate to the backend vtable */
 
@@ -113,6 +139,8 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     const wl_session_options_t *options, wl_session_t **out);
 
 #ifdef WL_SESSION_TEST_HOOKS
+void wl_session_testhook_fail_next_admission_lock(void);
+void wl_session_testhook_fail_next_admission_unlock(void);
 /* Test-only, per-thread default options substituted when a creator passes
  * NULL options.  Borrowed for as long as it stays installed; install NULL
  * to clear.  Never compiled into libwirelog. */
@@ -146,9 +174,16 @@ wl_session_testhook_after_worker_lease_release(wl_session_t *session);
  * tuple/delta callback; such reentrant destruction is unsupported.  The
  * operation admission guard waits for admitted work to finish before backend
  * teardown and therefore cannot safely wait for the operation that called it.
+ * Calling this with a parked internal exclusive attempt is a fatal contract
+ * violation; use wl_session_try_destroy() and retry after attempt ACK.
  */
 void
 wl_session_destroy(wl_session_t *session);
+
+/* Internal checked destruction for sessions with persistent attempts. The
+ * caller must externally synchronize all call entry against destruction. */
+int
+wl_session_try_destroy(wl_session_t **session_slot);
 
 /**
  * wl_session_insert:
