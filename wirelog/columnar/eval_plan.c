@@ -55,6 +55,12 @@ wl_columnar_eval_plan_numeric_composed_abort_supported(
         case WL_PLAN_OP_MAP:
             if (!depth) return EINVAL;
             break;
+        case WL_PLAN_OP_LFTJ:
+            /* A generated LFTJ owns its k input relations in opaque_data and
+             * contributes one result to the composed runtime stack. */
+            if (depth) return EINVAL;
+            ++depth;
+            break;
         case WL_PLAN_OP_JOIN:
             if (!depth) return EINVAL;
             /* The owned ordinary JOIN attempt retains cancellation state and
@@ -1454,6 +1460,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                 && kind != WL_PLAN_OP_MAP
                 && !(kind == WL_PLAN_OP_JOIN
                 && !record->plan->ops[record->cursor].materialized)
+                && kind != WL_PLAN_OP_LFTJ
                 && kind != WL_PLAN_OP_CONCAT
                 && !(kind == WL_PLAN_OP_CONSOLIDATE
                 && record->cursor + 1 == record->end))

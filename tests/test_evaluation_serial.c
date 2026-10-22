@@ -4312,27 +4312,6 @@ test_entry_generated_lftj(void)
         consolidate |= f.relation->ops[i].op == WL_PLAN_OP_CONSOLIDATE;
     }
     CHECK(lftj && map && consolidate);
-    uint64_t before = wl_columnar_memory_reserved(
-        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
-    CHECK(!entry_turn(&f, false, 0));
-    entry_until(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
-    CHECK(!entry_turn(&f, false, 0));
-    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
-    CHECK(ctx && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
-        && !ctx->abort_supported);
-    wl_evaluation_control_t *pending_funding = ctx->pending_funding;
-    uint64_t pending_funding_id = ctx->pending_funding_id;
-    wl_columnar_eval_plan_numeric_phase_t child_phase = ctx->child.phase;
-    CHECK(entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0)
-        == ENOTSUP);
-    CHECK(entry_context(&f) == ctx
-        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
-        && ctx->pending_funding == pending_funding
-        && ctx->pending_funding_id == pending_funding_id
-        && ctx->child.phase == child_phase && !ctx->abort_requested
-        && f.previous.previous_valid
-        && f.previous.previous_funding == pending_funding
-        && f.previous.previous_funding_id == pending_funding_id);
     entry_complete(&f);
     CHECK(!f.reply.execution_result && f.reply.committed);
     col_rel_t *output = session_find_rel(f.session, "output");
@@ -4576,6 +4555,57 @@ entry_lftj_phase_reached(entry_fixture_t *f,
         (void)entry_turn(f, false, 0);
     }
     return false;
+}
+
+static void
+entry_assert_lftj_inputs_unchanged(entry_fixture_t *f,
+    const entry_input_t *inputs, uint32_t input_count);
+
+static void
+test_entry_generated_lftj_abort_cleanup_retry(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- input(x), a(x), b(x).\n";
+    const entry_input_t inputs[] = {
+        {"input", entry_rows, 4, 1},
+        {"a", entry_rows, 4, 1},
+        {"b", entry_rows, 4, 1}
+    };
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 3, 0);
+    col_rel_t **old_rels = f.session->rels;
+    uint32_t old_nrels = f.session->nrels;
+    uint32_t old_arr_count = f.session->arr_count;
+    col_arr_entry_t *old_arr_entries = f.session->arr_entries;
+    uint64_t reserved_before = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.session->memory_governor));
+
+    CHECK(entry_lftj_phase_reached(&f, WL_COLUMNAR_LFTJ_ATTEMPT_SORT,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(&f);
+    CHECK(ctx && ctx->abort_supported
+        && ctx->child.lftj.identity == &ctx->child.lftj
+        && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT);
+    CHECK(!entry_turn_action(&f, WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(ctx->abort_requested);
+
+    entry_complete(&f);
+    CHECK(f.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !f.reply.committed && !session_rel_hash_lookup(f.session, "output")
+        && f.session->rels == old_rels && f.session->nrels == old_nrels
+        && f.session->arr_count == old_arr_count
+        && f.session->arr_entries == old_arr_entries
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            f.session->memory_governor)) == reserved_before);
+    entry_assert_lftj_inputs_unchanged(&f, inputs, 3);
+    entry_finish_original(&f);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.consumed > 0);
+    entry_retry_after_finished_stop(&f, source, inputs, 3);
+    entry_destroy(&f);
 }
 
 static uint64_t
@@ -4895,6 +4925,7 @@ main(void)
     test_entry_authority(); test_entry_generated_lftj();
     test_entry_generated_lftj_float_nonleading_duplicate_keys();
     test_entry_generated_lftj_widest_output_row();
+    test_entry_generated_lftj_abort_cleanup_retry();
     test_entry_generated_lftj_stops_inside_child();
     test_entry_generated_filter_work_boundary();
 
