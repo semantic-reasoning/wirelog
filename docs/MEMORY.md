@@ -3836,9 +3836,10 @@ finishes the reported stopped generation and retries with a fresh original
 generation. The keyed total-reservation `T` versus `T-1` check is a measured
 single-worker acceptance allowance; it does not define a source tariff or the
 256-unit source quantum. HOST384 remains separate financing for each real
-callback. These tests cover this generated ordinary right-filter route only;
-they do not close whole STEP/SNAPSHOT, recursive, differential, weighted,
-TDD/parallel, LFTJ/K-fusion, or public/default #1821 coverage.
+callback. These tests cover this generated ordinary right-filter route only.
+Bounded default serial preflight for supported nonrecursive STEP plans is
+described in `docs/SEMANTICS.md`; recursive, differential, weighted,
+TDD/parallel, LFTJ/K-fusion, and controlled SNAPSHOT coverage remain open.
 
 The generated product route also pins an empirical original-work boundary at
 pair 128. An unlimited attempt is cancelled at that JOIN checkpoint; its
