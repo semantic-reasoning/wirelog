@@ -133,6 +133,13 @@ typedef enum {
     WL_COLUMNAR_MEMORY_ADMISSION_DENIED = 4,
 } wl_columnar_memory_admission_status_t;
 
+typedef enum {
+    WL_COLUMNAR_MEMORY_RELEASE_TRY_OK = 0,
+    WL_COLUMNAR_MEMORY_RELEASE_TRY_RETRY,
+    WL_COLUMNAR_MEMORY_RELEASE_TRY_INVALID,
+    WL_COLUMNAR_MEMORY_RELEASE_TRY_OVERFLOW,
+} wl_columnar_memory_release_try_status_t;
+
 typedef struct {
     wl_columnar_memory_governor_t *governor;
     uint64_t bytes;
@@ -156,6 +163,7 @@ enum {
     WL_COLUMNAR_MEMORY_TEST_TRANSFER_CLAIMED,
     WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDITED,
     WL_COLUMNAR_MEMORY_TEST_DOWNSIZE_CREDITED,
+    WL_COLUMNAR_MEMORY_TEST_RELEASE_CREDIT_CAS,
 };
 void
 wl_columnar_memory_test_hook(wl_columnar_memory_reservation_t *reservation,
@@ -552,6 +560,15 @@ wl_columnar_memory_rollback(
 
 bool
 wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation);
+
+/* Non-spinning release for resumable cleanup. Makes at most one token-state
+ * CAS and one aggregate-credit CAS. RETRY denotes contention; INVALID and
+ * OVERFLOW denote terminal token/accounting shape errors. Supports RESERVED,
+ * COMMITTED, and REPLACING tokens. RETRY leaves the original token live and
+ * unchanged so a caller retaining exclusive token/governor lifetime can try
+ * again later. Does not release physical storage. */
+wl_columnar_memory_release_try_status_t
+wl_columnar_memory_release_try(wl_columnar_memory_reservation_t *reservation);
 
 uint64_t
 wl_columnar_memory_reserved(const wl_columnar_memory_governor_t *governor);
