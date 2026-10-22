@@ -57,6 +57,8 @@ wl_test_unsetenv_(const char *name)
 /* Defined under WL_SESSION_TEST_HOOKS in testlib_prod. */
 extern void (*wl_columnar_kfusion_test_clone)(wl_col_session_t *parent,
     wl_col_session_t *child, bool before);
+extern int (*wl_columnar_kfusion_test_submit)(wl_work_queue_t *wq,
+    void (*work_fn)(void *ctx), void *ctx);
 
 /* ----------------------------------------------------------------
  * Test framework (matches wirelog convention)
@@ -691,6 +693,353 @@ test_k4_join_batch_knob_runs_branches_serially(void)
 }
 
 /* ================================================================
+ * Issue #2129: a K-Fusion branch session is a shallow copy of the
+ * coordinator.  It must not inherit the coordinator's filt_cache array
+ * reservation, which the branch would release when it grows its own cache,
+ * and every reservation the branch takes for its own cache must be returned
+ * to the governor when the cohort is cleaned up.
+ * ================================================================ */
+
+static wl_columnar_memory_governor_ref_t *
+create_test_governor(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+
+    memset(&resolution, 0, sizeof(resolution));
+    resolution.budget_bytes = (uint64_t)256u * 1024u * 1024u;
+    resolution.usable_bytes = (uint64_t)256u * 1024u * 1024u;
+    resolution.mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING;
+    resolution.source = WL_COLUMNAR_MEMORY_SOURCE_ENV;
+    resolution.status = WL_COLUMNAR_MEMORY_OK;
+    return wl_columnar_memory_governor_ref_create(&resolution);
+}
+
+static uint64_t
+governor_reserved(wl_columnar_memory_governor_ref_t *governor)
+{
+    return wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(governor));
+}
+
+struct branch_token_probe {
+    wl_col_session_t *parent;
+    wl_col_session_t *child;
+    wl_columnar_memory_reservation_t *token;
+    uint64_t token_bytes;
+    uint64_t token_state;
+    unsigned primed_clones;
+    unsigned inherited;
+    unsigned grown_after_primed_parent;
+    unsigned parent_changed;
+};
+
+static struct branch_token_probe token_probe;
+
+/* Runs right after the shallow copy of branch d, before its resets. */
+static void
+record_parent_token(wl_col_session_t *parent, wl_col_session_t *child,
+    bool before)
+{
+    if (before)
+        return;
+    token_probe.parent = parent;
+    token_probe.child = child;
+    token_probe.token = parent->filt_cache_array_reservation;
+    if (token_probe.token) {
+        token_probe.primed_clones++;
+        token_probe.token_bytes = token_probe.token->bytes;
+        token_probe.token_state = atomic_load_explicit(
+            &token_probe.token->state, memory_order_acquire);
+    }
+}
+
+/* Runs branch d inline on the coordinator thread, after all of its resets.
+ * Clearing an inherited token here keeps the unfixed code from releasing
+ * the coordinator's token, so the token reads below and in the next
+ * branch's record_parent_token stay valid, and the test reports the
+ * inheritance instead of crashing. */
+static int
+run_branch_inline(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
+{
+    wl_col_session_t *child = token_probe.child;
+    wl_columnar_memory_reservation_t *token = token_probe.token;
+
+    (void)wq;
+    if (child->filt_cache_array_reservation != NULL) {
+        token_probe.inherited++;
+        child->filt_cache_array_reservation = NULL;
+    }
+    work_fn(ctx);
+    if (child->filt_cache_cap > 0 && token != NULL)
+        token_probe.grown_after_primed_parent++;
+    if (token_probe.parent->filt_cache_array_reservation != token
+        || (token != NULL && (token->bytes != token_probe.token_bytes
+        || atomic_load_explicit(&token->state, memory_order_acquire)
+        != token_probe.token_state)))
+        token_probe.parent_changed++;
+    return 0;
+}
+
+static void
+test_k4_branch_filter_cache_tokens_are_branch_owned(void)
+{
+    TEST("K=4 branches own their filter-cache reservations (#2129)");
+
+    /* s is a lower stratum, so the coordinator fills its own filter cache
+     * for k(y, 1) before dispatch; each branch then filters k(b, 1) into a
+     * cache of its own. */
+    const char *src = ".decl e(x: int32, y: int32)\n"
+        ".decl k(x: int32, y: int32)\n"
+        ".decl s(x: int32, y: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "e(0, 1). e(1, 2). e(2, 3). e(3, 4). e(4, 5). e(5, 6).\n"
+        "e(6, 7). e(7, 8). e(8, 9). e(9, 10). e(10, 11). e(11, 12).\n"
+        "k(0, 1). k(1, 1). k(2, 1). k(3, 1). k(4, 1). k(5, 1). k(6, 1).\n"
+        "k(7, 1). k(8, 1). k(9, 1). k(10, 1). k(11, 1). k(12, 1).\n"
+        "s(x, y) :- e(x, y), k(y, 1).\n"
+        "r(x, y) :- s(x, y).\n"
+        "r(a, f) :- r(a, b), k(b, 1), r(b, c), r(c, d), r(d, f).\n";
+    /* W=1 runs the branches serially without cloning: the control. */
+    static const uint32_t workers[] = { 1, 4, 2 };
+    char why[256];
+
+    why[0] = '\0';
+    unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    for (size_t wi = 0; wi < sizeof(workers) / sizeof(workers[0]); wi++) {
+        uint32_t w = workers[wi];
+        wl_columnar_memory_governor_ref_t *governor = create_test_governor();
+        wirelog_error_t err;
+        wirelog_program_t *prog = NULL;
+        wl_plan_t *plan = NULL;
+        wl_session_t *sess = NULL;
+        wl_session_options_t options;
+        struct pair_ctx pairs = { 0, 0 };
+        uint64_t baseline = 0;
+        uint64_t after = 0;
+        int rc = -1;
+
+        if (!governor) {
+            snprintf(why, sizeof(why), "W=%u: governor allocation failed",
+                w);
+            break;
+        }
+        baseline = governor_reserved(governor);
+        memset(&token_probe, 0, sizeof(token_probe));
+        wl_columnar_kfusion_test_clone = record_parent_token;
+        wl_columnar_kfusion_test_submit = run_branch_inline;
+        wl_session_options_init(&options);
+        options.memory_governor = governor;
+        prog = wirelog_parse_string(src, &err);
+        if (prog && wl_plan_from_program(prog, &plan) == 0
+            && wl_session_create_with_options(wl_backend_columnar(), plan, w,
+            &options, &sess) == 0
+            && wl_session_load_facts(sess, prog) == 0)
+            rc = wl_session_snapshot(sess, check_pair_cb, &pairs);
+        if (sess)
+            wl_session_destroy(sess);
+        if (plan)
+            wl_plan_free(plan);
+        if (prog)
+            wirelog_program_free(prog);
+        wl_columnar_kfusion_test_clone = NULL;
+        wl_columnar_kfusion_test_submit = NULL;
+        after = governor_reserved(governor);
+        wl_columnar_memory_governor_ref_release(governor);
+
+        printf("\n    W=%u primed=%u inherited=%u grown=%u "
+            "parent_changed=%u residue=%" PRId64 " ", w,
+            token_probe.primed_clones, token_probe.inherited,
+            token_probe.grown_after_primed_parent,
+            token_probe.parent_changed, (int64_t)(after - baseline));
+        if (rc != 0)
+            snprintf(why, sizeof(why), "W=%u: snapshot failed (rc %d)", w,
+                rc);
+        else if (pairs.count != 30 || pairs.mismatches != 0)
+            snprintf(why, sizeof(why),
+                "W=%u: closure differs from the 30 expected pairs", w);
+        else if (w > 1 && token_probe.grown_after_primed_parent < 2)
+            snprintf(why, sizeof(why), "W=%u: fewer than two branches grew "
+                "a filter cache while the coordinator held a token", w);
+        else if (token_probe.inherited != 0)
+            snprintf(why, sizeof(why), "W=%u: a branch session inherited "
+                "the coordinator's filter-cache array token", w);
+        else if (token_probe.parent_changed != 0)
+            snprintf(why, sizeof(why), "W=%u: a branch changed the "
+                "coordinator's filter-cache array token", w);
+        else if (after != baseline)
+            snprintf(why, sizeof(why), "W=%u: the governor still holds "
+                "reservations after the session was destroyed", w);
+        if (why[0] != '\0')
+            break;
+    }
+    printf("\n    ");
+    ASSERT(why[0] == '\0', why);
+    PASS();
+}
+
+/* Multiset digest of every tuple a snapshot reports: independent of the
+ * order of tuples, dependent on the order of columns within a tuple. */
+struct model_digest {
+    uint64_t rows;
+    uint64_t sum;
+};
+
+static void
+digest_tuple_cb(const char *relation, const int64_t *row, uint32_t ncols,
+    void *user_data)
+{
+    struct model_digest *digest = (struct model_digest *)user_data;
+    uint64_t h = 1469598103934665603ull;
+
+    for (const char *c = relation; c && *c; c++)
+        h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    for (uint32_t i = 0; i < ncols; i++)
+        h = (h ^ (uint64_t)row[i]) * 1099511628211ull;
+    digest->rows++;
+    digest->sum += h;
+}
+
+struct fact_rows {
+    const char *relation;
+    const int64_t *rows;
+    uint32_t count;
+    uint32_t ncols;
+};
+
+static int
+insert_fact_rows(wl_session_t *sess, const struct fact_rows *facts,
+    size_t nfacts)
+{
+    for (size_t f = 0; f < nfacts; f++) {
+        for (uint32_t i = 0; i < facts[f].count; i++) {
+            int rc = wl_session_insert(sess, facts[f].relation,
+                    facts[f].rows + (size_t)i * facts[f].ncols, 1,
+                    facts[f].ncols);
+            if (rc != 0)
+                return rc;
+        }
+    }
+    return 0;
+}
+
+static void
+test_issue_2129_program_same_model_at_every_width(void)
+{
+    TEST("#2129 program: same model and no reservation residue at W=1..8");
+
+    const char *src = ".decl e0(c0: int64, c1: int64, c2: int64)\n"
+        ".decl e1(c0: int64, c1: int64)\n"
+        ".decl e2(c0: int64, c1: int64, c2: int64)\n"
+        ".decl e3(c0: int64, c1: int64)\n"
+        ".decl a(c0: int64, c1: int64)\n"
+        ".decl b(c0: int64, c1: int64)\n"
+        ".decl l0(c0: int64, c1: int64)\n"
+        "l0(x0,x1) :- e1(x0,x1).\n"
+        "a(x1,x1) :- b(x0,x1), e1(x0,3).\n"
+        "b(x0,x0) :- a(x0,x0), e3(x0,x0), !e0(x0,x0,x0).\n"
+        "b(x2,x2) :- a(x0,x0), b(x0,x1), e0(x2,x3,x4), !e3(x1,x2).\n"
+        "a(x1,x0) :- b(x0,x1).\n"
+        "b(x0,x0) :- a(x0,x1), e1(x0,x1).\n"
+        "b(x2,x2) :- b(x0,x1), a(x1,x2), b(x0,x1), !l0(x1,x1), x1 != x2.\n";
+    static const int64_t e0_round1[] = { 3, 2, 0, 6, 4, 3, 5, 3, 1, 2, 6, 6,
+                                         4, 2, 1 };
+    static const int64_t e1_round1[] = { 3, 4, 2, 7, 6, 0 };
+    static const int64_t e2_round1[] = { 4, 2, 2, 6, 0, 7 };
+    static const int64_t e3_round1[] = { 7, 0, 6, 1, 4, 6, 7, 1, 6, 6 };
+    static const int64_t e1_round2[] = { 0, 4, 4, 5 };
+    static const int64_t e3_round2[] = { 0, 3 };
+    static const struct fact_rows round1[] = {
+        { "e0", e0_round1, 5, 3 },
+        { "e1", e1_round1, 3, 2 },
+        { "e2", e2_round1, 2, 3 },
+        { "e3", e3_round1, 5, 2 },
+    };
+    static const struct fact_rows round2[] = {
+        { "e1", e1_round2, 2, 2 },
+        { "e3", e3_round2, 1, 2 },
+    };
+    static const uint32_t workers[] = { 1, 2, 4, 8 };
+    struct model_digest reference[2];
+    char why[256];
+
+    memset(reference, 0, sizeof(reference));
+    why[0] = '\0';
+    setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+    unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    for (size_t wi = 0; wi < sizeof(workers) / sizeof(workers[0]); wi++) {
+        uint32_t w = workers[wi];
+        wl_columnar_memory_governor_ref_t *governor = create_test_governor();
+        wirelog_error_t err;
+        wirelog_program_t *prog = NULL;
+        wl_plan_t *plan = NULL;
+        wl_session_t *sess = NULL;
+        wl_session_options_t options;
+        struct model_digest got[2];
+        uint64_t baseline = 0;
+        uint64_t after = 0;
+        int rc = -1;
+
+        memset(got, 0, sizeof(got));
+        if (!governor) {
+            snprintf(why, sizeof(why), "W=%u: governor allocation failed",
+                w);
+            break;
+        }
+        baseline = governor_reserved(governor);
+        wl_session_options_init(&options);
+        options.memory_governor = governor;
+        prog = wirelog_parse_string(src, &err);
+        if (prog && wl_plan_from_program(prog, &plan) == 0
+            && wl_session_create_with_options(wl_backend_columnar(), plan, w,
+            &options, &sess) == 0) {
+            rc = insert_fact_rows(sess, round1,
+                    sizeof(round1) / sizeof(round1[0]));
+            if (rc == 0)
+                rc = wl_session_snapshot(sess, digest_tuple_cb, &got[0]);
+            if (rc == 0)
+                rc = insert_fact_rows(sess, round2,
+                        sizeof(round2) / sizeof(round2[0]));
+            if (rc == 0)
+                rc = wl_session_snapshot(sess, digest_tuple_cb, &got[1]);
+        }
+        if (sess)
+            wl_session_destroy(sess);
+        if (plan)
+            wl_plan_free(plan);
+        if (prog)
+            wirelog_program_free(prog);
+        after = governor_reserved(governor);
+        wl_columnar_memory_governor_ref_release(governor);
+
+        printf("\n    W=%u rows=%" PRIu64 "/%" PRIu64 " residue=%" PRId64
+            " ", w, got[0].rows, got[1].rows, (int64_t)(after - baseline));
+        if (w == 1)
+            memcpy(reference, got, sizeof(reference));
+        if (rc != 0)
+            snprintf(why, sizeof(why), "W=%u: insert or snapshot failed "
+                "(rc %d)", w, rc);
+        else if (reference[1].rows == 0)
+            snprintf(why, sizeof(why), "W=%u: the reference model is empty",
+                w);
+        else if (memcmp(got, reference, sizeof(reference)) != 0)
+            snprintf(why, sizeof(why), "W=%u: the model differs from W=1",
+                w);
+        else if (after != baseline)
+            snprintf(why, sizeof(why), "W=%u: the governor still holds "
+                "reservations after the session was destroyed", w);
+        if (why[0] != '\0')
+            break;
+    }
+    unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    printf("\n    ");
+    ASSERT(why[0] == '\0', why);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -711,6 +1060,8 @@ main(void)
     test_k2_all_inactive_branches_preserve_target_schema();
     test_k2_multiworker_threshold_serial_semantics();
     test_k4_join_batch_knob_runs_branches_serially();
+    test_k4_branch_filter_cache_tokens_are_branch_owned();
+    test_issue_2129_program_same_model_at_every_width();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

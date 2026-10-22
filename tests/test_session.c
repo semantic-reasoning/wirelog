@@ -14189,6 +14189,10 @@ static unsigned kfusion_submit_calls;
 static wl_col_session_t *kfusion_parent_session;
 static bool kfusion_registered_during_submit;
 static wl_columnar_memory_reservation_t *kfusion_retained_reservation;
+/* #2129: a filter-cache array token owned by a branch whose cleanup is
+ * refused and retried.  The pass that completes cleanup must return it to
+ * the governor. */
+static bool kfusion_branch_array_token_attached;
 static uintptr_t kfusion_refusal_token_identity;
 static uintptr_t kfusion_arena_token_identity;
 static bool kfusion_arena_owned_observed;
@@ -14291,6 +14295,22 @@ kfusion_inject_mixed_cleanup_refusal(wl_col_session_t *sess,
         return;
     }
     kfusion_retained_reservation = &heap->retained_reservation;
+    if (!sess->filt_cache_array_reservation) {
+        wl_columnar_memory_reservation_t *token = (
+            wl_columnar_memory_reservation_t *)malloc(sizeof(*token));
+        if (token) {
+            wl_columnar_memory_reservation_init(token);
+            if (wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        sess->memory_governor), 64, token)
+                == WL_COLUMNAR_MEMORY_ADMISSION_OK) {
+                sess->filt_cache_array_reservation = token;
+                kfusion_branch_array_token_attached = true;
+            } else {
+                free(token);
+            }
+        }
+    }
     kfusion_refusal_hook_hit = true;
 #ifdef WL_TEST_ALLOC_WRAP
     fail_calloc_size = sizeof(wl_columnar_retained_eval_entry_t);
@@ -14491,6 +14511,7 @@ test_kfusion_parallel_cohort_refusal_retry(void)
     kfusion_alias_dependency_mode = false;
     kfusion_alias_dependency_hit = false;
     kfusion_retained_reservation = NULL;
+    kfusion_branch_array_token_attached = false;
     kfusion_refusal_token_identity = 0;
     kfusion_arena_token_identity = 0;
     kfusion_arena_owned_observed = false;
@@ -14526,6 +14547,8 @@ test_kfusion_parallel_cohort_refusal_retry(void)
         "merged output was published before worker cleanup");
     KCOHORT_CHECK(kfusion_refusal_hook_hit,
         "mixed heap/pool cleanup entries were not installed");
+    KCOHORT_CHECK(kfusion_branch_array_token_attached,
+        "branch filter-cache array token was not installed");
     KCOHORT_CHECK(kfusion_retained_worker_pool != NULL,
         "worker delta pool was not retained with the cohort");
     KCOHORT_CHECK(kfusion_submit_calls == 2,
