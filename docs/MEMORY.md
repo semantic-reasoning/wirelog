@@ -3550,7 +3550,7 @@ The remaining activation boundary is explicit:
 | Initial scalar SEMIJOIN/ANTIJOIN | Supported in the named existing-right scalar domain, including numeric composition |
 | Initial scalar REDUCE | Supported in the documented scalar numeric child domain |
 | Initial scalar CONCAT/UNION | Supported as a two-input child and complete private composed numeric body through terminal CONSOLIDATE |
-| Generated LFTJ | Supported in serial controlled composition with a 64-column cap; source discovery, merge-sort, traversal, and output-cell actions are bounded. Relation destruction, allocator/Arrow release, and stack publication/disposal remain synchronous cleanup boundaries. |
+| Generated LFTJ | Supported in serial controlled composition with a 64-column cap; source discovery, descriptor/storage-reader admission, merge-sort, traversal, and output-cell actions are bounded. Contended reader admission resumes with the same input cursor and retires partial descriptor pins on cancellation. Reservation receipts are prepared before credit return, and successful writer-finalization refusals retry without changing semantic success. Relation destruction, allocator/Arrow release, and stack publication/disposal remain synchronous cleanup boundaries. |
 | LFTJ fallbacks/fused alternatives | Further implementation and path-specific qualification required |
 | Differential/weighted, recursive, batch/pipeline/TDD/parallel dispatch | Further implementation and path-specific qualification required |
 | Known numeric/projection MAP result schemas and FLOAT ordering/deduplication | Supported in the documented scalar domain; raw interpreter-only mixed schemas remain legacy/untyped |

@@ -653,28 +653,8 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         col_rel_t *rel = a->registry[in->lookup_match_slot];
         if (!rel) return wl_columnar_lftj_attempt_fail(a, ENOENT);
-        uint32_t key = a->metadata->key_cols[i];
-        if (!rel->ncols || key >= rel->ncols || rel->timestamps
-            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
-            return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
-        }
         in->relation = rel;
-        in->nrows = rel->nrows;
-        in->ncols = rel->ncols;
-        in->key_col = key;
-        in->key_type = rel->column_types ? rel->column_types[key]
-            : WIRELOG_TYPE_INT64;
-        if (i && in->key_type != a->inputs[0].key_type)
-            return wl_columnar_lftj_attempt_fail(a, EINVAL);
-        if (a->total_columns > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-            || in->ncols > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-            - a->total_columns)
-            return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
-        a->binary_offset[i] = a->total_columns;
-        for (uint32_t c = 0; c < in->ncols; c++)
-            a->output_types[a->total_columns + c] = rel->column_types
-                ? (int64_t)rel->column_types[c] : WIRELOG_TYPE_INT64;
-        a->total_columns += in->ncols;
+        in->key_col = a->metadata->key_cols[i];
         a->input_count = ++a->cursor;
         return 0;
     }
@@ -691,8 +671,39 @@ wl_columnar_lftj_attempt_acquire(wl_columnar_lftj_attempt_t *a)
                 WL_COLUMNAR_LFTJ_ACTION_UNITS);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[a->cursor];
-        rc = col_rel_source_reader_acquire(in->relation, &in->reader);
+        bool acquired = false;
+        rc = col_rel_source_reader_acquire_step(in->relation, &in->reader,
+                &acquired);
+        if (rc == EAGAIN)
+            return 0;
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        if (!acquired)
+            return 0;
+
+        rc = wl_columnar_lftj_attempt_charge(a,
+                WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
+                + WL_COLUMNAR_LFTJ_ACTION_UNITS);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        col_rel_t *rel = in->relation;
+        uint32_t key = in->key_col;
+        if (!rel->ncols || key >= rel->ncols || rel->timestamps
+            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+            return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
+        in->nrows = rel->nrows;
+        in->ncols = rel->ncols;
+        in->key_type = rel->column_types ? rel->column_types[key]
+            : WIRELOG_TYPE_INT64;
+        if (a->cursor && in->key_type != a->inputs[0].key_type)
+            return wl_columnar_lftj_attempt_fail(a, EINVAL);
+        if (a->total_columns > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
+            || in->ncols > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
+            - a->total_columns)
+            return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
+        a->binary_offset[a->cursor] = a->total_columns;
+        for (uint32_t c = 0; c < in->ncols; c++)
+            a->output_types[a->total_columns + c] = rel->column_types
+                ? (int64_t)rel->column_types[c] : WIRELOG_TYPE_INT64;
+        a->total_columns += in->ncols;
         ++a->cursor;
         return 0;
     }
@@ -1134,8 +1145,11 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         if (charge_rc) return charge_rc;
         int rc = wl_columnar_relation_append_batch_end_controlled(&a->writer,
                 a->semantic_result);
-        if (!a->writer.raw.active) a->writer_active = false;
-        if (rc && !a->semantic_result) a->semantic_result = rc;
+        if (!a->writer.raw.active) {
+            a->writer_active = false;
+            if (rc && !a->semantic_result)
+                a->semantic_result = rc;
+        }
         return 0;
     }
     if (a->output_owned && a->semantic_result) {

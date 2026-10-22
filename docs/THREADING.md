@@ -451,11 +451,14 @@ non-atomic payload reads require external synchronization.
 | `memory_governor.c:finish_reservation` | `reservation->state` | `atomic_load_explicit` | `acquire` | Observe an eligible stable state before claiming release; reject a busy token |
 | `memory_governor.c:finish_reservation#2` | `reservation->state` | `atomic_store_explicit` | `release` | Publish released state only after accounting, or restore the prior state on failure |
 | `memory_governor.c:wl_columnar_memory_reservation_finish_step` | `reservation->state` | `atomic_load_explicit` | `acquire` | Resume or admit a staged release using the token's current state |
-| `memory_governor.c:wl_columnar_memory_reservation_finish_step#2` | `reservation->state` | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim one release transition; contention returns without retrying or altering accounting |
-| `memory_governor.c:wl_columnar_memory_reservation_finish_step#3` | `governor->reserved_bytes` | `atomic_load_explicit` | relaxed | Read the aggregate before one checked credit CAS |
-| `memory_governor.c:wl_columnar_memory_reservation_finish_step#4` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Return this token's credit once; contention preserves RELEASING and the credit amount for retry |
-| `memory_governor.c:wl_columnar_memory_reservation_finish_step#5` | `reservation->owner_bits` | `atomic_store_explicit` | relaxed | Clear ownership after governor credit succeeds |
-| `memory_governor.c:wl_columnar_memory_reservation_finish_step#6` | `reservation->state` | `atomic_store_explicit` | release | Publish RELEASED only after the single accounting CAS completes |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#2` | `reservation->state` | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim RELEASE_PREPARING before reading mutable token payload; contention returns without touching the receipt |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#3` | `reservation->state` | `atomic_store_explicit` | release | Restore the prior state if replacement byte arithmetic is invalid after the exclusive claim |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#4` | `reservation->state` | `atomic_store_explicit` | release | Restore the prior state if the claimed token has no valid governor credit |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#5` | `reservation->state` | `atomic_store_explicit` | release | Publish the complete immutable release receipt for same-thread retries |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#6` | `governor->reserved_bytes` | `atomic_load_explicit` | relaxed | Read the aggregate before one checked credit CAS |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#7` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Return this token's credit once; contention preserves RELEASING and the credit amount for retry |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#8` | `reservation->owner_bits` | `atomic_store_explicit` | relaxed | Clear ownership after governor credit succeeds |
+| `memory_governor.c:wl_columnar_memory_reservation_finish_step#9` | `reservation->state` | `atomic_store_explicit` | release | Publish RELEASED only after the single accounting CAS completes |
 | `memory_governor.c:wl_columnar_memory_reserve_growth` | `reservation->state` | `atomic_load_explicit` | `acquire` | Validate the source token before creating a distinct growth reservation |
 | `memory_governor.c:wl_columnar_memory_reserved` | `reserved_bytes` | `atomic_load_explicit` | `acquire` | Read a coherent observable reservation total |
 | `memory_governor.c:wl_columnar_memory_reservation_move` | `destination->state` | `atomic_load_explicit` | `acquire` | Validate the destination token before moving ownership |
@@ -579,6 +582,8 @@ those slots and arena allocations are quiescent.
 | `source_access.h:wl_columnar_source_access_gate_init` | `gate->state` | `atomic_store_explicit` | relaxed | Establish inactive zero state before publication |
 | `source_access.h:wl_columnar_source_access_gate_reader_acquire` | `gate->state` | `atomic_load_explicit` | acquire | Observe writer release before admitting an ordinary or transferable reader |
 | `source_access.h:wl_columnar_source_access_gate_reader_acquire#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Linearize reader admission without overflowing the writer sentinel |
+| `source_access.h:wl_columnar_source_access_gate_reader_acquire_step` | `gate->state` | `atomic_load_explicit` | acquire | Observe one gate state before a bounded reader-acquisition attempt |
+| `source_access.h:wl_columnar_source_access_gate_reader_acquire_step#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Attempt exactly one reader increment; contention returns EAGAIN for the retained caller cursor |
 | `source_access.h:wl_columnar_source_access_gate_reader_release` | `gate->state` | `atomic_load_explicit` | acquire | Validate a live reader count before release |
 | `source_access.h:wl_columnar_source_access_gate_reader_release#2` | `gate->state` | `atomic_compare_exchange_weak_explicit` | release/relaxed | Publish reader completion and decrement the gate atomically |
 | `source_access.h:wl_columnar_source_access_cohort_exchange` | `source->state` | `atomic_compare_exchange_weak_explicit` | acquire/relaxed | Claim source WRITER only when the complete transferable cohort is present, blocking releases before descriptor exchange |
@@ -651,7 +656,8 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#2` | `src->retained_reservation.owner_bits` | `atomic_load_explicit` | acquire | Promote a committed reservation only when the pool slot still owns it |
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
-112 + 21 + 37 = **170 atomic call sites**.
+112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
+symbol-anchored inventory below covers 388 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -2047,13 +2053,24 @@ the commit.
 
 ### Controlled LFTJ cleanup boundary
 
-The controlled LFTJ continuation charges each cleanup action to its original
-funding control and attempt ID. A refusal leaves the cursor and owned handles
-available for a later call; every retry must validate a fresh funding grant
-before it performs one reader-gate or governor-credit CAS. Intermediate release
-states are retained in their original reader or reservation tokens if the host
-stops between actions. The synchronous compatibility APIs may still loop over
-these stepped primitives when called outside the continuation.
+The controlled LFTJ continuation charges each acquisition and cleanup action to
+its original funding control and attempt ID. Reader admission attempts at most
+one gate CAS per action. It acquires the relation descriptor before its storage
+owner; if storage admission is contended, the descriptor pin and input cursor
+remain in the attempt and the host can retry. Cancellation releases a partial
+descriptor pin through the same one-gate-at-a-time reader token. Relation
+mutation code that needs both gates follows descriptor-before-storage order;
+storage-only writers never wait for a descriptor while holding the owner gate.
+
+Every cleanup retry validates a fresh funding grant before it performs one
+reader-gate or governor-credit CAS. Reservation finishing first claims
+`RELEASE_PREPARING`, snapshots the receipt, and release-publishes
+`RELEASING` without changing governor accounting. Subsequent finish calls are
+serialized on the claiming thread; each performs at most one governor credit
+CAS, and a failed CAS leaves the same receipt available for retry. Intermediate
+release states remain in their original reader or reservation tokens if the
+host stops between actions. The synchronous compatibility APIs may still loop
+over these stepped primitives when called outside the continuation.
 
 This continuation does not yet bound every cleanup operation. Relation
 destruction (`col_rel_destroy_checked`), writer finalization, allocator/Arrow

@@ -65,6 +65,9 @@ typedef struct wl_columnar_source_access_reader {
 #endif
     bool thread_valid;
     bool transferable;
+    /* 0: ordinary/full token, 1: descriptor pinned while storage admission
+     * is pending. */
+    uint8_t acquire_stage;
     uint8_t release_stage;
 } wl_columnar_source_access_reader_t;
 
@@ -550,6 +553,29 @@ wl_columnar_source_access_gate_reader_acquire(
     }
 }
 
+/* Attempt exactly one reader-gate CAS. Contention is resumable EAGAIN. */
+static inline int
+wl_columnar_source_access_gate_reader_acquire_step(
+    wl_columnar_source_access_gate_t *gate, bool *acquired)
+{
+    uint64_t observed;
+    if (!acquired)
+        return EINVAL;
+    *acquired = false;
+    if (!gate)
+        return EINVAL;
+    observed = atomic_load_explicit(&gate->state, memory_order_acquire);
+    if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+        return EAGAIN;
+    if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u)
+        return EOVERFLOW;
+    if (!atomic_compare_exchange_strong_explicit(&gate->state, &observed,
+        observed + 1u, memory_order_acquire, memory_order_relaxed))
+        return EAGAIN;
+    *acquired = true;
+    return 0;
+}
+
 static inline int
 wl_columnar_source_access_gate_reader_release(
     wl_columnar_source_access_gate_t *gate)
@@ -784,6 +810,7 @@ wl_columnar_source_access_reader_initialize(
     token->owner = owner_gate;
     token->secondary_owner = NULL;
     token->identity = (uintptr_t)token;
+    token->acquire_stage = 0;
     token->release_stage = 0;
     if (transferable) {
         token->thread_valid = false;
@@ -809,7 +836,7 @@ wl_columnar_source_access_reader_acquire_common(
 
     if (!owner_gate || !token || token->owner || token->secondary_owner
         || token->identity != 0 || token->thread_valid || token->transferable
-        || token->release_stage != 0)
+        || token->acquire_stage != 0 || token->release_stage != 0)
         return EINVAL;
     rc = wl_columnar_source_access_gate_reader_acquire(owner_gate);
     if (rc != 0)
@@ -849,6 +876,7 @@ wl_columnar_source_access_reader_clear(
     token->identity = 0;
     token->thread_valid = false;
     token->transferable = false;
+    token->acquire_stage = 0;
     token->release_stage = 0;
 }
 
@@ -864,7 +892,9 @@ wl_columnar_source_access_reader_release_step(
         return EINVAL;
     *done = false;
     if (!token || token->identity != (uintptr_t)token || !token->owner
-        || token->release_stage > 1
+        || token->release_stage > 1 || token->acquire_stage > 1
+        || (token->acquire_stage == 1
+        && (token->secondary_owner || token->release_stage != 0))
         || (!token->transferable
         && !wl_columnar_source_access_reader_thread_equal(token))
         || (token->transferable && token->thread_valid))
