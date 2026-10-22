@@ -214,6 +214,34 @@ test_paired_cohort(bool shared_descriptor)
 }
 
 static void
+test_reader_acquire_steps(void)
+{
+    wl_columnar_source_access_gate_t gate = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    bool acquired = false;
+    wl_columnar_source_access_gate_init(&gate);
+    CHECK(wl_columnar_source_access_writer_acquire(&gate, &writer) == 0,
+        "acquire-step contention writer");
+    CHECK(wl_columnar_source_access_gate_reader_acquire_step(&gate,
+        &acquired) == EAGAIN && !acquired
+        && atomic_load_explicit(&gate.state, memory_order_acquire)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "reader acquire step retains on writer contention");
+    CHECK(wl_columnar_source_access_gate_reader_acquire_step(&gate,
+        &acquired) == EAGAIN && !acquired,
+        "reader acquire step retries without changing the gate");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "release contention writer");
+    CHECK(wl_columnar_source_access_gate_reader_acquire_step(&gate,
+        &acquired) == 0 && acquired
+        && atomic_load_explicit(&gate.state, memory_order_acquire) == 1,
+        "reader acquire step admits one reader");
+    CHECK(wl_columnar_source_access_gate_reader_release(&gate) == 0
+        && atomic_load_explicit(&gate.state, memory_order_acquire) == 0,
+        "reader acquire step balances the gate");
+}
+
+static void
 test_reader_release_steps(void)
 {
     wl_columnar_source_access_gate_t source = { 0 }, descriptor = { 0 };
@@ -1055,6 +1083,7 @@ main(void)
     test_paired_cohort(false);
     test_paired_cohort(true);
     test_reader_release_steps();
+    test_reader_acquire_steps();
     test_paired_cohort_rejections();
     test_paired_cohort_partial_unwind();
     test_growth_gate_attempt();

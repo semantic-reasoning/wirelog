@@ -1575,6 +1575,63 @@ col_rel_source_reader_acquire(const col_rel_t *rel,
     return rc;
 }
 
+/* Resumable form for controlled operators. Each call attempts at most one
+ * reader-gate CAS. The descriptor pin remains held while storage-owner
+ * admission is retried, preserving the descriptor-before-storage lock order. */
+int
+col_rel_source_reader_acquire_step(const col_rel_t *rel,
+    wl_columnar_source_access_reader_t *token, bool *done)
+{
+    if (!done)
+        return EINVAL;
+    *done = false;
+    if (!rel || !token)
+        return EINVAL;
+    if (token->acquire_stage == 0) {
+        bool acquired = false;
+        int rc;
+        if (token->owner || token->secondary_owner || token->identity
+            || token->thread_valid || token->transferable
+            || token->release_stage)
+            return EINVAL;
+        rc = wl_columnar_source_access_gate_reader_acquire_step(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access,
+            &acquired);
+        if (rc)
+            return rc;
+        if (!acquired)
+            return EAGAIN;
+        wl_columnar_source_access_reader_initialize(
+            (wl_columnar_source_access_gate_t *)&rel->descriptor_access,
+            token, false);
+        token->acquire_stage = 1;
+        return 0;
+    }
+    if (token->acquire_stage != 1
+        || token->identity != (uintptr_t)token
+        || token->owner != &rel->descriptor_access || token->secondary_owner
+        || token->release_stage
+        || !wl_columnar_source_access_reader_thread_equal(token))
+        return EINVAL;
+
+    col_rel_t *owner = NULL;
+    int rc = col_rel_storage_owner_resolve(rel, &owner);
+    if (rc)
+        return rc;
+    bool acquired = false;
+    rc = wl_columnar_source_access_gate_reader_acquire_step(
+        &owner->source_access, &acquired);
+    if (rc)
+        return rc;
+    if (!acquired)
+        return EAGAIN;
+    token->secondary_owner = token->owner;
+    token->owner = &owner->source_access;
+    token->acquire_stage = 0;
+    *done = true;
+    return 0;
+}
+
 int
 col_rel_source_reader_acquire_transferable(const col_rel_t *rel,
     wl_columnar_source_access_reader_t *token)

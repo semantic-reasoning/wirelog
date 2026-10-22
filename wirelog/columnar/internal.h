@@ -4307,6 +4307,8 @@ int col_rel_replacement_cohort_validate(
 int col_rel_storage_owner_destroy_status(const col_rel_t *owner);
 int col_rel_source_reader_acquire(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
+int col_rel_source_reader_acquire_step(const col_rel_t *,
+    wl_columnar_source_access_reader_t *, bool *);
 int col_rel_source_reader_acquire_transferable(const col_rel_t *,
     wl_columnar_source_access_reader_t *);
 /* One transferable reader transition per call. Original token storage and
