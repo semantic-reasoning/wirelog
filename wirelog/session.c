@@ -145,6 +145,41 @@ wl_session_operation_begin(wl_session_t *session)
     return 0;
 }
 
+static void wl_session_operation_end(wl_session_t *session);
+
+static int
+wl_session_operation_begin_insert(wl_session_t *session,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    bool controlled_complete;
+
+    if (!admission)
+        return 0;
+    if (wl_session_admission_lock(admission) != 0)
+        return EIO;
+    if (admission->closing || admission->controlled_step_pending
+        || admission->exclusive_attempt
+        || (admission->controlled_step_complete
+        && admission->active_operations != 0)) {
+        wl_session_checked_unlock(admission);
+        return EBUSY;
+    }
+    controlled_complete = admission->controlled_step_complete;
+    admission->active_operations++;
+    wl_session_checked_unlock(admission);
+
+    if (controlled_complete
+        && (!session->backend
+        || !session->backend->session_controlled_step_authorize_insert
+        || !session->backend->session_controlled_step_authorize_insert(
+            session, relation, num_rows, num_cols))) {
+        wl_session_operation_end(session);
+        return EBUSY;
+    }
+    return 0;
+}
+
 /* A controlled step owns the session across calls while its framed host
  * continuation is pending. Admit the first call only from a quiescent
  * session; a resume is the only public operation allowed through the gate. */
@@ -184,14 +219,18 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
     if (admission->closing || admission->active_operations != 0
         || admission->controlled_step_pending || admission->exclusive_attempt)
         rc = EBUSY;
-    else if (!admission->controlled_step_complete) {
+    else {
         wl_controlled_step_state_t state =
             session->backend && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
-        rc = state == WL_CONTROLLED_STEP_PENDING ? EBUSY : ENOTSUP;
-    }else
-        admission->active_operations++;
+        if (state == WL_CONTROLLED_STEP_COMPLETE
+            && admission->controlled_step_complete)
+            admission->active_operations++;
+        else
+            rc = state == WL_CONTROLLED_STEP_PENDING
+                || state == WL_CONTROLLED_STEP_RETRYABLE ? EBUSY : ENOTSUP;
+    }
     wl_session_checked_unlock(admission);
     return rc;
 }
@@ -212,7 +251,8 @@ wl_session_operation_end_step(wl_session_t *session,
      * separately parked frame must not poison session admission as though it
      * were a continuation created by this STEP call. */
     admission->controlled_step_pending = continuation_pending;
-    if (state == WL_CONTROLLED_STEP_COMPLETE)
+    if (state == WL_CONTROLLED_STEP_COMPLETE
+        || state == WL_CONTROLLED_STEP_RETRYABLE)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_IDLE)
         admission->controlled_step_complete = false;
@@ -682,7 +722,8 @@ wl_session_insert(wl_session_t *session, const char *relation,
     int rc;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    rc = wl_session_operation_begin_insert(session, relation, num_rows,
+            num_cols);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_insert
