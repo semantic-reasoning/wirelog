@@ -3181,6 +3181,10 @@ wl_columnar_relation_managed_binary_build_step_budgeted(
     wl_columnar_relation_managed_binary_build_t *build,
     wl_evaluation_control_t *control, uint64_t expected_attempt_id,
     uint64_t *remaining);
+int
+wl_columnar_relation_managed_binary_build_adopt_schema(
+    wl_columnar_relation_managed_binary_build_t *build,
+    const char *const *column_names);
 /* Caller must transfer exclusive relation lifetime before begin: stop new
  * raw-pointer operations and drain/join existing ones. Keep the descriptor at
  * a stable address until FREE_DESCRIPTOR runs, never dereference it afterward,
@@ -7187,7 +7191,8 @@ enum {
     WL_COLUMNAR_SESSION_TEST_RECURSIVE_DURING_MERGE,
     WL_COLUMNAR_SESSION_TEST_RECURSIVE_CONVERGENCE,
     WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_PRECHARGE,
-    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_SCHEMA_ADOPTED
 };
 #ifdef WL_SESSION_TEST_HOOKS
 typedef struct {

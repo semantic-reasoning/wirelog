@@ -135,22 +135,30 @@ wl_columnar_eval_serial_framed_pending(
     ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING;
 }
 
-int
-wl_columnar_eval_serial_framed_attempt_begin(
+static int
+wl_columnar_eval_serial_framed_attempt_begin_internal(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
     uint64_t id, uint64_t operation_identity,
     bool controlled_materialized_batch_fallback,
+    const wl_columnar_eval_private_bindings_t *private_bindings,
+    bool capture_only,
+    col_rel_t **capture_out,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!frame || !session || !plan || !plan->name || !plan->ops
         || !plan->op_count || !control || !id || !operation_identity)
         return EINVAL;
-    if (plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
+    if (capture_only != (private_bindings != NULL)
+        || capture_only != (capture_out != NULL)) return EINVAL;
+    if (capture_only
+        ? !wl_columnar_eval_plan_numeric_recursive_path_supported(plan)
+        : plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
         return ENOTSUP;
     bool abort_supported = false;
+    uint32_t child_end = capture_only ? plan->op_count - 1 : plan->op_count;
     int rc = wl_columnar_eval_plan_numeric_composed_abort_supported(plan, 0,
-            plan->op_count, &abort_supported);
+            child_end, &abort_supported);
     if (rc) return rc;
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     rc = wl_columnar_eval_stack_framed_context(frame, session, &ctx);
@@ -199,6 +207,10 @@ wl_columnar_eval_serial_framed_attempt_begin(
     ctx->abort_supported = abort_supported;
     ctx->controlled_materialized_batch_fallback =
         controlled_materialized_batch_fallback;
+    ctx->private_bindings = private_bindings;
+    ctx->capture_out = capture_out;
+    ctx->capture_only = capture_only;
+    ctx->capture_done = false;
 #if defined(WL_HAVE_C11_THREADS)
     ctx->owner_thread = thrd_current();
 #elif defined(_WIN32) || defined(_WIN64)
@@ -210,6 +222,39 @@ wl_columnar_eval_serial_framed_attempt_begin(
     ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP;
     ctx->identity = ctx;
     return 0;
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_begin(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
+    uint64_t id, uint64_t operation_identity,
+    bool controlled_materialized_batch_fallback,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    return wl_columnar_eval_serial_framed_attempt_begin_internal(frame,
+               session, plan, control, id, operation_identity,
+               controlled_materialized_batch_fallback, NULL, false, NULL,
+               funding, funding_id);
+}
+
+int
+wl_columnar_eval_serial_framed_attempt_begin_bound(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
+    uint64_t id, uint64_t operation_identity,
+    bool controlled_materialized_batch_fallback,
+    const wl_columnar_eval_private_bindings_t *private_bindings,
+    bool capture_only, col_rel_t **capture_out,
+    wl_evaluation_control_t *funding,
+    uint64_t funding_id)
+{
+    if (!private_bindings || !capture_only || !capture_out || *capture_out)
+        return EINVAL;
+    return wl_columnar_eval_serial_framed_attempt_begin_internal(frame,
+               session, plan, control, id, operation_identity,
+               controlled_materialized_batch_fallback, private_bindings,
+               capture_only, capture_out, funding, funding_id);
 }
 
 static int
@@ -325,6 +370,11 @@ wl_columnar_eval_serial_framed_attempt_step(
     case WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN:
         wl_columnar_eval_serial_framed_pending(ctx, ctx->phase, funding,
             funding_id);
+        if (ctx->private_bindings)
+            return wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &ctx->child, ctx->plan, 0, ctx->plan->op_count - 1, ctx->frame,
+                ctx->session, 0, ctx->control, ctx->attempt_id, funding,
+                funding_id, ctx->private_bindings);
         if (ctx->controlled_materialized_batch_fallback)
             return
                 wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback
@@ -1034,7 +1084,15 @@ wl_columnar_eval_serial_framed_bootstrap(const wl_plan_relation_t *rp,
             request->operation_id, 0);
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     if (!rc) rc = wl_columnar_eval_stack_framed_context(frame, sess, &ctx);
-    if (!rc) rc = wl_columnar_eval_serial_framed_attempt_begin(frame, sess, rp,
+    if (!rc && request->capture_only)
+        rc = wl_columnar_eval_serial_framed_attempt_begin_bound(frame, sess,
+                rp, request->operation, request->operation_id,
+                request->operation_identity,
+                request->controlled_materialized_batch_fallback,
+                request->private_bindings, true, request->capture_out,
+                request->funding, request->funding_id);
+    else if (!rc)
+        rc = wl_columnar_eval_serial_framed_attempt_begin(frame, sess, rp,
                 request->operation, request->operation_id,
                 request->operation_identity,
                 request->controlled_materialized_batch_fallback,
@@ -1259,6 +1317,10 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         wl_columnar_eval_serial_framed_host_reply_t *reply = request->reply;
         if (request->operation != sess->base.evaluation_control
             || !request->operation_id || !request->operation_identity
+            || (request->capture_only
+            != (request->private_bindings != NULL))
+            || (request->capture_only
+            != (request->capture_out != NULL))
             || (request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
             && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS
             && request->action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
@@ -1279,7 +1341,10 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 || ctx->attempt_id != request->operation_id
                 || ctx->operation_identity != request->operation_identity
                 || ctx->controlled_materialized_batch_fallback
-                != request->controlled_materialized_batch_fallback)
+                != request->controlled_materialized_batch_fallback
+                || ctx->private_bindings != request->private_bindings
+                || ctx->capture_only != request->capture_only
+                || ctx->capture_out != request->capture_out)
                 return EINVAL;
             if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
                 && !ctx->abort_supported) return ENOTSUP;
@@ -1329,9 +1394,24 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 if (protocol || ctx->phase !=
                     WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) return protocol;
             }
-            if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY)
-                return wl_columnar_eval_serial_framed_attempt_publish(ctx,
-                           request->funding, request->funding_id);
+            if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY) {
+                if (ctx->capture_only) {
+                    if (ctx->capture_done || !request->capture_out
+                        || request->capture_out != ctx->capture_out
+                        || *request->capture_out || !ctx->candidate
+                        || !ctx->candidate_owned)
+                        return EINVAL;
+                    *request->capture_out = ctx->candidate;
+                    ctx->candidate = NULL;
+                    ctx->candidate_owned = false;
+                    ctx->capture_done = true;
+                    return wl_columnar_eval_serial_framed_attempt_discard(
+                        ctx, request->funding, request->funding_id);
+                } else {
+                    return wl_columnar_eval_serial_framed_attempt_publish(ctx,
+                               request->funding, request->funding_id);
+                }
+            }
             if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) {
                 protocol = wl_columnar_eval_serial_framed_attempt_close(ctx,
                         &reply->execution_result, &reply->committed,
@@ -1388,7 +1468,9 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             || sess->coordinator || sess->num_workers > 1)
             return ENOTSUP;
         if (!rp->name || !rp->ops || !rp->op_count) return EINVAL;
-        if (rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+        if (request->capture_only
+            ? !wl_columnar_eval_plan_numeric_recursive_path_supported(rp)
+            : rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
             return ENOTSUP;
         if (request->controlled_materialized_batch_fallback
             && (!sess->join_batch_bytes || sess->join_batch_strict
