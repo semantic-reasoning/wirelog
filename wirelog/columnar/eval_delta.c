@@ -2171,6 +2171,8 @@ struct wl_columnar_eval_delta_observer_prepare {
     uintptr_t identity;
     wl_col_session_t *session;
     wl_columnar_eval_delta_observer_t *observer;
+    const char *override_name;
+    col_rel_t *override_relation;
     wl_columnar_relation_reader_step_t reader;
     uint64_t reserve_bytes, row_capacity;
     int error;
@@ -2194,6 +2196,12 @@ static bool
 wl_columnar_eval_delta_prepare_lookup_step(wl_col_session_t *sess,
     wl_columnar_eval_delta_observer_prepare_t *p, const char *name)
 {
+    if (p->override_name && p->override_relation
+        && strcmp(name, p->override_name) == 0) {
+        p->relation = p->override_relation;
+        p->lookup_done = true;
+        return true;
+    }
     if (p->lookup_registry == sess->nrels) {
         p->relation = NULL;
         p->lookup_done = true;
@@ -2245,9 +2253,11 @@ wl_columnar_eval_delta_prepare_current_alloc(
 }
 
 int
-wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
+wl_columnar_eval_delta_observer_prepare_start_with_override(
+    wl_col_session_t *sess, const char *name, col_rel_t *relation)
 {
-    if (!sess || !sess->delta_observer || sess->delta_observer_prepare
+    if (!sess || ((name == NULL) != (relation == NULL))
+        || !sess->delta_observer || sess->delta_observer_prepare
         || sess->delta_observer_build || sess->delta_publish_active)
         return EBUSY;
     wl_columnar_eval_delta_observer_t *o = sess->delta_observer;
@@ -2262,6 +2272,8 @@ wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
     p->identity = (uintptr_t)p;
     p->session = sess;
     p->observer = o;
+    p->override_name = name;
+    p->override_relation = relation;
     p->phase = o->stream_initial_output
         ? WL_COLUMNAR_DELTA_PREPARE_STREAM_ACQUIRE
         : WL_COLUMNAR_DELTA_PREPARE_PREFLIGHT;
@@ -2271,6 +2283,13 @@ wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
 #endif
     sess->delta_observer_prepare = p;
     return 0;
+}
+
+int
+wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
+{
+    return wl_columnar_eval_delta_observer_prepare_start_with_override(sess,
+               NULL, NULL);
 }
 
 static int

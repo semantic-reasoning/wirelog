@@ -20,8 +20,13 @@
 #endif
 
 extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
+extern bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
 extern uint32_t wl_columnar_eval_delta_test_stream_validation_rows;
 extern size_t wl_columnar_session_test_observer_precharged_events;
+extern void (*wl_columnar_session_test_before_successor_registration)(
+    col_rel_t *);
+extern void (*wl_columnar_session_test_successor_registry_charge)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
 extern void (*wl_columnar_eval_delta_test_observer_boundary)(
     wl_col_session_t *, unsigned);
 extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
@@ -2819,6 +2824,7 @@ test_controlled_recursive_step_rejects_unsupported_shape(void)
 typedef struct {
     wl_evaluation_control_t *control;
     int64_t rows[8];
+    int32_t diffs[8];
     uint32_t count;
     bool cancel_on_first;
 } controlled_observer_capture_t;
@@ -2829,8 +2835,10 @@ controlled_observer_capture(const char *relation, const int64_t *row,
 {
     controlled_observer_capture_t *capture = data;
     CHECK(capture && relation && !strcmp(relation, "output") && row
-        && ncols == 1 && diff == 1 && capture->count < 8);
-    capture->rows[capture->count++] = row[0];
+        && ncols == 1 && (diff == 1 || diff == -1)
+        && capture->count < 8);
+    capture->rows[capture->count] = row[0];
+    capture->diffs[capture->count++] = diff;
     if (capture->cancel_on_first && capture->count == 1)
         wl_evaluation_control_request_cancel(capture->control);
 }
@@ -2846,6 +2854,11 @@ controlled_observer_snapshot_capture(const char *relation,
 }
 
 static unsigned controlled_observer_framed_lookup_hits;
+static wl_columnar_source_access_reader_t
+    controlled_observer_registration_reader;
+static uint32_t controlled_registry_scan_indices[2][8];
+static unsigned controlled_registry_scan_counts[2];
+static unsigned controlled_registry_stop_count;
 static wl_evaluation_control_t *controlled_observer_boundary_control;
 static unsigned controlled_observer_boundary_hits;
 
@@ -2913,6 +2926,32 @@ controlled_observer_count_rule_start(
 {
     if (attempt->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP)
         controlled_observer_framed_lookup_hits++;
+}
+
+static void
+controlled_observer_hold_output_for_registration(col_rel_t *output)
+{
+    CHECK(output && !controlled_observer_registration_reader.owner);
+    CHECK(!col_rel_source_reader_acquire(output,
+        &controlled_observer_registration_reader));
+    wl_columnar_session_test_before_successor_registration = NULL;
+}
+
+static void
+controlled_observer_stop_registry_scan(wl_evaluation_control_t *control,
+    unsigned stage, uint32_t index)
+{
+    CHECK(stage == 1 || stage == 2);
+    unsigned stage_index = stage - 1;
+    CHECK(controlled_registry_scan_counts[stage_index] < 8);
+    controlled_registry_scan_indices[stage_index]
+    [controlled_registry_scan_counts[stage_index]++] = index;
+    if ((controlled_registry_stop_count == 0 && stage == 1 && index == 0)
+        || (controlled_registry_stop_count == 1 && stage == 2 && index == 0)) {
+        controlled_registry_stop_count++;
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    }
 }
 
 typedef struct {
@@ -3007,14 +3046,46 @@ test_controlled_observed_step(void)
         && report.stop_reason == WL_EVALUATION_CONTROL_NONE);
     CHECK(capture.rows[0] == 3 && capture.rows[1] == 7
         && capture.rows[2] == 11);
+    CHECK(capture.diffs[0] == 1 && capture.diffs[1] == 1
+        && capture.diffs[2] == 1);
     CHECK(controlled_observer_framed_lookup_hits == 1);
     wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+
+    /* A completed observed STEP admits a supported one-row EDB mutation.
+     * The successor captures the prior head, recomputes, and publishes the
+     * signed set difference exactly once. */
+    int64_t added_row = 13;
+    CHECK(!wl_session_insert(session, "input", &added_row, 1, 1));
+    CHECK(wl_session_snapshot(session,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_session_step(session));
+    CHECK(capture.count == 4 && capture.rows[3] == 13
+        && capture.diffs[3] == 1);
+    output = session_find_rel((wl_col_session_t *)session, "output");
+    CHECK(output && output->nrows == 4 && output->columns[0][0] == 3
+        && output->columns[0][1] == 7 && output->columns[0][2] == 11
+        && output->columns[0][3] == 13);
+    CHECK(!wl_session_snapshot(session,
+        controlled_observer_snapshot_capture, NULL));
+
+    int64_t removed_row = 3;
+    CHECK(!wl_session_remove(session, "input", &removed_row, 1, 1));
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_session_step(session));
+    CHECK(capture.count == 5 && capture.rows[4] == 3
+        && capture.diffs[4] == -1);
+    output = session_find_rel((wl_col_session_t *)session, "output");
+    CHECK(output && output->nrows == 3 && output->columns[0][0] == 7
+        && output->columns[0][1] == 11 && output->columns[0][2] == 13);
+    CHECK(!wl_session_snapshot(session,
+        controlled_observer_snapshot_capture, NULL));
 
     /* Cancellation requested by user code is after the final cutoff. It does
      * not truncate delivery or change this attempt's successful result. */
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_session_step(session));
-    CHECK(capture.count == 3);
+    CHECK(capture.count == 5);
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0 && report.consumed == 0);
 
@@ -3234,6 +3305,183 @@ test_controlled_observed_step(void)
         wl_session_destroy(callback_session);
         wl_evaluation_control_release(callback_control);
     }
+
+    /* One unit below a measured successor budget retains the old model and
+     * resumes the private attempt without rerunning its framed rule. */
+    wl_evaluation_control_t *successor_measure_control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &successor_measure_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = successor_measure_control;
+    wl_session_t *successor_measure = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &successor_measure));
+    CHECK(!wl_session_insert(successor_measure, "input", rows, 4, 1));
+    controlled_observer_capture_t successor_measure_capture = {
+        .control = successor_measure_control
+    };
+    wl_session_set_delta_cb(successor_measure, controlled_observer_capture,
+        &successor_measure_capture);
+    CHECK(!wl_session_step(successor_measure));
+    int64_t successor_row = 13;
+    CHECK(!wl_session_insert(successor_measure, "input", &successor_row,
+        1, 1));
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_session_step(successor_measure));
+    CHECK(!wl_evaluation_control_report(successor_measure_control, &report));
+    uint64_t successor_budget = report.consumed;
+    CHECK(successor_budget > 1 && successor_measure_capture.count == 4);
+    CHECK(!wl_session_snapshot(successor_measure,
+        controlled_observer_snapshot_capture, NULL));
+    int64_t failed_prepare_row = 17;
+    CHECK(!wl_session_insert(successor_measure, "input",
+        &failed_prepare_row, 1, 1));
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    wl_columnar_eval_delta_test_fail_prepare_current_alloc = true;
+    CHECK(wl_session_step(successor_measure) == ENOMEM);
+    CHECK(successor_measure_capture.count == 4);
+    output = session_find_rel((wl_col_session_t *)successor_measure,
+            "output");
+    CHECK(output && output->nrows == 4 && output->columns[0][3] == 13);
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_session_step(successor_measure));
+    CHECK(successor_measure_capture.count == 5
+        && successor_measure_capture.rows[4] == 17
+        && successor_measure_capture.diffs[4] == 1);
+    int64_t contended_row = 19;
+    CHECK(!wl_session_insert(successor_measure, "input", &contended_row,
+        1, 1));
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    wl_columnar_session_test_before_successor_registration =
+        controlled_observer_hold_output_for_registration;
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(wl_session_step(successor_measure) == EBUSY);
+    CHECK(controlled_observer_registration_reader.owner
+        && successor_measure_capture.count == 5);
+    output = session_find_rel((wl_col_session_t *)successor_measure,
+            "output");
+    CHECK(output && output->nrows == 5 && output->columns[0][4] == 17);
+    unsigned contended_lookup_hits = controlled_observer_framed_lookup_hits;
+    CHECK(!col_rel_source_reader_release(
+            &controlled_observer_registration_reader));
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_session_step(successor_measure));
+    CHECK(successor_measure_capture.count == 6
+        && successor_measure_capture.rows[5] == 19
+        && successor_measure_capture.diffs[5] == 1
+        && controlled_observer_framed_lookup_hits == contended_lookup_hits);
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+
+    int64_t registry_scan_row = 21;
+    CHECK(!wl_session_insert(successor_measure, "input", &registry_scan_row,
+        1, 1));
+    memset(controlled_registry_scan_indices, 0,
+        sizeof(controlled_registry_scan_indices));
+    memset(controlled_registry_scan_counts, 0,
+        sizeof(controlled_registry_scan_counts));
+    controlled_registry_stop_count = 0;
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    wl_columnar_session_test_successor_registry_charge =
+        controlled_observer_stop_registry_scan;
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_evaluation_control_configure(successor_measure_control,
+        UINT64_MAX - 1));
+    CHECK(wl_session_step(successor_measure)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(controlled_registry_stop_count == 1
+        && controlled_registry_scan_counts[0] == 1
+        && controlled_registry_scan_indices[0][0] == 0
+        && successor_measure_capture.count == 6);
+    unsigned registry_scan_lookup_hits = controlled_observer_framed_lookup_hits;
+    output = session_find_rel((wl_col_session_t *)successor_measure,
+            "output");
+    CHECK(output && output->nrows == 6 && output->columns[0][5] == 19);
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_evaluation_control_configure(successor_measure_control,
+        UINT64_MAX - 1));
+    CHECK(wl_session_step(successor_measure)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(controlled_registry_stop_count == 2
+        && controlled_registry_scan_counts[0] >= 3
+        && controlled_registry_scan_indices[0][1] == 1
+        && controlled_registry_scan_indices[1][0] == 0
+        && successor_measure_capture.count == 6
+        && controlled_observer_framed_lookup_hits
+        == registry_scan_lookup_hits);
+    CHECK(!wl_evaluation_control_reset(successor_measure_control));
+    CHECK(!wl_evaluation_control_configure(successor_measure_control, 0));
+    CHECK(!wl_session_step(successor_measure));
+    CHECK(controlled_registry_scan_counts[1] == 3
+        && controlled_registry_scan_indices[1][1] == 1
+        && successor_measure_capture.count == 7
+        && successor_measure_capture.rows[6] == 21
+        && successor_measure_capture.diffs[6] == 1
+        && controlled_observer_framed_lookup_hits
+        == registry_scan_lookup_hits);
+    wl_columnar_session_test_successor_registry_charge = NULL;
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    wl_session_destroy(successor_measure);
+    wl_evaluation_control_release(successor_measure_control);
+
+    wl_evaluation_control_t *successor_limited_control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &successor_limited_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = successor_limited_control;
+    wl_session_t *successor_limited = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &successor_limited));
+    CHECK(!wl_session_insert(successor_limited, "input", rows, 4, 1));
+    controlled_observer_capture_t successor_limited_capture = {
+        .control = successor_limited_control
+    };
+    wl_session_set_delta_cb(successor_limited, controlled_observer_capture,
+        &successor_limited_capture);
+    CHECK(!wl_session_step(successor_limited));
+    CHECK(!wl_session_insert(successor_limited, "input", &successor_row,
+        1, 1));
+    CHECK(!wl_evaluation_control_reset(successor_limited_control));
+    CHECK(!wl_evaluation_control_configure(successor_limited_control,
+        successor_budget - 1));
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    CHECK(wl_session_step(successor_limited)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(successor_limited_capture.count == 3
+        && controlled_observer_framed_lookup_hits != 0);
+    const col_rel_t *limited_head = session_find_rel(
+        (wl_col_session_t *)successor_limited, "output");
+    CHECK(limited_head && limited_head->nrows == 3
+        && limited_head->columns[0][0] == 3
+        && limited_head->columns[0][1] == 7
+        && limited_head->columns[0][2] == 11);
+    unsigned limited_lookup_hits = controlled_observer_framed_lookup_hits;
+    CHECK(wl_session_snapshot(successor_limited,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(successor_limited_control));
+    CHECK(!wl_evaluation_control_configure(successor_limited_control, 0));
+    wl_evaluation_control_request_cancel(successor_limited_control);
+    int successor_cancel_rc = wl_session_step(successor_limited);
+    CHECK(successor_cancel_rc == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(successor_limited_capture.count == 3);
+    limited_head = session_find_rel((wl_col_session_t *)successor_limited,
+            "output");
+    CHECK(limited_head && limited_head->nrows == 3
+        && limited_head->columns[0][0] == 3
+        && limited_head->columns[0][1] == 7
+        && limited_head->columns[0][2] == 11);
+    CHECK(!wl_evaluation_control_reset(successor_limited_control));
+    CHECK(!wl_session_step(successor_limited));
+    CHECK(successor_limited_capture.count == 4
+        && successor_limited_capture.rows[3] == 13
+        && successor_limited_capture.diffs[3] == 1
+        && controlled_observer_framed_lookup_hits == limited_lookup_hits);
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    wl_session_destroy(successor_limited);
+    wl_evaluation_control_release(successor_limited_control);
 
     wl_session_destroy(session);
     wl_evaluation_control_release(control);
