@@ -2718,6 +2718,39 @@ Attempt admission preserves the raw quota policy. Unary transactions extend
 the private frame storage: both raw and controlled admission charge its actual
 current size. Neither helper activates FILTER/MAP or default evaluation routes.
 
+### Resumable reservation retirement receipt (#1821 prerequisite)
+
+Replacement cleanup that must survive work limits uses a zero-initialized
+`wl_columnar_memory_retirement_receipt_t` at its original address and on its
+creating thread. Begin binds the token address, expected governor, expected
+owner and either RESERVED rollback or COMMITTED release without reading the
+token's mutable payload. Each step receives a live maintenance control and its
+expected attempt ID, admits 64 conservative work units before changing
+authority, and keeps no control pointer after return. The per-step admission is
+below the 256-unit evaluation quantum, including the bounded phase dispatch,
+thread/identity checks and one possible atomic transition.
+
+The receipt claims the exact token state with one strong CAS, captures and
+validates the positive byte count and non-overlap shape only after winning, then
+subtracts that captured credit with one strong aggregate CAS. A lost claim
+fails without reading token payload; malformed claimed payload restores the
+original state without refund. Aggregate contention returns `EAGAIN` while
+keeping the claim and CREDIT phase for a fresh funded retry. Underflow returns
+`EOVERFLOW` with that authority still reachable. A successful subtraction
+immediately publishes RELEASED and marks DONE, so a later step cannot refund
+twice. ACK is receipt-local and permits receipt reuse without inspecting a
+released or reused token. Status exposes phase, retained-claim authority and
+terminal disposition from the receipt alone. If cancellation or work exhaustion
+stops a step while the receipt owns the claim, the caller must preserve the
+receipt and resume it with a fresh live maintenance attempt; it must not abandon
+or reinitialize the receipt/token while the claim remains held.
+
+The caller must finish freeing the corresponding physical storage before
+beginning retirement and retain the token and governor through ACK. This
+protocol bounds its own reservation transitions; it does not bound allocator,
+destructor, physical teardown, overlap/downsize, or merge lifecycle work. Those
+remain separate obligations for the integrating replacement path.
+
 ## Persistent unary result replacement
 
 The internal `wl_columnar_eval_stack_unary_*` protocol keeps the original
