@@ -17,7 +17,8 @@ ir_src = files(
   '../wirelog/ir/stratify.c',
   '../wirelog/ir/api.c',
   '../wirelog/intern.c',
-  '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  '../wirelog/session.c', '../wirelog/session_delta_callback.c',
+  '../wirelog/evaluation_control.c',
   '../wirelog/exec_plan_gen.c',
   '../wirelog/session_facts.c',
   '../wirelog/extension_registry.c',
@@ -153,6 +154,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/rotation_pinned.c',
     '../wirelog/columnar/rotation_standard.c',
     '../wirelog/columnar/session.c',
+    '../wirelog/session_delta_callback.c',
     '../wirelog/columnar/session_hash.c',
     '../wirelog/crc32.c',
     '../wirelog/exec_plan_gen.c',
@@ -2074,6 +2076,7 @@ backend_src = files(
   '../wirelog/columnar/frontier_epoch.c',
   '../wirelog/columnar/mobius.c',
   '../wirelog/columnar/session.c',
+  '../wirelog/session_delta_callback.c',
   '../wirelog/columnar/spill.c',
   '../wirelog/columnar/session_hash.c',
   '../wirelog/columnar/delta_pool.c',
@@ -2245,7 +2248,9 @@ test_recursive_model_parity_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('recursive_model_parity', test_recursive_model_parity_exe)
+# This matrix runs several optimizer and worker configurations; its CPU time
+# can exceed Meson's default when the full suite is heavily parallelized.
+test('recursive_model_parity', test_recursive_model_parity_exe, timeout: 120)
 
 # ============================================================================
 # RDF Named-Graph Integration Tests (Issue #535)
@@ -5884,7 +5889,8 @@ test('extension_registry', test_extension_registry_exe)
 test_session_extension_snapshot_exe = executable(
   'test_session_extension_snapshot',
   files('test_session_extension_snapshot.c',
-        '../wirelog/session.c', '../wirelog/evaluation_control.c', '../wirelog/extension_registry.c'),
+        '../wirelog/session.c', '../wirelog/session_delta_callback.c',
+        '../wirelog/evaluation_control.c', '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   c_args: ['-DWIRELOG_BUILDING'],
@@ -5897,7 +5903,8 @@ test('session_extension_snapshot', test_session_extension_snapshot_exe)
 # fake backend verifies options dispatch without requiring a Windows host.
 test_session_options_exe = executable(
   'test_session_options',
-  files('test_session_options.c', '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  files('test_session_options.c', '../wirelog/session.c',
+        '../wirelog/session_delta_callback.c', '../wirelog/evaluation_control.c',
         '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
@@ -5910,7 +5917,8 @@ test('session_options', test_session_options_exe)
 # Internal operation admission closes synchronously around backend teardown.
 test_session_admission_exe = executable(
   'test_session_admission',
-  files('test_session_admission.c', '../wirelog/session.c', '../wirelog/evaluation_control.c',
+  files('test_session_admission.c', '../wirelog/session.c',
+        '../wirelog/session_delta_callback.c', '../wirelog/evaluation_control.c',
         '../wirelog/extension_registry.c'),
   thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],

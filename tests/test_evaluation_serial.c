@@ -13,6 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
+extern uint32_t wl_columnar_eval_delta_test_stream_validation_rows;
+extern size_t wl_columnar_session_test_observer_precharged_events;
+extern void (*wl_columnar_eval_delta_test_observer_boundary)(
+    wl_col_session_t *, unsigned);
+extern void (*wl_columnar_eval_serial_test_framed_checkpoint)(
+    wl_columnar_eval_serial_framed_attempt_t *);
+
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
                               #x); abort(); \
@@ -1745,6 +1753,534 @@ test_controlled_session_step_resume(void)
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
+}
+
+typedef struct {
+    wl_evaluation_control_t *control;
+    int64_t rows[8];
+    uint32_t count;
+    bool cancel_on_first;
+} controlled_observer_capture_t;
+
+static void
+controlled_observer_capture(const char *relation, const int64_t *row,
+    uint32_t ncols, int diff, void *data)
+{
+    controlled_observer_capture_t *capture = data;
+    CHECK(capture && relation && !strcmp(relation, "output") && row
+        && ncols == 1 && diff == 1 && capture->count < 8);
+    capture->rows[capture->count++] = row[0];
+    if (capture->cancel_on_first && capture->count == 1)
+        wl_evaluation_control_request_cancel(capture->control);
+}
+
+static void
+controlled_observer_snapshot_capture(const char *relation,
+    const int64_t *row, uint32_t ncols, void *data)
+{
+    (void)relation;
+    (void)row;
+    (void)ncols;
+    (void)data;
+}
+
+static unsigned controlled_observer_framed_lookup_hits;
+static wl_evaluation_control_t *controlled_observer_boundary_control;
+static unsigned controlled_observer_boundary_hits;
+
+static void
+controlled_observer_cancel_after_evaluation(wl_col_session_t *sess,
+    unsigned boundary)
+{
+    (void)sess;
+    if (boundary == 1) {
+        controlled_observer_boundary_hits++;
+        wl_columnar_eval_delta_test_observer_boundary = NULL;
+        wl_evaluation_control_request_cancel(
+            controlled_observer_boundary_control);
+    }
+}
+
+typedef struct {
+    wl_session_t *session;
+    unsigned *replacement_count;
+    unsigned count;
+} controlled_observer_replacement_t;
+
+static void
+controlled_observer_replacement_capture(const char *relation,
+    const int64_t *row, uint32_t ncols, int diff, void *data)
+{
+    unsigned *count = data;
+    CHECK(relation && !strcmp(relation, "output") && row && ncols == 1
+        && diff == 1);
+    ++*count;
+}
+
+static void
+controlled_observer_replace_callback(const char *relation,
+    const int64_t *row, uint32_t ncols, int diff, void *data)
+{
+    controlled_observer_replacement_t *state = data;
+    CHECK(relation && !strcmp(relation, "output") && row && ncols == 1
+        && diff == 1);
+    if (++state->count == 1)
+        wl_session_set_delta_cb(state->session,
+            controlled_observer_replacement_capture,
+            state->replacement_count);
+}
+
+typedef struct {
+    wl_session_t *session;
+    unsigned count;
+} controlled_observer_clear_t;
+
+static void
+controlled_observer_clear_callback(const char *relation,
+    const int64_t *row, uint32_t ncols, int diff, void *data)
+{
+    controlled_observer_clear_t *state = data;
+    CHECK(relation && !strcmp(relation, "output") && row && ncols == 1
+        && diff == 1);
+    ++state->count;
+    wl_session_set_delta_cb(state->session, NULL, NULL);
+}
+
+static void
+controlled_observer_count_rule_start(
+    wl_columnar_eval_serial_framed_attempt_t *attempt)
+{
+    if (attempt->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_LOOKUP)
+        controlled_observer_framed_lookup_hits++;
+}
+
+typedef struct {
+    uint32_t count;
+    int64_t first;
+} controlled_observer_order_capture_t;
+
+static void
+controlled_observer_order_capture(const char *relation, const int64_t *row,
+    uint32_t ncols, int diff, void *data)
+{
+    controlled_observer_order_capture_t *capture = data;
+    CHECK(capture && relation && !strcmp(relation, "output") && row
+        && ncols == 1 && diff == 1);
+    CHECK(row[0] == capture->first + capture->count);
+    capture->count++;
+}
+
+static void
+test_controlled_observed_step(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    const int64_t rows[] = {7, 3, 7, 11};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(6, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", rows, 4, 1));
+    CHECK(!session_find_rel((wl_col_session_t *)session, "output"));
+    controlled_observer_capture_t capture = {
+        .control = control, .cancel_on_first = true
+    };
+    wl_session_set_delta_cb(session, controlled_observer_capture, &capture);
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+
+    CHECK(wl_session_step(session) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!session_find_rel((wl_col_session_t *)session, "output")
+        && capture.count == 0);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+
+    /* Cancellation during stream setup discards its reader lease. The
+     * committed output survives, and a retry must not rerun the framed rule. */
+    controlled_observer_boundary_control = control;
+    controlled_observer_boundary_hits = 0;
+    wl_columnar_eval_delta_test_observer_boundary =
+        controlled_observer_cancel_after_evaluation;
+    int observed_rc = wl_session_step(session);
+    CHECK(observed_rc == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_columnar_eval_delta_test_observer_boundary = NULL;
+    CHECK(controlled_observer_boundary_hits == 1);
+    CHECK(!wl_evaluation_control_active_attempt_id(control));
+    const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
+            "output");
+    CHECK(output && output->nrows == 3 && capture.count == 0);
+    CHECK(controlled_observer_framed_lookup_hits == 1);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_session_snapshot(session, controlled_observer_snapshot_capture,
+        NULL) == EBUSY);
+
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    wl_columnar_eval_delta_test_fail_observer_stream_release_once = true;
+    int retry_rc = wl_session_step(session);
+    CHECK(retry_rc == EIO);
+    CHECK(capture.count == 3);
+    CHECK(wl_session_snapshot(session,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_session_step(session));
+    CHECK(capture.count == 3 && controlled_observer_framed_lookup_hits == 1);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == 0
+        && report.stop_reason == WL_EVALUATION_CONTROL_NONE);
+    CHECK(capture.rows[0] == 3 && capture.rows[1] == 7
+        && capture.rows[2] == 11);
+    CHECK(controlled_observer_framed_lookup_hits == 1);
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+
+    /* Cancellation requested by user code is after the final cutoff. It does
+     * not truncate delivery or change this attempt's successful result. */
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_session_step(session));
+    CHECK(capture.count == 3);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == 0 && report.consumed == 0);
+
+    /* Destruction after publication drains the retained stream lease without
+     * replaying the callback batch or the framed rule. */
+    wl_evaluation_control_t *destroy_control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &destroy_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = destroy_control;
+    wl_session_t *destroy_session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &destroy_session));
+    CHECK(!wl_session_insert(destroy_session, "input", rows, 4, 1));
+    controlled_observer_capture_t destroy_capture = {
+        .control = destroy_control, .cancel_on_first = true
+    };
+    wl_session_set_delta_cb(destroy_session, controlled_observer_capture,
+        &destroy_capture);
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    wl_columnar_eval_delta_test_fail_observer_stream_release_once = true;
+    CHECK(wl_session_step(destroy_session) == EIO);
+    CHECK(destroy_capture.count == 3
+        && controlled_observer_framed_lookup_hits == 1);
+    CHECK(wl_session_snapshot(destroy_session,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    wl_session_destroy(destroy_session);
+    CHECK(destroy_capture.count == 3
+        && controlled_observer_framed_lookup_hits == 1);
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    wl_evaluation_control_release(destroy_control);
+
+    /* A fresh run with one unit less than the measured complete budget stops
+     * before publication. Its committed rule is retained and retry emits the
+     * canonical batch once. */
+    wl_evaluation_control_t *measure_control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &measure_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = measure_control;
+    wl_session_t *measure = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &measure));
+    CHECK(!wl_session_insert(measure, "input", rows, 4, 1));
+    controlled_observer_capture_t measure_capture = {
+        .control = measure_control
+    };
+    wl_session_set_delta_cb(measure, controlled_observer_capture,
+        &measure_capture);
+    CHECK(!wl_session_step(measure));
+    CHECK(!wl_evaluation_control_report(measure_control, &report));
+    uint64_t complete_budget = report.consumed;
+    CHECK(complete_budget > 6 && measure_capture.count == 3);
+    wl_session_destroy(measure);
+    wl_evaluation_control_release(measure_control);
+    CHECK(complete_budget > 6);
+
+    /* A bounded attempt stops partway through the charged sortedness scan.
+     * The lease and cursor remain live; retry completes without re-evaluation. */
+    wl_evaluation_control_t *validation_control = NULL;
+    CHECK(!wl_evaluation_control_create(complete_budget - 6,
+        &validation_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = validation_control;
+    wl_session_t *validation_session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &validation_session));
+    CHECK(!wl_session_insert(validation_session, "input", rows, 4, 1));
+    controlled_observer_capture_t validation_capture = {
+        .control = validation_control
+    };
+    wl_session_set_delta_cb(validation_session, controlled_observer_capture,
+        &validation_capture);
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    wl_columnar_session_test_observer_precharged_events = 0;
+    CHECK(wl_session_step(validation_session)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(wl_columnar_eval_delta_test_stream_validation_rows > 0
+        && wl_columnar_eval_delta_test_stream_validation_rows < 3);
+    CHECK(wl_columnar_session_test_observer_precharged_events == 0);
+    CHECK(validation_capture.count == 0
+        && controlled_observer_framed_lookup_hits == 1);
+    CHECK(wl_session_snapshot(validation_session,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(validation_control));
+    CHECK(!wl_session_step(validation_session));
+    CHECK(validation_capture.count == 3
+        && controlled_observer_framed_lookup_hits == 1);
+    wl_session_destroy(validation_session);
+    wl_evaluation_control_release(validation_control);
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+
+    wl_evaluation_control_t *limited_control = NULL;
+    CHECK(!wl_evaluation_control_create(complete_budget - 1,
+        &limited_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = limited_control;
+    wl_session_t *limited = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &limited));
+    CHECK(!wl_session_insert(limited, "input", rows, 4, 1));
+    controlled_observer_capture_t limited_capture = {
+        .control = limited_control
+    };
+    wl_session_set_delta_cb(limited, controlled_observer_capture,
+        &limited_capture);
+    wl_columnar_session_test_observer_precharged_events = 0;
+    CHECK(wl_session_step(limited) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_report(limited_control, &report)
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    const col_rel_t *limited_output = session_find_rel(
+        (wl_col_session_t *)limited, "output");
+    CHECK(limited_output && limited_output->nrows == 3
+        && limited_capture.count == 0);
+    CHECK(wl_columnar_eval_delta_test_stream_validation_rows == 3
+        && wl_columnar_session_test_observer_precharged_events > 0);
+    CHECK(wl_session_snapshot(limited,
+        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(!wl_evaluation_control_reset(limited_control));
+    CHECK(!wl_session_step(limited));
+    CHECK(limited_capture.count == 3);
+    wl_session_destroy(limited);
+    wl_evaluation_control_release(limited_control);
+
+    /* A stopped prepublication stream holds the output reader lease. Destroy
+     * releases that lease without invoking callbacks or rerunning the rule. */
+    wl_evaluation_control_t *destroy_limited_control = NULL;
+    CHECK(!wl_evaluation_control_create(complete_budget - 1,
+        &destroy_limited_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = destroy_limited_control;
+    wl_session_t *destroy_limited = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &destroy_limited));
+    CHECK(!wl_session_insert(destroy_limited, "input", rows, 4, 1));
+    controlled_observer_capture_t destroy_limited_capture = {
+        .control = destroy_limited_control
+    };
+    wl_session_set_delta_cb(destroy_limited, controlled_observer_capture,
+        &destroy_limited_capture);
+    controlled_observer_framed_lookup_hits = 0;
+    wl_columnar_eval_serial_test_framed_checkpoint =
+        controlled_observer_count_rule_start;
+    CHECK(wl_session_step(destroy_limited)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    col_rel_t *destroy_limited_output = session_find_rel(
+        (wl_col_session_t *)destroy_limited, "output");
+    CHECK(destroy_limited_output && destroy_limited_output->nrows == 3
+        && destroy_limited_capture.count == 0);
+    wl_columnar_source_access_writer_t output_writer = { 0 };
+    CHECK(col_rel_source_writer_acquire(destroy_limited_output,
+        &output_writer) == EBUSY);
+    CHECK(controlled_observer_framed_lookup_hits == 1);
+    wl_session_destroy(destroy_limited);
+    CHECK(destroy_limited_capture.count == 0
+        && controlled_observer_framed_lookup_hits == 1);
+    CHECK(!wl_evaluation_control_active_attempt_id(destroy_limited_control));
+    wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+    wl_evaluation_control_release(destroy_limited_control);
+
+    /* Empty input still has a declared unary schema. It produces no events,
+     * while the virtual baseline remains invisible until normal commit. */
+    wl_evaluation_control_t *empty_control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &empty_control));
+    wl_session_options_init(&options);
+    options.evaluation_control = empty_control;
+    wl_session_t *empty_session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &empty_session));
+    CHECK(!wl_session_insert(empty_session, "input", rows, 0, 1));
+    controlled_observer_capture_t empty_capture = { .control = empty_control };
+    wl_session_set_delta_cb(empty_session, controlled_observer_capture,
+        &empty_capture);
+    int empty_rc = wl_session_step(empty_session);
+    CHECK(!empty_rc);
+    CHECK(empty_capture.count == 0);
+    const col_rel_t *empty_output = session_find_rel(
+        (wl_col_session_t *)empty_session, "output");
+    CHECK(empty_output && empty_output->nrows == 0);
+    wl_session_destroy(empty_session);
+    wl_evaluation_control_release(empty_control);
+
+    /* Callback replacement affects remaining events; clearing cancels only
+     * subsequent notifications from the current batch. */
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        wl_evaluation_control_t *callback_control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &callback_control));
+        wl_session_options_init(&options);
+        options.evaluation_control = callback_control;
+        wl_session_t *callback_session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &callback_session));
+        CHECK(!wl_session_insert(callback_session, "input", rows, 4, 1));
+        unsigned replacement_count = 0;
+        controlled_observer_replacement_t replacement = {
+            .session = callback_session,
+            .replacement_count = &replacement_count
+        };
+        controlled_observer_clear_t clear = { .session = callback_session };
+        if (mode == 0)
+            wl_session_set_delta_cb(callback_session,
+                controlled_observer_replace_callback, &replacement);
+        else
+            wl_session_set_delta_cb(callback_session,
+                controlled_observer_clear_callback, &clear);
+        CHECK(!wl_session_step(callback_session));
+        CHECK(mode == 0 ? replacement.count == 1
+            && replacement_count == 2 : clear.count == 1);
+        wl_session_destroy(callback_session);
+        wl_evaluation_control_release(callback_control);
+    }
+
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_observed_preflight_rejections(void)
+{
+    static const char unsupported[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x), x > 0.\n";
+    static const char wrong_type[] =
+        ".decl input(x:float)\n"
+        ".decl output(x:float)\n"
+        "output(x) :- input(x).\n";
+    static const char valid[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    const char *sources[] = { unsupported, wrong_type, valid };
+    for (unsigned i = 0; i < 3; ++i) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(sources[i], &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        if (i != 1) {
+            const int64_t input[] = { 1 };
+            CHECK(!wl_session_insert(session, "input", input, 1, 1));
+        }
+        col_rel_t *registered_empty = NULL;
+        if (i == 2) {
+            CHECK(!col_rel_alloc(&registered_empty, "output"));
+            CHECK(!col_rel_set_schema(registered_empty, 1, NULL));
+            CHECK(!session_add_rel((wl_col_session_t *)session,
+                registered_empty));
+        }
+        controlled_observer_capture_t capture = { .control = control };
+        wl_session_set_delta_cb(session, controlled_observer_capture,
+            &capture);
+        CHECK(wl_session_step(session) == ENOTSUP);
+        CHECK(!wl_evaluation_control_active_attempt_id(control));
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+        if (registered_empty) {
+            CHECK(session_find_rel((wl_col_session_t *)session, "output")
+                == registered_empty && registered_empty->nrows == 0);
+        }
+        wl_session_destroy(session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+
+}
+
+static void
+test_controlled_observed_large_output(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    enum { LARGE_UNIQUE_ROWS = 5003, LARGE_INPUT_ROWS = LARGE_UNIQUE_ROWS + 2 };
+    int64_t *large_rows = calloc(LARGE_INPUT_ROWS, sizeof(*large_rows));
+    CHECK(large_rows);
+    for (uint32_t i = 0; i < LARGE_UNIQUE_ROWS; ++i)
+        large_rows[i] = (int64_t)i - (LARGE_UNIQUE_ROWS / 2);
+    large_rows[LARGE_UNIQUE_ROWS] = large_rows[0];
+    large_rows[LARGE_UNIQUE_ROWS + 1] = 0;
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", large_rows, LARGE_INPUT_ROWS,
+        1));
+    controlled_observer_order_capture_t capture = {
+        .first = -(LARGE_UNIQUE_ROWS / 2)
+    };
+    wl_session_set_delta_cb(session, controlled_observer_order_capture,
+        &capture);
+    CHECK(!wl_session_step(session));
+    CHECK(capture.count == LARGE_UNIQUE_ROWS);
+    const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
+            "output");
+    CHECK(output && output->nrows == LARGE_UNIQUE_ROWS
+        && output->sorted_nrows == output->nrows
+        && output->run_count == 1
+        && output->run_ends[0] == output->nrows);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    free(large_rows);
 }
 
 static bool controlled_session_join_stop;
@@ -5340,6 +5876,9 @@ int
 main(void)
 {
     test_controlled_session_step_resume();
+    test_controlled_observed_step();
+    test_controlled_observed_preflight_rejections();
+    test_controlled_observed_large_output();
     test_controlled_session_join_step();
     test_controlled_session_step_prefix_resume();
     test_controlled_session_step_destroy_drain();
