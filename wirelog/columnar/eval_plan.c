@@ -2139,6 +2139,108 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
     return 0;
 }
 
+static int
+wl_columnar_eval_plan_composed_cleanup_stop(
+    const wl_columnar_eval_plan_numeric_attempt_t *record, int *stop)
+{
+    int rc = wl_evaluation_control_charge_attempt(record->control,
+            record->attempt_id, 0);
+    if (rc != WL_EVALUATION_CONTROL_CANCELLED
+        && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return rc ? rc : EBUSY;
+    *stop = rc;
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_cleanup_source(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT:
+        break;
+    /* Pending child results are receipts. Cleanup must not consume or
+     * replace the exact result the framed host still has to deliver. */
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING:
+    default:
+        return EBUSY;
+    }
+
+    bool aborting = record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+    if (aborting) {
+        rc = wl_columnar_eval_stack_composed_source_abort_validate(
+            record->frame, record->session, record);
+        if (rc) return rc;
+        if (!funding || funding == record->control || !funding_id
+            || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+            return EINVAL;
+    } else if (record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+        if (!record->source_initialized || record->source.identity !=
+            &record->source || record->source.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+            return EBUSY;
+    }
+
+    int stop = 0;
+    if (aborting) {
+        /* An ABORT that was reached for an earlier semantic error still
+         * needs a sticky control stop before this direct cleanup is allowed. */
+        rc = wl_columnar_eval_plan_composed_cleanup_stop(record, &stop);
+        if (rc) return rc;
+    }
+
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+
+    if (!aborting) {
+        rc = wl_columnar_eval_plan_composed_cleanup_stop(record, &stop);
+        if (rc) return rc;
+    }
+
+    if (!record->semantic_result) record->semantic_result = stop;
+    if (aborting) {
+        rc = wl_columnar_eval_stack_composed_source_abort_funded(
+            record->frame, record->session, record);
+        if (rc) return rc;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        return 0;
+    }
+    if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+        /* End is a child protocol of its own. Preserve its receipt and let the
+         * caller consume it with separate host funding before routing to an
+         * abort or release action. */
+        record->pending_action =
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_relation_scalar_source_end(&record->source,
+                   record->semantic_result);
+    }
+
+    /* Lookup/selection, slot creation, and installation are all skipped
+     * after the stop. Only an already-owned source or output is drained. */
+    record->phase = record->source_initialized
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+        : record->source_slot_borrowed
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+    return 0;
+}
+
 int
 wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,

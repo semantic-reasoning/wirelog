@@ -823,8 +823,22 @@ After LFTJ cleanup reaches `DONE`, the composed attempt is ACKed and its
 cleanup frame is explicitly finished. This discards any private result that
 LFTJ had already placed on that frame's stack; it does not publish the result
 to the session registry. This cleanup route covers only composed LFTJ owners.
-Other composed source, unary, and CONCAT owners still need equivalent
-cleanup-only routes before shared action-envelope charging can cover them.
+Unary and CONCAT owners still need equivalent cleanup-only routes before
+shared action-envelope charging can cover them.
+
+Composed scalar-source owners have a separate
+`wl_columnar_eval_plan_numeric_composed_cleanup_source()` route. It skips
+source lookup, output-slot creation, and installation once the original
+operation has latched cancellation or work-limit. If source end must release
+readers, cleanup returns its exact child protocol as a pending receipt; the
+caller must consume that receipt under a separate host action before cleanup
+can abort a borrowed result slot or release the attempt. Cleanup refuses an
+already-pending child receipt without changing it or spending funding. Other
+source cleanup actions consume one fresh 384-unit host grant before polling
+the original sticky stop. A source-slot abort first checks for the stop, then
+charges one 384-unit grant; if result disposal is refused, its borrowed slot
+remains owned and can be retried with fresh funding. Neither route installs or
+publishes a partial source result.
 
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
