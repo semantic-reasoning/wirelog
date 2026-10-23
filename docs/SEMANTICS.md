@@ -823,8 +823,15 @@ After LFTJ cleanup reaches `DONE`, the composed attempt is ACKed and its
 cleanup frame is explicitly finished. This discards any private result that
 LFTJ had already placed on that frame's stack; it does not publish the result
 to the session registry. This cleanup route covers only composed LFTJ owners.
-Unary and CONCAT owners still need equivalent cleanup-only routes before
-shared action-envelope charging can cover them.
+
+Admitted composed FILTER/MAP unary children and CONCAT children use their
+owned step/ACK state machines to drain bounded cleanup after cancellation or
+work exhaustion. A child step returns a pending receipt to the parent; the
+host must consume that exact receipt in a separate funded action before the
+parent continues. ACK validates child cleanup and ownership before resetting
+the child context. These routes cover only the admitted composed owners; they
+do not enable other composed children, public/session APIs, or a shared
+host/scheduler action envelope.
 
 Composed scalar-source owners have a separate
 `wl_columnar_eval_plan_numeric_composed_cleanup_source()` route. It skips
