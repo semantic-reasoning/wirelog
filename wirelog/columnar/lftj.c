@@ -562,6 +562,25 @@ enum { WL_COLUMNAR_LFTJ_ACTION_UNITS = 72u };
 typedef char wl_columnar_lftj_action_quantum[
         (WL_COLUMNAR_LFTJ_ACTION_UNITS
         >= WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 8u) ? 1 : -1];
+enum { WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS = 8u };
+
+static bool
+wl_columnar_lftj_allocation_work_add(uint64_t *total, uint64_t work)
+{
+    if (!total || work > UINT64_MAX - *total)
+        return false;
+    *total += work;
+    return true;
+}
+
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+int
+wl_columnar_lftj_test_add_allocation_work(uint64_t *total, uint64_t work)
+{
+    if (!total) return EINVAL;
+    return wl_columnar_lftj_allocation_work_add(total, work) ? 0 : EOVERFLOW;
+}
+#endif
 
 static int
 wl_columnar_lftj_attempt_charge(wl_columnar_lftj_attempt_t *a, uint64_t work)
@@ -718,12 +737,17 @@ wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
     if (!a->scratch_size_initialized) {
         int rc = wl_columnar_lftj_attempt_charge(a, 8);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-        uint64_t bytes;
+        uint64_t bytes, row_slots;
         if (!wl_columnar_memory_size_mul(a->metadata->k,
             sizeof(*a->inputs), &bytes)
             || !wl_columnar_memory_size_mul(a->total_columns,
             sizeof(*a->row), &a->row_bytes)
             || !wl_columnar_memory_size_add(bytes, a->row_bytes, &bytes))
+            return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        row_slots = a->row_bytes ? a->row_bytes / sizeof(*a->row) : 1u;
+        if (!wl_columnar_lftj_allocation_work_add(
+                &a->allocation_work_total,
+                row_slots + WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS))
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
         a->scratch_bytes = bytes;
         a->scratch_size_initialized = true;
@@ -741,9 +765,54 @@ wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
             || !wl_columnar_memory_size_add(a->scratch_bytes, pair_bytes,
             &a->scratch_bytes))
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        if (cells) {
+            uint64_t allocation_work;
+            if (!wl_columnar_memory_size_mul(cells, 2u, &allocation_work)
+                || !wl_columnar_memory_size_add(allocation_work,
+                2u * WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS,
+                &allocation_work)
+                || !wl_columnar_lftj_allocation_work_add(
+                    &a->allocation_work_total, allocation_work))
+                return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        }
         ++a->scratch_size_cursor;
         return 0;
     }
+    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_attempt_alloc_precharge(wl_columnar_lftj_attempt_t *a)
+{
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+    lftj_test_hook_state.controlled_allocation_work_total
+        = a->allocation_work_total;
+    lftj_test_hook_state.controlled_allocation_work_charged
+        = a->allocation_work_charged;
+#endif
+    if (a->allocation_work_charged < a->allocation_work_total) {
+        uint64_t remaining = a->allocation_work_total
+            - a->allocation_work_charged;
+        uint64_t charge = remaining < WL_EVALUATION_CONTROL_QUANTUM
+            ? remaining : WL_EVALUATION_CONTROL_QUANTUM;
+        int rc = wl_columnar_lftj_attempt_charge(a, charge);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        a->allocation_work_charged += charge;
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+        lftj_test_hook_state.controlled_allocation_work_charged
+            = a->allocation_work_charged;
+#endif
+        return 0;
+    }
+    a->cursor = 0;
+    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_attempt_reserve_scratch(wl_columnar_lftj_attempt_t *a)
+{
     uint64_t bytes = a->scratch_bytes;
     if (a->session->memory_governor && bytes) {
         wl_columnar_memory_governor_t *g =
@@ -762,20 +831,24 @@ wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
         }
         a->scratch_reserved = true;
     }
-    a->row = malloc((size_t)(a->row_bytes ? a->row_bytes
-        : sizeof(int64_t)));
-    if (!a->row) return wl_columnar_lftj_attempt_fail(a, ENOMEM);
-    a->cursor = 0;
-    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC;
     return 0;
 }
 
 static int
 wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
 {
+    if (!a->row) {
+        int rc = wl_columnar_lftj_attempt_reserve_scratch(a);
+        if (rc) return rc;
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+        ++lftj_test_hook_state.controlled_row_allocations;
+#endif
+        a->row = malloc((size_t)(a->row_bytes ? a->row_bytes
+            : sizeof(int64_t)));
+        if (!a->row) return wl_columnar_lftj_attempt_fail(a, ENOMEM);
+        return 0;
+    }
     if (a->cursor < a->input_count) {
-        int rc = wl_columnar_lftj_attempt_charge(a, 8);
-        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[a->cursor];
         uint64_t cells, bytes;
         if (!wl_columnar_memory_size_mul(in->nrows, in->ncols, &cells)
@@ -783,6 +856,14 @@ wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
             || bytes > SIZE_MAX)
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
         if (bytes) {
+#ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
+            lftj_test_hook_state.controlled_input_array_allocations += 2u;
+            if (bytes > (UINT64_MAX
+                - lftj_test_hook_state.controlled_input_array_bytes) / 2u)
+                lftj_test_hook_state.controlled_input_array_bytes = UINT64_MAX;
+            else
+                lftj_test_hook_state.controlled_input_array_bytes += 2u * bytes;
+#endif
             in->rows = malloc((size_t)bytes);
             in->scratch = malloc((size_t)bytes);
             if (!in->rows || !in->scratch)
@@ -1266,6 +1347,8 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
         return wl_columnar_lftj_attempt_acquire(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_SIZE:
         return wl_columnar_lftj_attempt_size(a);
+    case WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE:
+        return wl_columnar_lftj_attempt_alloc_precharge(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC:
         return wl_columnar_lftj_attempt_alloc(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_COPY:

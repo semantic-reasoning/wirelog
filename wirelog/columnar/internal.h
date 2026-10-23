@@ -6297,6 +6297,7 @@ typedef enum {
     WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE,
     WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
     WL_COLUMNAR_LFTJ_ATTEMPT_SIZE,
+    WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
     WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC,
     WL_COLUMNAR_LFTJ_ATTEMPT_COPY,
     WL_COLUMNAR_LFTJ_ATTEMPT_SORT,
@@ -6360,6 +6361,7 @@ typedef struct wl_columnar_lftj_attempt {
     uint32_t scratch_size_cursor;
     uint64_t row_bytes;
     bool scratch_size_initialized;
+    uint64_t allocation_work_total, allocation_work_charged;
     uint32_t binary_offset[WL_LFTJ_MAX_K];
     int64_t output_types[WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS];
     int64_t *row;

@@ -783,6 +783,20 @@ draining writer for retry. Relation destruction, allocator/Arrow release and
 stack publication remain synchronous cooperative cleanup boundaries. This
 route does not make other LFTJ entry points or fallback paths controlled.
 
+Before allocating its private output row or copied input/sort arrays, this
+route admits a checked allocation tariff in resumable charges of at most 256
+units. The tariff is one unit per output-row scalar slot plus eight units for
+that allocation, and for each nonempty input two units per scalar slot across
+its row and scratch arrays plus eight units per array allocation. Empty inputs
+have no row/scratch allocation tariff. The size pass charges eight units for
+initialization and eight units per input descriptor, and uses checked byte/work
+arithmetic. The complete
+tariff must fit before the governor reservation or any of those allocations
+begin; a one-unit-short limit stops before allocation. A later governor denial
+still leaves the already admitted tariff in the attempt's work count. This is
+a logical admission cost, not an allocator-time estimate: `malloc`/`free`
+latency remains synchronous and has no wall-clock bound.
+
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
 iteration/count equality is not promised. Parsing, planning and input ingestion
