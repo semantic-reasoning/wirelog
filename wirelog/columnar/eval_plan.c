@@ -2101,6 +2101,45 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
 }
 
 int
+wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if ((record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
+        || !record->lftj.identity || record->lftj.identity != &record->lftj)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+
+    /* Cleanup is authorized only by a terminal stop on the original
+     * operation. A zero-work probe observes that sticky disposition without
+     * spending or resetting its exhausted allowance. */
+    rc = wl_evaluation_control_charge_attempt(record->control,
+            record->attempt_id, 0);
+    if (rc != WL_EVALUATION_CONTROL_CANCELLED
+        && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return rc ? rc : EBUSY;
+    if (!record->semantic_result) record->semantic_result = rc;
+    if (!record->lftj.semantic_result) record->lftj.semantic_result = rc;
+
+    bool done = false;
+    rc = wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done,
+            record->control, record->attempt_id);
+    if (rc) return rc;
+    if (done) {
+        record->phase = record->phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+    }
+    return 0;
+}
+
+int
 wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
     wl_evaluation_control_t *funding, uint64_t funding_id)
