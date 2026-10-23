@@ -2577,6 +2577,180 @@ test_managed_binary_builder_respects_budget_and_attempt_binding(void)
 }
 
 static void
+test_managed_binary_builder_adopts_schema_without_reallocation(void)
+{
+    TEST("managed builder adopts schema without rebuilding funded lanes");
+
+    static const char *const column_names[] = { "x", "y" };
+    const uint32_t capacity = 2;
+    uint64_t lane_bytes = (uint64_t)capacity * sizeof(int64_t);
+    uint64_t retained_bytes = lane_bytes * 4u
+        + 2u * sizeof(int64_t *) + 2u * sizeof(int64_t *)
+        + 2u * sizeof(int64_t) + 2u * sizeof(wirelog_column_type_t);
+    uint64_t metadata_bytes = 3u + 2u * sizeof(char *)
+        + 2u * sizeof(wirelog_column_type_t)
+        + 2u * (sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema) + 2u)
+        + 2u * (sizeof("x") + sizeof("y"));
+    uint64_t descriptor_bytes = sizeof(col_rel_t);
+    uint64_t exact_budget = descriptor_bytes + retained_bytes
+        + metadata_bytes;
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor_ref
+        = test_ts_governor_create(exact_budget);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(governor_ref);
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    ASSERT(governor_ref && governor && control
+        && wl_columnar_relation_managed_binary_build_begin(&build, capacity,
+        governor_ref) == 0,
+        "exact-budget fixture starts a managed binary builder");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "exact builder budget admits descriptor, payload, and lanes");
+    }
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && build.relation && build.relation->capacity == capacity
+        && build.relation->retained_reserved_bytes == retained_bytes
+        && wl_columnar_memory_reserved(governor)
+        == descriptor_bytes + retained_bytes,
+        "ready builder holds exactly its precharged descriptor and lanes");
+    col_rel_t *relation = build.relation;
+    int64_t *columns0 = relation->columns[0];
+    int64_t *columns1 = relation->columns[1];
+    int64_t *merge0 = relation->merge_columns[0];
+    int64_t *merge1 = relation->merge_columns[1];
+    uint64_t retained_before = relation->retained_reserved_bytes;
+    ASSERT(wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == 0,
+        "schema metadata is admitted at the exact remaining governor limit");
+    ASSERT(relation->schema_ok && relation->col_names
+        && !strcmp(relation->col_names[0], "x")
+        && !strcmp(relation->col_names[1], "y")
+        && relation->capacity == capacity
+        && relation->columns[0] == columns0
+        && relation->columns[1] == columns1
+        && relation->merge_columns[0] == merge0
+        && relation->merge_columns[1] == merge1
+        && relation->retained_reserved_bytes == retained_before
+        && relation->metadata_reserved_bytes == metadata_bytes
+        && wl_columnar_memory_reserved(governor) == exact_budget,
+        "schema adoption preserves all lanes and charges metadata separately");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "schema-adopted relation enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64) {
+        int retire_rc = wl_columnar_relation_managed_retirement_step(
+            &retirement, control, attempt_id);
+        ASSERT(retire_rc == 0,
+            "schema-adopted relation retires every managed component");
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(governor) == 0,
+        "schema metadata and precharged lanes release exactly once");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+
+    owner = 0;
+    governor_ref = test_ts_governor_create(descriptor_bytes + retained_bytes);
+    governor = wl_columnar_memory_governor_ref_get(governor_ref);
+    control = attempt_test_control_create(0, &owner);
+    build = (wl_columnar_relation_managed_binary_build_t){ 0 };
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(governor_ref && governor && control
+        && wl_columnar_relation_managed_binary_build_begin(&build, capacity,
+        governor_ref) == 0,
+        "short-budget fixture starts with lane-only governor credit");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "short-budget builder admits all precharged lane storage");
+    }
+    relation = build.relation;
+    columns0 = relation->columns[0];
+    columns1 = relation->columns[1];
+    merge0 = relation->merge_columns[0];
+    merge1 = relation->merge_columns[1];
+    retained_before = relation->retained_reserved_bytes;
+    uint64_t reserved_before = wl_columnar_memory_reserved(governor);
+    ASSERT(wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == ENOSPC
+        && !relation->schema_ok && !relation->col_names
+        && relation->capacity == capacity
+        && relation->columns[0] == columns0
+        && relation->columns[1] == columns1
+        && relation->merge_columns[0] == merge0
+        && relation->merge_columns[1] == merge1
+        && relation->retained_reserved_bytes == retained_before
+        && relation->metadata_reserved_bytes == 0
+        && wl_columnar_memory_reserved(governor) == reserved_before,
+        "metadata refusal leaves builder lanes unchanged and retireable");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "metadata-refused builder enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64)
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "metadata-refused builder retires without leaked reservation");
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(governor) == 0,
+        "metadata denial cleanup returns the exact lane and descriptor credit");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+
+    owner = 0;
+    control = attempt_test_control_create(0, &owner);
+    build = (wl_columnar_relation_managed_binary_build_t){ 0 };
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        capacity, NULL) == 0,
+        "unmetered builder also accepts schema metadata");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "unmetered builder reaches its ready phase");
+    }
+    relation = build.relation;
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && relation
+        && wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == 0
+        && relation->schema_ok && relation->metadata_reserved_bytes == 0,
+        "schema adoption preserves the unmetered relation contract");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "unmetered schema relation enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64)
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "unmetered schema metadata is released during retirement");
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "unmetered managed retirement finishes with its schema released");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
 test_managed_binary_builder_partial_allocation_failures_are_retireable(void)
 {
     TEST("partial managed binary construction survives allocation failures");
@@ -5472,6 +5646,7 @@ main(void)
     test_managed_binary_builder_resumes_each_allocation_action();
     test_managed_binary_builder_preadmits_large_lanes();
     test_managed_binary_builder_respects_budget_and_attempt_binding();
+    test_managed_binary_builder_adopts_schema_without_reallocation();
     test_managed_binary_builder_partial_allocation_failures_are_retireable();
     test_managed_candidate_terminal_cleanup();
     test_managed_binary_candidate_merge_result_and_funding();

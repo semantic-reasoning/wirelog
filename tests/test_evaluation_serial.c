@@ -1931,6 +1931,355 @@ test_recursive_reachability_plan_manifest(void)
     wirelog_program_free(program);
 }
 
+static unsigned controlled_recursive_stop_phase;
+static bool controlled_recursive_stop_fired;
+static bool controlled_recursive_stop_enabled;
+static bool controlled_recursive_stop_unpublished;
+static bool controlled_recursive_convergence_unpublished;
+static int controlled_recursive_edge_write_status;
+static wl_col_session_t *controlled_recursive_session_under_test;
+
+static void
+controlled_recursive_stop_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint32_t iteration)
+{
+    if (phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_CONVERGENCE
+        && controlled_recursive_session_under_test)
+        controlled_recursive_convergence_unpublished
+            = !session_find_rel(controlled_recursive_session_under_test,
+                "path");
+    if (!controlled_recursive_stop_enabled)
+        return;
+    if (controlled_recursive_stop_fired
+        || phase != controlled_recursive_stop_phase)
+        return;
+    if ((phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_PRECHARGE
+        || phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED)
+        && iteration < 2)
+        return;
+    controlled_recursive_stop_fired = true;
+    controlled_recursive_stop_unpublished
+        = controlled_recursive_session_under_test
+        && !session_find_rel(controlled_recursive_session_under_test, "path");
+    if (phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY
+        && controlled_recursive_session_under_test) {
+        static const int64_t mutation[] = { 4, 5 };
+        const col_rel_t *edge = session_find_rel(
+            controlled_recursive_session_under_test, "edge");
+        controlled_recursive_edge_write_status = edge
+            ? col_rel_append_row((col_rel_t *)edge, mutation) : EINVAL;
+    }
+    if (phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY
+        || phase == WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED)
+        wl_evaluation_control_request_cancel(control);
+    else
+        (void)wl_evaluation_control_charge(control, UINT64_MAX);
+}
+
+static wl_session_t *
+controlled_recursive_session(const int64_t *edges, uint32_t edge_count,
+    wl_plan_t **plan_out, wirelog_program_t **program_out,
+    wl_evaluation_control_t **control_out)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "edge", edges, edge_count, 2));
+    *plan_out = plan;
+    *program_out = program;
+    *control_out = control;
+    return session;
+}
+
+static int
+controlled_recursive_run(wl_session_t *session,
+    wl_evaluation_control_t *control)
+{
+    int rc = wl_session_step(session);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    for (unsigned turn = 0; rc == EAGAIN && id && turn < 10000; ++turn) {
+        rc = wl_session_step(session);
+        if (rc == EAGAIN)
+            CHECK(wl_evaluation_control_active_attempt_id(control) == id);
+    }
+    return rc;
+}
+
+static void
+test_controlled_recursive_step_publication_and_stops(void)
+{
+    const int64_t edges[] = {1, 2, 2, 3, 3, 4};
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
+            &program, &control);
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    CHECK(!session_find_rel(columnar, "path"));
+    controlled_recursive_stop_phase =
+        WL_COLUMNAR_SESSION_TEST_RECURSIVE_CONVERGENCE;
+    controlled_recursive_stop_enabled = false;
+    controlled_recursive_stop_fired = false;
+    controlled_recursive_convergence_unpublished = false;
+    controlled_recursive_session_under_test = columnar;
+    wl_columnar_session_test_recursive_step_checkpoint =
+        controlled_recursive_stop_checkpoint;
+    CHECK(!controlled_recursive_run(session, control));
+    wl_columnar_session_test_recursive_step_checkpoint = NULL;
+    controlled_recursive_session_under_test = NULL;
+    CHECK(controlled_recursive_convergence_unpublished);
+    const col_rel_t *path = session_find_rel(columnar, "path");
+    wl_evaluation_control_report_t successful_report;
+    CHECK(!wl_evaluation_control_report(control, &successful_report));
+    /* Pinned single-worker cost for this graph under the documented row,
+     * transition, four-lane allocation, and managed-lane precharge tariffs.
+     * Limits below use this source-fixed oracle; the unlimited run checks
+     * repeatability only. */
+    const uint64_t expected_work = UINT64_C(2422377);
+    CHECK(successful_report.consumed == expected_work);
+    CHECK(path && path->nrows == 6 && path->ncols == 2
+        && path->capacity == 6
+        && path->schema_ok && path->col_names
+        && !strcmp(path->col_names[0], "x")
+        && !strcmp(path->col_names[1], "y")
+        && path->sorted_nrows == path->nrows);
+    const int64_t expected[][2] = {
+        {1, 2}, {1, 3}, {1, 4}, {2, 3}, {2, 4}, {3, 4}
+    };
+    for (uint32_t i = 0; i < 6; ++i) {
+        CHECK(path->columns[0][i] == expected[i][0]
+            && path->columns[1][i] == expected[i][1]);
+    }
+    uint64_t completed_attempt_id = successful_report.attempt_id;
+    CHECK(!wl_session_step(session));
+    CHECK(!wl_evaluation_control_report(control, &successful_report)
+        && successful_report.attempt_id == completed_attempt_id
+        && successful_report.consumed == expected_work);
+    const int64_t later_edge[] = { 4, 5 };
+    const col_rel_t *edge_const = session_find_rel(columnar, "edge");
+    CHECK(edge_const && !col_rel_append_row((col_rel_t *)edge_const,
+        later_edge));
+    CHECK(!wl_session_step(session));
+    CHECK(!wl_evaluation_control_report(control, &successful_report)
+        && successful_report.attempt_id == completed_attempt_id
+        && successful_report.consumed == expected_work);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    session = controlled_recursive_session(edges, 3, &plan, &program,
+            &control);
+    columnar = (wl_col_session_t *)session;
+    CHECK(!wl_evaluation_control_configure(control, expected_work));
+    CHECK(!controlled_recursive_run(session, control));
+    wl_evaluation_control_report_t boundary_report;
+    CHECK(!wl_evaluation_control_report(control, &boundary_report)
+        && boundary_report.limit == expected_work
+        && boundary_report.consumed == expected_work
+        && boundary_report.result == 0
+        && session_find_rel(columnar, "path"));
+    /* The successful controlled step remains parked until the caller
+     * acknowledges completion with its next step call. */
+    CHECK(!wl_session_step(session));
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    session = controlled_recursive_session(edges, 3, &plan, &program,
+            &control);
+    columnar = (wl_col_session_t *)session;
+    CHECK(!wl_evaluation_control_configure(control, expected_work - 1u));
+    int short_rc = controlled_recursive_run(session, control);
+    CHECK(short_rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !session_find_rel(columnar, "path")
+        && !columnar->cleanup_active && !columnar->cleanup_pending);
+    CHECK(!wl_evaluation_control_report(control, &boundary_report)
+        && boundary_report.limit == expected_work - 1u
+        && boundary_report.consumed == expected_work - 1u
+        && boundary_report.result == short_rc);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!controlled_recursive_run(session, control));
+    CHECK(session_find_rel(columnar, "path"));
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    for (unsigned stop_case = 0; stop_case < 5; ++stop_case) {
+        session = controlled_recursive_session(edges, 3, &plan, &program,
+                &control);
+        columnar = (wl_col_session_t *)session;
+        if (stop_case != 0)
+            CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
+        controlled_recursive_stop_phase = stop_case == 0
+            ? WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY
+            : stop_case == 1
+            ? WL_COLUMNAR_SESSION_TEST_RECURSIVE_DURING_MERGE
+            : stop_case == 2
+            ? WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_PRECHARGE
+            : stop_case == 3
+            ? WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED
+            : WL_COLUMNAR_SESSION_TEST_RECURSIVE_SCHEMA_ADOPTED;
+        controlled_recursive_stop_fired = false;
+        controlled_recursive_stop_enabled = true;
+        controlled_recursive_stop_unpublished = false;
+        controlled_recursive_edge_write_status = 0;
+        controlled_recursive_session_under_test = columnar;
+        wl_columnar_session_test_recursive_step_checkpoint =
+            controlled_recursive_stop_checkpoint;
+        int rc = controlled_recursive_run(session, control);
+        wl_columnar_session_test_recursive_step_checkpoint = NULL;
+        controlled_recursive_session_under_test = NULL;
+        CHECK(controlled_recursive_stop_fired
+            && controlled_recursive_stop_unpublished
+            && rc == ((stop_case == 0 || stop_case == 3)
+                ? WL_EVALUATION_CONTROL_CANCELLED
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+        if (stop_case == 0)
+            CHECK(controlled_recursive_edge_write_status == EBUSY);
+        CHECK(!session_find_rel(columnar, "path")
+            && !columnar->cleanup_active && !columnar->cleanup_pending);
+        const col_rel_t *edge = session_find_rel(columnar, "edge");
+        CHECK(edge && edge->nrows == 3);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.result == rc && report.consumed > 0);
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!controlled_recursive_run(session, control));
+        path = session_find_rel(columnar, "path");
+        CHECK(path && path->nrows == 6 && path->ncols == 2
+            && path->capacity == 6
+            && path->schema_ok && path->col_names
+            && !strcmp(path->col_names[0], "x")
+            && !strcmp(path->col_names[1], "y")
+            && path->sorted_nrows == path->nrows);
+        const int64_t expected[][2] = {
+            {1, 2}, {1, 3}, {1, 4}, {2, 3}, {2, 4}, {3, 4}
+        };
+        for (uint32_t i = 0; i < 6; ++i) {
+            CHECK(path->columns[0][i] == expected[i][0]
+                && path->columns[1][i] == expected[i][1]);
+        }
+        wl_session_destroy(session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
+static void
+test_controlled_recursive_snapshot_rejects_prelease_mutation(void)
+{
+    const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
+    const int64_t changed_edge[] = { 4, 5 };
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_session(edges, 3, &plan,
+            &program, &control);
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    CHECK(wl_session_step(session) == EAGAIN);
+    const col_rel_t *edge = session_find_rel(columnar, "edge");
+    CHECK(edge && !col_rel_append_row((col_rel_t *)edge, changed_edge));
+    int rc = controlled_recursive_run(session, control);
+    CHECK(rc == EBUSY && !session_find_rel(columnar, "path")
+        && !columnar->cleanup_active && !columnar->cleanup_pending);
+    edge = session_find_rel(columnar, "edge");
+    CHECK(edge && edge->nrows == 4);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == EBUSY);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_recursive_step_requires_edge_before_attempt(void)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(wl_session_step(session) == ENOTSUP);
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_controlled_recursive_step_rejects_unsupported_shape(void)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl walk(x:int64, y:int64)\n"
+        "walk(x,y) :- edge(x,y).\n"
+        "walk(x,w) :- walk(x,y), edge(y,z), edge(z,w).\n";
+    const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "edge", edges, 3, 2));
+    int rc = controlled_recursive_run(session, control);
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    CHECK(rc == ENOTSUP && !session_find_rel(columnar, "walk"));
+    wl_evaluation_control_report_t report;
+    CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+    const col_rel_t *edge = session_find_rel(columnar, "edge");
+    CHECK(edge && edge->nrows == 3);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 static bool controlled_session_join_stop;
 static unsigned controlled_session_join_stop_phase;
 static uint64_t controlled_session_join_phase17_hits;
@@ -6980,6 +7329,10 @@ int
 main(void)
 {
     test_recursive_reachability_plan_manifest();
+    test_controlled_recursive_step_publication_and_stops();
+    test_controlled_recursive_snapshot_rejects_prelease_mutation();
+    test_controlled_recursive_step_requires_edge_before_attempt();
+    test_controlled_recursive_step_rejects_unsupported_shape();
     test_controlled_session_step_resume();
     test_controlled_session_join_step();
     test_controlled_step_preflight_byte_cursor();
