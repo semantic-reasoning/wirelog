@@ -1757,6 +1757,180 @@ test_controlled_session_step_resume(void)
     wirelog_program_free(program);
 }
 
+static void
+check_recursive_manifest_op_defaults(const wl_plan_op_t *op)
+{
+    CHECK(op->filter_expr.data == NULL && op->filter_expr.size == 0);
+    CHECK(op->agg_expr.data == NULL && op->agg_expr.size == 0);
+    CHECK(op->agg_fn == WIRELOG_AGG_COUNT);
+    CHECK(op->group_by_indices == NULL && op->group_by_count == 0
+        && op->aggregate_index == 0);
+    CHECK(op->right_filter_expr.data == NULL
+        && op->right_filter_expr.size == 0);
+    CHECK(op->agg_operand_type == WL_PLAN_AGG_OPERAND_UNKNOWN
+        && op->agg_result_type == WL_PLAN_AGG_OPERAND_UNKNOWN);
+    CHECK(op->delta_mode == WL_DELTA_AUTO && !op->materialized);
+
+    if (op->op != WL_PLAN_OP_VARIABLE)
+        CHECK(op->relation_name == NULL);
+    if (op->op != WL_PLAN_OP_JOIN)
+        CHECK(op->right_relation == NULL && op->left_keys == NULL
+            && op->right_keys == NULL && op->key_count == 0);
+    if (op->op != WL_PLAN_OP_MAP && op->op != WL_PLAN_OP_JOIN)
+        CHECK(op->project_indices == NULL && op->project_count == 0);
+    if (op->op != WL_PLAN_OP_MAP)
+        CHECK(op->map_exprs == NULL && op->map_expr_count == 0);
+    if (op->op != WL_PLAN_OP_EXCHANGE)
+        CHECK(op->opaque_data == NULL);
+}
+
+static void
+test_recursive_reachability_plan_manifest(void)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    CHECK(plan->edb_count == 1 && plan->stratum_count == 1);
+    CHECK(!strcmp(plan->edb_relations[0], "edge")
+        && plan->edb_declared_width[0] == 2
+        && plan->edb_column_type_counts[0] == 2
+        && plan->edb_column_types[0][0] == WIRELOG_TYPE_INT64
+        && plan->edb_column_types[0][1] == WIRELOG_TYPE_INT64
+        && !plan->edb_has_graph_column[0]
+        && plan->edb_graph_col_index[0] == 0);
+
+    const wl_plan_stratum_t *stratum = &plan->strata[0];
+    CHECK(stratum->stratum_id == 0 && stratum->is_recursive
+        && stratum->is_monotone && !stratum->has_aggregate
+        && stratum->relation_count == 1 && stratum->rule_refs
+        && stratum->bodies);
+    const wl_plan_relation_t *relation = &stratum->relations[0];
+    CHECK(!strcmp(relation->name, "path")
+        && !strcmp(relation->delta_name, "$d$path")
+        && relation->op_count == 7 && !relation->recursive_agg.has_spec
+        && relation->recursive_agg.fn == WIRELOG_AGG_COUNT
+        && relation->recursive_agg.operand_type
+        == WL_PLAN_AGG_OPERAND_UNKNOWN
+        && relation->recursive_agg.group_by_count == 0
+        && relation->recursive_agg.aggregate_index == 0);
+    CHECK(stratum->rule_refs[0].count == 2
+        && !strcmp(stratum->rule_refs[0].names[0], "edge")
+        && !strcmp(stratum->rule_refs[0].names[1], "path"));
+
+    static const wl_plan_op_type_t body_ops[] = {
+        WL_PLAN_OP_VARIABLE, WL_PLAN_OP_MAP, WL_PLAN_OP_VARIABLE,
+        WL_PLAN_OP_JOIN, WL_PLAN_OP_MAP, WL_PLAN_OP_CONCAT,
+        WL_PLAN_OP_CONSOLIDATE
+    };
+    const wl_plan_body_t *body = &stratum->bodies[0];
+    CHECK(body->op_count == sizeof(body_ops) / sizeof(body_ops[0]));
+    for (uint32_t i = 0; i < body->op_count; i++) {
+        CHECK(body->ops[i].op == body_ops[i]);
+        check_recursive_manifest_op_defaults(&body->ops[i]);
+    }
+    CHECK(!strcmp(body->ops[0].relation_name, "edge")
+        && !strcmp(body->ops[2].relation_name, "path")
+        && !strcmp(body->ops[3].right_relation, "edge")
+        && body->ops[3].key_count == 1
+        && !strcmp(body->ops[3].left_keys[0], "col1")
+        && !strcmp(body->ops[3].right_keys[0], "col0"));
+    static const uint8_t body_map_col0[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
+    };
+    static const uint8_t body_map_col1[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
+    };
+    static const uint8_t body_map_col3[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '3'
+    };
+    CHECK(body->ops[1].project_count == 2
+        && body->ops[1].project_indices[0] == 0
+        && body->ops[1].project_indices[1] == 1
+        && body->ops[1].map_expr_count == 2
+        && body->ops[1].map_exprs[0].size == sizeof(body_map_col0)
+        && !memcmp(body->ops[1].map_exprs[0].data, body_map_col0,
+        sizeof(body_map_col0))
+        && body->ops[1].map_exprs[1].size == sizeof(body_map_col1)
+        && !memcmp(body->ops[1].map_exprs[1].data, body_map_col1,
+        sizeof(body_map_col1)));
+    CHECK(body->ops[3].project_indices == NULL
+        && body->ops[3].project_count == 0);
+    CHECK(body->ops[4].project_count == 2
+        && body->ops[4].project_indices[0] == 0
+        && body->ops[4].project_indices[1] == 3
+        && body->ops[4].map_expr_count == 2
+        && body->ops[4].map_exprs[0].size == sizeof(body_map_col0)
+        && !memcmp(body->ops[4].map_exprs[0].data, body_map_col0,
+        sizeof(body_map_col0))
+        && body->ops[4].map_exprs[1].size == sizeof(body_map_col3)
+        && !memcmp(body->ops[4].map_exprs[1].data, body_map_col3,
+        sizeof(body_map_col3)));
+
+    static const wl_plan_op_type_t lowered_ops[] = {
+        WL_PLAN_OP_VARIABLE, WL_PLAN_OP_MAP, WL_PLAN_OP_VARIABLE,
+        WL_PLAN_OP_JOIN, WL_PLAN_OP_CONCAT, WL_PLAN_OP_CONSOLIDATE,
+        WL_PLAN_OP_EXCHANGE
+    };
+    for (uint32_t i = 0; i < relation->op_count; i++) {
+        CHECK(relation->ops[i].op == lowered_ops[i]);
+        check_recursive_manifest_op_defaults(&relation->ops[i]);
+    }
+    const wl_plan_op_t *ops = relation->ops;
+    CHECK(!strcmp(ops[0].relation_name, "edge")
+        && !strcmp(ops[2].relation_name, "path")
+        && ops[0].delta_mode == WL_DELTA_AUTO
+        && ops[2].delta_mode == WL_DELTA_AUTO);
+    CHECK(ops[1].project_count == 2 && ops[1].project_indices[0] == 0
+        && ops[1].project_indices[1] == 1 && ops[1].map_expr_count == 2);
+    static const uint8_t map_col0[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
+    };
+    static const uint8_t map_col1[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
+    };
+    CHECK(ops[1].map_exprs[0].size == sizeof(map_col0)
+        && !memcmp(ops[1].map_exprs[0].data, map_col0, sizeof(map_col0))
+        && ops[1].map_exprs[1].size == sizeof(map_col1)
+        && !memcmp(ops[1].map_exprs[1].data, map_col1, sizeof(map_col1)));
+    CHECK(!strcmp(ops[3].right_relation, "edge")
+        && ops[3].key_count == 1
+        && !strcmp(ops[3].left_keys[0], "col1")
+        && !strcmp(ops[3].right_keys[0], "col0")
+        && ops[3].project_count == 2
+        && ops[3].project_indices[0] == 0
+        && ops[3].project_indices[1] == 3);
+    CHECK(ops[1].relation_name == NULL && ops[1].right_relation == NULL
+        && ops[1].left_keys == NULL && ops[1].right_keys == NULL
+        && ops[1].key_count == 0 && !ops[1].materialized);
+    CHECK(ops[3].relation_name == NULL && ops[3].map_exprs == NULL
+        && ops[3].map_expr_count == 0 && !ops[3].materialized);
+    CHECK(ops[4].relation_name == NULL && ops[4].right_relation == NULL
+        && ops[4].project_indices == NULL && ops[4].map_exprs == NULL
+        && ops[4].opaque_data == NULL);
+    CHECK(ops[5].relation_name == NULL && ops[5].right_relation == NULL
+        && ops[5].project_indices == NULL && ops[5].map_exprs == NULL
+        && ops[5].opaque_data == NULL);
+    CHECK(ops[6].relation_name == NULL && ops[6].right_relation == NULL
+        && ops[6].left_keys == NULL && ops[6].right_keys == NULL
+        && ops[6].key_count == 0 && ops[6].project_indices == NULL
+        && ops[6].project_count == 0 && ops[6].map_exprs == NULL
+        && ops[6].map_expr_count == 0);
+    const wl_plan_op_exchange_t *exchange = ops[6].opaque_data;
+    CHECK(exchange && exchange->num_workers == 0
+        && exchange->key_col_count == 1 && exchange->key_col_idxs[0] == 1
+        && !exchange->edb_rel_name && exchange->edb_key_col_count == 1
+        && exchange->edb_key_col_idxs[0] == 0);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 static bool controlled_session_join_stop;
 static unsigned controlled_session_join_stop_phase;
 static uint64_t controlled_session_join_phase17_hits;
@@ -6708,6 +6882,7 @@ test_entry_generated_filter_work_boundary(void)
 int
 main(void)
 {
+    test_recursive_reachability_plan_manifest();
     test_controlled_session_step_resume();
     test_controlled_session_join_step();
     test_controlled_step_preflight_byte_cursor();
