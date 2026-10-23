@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **407**).
+match the script's count (currently **418**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -657,7 +657,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 407 sites.
+symbol-anchored inventory below covers 418 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -863,6 +863,35 @@ lease validations a batch append takes.  Other builds compile neither row.
 | `relation.c:col_rel_mutation_lease_validate` | `wl_lease_validations` | `atomic_fetch_add_explicit` | `relaxed` | Test builds only (`WL_TEST_MUTATION_SET_HOOK`): count one full lease validation; the counter is read only as a delta and publishes no other state |
 
 The complete source audit now contains **234 atomic call sites**.
+
+### 5.24 Managed binary relation retirement (#1821 prerequisite, 11 rows)
+
+The managed binary builder creates private two-column INT64 storage one
+funded allocation or initialization action at a time. Retirement first takes
+the relation's descriptor and storage writer gates as one all-or-release round.
+That address-bound round stays on the creating thread through every cleanup
+yield, including token-credit retries. Before freeing the descriptor, the
+round is armed while both writer sentinels are still present. After the free,
+the receipt is consumed locally: it clears only its own fields and never
+dereferences either gate address. This closes the relation permanently before
+its storage can be reclaimed; callers must transfer exclusive lifetime before
+starting retirement and must not use any other raw pointer afterward.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_managed_empty_token` | `token->state` | `atomic_load_explicit` | acquire | Validate an EMPTY embedded token while both relation writer gates exclude concurrent reservation mutation |
+| `relation.c:wl_columnar_relation_managed_empty_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Require no owner to survive an EMPTY token before moving it into the stable receipt |
+| `relation.c:wl_columnar_relation_managed_token_valid` | `token->state` | `atomic_load_explicit` | acquire | Snapshot the token state under exclusive relation authority before selecting committed release or reserved rollback |
+| `relation.c:wl_columnar_relation_managed_token_valid#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Preserve the original relation owner identity in the detached retirement receipt |
+| `relation.c:wl_columnar_relation_managed_gate_round_validate` | `request->gate->state` | `atomic_load_explicit` | acquire | Revalidate both held writer sentinels before each pre-free cleanup action; never used after descriptor free |
+| `relation.c:wl_columnar_relation_managed_retirement_validate` | `storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject aliases while descriptor and storage writers prevent a borrow from racing validation |
+| `relation.c:wl_columnar_relation_managed_retirement_detach` | `source->state` | `atomic_load_explicit` | acquire | Distinguish an explicit EMPTY slot from a live token before moving exactly one reservation |
+| `relation.c:wl_columnar_relation_managed_retirement_detach#2` | `retirement->tokens[index].owner_bits` | `atomic_load_explicit` | acquire | Capture the original token owner before the relation descriptor is eventually freed |
+| `relation.c:wl_columnar_relation_managed_retirement_credit` | `retirement->tokens[index].state` | `atomic_load_explicit` | acquire | Choose reserved rollback or committed release without rereading relation storage |
+| `relation.c:wl_columnar_relation_managed_retirement_credit#2` | `retirement->tokens[index].owner_bits` | `atomic_load_explicit` | acquire | Confirm detached owner identity immediately before the receipt begins its one-shot claim |
+| `source_access.h:wl_columnar_source_access_gate_round_arm_terminal_consume` | `request->gate->state` | `atomic_load_explicit` | acquire | Verify every writer sentinel before arming local-only receipt consumption after the protected relation is freed |
+
+The complete source audit now contains **245 atomic call sites**.
 
 ---
 
@@ -1672,7 +1701,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 407 call sites.
+The complete current atomic-source inventory contains 418 call sites.
 
 ### Caller-attempt-bound single mutation admission
 

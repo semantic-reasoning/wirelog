@@ -783,6 +783,89 @@ typedef struct col_rel_mutable_image {
     wl_columnar_source_access_writer_t writer;
 } col_rel_mutable_image_t;
 
+/* Private, resumable retirement for the deliberately narrow managed-merge
+ * relation shape. The relation and this record remain at stable addresses on
+ * the creating thread until every token receipt is acknowledged. */
+typedef enum wl_columnar_relation_managed_retirement_phase {
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_INERT = 0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_GOVERNOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_ROW_SCRATCH,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_TYPES,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_SCHEMA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ZERO_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_GOVERNOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+} wl_columnar_relation_managed_retirement_phase_t;
+
+typedef struct wl_columnar_relation_managed_retirement {
+    uintptr_t identity;
+    col_rel_t *relation;
+    uintptr_t original_relation_address;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_source_access_gate_round_t gate_round;
+    wl_columnar_relation_managed_retirement_phase_t phase;
+    wl_columnar_memory_reservation_t tokens[4];
+    wl_columnar_memory_retirement_receipt_t receipts[4];
+    uint64_t token_bytes[4];
+    uint64_t token_owner_bits[4];
+    bool receipt_started[4];
+    bool token_empty[4];
+} wl_columnar_relation_managed_retirement_t;
+
+/* One-funded-action-at-a-time builder for a private, unnamed binary INT64
+ * relation. On a terminal allocation failure, relation retains all partial
+ * ownership so it can be passed to managed_retirement_begin(). */
+typedef enum wl_columnar_relation_managed_binary_build_phase {
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT = 0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_RESERVE_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COMMIT_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_ROW_SCRATCH,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_TYPES,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED
+} wl_columnar_relation_managed_binary_build_phase_t;
+
+typedef struct wl_columnar_relation_managed_binary_build {
+    uintptr_t identity;
+    col_rel_t *relation;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    wl_columnar_relation_managed_binary_build_phase_t phase;
+    uint64_t retained_bytes;
+    uint32_t capacity;
+    int failure_status;
+} wl_columnar_relation_managed_binary_build_t;
+
 /* A resumable, private incremental consolidation. Initialize the object with
  * { 0 } before begin. The object and its writer are address- and thread-bound;
  * keep it in one frame and pass by pointer.
@@ -3002,6 +3085,28 @@ int
 wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name);
 void
 col_rel_free_contents(col_rel_t *r);
+/* Both receipts are address- and creator-thread-bound. Initialize each with
+ * { 0 } before begin; keep it at one stable address through READY/DONE. */
+int
+wl_columnar_relation_managed_binary_build_begin(
+    wl_columnar_relation_managed_binary_build_t *build, uint32_t capacity,
+    wl_columnar_memory_governor_ref_t *governor_ref);
+int
+wl_columnar_relation_managed_binary_build_step(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
+/* Caller must transfer exclusive relation lifetime before begin: stop new
+ * raw-pointer operations and drain/join existing ones. Keep the descriptor at
+ * a stable address until FREE_DESCRIPTOR runs, never dereference it afterward,
+ * and keep the receipt stable through DONE. Do not use another relation
+ * pointer or reuse the descriptor after retirement begins. */
+int
+wl_columnar_relation_managed_retirement_begin(
+    wl_columnar_relation_managed_retirement_t *retirement, col_rel_t *relation);
+int
+wl_columnar_relation_managed_retirement_step(
+    wl_columnar_relation_managed_retirement_t *retirement,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /* Checked flat-grid size for ncols pointer slots and owned INT64 lanes. */
