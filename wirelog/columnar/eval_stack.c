@@ -2703,10 +2703,9 @@ wl_columnar_eval_stack_composed_source_install(
 }
 
 int
-wl_columnar_eval_stack_composed_source_abort(
+wl_columnar_eval_stack_composed_source_abort_validate(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
-    wl_columnar_eval_plan_numeric_attempt_t *owner,
-    wl_evaluation_control_t *funding, uint64_t funding_id)
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
 {
     int rc = wl_columnar_eval_stack_composed_source_frame(frame, sess, owner,
             true, true);
@@ -2714,16 +2713,40 @@ wl_columnar_eval_stack_composed_source_abort(
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
         || owner->source_initialized || !owner->source_slot_borrowed)
         return EBUSY;
-    if (!funding || funding == owner->control || !funding_id
-        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
-        return EINVAL;
-    rc = wl_evaluation_control_charge(funding, 384);
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_source_abort_funded(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner)
+{
+    int rc = wl_columnar_eval_stack_composed_source_abort_validate(frame,
+            sess, owner);
     if (rc) return rc;
     rc = eval_entry_dispose(&frame->result);
     if (rc) return rc;
     wl_columnar_eval_stack_unary_entry_clear(&frame->result);
     owner->source_slot_borrowed = false; owner->source_output = NULL;
     return 0;
+}
+
+int
+wl_columnar_eval_stack_composed_source_abort(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
+    wl_columnar_eval_plan_numeric_attempt_t *owner,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_stack_composed_source_abort_validate(frame,
+            sess, owner);
+    if (rc) return rc;
+    if (!funding || funding == owner->control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return EINVAL;
+    rc = wl_evaluation_control_charge(funding, 384);
+    if (rc) return rc;
+    return wl_columnar_eval_stack_composed_source_abort_funded(frame, sess,
+               owner);
 }
 
 int
