@@ -4438,6 +4438,28 @@ test_entry_receipts(void)
     entry_compare(&f, entry_simple, entry_rows, 4, 1); entry_destroy(&f);
 }
 
+static bool
+entry_composed_progress_unchanged(
+    const wl_columnar_eval_plan_numeric_attempt_t *a,
+    const wl_columnar_eval_plan_numeric_attempt_t *b)
+{
+    return a->phase == b->phase && a->pending_action == b->pending_action
+           && a->cursor == b->cursor && a->completed == b->completed
+           && a->semantic_result == b->semantic_result
+           && a->protocol_result == b->protocol_result
+           && a->abort_requested == b->abort_requested
+           && a->control == b->control && a->attempt_id == b->attempt_id
+           && a->frame == b->frame && a->session == b->session
+           && a->plan == b->plan && a->lftj.phase == b->lftj.phase
+           && a->lftj.semantic_result == b->lftj.semantic_result
+           && a->child_status.progress == b->child_status.progress
+           && a->child_status.execution_result ==
+           b->child_status.execution_result
+           && a->child_status.cleanup_result == b->child_status.cleanup_result
+           && a->child_status.semantic_result == b->child_status.semantic_result
+           && a->child_status.committed == b->child_status.committed;
+}
+
 static void
 test_entry_abort_and_unsupported_abort(void)
 {
@@ -4517,11 +4539,86 @@ test_entry_abort_and_unsupported_abort(void)
     }
     CHECK(entry_context(&nested)->phase ==
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING);
+    /* First consume the outer receipt for the child step that produced the
+     * child PENDING result. A second step now consumes that inner result and
+     * creates the nested framed receipt we exercise below. */
+    CHECK(!entry_turn_action(&nested,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE, 0));
+    CHECK(entry_context(&nested)->phase ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        && entry_context(&nested)->child.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+    CHECK(!entry_turn_action(&nested,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE, 0));
+    ctx = entry_context(&nested);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->pending_inner_consume
+        && ctx->pending_funding == nested.previous.previous_funding
+        && ctx->pending_funding_id == nested.previous.previous_funding_id);
+    wl_columnar_eval_plan_numeric_attempt_t child_before = ctx->child;
+    wl_evaluation_control_t *pending_grant = nested.previous.previous_funding;
+    uint64_t pending_grant_id = nested.previous.previous_funding_id;
+    wl_columnar_eval_serial_framed_host_reply_kind_t pending_kind =
+        nested.previous.previous_kind;
+    int pending_protocol = nested.previous.previous_protocol;
+
+    /* A stale tuple cannot consume the outer PENDING receipt or latch abort. */
+    grant_t *wrong_grant = entry_grant(&nested, 0);
+    wl_columnar_eval_serial_framed_host_request_t wrong = nested.previous;
+    wrong.funding = wrong_grant->control;
+    wrong.funding_id = wrong_grant->id;
+    wrong.operation = nested.operation;
+    wrong.operation_id = nested.id;
+    wrong.operation_identity = nested.operation_identity;
+    wrong.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT;
+    wrong.previous_funding_id++;
+    wrong.reply = &nested.reply;
+    CHECK(entry_host(&nested, &wrong, wrong_grant) == EINVAL);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && !ctx->abort_requested
+        && ctx->pending_funding == pending_grant
+        && ctx->pending_funding_id == pending_grant_id
+        && entry_composed_progress_unchanged(&child_before, &ctx->child)
+        && nested.previous.previous_valid
+        && nested.previous.previous_funding == pending_grant
+        && nested.previous.previous_funding_id == pending_grant_id
+        && nested.previous.previous_kind == pending_kind
+        && nested.previous.previous_protocol == pending_protocol);
+
+    /* Refusing the fresh outer grant also leaves both pending layers intact. */
+    CHECK(entry_turn_action(&nested,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 383)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && !ctx->abort_requested
+        && ctx->pending_funding == pending_grant
+        && ctx->pending_funding_id == pending_grant_id
+        && entry_composed_progress_unchanged(&child_before, &ctx->child)
+        && nested.previous.previous_valid
+        && nested.previous.previous_funding == pending_grant
+        && nested.previous.previous_funding_id == pending_grant_id
+        && nested.previous.previous_kind == pending_kind
+        && nested.previous.previous_protocol == pending_protocol);
+
+    /* The correct ABORT consumes only the framed receipt. It does not run
+     * cleanup in the same request; the next request first latches child stop. */
     CHECK(!entry_turn_action(&nested,
         WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
-    CHECK(entry_context(&nested)->abort_requested
-        && entry_context(&nested)->phase ==
-        WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
+    CHECK(ctx->abort_requested
+        && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        && !ctx->pending_funding && !ctx->pending_funding_id
+        && ctx->child.phase == child_before.phase
+        && ctx->child.cursor == child_before.cursor
+        && ctx->child.completed == child_before.completed);
+    CHECK(!entry_turn_action(&nested,
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT, 0));
+    CHECK(ctx->abort_requested && ctx->child.abort_requested);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD);
+    CHECK(ctx->pending_funding == NULL);
+    CHECK(ctx->pending_funding_id == 0);
+    CHECK(ctx->child.phase == child_before.phase
+        && ctx->child.cursor == child_before.cursor
+        && ctx->child.completed == child_before.completed);
     entry_complete(&nested);
     CHECK(nested.reply.execution_result == WL_EVALUATION_CONTROL_CANCELLED
         && !nested.reply.committed);
