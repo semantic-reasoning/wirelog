@@ -229,7 +229,8 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
             admission->active_operations++;
         else
             rc = state == WL_CONTROLLED_STEP_PENDING
-                || state == WL_CONTROLLED_STEP_RETRYABLE ? EBUSY : ENOTSUP;
+                || state == WL_CONTROLLED_STEP_RETRYABLE
+                || state == WL_CONTROLLED_STEP_INVALIDATED ? EBUSY : ENOTSUP;
     }
     wl_session_checked_unlock(admission);
     return rc;
@@ -254,6 +255,8 @@ wl_session_operation_end_step(wl_session_t *session,
     if (state == WL_CONTROLLED_STEP_COMPLETE)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_RETRYABLE)
+        admission->controlled_step_complete = true;
+    else if (state == WL_CONTROLLED_STEP_INVALIDATED)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_IDLE)
         admission->controlled_step_complete = false;
