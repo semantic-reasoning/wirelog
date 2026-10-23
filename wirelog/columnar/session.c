@@ -13,8 +13,6 @@
 #include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
 
-#define WL_COLUMNAR_SESSION_CONTROLLED_OBSERVER_MAX_ROWS UINT32_C(4096)
-
 #include "../wirelog-internal.h"
 
 #include <assert.h>
@@ -222,6 +220,7 @@ int wl_columnar_session_test_exhaust_after_relation;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
+size_t wl_columnar_session_test_observer_precharged_events;
 #endif
 
 static int wl_columnar_session_controlled_step_drain_for_destroy(
@@ -6370,8 +6369,6 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
             || (source->nrows == 0 && source->ncols == 0
             && source->declared_ncols == 1)))
             return ENOTSUP;
-        if (source->nrows > WL_COLUMNAR_SESSION_CONTROLLED_OBSERVER_MAX_ROWS)
-            return ENOTSUP;
     }
     return 0;
 }
@@ -7053,10 +7050,18 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
         }
     }
     size_t event_count = wl_columnar_eval_delta_observer_event_count(sess);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!step->delivery_precharge_index)
+        wl_columnar_session_test_observer_precharged_events = 0;
+#endif
     while (step->delivery_precharge_index < event_count) {
         int rc = wl_evaluation_control_charge(control, 1);
         if (rc) return rc;
         step->delivery_precharge_index++;
+#ifdef WL_SESSION_TEST_HOOKS
+        wl_columnar_session_test_observer_precharged_events =
+            step->delivery_precharge_index;
+#endif
     }
     int rc = wl_evaluation_control_charge(control, 0);
     if (rc) return rc;

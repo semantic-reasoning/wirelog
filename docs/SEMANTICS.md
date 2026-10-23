@@ -1663,10 +1663,16 @@ is retained and a fresh attempt completes READY without committing twice.
 This is still a preparation primitive, not whole-plan observer delivery or
 callback scheduling, and does not complete #1821 acceptance coverage.
 
-The controlled observer route accepts the restricted unary identity-map plan
-with at most 4096 source rows. Other observer plans remain disabled. The
-restricted recursive reachability route and controlled single-rule STEP
-entrypoint are documented above; this increment does not claim complete
+Other observer plans remain disabled. The restricted recursive reachability
+route and controlled initial single-rule STEP entrypoint are documented above. For that route, the committed unary INT64
+output is verified as sorted and unique under a reader lease, then streamed in
+signed INT64 ascending order after all callback work is precharged and the
+final cancellation poll succeeds. Observer delivery does not allocate
+row-sized current or event arrays and has no separate source-row limit. The
+reader lease and cursors survive work-limit stops; cancellation and destruction
+before publication release the lease without callbacks, while cleanup after
+publication cannot replay callbacks. Framed consolidation still materializes
+and charges its own sorting scratch. This increment does not claim complete
 #1821 coverage or enable unrestricted public dispatch.
 
 ### Managed binary candidate union and novel delta (#1821 increment)
