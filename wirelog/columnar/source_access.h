@@ -184,6 +184,7 @@ typedef struct wl_columnar_source_access_gate_round {
     pthread_t owner_thread;
 #endif
     bool thread_valid;
+    bool terminal_consume_armed;
     size_t request_count;
     size_t acquired_count;
     wl_columnar_source_access_gate_request_t requests
@@ -678,6 +679,7 @@ wl_columnar_source_access_gate_round_clear(
 {
     round->identity = 0;
     round->thread_valid = false;
+    round->terminal_consume_armed = false;
     round->request_count = 0;
     round->acquired_count = 0;
     for (size_t i = 0; i < WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX; i++) {
@@ -692,6 +694,7 @@ wl_columnar_source_access_gate_round_validate(
 {
     if (!round || round->identity != (uintptr_t)round
         || !wl_columnar_source_access_gate_round_thread_equal(round)
+        || round->terminal_consume_armed
         || !round->request_count
         || round->request_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
         || round->acquired_count > round->request_count)
@@ -841,6 +844,56 @@ wl_columnar_source_access_gate_round_release(
         || round->acquired_count != round->request_count)
         return EINVAL;
     wl_columnar_source_access_gate_round_unwind(round);
+    wl_columnar_source_access_gate_round_clear(round);
+    return 0;
+}
+
+/* Arm a writer-only gate round for terminal relation destruction. The caller
+ * must invoke this before freeing any gate. The matching consume operation
+ * below is local-only and never dereferences the recorded gate pointers. */
+static inline int
+wl_columnar_source_access_gate_round_arm_terminal_consume(
+    wl_columnar_source_access_gate_round_t *round)
+{
+    if (!round || round->identity != (uintptr_t)round
+        || !wl_columnar_source_access_gate_round_thread_equal(round)
+        || !round->request_count
+        || round->request_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        || round->acquired_count != round->request_count
+        || round->terminal_consume_armed)
+        return EINVAL;
+    for (size_t i = 0; i < round->request_count; i++) {
+        const wl_columnar_source_access_gate_request_t *request
+            = &round->requests[i];
+        if (!request->gate
+            || request->mode != WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER
+            || atomic_load_explicit(&request->gate->state,
+            memory_order_acquire) != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EINVAL;
+    }
+    round->terminal_consume_armed = true;
+    return 0;
+}
+
+/* Consume a previously armed writer-only round after its protected relation
+ * was freed. This intentionally validates and clears receipt-local fields
+ * only; the gate addresses in requests may already be dangling. */
+static inline int
+wl_columnar_source_access_gate_round_consume_terminal(
+    wl_columnar_source_access_gate_round_t *round)
+{
+    if (!round || round->identity != (uintptr_t)round
+        || !wl_columnar_source_access_gate_round_thread_equal(round)
+        || !round->terminal_consume_armed
+        || !round->request_count
+        || round->request_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        || round->acquired_count != round->request_count)
+        return EINVAL;
+    for (size_t i = 0; i < round->request_count; i++)
+        if (!round->requests[i].gate
+            || round->requests[i].mode
+            != WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER)
+            return EINVAL;
     wl_columnar_source_access_gate_round_clear(round);
     return 0;
 }
