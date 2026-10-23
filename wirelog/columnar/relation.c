@@ -3595,24 +3595,81 @@ wl_columnar_relation_managed_binary_build_fail_allocation(void)
 }
 
 int
-wl_columnar_relation_managed_binary_build_step(
+wl_columnar_relation_managed_binary_build_step_budgeted(
     wl_columnar_relation_managed_binary_build_t *build,
-    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id,
+    uint64_t *remaining)
 {
     uint64_t lane_bytes, buffer_bytes, part_bytes;
     wl_columnar_memory_admission_status_t admission;
     int rc;
 
     if (!build || build->identity != (uintptr_t)build
-        || !expected_attempt_id)
+        || !expected_attempt_id || !remaining)
         return EINVAL;
     if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY)
         return 0;
     if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED)
         return build->failure_status ? build->failure_status : EINVAL;
+    bool lane_allocation = build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1;
+    if (lane_allocation) {
+        if (build->allocation_phase != build->phase) {
+            if (build->allocation_control_identity
+                || build->allocation_attempt_id)
+                return EINVAL;
+            build->allocation_phase = build->phase;
+            build->allocation_units_remaining = build->capacity;
+        }
+        if ((build->allocation_control_identity
+            && build->allocation_control_identity
+            != wl_evaluation_control_identity(control))
+            || (build->allocation_attempt_id
+            && build->allocation_attempt_id != expected_attempt_id))
+            return EINVAL;
+        if (build->allocation_units_remaining) {
+            uint64_t work = build->allocation_units_remaining;
+            if (work > *remaining)
+                work = *remaining;
+            if (work > WL_EVALUATION_CONTROL_QUANTUM)
+                work = WL_EVALUATION_CONTROL_QUANTUM;
+            if (!work)
+                return EAGAIN;
+            rc = wl_evaluation_control_charge_attempt(control,
+                    expected_attempt_id, work);
+            if (rc != 0)
+                return rc;
+            if (!build->allocation_control_identity) {
+                build->allocation_control_identity
+                    = wl_evaluation_control_identity(control);
+                build->allocation_attempt_id = expected_attempt_id;
+            }
+            build->allocation_units_remaining -= work;
+            *remaining -= work;
+            /* Reserve logical cell work before the fresh backing allocation.
+            * The allocation itself is a single noninterruptible allocator
+            * action; no existing relation cells are copied in this phase. */
+            if (!*remaining || build->allocation_units_remaining)
+                return EAGAIN;
+        } else if (build->allocation_control_identity
+            && (build->allocation_control_identity
+            != wl_evaluation_control_identity(control)
+            || build->allocation_attempt_id != expected_attempt_id)) {
+            return EINVAL;
+        }
+    }
+    if (!*remaining)
+        return EAGAIN;
     rc = wl_evaluation_control_charge_attempt(control, expected_attempt_id, 1);
     if (rc != 0)
         return rc;
+    (*remaining)--;
     switch (build->phase) {
     case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR:
         if (build->governor_ref)
@@ -3730,6 +3787,10 @@ wl_columnar_relation_managed_binary_build_step(
             rc = ENOMEM;
             goto failed;
         }
+        build->allocation_phase
+            = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT;
+        build->allocation_control_identity = 0;
+        build->allocation_attempt_id = 0;
         build->phase++;
         return 0;
     }
@@ -3784,7 +3845,20 @@ wl_columnar_relation_managed_binary_build_step(
 failed:
     build->failure_status = rc;
     build->phase = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED;
+    build->allocation_control_identity = 0;
+    build->allocation_attempt_id = 0;
     return rc;
+}
+
+int
+wl_columnar_relation_managed_binary_build_step(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+{
+    uint64_t remaining = WL_EVALUATION_CONTROL_QUANTUM;
+
+    return wl_columnar_relation_managed_binary_build_step_budgeted(build,
+               control, expected_attempt_id, &remaining);
 }
 
 static bool
