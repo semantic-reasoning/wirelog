@@ -52,6 +52,8 @@ typedef enum {
     /* A completed recursive route may admit only backend-approved input
      * appends before its next controlled STEP. */
     WL_CONTROLLED_STEP_RETRYABLE,
+    /* Provenance changed outside the authorized retryable input path. */
+    WL_CONTROLLED_STEP_INVALIDATED,
 } wl_controlled_step_state_t;
 
 /**
