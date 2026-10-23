@@ -3829,6 +3829,11 @@ composed_host_turn(fixture_t *f, bool ack)
     return rc;
 }
 
+static col_rel_t *composed_source(const char *, uint32_t, const double *,
+    uint32_t, bool);
+static void composed_fixture(fixture_t *, col_rel_t *, uint64_t);
+static void composed_action(fixture_t *);
+
 static int
 composed_abort_request(fixture_t *f, uint64_t funding_limit)
 {
@@ -3849,6 +3854,108 @@ composed_abort_request(fixture_t *f, uint64_t funding_limit)
     CHECK(!wl_evaluation_control_detach(funding, &owner));
     wl_evaluation_control_release(funding);
     return rc;
+}
+
+static int
+composed_cleanup_lftj_turn(fixture_t *f, uint64_t funding_limit,
+    uint64_t funding_id_adjustment)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(funding_limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    bool eligible = (f->record.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        || f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
+        && f->record.lftj.identity;
+    int rc = wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+        &f->record, funding, id + funding_id_adjustment);
+    int finish = wl_evaluation_control_finish(funding, &owner,
+            rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0, 0);
+    CHECK(finish == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
+    wl_evaluation_control_report_t report;
+    int report_rc = wl_evaluation_control_report(funding, &report);
+    uint64_t expected_consumed = funding_limit == 383
+        || funding_id_adjustment || !eligible ? 0 : 384;
+    CHECK(!report_rc
+        && report.attempt_id == id && !report.cleanup_status
+        && report.consumed == expected_consumed);
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static uint32_t
+composed_lftj_reader_count(const wl_columnar_lftj_attempt_t *attempt)
+{
+    uint32_t count = 0;
+    if (attempt->inputs)
+        for (uint32_t i = 0; i < attempt->input_count; ++i)
+            count += attempt->inputs[i].reader.owner != NULL;
+    return count;
+}
+
+static void
+composed_lftj_fixture(fixture_t *f, uint64_t limit,
+    wl_plan_relation_t *body, wl_plan_op_t *op, wl_plan_op_lftj_t *metadata,
+    char **names, uint32_t *key_cols, col_rel_t **relations)
+{
+    static const double values[] = {1, 10, 2, 20};
+    names[0] = "a"; names[1] = "b"; names[2] = "c";
+    key_cols[0] = key_cols[1] = key_cols[2] = 0;
+    metadata->k = 3; metadata->rel_names = names;
+    metadata->key_cols = key_cols;
+    *op = (wl_plan_op_t){.op = WL_PLAN_OP_LFTJ, .opaque_data = metadata};
+    *body = (wl_plan_relation_t){.ops = op, .op_count = 1};
+    for (uint32_t i = 0; i < 3; ++i)
+        relations[i] = composed_source(names[i], 2, values, 2, false);
+    composed_fixture(f, source_new(2, 0), limit);
+    f->session.base.evaluation_control = f->operation;
+    f->session.rels = relations; f->session.nrels = 3; f->session.rel_cap = 3;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(&f->record,
+        body, 0, body->op_count, f->frame, &f->session, 0, f->operation,
+        f->operation_id, f->funding, f->funding_id));
+}
+
+static void
+composed_lftj_finish_stop(fixture_t *f, int stop, int result)
+{
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f->record.semantic_result == result);
+    CHECK(!composed_host_turn(f, true));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(!f->session.cleanup_active_count
+        && !f->session.cleanup_reserved_bytes);
+    session_rel_free_hash(&f->session);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner,
+        result, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->operation, &report)
+        && report.stop_reason == stop && report.result == result);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->operation);
+    wl_evaluation_control_release(f->funding);
+    col_rel_destroy(f->input);
+}
+
+static void
+composed_lftj_until_reader(fixture_t *f)
+{
+    for (unsigned turns = 0; f->record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD; ++turns) {
+        CHECK(turns < 1000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(f);
+    }
+    for (unsigned turns = 0; !composed_lftj_reader_count(&f->record.lftj);
+        ++turns) {
+        CHECK(turns < 1000 && f->record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD);
+        composed_action(f);
+    }
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && f->record.lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
 }
 
 static void
@@ -4826,6 +4933,121 @@ test_composed_generated_union(void)
 }
 
 static void
+test_composed_lftj_stopped_cleanup(void)
+{
+    wl_plan_relation_t body;
+    wl_plan_op_t op;
+    wl_plan_op_lftj_t metadata;
+    char *names[3];
+    uint32_t key_cols[3];
+    col_rel_t *relations[3];
+    fixture_t f;
+
+    /* A work-limit stop can arrive while LFTJ owns source readers, before its
+     * next semantic action observes the stop. Cleanup is host-funded and
+     * drains at most one child release action per call. */
+    composed_lftj_fixture(&f, UINT64_C(1) << 20, &body, &op, &metadata,
+        names, key_cols, relations);
+    wl_columnar_eval_plan_numeric_attempt_t before_record = f.record;
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 0) == EBUSY);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    composed_lftj_until_reader(&f);
+    wl_columnar_lftj_attempt_t before_lftj = f.record.lftj;
+    before_record = f.record;
+    CHECK(composed_cleanup_lftj_turn(&f, 383, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!memcmp(&before_lftj, &f.record.lftj, sizeof(before_lftj))
+        && !memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 1) == EINVAL);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 0) == EBUSY);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(wl_evaluation_control_charge_attempt(f.operation,
+        f.operation_id, UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100 && (f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+            || f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE));
+        uint32_t readers_before = composed_lftj_reader_count(&f.record.lftj);
+        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+        uint32_t readers_after = composed_lftj_reader_count(&f.record.lftj);
+        CHECK(readers_before >= readers_after
+            && readers_before - readers_after <= 1);
+    }
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.lftj.semantic_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !session_find_rel(&f.session, "result"));
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_WORK_LIMIT,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* Abort-request cancellation and direct cancellation both use the same
+     * cleanup drain; the LFTJ child has not yet polled this stop. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    composed_lftj_until_reader(&f);
+    CHECK(!composed_abort_request(&f, 0));
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100);
+        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    }
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* A direct cancellation is copied to the child before its first abort
+     * action, even while that child still owns readers. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    composed_lftj_until_reader(&f);
+    wl_evaluation_control_request_cancel(f.operation);
+    uint32_t readers_before = composed_lftj_reader_count(&f.record.lftj);
+    CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    CHECK(f.record.lftj.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && composed_lftj_reader_count(&f.record.lftj) < readers_before);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100);
+        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    }
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* A completed LFTJ result is still private to the cleanup frame. A stop
+     * before the parent advances to DONE makes cleanup discard that result. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE; ++turns) {
+        CHECK(turns < 10000 && f.record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(&f);
+    }
+    CHECK(f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].owned);
+    CHECK(!session_find_rel(&f.session, "result"));
+    f.record.semantic_result = EDOM;
+    f.record.lftj.semantic_result = EINVAL;
+    wl_evaluation_control_request_cancel(f.operation);
+    CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f.record.semantic_result == EDOM
+        && f.record.lftj.semantic_result == EINVAL
+        && stack->top == 1 && stack->items[0].owned);
+    CHECK(!session_find_rel(&f.session, "result"));
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        EDOM);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+}
+
+static void
 test_composed_nested_and_wide(void)
 {
     const double av[] = {3, 1, 3, -2}, bv[] = {1, 4, 0}, cv[] = {7, 4, -3};
@@ -5534,6 +5756,7 @@ main(void)
 {
     test_composed_private_input_binding();
     test_composed_recursive_terminal_exchange();
+    test_composed_lftj_stopped_cleanup();
     test_composed_domain_and_repeated_source();
     test_composed_controlled_batch_fallback_owner();
     test_composed_abort_request();

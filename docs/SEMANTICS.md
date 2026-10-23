@@ -808,6 +808,24 @@ add recursive iteration, private candidate publication, or a shared
 host/scheduler action envelope. Controlled recursive STEP therefore remains
 disabled and #1821 remains incomplete.
 
+When a composed attempt owns an LFTJ child at the moment its original
+operation control latches cancellation or work-limit, the internal
+`wl_columnar_eval_plan_numeric_composed_cleanup_lftj()` path can drain that
+child without resuming semantic evaluation. Each call requires a fresh
+384-unit host grant, verifies the original sticky stop with a zero-work poll,
+and performs at most one LFTJ release action. Cleanup preserves an earlier
+semantic error; otherwise it records the exact original stop in both parent
+and child, so a work-limit is not changed into cancellation. A missing stop
+returns `EBUSY` after consuming the host grant. Other control errors are
+returned without treating them as cleanup authorization.
+
+After LFTJ cleanup reaches `DONE`, the composed attempt is ACKed and its
+cleanup frame is explicitly finished. This discards any private result that
+LFTJ had already placed on that frame's stack; it does not publish the result
+to the session registry. This cleanup route covers only composed LFTJ owners.
+Other composed source, unary, and CONCAT owners still need equivalent
+cleanup-only routes before shared action-envelope charging can cover them.
+
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
 iteration/count equality is not promised. Parsing, planning and input ingestion
