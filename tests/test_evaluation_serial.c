@@ -6403,6 +6403,126 @@ test_entry_generated_lftj_stops_inside_child(void)
     }
 }
 
+static void
+test_entry_generated_lftj_allocation_precharge(void)
+{
+    enum { INPUT_COUNT = 3, ROW_COUNT = 256 };
+    static const char source[] =
+        ".decl input(k:int64)\n.decl a(k:int64)\n.decl b(k:int64)\n"
+        ".decl output(k:int64)\noutput(k) :- input(k), a(k), b(k).\n";
+    int64_t rows[ROW_COUNT];
+    for (uint32_t i = 0; i < ROW_COUNT; ++i)
+        rows[i] = (int64_t)i + 1;
+    const entry_input_t inputs[] = {
+        {"input", rows, ROW_COUNT, 1},
+        {"a", rows, ROW_COUNT, 1},
+        {"b", rows, ROW_COUNT, 1}
+    };
+    /* Three output cells plus the allocation action; each nonempty input pays
+     * two full scalar arrays and two allocation actions. */
+    const uint64_t allocation_tariff = 3u + 8u
+        + INPUT_COUNT * (2u * ROW_COUNT + 2u * 8u);
+    const uint64_t precharge_prefix = entry_lftj_phase_minimum_limit(source,
+            inputs, INPUT_COUNT,
+            WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
+            WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK);
+    CHECK(precharge_prefix > 0
+        && allocation_tariff > WL_EVALUATION_CONTROL_QUANTUM);
+
+    wl_columnar_lftj_test_clear_hooks();
+    entry_fixture_t short_one;
+    entry_init_inputs(&short_one, source, inputs, INPUT_COUNT,
+        precharge_prefix + allocation_tariff - 1u);
+    uint64_t short_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(
+            short_one.session->memory_governor));
+    CHECK(entry_lftj_phase_reached(&short_one,
+        WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    entry_complete(&short_one);
+    CHECK(short_one.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !short_one.reply.committed
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            short_one.session->memory_governor)) == short_reserved);
+    wl_columnar_lftj_test_hook_state_t short_hooks;
+    wl_columnar_lftj_test_get_hook_state(&short_hooks);
+    CHECK(short_hooks.controlled_allocation_work_total == allocation_tariff
+        && short_hooks.controlled_allocation_work_charged
+        < allocation_tariff
+        && !short_hooks.controlled_row_allocations
+        && !short_hooks.controlled_input_array_allocations
+        && !short_hooks.controlled_input_array_bytes);
+    entry_retry_after_stop(&short_one, source, inputs, INPUT_COUNT);
+    const col_rel_t *short_output = session_rel_hash_lookup(short_one.session,
+            "output");
+    CHECK(short_output && short_output->nrows == ROW_COUNT);
+    entry_destroy(&short_one);
+
+    wl_columnar_lftj_test_clear_hooks();
+    entry_fixture_t exact;
+    entry_init_inputs(&exact, source, inputs, INPUT_COUNT,
+        precharge_prefix + allocation_tariff);
+    uint64_t exact_reserved = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(exact.session->memory_governor));
+    CHECK(entry_lftj_phase_reached(&exact,
+        WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
+        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    entry_complete(&exact);
+    CHECK(exact.reply.execution_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !exact.reply.committed
+        && wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            exact.session->memory_governor)) == exact_reserved);
+    wl_columnar_lftj_test_hook_state_t exact_hooks;
+    wl_columnar_lftj_test_get_hook_state(&exact_hooks);
+    CHECK(exact_hooks.controlled_allocation_work_total == allocation_tariff
+        && exact_hooks.controlled_allocation_work_charged == allocation_tariff
+        && exact_hooks.controlled_row_allocations == 1
+        && exact_hooks.controlled_input_array_allocations
+        == 2u * INPUT_COUNT
+        && exact_hooks.controlled_input_array_bytes
+        == 2u * INPUT_COUNT * ROW_COUNT * sizeof(int64_t));
+    entry_retry_after_stop(&exact, source, inputs, INPUT_COUNT);
+    const col_rel_t *exact_output = session_rel_hash_lookup(exact.session,
+            "output");
+    CHECK(exact_output && exact_output->nrows == ROW_COUNT);
+    entry_destroy(&exact);
+
+    {
+        static const int64_t one[] = {7};
+        const entry_input_t with_empty[] = {
+            {"input", one, 1, 1}, {"a", NULL, 0, 1}, {"b", one, 1, 1}
+        };
+        wl_columnar_lftj_test_clear_hooks();
+        entry_fixture_t empty;
+        entry_init_inputs(&empty, source, with_empty, INPUT_COUNT, 0);
+        col_rel_t *empty_relation = col_rel_new_auto("a", 1);
+        CHECK(empty_relation && !session_add_rel(empty.session,
+            empty_relation));
+        entry_complete(&empty);
+        CHECK(!empty.reply.execution_result && empty.reply.committed);
+        const col_rel_t *output = session_rel_hash_lookup(empty.session,
+                "output");
+        CHECK(output && output->nrows == 0);
+        wl_columnar_lftj_test_hook_state_t empty_hooks;
+        wl_columnar_lftj_test_get_hook_state(&empty_hooks);
+        CHECK(empty_hooks.controlled_row_allocations == 1
+            && empty_hooks.controlled_input_array_allocations == 4
+            && empty_hooks.controlled_input_array_bytes
+            == 4u * sizeof(int64_t));
+        entry_destroy(&empty);
+    }
+
+    {
+        uint64_t total = UINT64_MAX - 1u;
+        CHECK(wl_columnar_lftj_test_add_allocation_work(&total, 2u)
+            == EOVERFLOW && total == UINT64_MAX - 1u);
+        CHECK(!wl_columnar_lftj_test_add_allocation_work(&total, 1u)
+            && total == UINT64_MAX);
+        CHECK(wl_columnar_lftj_test_add_allocation_work(NULL, 1u) == EINVAL);
+    }
+    wl_columnar_lftj_test_clear_hooks();
+}
+
 static const char entry_filter_large[] =
     ".decl input(x:int64)\n"
     ".decl output(y:int64)\n"
@@ -6627,6 +6747,7 @@ main(void)
     test_entry_generated_lftj_partial_reader_acquire_abort();
     test_entry_generated_lftj_abort_cleanup_retry();
     test_entry_generated_lftj_stops_inside_child();
+    test_entry_generated_lftj_allocation_precharge();
     test_entry_generated_filter_work_boundary();
 
     test_shapes(); test_generated_union(); test_refusal_and_identity();
