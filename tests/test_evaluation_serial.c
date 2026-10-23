@@ -1931,6 +1931,76 @@ test_recursive_reachability_plan_manifest(void)
     wirelog_program_free(program);
 }
 
+static void
+test_recursive_two_join_plan_manifest(void)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,w) :- path(x,y), edge(y,z), edge(z,w).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    CHECK(plan->stratum_count == 1 && plan->strata[0].is_recursive
+        && plan->edb_count == 1 && !strcmp(plan->edb_relations[0], "edge"));
+    const wl_plan_stratum_t *stratum = &plan->strata[0];
+    CHECK(stratum->relation_count == 1);
+    const wl_plan_relation_t *relation = &stratum->relations[0];
+    CHECK(!strcmp(relation->name, "path")
+        && !strcmp(relation->delta_name, "$d$path")
+        && relation->op_count == 8);
+    static const wl_plan_op_type_t expected_ops[] = {
+        WL_PLAN_OP_VARIABLE, WL_PLAN_OP_MAP, WL_PLAN_OP_VARIABLE,
+        WL_PLAN_OP_JOIN, WL_PLAN_OP_JOIN, WL_PLAN_OP_CONCAT,
+        WL_PLAN_OP_CONSOLIDATE, WL_PLAN_OP_EXCHANGE
+    };
+    for (uint32_t i = 0; i < relation->op_count; ++i) {
+        CHECK(relation->ops[i].op == expected_ops[i]);
+        check_recursive_manifest_op_defaults(&relation->ops[i]);
+    }
+    const wl_plan_op_t *ops = relation->ops;
+    CHECK(!strcmp(ops[0].relation_name, "edge")
+        && !strcmp(ops[2].relation_name, "path")
+        && !strcmp(ops[3].right_relation, "edge")
+        && !strcmp(ops[4].right_relation, "edge"));
+    CHECK(ops[1].project_count == 2 && ops[1].project_indices
+        && ops[1].project_indices[0] == 0
+        && ops[1].project_indices[1] == 1
+        && ops[1].map_expr_count == 2 && ops[1].map_exprs);
+    static const uint8_t map_col0[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
+    };
+    static const uint8_t map_col1[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
+    };
+    CHECK(ops[1].map_exprs[0].size == sizeof(map_col0)
+        && !memcmp(ops[1].map_exprs[0].data, map_col0, sizeof(map_col0))
+        && ops[1].map_exprs[1].size == sizeof(map_col1)
+        && !memcmp(ops[1].map_exprs[1].data, map_col1, sizeof(map_col1)));
+    for (uint32_t i = 3; i <= 4; ++i) {
+        CHECK(ops[i].key_count == 1 && ops[i].left_keys
+            && ops[i].right_keys
+            && !strcmp(ops[i].right_keys[0], "col0"));
+    }
+    CHECK(!strcmp(ops[3].left_keys[0], "col1")
+        && ops[3].project_count == 0 && !ops[3].project_indices
+        && !strcmp(ops[4].left_keys[0], "col3")
+        && ops[4].project_count == 2 && ops[4].project_indices
+        && ops[4].project_indices[0] == 0
+        && ops[4].project_indices[1] == 5);
+    const wl_plan_op_exchange_t *exchange = ops[7].opaque_data;
+    CHECK(exchange && exchange->num_workers == 0
+        && exchange->key_col_count == 1 && exchange->key_col_idxs
+        && exchange->key_col_idxs[0] == 1 && !exchange->edb_rel_name
+        && exchange->edb_key_col_count == 0
+        && !exchange->edb_key_col_idxs);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
 static unsigned controlled_recursive_stop_phase;
 static bool controlled_recursive_stop_fired;
 static bool controlled_recursive_stop_enabled;
@@ -2062,6 +2132,36 @@ controlled_recursive_session(const int64_t *edges, uint32_t edge_count,
     return session;
 }
 
+static wl_session_t *
+controlled_recursive_two_join_session(const int64_t *edges,
+    uint32_t edge_count, wl_plan_t **plan_out,
+    wirelog_program_t **program_out, wl_evaluation_control_t **control_out)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,w) :- path(x,y), edge(y,z), edge(z,w).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "edge", edges, edge_count, 2));
+    *plan_out = plan;
+    *program_out = program;
+    *control_out = control;
+    return session;
+}
+
 static int
 controlled_recursive_run(wl_session_t *session,
     wl_evaluation_control_t *control)
@@ -2074,6 +2174,151 @@ controlled_recursive_run(wl_session_t *session,
             CHECK(wl_evaluation_control_active_attempt_id(control) == id);
     }
     return rc;
+}
+
+static void
+check_two_join_path(const col_rel_t *path, uint32_t expected_rows)
+{
+    static const int64_t expected_initial[][2] = {
+        {1, 2}, {1, 4}, {2, 3}, {2, 5}, {3, 4}, {4, 5}
+    };
+    static const int64_t expected_successor[][2] = {
+        {1, 2}, {1, 4}, {1, 6}, {2, 3}, {2, 5},
+        {3, 4}, {3, 6}, {4, 5}, {5, 6}
+    };
+    const int64_t (*expected)[2] = expected_rows == 6
+        ? expected_initial : expected_successor;
+    CHECK(expected_rows == 6 || expected_rows == 9);
+    CHECK(path && path->nrows == expected_rows && path->ncols == 2
+        && path->schema_ok && path->col_names
+        && !strcmp(path->col_names[0], "x")
+        && !strcmp(path->col_names[1], "y")
+        && path->sorted_nrows == path->nrows);
+    for (uint32_t i = 0; i < expected_rows; ++i)
+        CHECK(path->columns[0][i] == expected[i][0]
+            && path->columns[1][i] == expected[i][1]);
+}
+
+static void
+test_controlled_recursive_two_join_step(void)
+{
+    const int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5};
+    const uint64_t expected_work = UINT64_C(2020526);
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_two_join_session(edges, 4,
+            &plan, &program, &control);
+    CHECK(!wl_evaluation_control_configure(control, expected_work));
+    CHECK(!controlled_recursive_run(session, control));
+    const col_rel_t *path = session_find_rel((wl_col_session_t *)session,
+            "path");
+    check_two_join_path(path, 6);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == 0 && report.consumed == expected_work);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    session = controlled_recursive_two_join_session(edges, 4, &plan,
+            &program, &control);
+    CHECK(!wl_evaluation_control_configure(control, expected_work - 1));
+    CHECK(controlled_recursive_run(session, control)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!session_find_rel((wl_col_session_t *)session, "path"));
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && report.consumed == expected_work - 1);
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!controlled_recursive_run(session, control));
+    check_two_join_path(session_find_rel((wl_col_session_t *)session, "path"),
+        6);
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == 0 && report.consumed == expected_work);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static unsigned controlled_two_join_start_count;
+static bool controlled_two_join_second_started;
+static bool controlled_two_join_stopped;
+static bool controlled_two_join_old_path_preserved;
+static const col_rel_t *controlled_two_join_old_path;
+static wl_col_session_t *controlled_two_join_session_under_test;
+
+static void
+controlled_two_join_stop_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)progress;
+    if (phase == 1 && ++controlled_two_join_start_count == 2)
+        controlled_two_join_second_started = true;
+    if (phase == 17 && controlled_two_join_second_started
+        && !controlled_two_join_stopped) {
+        controlled_two_join_stopped = true;
+        controlled_two_join_old_path_preserved
+            = controlled_two_join_session_under_test
+            && session_find_rel(controlled_two_join_session_under_test,
+                "path") == controlled_two_join_old_path
+            && controlled_two_join_old_path
+            && controlled_two_join_old_path->nrows == 6;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
+test_controlled_recursive_two_join_successor_stop(void)
+{
+    const int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5};
+    const int64_t next_edge[] = {5, 6};
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *program = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_session_t *session = controlled_recursive_two_join_session(edges, 4,
+            &plan, &program, &control);
+    CHECK(!controlled_recursive_run(session, control));
+    wl_col_session_t *columnar = (wl_col_session_t *)session;
+    const col_rel_t *old_path = session_find_rel(columnar, "path");
+    check_two_join_path(old_path, 6);
+    CHECK(!wl_session_insert(session, "edge", next_edge, 1, 2));
+    CHECK(session_find_rel(columnar, "path") == old_path
+        && old_path->nrows == 6);
+
+    controlled_two_join_start_count = 0;
+    controlled_two_join_second_started = false;
+    controlled_two_join_stopped = false;
+    controlled_two_join_old_path_preserved = false;
+    controlled_two_join_old_path = old_path;
+    controlled_two_join_session_under_test = columnar;
+    wl_columnar_join_test_attempt_checkpoint =
+        controlled_two_join_stop_checkpoint;
+    int rc = controlled_recursive_run(session, control);
+    wl_columnar_join_test_attempt_checkpoint = NULL;
+    controlled_two_join_session_under_test = NULL;
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED
+        && controlled_two_join_second_started
+        && controlled_two_join_stopped
+        && controlled_two_join_old_path_preserved);
+    CHECK(session_find_rel(columnar, "path") == old_path
+        && old_path->nrows == 6);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(control, &report)
+        && report.result == WL_EVALUATION_CONTROL_CANCELLED
+        && report.consumed > 0);
+
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!wl_evaluation_control_configure(control, 0));
+    CHECK(!controlled_recursive_run(session, control));
+    check_two_join_path(session_find_rel(columnar, "path"), 9);
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
 }
 
 static void
@@ -2511,7 +2756,7 @@ test_controlled_recursive_step_rejects_unsupported_shape(void)
         ".decl edge(x:int64, y:int64)\n"
         ".decl walk(x:int64, y:int64)\n"
         "walk(x,y) :- edge(x,y).\n"
-        "walk(x,w) :- walk(x,y), edge(y,z), edge(z,w).\n";
+        "walk(x,v) :- walk(x,y), edge(y,z), edge(z,w), edge(w,v).\n";
     const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     wirelog_error_t error;
     wirelog_program_t *program = wirelog_parse_string(source, &error);
@@ -7589,6 +7834,9 @@ int
 main(void)
 {
     test_recursive_reachability_plan_manifest();
+    test_recursive_two_join_plan_manifest();
+    test_controlled_recursive_two_join_step();
+    test_controlled_recursive_two_join_successor_stop();
     test_controlled_recursive_step_publication_and_stops();
     test_controlled_recursive_step_after_public_edge_append();
     test_controlled_recursive_successor_work_boundaries();
