@@ -13,6 +13,8 @@
 #include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
 
+#define WL_COLUMNAR_SESSION_CONTROLLED_OBSERVER_MAX_ROWS UINT32_C(4096)
+
 #include "../wirelog-internal.h"
 
 #include <assert.h>
@@ -35,11 +37,20 @@ struct wl_columnar_controlled_step {
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
+    size_t delivery_precharge_index;
     bool operation_active;
     bool relation_active;
     bool previous_valid;
     bool refused;
     bool complete;
+    bool observed;
+    bool baseline_ready;
+    bool observer_preparing;
+    bool observer_prepare_discard;
+    bool observer_prepared;
+    bool observer_evaluated;
+    bool published;
+    bool observer_cleanup_pending;
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -5876,10 +5887,11 @@ static int
 col_controlled_step_static_preflight(wl_col_session_t *sess)
 {
     const wl_plan_t *plan = sess->plan;
+    const wl_plan_relation_t *only_relation = NULL;
+    uint32_t relation_count = 0;
     if (sess->cleanup_active || sess->cleanup_pending)
         return EBUSY;
     if (!plan || !plan->strata || !sess->base.evaluation_control
-        || sess->delta_cb
         || sess->delta_observer || sess->current_iteration
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
@@ -5895,6 +5907,69 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
         const wl_plan_stratum_t *stratum = &plan->strata[si];
         if (stratum->is_recursive
             || (stratum->relation_count && !stratum->relations))
+            return ENOTSUP;
+        if (stratum->relation_count == 1 && relation_count == 0)
+            only_relation = &stratum->relations[0];
+        else if (stratum->relation_count)
+            only_relation = NULL;
+        if (stratum->relation_count > UINT32_MAX - relation_count)
+            return EOVERFLOW;
+        relation_count += stratum->relation_count;
+    }
+    if (sess->delta_cb) {
+        if (plan->stratum_count != 1 || relation_count != 1
+            || !only_relation || !only_relation->name
+            || only_relation->op_count != 3 || !only_relation->ops
+            || only_relation->ops[0].op != WL_PLAN_OP_VARIABLE
+            || only_relation->ops[1].op != WL_PLAN_OP_MAP
+            || only_relation->ops[2].op != WL_PLAN_OP_CONSOLIDATE
+            || !only_relation->ops[0].relation_name
+            || session_find_rel(sess, only_relation->name))
+            return ENOTSUP;
+        const wl_plan_op_t *map = &only_relation->ops[1];
+        if (map->project_count != 1 || !map->project_indices
+            || map->project_indices[0] != 0
+            || (map->map_expr_count && (!map->map_exprs
+            || map->map_expr_count != 1)))
+            return ENOTSUP;
+        if (map->map_expr_count) {
+            const wl_plan_expr_buffer_t *expr = &map->map_exprs[0];
+            if (!expr->data && expr->size)
+                return ENOTSUP;
+            if (expr->data && expr->size) {
+                uint16_t len = 0;
+                if (expr->size != 7 || expr->data[0] != WL_PLAN_EXPR_VAR)
+                    return ENOTSUP;
+                memcpy(&len, expr->data + 1, sizeof(len));
+                if (len != 4 || memcmp(expr->data + 3, "col0", 4) != 0)
+                    return ENOTSUP;
+            }
+        }
+        const char *source_name = only_relation->ops[0].relation_name;
+        uint32_t source_index = plan->edb_count;
+        for (uint32_t i = 0; i < plan->edb_count; ++i)
+            if (plan->edb_relations && plan->edb_relations[i]
+                && strcmp(plan->edb_relations[i], source_name) == 0) {
+                source_index = i;
+                break;
+            }
+        if (source_index == plan->edb_count || !plan->edb_declared_width
+            || !plan->edb_column_type_counts || !plan->edb_column_types
+            || plan->edb_declared_width[source_index] != 1
+            || plan->edb_column_type_counts[source_index] != 1
+            || !plan->edb_column_types[source_index]
+            || plan->edb_column_types[source_index][0]
+            != WIRELOG_TYPE_INT64)
+            return ENOTSUP;
+        col_rel_t *source = session_find_rel(sess, source_name);
+        if (!source || source->nrows > source->capacity
+            || !((source->ncols == 1
+            && (!source->column_types || source->column_types[0]
+            == WIRELOG_TYPE_INT64))
+            || (source->nrows == 0 && source->ncols == 0
+            && source->declared_ncols == 1)))
+            return ENOTSUP;
+        if (source->nrows > WL_COLUMNAR_SESSION_CONTROLLED_OBSERVER_MAX_ROWS)
             return ENOTSUP;
     }
     return 0;
@@ -6100,6 +6175,71 @@ col_controlled_step_finish(wl_col_session_t *sess,
     return rc;
 }
 
+static int
+col_controlled_step_observer_drive(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (!step->observer_evaluated) {
+        wl_columnar_eval_delta_observer_set_active(sess, false);
+        wl_columnar_eval_delta_observer_set_evaluated(sess);
+        step->observer_evaluated = true;
+    }
+    while (step->observer_prepare_discard) {
+        int rc = wl_columnar_eval_delta_observer_prepare_discard(sess);
+        if (rc == EAGAIN) continue;
+        if (rc) return rc;
+        step->observer_prepare_discard = false;
+        step->observer_preparing = false;
+    }
+    if (!step->observer_prepared) {
+        if (!step->observer_preparing) {
+            int rc = wl_columnar_eval_delta_observer_prepare_start(sess);
+            if (rc) return rc;
+            step->observer_preparing = true;
+        }
+        for (;;) {
+            bool ready = false;
+            int rc = wl_columnar_eval_delta_observer_prepare_advance(sess,
+                    control, step->operation_id, &ready);
+            if (rc == EAGAIN) continue;
+            if (rc == WL_EVALUATION_CONTROL_CANCELLED) {
+                step->observer_prepare_discard = true;
+                return rc;
+            }
+            if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT)
+                return rc;
+            if (rc) {
+                step->observer_prepare_discard = true;
+                return rc;
+            }
+            if (!ready) continue;
+            step->observer_preparing = false;
+            step->observer_prepared = true;
+            break;
+        }
+    }
+    size_t event_count = wl_columnar_eval_delta_observer_event_count(sess);
+    while (step->delivery_precharge_index < event_count) {
+        int rc = wl_evaluation_control_charge(control, 1);
+        if (rc) return rc;
+        step->delivery_precharge_index++;
+    }
+    int rc = wl_evaluation_control_charge(control, 0);
+    if (rc) return rc;
+    if (!step->published) {
+        step->published = true;
+        wl_columnar_eval_delta_observer_publish(sess);
+        step->observer_cleanup_pending = true;
+    }
+    if (step->observer_cleanup_pending) {
+        rc = wl_columnar_eval_delta_observer_finish(sess);
+        if (rc) return rc;
+        step->observer_cleanup_pending = false;
+    }
+    return 0;
+}
+
 static const wl_plan_relation_t *
 col_controlled_step_current_relation(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -6141,6 +6281,48 @@ col_controlled_step_drive(wl_col_session_t *sess,
         return EINVAL;
     }
 
+    if (step->observed) {
+        const wl_plan_relation_t *relation =
+            &sess->plan->strata[0].relations[0];
+        col_rel_t *source = session_find_rel(sess,
+                relation->ops[0].relation_name);
+        if (source && source->ncols == 0 && source->nrows == 0) {
+            int schema_rc = wl_evaluation_control_charge(control, 1);
+            if (schema_rc)
+                return col_controlled_step_finish(sess, step, schema_rc);
+            schema_rc = col_rel_set_schema(source, 1, NULL);
+            if (schema_rc)
+                return col_controlled_step_finish(sess, step, schema_rc);
+            schema_rc = wl_evaluation_control_charge(control, 0);
+            if (schema_rc)
+                return col_controlled_step_finish(sess, step, schema_rc);
+        }
+    }
+
+    if (step->observed && !step->baseline_ready) {
+        const wl_plan_relation_t *relation =
+            &sess->plan->strata[0].relations[0];
+        if (!sess->delta_observer_build) {
+            int build_rc =
+                wl_columnar_eval_delta_observer_build_start_missing_head(
+                sess, UINT64_MAX, relation->name);
+            if (build_rc)
+                return col_controlled_step_finish(sess, step, build_rc);
+        }
+        for (;;) {
+            bool ready = false;
+            int build_rc = wl_columnar_eval_delta_observer_build_advance(sess,
+                    control, step->operation_id, &ready);
+            if (build_rc == EAGAIN) continue;
+            if (build_rc)
+                return col_controlled_step_finish(sess, step, build_rc);
+            if (!ready) continue;
+            step->baseline_ready = true;
+            wl_columnar_eval_delta_observer_set_active(sess, true);
+            break;
+        }
+    }
+
     if (teardown) {
         wl_evaluation_control_request_cancel(control);
         if (!step->relation_active) {
@@ -6152,7 +6334,18 @@ col_controlled_step_drive(wl_col_session_t *sess,
     }
 
     if (step->complete) {
-        int rc = wl_evaluation_control_charge(control, 0);
+        if (step->observed && !step->published) {
+            int observer_rc = col_controlled_step_observer_drive(sess, step);
+            if (observer_rc)
+                return col_controlled_step_finish(sess, step, observer_rc);
+        } else if (step->observer_cleanup_pending) {
+            int cleanup_rc = wl_columnar_eval_delta_observer_finish(sess);
+            if (cleanup_rc)
+                return col_controlled_step_finish(sess, step, cleanup_rc);
+            step->observer_cleanup_pending = false;
+        }
+        int rc = step->observed ? 0
+            : wl_evaluation_control_charge(control, 0);
         return col_controlled_step_finish(sess, step, rc);
     }
 
@@ -6160,6 +6353,20 @@ col_controlled_step_drive(wl_col_session_t *sess,
         const wl_plan_relation_t *relation
             = col_controlled_step_current_relation(sess, step);
         if (!relation) {
+            if (step->observed && !step->published) {
+                int observer_rc = col_controlled_step_observer_drive(sess,
+                        step);
+                if (observer_rc)
+                    return col_controlled_step_finish(sess, step,
+                               observer_rc);
+            } else if (step->observer_cleanup_pending) {
+                int cleanup_rc =
+                    wl_columnar_eval_delta_observer_finish(sess);
+                if (cleanup_rc)
+                    return col_controlled_step_finish(sess, step,
+                               cleanup_rc);
+                step->observer_cleanup_pending = false;
+            }
             int rc = col_controlled_step_finish(sess, step, 0);
             return rc;
         }
@@ -6261,6 +6468,7 @@ col_controlled_step(wl_col_session_t *sess)
         /* The host identity persists while control attempt IDs may change. */
         sess->controlled_step->operation_identity =
             (uint64_t)(uintptr_t)sess->controlled_step;
+        sess->controlled_step->observed = sess->delta_cb != NULL;
     }
     return col_controlled_step_drive(sess, sess->controlled_step, false);
 }
@@ -6301,7 +6509,12 @@ col_session_controlled_step_state(const wl_session_t *session)
     if (sess->cleanup_active || sess->cleanup_pending)
         return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
-    if (step->complete) return WL_CONTROLLED_STEP_COMPLETE;
+    if (step->complete) {
+        if (step->observed && (!step->published
+            || step->observer_cleanup_pending))
+            return WL_CONTROLLED_STEP_PENDING;
+        return WL_CONTROLLED_STEP_COMPLETE;
+    }
     return step->refused ? WL_CONTROLLED_STEP_IDLE
         : WL_CONTROLLED_STEP_PENDING;
 }

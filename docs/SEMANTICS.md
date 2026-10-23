@@ -635,13 +635,30 @@ only during creation. A control on a backend without the options hook is refused
 
 An attached control enables a limited controlled initial `wl_session_step()`
 for an acyclic plan using the columnar backend. Before evaluation, the session
-checks every stratum, rule head, and operator kind. Recursive plans, callbacks,
-parallel execution, differential/retraction state, unsupported operator kinds,
-and pre-existing rule-head relations return `ENOTSUP` without evaluation. The
-framed evaluator validates each operator's detailed metadata before executing
-that operator; a later execution error can therefore follow an already
-published rule prefix. A work stop at a rule boundary preserves that committed
-prefix, and a fresh STEP attempt resumes at the first unfinished rule.
+checks every stratum, rule head, and operator kind. Recursive plans, parallel
+execution, differential/retraction state, unsupported operator kinds, and
+pre-existing rule-head relations return `ENOTSUP` without evaluation. The
+observed callback route is currently limited further to one unary INT64 EDB
+rule with the exact `VARIABLE -> MAP(identity col0) -> CONSOLIDATE` plan shape.
+Its missing IDB head is represented by a virtual empty observer baseline; that
+baseline does not register or publish the relation. The framed evaluator
+registers the output only with its normal commit. A separately registered
+empty IDB head is rejected because replacing an existing target is outside
+this route. All other callback plans return `ENOTSUP` before the control
+attempt begins.
+
+The framed evaluator validates each operator's detailed metadata before
+executing that operator; a later execution error can therefore follow an
+already published rule prefix. A work stop at a rule boundary preserves that
+committed prefix, and a fresh STEP attempt resumes at the first unfinished
+rule. In the observed route, a stop after rule commit resumes observer
+preparation or delivery without rerunning the rule. Before callbacks begin,
+the complete event batch is charged and a final cancellation cutoff is polled.
+Publication then latches before entering user code and delivers the full batch
+synchronously without further polls. Cancellation requested by a callback
+does not truncate delivery or change that attempt's successful result. A
+cleanup retry after publication resumes retirement only and never replays
+events.
 Repeated STEP after full completion is a semantic no-op. Because incremental
 re-evaluation is not implemented in this slice, session mutations remain
 `EBUSY` after completion until the session is destroyed. Snapshot is `ENOTSUP`
@@ -665,9 +682,10 @@ while that attempt is active. Once a work stop finishes the attempt, control
 reset/configure may raise or remove its limit, but other session operations
 remain `EBUSY` until the logical STEP completes. Session destruction drains an
 active framed continuation before releasing session storage. This controlled
-initial-step slice does not complete whole-session recovery, observer delivery,
-recursive, differential, weighted, TDD/parallel, or every fallback path, and
-does not close #1817 or expose an installed public option.
+initial-step slice does not complete whole-session recovery, general observer
+delivery beyond the exact unary identity-map route above, recursive,
+differential, weighted, TDD/parallel, or every fallback path, and does not
+close #1817 or expose an installed public option.
 
 ### Implemented primitive contract
 
@@ -1492,5 +1510,7 @@ callback scheduling, and does not complete #1821 acceptance coverage.
 
 Whole-plan observer delivery, recursive STEP, and other unsupported controlled
 execution paths remain disabled. The controlled initial single-rule STEP
-entrypoint is documented above; this increment does not claim complete #1821
-coverage or enable unrestricted public dispatch.
+entrypoint is documented above. Its observer path accepts at most 4096 source
+rows so each event and relation-copy allocation remains bounded; larger inputs
+are rejected before the control attempt begins. This increment does not claim
+complete #1821 coverage or enable unrestricted public dispatch.
