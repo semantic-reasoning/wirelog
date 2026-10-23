@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -44,6 +45,9 @@ typedef struct {
     wl_session_t base;
     test_sync_t *sync;
     bool controlled_step_complete;
+    bool controlled_mutation_allowed;
+    bool fail_next_insert;
+    unsigned controlled_mutation_commits;
 } fake_session_t;
 
 typedef struct {
@@ -111,11 +115,16 @@ static int
 fake_insert(wl_session_t *base, const char *relation, const int64_t *data,
     uint32_t num_rows, uint32_t num_cols)
 {
+    fake_session_t *session = (fake_session_t *)base;
     (void)relation;
     (void)data;
     (void)num_rows;
     (void)num_cols;
-    record_operation((fake_session_t *)base, TEST_OP_INSERT);
+    record_operation(session, TEST_OP_INSERT);
+    if (session->fail_next_insert) {
+        session->fail_next_insert = false;
+        return EIO;
+    }
     return 0;
 }
 
@@ -159,8 +168,10 @@ fake_step(wl_session_t *base)
         }
         int rc = wl_evaluation_control_finish(base->evaluation_control,
                 base->operation_admission, 0, 0);
-        if (!rc)
+        if (!rc) {
             session->controlled_step_complete = true;
+            session->controlled_mutation_commits = 0;
+        }
         return rc;
     }
     return 0;
@@ -170,8 +181,38 @@ static wl_controlled_step_state_t
 fake_controlled_step_state(const wl_session_t *base)
 {
     const fake_session_t *session = (const fake_session_t *)base;
+    if (base->evaluation_control
+        && wl_evaluation_control_active_attempt_id(base->evaluation_control))
+        return WL_CONTROLLED_STEP_PENDING;
+    if (session->controlled_step_complete
+        && session->controlled_mutation_commits != 0)
+        return WL_CONTROLLED_STEP_RETRYABLE;
     return session->controlled_step_complete ? WL_CONTROLLED_STEP_COMPLETE
         : WL_CONTROLLED_STEP_IDLE;
+}
+
+static int
+fake_controlled_mutation_admit(wl_session_t *base, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    fake_session_t *session = (fake_session_t *)base;
+    (void)insert;
+    if (!session->controlled_mutation_allowed || !relation
+        || strcmp(relation, "r") != 0 || num_rows > 1 || num_cols != 1)
+        return ENOTSUP;
+    return 0;
+}
+
+static void
+fake_controlled_mutation_committed(wl_session_t *base, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    fake_session_t *session = (fake_session_t *)base;
+    (void)insert;
+    (void)relation;
+    (void)num_cols;
+    if (num_rows != 0)
+        session->controlled_mutation_commits++;
 }
 
 static void
@@ -213,6 +254,9 @@ static const wl_compute_backend_t fake_backend = {
     .session_snapshot = fake_snapshot,
     .session_memory_governor = fake_memory_governor,
     .session_controlled_step_state = fake_controlled_step_state,
+    .session_controlled_mutation_admit = fake_controlled_mutation_admit,
+    .session_controlled_mutation_committed =
+        fake_controlled_mutation_committed,
 };
 
 static void noop_tuple(const char *relation, const int64_t *row,
@@ -598,8 +642,55 @@ run_controlled_step_gate(void)
     wl_thread_join(&operation_tid);
     failures += expect(operation_ctx.rc == 0,
             "completed controlled-step snapshot finishes");
-    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EBUSY,
-            "mutations remain blocked after snapshot completion");
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1)
+            == ENOTSUP,
+            "backend without successor mutation support fails closed");
+    fake_session_t *fake = (fake_session_t *)session;
+    fake->controlled_mutation_allowed = true;
+    fake->fail_next_insert = true;
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == EIO,
+            "failed admitted insert preserves backend error");
+    failures += expect(fake->controlled_mutation_commits == 0
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_COMPLETE,
+            "failed insert does not record successor provenance");
+    failures += expect(wl_session_insert(session, "r", &row, 0, 1) == 0,
+            "zero-row admitted insert is accepted");
+    failures += expect(fake->controlled_mutation_commits == 0,
+            "zero-row insert does not record successor provenance");
+    failures += expect(wl_session_remove(session, "r", &row, 0, 1) == 0,
+            "zero-row admitted remove is accepted");
+    failures += expect(fake->controlled_mutation_commits == 0,
+            "zero-row remove does not record successor provenance");
+    unsigned inserts_before = sync.calls[TEST_OP_INSERT];
+    failures += expect(wl_session_insert(session, "other", &row, 1, 1)
+            == ENOTSUP,
+            "unsupported relation is rejected before backend mutation");
+    failures += expect(wl_session_insert(session, "r", &row, 2, 1)
+            == ENOTSUP,
+            "multirow mutation is rejected before backend mutation");
+    failures += expect(sync.calls[TEST_OP_INSERT] == inserts_before,
+            "rejected successor mutations never enter the backend");
+    failures += expect(wl_session_insert(session, "r", &row, 1, 1) == 0,
+            "one-row admitted insert reaches backend");
+    failures += expect(fake->controlled_mutation_commits == 1
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_RETRYABLE,
+            "successful insert records retryable successor provenance");
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL) == EBUSY,
+            "snapshot is blocked after a successor mutation");
+    failures += expect(wl_session_remove(session, "r", &row, 1, 1) == 0,
+            "one-row admitted remove reaches backend");
+    failures += expect(fake->controlled_mutation_commits == 2,
+            "successful remove records successor provenance");
+    failures += expect(wl_session_step(session) == EAGAIN,
+            "successor STEP retains the controlled continuation");
+    failures += expect(wl_session_step(session) == 0,
+            "successor STEP completes and clears mutation provenance");
+    failures += expect(fake->controlled_mutation_commits == 0
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_COMPLETE,
+            "completed successor restores the stable controlled state");
 destroy_session:
     wl_session_destroy(session);
 done:
