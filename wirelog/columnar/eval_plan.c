@@ -680,11 +680,11 @@ wl_columnar_eval_plan_numeric_forward(
            == record->attempt_id ? 0 : EINVAL;
 }
 
-/* The parsed reachability rule lowers to this exact seven-op relation. Its
- * final zero-worker EXCHANGE is metadata for the ordinary multi-worker
- * planner; under the controlled, single-session composed evaluator it has no
- * redistribution work to perform. Keep this bridge narrower than generic
- * EXCHANGE support. */
+/* The parsed one-edge and two-edge recursive reachability rules lower to
+ * these exact seven- and eight-op relations. Their final zero-worker EXCHANGE
+ * is metadata for the ordinary multi-worker planner; under the controlled,
+ * single-session composed evaluator it has no redistribution work to do.
+ * Keep this bridge narrower than generic EXCHANGE support. */
 static bool
 wl_columnar_eval_plan_composed_terminal_exchange_valid(
     const wl_columnar_eval_plan_numeric_attempt_t *record)
@@ -696,13 +696,22 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
         WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
     };
     if (!record || !record->composed_mode || !record->private_bindings
-        || record->begin != 0 || record->end != 7
-        || record->plan->op_count != 7)
+        || record->begin != 0 || !record->plan || !record->plan->ops
+        || (record->end != 7 && record->end != 8)
+        || record->plan->op_count != record->end)
         return false;
     const wl_plan_relation_t *plan = record->plan;
     const wl_plan_op_t *ops = plan->ops;
-    for (uint32_t i = 0; i < 7; ++i) {
+    uint32_t join_count = record->end == 7 ? 1 : 2;
+    uint32_t last_join = 2 + join_count;
+    uint32_t concat = last_join + 1;
+    uint32_t consolidate = concat + 1;
+    uint32_t exchange_index = consolidate + 1;
+    for (uint32_t i = 0; i < record->end; ++i) {
         const wl_plan_op_t *op = &ops[i];
+        bool join = i >= 3 && i <= last_join;
+        bool projected = i == 1 || (join
+            && (join_count == 1 || i == last_join));
         if (op->filter_expr.data || op->filter_expr.size
             || op->agg_expr.data || op->agg_expr.size
             || op->agg_fn != WIRELOG_AGG_COUNT
@@ -713,12 +722,12 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
             || op->agg_result_type != WL_PLAN_AGG_OPERAND_UNKNOWN
             || op->delta_mode != WL_DELTA_AUTO || op->materialized
             || (i != 0 && i != 2 && op->relation_name)
-            || (i != 3 && (op->right_relation || op->left_keys
+            || (!join && (op->right_relation || op->left_keys
             || op->right_keys || op->key_count))
-            || (i != 1 && i != 3
+            || (!projected
             && (op->project_indices || op->project_count))
             || (i != 1 && (op->map_exprs || op->map_expr_count))
-            || (i != 6 && op->opaque_data))
+            || (i != exchange_index && op->opaque_data))
             return false;
     }
     if (!plan->name || strcmp(plan->name, "path") != 0 || !plan->delta_name
@@ -730,13 +739,6 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
         || ops[2].op != WL_PLAN_OP_VARIABLE || !ops[2].relation_name
         || strcmp(ops[2].relation_name, "path") != 0
         || ops[2].delta_mode != WL_DELTA_AUTO
-        || ops[3].op != WL_PLAN_OP_JOIN || !ops[3].right_relation
-        || strcmp(ops[3].right_relation, "edge") != 0
-        || ops[3].key_count != 1 || !ops[3].left_keys
-        || !ops[3].right_keys || !ops[3].left_keys[0]
-        || !ops[3].right_keys[0]
-        || strcmp(ops[3].left_keys[0], "col1") != 0
-        || strcmp(ops[3].right_keys[0], "col0") != 0
         || ops[1].project_count != 2 || !ops[1].project_indices
         || ops[1].project_indices[0] != 0 || ops[1].project_indices[1] != 1
         || ops[1].map_expr_count != 2 || !ops[1].map_exprs
@@ -746,20 +748,47 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
         || ops[1].map_exprs[1].size != sizeof(map_col1)
         || !ops[1].map_exprs[1].data
         || memcmp(ops[1].map_exprs[1].data, map_col1, sizeof(map_col1))
-        || ops[3].project_count != 2 || !ops[3].project_indices
-        || ops[3].project_indices[0] != 0 || ops[3].project_indices[1] != 3
-        || ops[3].materialized || ops[3].delta_mode != WL_DELTA_AUTO
-        || ops[4].op != WL_PLAN_OP_CONCAT
-        || ops[5].op != WL_PLAN_OP_CONSOLIDATE
-        || ops[6].op != WL_PLAN_OP_EXCHANGE || !ops[6].opaque_data)
+        || ops[concat].op != WL_PLAN_OP_CONCAT
+        || ops[consolidate].op != WL_PLAN_OP_CONSOLIDATE
+        || ops[exchange_index].op != WL_PLAN_OP_EXCHANGE
+        || !ops[exchange_index].opaque_data)
         return false;
+    for (uint32_t i = 3; i <= last_join; ++i) {
+        if (ops[i].op != WL_PLAN_OP_JOIN || !ops[i].right_relation
+            || strcmp(ops[i].right_relation, "edge") != 0
+            || ops[i].key_count != 1 || !ops[i].left_keys
+            || !ops[i].right_keys || !ops[i].left_keys[0]
+            || !ops[i].right_keys[0]
+            || strcmp(ops[i].right_keys[0], "col0") != 0
+            || ops[i].materialized || ops[i].delta_mode != WL_DELTA_AUTO)
+            return false;
+    }
+    if (join_count == 1) {
+        if (strcmp(ops[3].left_keys[0], "col1") != 0
+            || ops[3].project_count != 2 || !ops[3].project_indices
+            || ops[3].project_indices[0] != 0
+            || ops[3].project_indices[1] != 3)
+            return false;
+    } else if (strcmp(ops[3].left_keys[0], "col1") != 0
+        || ops[3].project_count || ops[3].project_indices
+        || strcmp(ops[4].left_keys[0], "col3") != 0
+        || ops[4].project_count != 2 || !ops[4].project_indices
+        || ops[4].project_indices[0] != 0
+        || ops[4].project_indices[1] != 5) {
+        return false;
+    }
     const wl_plan_op_exchange_t *exchange =
-        (const wl_plan_op_exchange_t *)ops[6].opaque_data;
+        (const wl_plan_op_exchange_t *)ops[exchange_index].opaque_data;
     bool valid = exchange->num_workers == 0 && exchange->key_col_count == 1
         && exchange->key_col_idxs && exchange->key_col_idxs[0] == 1
-        && !exchange->edb_rel_name && exchange->edb_key_col_count == 1
-        && exchange->edb_key_col_idxs
-        && exchange->edb_key_col_idxs[0] == 0;
+        && !exchange->edb_rel_name;
+    if (join_count == 1)
+        valid = valid && exchange->edb_key_col_count == 1
+            && exchange->edb_key_col_idxs
+            && exchange->edb_key_col_idxs[0] == 0;
+    else
+        valid = valid && exchange->edb_key_col_count == 0
+            && !exchange->edb_key_col_idxs;
     return valid;
 }
 
@@ -773,8 +802,8 @@ wl_columnar_eval_plan_numeric_recursive_path_supported(
     shape.composed_mode = true;
     shape.private_bindings = &bindings;
     shape.begin = 0;
-    shape.end = 7;
     shape.plan = plan;
+    shape.end = plan->op_count;
     return wl_columnar_eval_plan_composed_terminal_exchange_valid(&shape);
 }
 
