@@ -381,8 +381,10 @@ def main() -> int:
         # Anchored on the cell, not the bare name: the prose above the table
         # names this function too, and row_edit refuses an ambiguous anchor.
         row_edit("an unresolvable anchor fails",
-                 "| `col_session_create_internal`, `col_session_remove`,",
-                 "| `col_session_create_internal_renamed`,"
+                 "| `col_controlled_step_recursive_drive`,"
+                 " `col_session_create_internal`, `col_session_remove`,",
+                 "| `col_controlled_step_recursive_drive`,"
+                 " `col_session_create_internal_renamed`,"
                  " `col_session_remove`,")
 
         # A symbol defined more than once must fail closed rather than resolve
@@ -410,9 +412,11 @@ def main() -> int:
         # The same for the write column, so `writes()` is not free to be
         # `return True` at this level either.
         row_edit("a real function that never writes the field fails",
-                 "| `col_session_insert`, `col_session_remove`,"
+                 "| `col_controlled_step_recursive_drive`,"
+                 " `col_session_insert`, `col_session_remove`,"
                  " `col_session_snapshot_impl`,",
-                 "| `arr_build_full`, `col_session_insert`,"
+                 "| `arr_build_full`, `col_controlled_step_recursive_drive`,"
+                 " `col_session_insert`,"
                  " `col_session_remove`,"
                  " `col_session_snapshot_impl`,")
 
@@ -423,8 +427,12 @@ def main() -> int:
         # The write column is the one that ends at `wl_retraction_restore` and
         # is followed by the read column; the read column ends at the verdict.
         row_edit("an arrangement function is not a col_rel_t writer",
-                 "| `col_rel_t::base_nrows` | `col_rel_compact_impl`,",
-                 "| `col_rel_t::base_nrows` | `col_diff_arrangement_reset_delta`,"
+                 "| `col_rel_t::base_nrows` |"
+                 " `col_controlled_step_recursive_drive`,"
+                 " `col_rel_compact_impl`,",
+                 "| `col_rel_t::base_nrows` |"
+                 " `col_controlled_step_recursive_drive`,"
+                 " `col_diff_arrangement_reset_delta`,"
                  " `col_rel_compact_impl`,")
         row_edit("an arrangement function is not a col_rel_t reader",
                  "`wl_retraction_restore` |"
@@ -435,12 +443,15 @@ def main() -> int:
         # Completeness: dropping a real writer must fail.  Soundness alone would
         # let a cell be trimmed to whatever is convenient.
         row_edit("a dropped writer fails",
-                 "`col_session_create_internal`, `col_session_remove`,",
+                 "`col_controlled_step_recursive_drive`,"
+                 " `col_session_create_internal`, `col_session_remove`,",
+                 "`col_controlled_step_recursive_drive`,"
                  "`col_session_remove`,")
 
         # And emptying a column outright must fail, not pass with less to check.
         row_edit("an emptied column fails",
-                 "| `col_session_insert`, `col_session_remove`,"
+                 "| `col_controlled_step_recursive_drive`,"
+                 " `col_session_insert`, `col_session_remove`,"
                  " `col_session_snapshot_impl`,"
                  " `col_session_step_impl`, `session_note_inserted_input` |",
                  "| — |")
@@ -518,8 +529,11 @@ def main() -> int:
         # unresolvable-symbol branch, because completeness still sees every real
         # function named.  Every other case removes something as well.
         row_edit("an added unresolvable anchor fails",
-                 "| `col_session_create_internal`,",
-                 "| `wl_mutex_lock`, `col_session_create_internal`,")
+                 "| `col_controlled_step_recursive_drive`,"
+                 " `col_session_create_internal`,",
+                 "| `wl_mutex_lock`,"
+                 " `col_controlled_step_recursive_drive`,"
+                 " `col_session_create_internal`,")
 
         # A table with rows but no backticked subject must fail closed.  This
         # reaches the no-subject guard, which the empty-section fixture cannot:
