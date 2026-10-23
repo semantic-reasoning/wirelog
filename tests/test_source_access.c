@@ -52,6 +52,330 @@ test_atomic_strong_compare_exchange(void)
         "atomic reader decrement preserves peer readers");
 }
 
+struct gate_round_thread_arg {
+    wl_columnar_source_access_gate_round_t *round;
+    int result;
+};
+
+struct gate_round_reciprocal_arg {
+    wl_columnar_source_access_gate_request_t requests[2];
+    wl_columnar_source_access_gate_round_t round;
+    wl_mutex_t *lock;
+    wl_cond_t *changed;
+    int *arrived;
+    int *completed;
+    bool *release;
+    int result;
+};
+
+static void *
+gate_round_release_on_thread(void *opaque)
+{
+    struct gate_round_thread_arg *arg = opaque;
+    arg->result = wl_columnar_source_access_gate_round_release(arg->round);
+    return NULL;
+}
+
+static void *
+gate_round_reciprocal_on_thread(void *opaque)
+{
+    struct gate_round_reciprocal_arg *arg = opaque;
+    (void)wl_mutex_lock(arg->lock);
+    (*arg->arrived)++;
+    (void)wl_cond_broadcast(arg->changed);
+    while (*arg->arrived < 2 && !*arg->release)
+        (void)wl_cond_wait(arg->changed, arg->lock);
+    if (*arg->release) {
+        (void)wl_mutex_unlock(arg->lock);
+        return NULL;
+    }
+    (void)wl_mutex_unlock(arg->lock);
+
+    arg->result = wl_columnar_source_access_gate_round_acquire(&arg->round,
+            arg->requests, 0, 2);
+
+    (void)wl_mutex_lock(arg->lock);
+    (*arg->completed)++;
+    (void)wl_cond_broadcast(arg->changed);
+    while (!*arg->release)
+        (void)wl_cond_wait(arg->changed, arg->lock);
+    (void)wl_mutex_unlock(arg->lock);
+    if (arg->result == 0)
+        arg->result = wl_columnar_source_access_gate_round_release(&arg->round);
+    return NULL;
+}
+
+static void
+test_gate_round_success(void)
+{
+    wl_columnar_source_access_gate_t gates[4] = { 0 };
+    wl_columnar_source_access_gate_request_t requests[4] = {
+        { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[3], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[2], WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER },
+    };
+    wl_columnar_source_access_gate_round_t round = { 0 }, copy;
+    struct gate_round_thread_arg arg;
+    wl_thread_t thread;
+
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == 0, "mixed gate round acquire");
+    CHECK(round.acquired_count == 4
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 1
+        && atomic_load_explicit(&gates[1].state, memory_order_relaxed) == 1
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && atomic_load_explicit(&gates[3].state, memory_order_relaxed) == 1,
+        "mixed gate round holds every requested gate");
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EINVAL
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 1
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "live gate receipt cannot be reinitialized");
+
+    copy = round;
+    CHECK(wl_columnar_source_access_gate_round_release(&copy) == EINVAL
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 1
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "copied gate round cannot release original holds");
+
+    arg = (struct gate_round_thread_arg){ &round, EINVAL };
+    CHECK(wl_thread_create(&thread, gate_round_release_on_thread, &arg) == 0,
+        "wrong-thread gate round setup");
+    CHECK(wl_thread_join(&thread) == 0 && arg.result == EINVAL
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 1
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "wrong-thread gate round leaves original holds intact");
+    CHECK(wl_columnar_source_access_gate_round_release(&round) == 0,
+        "mixed gate round release");
+    CHECK(wl_columnar_source_access_gate_round_release(&round) == EINVAL,
+        "repeated gate round release rejected");
+    for (size_t i = 0; i < 4; i++)
+        CHECK(atomic_load_explicit(&gates[i].state, memory_order_relaxed) == 0,
+            "reverse release drains every gate");
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == 0
+        && wl_columnar_source_access_gate_round_release(&round) == 0,
+        "released gate receipt can be reused");
+}
+
+static void
+test_gate_round_storage_only(void)
+{
+    wl_columnar_source_access_gate_t gates[3] = { 0 };
+    wl_columnar_source_access_gate_request_t requests[3] = {
+        { &gates[2], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER },
+        { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+    };
+    wl_columnar_source_access_gate_round_t round = { 0 };
+
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 0,
+        3) == 0 && round.request_count == 3 && round.acquired_count == 3,
+        "storage-only gate round completes its bounded sort and acquire");
+    CHECK(round.requests[0].gate == &gates[0]
+        && round.requests[0].mode == WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER
+        && round.requests[1].gate == &gates[1]
+        && round.requests[2].gate == &gates[2],
+        "storage-only round sorts gates and preserves their modes");
+    CHECK(wl_columnar_source_access_gate_round_release(&round) == 0,
+        "storage-only round releases all acquired gates");
+    for (size_t i = 0; i < 3; i++)
+        CHECK(atomic_load_explicit(&gates[i].state, memory_order_relaxed) == 0,
+            "storage-only round leaves every gate available");
+}
+
+static void
+test_gate_round_reciprocal_contention(void)
+{
+    wl_columnar_source_access_gate_t gates[2] = { 0 };
+    wl_mutex_t lock;
+    wl_cond_t changed;
+    int arrived = 0, completed = 0;
+    bool release = false;
+    wl_thread_t threads[2];
+    struct gate_round_reciprocal_arg args[2] = {
+        {
+            .requests = {
+                { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER },
+                { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+            },
+            .lock = &lock, .changed = &changed, .arrived = &arrived,
+            .completed = &completed, .release = &release,
+        },
+        {
+            .requests = {
+                { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER },
+                { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+            },
+            .lock = &lock, .changed = &changed, .arrived = &arrived,
+            .completed = &completed, .release = &release,
+        },
+    };
+    CHECK(wl_mutex_init(&lock) == 0 && wl_cond_init(&changed) == 0,
+        "reciprocal gate synchronization setup");
+    int first_created = wl_thread_create(&threads[0],
+            gate_round_reciprocal_on_thread, &args[0]);
+    int second_created = first_created == 0
+        ? wl_thread_create(&threads[1], gate_round_reciprocal_on_thread,
+            &args[1]) : -1;
+    if (first_created != 0 || second_created != 0) {
+        (void)wl_mutex_lock(&lock);
+        release = true;
+        (void)wl_cond_broadcast(&changed);
+        (void)wl_mutex_unlock(&lock);
+        if (first_created == 0)
+            (void)wl_thread_join(&threads[0]);
+        if (second_created == 0)
+            (void)wl_thread_join(&threads[1]);
+        wl_cond_destroy(&changed);
+        wl_mutex_destroy(&lock);
+        CHECK(0, "reciprocal gate thread creation");
+    }
+    (void)wl_mutex_lock(&lock);
+    while (completed < 2)
+        (void)wl_cond_wait(&changed, &lock);
+    int first_result = args[0].result;
+    int second_result = args[1].result;
+    uint64_t first_gate_held = atomic_load_explicit(&gates[0].state,
+            memory_order_relaxed);
+    uint64_t second_gate_held = atomic_load_explicit(&gates[1].state,
+            memory_order_relaxed);
+    bool complete_owner_held = first_result == 0
+        ? first_gate_held == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && second_gate_held == 1
+        : second_gate_held == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+        && first_gate_held == 1;
+    release = true;
+    (void)wl_cond_broadcast(&changed);
+    (void)wl_mutex_unlock(&lock);
+    int joined = wl_thread_join(&threads[0]) == 0
+        && wl_thread_join(&threads[1]) == 0;
+    bool valid = joined
+        && complete_owner_held
+        && ((first_result == 0 && second_result == EAGAIN)
+        || (second_result == 0 && first_result == EAGAIN))
+        && args[0].result == (first_result == 0 ? 0 : EAGAIN)
+        && args[1].result == (second_result == 0 ? 0 : EAGAIN)
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[1].state, memory_order_relaxed) == 0;
+    wl_cond_destroy(&changed);
+    wl_mutex_destroy(&lock);
+    CHECK(valid,
+        "reciprocal rounds yield one complete owner and no partial hold");
+}
+
+static void
+test_gate_round_failure_positions(void)
+{
+    wl_columnar_source_access_gate_t gates[4] = { 0 };
+    wl_columnar_source_access_gate_request_t requests[4] = {
+        { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[3], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[2], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+    };
+    wl_columnar_source_access_gate_t *ordered[4] = {
+        &gates[1], &gates[0], &gates[3], &gates[2]
+    };
+    for (size_t start = 0; start < 4; start += 2) {
+        for (size_t i = start + 1; i < start + 2; i++) {
+            wl_columnar_source_access_gate_t *item = ordered[i];
+            size_t j = i;
+            while (j > start && (uintptr_t)ordered[j - 1]
+                > (uintptr_t)item) {
+                ordered[j] = ordered[j - 1];
+                j--;
+            }
+            ordered[j] = item;
+        }
+    }
+    for (size_t blocked = 0; blocked < 4; blocked++) {
+        wl_columnar_source_access_gate_round_t round = { 0 };
+        for (size_t i = 0; i < 4; i++)
+            atomic_store_explicit(&gates[i].state, 0, memory_order_relaxed);
+        atomic_store_explicit(&ordered[blocked]->state,
+            WL_COLUMNAR_SOURCE_ACCESS_WRITER, memory_order_relaxed);
+        CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests,
+            2, 2) == EAGAIN, "busy gate returns EAGAIN");
+        CHECK(round.identity == 0 && round.acquired_count == 0,
+            "failed round clears its receipt");
+        for (size_t i = 0; i < 4; i++) {
+            uint64_t expected = &gates[i] == ordered[blocked]
+                ? WL_COLUMNAR_SOURCE_ACCESS_WRITER : 0;
+            CHECK(atomic_load_explicit(&gates[i].state,
+                memory_order_relaxed) == expected,
+                "failure position leaves no partial gate hold");
+        }
+    }
+
+    wl_columnar_source_access_reader_t peer = { 0 };
+    wl_columnar_source_access_gate_round_t round = { 0 };
+    for (size_t i = 0; i < 4; i++)
+        atomic_store_explicit(&gates[i].state, 0, memory_order_relaxed);
+    CHECK(wl_columnar_source_access_reader_acquire(&gates[0], &peer) == 0,
+        "peer reader setup for rollback");
+    atomic_store_explicit(&gates[3].state, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        memory_order_relaxed);
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EAGAIN
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 1,
+        "reader rollback preserves a peer reader count");
+    CHECK(atomic_load_explicit(&gates[1].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[3].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+        "peer-reader rollback releases only the round's other holds");
+    CHECK(wl_columnar_source_access_reader_release(&peer) == 0,
+        "peer reader release after rollback");
+}
+
+static void
+test_gate_round_overflow_and_rejections(void)
+{
+    wl_columnar_source_access_gate_t gates[4] = { 0 };
+    wl_columnar_source_access_gate_request_t requests[4] = {
+        { &gates[0], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[1], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[2], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+        { &gates[3], WL_COLUMNAR_SOURCE_ACCESS_GATE_READER },
+    };
+    wl_columnar_source_access_gate_round_t round = { 0 };
+
+    atomic_store_explicit(&gates[3].state,
+        WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u, memory_order_relaxed);
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EOVERFLOW, "reader count overflow returns EOVERFLOW");
+    CHECK(round.identity == 0
+        && atomic_load_explicit(&gates[0].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[1].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[2].state, memory_order_relaxed) == 0
+        && atomic_load_explicit(&gates[3].state, memory_order_relaxed)
+        == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u,
+        "overflow reverses earlier reader acquisitions");
+
+    requests[3].gate = &gates[2];
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EINVAL && round.identity == 0,
+        "duplicate gates rejected before acquisition");
+    requests[3].gate = &gates[3];
+    requests[0].mode = (wl_columnar_source_access_gate_mode_t)3;
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EINVAL && round.identity == 0,
+        "invalid gate mode rejected before acquisition");
+    requests[0].mode = WL_COLUMNAR_SOURCE_ACCESS_GATE_READER;
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 5,
+        0) == EINVAL && round.identity == 0,
+        "oversized gate round rejected before acquisition");
+    CHECK(wl_columnar_source_access_gate_round_acquire(&round, requests, 2,
+        2) == EOVERFLOW && round.identity == 0,
+        "rejected overflow receipt remains reusable");
+}
+
 static int
 paired_reader_acquire(wl_columnar_source_access_gate_t *source,
     wl_columnar_source_access_gate_t *descriptor,
@@ -1100,6 +1424,11 @@ main(void)
 {
     printf("Source access gate tests (#1492)\n");
     test_atomic_strong_compare_exchange();
+    test_gate_round_success();
+    test_gate_round_storage_only();
+    test_gate_round_failure_positions();
+    test_gate_round_overflow_and_rejections();
+    test_gate_round_reciprocal_contention();
     test_lifecycle();
     test_writer_move();
     test_invalid_and_cross_thread();

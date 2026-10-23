@@ -152,7 +152,7 @@ explicitly (audit in [§5](#5-atomics-audit)).
 
 ### 4.2 MSVC shim in `mem_ledger.h`
 
-`wirelog/columnar/mem_ledger.h:24-89` reimplements the subset of C11
+`wirelog/columnar/mem_ledger.h:24-195` reimplements the subset of C11
 atomics that `mem_ledger.c` needs by routing through
 `_InterlockedCompareExchange64`. Notes:
 
@@ -162,13 +162,16 @@ atomics that `mem_ledger.c` needs by routing through
   qualifier prevents the compiler from caching the value.
 - `atomic_store_explicit(ptr, val, order)` expands to `(*(ptr) = (val))`
   under the same constraints.
-- `atomic_fetch_add_explicit` and `atomic_fetch_sub_explicit` use a
-  `_InterlockedCompareExchange64` retry loop; this gives acquire+release
+- `atomic_fetch_add_explicit` and `atomic_fetch_sub_explicit` use the
+  width-aware `_InterlockedExchangeAdd*` intrinsic, giving acquire+release
   semantics regardless of the requested order.
-- `atomic_compare_exchange_weak_explicit` is `_InterlockedCompareExchange64`
-  with one comparison, returning `true` on success.
+- `atomic_compare_exchange_weak_explicit` and
+  `atomic_compare_exchange_strong_explicit` use one width-aware
+  `_InterlockedCompareExchange*` operation. Interlocked cannot fail
+  spuriously, and both spellings update `expected` on mismatch.
 - **Memory orders are ignored** under this shim. The macros at
-  `mem_ledger.h:87-89` define `memory_order_relaxed`/`_release`/`_acquire`
+  `mem_ledger.h:192-195` define `memory_order_relaxed`/`_release`/`_acquire`/
+  `_acq_rel`
   as integer constants only; the intrinsics provide the order the
   hardware already gives. The portable code in `mem_ledger.c` continues
   to pass explicit orders so the GCC/Clang path is correct; the MSVC
@@ -228,7 +231,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **376**).
+match the script's count (currently **394**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -657,7 +660,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 388 sites.
+symbol-anchored inventory below covers 394 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1646,7 +1649,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce committed credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#7` | token state | `atomic_store_explicit` | release | Publish the downsized token after aggregate credit succeeds |
 
-The complete current atomic-source inventory contains 376 call sites.
+The complete current atomic-source inventory contains 394 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2000,6 +2003,23 @@ more source sites. The test hook resets that counter only in isolated tests.
 | `session_hash.c:wl_columnar_session_hash_registry_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Reject leased/transition credit before a reversible journal move |
 | `session_hash.c:wl_columnar_session_hash_registry_inert` | `token->state` | `atomic_load_explicit` | acquire | Prove one private or retired token inert before the image drain seal |
 | `session_hash.c:wl_columnar_session_hash_registry_inert#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify no lease remains while the original parent marker still protects retirement |
+
+The bounded mixed-gate receipt takes at most four non-spurious CAS attempts,
+then releases any acquired prefix in reverse order before returning. Reader
+rollback uses one atomic decrement so concurrent peer readers keep their own
+counts; only an exclusively held writer sentinel is cleared with a store. Its
+receipt is bound to its original address and creating thread, and must be
+zero-initialized with `{0}` before its first acquire. A failed acquire or
+successful release clears it for reuse.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `source_access.h:wl_columnar_source_access_gate_round_unwind` | `request->gate->state` | `atomic_load_explicit` | acquire | Validate the owned gate state before bounded rollback |
+| `source_access.h:wl_columnar_source_access_gate_round_unwind#2` | `request->gate->state` | `atomic_fetch_sub_explicit` | release | Remove exactly this receipt's reader hold while preserving peer readers |
+| `source_access.h:wl_columnar_source_access_gate_round_unwind#3` | `request->gate->state` | `atomic_store_explicit` | release | Release a writer sentinel held exclusively by this receipt |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire` | `request->gate->state` | `atomic_load_explicit` | acquire | Check reader count and writer sentinel before its one admission CAS |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire#2` | `request->gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Add one reader hold without retrying a failed round |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire#3` | `request->gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Claim one writer gate without retrying a failed round |
 
 The private fresh-head publisher creates registry/hash arrays offside, one slot
 or name byte per action. Its original-address four-move journal reverses before
