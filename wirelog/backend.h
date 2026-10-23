@@ -55,6 +55,9 @@ typedef enum {
     WL_CONTROLLED_STEP_IDLE = 0,
     WL_CONTROLLED_STEP_PENDING,
     WL_CONTROLLED_STEP_COMPLETE,
+    /* The initial result is complete, but an explicitly admitted successor
+     * mutation makes snapshots stale until the next controlled STEP. */
+    WL_CONTROLLED_STEP_RETRYABLE,
 } wl_controlled_step_state_t;
 
 /**
@@ -126,6 +129,15 @@ typedef struct {
      * closed between stopped attempts; COMPLETE rejects later mutations. */
     wl_controlled_step_state_t (*session_controlled_step_state)(
         const wl_session_t *session);
+    /* Validate a narrow post-completion input mutation before entering the
+     * backend.  Backends without this hook keep the default closed policy. */
+    int (*session_controlled_mutation_admit)(wl_session_t *session,
+        bool insert, const char *relation, uint32_t num_rows,
+        uint32_t num_cols);
+    /* Record a controlled successor mutation after the backend committed it. */
+    void (*session_controlled_mutation_committed)(wl_session_t *session,
+        bool insert, const char *relation, uint32_t num_rows,
+        uint32_t num_cols);
 } wl_compute_backend_t;
 
 /**

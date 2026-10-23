@@ -84,6 +84,51 @@ wl_session_operation_begin(wl_session_t *session)
     return 0;
 }
 
+/* After an observed controlled STEP, only mutations explicitly admitted by
+ * the backend may change the input before its successor attempt.  Query the
+ * backend state under the same mutex that excludes concurrent STEP changes. */
+static int
+wl_session_operation_begin_mutation(wl_session_t *session, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols,
+    bool *controlled_mutation)
+{
+    *controlled_mutation = false;
+    wl_session_admission_t *admission = session->operation_admission;
+    if (!admission)
+        return 0;
+
+    wl_mutex_lock(&admission->mutex);
+    int rc = 0;
+    if (admission->closing || admission->controlled_step_pending) {
+        rc = EBUSY;
+    } else {
+        wl_controlled_step_state_t state =
+            session->backend && session->backend->session_controlled_step_state
+            ? session->backend->session_controlled_step_state(session)
+            : WL_CONTROLLED_STEP_IDLE;
+        if (session->evaluation_control
+            && (state == WL_CONTROLLED_STEP_COMPLETE
+            || state == WL_CONTROLLED_STEP_RETRYABLE)) {
+            if (admission->active_operations != 0)
+                rc = EBUSY;
+            else if (!session->backend->session_controlled_mutation_admit
+                || !session->backend->session_controlled_mutation_committed)
+                rc = ENOTSUP;
+            else
+                rc = session->backend->session_controlled_mutation_admit(
+                    session, insert, relation, num_rows, num_cols);
+            if (!rc)
+                *controlled_mutation = true;
+        } else if (admission->controlled_step_complete) {
+            rc = EBUSY;
+        }
+    }
+    if (!rc)
+        admission->active_operations++;
+    wl_mutex_unlock(&admission->mutex);
+    return rc;
+}
+
 /* A controlled step owns the session across calls while its framed host
  * continuation is pending. Admit the first call only from a quiescent
  * session; a resume is the only public operation allowed through the gate. */
@@ -120,14 +165,17 @@ wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
     if (admission->closing || admission->active_operations != 0
         || admission->controlled_step_pending)
         rc = EBUSY;
-    else if (!admission->controlled_step_complete) {
+    else {
         wl_controlled_step_state_t state =
             session->backend && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
-        rc = state == WL_CONTROLLED_STEP_PENDING ? EBUSY : ENOTSUP;
-    }else
-        admission->active_operations++;
+        if (state == WL_CONTROLLED_STEP_COMPLETE)
+            admission->active_operations++;
+        else
+            rc = state == WL_CONTROLLED_STEP_PENDING
+                || state == WL_CONTROLLED_STEP_RETRYABLE ? EBUSY : ENOTSUP;
+    }
     wl_mutex_unlock(&admission->mutex);
     return rc;
 }
@@ -144,7 +192,8 @@ wl_session_operation_end_step(wl_session_t *session,
     admission->active_operations--;
     admission->controlled_step_pending = continuation_pending
         || state == WL_CONTROLLED_STEP_PENDING;
-    if (state == WL_CONTROLLED_STEP_COMPLETE)
+    if (state == WL_CONTROLLED_STEP_COMPLETE
+        || state == WL_CONTROLLED_STEP_RETRYABLE)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_IDLE)
         admission->controlled_step_complete = false;
@@ -442,9 +491,11 @@ wl_session_insert(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
 {
     int rc;
+    bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    rc = wl_session_operation_begin_mutation(session, true, relation,
+            num_rows, num_cols, &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_insert
@@ -456,6 +507,10 @@ wl_session_insert(wl_session_t *session, const char *relation,
         rc = session->backend->session_insert(session, relation, data,
                 num_rows, num_cols);
     }
+    if (controlled_mutation && rc == 0 && num_rows != 0
+        && session->backend->session_controlled_mutation_committed)
+        session->backend->session_controlled_mutation_committed(session, true,
+            relation, num_rows, num_cols);
     wl_session_operation_end(session);
     return rc;
 }
@@ -499,9 +554,11 @@ wl_session_remove(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
 {
     int rc;
+    bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    rc = wl_session_operation_begin_mutation(session, false, relation,
+            num_rows, num_cols, &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_remove)
@@ -512,6 +569,10 @@ wl_session_remove(wl_session_t *session, const char *relation,
         rc = session->backend->session_remove(session, relation, data,
                 num_rows, num_cols);
     }
+    if (controlled_mutation && rc == 0 && num_rows != 0
+        && session->backend->session_controlled_mutation_committed)
+        session->backend->session_controlled_mutation_committed(session, false,
+            relation, num_rows, num_cols);
     wl_session_operation_end(session);
     return rc;
 }

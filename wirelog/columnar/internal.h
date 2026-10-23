@@ -2818,6 +2818,8 @@ int wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, bool *ready);
 int wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *);
 int wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *);
+int wl_columnar_eval_delta_observer_prepare_start_with_override(
+    wl_col_session_t *, const char *, col_rel_t *);
 int wl_columnar_eval_delta_observer_prepare_advance(wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, bool *ready);
 int wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *);
@@ -4602,6 +4604,9 @@ session_remove_rel(wl_col_session_t *sess, const char *name);
 #ifdef WL_SESSION_TEST_HOOKS
 int wl_columnar_session_test_register_retraction(wl_col_session_t *sess,
     col_rel_t *relation, bool publish);
+int wl_columnar_session_test_register_expected_head(wl_col_session_t *sess,
+    col_rel_t *relation, col_rel_t *expected_old, uint64_t identity,
+    uint64_t view_generation, uint64_t storage_generation, bool publish);
 /* Calls of session_snapshot_insert() that returned 0 (Issue #2119). */
 extern uint32_t wl_columnar_session_test_insert_route_taken;
 #endif
