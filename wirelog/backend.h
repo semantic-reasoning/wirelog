@@ -137,6 +137,16 @@ typedef struct {
     bool (*session_controlled_step_authorize_insert)(
         const wl_session_t *session, const char *relation,
         uint32_t num_rows, uint32_t num_cols);
+    /* Validate a narrow post-completion mutation with an operation reservation
+     * active and no admission mutex held. Used after append authorization
+     * declines; backends without these mutation hooks remain closed. */
+    int (*session_controlled_mutation_admit)(wl_session_t *session,
+        bool insert, const char *relation, uint32_t num_rows,
+        uint32_t num_cols);
+    /* Record a controlled successor mutation after the backend committed it. */
+    void (*session_controlled_mutation_committed)(wl_session_t *session,
+        bool insert, const char *relation, uint32_t num_rows,
+        uint32_t num_cols);
 } wl_compute_backend_t;
 
 /**
