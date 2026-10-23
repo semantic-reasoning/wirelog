@@ -1508,6 +1508,25 @@ is retained and a fresh attempt completes READY without committing twice.
 This is still a preparation primitive, not whole-plan observer delivery or
 callback scheduling, and does not complete #1821 acceptance coverage.
 
+The controlled observed STEP host also admits a narrow successor after its
+initial STEP has completed: exactly one nonzero row insert or remove on the
+unary INT64 input of the supported one-rule `VARIABLE -> MAP(identity) ->
+CONSOLIDATE` plan. Unsupported mutation shapes fail before backend mutation;
+zero-row calls do not create successor work. A supported mutation makes
+snapshots busy until the next controlled STEP. That STEP recomputes into a
+private relation, compares it with the last committed output, and emits the
+net signed `+1`/`-1` events. The prior public output remains registered through
+work limits, cancellation and preparation errors. The candidate replaces it
+only after event preparation and the final control poll succeed. A stop before
+that boundary can be resumed without repeating the framed rule; post-commit
+cleanup cannot publish the events twice. This remains a controlled internal
+route: it does not enable public/default activation, multirow updates, other
+plan shapes, weighted rows, JOIN, recursion or the remaining #1821 acceptance
+criteria.
+This host also bounds that shape to three registered relation slots (input,
+committed output and one private candidate); sessions exceeding that bound
+reject successor mutation before it enters the backend.
+
 Whole-plan observer delivery, recursive STEP, and other unsupported controlled
 execution paths remain disabled. The controlled initial single-rule STEP
 entrypoint is documented above. For that route, the committed unary INT64
