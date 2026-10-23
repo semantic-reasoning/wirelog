@@ -2286,7 +2286,8 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
             : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD;
         break;
     case WL_COLUMNAR_FILTER_PROGRESS_DONE:
-        record->semantic_result = record->child_status.semantic_result;
+        if (!record->semantic_result)
+            record->semantic_result = record->child_status.semantic_result;
         record->phase =
             concat ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK
             : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK;

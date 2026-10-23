@@ -5038,10 +5038,14 @@ cancel_after_terminal_exchange(wl_evaluation_control_t *control,
 static void
 composed_close(fixture_t *f)
 {
-    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
-    CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+    bool acknowledged = !f->record.composed_mode && !f->record.identity;
+    CHECK(acknowledged
+        ? f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+        : f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+    if (!acknowledged)
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
     int result = f->record.semantic_result;
-    CHECK(!composed_host_turn(f, true));
+    if (!acknowledged) CHECK(!composed_host_turn(f, true));
     CHECK(!f->record.composed_mode && !f->record.identity);
     CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
     CHECK(!f->session.cleanup_active_count &&
@@ -6194,11 +6198,80 @@ test_composed_concat_work_limit_cleanup(void)
     col_rel_destroy(b);
 }
 
+static void
+test_composed_concat_stopped_retirement_retry(void)
+{
+    static const double a_values[] = {3, 1, 3, -2};
+    static const double b_values[] = {1, 4, 0};
+    wl_plan_op_t concat = {.op = WL_PLAN_OP_CONCAT};
+    wl_plan_relation_t body = {.ops = &concat, .op_count = 1};
+    col_rel_t *a = composed_source("a", 1, a_values, 4, false);
+    col_rel_t *b = composed_source("b", 1, b_values, 3, false);
+    fixture_t f;
+    composed_fixture(&f, a, 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(!eval_stack_push(stack, a, true));
+    CHECK(!eval_stack_push(stack, b, true));
+    composed_begin(&f, &body, NULL, 0, 2);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(b, &reader));
+
+    for (unsigned turns = 0;
+        !(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+        && f.record.child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED); ++turns) {
+        CHECK(turns < 100000 && f.record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(&f);
+    }
+    CHECK(f.record.child_status.committed && stack->top == 1
+        && stack->items[0].owned && stack->items[0].rel);
+    col_rel_t *published = stack->items[0].rel;
+
+    /* Stop while the committed private result is retained behind an input
+     * reader. Every refusal must preserve that result until the reader goes. */
+    CHECK(!composed_abort_request(&f, 0));
+    for (unsigned retry = 0; retry < 3; ++retry) {
+        composed_action(&f);
+        CHECK(f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && f.record.pending_action ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD);
+        int receipt = f.pending_protocol;
+        CHECK(composed_abort_request(&f, 0) == EBUSY);
+        CHECK(!composed_host_turn(&f, false));
+        CHECK(f.record.protocol_result == receipt
+            && f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+            && f.record.child_status.progress ==
+            WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+            && f.record.child_status.committed
+            && stack->top == 1 && stack->items[0].rel == published
+            && stack->items[0].owned);
+    }
+
+    CHECK(!col_rel_source_reader_release(&reader));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.cursor == 0 && f.record.completed == 0
+        && stack->top == 1 && stack->items[0].rel == published
+        && stack->items[0].owned);
+    CHECK(!composed_host_turn(&f, true));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+        && !f.record.composed_mode && !f.record.identity
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && stack->top == 1 && stack->items[0].rel == published
+        && stack->items[0].owned);
+    f.input = NULL;
+    composed_close(&f);
+}
+
 int
 main(void)
 {
     test_composed_unary_work_limit_cleanup();
     test_composed_concat_work_limit_cleanup();
+    test_composed_concat_stopped_retirement_retry();
     test_composed_private_input_binding();
     test_composed_recursive_terminal_exchange();
     test_composed_lftj_stopped_cleanup();
