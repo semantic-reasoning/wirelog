@@ -6854,6 +6854,11 @@ int wl_columnar_eval_plan_numeric_composed_attempt_step(
 int wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Cooperatively stop a composed source owner without starting pending child
+ * work, publishing output, or consuming an outstanding child receipt. */
+int wl_columnar_eval_plan_numeric_composed_cleanup_source(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 /* Latch a funded abort request without advancing an owner. The next step
 * observes cancellation through each operator's existing cleanup path. */
 int wl_columnar_eval_plan_numeric_composed_abort_request(
@@ -6886,6 +6891,15 @@ int wl_columnar_eval_stack_composed_source_abort(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Validate or perform the result-slot abort after the caller has already
+ * charged one 384-unit host action. Both share the charged wrapper's checks
+ * and preserve the borrowed slot when disposal is refused. */
+int wl_columnar_eval_stack_composed_source_abort_validate(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_abort_funded(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
 int wl_columnar_eval_stack_composed_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
