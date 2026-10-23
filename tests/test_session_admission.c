@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -48,6 +49,9 @@ typedef struct {
     wl_session_t base;
     test_sync_t *sync;
     bool controlled_step_complete;
+    bool controlled_step_retryable;
+    bool controlled_insert_allowed;
+    bool fail_next_insert;
 } fake_session_t;
 
 typedef struct {
@@ -127,6 +131,14 @@ fake_insert(wl_session_t *base, const char *relation, const int64_t *data,
     (void)num_rows;
     (void)num_cols;
     record_operation((fake_session_t *)base, TEST_OP_INSERT);
+    fake_session_t *session = (fake_session_t *)base;
+    if (session->fail_next_insert) {
+        session->fail_next_insert = false;
+        return ENOMEM;
+    }
+    if (session->controlled_step_complete && relation
+        && strcmp(relation, "edge") == 0)
+        session->controlled_step_retryable = true;
     if (fail_unlock_after_insert) {
         fail_unlock_after_insert = false;
         wl_session_testhook_fail_next_admission_unlock();
@@ -174,8 +186,10 @@ fake_step(wl_session_t *base)
         }
         int rc = wl_evaluation_control_finish(base->evaluation_control,
                 base->operation_admission, 0, 0);
-        if (!rc)
+        if (!rc) {
             session->controlled_step_complete = true;
+            session->controlled_step_retryable = false;
+        }
         return rc;
     }
     return 0;
@@ -185,8 +199,25 @@ static wl_controlled_step_state_t
 fake_controlled_step_state(const wl_session_t *base)
 {
     const fake_session_t *session = (const fake_session_t *)base;
-    return session->controlled_step_complete ? WL_CONTROLLED_STEP_COMPLETE
-        : WL_CONTROLLED_STEP_IDLE;
+    if (base->evaluation_control
+        && wl_evaluation_control_active_attempt_id(
+            base->evaluation_control) != 0)
+        return WL_CONTROLLED_STEP_PENDING;
+    if (!session->controlled_step_complete)
+        return WL_CONTROLLED_STEP_IDLE;
+    return session->controlled_step_retryable
+        ? WL_CONTROLLED_STEP_RETRYABLE : WL_CONTROLLED_STEP_COMPLETE;
+}
+
+static bool
+fake_authorize_controlled_insert(const wl_session_t *base,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    const fake_session_t *session = (const fake_session_t *)base;
+    return session->controlled_step_complete
+           && session->controlled_insert_allowed
+           && relation && strcmp(relation, "edge") == 0
+           && num_rows > 0 && num_cols == 2;
 }
 
 static void
@@ -228,6 +259,8 @@ static const wl_compute_backend_t fake_backend = {
     .session_snapshot = fake_snapshot,
     .session_memory_governor = fake_memory_governor,
     .session_controlled_step_state = fake_controlled_step_state,
+    .session_controlled_step_authorize_insert =
+        fake_authorize_controlled_insert,
 };
 
 static void noop_tuple(const char *relation, const int64_t *row,
@@ -645,6 +678,91 @@ done:
 }
 
 static int
+run_controlled_retryable_insert_gate(void)
+{
+    int failures = 0;
+    test_sync_t sync = {0};
+    wl_mutex_init(&sync.mutex);
+    wl_cond_init(&sync.changed);
+    sync.blocked_operation = TEST_OP_COUNT;
+    creation_sync = &sync;
+
+    wl_evaluation_control_t *control = NULL;
+    failures += expect(wl_evaluation_control_create(0, &control) == 0,
+            "create retryable admission control");
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    failures += expect(wl_session_create_with_options(&fake_backend, NULL, 1,
+            &options, &session) == 0,
+            "create retryable fake session");
+    if (!session) goto done;
+
+    failures += expect(wl_session_step(session) == EAGAIN
+            && wl_session_step(session) == 0,
+            "initial controlled STEP reaches completed state");
+    fake_session_t *fake = (fake_session_t *)session;
+    fake->controlled_insert_allowed = true;
+    int64_t edge[] = { 1, 2 };
+    int64_t other[] = { 4, 5 };
+    failures += expect(wl_session_insert(session, "edge", edge, 1, 2) == 0
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_RETRYABLE,
+            "successful edge append keeps restricted retryable admission");
+
+    unsigned insert_calls = sync.calls[TEST_OP_INSERT];
+    failures += expect(wl_session_insert(session, "other", other, 1, 2)
+            == EBUSY
+            && sync.calls[TEST_OP_INSERT] == insert_calls,
+            "non-edge insert is rejected before backend mutation");
+    failures += expect(wl_session_remove(session, "edge", edge, 1, 2)
+            == EBUSY
+            && sync.calls[TEST_OP_REMOVE] == 0,
+            "remove is rejected before backend mutation in retryable state");
+    wirelog_compound_arg_t arg = { .type = WIRELOG_TYPE_INT64, .value = 1 };
+    uint64_t handle = 0;
+    failures += expect(wl_session_make_compound(session, "f", 1, &arg,
+            &handle) == EBUSY
+            && sync.calls[TEST_OP_MAKE_COMPOUND] == 0,
+            "compound creation is rejected before backend mutation");
+    failures += expect(wl_session_snapshot(session, noop_tuple, NULL) == EBUSY,
+            "stale recursive output is not snapshotted while retryable");
+
+    fake->fail_next_insert = true;
+    failures += expect(wl_session_insert(session, "edge", edge, 1, 2)
+            == ENOMEM
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_RETRYABLE,
+            "failed authorized insert leaves retryable backend state unchanged");
+    failures += expect(wl_session_insert(session, "edge", edge, 1, 2) == 0,
+            "another edge append remains eligible after an insert failure");
+
+    failures += expect(wl_session_step(session) == EAGAIN,
+            "successor STEP starts from restricted retryable state");
+    insert_calls = sync.calls[TEST_OP_INSERT];
+    failures += expect(wl_session_insert(session, "edge", edge, 1, 2)
+            == EBUSY
+            && sync.calls[TEST_OP_INSERT] == insert_calls
+            && wl_session_remove(session, "edge", edge, 1, 2) == EBUSY
+            && wl_session_make_compound(session, "f", 1, &arg, &handle)
+            == EBUSY,
+            "pending successor STEP blocks all mutations");
+    failures += expect(wl_session_step(session) == 0
+            && fake_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_COMPLETE,
+            "completed successor STEP restores controlled output state");
+
+    wl_session_destroy(session);
+done:
+    if (control) wl_evaluation_control_release(control);
+    creation_sync = NULL;
+    wl_cond_destroy(&sync.changed);
+    wl_mutex_destroy(&sync.mutex);
+    return failures;
+}
+
+static int
 run_exclusive_attempt_gate(void)
 {
     test_sync_t sync = { 0 };
@@ -828,6 +946,7 @@ main(void)
     failures += run_destroy_race(TEST_OP_STEP, false, true);
     failures += run_destroy_race(TEST_OP_INSERT, true, true);
     failures += run_controlled_step_gate();
+    failures += run_controlled_retryable_insert_gate();
     failures += run_exclusive_attempt_gate();
 #if !defined(_WIN32)
     failures += run_admission_unlock_fail_stop();
