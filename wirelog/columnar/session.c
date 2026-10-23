@@ -72,10 +72,11 @@ typedef enum {
     COL_CONTROLLED_RECURSIVE_RETIRE_OLD_WORKING,
     COL_CONTROLLED_RECURSIVE_RETIRE_CANDIDATE,
     COL_CONTROLLED_RECURSIVE_CHECK_CONVERGENCE,
-    COL_CONTROLLED_RECURSIVE_RELEASE_EDGE,
+    COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER,
     COL_CONTROLLED_RECURSIVE_BUILD_PUBLICATION,
     COL_CONTROLLED_RECURSIVE_COPY_PUBLICATION,
     COL_CONTROLLED_RECURSIVE_PUBLISH,
+    COL_CONTROLLED_RECURSIVE_FINALIZE_COMMITTED,
     COL_CONTROLLED_RECURSIVE_RETIRE_FINAL_WORKING,
     COL_CONTROLLED_RECURSIVE_ABORT,
     COL_CONTROLLED_RECURSIVE_DONE
@@ -121,6 +122,8 @@ typedef struct {
     bool merge_result_taken;
     bool maintenance_active;
     bool edge_held;
+    bool committed;
+    bool postcommit_yielded;
 } col_controlled_recursive_step_t;
 
 struct wl_columnar_controlled_step {
@@ -169,7 +172,22 @@ struct wl_columnar_controlled_step {
     bool refused;
     bool complete;
     bool recursive_route;
+    bool retryable;
+    bool provenance_invalid;
+    bool provenance_valid;
+    col_rel_t *provenance_edge;
+    col_relation_snapshot_t provenance_edge_snapshot;
+    col_relation_snapshot_t provenance_path_snapshot;
 };
+
+static bool col_controlled_step_provenance_current(
+    const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step);
+static void col_controlled_step_record_edge_append(wl_col_session_t *sess,
+    col_rel_t *edge);
+static bool col_session_controlled_step_authorize_insert(
+    const wl_session_t *session, const char *relation, uint32_t num_rows,
+    uint32_t num_cols);
 
 bool
 wl_columnar_session_controlled_batch_authorized(
@@ -4645,6 +4663,60 @@ col_worker_session_destroy(wl_col_session_t *worker)
     return 0;
 }
 
+static bool
+col_controlled_step_provenance_current(const wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!sess || !step || !step->provenance_valid
+        || step->provenance_invalid || !step->provenance_edge
+        || !step->provenance_edge->name
+        || strcmp(step->provenance_edge->name, "edge") != 0
+        || session_find_rel((wl_col_session_t *)sess, "edge")
+        != step->provenance_edge)
+        return false;
+    const col_rel_t *path = session_find_rel((wl_col_session_t *)sess,
+            "path");
+    return path && wl_columnar_relation_snapshot_equal(
+        step->provenance_edge_snapshot,
+        wl_columnar_relation_snapshot(step->provenance_edge))
+           && wl_columnar_relation_snapshot_equal(
+        step->provenance_path_snapshot,
+        wl_columnar_relation_snapshot(path));
+}
+
+static void
+col_controlled_step_record_edge_append(wl_col_session_t *sess, col_rel_t *edge)
+{
+    wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
+    if (!step || !step->complete || !step->recursive_route
+        || !step->provenance_valid || step->provenance_invalid
+        || edge != step->provenance_edge
+        || !edge || session_find_rel(sess, "edge") != edge
+        || !wl_columnar_relation_snapshot_equal(
+            step->provenance_path_snapshot,
+            wl_columnar_relation_snapshot(session_find_rel(sess, "path")))) {
+        if (step) step->provenance_invalid = true;
+        return;
+    }
+    step->provenance_edge_snapshot = wl_columnar_relation_snapshot(edge);
+    step->retryable = true;
+}
+
+static bool
+col_session_controlled_step_authorize_insert(const wl_session_t *session,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    if (!session || !relation || strcmp(relation, "edge") != 0
+        || num_rows == 0 || num_cols != 2)
+        return false;
+    const wl_col_session_t *sess = COL_SESSION((wl_session_t *)session);
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    return step && step->complete && step->recursive_route
+           && !sess->delta_cb && !sess->delta_observer
+           && !sess->delta_publish_active
+           && col_controlled_step_provenance_current(sess, step);
+}
+
 int
 col_session_insert(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
@@ -4667,9 +4739,14 @@ col_session_insert(wl_session_t *session, const char *relation,
     wl_col_session_t *sess = COL_SESSION(session);
     if (sess->plain_step_completion_pending)
         return EBUSY;
-    if (sess->delta_cb != NULL)
-        return col_session_insert_incremental(session, relation, data,
-                   num_rows, num_cols);
+    if (sess->delta_cb != NULL) {
+        int incremental_rc = col_session_insert_incremental(session, relation,
+                data, num_rows, num_cols);
+        if (!incremental_rc && num_rows)
+            col_controlled_step_record_edge_append(sess,
+                session_find_rel(sess, relation));
+        return incremental_rc;
+    }
 
     int cleanup_rc = wl_columnar_session_cleanup_ready_quiescent(
         COL_SESSION(session));
@@ -4710,6 +4787,7 @@ col_session_insert(wl_session_t *session, const char *relation,
     }
 
     session_note_inserted_input(sess, r, false);
+    col_controlled_step_record_edge_append(sess, r);
     /* The non-incremental API must force a full epoch evaluation even when
      * the previous update targeted the same relation. */
     sess->pending_full_input_eval = true;
@@ -4903,6 +4981,7 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
 
     wl_col_session_t *sess = COL_SESSION(session);
     session_note_inserted_input(sess, r, true);
+    col_controlled_step_record_edge_append(sess, r);
     return 0;
 }
 
@@ -6039,11 +6118,17 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
      * fail-closed before opening an attempt. */
     if (plan->stratum_count == 1 && plan->strata[0].is_recursive) {
         const wl_plan_stratum_t *stratum = &plan->strata[0];
+        bool successor = sess->controlled_step
+            && sess->controlled_step->provenance_valid;
         if (stratum->relation_count != 1 || !stratum->relations
-            || sess->nrels != 1
+            || sess->nrels != (successor ? 2u : 1u)
             || !wl_columnar_eval_plan_numeric_recursive_path_supported(
                 &stratum->relations[0]))
             return ENOTSUP;
+        if (successor
+            && !col_controlled_step_provenance_current(sess,
+            sess->controlled_step))
+            return EINVAL;
         col_rel_t *edge = sess->rels ? sess->rels[0] : NULL;
         if (!edge || !edge->name || strcmp(edge->name, "edge") != 0
             || edge->ncols != 2 || edge->timestamps
@@ -6194,7 +6279,8 @@ col_controlled_step_default_preflight_action(wl_col_session_t *sess,
             || (step->cursor_advance_pending
             && step->default_preflight_stratum == step->stratum_index
             && step->default_preflight_relation == step->relation_index)
-            || step->complete;
+            || step->complete
+            || (step->recursive_route && step->provenance_valid);
         if (step->default_preflight_target_found != committed_prefix)
             return ENOTSUP;
         step->default_preflight_phase =
@@ -7172,7 +7258,8 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
 
     if (teardown && !recursive->primary_result)
         recursive->primary_result = WL_EVALUATION_CONTROL_CANCELLED;
-    if (teardown || recursive->phase == COL_CONTROLLED_RECURSIVE_ABORT) {
+    if ((teardown || recursive->phase == COL_CONTROLLED_RECURSIVE_ABORT)
+        && !recursive->committed) {
         if (!recursive->primary_result)
             recursive->primary_result = WL_EVALUATION_CONTROL_CANCELLED;
         int cleanup_rc = col_controlled_recursive_abort_cleanup(sess, step,
@@ -7198,7 +7285,9 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 col_controlled_recursive_fail(recursive, rc);
                 return EAGAIN;
             }
-            if (sess->nrels != 1 || !sess->rels || !sess->rels[0]
+            bool successor = step->provenance_valid;
+            if ((sess->nrels != (successor ? 2u : 1u))
+                || !sess->rels || !sess->rels[0]
                 || !sess->rels[0]->name
                 || strcmp(sess->rels[0]->name, "edge") != 0
                 || sess->rels[0]->ncols != 2 || sess->rels[0]->timestamps
@@ -7538,7 +7627,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 return EAGAIN;
             }
             col_controlled_recursive_maintenance_end(recursive);
-            recursive->phase = COL_CONTROLLED_RECURSIVE_RELEASE_EDGE;
+            recursive->phase = COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER;
             continue;
         }
         case COL_CONTROLLED_RECURSIVE_COPY_FRONTIER:
@@ -7580,9 +7669,8 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             recursive->copy_row = 0;
             recursive->phase = COL_CONTROLLED_RECURSIVE_BEGIN_BODY;
             return EAGAIN;
-        case COL_CONTROLLED_RECURSIVE_RELEASE_EDGE:
+        case COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER:
             rc = col_controlled_recursive_charge(sess, recursive);
-            if (!rc) rc = col_controlled_recursive_release_edge(recursive);
             if (rc == EAGAIN) return EAGAIN;
             if (rc) {
                 col_controlled_recursive_fail(recursive, rc);
@@ -7664,14 +7752,42 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 recursive->registration_prepared = true;
                 return EAGAIN;
             }
+            rc = col_controlled_recursive_charge(sess, recursive);
+            if (!rc) rc = col_controlled_recursive_checkpoint(sess,
+                        recursive,
+                        WL_COLUMNAR_SESSION_TEST_RECURSIVE_BEFORE_COMMIT);
+            if (rc) {
+                col_controlled_recursive_fail(recursive, rc);
+                return EAGAIN;
+            }
             rc = wl_evaluation_control_charge_attempt(control,
                     recursive->operation_id, 0);
             if (rc) {
                 col_controlled_recursive_fail(recursive, rc);
                 return EAGAIN;
             }
+            if (!wl_columnar_relation_snapshot_equal(
+                    recursive->edge_snapshot,
+                    wl_columnar_relation_snapshot(recursive->edge))) {
+                col_controlled_recursive_fail(recursive, EBUSY);
+                return EAGAIN;
+            }
             session_rel_registration_commit(sess, recursive->publication,
                 recursive->registration);
+            step->provenance_edge = recursive->edge;
+            step->provenance_edge_snapshot =
+                wl_columnar_relation_snapshot(recursive->edge);
+            col_rel_t *published_path = session_find_rel(sess, "path");
+            step->provenance_path_snapshot = published_path
+                ? wl_columnar_relation_snapshot(published_path)
+                : (col_relation_snapshot_t){ 0, 0, 0 };
+            step->provenance_valid = recursive->edge && published_path
+                && wl_columnar_relation_snapshot_valid(
+                step->provenance_edge_snapshot)
+                && wl_columnar_relation_snapshot_valid(
+                step->provenance_path_snapshot);
+            step->provenance_invalid = !step->provenance_valid;
+            step->retryable = false;
             free(recursive->registration);
             recursive->registration = NULL;
             recursive->registration_prepared = false;
@@ -7686,6 +7802,28 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 if (sess->rels[i])
                     sess->rels[i]->base_nrows = sess->rels[i]->nrows;
             session_retired_rows_clear(sess);
+            recursive->committed = true;
+            recursive->phase = COL_CONTROLLED_RECURSIVE_FINALIZE_COMMITTED;
+            continue;
+        case COL_CONTROLLED_RECURSIVE_FINALIZE_COMMITTED:
+            if (!recursive->postcommit_yielded) {
+                recursive->postcommit_yielded = true;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_session_test_recursive_step_checkpoint)
+                    wl_columnar_session_test_recursive_step_checkpoint(
+                        control,
+                        WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_COMMIT,
+                        recursive->iterations);
+#endif
+                return EAGAIN;
+            }
+            rc = col_controlled_recursive_release_edge(recursive);
+            if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
+            if (rc) {
+                if (!recursive->primary_result)
+                    recursive->primary_result = rc;
+                return EAGAIN;
+            }
             recursive->phase
                 = COL_CONTROLLED_RECURSIVE_RETIRE_FINAL_WORKING;
             continue;
@@ -7957,9 +8095,37 @@ static int
 col_controlled_step(wl_col_session_t *sess)
 {
     wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (step && step->complete && step->recursive_route)
-        return 0;
-    if (!step || (!step->operation_active && !step->complete)) {
+    bool successor_step = false;
+    if (step && step->complete && step->recursive_route) {
+        if (!step->retryable) {
+            if (col_controlled_step_provenance_current(sess, step))
+                return 0;
+            step->provenance_invalid = true;
+            return EINVAL;
+        }
+        if (!col_controlled_step_provenance_current(sess, step)) {
+            step->provenance_invalid = true;
+            step->retryable = false;
+            return EINVAL;
+        }
+        int preflight_rc = col_controlled_step_static_preflight(sess);
+        if (preflight_rc) return preflight_rc;
+        step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
+        step->default_preflight_plan = NULL;
+        step->default_preflight_registry = NULL;
+        step->default_preflight_registry_count = 0;
+        step->default_preflight_stratum = 0;
+        step->default_preflight_relation = 0;
+        step->default_preflight_op = 0;
+        step->default_preflight_registry_slot = 0;
+        step->default_preflight_name_byte = 0;
+        step->default_preflight_target_found = false;
+        step->complete = false;
+        step->retryable = false;
+        successor_step = true;
+    }
+    if (!successor_step
+        && (!step || (!step->operation_active && !step->complete))) {
         int rc = col_controlled_step_static_preflight(sess);
         if (rc) return rc;
     }
@@ -8017,7 +8183,14 @@ col_session_controlled_step_state(const wl_session_t *session)
     if (sess->cleanup_active || sess->cleanup_pending)
         return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
-    if (step->complete) return WL_CONTROLLED_STEP_COMPLETE;
+    if (step->provenance_invalid
+        || (step->complete && step->recursive_route
+        && step->provenance_valid
+        && !col_controlled_step_provenance_current(sess, step)))
+        return WL_CONTROLLED_STEP_INVALIDATED;
+    if (step->complete)
+        return step->retryable ? WL_CONTROLLED_STEP_RETRYABLE
+            : WL_CONTROLLED_STEP_COMPLETE;
     return step->refused ? WL_CONTROLLED_STEP_IDLE
         : WL_CONTROLLED_STEP_PENDING;
 }
@@ -8820,6 +8993,8 @@ static const wl_compute_backend_t col_backend = {
     .session_budget_denied = wl_columnar_session_budget_denied,
     .session_budget_denial_clear = col_session_budget_denial_clear,
     .session_controlled_step_state = col_session_controlled_step_state,
+    .session_controlled_step_authorize_insert =
+        col_session_controlled_step_authorize_insert,
 };
 
 const wl_compute_backend_t *

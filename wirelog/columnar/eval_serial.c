@@ -281,8 +281,10 @@ wl_columnar_eval_serial_framed_lookup(
     if (rc) return rc;
     if (a != b) {
         ++ctx->registry_slot; ctx->name_byte = 0;
-    } else if (!a) return ENOTSUP;
-    else if (ctx->name_byte == UINT32_MAX) return EOVERFLOW;
+    } else if (!a) {
+        if (!ctx->capture_only) return ENOTSUP;
+        ctx->phase = WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD_BEGIN;
+    }else if (ctx->name_byte == UINT32_MAX)return EOVERFLOW;
     else ++ctx->name_byte;
     return 0;
 }
