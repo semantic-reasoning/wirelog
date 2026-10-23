@@ -231,7 +231,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **394**).
+match the script's count (currently **400**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -1649,7 +1649,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce committed credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_downsize_attempt_advance#7` | token state | `atomic_store_explicit` | release | Publish the downsized token after aggregate credit succeeds |
 
-The complete current atomic-source inventory contains 394 call sites.
+The complete current atomic-source inventory contains 400 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2107,3 +2107,25 @@ work; this slice does not claim a hard cleanup quantum or complete issue #1821.
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Acquire one gate in the ordered set with a single non-spurious transition |
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#3` | `gate->state` | `atomic_load_explicit` | acquire | Read one reader gate before its bounded release transition |
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#4` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Release one gate in reverse order with a single non-spurious transition |
+
+### Resumable reservation retirement
+
+The retirement receipt is bound to its original address and creating thread.
+Every step admits 64 conservative logical work units, below the 256-unit
+evaluation quantum. Begin reads only immutable token identity; a funded step
+claims the expected state before reading mutable payload. Claim and aggregate-
+credit CAS operations are each one-shot strong operations. A failed aggregate
+CAS retains CREDIT authority for a later step; successful credit is followed
+by finite metadata stores and RELEASED publication before the receipt becomes
+DONE. If a stop leaves the receipt holding a claim, its caller preserves that
+receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
+reinitialize the receipt/token while the claim remains held.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `memory_governor.c:wl_columnar_memory_retirement_step` | `token->state` | `atomic_compare_exchange_strong_explicit` | acquire/release | Claim the exact original RESERVED or COMMITTED state once before reading mutable payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#2` | `governor->reserved_bytes` | `atomic_load_explicit` | acquire | Snapshot the aggregate before one separately funded credit CAS |
+| `memory_governor.c:wl_columnar_memory_retirement_step#3` | `token->state` | `atomic_store_explicit` | release | Restore original state after validation rejects a claimed token without refund |
+| `memory_governor.c:wl_columnar_memory_retirement_step#4` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate the expected owner after the state claim protects token payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#5` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Subtract captured credit once; failed contention leaves receipt phase and claim unchanged |
+| `memory_governor.c:wl_columnar_memory_retirement_step#6` | `token->state` | `atomic_store_explicit` | release | Publish RELEASED after credit and token metadata are finalized |

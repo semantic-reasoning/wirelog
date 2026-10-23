@@ -2452,6 +2452,359 @@ test_prepared_growth_refusals(void)
     PASS();
 }
 
+static wl_columnar_memory_reservation_t *retirement_peer;
+static bool retirement_peer_reserved;
+
+static void
+retirement_reserve_peer(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, uint64_t old, bool overflow)
+{
+    (void)control;
+    (void)old;
+    (void)overflow;
+    if (!retirement_peer_reserved) {
+        retirement_peer_reserved = wl_columnar_memory_reserve(governor, 3,
+                retirement_peer);
+    }
+}
+
+typedef struct {
+    wl_columnar_memory_retirement_receipt_t *receipt;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    int step_rc;
+    int ack_rc;
+} retirement_thread_context_t;
+
+static void *
+retirement_wrong_thread(void *opaque)
+{
+    retirement_thread_context_t *context = opaque;
+    context->step_rc = wl_columnar_memory_retirement_step(context->receipt,
+            context->control, context->attempt_id);
+    context->ack_rc = wl_columnar_memory_retirement_acknowledge(
+        context->receipt);
+    return NULL;
+}
+
+static void
+retirement_complete(wl_columnar_memory_retirement_receipt_t *receipt,
+    wl_evaluation_control_t *control)
+{
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(id != 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(receipt->phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_DONE);
+}
+
+static void
+test_resumable_reservation_retirement(void)
+{
+    TEST("resumable reservation retirement and exactly-once credit");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t receipt = { 0 };
+    int owner;
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        11, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt) == 0);
+    wl_evaluation_control_t *control = controlled_begin(192);
+    retirement_complete(&receipt, control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 192);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&governor)
+        == 0 && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED);
+    wl_columnar_memory_retirement_phase_t phase;
+    bool owns_claim;
+    int terminal_status;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_status(&receipt, &phase, &owns_claim,
+        &terminal_status) == 0
+        && phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE && !owns_claim
+        && terminal_status == 0);
+    /* ACK remains receipt-local even after the token address is reused. */
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        4, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&token));
+
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        9, &token) && wl_columnar_memory_commit(&token, &owner));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, &owner,
+        WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED, &receipt) == 0);
+    control = controlled_begin(192);
+    retirement_complete(&receipt, control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 192);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&governor)
+        == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+
+    PASS();
+}
+
+static void
+test_resumable_retirement_authority(void)
+{
+    TEST("retirement receipt rejects copies, wrong thread and stale funding");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t receipt = { 0 };
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        7, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt) == 0);
+    wl_evaluation_control_t *control = controlled_begin(
+        3 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    wl_columnar_memory_retirement_receipt_t copy = receipt;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&copy, control, id) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(receipt.phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM);
+    retirement_thread_context_t context = {
+        .receipt = &receipt, .control = control, .attempt_id = id,
+    };
+    wl_thread_t thread;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_thread_create(&thread,
+        retirement_wrong_thread, &context) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_thread_join(&thread) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(context.step_rc == EINVAL
+        && context.ack_rc == EINVAL && receipt.phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id + 1) ==
+        EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(receipt.phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM
+        && wl_columnar_memory_reserved(&governor) == 7);
+    retirement_complete(&receipt, control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0) == 192);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+
+    /* An exhausted maintenance allowance leaves phase/token untouched. */
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        5, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt) == 0);
+    control = controlled_begin(WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0);
+    int rc = wl_columnar_memory_retirement_step(&receipt, control, id);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED
+        && wl_columnar_memory_reserved(&governor) == 5);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, rc)
+        == WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    control = controlled_begin(2 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0
+        && wl_columnar_memory_retirement_step(&receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0)
+        == 2 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+    PASS();
+}
+
+static void
+test_resumable_retirement_contention(void)
+{
+    TEST("retirement retries one strong credit CAS without double refund");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token, peer;
+    wl_columnar_memory_retirement_receipt_t receipt = { 0 };
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&peer);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        7, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt) == 0);
+    wl_evaluation_control_t *control = controlled_begin(
+        4 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0);
+    retirement_peer = &peer;
+    retirement_peer_reserved = false;
+    wl_columnar_memory_governor_test_before_total_cas =
+        retirement_reserve_peer;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == EAGAIN);
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(retirement_peer_reserved
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED
+        && wl_columnar_memory_reserved(&governor) == 10);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0)
+        == 4 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&governor)
+        == 3 && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&peer));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&governor)
+        == 0);
+    PASS();
+}
+
+static void
+test_resumable_retirement_claim_and_underflow(void)
+{
+    TEST("retirement claim loss is isolated and underflow retains authority");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t first = { 0 }, second = { 0 };
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        5, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &first) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &second) == 0);
+    wl_evaluation_control_t *control = controlled_begin(
+        6 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&first, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&second, control, id) == EBUSY);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(second.phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_FAILED
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED);
+    wl_columnar_memory_retirement_phase_t phase;
+    bool owns_claim;
+    int terminal_status;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_status(&second, &phase, &owns_claim,
+        &terminal_status) == 0
+        && phase == WL_COLUMNAR_MEMORY_RETIREMENT_FAILED && !owns_claim
+        && terminal_status == EBUSY);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&second) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&first, control, id) == 0);
+    atomic_store_explicit(&governor.reserved_bytes, 0, memory_order_release);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&first, control, id) == EOVERFLOW);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(first.phase ==
+        WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED);
+    atomic_store_explicit(&governor.reserved_bytes, 5, memory_order_release);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&first, control, id) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, 0)
+        == 5 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserved(&governor)
+        == 0 && wl_columnar_memory_retirement_acknowledge(&first) == 0);
+    PASS();
+}
+
+static void
+test_resumable_retirement_invalid_shapes(void)
+{
+    TEST("retirement rejects overlap and restores malformed claimed payload");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t receipt = { 0 };
+    int owner;
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        8, &token) && wl_columnar_memory_commit(&token, &owner));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_begin_growth(&token, 2)
+        == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, &owner,
+        WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED, &receipt) == 0);
+    wl_evaluation_control_t *control = controlled_begin(
+        WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == EBUSY
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_FAILED
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_REPLACING);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, EBUSY)
+        == WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_rollback_growth(&token)
+        && wl_columnar_memory_release(&token)
+        && wl_columnar_memory_reserved(&governor) == 0);
+
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_reserve(&governor,
+        5, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        (wl_columnar_memory_retirement_operation_t)99,
+        &receipt) == EINVAL);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!receipt.identity
+        && wl_columnar_memory_reserved(&governor) == 5);
+    token.bytes = 0;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt) == 0);
+    control = controlled_begin(2 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_step(&receipt, control, id) == 0
+        && wl_columnar_memory_retirement_step(&receipt, control, id) == EINVAL
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_FAILED
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && wl_columnar_memory_reserved(&governor) == 5);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(controlled_end(control, EINVAL)
+        == 2 * WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_retirement_acknowledge(&receipt) == 0);
+    token.bytes = 5;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(wl_columnar_memory_rollback(&token)
+        && wl_columnar_memory_reserved(&governor) == 0);
+    PASS();
+}
+
 /* Attempt-bound admission fixtures. Physical storage follows successful
  * admission; a failing API has not allocated incoming storage. Independent
  * peer credit advances at a hook and must survive original-only restoration.
@@ -3145,6 +3498,11 @@ main(void)
     test_prepared_growth_prefixes();
     test_prepared_growth_authority();
     test_prepared_growth_refusals();
+    test_resumable_reservation_retirement();
+    test_resumable_retirement_authority();
+    test_resumable_retirement_contention();
+    test_resumable_retirement_claim_and_underflow();
+    test_resumable_retirement_invalid_shapes();
     test_attempt_admission_raw_twins();
     test_attempt_admission_bootstrap();
     test_attempt_admission_seams();
