@@ -2751,6 +2751,38 @@ protocol bounds its own reservation transitions; it does not bound allocator,
 destructor, physical teardown, overlap/downsize, or merge lifecycle work. Those
 remain separate obligations for the integrating replacement path.
 
+### Managed binary relation construction and retirement (#1821 prerequisite)
+
+`wl_columnar_relation_managed_binary_build_t` constructs an unnamed private
+binary INT64 relation through address-stable, one-action steps. A stopped step
+leaves its cursor and allocations unchanged; the caller may continue the same
+receipt with a fresh live attempt. A terminal allocation failure leaves every
+partial pointer and committed token reachable through `build.relation`, which
+must enter the managed retirement path. The builder reserves and commits one
+retained token for all four payload lanes (two output columns and two merge
+columns), both pointer arrays, row scratch, and the type array before
+allocating those components. The descriptor reservation remains embedded
+until descriptor storage is physically freed.
+
+`wl_columnar_relation_managed_retirement_t` accepts only the narrow private
+shape produced by that builder. It acquires descriptor and storage writer gates
+as one round before inspecting mutable shape. A validation refusal releases
+both gates and changes no ownership. Once the first token detaches, the receipt
+keeps both writer sentinels, detached token slots, receipt addresses, and the
+governor reference stable across every yield. Each physical pointer is freed
+and cleared in its own action. Retained credit is refunded only after all
+accounted arrays and lanes are gone; descriptor credit remains charged until
+the descriptor allocation itself is freed.
+
+The relation gates remain WRITER through descriptor free. The round is armed
+before that free and then consumed by a local-only step that clears only the
+round record; it never reads or releases gate pointers after their relation
+has been reclaimed. Receipt and builder objects are creator-thread-bound and
+must stay at their original addresses. Callers transfer exclusive relation
+lifetime before retirement and must not use outstanding raw pointers after
+that handoff. Allocator/free latency remains a non-preemptible library call;
+the protocol bounds engine work between those calls, not wall-clock time.
+
 ## Persistent unary result replacement
 
 The internal `wl_columnar_eval_stack_unary_*` protocol keeps the original
