@@ -2235,9 +2235,10 @@ attempt_test_managed_retirement_relation(
     uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
     uint32_t build_steps = 0;
     while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
-        && build_steps < 16) {
-        if (wl_columnar_relation_managed_binary_build_step(&build, control,
-            attempt_id) != 0)
+        && build_steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        if (rc != 0 && rc != EAGAIN)
             break;
         build_steps++;
     }
@@ -2286,10 +2287,11 @@ test_managed_binary_builder_resumes_each_allocation_action(void)
     attempt_id = wl_evaluation_control_active_attempt_id(control);
     uint32_t steps = 0;
     while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
-        && steps < 16) {
-        ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
-            attempt_id) == 0,
-            "one funded allocation or initialization action completes");
+        && steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "funded allocation admission or initialization advances");
         steps++;
     }
     ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
@@ -2314,6 +2316,262 @@ test_managed_binary_builder_resumes_each_allocation_action(void)
     }
     ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
         "constructed relation reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_preadmits_large_lanes(void)
+{
+    TEST(
+        "large managed lanes are refused before allocation without enough work");
+
+    int owner = 0;
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(12, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        4096, NULL) == 0,
+        "large builder records its requested lane capacity without allocating it");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    while (build.phase < WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0) {
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+            attempt_id) == 0,
+            "fixed setup actions fit the deliberately small work allowance");
+    }
+    col_rel_t *partial = build.relation;
+    ASSERT(partial && partial->columns && !partial->columns[0]
+        && wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0
+        && partial->columns && !partial->columns[0]
+        && build.allocation_units_remaining == 4096,
+        "capacity-proportional precharge refuses before the large lane allocation");
+    attempt_test_control_destroy(control, &owner,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, partial) == 0,
+        "partial builder ownership remains available for managed retirement");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "funded cleanup retires the partial descriptor");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "all partial constructor storage is retired");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    memset(&build, 0, sizeof(build));
+    memset(&retirement, 0, sizeof(retirement));
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        2, NULL) == 0,
+        "cancellation fixture reaches the allocation admission boundary");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0)
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build,
+            control, attempt_id) == 0,
+            "unlimited work reaches the first lane allocation");
+    uint64_t lane_budget = 2;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &lane_budget) == EAGAIN && lane_budget == 0,
+        "exact lane tariff consumes its quantum and yields before allocation");
+    col_rel_t *cancelled = build.relation;
+    ASSERT(cancelled && cancelled->columns
+        && !cancelled->columns[0],
+        "the fully admitted fresh lane has not been allocated yet");
+    wl_evaluation_control_request_cancel(control);
+    ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == WL_EVALUATION_CONTROL_CANCELLED
+        && !cancelled->columns[0],
+        "cancellation is observed after admission but before allocation");
+    attempt_test_control_destroy(control, &owner,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, cancelled) == 0,
+        "cancelled partial relation remains under managed cleanup");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "cancelled lane admission drains through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "cancelled partial relation reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    memset(&build, 0, sizeof(build));
+    memset(&retirement, 0, sizeof(retirement));
+    control = attempt_test_control_create(20, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        2, NULL) == 0,
+        "exact-limit fixture requests four two-cell backing lanes");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "exact allowance admits each setup and capacity cell");
+        steps++;
+    }
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY,
+        "the exact work allowance completes all four bounded lane allocations");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0,
+        "exact-limit constructor attempt finishes successfully");
+    wl_evaluation_control_report_t report;
+    ASSERT(wl_evaluation_control_report(control, &report) == 0
+        && report.limit == 20 && report.consumed == 20 && report.result == 0,
+        "the allocation tariff consumes its exact documented work");
+    ASSERT(wl_evaluation_control_detach(control, &owner) == 0,
+        "completed constructor control detaches cleanly");
+    wl_evaluation_control_release(control);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, build.relation) == 0,
+        "exact-limit result remains available for managed retirement");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "exact-limit result retires through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "exact-limit result reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_respects_budget_and_attempt_binding(void)
+{
+    TEST("managed lane precharge obeys caller budget and attempt identity");
+
+    int owner = 0, other_owner = 0;
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_evaluation_control_t *other = attempt_test_control_create(0,
+            &other_owner);
+    ASSERT(control && other && wl_evaluation_control_identity(control)
+        != wl_evaluation_control_identity(other),
+        "distinct controls carry distinct process identities");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint64_t other_attempt_id
+        = wl_evaluation_control_active_attempt_id(other);
+    ASSERT(attempt_id == other_attempt_id,
+        "fixture gives separate controls colliding local attempt IDs");
+    ASSERT(wl_columnar_relation_managed_binary_build_begin(&build, 257,
+        NULL) == 0,
+        "large capacity builder starts without allocating lane storage");
+    while (build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0) {
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build,
+            control, attempt_id) == 0,
+            "fixed setup reaches first lane allocation");
+    }
+    uint64_t remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &remaining) == EAGAIN && remaining == 0
+        && build.allocation_units_remaining == 256,
+        "originating control begins partial lane precharge");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        other, other_attempt_id, &remaining) == EINVAL
+        && remaining == 1 && !build.relation->columns[0],
+        "another control with the same attempt ID cannot resume precharge");
+
+    for (uint32_t unit = 1; unit < 257; unit++) {
+        remaining = 1;
+        int rc = wl_columnar_relation_managed_binary_build_step_budgeted(
+            &build, control, attempt_id, &remaining);
+        ASSERT(rc == EAGAIN && remaining == 0
+            && build.allocation_units_remaining == 256u - unit
+            && !build.relation->columns[0],
+            "each one-unit call admits at most one cell and yields before allocation");
+    }
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &remaining) == 0 && remaining == 0
+        && build.relation->columns[0]
+        && build.allocation_control_identity == 0
+        && build.allocation_attempt_id == 0,
+        "same control and attempt resume then separately admit the allocator");
+
+    wl_columnar_relation_managed_binary_build_t successor_build = { 0 };
+    ASSERT(wl_columnar_relation_managed_binary_build_begin(&successor_build,
+        4, NULL) == 0,
+        "successor-attempt fixture begins a second private builder");
+    while (successor_build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0)
+        ASSERT(wl_columnar_relation_managed_binary_build_step(
+                &successor_build, control, attempt_id) == 0,
+            "successor fixture reaches first lane");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(
+            &successor_build, control, attempt_id, &remaining) == EAGAIN
+        && remaining == 0
+        && successor_build.allocation_control_identity
+        == wl_evaluation_control_identity(control),
+        "partial precharge captures its originating attempt");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0
+        && wl_evaluation_control_begin(control, &owner) == 0,
+        "same control advances to a distinct successor attempt");
+    uint64_t successor_attempt_id
+        = wl_evaluation_control_active_attempt_id(control);
+    ASSERT(successor_attempt_id != attempt_id,
+        "control assigns the successor a fresh attempt ID");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(
+            &successor_build, control, successor_attempt_id,
+            &remaining) == EINVAL
+        && remaining == 1 && !successor_build.relation->columns[0],
+        "successor attempt cannot resume prior partial precharge");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        successor_build.relation) == 0,
+        "rejected partial builder remains available for managed retirement");
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, successor_attempt_id) == 0,
+            "managed retirement accepts the successor cleanup attempt");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && retirement.relation == NULL,
+        "rejected builder reaches terminal cleanup without lane allocation");
+
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        build.relation) == 0,
+        "successfully resumed result is also managed-retireable");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, successor_attempt_id) == 0,
+            "constructed result retires through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "constructed result reaches terminal retirement");
+    attempt_test_control_destroy(other, &other_owner, 0);
     attempt_test_control_destroy(control, &owner, 0);
     PASS();
 }
@@ -2347,14 +2605,20 @@ test_managed_binary_builder_partial_allocation_failures_are_retireable(void)
             "start a fresh managed constructor for each fault site");
         uint64_t attempt_id
             = wl_evaluation_control_active_attempt_id(control);
-        while (build.phase != allocation_phases[i])
-            ASSERT(wl_columnar_relation_managed_binary_build_step(&build,
-                control, attempt_id) == 0,
+        while (build.phase != allocation_phases[i]) {
+            int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                    control, attempt_id);
+            ASSERT(rc == 0 || rc == EAGAIN,
                 "advance to the selected physical allocation action");
+        }
 
         wl_columnar_relation_test_constructor_fail_allocation = 1;
-        ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
-            attempt_id) == ENOMEM
+        int allocation_rc = EAGAIN;
+        for (uint32_t allocation_step = 0; allocation_step < 128
+            && allocation_rc == EAGAIN; allocation_step++)
+            allocation_rc = wl_columnar_relation_managed_binary_build_step(
+                &build, control, attempt_id);
+        ASSERT(allocation_rc == ENOMEM
             && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED
             && !wl_columnar_relation_test_constructor_fail_allocation
             && build.relation,
@@ -2899,11 +3163,17 @@ attempt_test_managed_candidate_relation(const int64_t *values,
         rows ? rows : 1u, governor) != 0)
         goto done;
     uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t max_build_steps = 64
+        + ((rows ? rows : 1u) + WL_EVALUATION_CONTROL_QUANTUM - 1u)
+        / WL_EVALUATION_CONTROL_QUANTUM * 4u;
     for (uint32_t i = 0; build.phase
-        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY && i < 16; i++)
-        if (wl_columnar_relation_managed_binary_build_step(&build, control,
-            attempt_id) != 0)
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && i < max_build_steps; i++) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        if (rc != 0 && rc != EAGAIN)
             goto done;
+    }
     if (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
         || !build.relation)
         goto done;
@@ -5200,6 +5470,8 @@ main(void)
     printf("=== test_consolidate_incremental_delta ===\n\n");
 
     test_managed_binary_builder_resumes_each_allocation_action();
+    test_managed_binary_builder_preadmits_large_lanes();
+    test_managed_binary_builder_respects_budget_and_attempt_binding();
     test_managed_binary_builder_partial_allocation_failures_are_retireable();
     test_managed_candidate_terminal_cleanup();
     test_managed_binary_candidate_merge_result_and_funding();
