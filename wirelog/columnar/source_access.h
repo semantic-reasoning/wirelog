@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #define WL_COLUMNAR_SOURCE_ACCESS_WRITER UINT64_MAX
 
@@ -157,6 +158,37 @@ typedef struct wl_columnar_source_access_gate_set_attempt {
     wl_columnar_source_access_gate_set_phase_t phase;
     bool thread_valid;
 } wl_columnar_source_access_gate_set_attempt_t;
+
+#define WL_COLUMNAR_SOURCE_ACCESS_GATE_READER \
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_READER
+#define WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER \
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_MODE_WRITER
+
+typedef struct wl_columnar_source_access_gate_request {
+    wl_columnar_source_access_gate_t *gate;
+    wl_columnar_source_access_gate_mode_t mode;
+} wl_columnar_source_access_gate_request_t;
+
+#define WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX 4u
+
+/* Address-bound, thread-affine receipt for one all-or-release round.  The
+ * caller must initialize it as {0} before its first acquire and keep this
+ * record and every gate at a stable address while held. */
+typedef struct wl_columnar_source_access_gate_round {
+    uintptr_t identity;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    size_t request_count;
+    size_t acquired_count;
+    wl_columnar_source_access_gate_request_t requests
+    [WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX];
+} wl_columnar_source_access_gate_round_t;
 
 static inline bool
 wl_columnar_source_access_gate_set_thread_equal(
@@ -510,7 +542,6 @@ wl_columnar_source_access_growth_gate_attempt_release(
         attempt->phase = WL_COLUMNAR_SOURCE_ACCESS_GROWTH_GATE_DONE;
     return 0;
 }
-
 typedef struct wl_columnar_source_access_cohort_entry {
     wl_columnar_source_access_gate_t *gate;
     uint64_t readers;
@@ -623,6 +654,195 @@ wl_columnar_source_access_writer_thread_equal(
     return token->thread_valid
            && pthread_equal(token->owner_thread, pthread_self()) != 0;
 #endif
+}
+
+static inline bool
+wl_columnar_source_access_gate_round_thread_equal(
+    const wl_columnar_source_access_gate_round_t *round)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return round->thread_valid
+           && thrd_equal(round->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return round->thread_valid
+           && round->owner_thread == GetCurrentThreadId();
+#else
+    return round->thread_valid
+           && pthread_equal(round->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static inline void
+wl_columnar_source_access_gate_round_clear(
+    wl_columnar_source_access_gate_round_t *round)
+{
+    round->identity = 0;
+    round->thread_valid = false;
+    round->request_count = 0;
+    round->acquired_count = 0;
+    for (size_t i = 0; i < WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX; i++) {
+        round->requests[i].gate = NULL;
+        round->requests[i].mode = 0;
+    }
+}
+
+static inline int
+wl_columnar_source_access_gate_round_validate(
+    const wl_columnar_source_access_gate_round_t *round)
+{
+    if (!round || round->identity != (uintptr_t)round
+        || !wl_columnar_source_access_gate_round_thread_equal(round)
+        || !round->request_count
+        || round->request_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        || round->acquired_count > round->request_count)
+        return EINVAL;
+    return 0;
+}
+
+/* Drop exactly the holds recorded in the acquired prefix.  A reader hold
+ * prevents the count from reaching zero or WRITER before its atomic decrement;
+ * an exclusive writer hold prevents any peer from changing the sentinel. */
+static inline void
+wl_columnar_source_access_gate_round_unwind(
+    wl_columnar_source_access_gate_round_t *round)
+{
+    if (wl_columnar_source_access_gate_round_validate(round) != 0)
+        abort();
+    while (round->acquired_count) {
+        size_t index = --round->acquired_count;
+        wl_columnar_source_access_gate_request_t *request
+            = &round->requests[index];
+        uint64_t state = atomic_load_explicit(&request->gate->state,
+                memory_order_acquire);
+        if (request->mode == WL_COLUMNAR_SOURCE_ACCESS_GATE_READER) {
+            if (state == 0 || state == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+                abort();
+            uint64_t prior = (uint64_t)atomic_fetch_sub_explicit(
+                &request->gate->state, 1, memory_order_release);
+            if (prior == 0 || prior == WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+                abort();
+        } else {
+            if (request->mode != WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER
+                || state != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+                abort();
+            atomic_store_explicit(&request->gate->state, 0,
+                memory_order_release);
+        }
+    }
+}
+
+/* Attempt a fixed-size set exactly once.  `round` must be zero-initialized or
+ * have been cleared by a previous failed acquire or successful release.
+ * Requests before descriptor_count
+ * are descriptor gates; remaining requests are storage gates.  The function
+ * sorts each group by uintptr_t gate address and pairs every mode with its gate.
+ * EAGAIN/EOVERFLOW returns only after every acquired hold has been reversed. */
+static inline int
+wl_columnar_source_access_gate_round_acquire(
+    wl_columnar_source_access_gate_round_t *round,
+    const wl_columnar_source_access_gate_request_t *requests,
+    size_t descriptor_count, size_t storage_count)
+{
+    size_t count;
+    if (!round || !requests
+        || descriptor_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        || storage_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        || descriptor_count > WL_COLUMNAR_SOURCE_ACCESS_GATE_ROUND_MAX
+        - storage_count
+        || descriptor_count + storage_count == 0
+        || round->identity || round->thread_valid || round->request_count
+        || round->acquired_count)
+        return EINVAL;
+    count = descriptor_count + storage_count;
+    for (size_t i = 0; i < count; i++) {
+        if (!requests[i].gate
+            || (requests[i].mode != WL_COLUMNAR_SOURCE_ACCESS_GATE_READER
+            && requests[i].mode != WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER))
+            return EINVAL;
+        for (size_t j = 0; j < i; j++)
+            if (requests[i].gate == requests[j].gate)
+                return EINVAL;
+    }
+    round->identity = (uintptr_t)round;
+    round->owner_thread =
+#if defined(WL_HAVE_C11_THREADS)
+        thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+        GetCurrentThreadId();
+#else
+        pthread_self();
+#endif
+    round->thread_valid = true;
+    round->request_count = count;
+    for (size_t i = 0; i < count; i++)
+        round->requests[i] = requests[i];
+    /* Four-entry insertion sort, separately preserving descriptor priority. */
+    for (size_t start = 0; start < count; ) {
+        size_t end = start < descriptor_count ? descriptor_count : count;
+        for (size_t i = start + 1; i < end; i++) {
+            wl_columnar_source_access_gate_request_t item
+                = round->requests[i];
+            size_t j = i;
+            while (j > start
+                && (uintptr_t)round->requests[j - 1].gate
+                > (uintptr_t)item.gate) {
+                round->requests[j] = round->requests[j - 1];
+                j--;
+            }
+            round->requests[j] = item;
+        }
+        start = end;
+    }
+    for (size_t i = 0; i < count; i++) {
+        wl_columnar_source_access_gate_request_t *request
+            = &round->requests[i];
+        uint64_t observed;
+        if (request->mode == WL_COLUMNAR_SOURCE_ACCESS_GATE_READER) {
+            observed = atomic_load_explicit(&request->gate->state,
+                    memory_order_acquire);
+            if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER) {
+                wl_columnar_source_access_gate_round_unwind(round);
+                wl_columnar_source_access_gate_round_clear(round);
+                return EAGAIN;
+            }
+            if (observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u) {
+                wl_columnar_source_access_gate_round_unwind(round);
+                wl_columnar_source_access_gate_round_clear(round);
+                return EOVERFLOW;
+            }
+            if (!atomic_compare_exchange_strong_explicit(&request->gate->state,
+                &observed, observed + 1u, memory_order_acquire,
+                memory_order_relaxed)) {
+                wl_columnar_source_access_gate_round_unwind(round);
+                wl_columnar_source_access_gate_round_clear(round);
+                return observed == WL_COLUMNAR_SOURCE_ACCESS_WRITER - 1u
+                    ? EOVERFLOW : EAGAIN;
+            }
+        } else {
+            observed = 0;
+            if (!atomic_compare_exchange_strong_explicit(&request->gate->state,
+                &observed, WL_COLUMNAR_SOURCE_ACCESS_WRITER,
+                memory_order_acquire, memory_order_relaxed)) {
+                wl_columnar_source_access_gate_round_unwind(round);
+                wl_columnar_source_access_gate_round_clear(round);
+                return EAGAIN;
+            }
+        }
+        round->acquired_count++;
+    }
+    return 0;
+}
+
+static inline int
+wl_columnar_source_access_gate_round_release(
+    wl_columnar_source_access_gate_round_t *round)
+{
+    if (wl_columnar_source_access_gate_round_validate(round) != 0
+        || round->acquired_count != round->request_count)
+        return EINVAL;
+    wl_columnar_source_access_gate_round_unwind(round);
+    wl_columnar_source_access_gate_round_clear(round);
+    return 0;
 }
 
 static inline int
