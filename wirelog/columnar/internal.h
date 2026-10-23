@@ -862,6 +862,10 @@ typedef struct wl_columnar_relation_managed_binary_build {
     wl_columnar_memory_governor_ref_t *governor_ref;
     wl_columnar_relation_managed_binary_build_phase_t phase;
     uint64_t retained_bytes;
+    uint64_t allocation_units_remaining;
+    wl_columnar_relation_managed_binary_build_phase_t allocation_phase;
+    uint64_t allocation_control_identity;
+    uint64_t allocation_attempt_id;
     uint32_t capacity;
     int failure_status;
 } wl_columnar_relation_managed_binary_build_t;
@@ -3172,6 +3176,11 @@ int
 wl_columnar_relation_managed_binary_build_step(
     wl_columnar_relation_managed_binary_build_t *build,
     wl_evaluation_control_t *control, uint64_t expected_attempt_id);
+int
+wl_columnar_relation_managed_binary_build_step_budgeted(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id,
+    uint64_t *remaining);
 /* Caller must transfer exclusive relation lifetime before begin: stop new
  * raw-pointer operations and drain/join existing ones. Keep the descriptor at
  * a stable address until FREE_DESCRIPTOR runs, never dereference it afterward,
@@ -6831,6 +6840,8 @@ int wl_columnar_eval_plan_numeric_private_bindings_get(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t,
     const wl_columnar_eval_private_bindings_t **);
+bool wl_columnar_eval_plan_numeric_recursive_path_supported(
+    const wl_plan_relation_t *);
 int wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
@@ -7043,6 +7054,10 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
     bool controlled_materialized_batch_fallback;
+    const wl_columnar_eval_private_bindings_t *private_bindings;
+    col_rel_t **capture_out;
+    bool capture_only;
+    bool capture_done;
     wl_columnar_session_hash_registry_attempt_t publication;
 } wl_columnar_eval_serial_framed_attempt_t;
 
@@ -7107,6 +7122,11 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t operation_identity;
     /* Frozen authorization from the controlled initial-STEP classifier. */
     bool controlled_materialized_batch_fallback;
+    /* Private body evaluation is authenticated by the address-bound binding
+     * record and captures its materialized result without registry publish. */
+    const wl_columnar_eval_private_bindings_t *private_bindings;
+    bool capture_only;
+    col_rel_t **capture_out;
     wl_columnar_eval_serial_framed_host_action_t action;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     bool previous_valid;
@@ -7144,6 +7164,11 @@ int wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
     uint64_t, bool, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_serial_framed_attempt_begin_bound(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    uint64_t, bool, const wl_columnar_eval_private_bindings_t *, bool,
+    col_rel_t **, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_serial_framed_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -7156,6 +7181,14 @@ int wl_columnar_session_hash_registry_attempt_begin(
     wl_columnar_eval_serial_framed_attempt_t *);
 int wl_columnar_session_hash_registry_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *);
+enum {
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY = 1,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_MERGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_DURING_MERGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_CONVERGENCE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_PRECHARGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED
+};
 #ifdef WL_SESSION_TEST_HOOKS
 typedef struct {
     uint32_t phase;
@@ -7174,6 +7207,8 @@ typedef struct {
     bool entry_charged;
 } wl_columnar_session_test_preflight_state_t;
 extern unsigned wl_columnar_session_test_preflight_quantum;
+extern void (*wl_columnar_session_test_recursive_step_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
 int wl_columnar_session_test_preflight_snapshot(wl_session_t *,
     wl_columnar_session_test_preflight_state_t *);
 /* Fail one controlled STEP funding creation before it reaches the host. */

@@ -4061,10 +4061,15 @@ wl_columnar_managed_candidate_builder_step(
             return rc;
         return 1;
     }
-    rc = wl_columnar_relation_managed_binary_build_step(build,
-            attempt->control, attempt->control_attempt_id);
-    if (rc == 0)
-        (*remaining)--;
+    rc = wl_columnar_relation_managed_binary_build_step_budgeted(build,
+            attempt->control, attempt->control_attempt_id, remaining);
+    if (rc == EAGAIN) {
+        /* The relation builder may spend several bounded slices admitting the
+         * requested lane capacity before issuing one fresh allocation. Yield
+         * the caller's quantum so EAGAIN is treated as progress, not failure. */
+        *remaining = 0;
+        return EAGAIN;
+    }
     return rc;
 }
 
