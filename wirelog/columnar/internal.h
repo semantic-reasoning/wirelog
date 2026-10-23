@@ -6642,6 +6642,10 @@ typedef struct {
     int semantic_result, protocol_result;
     bool retained;
 } wl_columnar_eval_plan_numeric_status_t;
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_plan_test_after_terminal_exchange)(
+    wl_evaluation_control_t *, uint64_t);
+#endif
 
 /* Authenticated name-to-owner overlay for one serialized evaluator attempt.
  * Keys are copied into this address-bound record; relation descriptors stay
