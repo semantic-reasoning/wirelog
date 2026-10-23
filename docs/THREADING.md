@@ -472,7 +472,7 @@ non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | `relaxed` | Clear the source owner after ownership has moved |
 | `memory_governor.c:wl_columnar_memory_reservation_move#7` | `source->state` | `atomic_store_explicit` | `release` | Publish the empty source state after clearing its ownership |
 
-### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation (5 rows)
+### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation and registry admission (9 rows)
 
 Arrangement registry entries embed non-copyable memory reservations. These
 loads validate the reservation state before moving or publishing a token;
@@ -485,6 +485,10 @@ the relocation paths preserve identity and transfer ownership explicitly.
 | `arrangement.c:arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved token before transferring its owner |
 | `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
 | `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
+| `arrangement.c:diff_registry_metadata_begin` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Confirm the committed registry token before reserving entry metadata growth |
+| `arrangement.c:diff_registry_grow` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Validate the committed registry token before beginning an overlapping array growth |
+| `arrangement.c:diff_registry_grow#2` | `pending.state` | `atomic_load_explicit` | `acquire` | Roll back an independently reserved replacement array after allocation failure |
+| `arrangement.c:col_session_free_diff_arrangements` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Choose rollback or release from the token's current ownership state during teardown |
 
 ### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and GC holds (7 rows)
 

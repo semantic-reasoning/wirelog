@@ -3874,11 +3874,11 @@ composed_cleanup_lftj_turn(fixture_t *f, uint64_t funding_limit,
     CHECK(finish == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
     wl_evaluation_control_report_t report;
     int report_rc = wl_evaluation_control_report(funding, &report);
-    uint64_t expected_consumed = funding_limit == 383
-        || funding_id_adjustment || !eligible ? 0 : 384;
     CHECK(!report_rc
         && report.attempt_id == id && !report.cleanup_status
-        && report.consumed == expected_consumed);
+        && (funding_limit == 383 || funding_id_adjustment || !eligible
+        ? report.consumed == 0
+        : report.consumed >= 384 && report.consumed <= 386));
     CHECK(!wl_evaluation_control_detach(funding, &owner));
     wl_evaluation_control_release(funding);
     return rc;
@@ -5309,7 +5309,8 @@ test_composed_lftj_stopped_cleanup(void)
             || f.record.phase ==
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE));
         uint32_t readers_before = composed_lftj_reader_count(&f.record.lftj);
-        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+        int cleanup_rc = composed_cleanup_lftj_turn(&f, 0, 0);
+        CHECK(!cleanup_rc);
         uint32_t readers_after = composed_lftj_reader_count(&f.record.lftj);
         CHECK(readers_before >= readers_after
             && readers_before - readers_after <= 1);

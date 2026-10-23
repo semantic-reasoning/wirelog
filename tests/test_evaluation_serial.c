@@ -2203,7 +2203,7 @@ static void
 test_controlled_recursive_two_join_step(void)
 {
     const int64_t edges[] = {1, 2, 2, 3, 3, 4, 4, 5};
-    const uint64_t expected_work = UINT64_C(2020526);
+    const uint64_t expected_work = UINT64_C(2124014);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
     wl_evaluation_control_t *control = NULL;
@@ -2217,11 +2217,11 @@ test_controlled_recursive_two_join_step(void)
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0 && report.consumed == expected_work);
+
     wl_session_destroy(session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
-
     session = controlled_recursive_two_join_session(edges, 4, &plan,
             &program, &control);
     CHECK(!wl_evaluation_control_configure(control, expected_work - 1));
@@ -2545,7 +2545,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
         && successor_report.attempt_id
         == controlled_recursive_boundary_attempt_id
         && successor_report.result == 0);
-    CHECK(successor_report.consumed == UINT64_C(2998746));
+    CHECK(successor_report.consumed == UINT64_C(3148826));
     const int64_t expected[][2] = {
         { 1, 2 }, { 1, 3 }, { 1, 4 }, { 1, 5 },
         { 2, 3 }, { 2, 4 }, { 2, 5 },
@@ -2579,7 +2579,7 @@ test_controlled_recursive_successor_work_boundaries(void)
 {
     static const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     static const int64_t later_edge[] = { 4, 5 };
-    const uint64_t successor_work = UINT64_C(2998746);
+    const uint64_t successor_work = UINT64_C(3148826);
     wl_plan_t *plan = NULL;
     wirelog_program_t *program = NULL;
     wl_evaluation_control_t *control = NULL;
@@ -2674,8 +2674,9 @@ test_controlled_recursive_successor_stop_preserves_published_path(void)
         && old_path->nrows == 6 && !columnar->cleanup_active
         && !columnar->cleanup_pending);
     snapshot_capture_t stale_capture = {0};
-    CHECK(wl_session_snapshot(session, capture_snapshot_tuple,
-        &stale_capture) == EBUSY);
+    int snapshot_rc = wl_session_snapshot(session, capture_snapshot_tuple,
+            &stale_capture);
+    CHECK(snapshot_rc == ENOTSUP && stale_capture.count == 0);
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == rc);

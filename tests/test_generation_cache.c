@@ -335,7 +335,7 @@ test_generation_consumers(void)
         "adopted sorted probe retained source reader after release");
 
     col_diff_arrangement_t *diff = col_session_get_diff_arrangement(cs,
-            "edge", rel, &key_col, 1);
+            "edge", rel, &key_col, 1, NULL);
     CHECK(diff != NULL, "differential arrangement creation failed");
     CHECK(index_diff_arrangement(diff, rel, &key_col, 1) == 0,
         "differential arrangement initial index failed");
@@ -343,7 +343,8 @@ test_generation_consumers(void)
         "initial differential index incomplete");
     CHECK(col_rel_set(rel, 100, 0, 303) == 0,
         "differential same-nrows mutation failed");
-    diff = col_session_get_diff_arrangement(cs, "edge", rel, &key_col, 1);
+    diff = col_session_get_diff_arrangement(cs, "edge", rel, &key_col, 1,
+            NULL);
     CHECK(diff != NULL && diff->indexed_rows == 0,
         "differential arrangement did not discard stale index");
     CHECK(index_diff_arrangement(diff, rel, &key_col, 1) == 0,
@@ -407,7 +408,7 @@ test_generation_consumers(void)
         "worker clone reused coordinator primary snapshot");
 
     CHECK(col_diff_arr_entries_clone(cs->diff_arr_entries, cs->diff_arr_count,
-        &diff_clone, &diff_clone_cap) == 0 && diff_clone_cap > 0,
+        &diff_clone, &diff_clone_cap, NULL) == 0 && diff_clone_cap > 0,
         "differential arrangement worker clone failed");
     CHECK(diff_clone[0].diff_arr->source_snapshot.relation_identity == 0
         && diff_clone[0].diff_arr->indexed_rows == 0
@@ -435,7 +436,7 @@ test_generation_consumers(void)
         == sizeof(col_diff_arrangement_t) + sizeof(uint32_t),
         "cold differential clone charged copied hash storage");
     col_diff_arrangement_t *worker_diff = col_session_get_diff_arrangement(
-        &worker, "edge", worker_rel, &key_col, 1);
+        &worker, "edge", worker_rel, &key_col, 1, NULL);
     CHECK(worker_diff && wl_columnar_arrangement_diff_txn_begin(&worker,
         "edge", worker_rel, &key_col, 1, &worker_txn) == 0,
         "cold differential transaction failed");

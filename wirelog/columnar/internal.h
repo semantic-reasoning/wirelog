@@ -2016,6 +2016,8 @@ typedef struct {
 /* Differential Arrangement Registry (Issue #263)                           */
 /* ======================================================================== */
 
+#define WL_DIFF_ARR_REGISTRY_INITIAL_CAP 4u
+
 /*
  * col_diff_arr_entry_t: one (rel_name, key_cols) -> diff_arrangement mapping.
  * Stored in the session's flat differential arrangement registry.
@@ -2644,6 +2646,9 @@ typedef struct wl_col_session_t {
     col_diff_arr_entry_t *diff_arr_entries;
     uint32_t diff_arr_count;
     uint32_t diff_arr_cap;
+    wl_columnar_memory_reservation_t diff_arr_registry_reservation;
+    uint64_t diff_arr_registry_reserved_bytes;
+    uint64_t diff_arr_registry_metadata_reserved_bytes;
     uint32_t diff_txn_count;      /* active differential replacement txns */
     /* Session-level differential path master switch (Issue #264).
      * When true, differential operators may be activated based on guard logic.
@@ -4953,7 +4958,7 @@ typedef struct wl_columnar_arrangement_diff_txn {
 col_diff_arrangement_t *
 col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
-    const uint32_t *key_cols, uint32_t key_count);
+    const uint32_t *key_cols, uint32_t key_count, int *status_out);
 void
 wl_columnar_arrangement_diff_reset_state(col_diff_arrangement_t *arr);
 int
@@ -4984,7 +4989,11 @@ col_arr_entries_clone(const col_arr_entry_t *src, uint32_t count,
 /* Issue #274: Deep-copy differential arrangement entries for K-fusion worker isolation. */
 int
 col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
-    col_diff_arr_entry_t **out_entries, uint32_t *out_cap);
+    col_diff_arr_entry_t **out_entries, uint32_t *out_cap,
+    wl_columnar_memory_governor_ref_t *memory_governor);
+int
+col_diff_arr_entries_registry_size(const col_diff_arr_entry_t *src,
+    uint32_t count, uint64_t *array_bytes, uint64_t *metadata_bytes);
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
     uint32_t key_col);
