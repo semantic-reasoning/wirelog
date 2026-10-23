@@ -171,6 +171,48 @@ static void build(bool stepped)
     session_rel_free_hash(&sess);
     for (unsigned i = 0; i < 3; i++) assert(!col_rel_destroy_checked(rels[i]));
 }
+
+static void virtual_missing_head_baseline(void)
+{
+    static const uint32_t column_zero = 0;
+    static const char *const edbs[] = { "input" };
+    static const uint32_t widths[] = { 1 };
+    static const uint32_t type_counts[] = { 1 };
+    static const wirelog_column_type_t int64_types[] = { WIRELOG_TYPE_INT64 };
+    static const wirelog_column_type_t *const types[] = { int64_types };
+    wl_plan_op_t ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_MAP, .project_indices = &column_zero,
+          .project_count = 1 },
+        { .op = WL_PLAN_OP_CONSOLIDATE }
+    };
+    wl_plan_relation_t head = { .name = "head", .ops = ops, .op_count = 3 };
+    wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edbs, .edb_count = 1,
+                       .edb_declared_width = widths,
+                       .edb_column_type_counts = type_counts,
+                       .edb_column_types = types };
+    wl_col_session_t sess = { .plan = &plan, .delta_cb = delta };
+    char missing_head[] = "head";
+    wl_columnar_memory_reservation_init(
+        &sess.delta_observer_retirement_metadata);
+    wl_evaluation_control_t *c = control(0);
+    assert(!wl_columnar_eval_delta_observer_build_start_missing_head(&sess,
+        UINT64_MAX, missing_head));
+    bool ready = false;
+    unsigned calls = 0;
+    while (!ready) {
+        int rc = wl_columnar_eval_delta_observer_build_advance(&sess, c,
+                wl_evaluation_control_active_attempt_id(c), &ready);
+        assert((rc == EAGAIN || (!rc && ready)) && ++calls < 1000);
+    }
+    /* The virtual baseline has observer state but never registers a fake
+     * output relation in the session. Framed evaluation owns that commit. */
+    assert(sess.delta_observer && sess.nrels == 0 && !sess.rels);
+    assert(!wl_columnar_eval_delta_observer_discard(&sess));
+    close_control(c);
+}
 static void byte_order_no_change(bool stepped)
 {
     wl_plan_relation_t heads[2] = { { .name = "head" }, { .name = "head" } };
@@ -670,6 +712,7 @@ int main(void)
 {
     assert(wl_columnar_eval_delta_observer_prepare(NULL) == EINVAL);
     reader_steps(); build(false); build(true);
+    virtual_missing_head_baseline();
     byte_order_no_change(false); byte_order_no_change(true);
     large_reverse_input_is_bounded(); unsupported();
     all_empty_supported_head(); malformed_plan_members();
