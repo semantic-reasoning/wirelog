@@ -824,14 +824,25 @@ All recursive body evaluations, private captures, cumulative union and exact
 new-row delta work use the root STEP control and attempt. Frontier and
 publication relations are built through the managed binary builder, which
 admits each fresh lane's requested cells within the caller quantum before
-allocation. `path` remains absent from the registry until the frontier is
-empty, when one final schemaful relation is published. On cancellation or work
-exhaustion, a separate maintenance control drains child cleanup receipts,
-merge cleanup and managed relation retirement before releasing the edge lease.
-This route handles initial evaluation only: once the session is complete, later
-`STEP` calls are idempotent and do not open another attempt or reevaluate
-mutated inputs. Other recursive plans and repeated evaluation remain
-unsupported, so #1821 still requires additional operator coverage.
+allocation. On initial evaluation, `path` remains absent from the registry
+until the frontier is empty, when one final schemaful relation is published.
+On a completed route, positive two-column appends to the registered `edge`
+relation through `wl_session_insert` are the only mutations admitted. Their
+relation snapshot is recorded only after the complete append succeeds. A later
+controlled `STEP` recomputes the closure privately and replaces `path` only
+after convergence; snapshots and mutations remain gated while that attempt is
+pending. The edge reader lease remains held through replacement registration
+preparation, a final edge snapshot check, and the registry commit. A stop before
+that commit drains child cleanup receipts before releasing the lease. The
+prepared registration, merge state and managed private relations are then
+cleaned while the session remains pending and supported mutations stay gated;
+the previous `path` remains registered for retry. Commit is the publication
+point: afterward the new `path` is authoritative, and lease release plus final
+private retirement resume as pending cleanup without publishing again. If
+relation storage changes outside the admitted append path, the route is
+invalidated and neither stale `path` snapshots nor further appends are
+admitted. Other recursive plans and mutation shapes remain unsupported, so
+#1821 still requires additional operator coverage.
 
 When a composed attempt owns an LFTJ child at the moment its original
 operation control latches cancellation or work-limit, the internal
@@ -1535,14 +1546,16 @@ cancellation. Output cells and B2 append work contribute between pair
 checkpoints, so this fixture measurement is not a general source tariff.
 
 Supported serial nonrecursive STEP now uses the bounded default proof described
-above. STEP still rejects recursive plans and unsupported whole-session routes
-before evaluation; controlled SNAPSHOT remains unsupported. TDD/multiworker,
-differential, and whole controlled observer delivery remain outside this slice.
+above. The single-relation INT64 reachability STEP described above is the only
+recursive route admitted; other recursive plans and unsupported whole-session
+routes are rejected before evaluation. Controlled SNAPSHOT remains unsupported.
+TDD/multiworker, differential, and whole controlled observer delivery remain
+outside this slice.
 Raw references and coverage for those routes remain, with this split:
 
 | Former whole controlled expectation | Replacement or remaining scope |
 |---|---|
-| STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive/observer routes remain fail-closed |
+| STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive and observer routes remain fail-closed |
 | STEP observer cutoff and retry | Raw observer reference and unchanged-state refusal coverage; whole controlled observer delivery/resume remains deferred |
 | Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence | Raw evaluating/stable references and direct lower quiescent/reclaimer checks; whole controlled snapshot bookkeeping/precedence remains deferred |
 
@@ -1628,10 +1641,10 @@ is retained and a fresh attempt completes READY without committing twice.
 This is still a preparation primitive, not whole-plan observer delivery or
 callback scheduling, and does not complete #1821 acceptance coverage.
 
-Whole-plan observer delivery, recursive STEP, and other unsupported controlled
-execution paths remain disabled. The controlled initial single-rule STEP
-entrypoint is documented above; this increment does not claim complete #1821
-coverage or enable unrestricted public dispatch.
+Whole-plan observer delivery and other unsupported controlled execution paths
+remain disabled. The restricted recursive reachability route and controlled
+single-rule STEP entrypoint are documented above; this increment does not claim
+complete #1821 coverage or enable unrestricted public dispatch.
 
 ### Managed binary candidate union and novel delta (#1821 increment)
 
