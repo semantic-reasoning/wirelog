@@ -2248,7 +2248,9 @@ test_recursive_model_parity_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('recursive_model_parity', test_recursive_model_parity_exe)
+# This matrix runs several optimizer and worker configurations; its CPU time
+# can exceed Meson's default when the full suite is heavily parallelized.
+test('recursive_model_parity', test_recursive_model_parity_exe, timeout: 120)
 
 # ============================================================================
 # RDF Named-Graph Integration Tests (Issue #535)
