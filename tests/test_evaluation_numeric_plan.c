@@ -4418,6 +4418,7 @@ reject_composed_recursive_manifest(const wl_plan_relation_t *original,
             f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
     composed_run(&f);
     CHECK(f.record.semantic_result == ENOTSUP
+        && !f.record.completed
         && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
     composed_close(&f);
 }
@@ -4560,6 +4561,14 @@ test_composed_recursive_terminal_exchange(void)
     CHECK(f.record.semantic_result == ENOTSUP
         && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
     composed_close(&f);
+
+    /* Moving EXCHANGE ahead of terminal CONSOLIDATE is rejected during
+    * preflight, before any operator completes or changes the stack. */
+    memcpy(changed_ops, path->ops, sizeof(changed_ops));
+    wl_plan_op_t misplaced_exchange = changed_ops[6];
+    changed_ops[6] = changed_ops[5];
+    changed_ops[5] = misplaced_exchange;
+    reject_composed_recursive_manifest(path, changed_ops, names, relations);
 
     /* Every behavior-bearing operator field is pinned, not merely the final
      * EXCHANGE descriptor. Changed MAP and JOIN metadata reject preflight. */
