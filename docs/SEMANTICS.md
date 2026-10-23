@@ -1557,3 +1557,19 @@ Whole-plan observer delivery, recursive STEP, and other unsupported controlled
 execution paths remain disabled. The controlled initial single-rule STEP
 entrypoint is documented above; this increment does not claim complete #1821
 coverage or enable unrestricted public dispatch.
+
+### Managed binary candidate union and novel delta (#1821 increment)
+
+The internal managed candidate merge accepts unnamed, private binary INT64
+relations without schema, ledger, or delta-baseline metadata. It requires a canonical sorted source; the candidate may
+arrive unsorted and contain duplicates. The result is the numerically sorted,
+distinct union of both inputs, and the delta contains exactly the union rows not
+present in the original source. Neither input changes. The replacement and
+delta are transferred together exactly once; until then both remain private.
+
+The operation is resumable under one shared attempt allowance and a maximum of
+64 charged comparison, copy, builder, or state actions per advance. A terminal
+stop before transfer retains every partial allocation and gate until charged
+maintenance cleanup completes. This is a restricted internal preparation
+primitive; it does not activate unsupported evaluator routes or satisfy all of
+issue #1821.

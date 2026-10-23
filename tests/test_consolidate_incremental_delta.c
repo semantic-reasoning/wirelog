@@ -2879,10 +2879,422 @@ attempt_test_int64_relation_width(const int64_t *values, uint32_t count,
     return rel;
 }
 
+static void
+attempt_test_managed_candidate_relation_destroy(col_rel_t *relation)
+{
+    if (relation)
+        (void)col_rel_destroy_checked(relation);
+}
+
+static col_rel_t *
+attempt_test_managed_candidate_relation(const int64_t *values,
+    uint32_t rows, bool canonical, wl_columnar_memory_governor_ref_t *governor)
+{
+    int owner = 0;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    col_rel_t *relation = NULL;
+
+    if (!control || wl_columnar_relation_managed_binary_build_begin(&build,
+        rows ? rows : 1u, governor) != 0)
+        goto done;
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    for (uint32_t i = 0; build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY && i < 16; i++)
+        if (wl_columnar_relation_managed_binary_build_step(&build, control,
+            attempt_id) != 0)
+            goto done;
+    if (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        || !build.relation)
+        goto done;
+    relation = build.relation;
+    for (uint32_t row = 0; row < rows; row++)
+        for (uint32_t column = 0; column < 2; column++)
+            relation->columns[column][row] = values[2u * row + column];
+    relation->nrows = rows;
+    relation->sorted_nrows = canonical ? rows : 0;
+    relation->run_count = rows ? 1u : 0u;
+    if (rows)
+        relation->run_ends[0] = rows;
+    if (wl_evaluation_control_finish(control, &owner, 0, 0) != 0) {
+        attempt_test_managed_candidate_relation_destroy(relation);
+        relation = NULL;
+        goto done;
+    }
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    return relation;
+
+done:
+    if (build.relation && build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY)
+        attempt_test_managed_candidate_relation_destroy(build.relation);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    return NULL;
+}
+
 static col_rel_t *
 attempt_test_int64_relation(const int64_t *values, uint32_t count)
 {
     return attempt_test_int64_relation_width(values, count, 1);
+}
+
+static bool
+attempt_test_managed_candidate_case(uint64_t quantum, uint64_t *work_out,
+    const int64_t *source_values, uint32_t source_rows,
+    const int64_t *candidate_values, uint32_t candidate_rows,
+    const int64_t *expected_union, uint32_t expected_union_rows,
+    const int64_t *expected_delta, uint32_t expected_delta_rows)
+{
+    int owner = 0, maintenance_owner = 0;
+    wl_columnar_memory_governor_ref_t *governor
+        = test_ts_governor_create(16u << 20);
+    wl_evaluation_control_t *control = attempt_test_control_create(0,
+            &owner);
+    wl_evaluation_control_t *maintenance = NULL;
+    col_rel_t *legacy = attempt_test_int64_relation_width(source_values,
+            source_rows, 2);
+    col_rel_t *legacy_delta = test_rel_alloc(2);
+    col_rel_t *source = attempt_test_managed_candidate_relation(source_values,
+            source_rows, true, governor);
+    col_rel_t *candidate = attempt_test_managed_candidate_relation(
+        candidate_values, candidate_rows, false, governor);
+    col_rel_t *replacement = NULL, *delta = NULL;
+    wl_columnar_managed_candidate_merge_t attempt = { 0 };
+    bool ok = false;
+    int rc = 0;
+
+    if (!governor || !control || !legacy || !legacy_delta || !source
+        || !candidate) {
+        goto done;
+    }
+    int legacy_fast = -1;
+    if (col_op_consolidate_incremental_delta(legacy, 0, NULL,
+        &legacy_fast) != 0 || legacy_fast != 1)
+        goto done;
+    uint32_t legacy_source_rows = legacy->nrows;
+    for (uint32_t row = 0; row < candidate_rows; row++)
+        if (test_rel_append_row(legacy,
+            &candidate_values[2u * row]) != 0)
+            goto done;
+    if (col_op_consolidate_incremental_delta(legacy, legacy_source_rows,
+        legacy_delta, &legacy_fast) != 0)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_begin(&attempt, source,
+            candidate, control,
+            wl_evaluation_control_active_attempt_id(control));
+    if (rc != 0) {
+        goto done;
+    }
+    col_relation_snapshot_t source_before
+        = wl_columnar_relation_snapshot(source);
+    col_relation_snapshot_t candidate_before
+        = wl_columnar_relation_snapshot(candidate);
+    uint32_t slices = 0;
+    while (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        && slices++ < 10000) {
+        rc = wl_columnar_managed_candidate_merge_advance(&attempt, quantum);
+        if (rc != 0 && rc != EAGAIN)
+            goto done;
+    }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || !wl_columnar_relation_snapshot_equal(source_before,
+        wl_columnar_relation_snapshot(source))
+        || !wl_columnar_relation_snapshot_equal(candidate_before,
+        wl_columnar_relation_snapshot(candidate))
+        || wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != 0)
+        goto done;
+    if (!replacement || replacement->nrows != expected_union_rows
+        || !delta || delta->nrows != expected_delta_rows)
+        goto done;
+    for (uint32_t i = 0; i < expected_union_rows; i++)
+        if (!attempt_test_pair_is(replacement, i, expected_union[2 * i],
+            expected_union[2 * i + 1]))
+            goto done;
+    for (uint32_t i = 0; i < expected_delta_rows; i++)
+        if (!attempt_test_pair_is(delta, i, expected_delta[2 * i],
+            expected_delta[2 * i + 1]))
+            goto done;
+    if (legacy->nrows != replacement->nrows
+        || legacy_delta->nrows != delta->nrows)
+        goto done;
+    for (uint32_t i = 0; i < replacement->nrows; i++)
+        if (!attempt_test_pair_is(legacy, i,
+            replacement->columns[0][i], replacement->columns[1][i]))
+            goto done;
+    for (uint32_t i = 0; i < delta->nrows; i++)
+        if (!attempt_test_pair_is(legacy_delta, i,
+            delta->columns[0][i], delta->columns[1][i]))
+            goto done;
+    if (wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != EINVAL)
+        goto done;
+    if (wl_evaluation_control_finish(control, &owner, 0, 0) != 0)
+        goto done;
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(control, &report) != 0)
+        goto done;
+    if (work_out)
+        *work_out = report.consumed;
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    uint64_t maintenance_id
+        = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0) {
+            goto done;
+        }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || replacement->nrows != expected_union_rows
+        || delta->nrows != expected_delta_rows
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    control = attempt_test_control_create(0, &owner);
+    if (!control || wl_columnar_managed_candidate_merge_begin(&attempt,
+        source, candidate, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0)
+        goto done;
+    wl_evaluation_control_request_cancel(control);
+    if (wl_columnar_managed_candidate_merge_advance(&attempt, 1)
+        != WL_EVALUATION_CONTROL_CANCELLED
+        || attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        || !attempt.input_gates.identity)
+        goto done;
+    attempt_test_control_destroy(control, &owner, 0);
+    control = NULL;
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    maintenance_id = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 16; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    ok = true;
+
+done:
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (attempt.identity
+        && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) {
+        if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+            && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+            (void)wl_columnar_managed_candidate_merge_abort(&attempt);
+        if (!maintenance)
+            maintenance = attempt_test_control_create(0,
+                    &maintenance_owner);
+        if (maintenance) {
+            uint64_t maintenance_id
+                = wl_evaluation_control_active_attempt_id(maintenance);
+            for (uint32_t i = 0; attempt.phase
+                != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+                if (wl_columnar_managed_candidate_merge_cleanup_step(
+                        &attempt, maintenance, maintenance_id) != 0)
+                    break;
+            if (attempt.phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+                (void)wl_columnar_managed_candidate_merge_ack(&attempt);
+        }
+    }
+    if (maintenance)
+        attempt_test_control_destroy(maintenance, &maintenance_owner, 0);
+    test_rel_free(delta);
+    test_rel_free(replacement);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    test_rel_free(legacy_delta);
+    test_rel_free(legacy);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return ok;
+}
+
+static void
+test_managed_candidate_terminal_cleanup(void)
+{
+    TEST(
+        "managed candidate work exhaustion retains gates through cleanup (#1821)");
+    const int64_t values[] = { 1, 1 };
+    int owner = 0, maintenance_owner = 0;
+    wl_evaluation_control_t *control = attempt_test_control_create(2, &owner);
+    wl_evaluation_control_t *maintenance = NULL;
+    col_rel_t *source = attempt_test_managed_candidate_relation(values, 1,
+            true, NULL);
+    col_rel_t *candidate = attempt_test_managed_candidate_relation(values, 1,
+            false, NULL);
+    col_rel_t *replacement = NULL, *delta = NULL;
+    wl_columnar_managed_candidate_merge_t attempt = { 0 };
+    bool ok = false;
+    int rc = 0;
+
+    if (!control || !source || !candidate)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_begin(&attempt, source,
+            candidate, control,
+            wl_evaluation_control_active_attempt_id(control));
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_advance(&attempt, 1);
+    if (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+        || attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        || attempt.terminal_status != WL_EVALUATION_CONTROL_WORK_LIMIT
+        || !attempt.input_gates.identity)
+        goto done;
+    attempt_test_control_destroy(control, &owner, 0);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    uint64_t maintenance_id
+        = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 16; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    control = attempt_test_control_create(0, &owner);
+    if (!control || wl_columnar_managed_candidate_merge_begin(&attempt,
+        source, candidate, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0)
+        goto done;
+    uint32_t slices = 0;
+    while (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        && slices++ < 10000) {
+        rc = wl_columnar_managed_candidate_merge_advance(&attempt, 1);
+        if (rc != 0 && rc != EAGAIN)
+            goto done;
+    }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != 0
+        || !replacement || replacement->nrows != 1
+        || !attempt_test_pair_is(replacement, 0, 1, 1)
+        || !delta || delta->nrows != 0
+        || wl_evaluation_control_finish(control, &owner, 0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    maintenance_id = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+    ok = true;
+
+done:
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (attempt.identity && attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) {
+        if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+            && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+            (void)wl_columnar_managed_candidate_merge_abort(&attempt);
+        if (!maintenance)
+            maintenance = attempt_test_control_create(0,
+                    &maintenance_owner);
+        if (maintenance) {
+            uint64_t maintenance_id
+                = wl_evaluation_control_active_attempt_id(maintenance);
+            for (uint32_t i = 0; attempt.phase
+                != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+                if (wl_columnar_managed_candidate_merge_cleanup_step(
+                        &attempt, maintenance, maintenance_id) != 0)
+                    break;
+            if (attempt.phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+                (void)wl_columnar_managed_candidate_merge_ack(&attempt);
+        }
+    }
+    if (maintenance)
+        attempt_test_control_destroy(maintenance, &maintenance_owner, 0);
+    test_rel_free(delta);
+    test_rel_free(replacement);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    ASSERT(ok, "a stopped candidate keeps ownership until charged cleanup");
+    PASS();
+}
+
+static void
+test_managed_binary_candidate_merge_result_and_funding(void)
+{
+    TEST(
+        "managed binary candidate merge transfers union and delta once (#1821)");
+    const int64_t source[] = { 1, 1, 2, 1 };
+    const int64_t candidate[] = { 3, 0, 1, 1, 2, 2, 3, 0 };
+    const int64_t expected_union[] = { 1, 1, 2, 1, 2, 2, 3, 0 };
+    const int64_t expected_delta[] = { 2, 2, 3, 0 };
+    uint64_t one_unit_work = 0, wide_work = 0;
+    ASSERT(attempt_test_managed_candidate_case(1, &one_unit_work, source, 2,
+        candidate, 4, expected_union, 4, expected_delta, 2),
+        "one-action slices preserve both inputs and transfer valid outputs");
+    ASSERT(attempt_test_managed_candidate_case(64, &wide_work, source, 2,
+        candidate, 4, expected_union, 4, expected_delta, 2),
+        "wide slices produce the same managed merge result");
+    ASSERT(one_unit_work == wide_work,
+        "quantum size does not change original-attempt work accounting");
+    const int64_t overlap[] = { 1, 1, 2, 1, 2, 1 };
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, source, 2,
+        overlap, 3, source, 2, NULL, 0),
+        "duplicate candidate rows already in the source produce empty delta");
+    const int64_t signed_source[] = { -9, 1, 2, 0 };
+    const int64_t signed_candidates[] = { 0, 7, -10, 3, -9, 1 };
+    const int64_t signed_union[] = { -10, 3, -9, 1, 0, 7, 2, 0 };
+    const int64_t signed_delta[] = { -10, 3, 0, 7 };
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, signed_source, 2,
+        signed_candidates, 3, signed_union, 4, signed_delta, 2),
+        "signed INT64 candidates use numeric row ordering");
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0),
+        "empty binary relations produce canonical empty outputs");
+    PASS();
 }
 
 static void
@@ -4789,6 +5201,8 @@ main(void)
 
     test_managed_binary_builder_resumes_each_allocation_action();
     test_managed_binary_builder_partial_allocation_failures_are_retireable();
+    test_managed_candidate_terminal_cleanup();
+    test_managed_binary_candidate_merge_result_and_funding();
     test_managed_relation_retirement_fixed_components();
     test_managed_relation_retirement_refunds_detached_tokens();
     test_managed_relation_retirement_resumes_claimed_credit();

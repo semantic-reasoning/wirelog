@@ -3754,6 +3754,891 @@ wl_columnar_merge_incremental_delta_attempt_abort(col_rel_t *source,
     return 0;
 }
 
+/* Managed binary candidate merge (#1821). This is a private immutable-input
+* path; the legacy in-place attempt above retains its original semantics. */
+static int
+wl_columnar_managed_candidate_charge(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t *remaining)
+{
+    int rc;
+
+    if (!attempt || !remaining || !attempt->control
+        || !attempt->control_attempt_id)
+        return EINVAL;
+    if (*remaining == 0)
+        return EAGAIN;
+    rc = wl_evaluation_control_charge_attempt(attempt->control,
+            attempt->control_attempt_id, 1);
+    if (rc == 0)
+        (*remaining)--;
+    return rc;
+}
+
+static int
+wl_columnar_managed_candidate_charge_maintenance(
+    wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    if (!control || !attempt_id)
+        return EINVAL;
+    return wl_evaluation_control_charge_attempt(control, attempt_id, 1);
+}
+
+static void
+wl_columnar_managed_candidate_terminal(
+    wl_columnar_managed_candidate_merge_t *attempt, int status)
+{
+    if (!attempt || status == 0 || status == EAGAIN)
+        return;
+    if (!attempt->terminal_status)
+        attempt->terminal_status = status;
+    attempt->control = NULL;
+    attempt->control_attempt_id = 0;
+    if (attempt->phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+        attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP;
+}
+
+static bool
+wl_columnar_managed_candidate_input_shape(const col_rel_t *relation,
+    bool require_sorted)
+{
+    if (!relation || !relation->relation_identity || relation->name
+        || relation->ncols != 2
+        || (relation->declared_ncols != 0
+        && relation->declared_ncols != 2)
+        || relation->nrows > relation->capacity
+        || relation->base_nrows
+        || relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || relation->pool_owned || relation->arena_owned
+        || relation->mem_ledger || relation->pool_name_reserved_bytes
+        || relation->col_shared || relation->timestamps
+        || relation->ledger_ts_bytes
+        || relation->retract_backup_columns
+        || relation->retract_backup_timestamps
+        || relation->retract_backup_timestamp_capacity
+        || relation->retract_backup_nrows
+        || relation->retract_backup_base_nrows
+        || relation->retract_backup_capacity
+        || relation->retract_backup_sorted_nrows
+        || relation->retract_backup_run_count
+        || relation->schema_ok || relation->col_names
+        || relation->has_graph_column
+        || relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || relation->compound_count || relation->compound_arity_len
+        || relation->compound_arity_map || relation->inline_physical_offset
+        || relation->dedup_slots || relation->dedup_cap
+        || relation->dedup_count || relation->dedup_reserved_bytes
+        || relation->metadata_reserved_bytes
+        || col_rel_storage_alias_borrow_count(relation) != 0
+        || (require_sorted && relation->sorted_nrows != relation->nrows)
+        || (relation->column_types
+        && (relation->column_types[0] != WIRELOG_TYPE_INT64
+        || relation->column_types[1] != WIRELOG_TYPE_INT64)))
+        return false;
+    if (relation->nrows
+        && (!relation->columns || !relation->columns[0]
+        || !relation->columns[1]))
+        return false;
+    return true;
+}
+
+int
+wl_columnar_managed_candidate_merge_begin(
+    wl_columnar_managed_candidate_merge_t *attempt, col_rel_t *source,
+    const col_rel_t *candidate, wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id)
+{
+    wl_columnar_source_access_gate_request_t requests[4];
+    uint64_t capacity;
+    int rc;
+
+    if (!attempt || attempt->identity || !source || !candidate
+        || source == candidate || !control || !expected_attempt_id)
+        return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(control,
+            expected_attempt_id, 0);
+    if (rc != 0)
+        return rc;
+    memset(attempt, 0, sizeof(*attempt));
+    attempt->identity = (uintptr_t)attempt;
+    attempt->source = source;
+    attempt->candidate = candidate;
+    attempt->control = control;
+    attempt->control_attempt_id = expected_attempt_id;
+    requests[0] = (wl_columnar_source_access_gate_request_t){
+        &source->descriptor_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_READER
+    };
+    requests[1] = (wl_columnar_source_access_gate_request_t){
+        (wl_columnar_source_access_gate_t *)&candidate->descriptor_access,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_READER
+    };
+    requests[2] = (wl_columnar_source_access_gate_request_t){
+        &source->source_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_READER
+    };
+    requests[3] = (wl_columnar_source_access_gate_request_t){
+        (wl_columnar_source_access_gate_t *)&candidate->source_access,
+        WL_COLUMNAR_SOURCE_ACCESS_GATE_READER
+    };
+    rc = wl_evaluation_control_charge_attempt(control,
+            expected_attempt_id, 1);
+    if (rc == 0)
+        rc = wl_columnar_source_access_gate_round_acquire(
+            &attempt->input_gates, requests, 2, 2);
+    if (rc != 0) {
+        memset(attempt, 0, sizeof(*attempt));
+        return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(control,
+            expected_attempt_id, 1);
+    if (rc != 0)
+        goto invalid;
+    if (!wl_columnar_managed_candidate_input_shape(source, true)
+        || !wl_columnar_managed_candidate_input_shape(candidate, false)
+        || source->memory_governor != candidate->memory_governor) {
+        rc = ENOTSUP;
+        goto invalid;
+    }
+    if ((uint64_t)source->nrows + candidate->nrows > UINT32_MAX) {
+        rc = EOVERFLOW;
+        goto invalid;
+    }
+    capacity = (uint64_t)source->nrows + candidate->nrows;
+    attempt->source_rows = source->nrows;
+    attempt->candidate_rows = candidate->nrows;
+    attempt->input_rows = (uint32_t)capacity;
+    attempt->capacity = capacity ? (uint32_t)capacity : 1u;
+    attempt->source_snapshot = wl_columnar_relation_snapshot(source);
+    attempt->candidate_snapshot = wl_columnar_relation_snapshot(candidate);
+    attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_REPLACEMENT;
+    return 0;
+
+invalid:
+    if (wl_columnar_source_access_gate_round_release(
+            &attempt->input_gates) != 0)
+        rc = EINVAL;
+    memset(attempt, 0, sizeof(*attempt));
+    return rc;
+}
+
+static int
+wl_columnar_managed_candidate_validate_live(
+    wl_columnar_managed_candidate_merge_t *attempt)
+{
+    if (!attempt || attempt->identity != (uintptr_t)attempt
+        || !attempt->source || !attempt->candidate
+        || attempt->source == attempt->candidate
+        || !wl_columnar_source_access_gate_round_thread_equal(
+            &attempt->input_gates)
+        || wl_columnar_source_access_gate_round_validate(
+            &attempt->input_gates) != 0
+        || attempt->input_gates.request_count != 4
+        || !wl_columnar_relation_snapshot_equal(attempt->source_snapshot,
+        wl_columnar_relation_snapshot(attempt->source))
+        || !wl_columnar_relation_snapshot_equal(attempt->candidate_snapshot,
+        wl_columnar_relation_snapshot(attempt->candidate)))
+        return EINVAL;
+    return 0;
+}
+
+static void
+wl_columnar_managed_candidate_copy_cell(col_rel_t *destination,
+    const col_rel_t *source, uint32_t source_row, uint32_t destination_row,
+    uint32_t column)
+{
+    destination->columns[column][destination_row]
+        = source->columns[column][source_row];
+}
+
+static int
+wl_columnar_managed_candidate_compare_cell(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t *remaining,
+    const int64_t *left0, const int64_t *left1, uint32_t left_row,
+    const int64_t *right0, const int64_t *right1, uint32_t right_row,
+    uint32_t *column, int *out_cmp)
+{
+    int rc;
+
+    while (*column < 2) {
+        rc = wl_columnar_managed_candidate_charge(attempt, remaining);
+        if (rc != 0)
+            return rc;
+        int64_t left = (*column == 0 ? left0 : left1)[left_row];
+        int64_t right = (*column == 0 ? right0 : right1)[right_row];
+        if (left < right) {
+            *out_cmp = -1;
+            *column = 0;
+            return 0;
+        }
+        if (left > right) {
+            *out_cmp = 1;
+            *column = 0;
+            return 0;
+        }
+        (*column)++;
+    }
+    *column = 0;
+    *out_cmp = 0;
+    return 0;
+}
+
+static int
+wl_columnar_managed_candidate_search_step(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t *remaining,
+    const col_rel_t *rows, uint32_t row, bool *done)
+{
+    const col_rel_t *source = attempt->source;
+    int rc;
+
+    *done = false;
+    if (!attempt->search_active) {
+        rc = wl_columnar_managed_candidate_charge(attempt, remaining);
+        if (rc != 0)
+            return rc;
+        attempt->search_low = 0;
+        attempt->search_high = attempt->source_rows;
+        attempt->search_column = 0;
+        attempt->search_active = true;
+        attempt->search_found = false;
+        if (attempt->search_high == 0) {
+            attempt->search_active = false;
+            *done = true;
+        }
+        return 0;
+    }
+    if (attempt->search_low >= attempt->search_high) {
+        rc = wl_columnar_managed_candidate_charge(attempt, remaining);
+        if (rc != 0)
+            return rc;
+        attempt->search_active = false;
+        *done = true;
+        return 0;
+    }
+    attempt->search_mid = attempt->search_low
+        + (attempt->search_high - attempt->search_low) / 2u;
+    uint32_t column = attempt->search_column;
+    int cmp = 0;
+    rc = wl_columnar_managed_candidate_compare_cell(attempt, remaining,
+            rows->columns[0], rows->columns[1], row,
+            source->columns[0], source->columns[1], attempt->search_mid,
+            &column, &cmp);
+    if (rc != 0) {
+        attempt->search_column = column;
+        return rc;
+    }
+    attempt->search_column = column;
+    if (cmp == 0) {
+        attempt->search_found = true;
+        attempt->search_active = false;
+        *done = true;
+    } else {
+        if (cmp < 0)
+            attempt->search_high = attempt->search_mid;
+        else
+            attempt->search_low = attempt->search_mid + 1u;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_managed_candidate_builder_step(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t *remaining,
+    wl_columnar_relation_managed_binary_build_t *build, uint32_t capacity)
+{
+    int rc;
+
+    if (*remaining == 0)
+        return EAGAIN;
+    if (build->identity == 0) {
+        rc = wl_columnar_managed_candidate_charge(attempt, remaining);
+        if (rc != 0)
+            return rc;
+        return wl_columnar_relation_managed_binary_build_begin(build,
+                   capacity, attempt->source->memory_governor);
+    }
+    if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY) {
+        rc = wl_columnar_managed_candidate_charge(attempt, remaining);
+        if (rc != 0)
+            return rc;
+        return 1;
+    }
+    rc = wl_columnar_relation_managed_binary_build_step(build,
+            attempt->control, attempt->control_attempt_id);
+    if (rc == 0)
+        (*remaining)--;
+    return rc;
+}
+
+int
+wl_columnar_managed_candidate_merge_advance(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t quantum)
+{
+    uint64_t remaining = quantum < WL_EVALUATION_CONTROL_QUANTUM
+        ? quantum : WL_EVALUATION_CONTROL_QUANTUM;
+    int rc;
+
+    if (!attempt || attempt->identity != (uintptr_t)attempt)
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || attempt->phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+        return 0;
+    if (attempt->phase == WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        || attempt->phase == WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+        return attempt->terminal_status ? attempt->terminal_status : EBUSY;
+    rc = wl_columnar_managed_candidate_validate_live(attempt);
+    if (rc != 0) {
+        wl_columnar_managed_candidate_terminal(attempt, rc);
+        return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(attempt->control,
+            attempt->control_attempt_id, 0);
+    if (rc != 0) {
+        wl_columnar_managed_candidate_terminal(attempt, rc);
+        return rc;
+    }
+
+    for (;;) {
+        col_rel_t *replacement = attempt->replacement_build.relation;
+        col_rel_t *scratch = attempt->scratch_build.relation;
+        col_rel_t *delta = attempt->delta_build.relation;
+        switch (attempt->phase) {
+        case WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_REPLACEMENT:
+            rc = wl_columnar_managed_candidate_builder_step(attempt,
+                    &remaining, &attempt->replacement_build,
+                    attempt->capacity);
+            if (rc == 1) {
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_SCRATCH;
+                continue;
+            }
+            if (rc != 0)
+                goto stop;
+            continue;
+        case WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_SCRATCH:
+            rc = wl_columnar_managed_candidate_builder_step(attempt,
+                    &remaining, &attempt->scratch_build, attempt->capacity);
+            if (rc == 1) {
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_COPY_SOURCE;
+                continue;
+            }
+            if (rc != 0)
+                goto stop;
+            continue;
+        case WL_COLUMNAR_MANAGED_CANDIDATE_COPY_SOURCE:
+        case WL_COLUMNAR_MANAGED_CANDIDATE_COPY_CANDIDATE: {
+            bool copying_source = attempt->phase
+                == WL_COLUMNAR_MANAGED_CANDIDATE_COPY_SOURCE;
+            const col_rel_t *input = copying_source ? attempt->source
+                : attempt->candidate;
+            uint32_t input_rows = copying_source ? attempt->source_rows
+                : attempt->candidate_rows;
+            if (attempt->copy_row >= input_rows) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->copy_row = 0;
+                if (copying_source)
+                    attempt->phase
+                        = WL_COLUMNAR_MANAGED_CANDIDATE_COPY_CANDIDATE;
+                else {
+                    replacement->nrows = attempt->input_rows;
+                    attempt->sort_width = 1;
+                    attempt->sort_left = 0;
+                    attempt->sort_mid = 0;
+                    attempt->sort_right = 0;
+                    attempt->sort_source_scratch = false;
+                    attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_SORT;
+                }
+                continue;
+            }
+            rc = wl_columnar_managed_candidate_charge(attempt, &remaining);
+            if (rc != 0)
+                goto stop;
+            wl_columnar_managed_candidate_copy_cell(replacement, input,
+                attempt->copy_row, copying_source ? attempt->copy_row
+                : attempt->source_rows + attempt->copy_row,
+                attempt->copy_column);
+            attempt->copy_column++;
+            if (attempt->copy_column == 2) {
+                attempt->copy_column = 0;
+                attempt->copy_row++;
+            }
+            continue;
+        }
+        case WL_COLUMNAR_MANAGED_CANDIDATE_SORT: {
+            if (attempt->input_rows < 2) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->dedup_read = 0;
+                attempt->dedup_write = 0;
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_DEDUP;
+                continue;
+            }
+            if (attempt->sort_left >= attempt->input_rows) {
+                uint32_t prior_width = attempt->sort_width;
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->sort_source_scratch =
+                    !attempt->sort_source_scratch;
+                attempt->sort_left = 0;
+                attempt->sort_mid = 0;
+                attempt->sort_right = 0;
+                if (prior_width >= attempt->input_rows - prior_width) {
+                    if (attempt->sort_source_scratch) {
+                        int64_t **columns = replacement->columns;
+                        replacement->columns = scratch->columns;
+                        scratch->columns = columns;
+                        attempt->sort_source_scratch = false;
+                    }
+                    attempt->dedup_read = 0;
+                    attempt->dedup_write = 0;
+                    attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_DEDUP;
+                } else {
+                    attempt->sort_width = prior_width * 2u;
+                }
+                continue;
+            }
+            if (attempt->sort_right == 0) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                uint64_t mid = (uint64_t)attempt->sort_left
+                    + attempt->sort_width;
+                uint64_t right = (uint64_t)attempt->sort_left
+                    + 2u * attempt->sort_width;
+                attempt->sort_mid = mid < attempt->input_rows
+                    ? (uint32_t)mid : attempt->input_rows;
+                attempt->sort_right = right < attempt->input_rows
+                    ? (uint32_t)right : attempt->input_rows;
+                attempt->sort_i = attempt->sort_left;
+                attempt->sort_j = attempt->sort_mid;
+                attempt->sort_out = attempt->sort_left;
+                attempt->sort_selected = false;
+                continue;
+            }
+            if (attempt->sort_out >= attempt->sort_right) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->sort_left = attempt->sort_right;
+                attempt->sort_mid = 0;
+                attempt->sort_right = 0;
+                continue;
+            }
+            int64_t **from = attempt->sort_source_scratch
+                ? scratch->columns : replacement->columns;
+            int64_t **to = attempt->sort_source_scratch
+                ? replacement->columns : scratch->columns;
+            if (!attempt->sort_selected) {
+                if (attempt->sort_i >= attempt->sort_mid) {
+                    rc = wl_columnar_managed_candidate_charge(attempt,
+                            &remaining);
+                    if (rc != 0)
+                        goto stop;
+                    attempt->sort_selected_row = attempt->sort_j++;
+                    attempt->sort_selected = true;
+                    attempt->sort_copy_column = 0;
+                    continue;
+                }
+                if (attempt->sort_j >= attempt->sort_right) {
+                    rc = wl_columnar_managed_candidate_charge(attempt,
+                            &remaining);
+                    if (rc != 0)
+                        goto stop;
+                    attempt->sort_selected_row = attempt->sort_i++;
+                    attempt->sort_selected = true;
+                    attempt->sort_copy_column = 0;
+                    continue;
+                }
+                int cmp = 0;
+                uint32_t compare_column = attempt->sort_compare_column;
+                rc = wl_columnar_managed_candidate_compare_cell(attempt,
+                        &remaining, from[0], from[1], attempt->sort_i,
+                        from[0], from[1], attempt->sort_j, &compare_column,
+                        &cmp);
+                attempt->sort_compare_column = compare_column;
+                if (rc != 0)
+                    goto stop;
+                if (cmp != 0 || compare_column == 0) {
+                    attempt->sort_selected_row = cmp <= 0
+                        ? attempt->sort_i++ : attempt->sort_j++;
+                    attempt->sort_selected = true;
+                    attempt->sort_copy_column = 0;
+                }
+                continue;
+            }
+            rc = wl_columnar_managed_candidate_charge(attempt, &remaining);
+            if (rc != 0)
+                goto stop;
+            to[attempt->sort_copy_column][attempt->sort_out]
+                = from[attempt->sort_copy_column][attempt->sort_selected_row];
+            attempt->sort_copy_column++;
+            if (attempt->sort_copy_column == 2) {
+                attempt->sort_copy_column = 0;
+                attempt->sort_selected = false;
+                attempt->sort_out++;
+            }
+            continue;
+        }
+        case WL_COLUMNAR_MANAGED_CANDIDATE_DEDUP: {
+            if (attempt->dedup_read >= attempt->input_rows) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                replacement->nrows = attempt->dedup_write;
+                replacement->sorted_nrows = attempt->dedup_write;
+                replacement->run_count = attempt->dedup_write ? 1u : 0u;
+                if (attempt->dedup_write)
+                    replacement->run_ends[0] = attempt->dedup_write;
+                attempt->novel_count = 0;
+                attempt->search_row = 0;
+                attempt->search_active = false;
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_COUNT_NOVEL;
+                continue;
+            }
+            if (attempt->dedup_read == 0) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->dedup_read = 1;
+                attempt->dedup_write = 1;
+                continue;
+            }
+            if (attempt->dedup_copy_active) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                replacement->columns[attempt->dedup_copy_column]
+                [attempt->dedup_write]
+                    = replacement->columns[attempt->dedup_copy_column]
+                    [attempt->dedup_read];
+                if (++attempt->dedup_copy_column == 2) {
+                    attempt->dedup_copy_column = 0;
+                    attempt->dedup_copy_active = false;
+                    attempt->dedup_write++;
+                    attempt->dedup_read++;
+                }
+                continue;
+            }
+            uint32_t compare_column = attempt->dedup_compare_column;
+            int cmp = 0;
+            rc = wl_columnar_managed_candidate_compare_cell(attempt,
+                    &remaining, replacement->columns[0],
+                    replacement->columns[1], attempt->dedup_read,
+                    replacement->columns[0], replacement->columns[1],
+                    attempt->dedup_write - 1u, &compare_column, &cmp);
+            attempt->dedup_compare_column = compare_column;
+            if (rc != 0)
+                goto stop;
+            if (cmp == 0) {
+                attempt->dedup_read++;
+            } else if (attempt->dedup_write != attempt->dedup_read) {
+                attempt->dedup_copy_active = true;
+                attempt->dedup_copy_column = 0;
+            } else {
+                attempt->dedup_write++;
+                attempt->dedup_read++;
+            }
+            continue;
+        }
+        case WL_COLUMNAR_MANAGED_CANDIDATE_COUNT_NOVEL: {
+            if (attempt->search_row >= replacement->nrows) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_DELTA;
+                continue;
+            }
+            bool done = false;
+            rc = wl_columnar_managed_candidate_search_step(attempt,
+                    &remaining, replacement, attempt->search_row, &done);
+            if (rc != 0)
+                goto stop;
+            if (done) {
+                if (!attempt->search_found)
+                    attempt->novel_count++;
+                attempt->search_row++;
+            }
+            continue;
+        }
+        case WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_DELTA:
+            rc = wl_columnar_managed_candidate_builder_step(attempt,
+                    &remaining, &attempt->delta_build,
+                    attempt->novel_count ? attempt->novel_count : 1u);
+            if (rc == 1) {
+                attempt->emit_row = 0;
+                attempt->emit_write = 0;
+                attempt->search_active = false;
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_EMIT_DELTA;
+                continue;
+            }
+            if (rc != 0)
+                goto stop;
+            continue;
+        case WL_COLUMNAR_MANAGED_CANDIDATE_EMIT_DELTA: {
+            if (attempt->emit_row >= replacement->nrows) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                delta->nrows = attempt->emit_write;
+                delta->sorted_nrows = attempt->emit_write;
+                delta->run_count = attempt->emit_write ? 1u : 0u;
+                if (attempt->emit_write)
+                    delta->run_ends[0] = attempt->emit_write;
+                attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_READY;
+                return remaining ? 0 : EAGAIN;
+            }
+            if (attempt->emit_column != 0) {
+                rc = wl_columnar_managed_candidate_charge(attempt,
+                        &remaining);
+                if (rc != 0)
+                    goto stop;
+                delta->columns[attempt->emit_column - 1u]
+                [attempt->emit_write]
+                    = replacement->columns[attempt->emit_column - 1u]
+                    [attempt->emit_row];
+                attempt->emit_column++;
+                if (attempt->emit_column == 3) {
+                    attempt->emit_column = 0;
+                    attempt->emit_write++;
+                    attempt->emit_row++;
+                    attempt->search_active = false;
+                }
+                continue;
+            }
+            bool done = false;
+            rc = wl_columnar_managed_candidate_search_step(attempt,
+                    &remaining, replacement, attempt->emit_row, &done);
+            if (rc != 0)
+                goto stop;
+            if (done) {
+                if (!attempt->search_found)
+                    attempt->emit_column = 1;
+                else {
+                    attempt->emit_row++;
+                    attempt->search_active = false;
+                }
+            }
+            continue;
+        }
+        default:
+            return EINVAL;
+        }
+    }
+
+stop:
+    if (rc == EAGAIN && remaining == 0)
+        return EAGAIN;
+    wl_columnar_managed_candidate_terminal(attempt, rc);
+    return rc;
+}
+
+static bool
+wl_columnar_managed_candidate_ranges_overlap(uintptr_t left, size_t left_size,
+    uintptr_t right, size_t right_size)
+{
+    if (!left || !right || left > UINTPTR_MAX - left_size
+        || right > UINTPTR_MAX - right_size)
+        return true;
+    return left < right + right_size && right < left + left_size;
+}
+
+int
+wl_columnar_managed_candidate_merge_take_result(
+    wl_columnar_managed_candidate_merge_t *attempt,
+    col_rel_t **replacement_out, col_rel_t **delta_out)
+{
+    uintptr_t slots[2];
+    uintptr_t protected[6];
+    size_t protected_sizes[6];
+    int rc;
+
+    if (!attempt || attempt->identity != (uintptr_t)attempt
+        || attempt->phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || attempt->result_transferred || !replacement_out || !delta_out
+        || replacement_out == delta_out || *replacement_out || *delta_out)
+        return EINVAL;
+    slots[0] = (uintptr_t)replacement_out;
+    slots[1] = (uintptr_t)delta_out;
+    protected[0] = (uintptr_t)attempt;
+    protected[1] = (uintptr_t)attempt->source;
+    protected[2] = (uintptr_t)attempt->candidate;
+    protected[3] = (uintptr_t)attempt->replacement_build.relation;
+    protected[4] = (uintptr_t)attempt->scratch_build.relation;
+    protected[5] = (uintptr_t)attempt->delta_build.relation;
+    protected_sizes[0] = sizeof(*attempt);
+    protected_sizes[1] = sizeof(*attempt->source);
+    protected_sizes[2] = sizeof(*attempt->candidate);
+    protected_sizes[3] = sizeof(*attempt->replacement_build.relation);
+    protected_sizes[4] = sizeof(*attempt->scratch_build.relation);
+    protected_sizes[5] = sizeof(*attempt->delta_build.relation);
+    if (wl_columnar_managed_candidate_ranges_overlap(slots[0],
+        sizeof(*replacement_out), slots[1], sizeof(*delta_out)))
+        return EINVAL;
+    for (size_t i = 0; i < 6; i++)
+        if (protected[i]
+            && (wl_columnar_managed_candidate_ranges_overlap(slots[0],
+            sizeof(*replacement_out), protected[i], protected_sizes[i])
+            || wl_columnar_managed_candidate_ranges_overlap(slots[1],
+            sizeof(*delta_out), protected[i], protected_sizes[i])))
+            return EINVAL;
+    rc = wl_columnar_managed_candidate_validate_live(attempt);
+    if (rc != 0) {
+        wl_columnar_managed_candidate_terminal(attempt, rc);
+        return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(attempt->control,
+            attempt->control_attempt_id, 0);
+    if (rc != 0) {
+        wl_columnar_managed_candidate_terminal(attempt, rc);
+        return rc;
+    }
+    *replacement_out = attempt->replacement_build.relation;
+    *delta_out = attempt->delta_build.relation;
+    attempt->replacement_build.relation = NULL;
+    attempt->delta_build.relation = NULL;
+    attempt->result_transferred = true;
+    attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP;
+    attempt->cleanup_index = 0;
+    return 0;
+}
+
+int
+wl_columnar_managed_candidate_merge_abort(
+    wl_columnar_managed_candidate_merge_t *attempt)
+{
+    if (!attempt || attempt->identity != (uintptr_t)attempt
+        || attempt->phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || attempt->result_transferred)
+        return EINVAL;
+    if (attempt->phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP) {
+        if (!attempt->terminal_status)
+            attempt->terminal_status = ECANCELED;
+        attempt->control = NULL;
+        attempt->control_attempt_id = 0;
+        attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP;
+        attempt->cleanup_index = 0;
+    }
+    return 0;
+}
+
+int
+wl_columnar_managed_candidate_merge_cleanup_step(
+    wl_columnar_managed_candidate_merge_t *attempt,
+    wl_evaluation_control_t *maintenance_control,
+    uint64_t maintenance_attempt_id)
+{
+    wl_columnar_relation_managed_binary_build_t *builds[3];
+    int rc;
+
+    if (!attempt || attempt->identity != (uintptr_t)attempt
+        || (attempt->phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        && attempt->phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+        || !wl_columnar_source_access_gate_round_thread_equal(
+            &attempt->input_gates))
+        return EINVAL;
+    builds[0] = &attempt->replacement_build;
+    builds[1] = &attempt->scratch_build;
+    builds[2] = &attempt->delta_build;
+    if (attempt->cleanup_index >= 3) {
+        rc = wl_columnar_managed_candidate_charge_maintenance(
+            maintenance_control, maintenance_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_source_access_gate_round_release(
+            &attempt->input_gates);
+        if (rc != 0)
+            return rc;
+        attempt->phase = WL_COLUMNAR_MANAGED_CANDIDATE_DONE;
+        return 0;
+    }
+    wl_columnar_relation_managed_binary_build_t *build
+        = builds[attempt->cleanup_index];
+    if (!build->relation) {
+        rc = wl_columnar_managed_candidate_charge_maintenance(
+            maintenance_control, maintenance_attempt_id);
+        if (rc != 0)
+            return rc;
+        attempt->cleanup_index++;
+        return 0;
+    }
+    wl_columnar_relation_managed_retirement_t *retirement
+        = &attempt->retirements[attempt->cleanup_index];
+    if (!attempt->retirement_started[attempt->cleanup_index]) {
+        rc = wl_columnar_managed_candidate_charge_maintenance(
+            maintenance_control, maintenance_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_relation_managed_retirement_begin(retirement,
+                build->relation);
+        if (rc != 0)
+            return rc;
+        attempt->retirement_started[attempt->cleanup_index] = true;
+        return 0;
+    }
+    if (retirement->phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE) {
+        rc = wl_columnar_managed_candidate_charge_maintenance(
+            maintenance_control, maintenance_attempt_id);
+        if (rc != 0)
+            return rc;
+        build->relation = NULL;
+        attempt->cleanup_index++;
+        return 0;
+    }
+    rc = wl_columnar_relation_managed_retirement_step(retirement,
+            maintenance_control, maintenance_attempt_id);
+    if (rc == 0 && retirement->phase ==
+        WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE) {
+        build->relation = NULL;
+        attempt->cleanup_index++;
+    }
+    return rc;
+}
+
+int
+wl_columnar_managed_candidate_merge_status(
+    const wl_columnar_managed_candidate_merge_t *attempt,
+    wl_columnar_managed_candidate_phase_t *phase, int *terminal_status)
+{
+    if (!attempt || attempt->identity != (uintptr_t)attempt || !phase
+        || !terminal_status)
+        return EINVAL;
+    *phase = attempt->phase;
+    *terminal_status = attempt->terminal_status;
+    return 0;
+}
+
+int
+wl_columnar_managed_candidate_merge_ack(
+    wl_columnar_managed_candidate_merge_t *attempt)
+{
+    if (!attempt || attempt->identity != (uintptr_t)attempt
+        || attempt->phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || attempt->input_gates.identity || attempt->replacement_build.relation
+        || attempt->scratch_build.relation || attempt->delta_build.relation)
+        return EINVAL;
+    for (size_t i = 0; i < 3; i++)
+        if ((attempt->retirement_started[i]
+            && attempt->retirements[i].phase
+            != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE)
+            || (!attempt->retirement_started[i]
+            && attempt->retirements[i].identity))
+            return EINVAL;
+    memset(attempt, 0, sizeof(*attempt));
+    return 0;
+}
+
 /* --- Private original-attempt scalar CONCAT (#1821) --- */
 enum {
     WL_COLUMNAR_MERGE_CONCAT_WORK = 192,
