@@ -954,6 +954,7 @@ test_retraction_registry_pointer_admission(void)
         = wl_columnar_memory_governor_ref_create(&resolution);
     col_rel_t *edb = col_rel_new_auto("edb", 1);
     col_rel_t *retraction = col_rel_new_auto("$r$edb", 1);
+    col_rel_t *stale_candidate = NULL;
     if (!ref || !edb || !retraction
         || col_rel_append_row(edb, (int64_t[]){ 42 }) != 0) {
         if (edb) col_rel_destroy(edb);
@@ -981,6 +982,19 @@ test_retraction_registry_pointer_admission(void)
     edb = NULL;
     sess.nrels = 1;
     col_rel_t **original = sess.rels;
+    stale_candidate = col_rel_new_auto("edb", 1);
+    RETRACTION_CHECK(stale_candidate != NULL,
+        "stale-head candidate allocation failed");
+    RETRACTION_CHECK(wl_columnar_session_test_register_expected_head(&sess,
+        stale_candidate, sess.rels[0], sess.rels[0]->relation_identity + 1,
+        sess.rels[0]->view_generation, sess.rels[0]->storage_generation,
+        true) == EINVAL
+        && sess.rels == original && sess.nrels == 1
+        && sess.rels[0]->columns[0][0] == 42
+        && wl_columnar_memory_reserved(governor) == one,
+        "stale expected head was accepted or changed the registry");
+    col_rel_destroy(stale_candidate);
+    stale_candidate = NULL;
     atomic_store_explicit(&governor->usable_bytes, one + two - 1u,
         memory_order_release);
     RETRACTION_CHECK(wl_columnar_session_test_register_retraction(&sess,
@@ -1025,6 +1039,7 @@ cleanup:
             col_rel_destroy(sess.rels[i]);
     col_rel_destroy(edb);
     col_rel_destroy(retraction);
+    col_rel_destroy(stale_candidate);
     free(sess.rels);
     if (atomic_load_explicit(&sess.rels_reservation.state,
         memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)

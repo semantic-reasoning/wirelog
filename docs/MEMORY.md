@@ -873,6 +873,21 @@ through retry and callback delivery. Relation replacement does not invalidate
 this baseline; changed arity yields old removals and new additions with their
 respective row widths.
 
+For the controlled observed successor STEP, recomputation uses a separate
+registered private target while the old public output remains in the session
+registry. Observer preparation reads that private target through an explicit
+output override and retains the public output name in its signed events. After
+all preparation and callback work are funded, the private target is detached,
+renamed and prepared as a replacement. A successful registration commit is the
+publication boundary; before it, cancellation, work limits and replacement
+refusal leave the old output authoritative. The detached candidate and prepared
+events remain owned for retry or teardown, and only the commit path replaces
+the old relation. This narrow internal route does not change the broader
+whole-step transaction semantics described below.
+The host admits at most three relation registry slots for this route. It charges
+candidate-slot scanning, name copying and replacement preparation before the
+final poll; once replacement preparation succeeds, commit has no fallible work.
+
 Evaluation failures retain the original observer baseline and affected mask.
 After evaluation succeeds, the transaction remembers that phase, so compaction
 or event-staging failure retries completion without rerunning evaluation. Final

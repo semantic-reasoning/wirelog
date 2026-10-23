@@ -131,6 +131,13 @@ struct wl_columnar_controlled_step {
     wl_evaluation_control_t *previous_funding;
     uint64_t operation_id, operation_identity;
     uint64_t previous_funding_id;
+    uint64_t successor_input_identity, successor_input_view_generation;
+    uint64_t successor_input_storage_generation;
+    uint64_t successor_head_identity, successor_head_view_generation;
+    uint64_t successor_head_storage_generation;
+    size_t successor_rename_name_bytes_charged;
+    uint32_t successor_candidate_scan_index;
+    uint32_t successor_registration_scan_charged;
     uint32_t stratum_index;
     uint32_t relation_index;
     uint32_t preflight_op;
@@ -163,6 +170,11 @@ struct wl_columnar_controlled_step {
     bool default_preflight_target_found;
     bool default_preflight_entry_charged;
     bool cursor_advance_pending;
+    char *successor_private_name;
+    col_rel_t *successor_candidate;
+    wl_columnar_source_access_reader_t successor_input_reader;
+    wl_plan_relation_t successor_relation;
+    wl_plan_op_t successor_ops[3];
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
@@ -180,6 +192,10 @@ struct wl_columnar_controlled_step {
     col_relation_snapshot_t provenance_edge_snapshot;
     col_relation_snapshot_t provenance_path_snapshot;
     bool observed;
+    bool successor_mutation_seen;
+    bool successor_attempt;
+    bool successor_candidate_detached;
+    bool successor_candidate_renamed;
     bool baseline_ready;
     bool observer_preparing;
     bool observer_prepare_discard;
@@ -221,6 +237,9 @@ unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 size_t wl_columnar_session_test_observer_precharged_events;
+void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
+void (*wl_columnar_session_test_successor_registry_charge)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
 #endif
 
 static int wl_columnar_session_controlled_step_drain_for_destroy(
@@ -2239,6 +2258,28 @@ session_rel_registration_discard(session_rel_registration_t *registration)
     session_rel_registration_init(registration);
 }
 
+/* Return success only after the prepared retirement token belongs to the
+ * expected public head generation.  Callers can then commit immediately. */
+static int
+session_rel_registration_prepare_expected(wl_col_session_t *sess,
+    col_rel_t *relation, col_rel_t *expected_old, uint64_t identity,
+    uint64_t view_generation, uint64_t storage_generation,
+    session_rel_registration_t *registration)
+{
+    int rc = session_rel_registration_prepare(sess, relation, registration);
+    if (rc)
+        return rc;
+    col_rel_t *prepared_old = registration->old_relation;
+    if (prepared_old != expected_old || !prepared_old
+        || prepared_old->relation_identity != identity
+        || prepared_old->view_generation != view_generation
+        || prepared_old->storage_generation != storage_generation) {
+        session_rel_registration_discard(registration);
+        return EINVAL;
+    }
+    return 0;
+}
+
 static void
 session_rel_registration_commit(wl_col_session_t *sess, col_rel_t *relation,
     session_rel_registration_t *registration)
@@ -2293,6 +2334,25 @@ wl_columnar_session_test_register_retraction(wl_col_session_t *sess,
     session_rel_registration_t registration;
     session_rel_registration_init(&registration);
     int rc = session_rel_registration_prepare(sess, relation, &registration);
+    if (rc != 0)
+        return rc;
+    if (publish)
+        session_rel_registration_commit(sess, relation, &registration);
+    else
+        session_rel_registration_discard(&registration);
+    return 0;
+}
+
+int
+wl_columnar_session_test_register_expected_head(wl_col_session_t *sess,
+    col_rel_t *relation, col_rel_t *expected_old, uint64_t identity,
+    uint64_t view_generation, uint64_t storage_generation, bool publish)
+{
+    session_rel_registration_t registration;
+    session_rel_registration_init(&registration);
+    int rc = session_rel_registration_prepare_expected(sess, relation,
+            expected_old, identity, view_generation, storage_generation,
+            &registration);
     if (rc != 0)
         return rc;
     if (publish)
@@ -6253,7 +6313,7 @@ col_controlled_step_batch_shape(const wl_col_session_t *sess)
  * attempt.  This checks only immutable plan shape and session admission state;
  * relation/operator validation and all evaluation work remain charged below. */
 static int
-col_controlled_step_static_preflight(wl_col_session_t *sess)
+col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
 {
     const wl_plan_t *plan = sess->plan;
     const wl_plan_relation_t *only_relation = NULL;
@@ -6316,7 +6376,9 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
             return EOVERFLOW;
         relation_count += stratum->relation_count;
     }
-    if (sess->delta_cb) {
+    if (sess->delta_cb || successor) {
+        if (successor && sess->nrels > 3)
+            return ENOTSUP;
         if (plan->stratum_count != 1 || relation_count != 1
             || !only_relation || !only_relation->name
             || only_relation->op_count != 3 || !only_relation->ops
@@ -6324,7 +6386,9 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
             || only_relation->ops[1].op != WL_PLAN_OP_MAP
             || only_relation->ops[2].op != WL_PLAN_OP_CONSOLIDATE
             || !only_relation->ops[0].relation_name
-            || session_find_rel(sess, only_relation->name))
+            || (successor
+            ? !session_find_rel(sess, only_relation->name)
+            : session_find_rel(sess, only_relation->name) != NULL))
             return ENOTSUP;
         const wl_plan_op_t *map = &only_relation->ops[1];
         if (map->project_count != 1 || !map->project_indices
@@ -6369,6 +6433,13 @@ col_controlled_step_static_preflight(wl_col_session_t *sess)
             || (source->nrows == 0 && source->ncols == 0
             && source->declared_ncols == 1)))
             return ENOTSUP;
+        if (successor) {
+            col_rel_t *head = session_find_rel(sess, only_relation->name);
+            if (!head || head->ncols != 1 || head->nrows > head->capacity
+                || (head->column_types && head->column_types[0]
+                != WIRELOG_TYPE_INT64))
+                return ENOTSUP;
+        }
     }
     return 0;
 }
@@ -6510,7 +6581,10 @@ col_controlled_step_default_preflight_action(wl_col_session_t *sess,
             && step->default_preflight_stratum == step->stratum_index
             && step->default_preflight_relation == step->relation_index)
             || step->complete
-            || (step->recursive_route && step->provenance_valid);
+            || (step->recursive_route && step->provenance_valid)
+            || (step->successor_attempt
+            && step->default_preflight_stratum == 0
+            && step->default_preflight_relation == 0);
         if (step->default_preflight_target_found != committed_prefix)
             return ENOTSUP;
         step->default_preflight_phase =
@@ -6963,6 +7037,112 @@ col_controlled_step_advance_cursor(wl_col_session_t *sess,
 }
 
 static int
+col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    const char *public_name = sess->plan->strata[0].relations[0].name;
+    const char *input_name = sess->plan->strata[0].relations[0].ops[0]
+        .relation_name;
+    col_rel_t *input = session_find_rel(sess, input_name);
+    col_rel_t *old_head = session_find_rel(sess, public_name);
+    if (!step->successor_input_reader.owner || !input || !old_head
+        || input->relation_identity != step->successor_input_identity
+        || input->view_generation != step->successor_input_view_generation
+        || input->storage_generation
+        != step->successor_input_storage_generation
+        || old_head->relation_identity != step->successor_head_identity
+        || old_head->view_generation != step->successor_head_view_generation
+        || old_head->storage_generation
+        != step->successor_head_storage_generation)
+        return EINVAL;
+    if (!step->successor_candidate) {
+        step->successor_candidate = session_find_rel(sess,
+                step->successor_private_name);
+        if (!step->successor_candidate)
+            return ENOENT;
+    }
+    if (!step->successor_candidate_detached) {
+        while (step->successor_candidate_scan_index < sess->nrels) {
+            uint32_t i = step->successor_candidate_scan_index;
+            int charge_rc = wl_evaluation_control_charge(control, 1);
+            if (charge_rc)
+                return charge_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_successor_registry_charge)
+                wl_columnar_session_test_successor_registry_charge(control,
+                    1, i);
+#endif
+            if (sess->rels[i] != step->successor_candidate)
+                step->successor_candidate_scan_index++;
+            else {
+                sess->rels[i] = NULL;
+                session_rel_free_hash(sess);
+                step->successor_candidate_detached = true;
+                break;
+            }
+        }
+        if (!step->successor_candidate_detached)
+            return ENOENT;
+    }
+    if (!step->successor_candidate_renamed) {
+        while (public_name[step->successor_rename_name_bytes_charged]) {
+            int charge_rc = wl_evaluation_control_charge(control, 1);
+            if (charge_rc)
+                return charge_rc;
+            step->successor_rename_name_bytes_charged++;
+        }
+        int charge_rc = wl_evaluation_control_charge(control, 1);
+        if (charge_rc)
+            return charge_rc;
+        int rename_rc = wl_columnar_relation_rename_checked(
+            step->successor_candidate, public_name);
+        if (rename_rc)
+            return rename_rc;
+        step->successor_candidate_renamed = true;
+    }
+    while (step->successor_registration_scan_charged < sess->nrels) {
+        int charge_rc = wl_evaluation_control_charge(control, 1);
+        if (charge_rc)
+            return charge_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_successor_registry_charge)
+            wl_columnar_session_test_successor_registry_charge(control, 2,
+                step->successor_registration_scan_charged);
+#endif
+        step->successor_registration_scan_charged++;
+    }
+    int charge_rc = wl_evaluation_control_charge(control, 1);
+    if (charge_rc)
+        return charge_rc;
+    charge_rc = wl_evaluation_control_charge(control, 0);
+    if (charge_rc)
+        return charge_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_before_successor_registration)
+        wl_columnar_session_test_before_successor_registration(old_head);
+#endif
+    session_rel_registration_t registration;
+    session_rel_registration_init(&registration);
+    int rc = session_rel_registration_prepare_expected(sess,
+            step->successor_candidate, old_head, step->successor_head_identity,
+            step->successor_head_view_generation,
+            step->successor_head_storage_generation, &registration);
+    if (rc) {
+        step->successor_registration_scan_charged = 0;
+        return rc;
+    }
+    session_rel_registration_commit(sess, step->successor_candidate,
+        &registration);
+    step->successor_candidate = NULL;
+    step->successor_candidate_detached = false;
+    int release_rc = col_rel_source_reader_release(
+        &step->successor_input_reader);
+    assert(release_rc == 0);
+    return 0;
+}
+
+static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
 {
@@ -7024,7 +7204,16 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
     }
     if (!step->observer_prepared) {
         if (!step->observer_preparing) {
-            int rc = wl_columnar_eval_delta_observer_prepare_start(sess);
+            if (step->successor_attempt && !step->successor_candidate)
+                step->successor_candidate = session_find_rel(sess,
+                        step->successor_private_name);
+            if (step->successor_attempt && !step->successor_candidate)
+                return ENOENT;
+            int rc = step->successor_attempt
+                ? wl_columnar_eval_delta_observer_prepare_start_with_override(
+                sess, sess->plan->strata[0].relations[0].name,
+                step->successor_candidate)
+                : wl_columnar_eval_delta_observer_prepare_start(sess);
             if (rc) return rc;
             step->observer_preparing = true;
         }
@@ -7063,9 +7252,15 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
             step->delivery_precharge_index;
 #endif
     }
-    int rc = wl_evaluation_control_charge(control, 0);
-    if (rc) return rc;
+    int rc = 0;
     if (!step->published) {
+        if (step->successor_attempt) {
+            rc = col_controlled_step_successor_publish_candidate(sess, step);
+            if (rc) return rc;
+        } else {
+            rc = wl_evaluation_control_charge(control, 0);
+            if (rc) return rc;
+        }
         step->published = true;
         wl_columnar_eval_delta_observer_publish(sess);
         step->observer_cleanup_pending = true;
@@ -8214,6 +8409,13 @@ col_controlled_step_current_relation(wl_col_session_t *sess,
     const wl_plan_relation_t **out)
 {
     *out = NULL;
+    if (step->successor_attempt) {
+        if (step->stratum_index == 0 && step->relation_index == 0)
+            *out = &step->successor_relation;
+        else
+            step->complete = true;
+        return 0;
+    }
     if (step->stratum_index >= sess->plan->stratum_count) {
         step->complete = true;
         return 0;
@@ -8269,6 +8471,41 @@ col_controlled_step_drive(wl_col_session_t *sess,
      * including child execution, delta growth and final publication. */
     if (step->recursive_route && !step->complete)
         return col_controlled_step_recursive_drive(sess, step, teardown);
+    if (step->successor_attempt && !step->published
+        && !step->successor_input_reader.owner) {
+        const wl_plan_relation_t *plan_relation =
+            &sess->plan->strata[0].relations[0];
+        col_rel_t *source = session_find_rel(sess,
+                plan_relation->ops[0].relation_name);
+        if (!source || source->relation_identity
+            != step->successor_input_identity
+            || source->view_generation
+            != step->successor_input_view_generation
+            || source->storage_generation
+            != step->successor_input_storage_generation)
+            return col_controlled_step_finish(sess, step, EINVAL);
+        int lease_rc = wl_evaluation_control_charge(control, 1);
+        if (lease_rc)
+            return col_controlled_step_finish(sess, step, lease_rc);
+        lease_rc = col_rel_source_reader_acquire(source,
+                &step->successor_input_reader);
+        if (lease_rc)
+            return col_controlled_step_finish(sess, step, lease_rc);
+        if (source->relation_identity != step->successor_input_identity
+            || source->view_generation
+            != step->successor_input_view_generation
+            || source->storage_generation
+            != step->successor_input_storage_generation) {
+            int release_rc = col_rel_source_reader_release(
+                &step->successor_input_reader);
+            assert(release_rc == 0);
+            return col_controlled_step_finish(sess, step, EINVAL);
+        }
+        lease_rc = wl_evaluation_control_charge(control, 0);
+        if (lease_rc)
+            return col_controlled_step_finish(sess, step, lease_rc);
+    }
+
     if (step->observed) {
         const wl_plan_relation_t *relation =
             &sess->plan->strata[0].relations[0];
@@ -8291,8 +8528,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
         const wl_plan_relation_t *relation =
             &sess->plan->strata[0].relations[0];
         if (!sess->delta_observer_build) {
-            int build_rc =
-                wl_columnar_eval_delta_observer_build_start_missing_head(
+            int build_rc = step->successor_attempt
+                ? wl_columnar_eval_delta_observer_build_start(sess,
+                    UINT64_MAX)
+                : wl_columnar_eval_delta_observer_build_start_missing_head(
                 sess, UINT64_MAX, relation->name);
             if (build_rc)
                 return col_controlled_step_finish(sess, step, build_rc);
@@ -8464,6 +8703,46 @@ col_controlled_step_drive(wl_col_session_t *sess,
 }
 
 static int
+col_controlled_step_successor_target_init(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step,
+    const wl_plan_relation_t *source_relation)
+{
+    const char *input_name = source_relation->ops[0].relation_name;
+    col_rel_t *input = session_find_rel(sess, input_name);
+    col_rel_t *head = session_find_rel(sess, source_relation->name);
+    if (!input || !head)
+        return ENOTSUP;
+    step->successor_input_identity = input->relation_identity;
+    step->successor_input_view_generation = input->view_generation;
+    step->successor_input_storage_generation = input->storage_generation;
+    step->successor_head_identity = head->relation_identity;
+    step->successor_head_view_generation = head->view_generation;
+    step->successor_head_storage_generation = head->storage_generation;
+    char name[128];
+    for (uint32_t suffix = 0; suffix < 1024; ++suffix) {
+        int n = snprintf(name, sizeof(name), "__wirelog_step_%" PRIxPTR
+                "_%" PRIx64 "_%" PRIx32, (uintptr_t)step,
+                step->operation_identity, suffix);
+        if (n < 0 || (size_t)n >= sizeof(name))
+            return EOVERFLOW;
+        if (session_find_rel(sess, name))
+            continue;
+        step->successor_private_name = malloc((size_t)n + 1);
+        if (!step->successor_private_name)
+            return ENOMEM;
+        memcpy(step->successor_private_name, name, (size_t)n + 1);
+        step->successor_relation = *source_relation;
+        step->successor_relation.name = step->successor_private_name;
+        memcpy(step->successor_ops, source_relation->ops,
+            sizeof(step->successor_ops));
+        step->successor_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
+        step->successor_relation.ops = step->successor_ops;
+        return 0;
+    }
+    return EEXIST;
+}
+
+static int
 col_controlled_step(wl_col_session_t *sess)
 {
     wl_columnar_controlled_step_t *step = sess->controlled_step;
@@ -8480,7 +8759,7 @@ col_controlled_step(wl_col_session_t *sess)
             step->retryable = false;
             return EINVAL;
         }
-        int preflight_rc = col_controlled_step_static_preflight(sess);
+        int preflight_rc = col_controlled_step_static_preflight(sess, false);
         if (preflight_rc) return preflight_rc;
         step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
         step->default_preflight_plan = NULL;
@@ -8496,9 +8775,31 @@ col_controlled_step(wl_col_session_t *sess)
         step->retryable = false;
         successor_step = true;
     }
+    if (step && step->complete && step->successor_mutation_seen) {
+        int rc = col_controlled_step_static_preflight(sess, true);
+        if (rc) return rc;
+        uint64_t identity = step->operation_identity;
+        bool observed = step->observed;
+        free(step->successor_private_name);
+        memset(step, 0, sizeof(*step));
+        step->operation_identity = identity;
+        step->observed = observed;
+        step->successor_attempt = true;
+        const wl_plan_relation_t *source_relation =
+            &sess->plan->strata[0].relations[0];
+        int target_rc = col_controlled_step_successor_target_init(sess, step,
+                source_relation);
+        if (target_rc) {
+            step->refused = true;
+            step->complete = true;
+            step->successor_mutation_seen = true;
+            return target_rc;
+        }
+    }
     if (!successor_step
         && (!step || (!step->operation_active && !step->complete))) {
-        int rc = col_controlled_step_static_preflight(sess);
+        int rc = col_controlled_step_static_preflight(sess,
+                step && step->successor_attempt);
         if (rc) return rc;
     }
     if (!step) {
@@ -8529,7 +8830,20 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
     if (step->operation_active)
         rc = col_controlled_step_drive(sess, step, true);
     if (rc == EAGAIN || step->operation_active) return EBUSY;
+    if (step->successor_candidate_detached && step->successor_candidate) {
+        int candidate_rc = col_rel_destroy_checked(step->successor_candidate);
+        if (candidate_rc != 0)
+            return candidate_rc;
+        step->successor_candidate = NULL;
+    }
+    if (step->successor_input_reader.owner) {
+        int reader_rc = col_rel_source_reader_release(
+            &step->successor_input_reader);
+        if (reader_rc != 0)
+            return reader_rc;
+    }
     col_controlled_step_grant_release(step, &step->previous_funding);
+    free(step->successor_private_name);
     free(step);
     sess->controlled_step = NULL;
     /* Destroy consumes the terminal outcome from the caller-owned control
@@ -8565,11 +8879,59 @@ col_session_controlled_step_state(const wl_session_t *session)
         if (step->observed && (!step->published
             || step->observer_cleanup_pending))
             return WL_CONTROLLED_STEP_PENDING;
-        return step->retryable ? WL_CONTROLLED_STEP_RETRYABLE
+        return (step->retryable ||
+               step->successor_mutation_seen) ? WL_CONTROLLED_STEP_RETRYABLE
             : WL_CONTROLLED_STEP_COMPLETE;
     }
     return step->refused ? WL_CONTROLLED_STEP_IDLE
         : WL_CONTROLLED_STEP_PENDING;
+}
+
+static int
+col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->observed)
+        return EBUSY;
+    if (!relation || num_cols != 1 || num_rows > 1)
+        return ENOTSUP;
+    if (!step->complete || !step->published
+        || step->observer_cleanup_pending)
+        return ENOTSUP;
+    int rc = col_controlled_step_static_preflight(sess, true);
+    if (rc)
+        return rc;
+    const char *source = sess->plan->strata[0].relations[0]
+        .ops[0].relation_name;
+    if (strcmp(relation, source) != 0)
+        return ENOTSUP;
+    (void)insert;
+    return 0;
+}
+
+static void
+col_session_controlled_mutation_committed(wl_session_t *session,
+    bool insert, const char *relation, uint32_t num_rows, uint32_t num_cols)
+{
+    (void)insert;
+    (void)num_cols;
+    if (!session || !relation || num_rows == 0)
+        return;
+    wl_col_session_t *sess = COL_SESSION(session);
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (!step || !step->observed || !step->complete || !step->published
+        || !sess->plan || sess->plan->stratum_count != 1
+        || !sess->plan->strata || sess->plan->strata[0].relation_count != 1
+        || !sess->plan->strata[0].relations
+        || !sess->plan->strata[0].relations[0].ops
+        || sess->plan->strata[0].relations[0].op_count == 0
+        || !sess->plan->strata[0].relations[0].ops[0].relation_name)
+        return;
+    if (strcmp(relation,
+        sess->plan->strata[0].relations[0].ops[0].relation_name) == 0)
+        step->successor_mutation_seen = true;
 }
 
 static int
@@ -9372,6 +9734,10 @@ static const wl_compute_backend_t col_backend = {
     .session_controlled_step_state = col_session_controlled_step_state,
     .session_controlled_step_authorize_insert =
         col_session_controlled_step_authorize_insert,
+    .session_controlled_mutation_admit =
+        col_session_controlled_mutation_admit,
+    .session_controlled_mutation_committed =
+        col_session_controlled_mutation_committed,
 };
 
 const wl_compute_backend_t *
