@@ -20,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_plan_test_after_terminal_exchange)(
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
 /* ======================================================================== */
 /* Stratum Evaluator                                                         */
 /* ======================================================================== */
@@ -673,6 +678,89 @@ wl_columnar_eval_plan_numeric_forward(
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(record->control)
            == record->attempt_id ? 0 : EINVAL;
+}
+
+/* The parsed reachability rule lowers to this exact seven-op relation. Its
+ * final zero-worker EXCHANGE is metadata for the ordinary multi-worker
+ * planner; under the controlled, single-session composed evaluator it has no
+ * redistribution work to perform. Keep this bridge narrower than generic
+ * EXCHANGE support. */
+static bool
+wl_columnar_eval_plan_composed_terminal_exchange_valid(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    static const uint8_t map_col0[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
+    };
+    static const uint8_t map_col1[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
+    };
+    if (!record || !record->composed_mode || !record->private_bindings
+        || record->begin != 0 || record->end != 7
+        || record->plan->op_count != 7)
+        return false;
+    const wl_plan_relation_t *plan = record->plan;
+    const wl_plan_op_t *ops = plan->ops;
+    for (uint32_t i = 0; i < 7; ++i) {
+        const wl_plan_op_t *op = &ops[i];
+        if (op->filter_expr.data || op->filter_expr.size
+            || op->agg_expr.data || op->agg_expr.size
+            || op->agg_fn != WIRELOG_AGG_COUNT
+            || op->group_by_indices || op->group_by_count
+            || op->aggregate_index || op->right_filter_expr.data
+            || op->right_filter_expr.size
+            || op->agg_operand_type != WL_PLAN_AGG_OPERAND_UNKNOWN
+            || op->agg_result_type != WL_PLAN_AGG_OPERAND_UNKNOWN
+            || op->delta_mode != WL_DELTA_AUTO || op->materialized
+            || (i != 0 && i != 2 && op->relation_name)
+            || (i != 3 && (op->right_relation || op->left_keys
+            || op->right_keys || op->key_count))
+            || (i != 1 && i != 3
+            && (op->project_indices || op->project_count))
+            || (i != 1 && (op->map_exprs || op->map_expr_count))
+            || (i != 6 && op->opaque_data))
+            return false;
+    }
+    if (!plan->name || strcmp(plan->name, "path") != 0 || !plan->delta_name
+        || strcmp(plan->delta_name, "$d$path") != 0
+        || ops[0].op != WL_PLAN_OP_VARIABLE || !ops[0].relation_name
+        || strcmp(ops[0].relation_name, "edge") != 0
+        || ops[0].delta_mode != WL_DELTA_AUTO
+        || ops[1].op != WL_PLAN_OP_MAP
+        || ops[2].op != WL_PLAN_OP_VARIABLE || !ops[2].relation_name
+        || strcmp(ops[2].relation_name, "path") != 0
+        || ops[2].delta_mode != WL_DELTA_AUTO
+        || ops[3].op != WL_PLAN_OP_JOIN || !ops[3].right_relation
+        || strcmp(ops[3].right_relation, "edge") != 0
+        || ops[3].key_count != 1 || !ops[3].left_keys
+        || !ops[3].right_keys || !ops[3].left_keys[0]
+        || !ops[3].right_keys[0]
+        || strcmp(ops[3].left_keys[0], "col1") != 0
+        || strcmp(ops[3].right_keys[0], "col0") != 0
+        || ops[1].project_count != 2 || !ops[1].project_indices
+        || ops[1].project_indices[0] != 0 || ops[1].project_indices[1] != 1
+        || ops[1].map_expr_count != 2 || !ops[1].map_exprs
+        || ops[1].map_exprs[0].size != sizeof(map_col0)
+        || !ops[1].map_exprs[0].data
+        || memcmp(ops[1].map_exprs[0].data, map_col0, sizeof(map_col0))
+        || ops[1].map_exprs[1].size != sizeof(map_col1)
+        || !ops[1].map_exprs[1].data
+        || memcmp(ops[1].map_exprs[1].data, map_col1, sizeof(map_col1))
+        || ops[3].project_count != 2 || !ops[3].project_indices
+        || ops[3].project_indices[0] != 0 || ops[3].project_indices[1] != 3
+        || ops[3].materialized || ops[3].delta_mode != WL_DELTA_AUTO
+        || ops[4].op != WL_PLAN_OP_CONCAT
+        || ops[5].op != WL_PLAN_OP_CONSOLIDATE
+        || ops[6].op != WL_PLAN_OP_EXCHANGE || !ops[6].opaque_data)
+        return false;
+    const wl_plan_op_exchange_t *exchange =
+        (const wl_plan_op_exchange_t *)ops[6].opaque_data;
+    bool valid = exchange->num_workers == 0 && exchange->key_col_count == 1
+        && exchange->key_col_idxs && exchange->key_col_idxs[0] == 1
+        && !exchange->edb_rel_name && exchange->edb_key_col_count == 1
+        && exchange->edb_key_col_idxs
+        && exchange->edb_key_col_idxs[0] == 0;
+    return valid;
 }
 
 void
@@ -1771,7 +1859,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                 && kind != WL_PLAN_OP_LFTJ
                 && kind != WL_PLAN_OP_CONCAT
                 && !(kind == WL_PLAN_OP_CONSOLIDATE
-                && record->cursor + 1 == record->end))
+                && record->cursor + 1 == record->end)
+                && !(kind == WL_PLAN_OP_EXCHANGE
+                && record->cursor + 1 == record->end
+                && wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                    record)))
                 record->abort_supported = false;
             if (kind == WL_PLAN_OP_VARIABLE) {
                 if (record->preflight_depth == COL_STACK_MAX) rc = ENOBUFS;
@@ -1789,6 +1881,12 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                 || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_REDUCE
                 || kind == WL_PLAN_OP_CONSOLIDATE) {
                 if (!record->preflight_depth) rc = EINVAL;
+            } else if (kind == WL_PLAN_OP_EXCHANGE) {
+                if (record->cursor + 1 != record->end
+                    || !record->preflight_depth
+                    || !wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                        record))
+                    rc = ENOTSUP;
             } else rc = ENOTSUP;
         }
         if (!rc && ++record->cursor == record->end) {
@@ -1821,6 +1919,29 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
             record->source_slot_borrowed = false;
             record->source_installed = false;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL;
+            return 0;
+        }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_EXCHANGE) {
+            /* The exact terminal zero-worker bridge is a charged, fixed-cost
+             * no-op. Preflight authenticated it before any child ran. */
+            if (record->cursor + 1 != record->end
+                || !wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                    record)) {
+                record->semantic_result = ENOTSUP;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else {
+                ++record->completed;
+                ++record->cursor;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_eval_plan_test_after_terminal_exchange)
+                    wl_columnar_eval_plan_test_after_terminal_exchange(
+                        record->control, record->attempt_id);
+#endif
+                rc = wl_columnar_eval_plan_composed_charge(record->control,
+                        record->attempt_id, 0);
+                if (rc) record->semantic_result = rc;
+            }
             return 0;
         }
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_CONCAT) {

@@ -797,6 +797,17 @@ still leaves the already admitted tariff in the attempt's work count. This is
 a logical admission cost, not an allocator-time estimate: `malloc`/`free`
 latency remains synchronous and has no wall-clock bound.
 
+The bound composed evaluator recognizes one additional shape: the generated
+`path(x,y) :- edge(x,y); path(x,z) :- path(x,y), edge(y,z)` reachability
+relation, including its exact terminal zero-worker `EXCHANGE` metadata. That
+terminal node is a charged fixed-cost no-op in this single-session evaluator;
+it preserves the result stack and never invokes redistribution. Other
+`EXCHANGE` positions or metadata remain unsupported. This lets the generated
+relation plan execute against authenticated private inputs, but it does not
+add recursive iteration, private candidate publication, or a shared
+host/scheduler action envelope. Controlled recursive STEP therefore remains
+disabled and #1821 remains incomplete.
+
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
 iteration/count equality is not promised. Parsing, planning and input ingestion
