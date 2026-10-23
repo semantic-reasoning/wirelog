@@ -6632,6 +6632,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     bool composed_mode;
     /* Set only by the exact framed controlled STEP fallback preflight. */
     bool controlled_materialized_batch_fallback;
+    const struct wl_columnar_eval_private_bindings *private_bindings;
     wl_columnar_lftj_attempt_t lftj;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
@@ -6641,6 +6642,29 @@ typedef struct {
     int semantic_result, protocol_result;
     bool retained;
 } wl_columnar_eval_plan_numeric_status_t;
+
+/* Authenticated name-to-owner overlay for one serialized evaluator attempt.
+ * Keys are copied into this address-bound record; relation descriptors stay
+ * private and may be unnamed. The caller borrows these descriptors and must
+ * keep them alive and immutable until the child attempt is acknowledged.
+ * Keep this record stable and immutable for the same interval. */
+#define WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX 4u
+typedef struct {
+    char name[256];
+    col_rel_t *relation;
+    col_relation_snapshot_t snapshot;
+} wl_columnar_eval_private_binding_t;
+
+typedef struct wl_columnar_eval_private_bindings {
+    uintptr_t identity;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    uint32_t count;
+    wl_columnar_eval_private_binding_t entries[
+        WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX];
+} wl_columnar_eval_private_bindings_t;
 
 void wl_columnar_eval_plan_numeric_attempt_init(
     wl_columnar_eval_plan_numeric_attempt_t *);
@@ -6789,6 +6813,20 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_private_bindings_begin(
+    wl_columnar_eval_private_bindings_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    const char *const *, col_rel_t *const *, uint32_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t *);
+int wl_columnar_eval_plan_numeric_private_bindings_get(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t **);
 int wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,

@@ -4173,6 +4173,233 @@ composed_begin(fixture_t *f, const wl_plan_relation_t *plan,
 }
 
 static void
+test_composed_private_input_binding(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    static const double private_values[] = {17, 29, 43};
+    static const double public_values[] = {80, 90};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *output = composed_find_relation(plan, "output");
+    CHECK(output && output->op_count >= 3
+        && output->ops[0].op == WL_PLAN_OP_VARIABLE);
+
+    col_rel_t *private_input = composed_source("private", 1, private_values,
+            3, false);
+    free(private_input->name);
+    private_input->name = NULL;
+    col_rel_t *public_input = composed_source("input", 1, public_values, 2,
+            false);
+    col_rel_t *registry[] = {public_input};
+    fixture_t f;
+    composed_fixture(&f, private_input, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const names[] = {"input"};
+    col_rel_t *relations[] = {private_input};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        output, f.operation, f.operation_id, names, relations, 1));
+    f.session.rels = registry;
+    f.session.nrels = 1;
+    f.session.rel_cap = 1;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, output, 0, output->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == output->op_count);
+    CHECK(session_find_rel(&f.session, "input") == public_input);
+    session_rel_free_hash(&f.session);
+    CHECK(private_input->name == NULL);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 3
+        && stack->items[0].rel->ncols == 1);
+    for (uint32_t row = 0; row < 3; ++row)
+        CHECK(stack->items[0].rel->columns[0][row]
+            == (int64_t)private_values[row]);
+    composed_close(&f);
+    col_rel_destroy(public_input);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    static const char join_source[] =
+        ".decl a(k:int64)\n"
+        ".decl b(k:int64)\n"
+        ".decl output(k:int64)\n"
+        "output(k) :- a(k), b(k).\n";
+    static const double a_values[] = {1, 3};
+    static const double b_private_values[] = {1, 2};
+    static const double b_public_values[] = {3, 3};
+    wirelog_program_t *join_program = wirelog_parse_string(join_source,
+            &error);
+    wl_plan_t *join_plan = NULL;
+    CHECK(join_program && !wl_plan_from_program(join_program, &join_plan));
+    const wl_plan_relation_t *join = composed_find_relation(join_plan,
+            "output");
+    CHECK(join && join->op_count >= 3
+        && join->ops[0].op == WL_PLAN_OP_VARIABLE
+        && join->ops[1].op == WL_PLAN_OP_JOIN
+        && !strcmp(join->ops[1].right_relation, "b"));
+    col_rel_t *private_a = composed_source("private-a", 1, a_values, 2,
+            false);
+    col_rel_t *private_b = composed_source("private-b", 1,
+            b_private_values, 2, false);
+    col_rel_t *public_b = composed_source("b", 1, b_public_values, 2,
+            false);
+    free(private_a->name);
+    private_a->name = NULL;
+    free(private_b->name);
+    private_b->name = NULL;
+    col_rel_t *join_registry[] = {public_b};
+    composed_fixture(&f, private_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const join_names[] = {"a", "b"};
+    col_rel_t *join_relations[] = {private_a, private_b};
+    wl_columnar_eval_private_bindings_t join_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&join_bindings, &f.session,
+        join, f.operation, f.operation_id, join_names, join_relations, 2));
+    f.session.rels = join_registry;
+    f.session.nrels = 1;
+    f.session.rel_cap = 1;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, join, 0, join->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &join_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "b") == public_b);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(private_b);
+    col_rel_destroy(public_b);
+
+    static const double a_public_values[] = {2, 2};
+    static const double b_public_mixed_values[] = {1, 2};
+    col_rel_t *private_a_mixed = composed_source("private-a", 1, a_values,
+            2, false);
+    free(private_a_mixed->name);
+    private_a_mixed->name = NULL;
+    col_rel_t *public_a = composed_source("a", 1, a_public_values, 2,
+            false);
+    col_rel_t *public_b_mixed = composed_source("b", 1,
+            b_public_mixed_values, 2, false);
+    col_rel_t *mixed_registry[] = {public_a, public_b_mixed};
+    composed_fixture(&f, private_a_mixed, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const mixed_names[] = {"a"};
+    col_rel_t *mixed_relations[] = {private_a_mixed};
+    wl_columnar_eval_private_bindings_t mixed_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&mixed_bindings,
+        &f.session, join, f.operation, f.operation_id, mixed_names,
+        mixed_relations, 1));
+    f.session.rels = mixed_registry;
+    f.session.nrels = 2;
+    f.session.rel_cap = 2;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, join, 0, join->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &mixed_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "a") == public_a);
+    CHECK(session_find_rel(&f.session, "b") == public_b_mixed);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(public_a);
+    col_rel_destroy(public_b_mixed);
+
+    static const double private_delta_a_values[] = {1};
+    static const double private_delta_b_values[] = {1};
+    static const double private_full_b_values[] = {2};
+    static const double public_delta_values[] = {3};
+    col_rel_t *private_full_a = composed_source("private-full-a", 1,
+            a_values, 2, false);
+    col_rel_t *private_delta_a = composed_source("private-delta-a", 1,
+            private_delta_a_values, 1, false);
+    col_rel_t *private_full_b = composed_source("private-full-b", 1,
+            private_full_b_values, 1, false);
+    col_rel_t *private_delta_b = composed_source("private-delta-b", 1,
+            private_delta_b_values, 1, false);
+    col_rel_t *public_full_a = composed_source("a", 1, a_values, 2, false);
+    col_rel_t *public_full_b = composed_source("b", 1,
+            b_private_values, 2, false);
+    col_rel_t *public_a_delta = composed_source("$d$a", 1,
+            public_delta_values, 1, false);
+    col_rel_t *public_b_delta = composed_source("$d$b", 1,
+            public_delta_values, 1, false);
+    free(private_full_a->name);
+    private_full_a->name = NULL;
+    free(private_delta_a->name);
+    private_delta_a->name = NULL;
+    free(private_full_b->name);
+    private_full_b->name = NULL;
+    free(private_delta_b->name);
+    private_delta_b->name = NULL;
+    wl_plan_relation_t delta_plan = *join;
+    wl_plan_op_t *delta_ops = malloc((size_t)join->op_count
+            * sizeof(*delta_ops));
+    CHECK(delta_ops);
+    memcpy(delta_ops, join->ops,
+        (size_t)join->op_count * sizeof(*delta_ops));
+    delta_ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+    delta_ops[1].delta_mode = WL_DELTA_FORCE_DELTA;
+    delta_plan.ops = delta_ops;
+    col_rel_t *delta_registry[] = {public_full_a, public_full_b,
+                                   public_a_delta, public_b_delta};
+    composed_fixture(&f, private_full_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    f.session.delta_seeded = true;
+    static const char *const delta_names[] = {"a", "$d$a", "b", "$d$b"};
+    col_rel_t *delta_relations[] = {private_full_a, private_delta_a,
+                                    private_full_b, private_delta_b};
+    wl_columnar_eval_private_bindings_t delta_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&delta_bindings,
+        &f.session, &delta_plan, f.operation, f.operation_id, delta_names,
+        delta_relations, 4));
+    f.session.rels = delta_registry;
+    f.session.nrels = 4;
+    f.session.rel_cap = 4;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, &delta_plan, 0, delta_plan.op_count, f.frame,
+            &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &delta_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "$d$a") == public_a_delta);
+    CHECK(session_find_rel(&f.session, "$d$b") == public_b_delta);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(private_delta_a);
+    col_rel_destroy(private_full_b);
+    col_rel_destroy(private_delta_b);
+    col_rel_destroy(public_full_a);
+    col_rel_destroy(public_full_b);
+    col_rel_destroy(public_a_delta);
+    col_rel_destroy(public_b_delta);
+    free(delta_ops);
+    wl_plan_free(join_plan);
+    wirelog_program_free(join_program);
+}
+
+static void
 composed_close(fixture_t *f)
 {
     CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
@@ -5110,6 +5337,7 @@ test_composed_controlled_batch_fallback_owner(void)
 int
 main(void)
 {
+    test_composed_private_input_binding();
     test_composed_domain_and_repeated_source();
     test_composed_controlled_batch_fallback_owner();
     test_composed_abort_request();
