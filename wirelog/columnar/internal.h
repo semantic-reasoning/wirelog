@@ -6848,6 +6848,12 @@ int wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *, bool *,
 int wl_columnar_eval_plan_numeric_composed_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Drain an owned LFTJ child after the original operation has latched a
+ * cancellation or work-limit stop. Each call performs at most one child
+ * cleanup action under fresh host funding; it never resumes evaluation. */
+int wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 /* Latch a funded abort request without advancing an owner. The next step
 * observes cancellation through each operator's existing cleanup path. */
 int wl_columnar_eval_plan_numeric_composed_abort_request(
