@@ -763,6 +763,21 @@ wl_columnar_eval_plan_composed_terminal_exchange_valid(
     return valid;
 }
 
+bool
+wl_columnar_eval_plan_numeric_recursive_path_supported(
+    const wl_plan_relation_t *plan)
+{
+    if (!plan || !plan->ops) return false;
+    wl_columnar_eval_plan_numeric_attempt_t shape = {0};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    shape.composed_mode = true;
+    shape.private_bindings = &bindings;
+    shape.begin = 0;
+    shape.end = 7;
+    shape.plan = plan;
+    return wl_columnar_eval_plan_composed_terminal_exchange_valid(&shape);
+}
+
 void
 wl_columnar_eval_plan_numeric_attempt_init(
     wl_columnar_eval_plan_numeric_attempt_t *record)

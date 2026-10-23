@@ -810,16 +810,28 @@ still leaves the already admitted tariff in the attempt's work count. This is
 a logical admission cost, not an allocator-time estimate: `malloc`/`free`
 latency remains synchronous and has no wall-clock bound.
 
-The bound composed evaluator recognizes one additional shape: the generated
-`path(x,y) :- edge(x,y); path(x,z) :- path(x,y), edge(y,z)` reachability
-relation, including its exact terminal zero-worker `EXCHANGE` metadata. That
-terminal node is a charged fixed-cost no-op in this single-session evaluator;
-it preserves the result stack and never invokes redistribution. Other
-`EXCHANGE` positions or metadata remain unsupported. This lets the generated
-relation plan execute against authenticated private inputs, but it does not
-add recursive iteration, private candidate publication, or a shared
-host/scheduler action envelope. Controlled recursive STEP therefore remains
-disabled and #1821 remains incomplete.
+Controlled initial STEP now supports the generated two-column INT64 reachability
+plan `path(x,y) :- edge(x,y); path(x,z) :- path(x,y), edge(y,z)`, including its
+exact terminal zero-worker `EXCHANGE`. That terminal node is a charged fixed-cost
+no-op in this single-session evaluator; it preserves the result stack and never
+invokes redistribution. Other `EXCHANGE` positions or metadata remain
+unsupported. Eligibility requires the exact one-stratum, one-target plan and a
+single registered `edge` input. The evaluator snapshots and leases `edge` from
+before the first recursive body read through convergence, then checks that the
+snapshot still matches after acquiring the lease.
+
+All recursive body evaluations, private captures, cumulative union and exact
+new-row delta work use the root STEP control and attempt. Frontier and
+publication relations are built through the managed binary builder, which
+admits each fresh lane's requested cells within the caller quantum before
+allocation. `path` remains absent from the registry until the frontier is
+empty, when one final schemaful relation is published. On cancellation or work
+exhaustion, a separate maintenance control drains child cleanup receipts,
+merge cleanup and managed relation retirement before releasing the edge lease.
+This route handles initial evaluation only: once the session is complete, later
+`STEP` calls are idempotent and do not open another attempt or reevaluate
+mutated inputs. Other recursive plans and repeated evaluation remain
+unsupported, so #1821 still requires additional operator coverage.
 
 When a composed attempt owns an LFTJ child at the moment its original
 operation control latches cancellation or work-limit, the internal
