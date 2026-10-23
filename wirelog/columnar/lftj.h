@@ -124,6 +124,11 @@ typedef struct {
     uint64_t limited_usable_bytes;
     uint64_t reserved_before_inner;
     wl_columnar_memory_admission_status_t inner_status;
+    uint32_t controlled_row_allocations;
+    uint32_t controlled_input_array_allocations;
+    uint64_t controlled_input_array_bytes;
+    uint64_t controlled_allocation_work_total;
+    uint64_t controlled_allocation_work_charged;
 } wl_columnar_lftj_test_hook_state_t;
 
 typedef struct {
@@ -153,6 +158,8 @@ wl_columnar_lftj_test_get_hook_state(
     wl_columnar_lftj_test_hook_state_t *out);
 void
 wl_columnar_lftj_test_clear_hooks(void);
+int
+wl_columnar_lftj_test_add_allocation_work(uint64_t *total, uint64_t work);
 
 void
 wl_columnar_lftj_test_deny_next_output_growth(void);
