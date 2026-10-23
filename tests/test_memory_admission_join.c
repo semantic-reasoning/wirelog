@@ -259,6 +259,12 @@ make_session_workers(uint64_t budget, uint32_t workers)
     wl_col_session_t *s = (wl_col_session_t *)calloc(1, sizeof(*s));
     if (!s)
         return NULL;
+    uint64_t registry_bytes = WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        * sizeof(*s->diff_arr_entries);
+    if (budget > UINT64_MAX - registry_bytes) {
+        free(s);
+        return NULL;
+    }
     s->frontier_ops = &col_frontier_epoch_ops;
     s->delta_pool = delta_pool_create(256, sizeof(col_rel_t), 1024 * 1024);
     wl_mem_ledger_init(&s->mem_ledger, 0);
@@ -272,6 +278,43 @@ make_session_workers(uint64_t budget, uint32_t workers)
         free(s);
         return NULL;
     }
+    wl_columnar_memory_reservation_init(
+        &s->diff_arr_registry_reservation);
+    wl_columnar_memory_admission_status_t status
+        = wl_columnar_memory_reserve_checked(
+            wl_columnar_memory_governor_ref_get(s->memory_governor),
+            registry_bytes, &s->diff_arr_registry_reservation);
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        delta_pool_destroy(s->delta_pool);
+        wl_columnar_memory_governor_ref_release(s->memory_governor);
+        free(s);
+        return NULL;
+    }
+    s->diff_arr_entries = (col_diff_arr_entry_t *)calloc(
+        WL_DIFF_ARR_REGISTRY_INITIAL_CAP, sizeof(*s->diff_arr_entries));
+    if (!s->diff_arr_entries) {
+        (void)wl_columnar_memory_rollback(
+            &s->diff_arr_registry_reservation);
+        delta_pool_destroy(s->delta_pool);
+        wl_columnar_memory_governor_ref_release(s->memory_governor);
+        free(s);
+        return NULL;
+    }
+    if (!wl_columnar_memory_commit(&s->diff_arr_registry_reservation, s)) {
+        free(s->diff_arr_entries);
+        (void)wl_columnar_memory_rollback(
+            &s->diff_arr_registry_reservation);
+        delta_pool_destroy(s->delta_pool);
+        wl_columnar_memory_governor_ref_release(s->memory_governor);
+        free(s);
+        return NULL;
+    }
+    s->diff_arr_cap = WL_DIFF_ARR_REGISTRY_INITIAL_CAP;
+    s->diff_arr_registry_reserved_bytes = registry_bytes;
+    s->diff_arr_registry_metadata_reserved_bytes = 0;
+    wl_mem_ledger_alloc(&s->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        registry_bytes);
     return s;
 }
 
@@ -321,8 +364,11 @@ static uint64_t
 registry_charge(const wl_col_session_t *s)
 {
     /* Session registration retains the pointer array and, when admission
-     * permits it, the optional relation-name hash. */
-    return s->rels_reservation.bytes + s->rel_hash_reservation.bytes;
+     * permits it, the optional relation-name hash. Differential arrangements
+     * also retain their fixed registry allocation for the session lifetime. */
+    return s->rels_reservation.bytes + s->rel_hash_reservation.bytes
+           + s->diff_arr_registry_reserved_bytes
+           + s->diff_arr_registry_metadata_reserved_bytes;
 }
 
 static uint64_t
@@ -1255,7 +1301,7 @@ cleanup:
     col_rel_destroy(a);
     col_rel_destroy(b);
     col_rel_destroy(lower);
-    if (sess && reserved_of(sess) != 0 && !failure)
+    if (sess && reserved_of(sess) != registry_charge(sess) && !failure)
         failure = "reservation leak";
     destroy_session(sess);
     if (failure) {
@@ -1665,21 +1711,22 @@ test_missing_right_metadata_boundary(void)
         * (sizeof(int64_t *) + sizeof(int64_t));
     init_cross_op(&op);
     op.right_relation = "missing";
-    uint64_t peak = sizeof(col_rel_t) + sizeof("$join_empty")
+    uint64_t peak = registry_charge(sess) + sizeof(col_rel_t)
+        + sizeof("$join_empty")
         + payload + 2u * metadata + 2u * sizeof(wirelog_column_type_t);
     wl_columnar_memory_governor_t *governor
         = wl_columnar_memory_governor_ref_get(sess->memory_governor);
     atomic_store_explicit(&governor->usable_bytes, peak - 1u,
         memory_order_release);
     if (run_join(sess, left, &op, &result) != ENOSPC
-        || result.rel || reserved_of(sess) != 0) {
+        || result.rel || reserved_of(sess) != registry_charge(sess)) {
         FAIL("missing-right metadata denial was not typed or balanced");
         goto out;
     }
     atomic_store_explicit(&governor->usable_bytes, peak, memory_order_release);
     wl_columnar_relation_test_fail_next_metadata_alloc();
     if (run_join(sess, left, &op, &result) != ENOMEM
-        || result.rel || reserved_of(sess) != 0) {
+        || result.rel || reserved_of(sess) != registry_charge(sess)) {
         FAIL("missing-right metadata allocator failure lost its type");
         goto out;
     }
@@ -1690,7 +1737,7 @@ test_missing_right_metadata_boundary(void)
     }
     col_rel_destroy(result.rel);
     result.rel = NULL;
-    if (reserved_of(sess) != 0) {
+    if (reserved_of(sess) != registry_charge(sess)) {
         FAIL("missing-right result destruction leaked credit");
         goto out;
     }
@@ -3548,7 +3595,9 @@ test_parallel_cross_denial(void)
     }
     /* Strictly below the substitute's own footprint, so the bulk reserve
      * cannot fit however the transient peak is counted. */
-    sess = make_session_workers(residual + 16u * sizeof(col_rel_t *)
+    sess = make_session_workers(residual
+            + WL_DIFF_ARR_REGISTRY_INITIAL_CAP * sizeof(col_diff_arr_entry_t)
+            + 16u * sizeof(col_rel_t *)
             + 16u * sizeof(uint32_t) + sizeof(uint32_t) - 1u, 2);
     if (!sess || !right || !left) {
         FAIL("fixture");
@@ -4300,7 +4349,8 @@ static void
 test_parallel_diff_true_admission_denial_rolls_back(void)
 {
     wl_col_session_t *sess = make_session_workers(
-        16u * sizeof(col_rel_t *), 2);
+        WL_DIFF_ARR_REGISTRY_INITIAL_CAP * sizeof(col_diff_arr_entry_t)
+        + 16u * sizeof(col_rel_t *), 2);
     col_rel_t *right = make_right(1, 2);
     col_rel_t *left = make_left(65, 1);
     wl_plan_op_t op;

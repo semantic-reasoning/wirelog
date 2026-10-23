@@ -2172,7 +2172,7 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
 
     bool done = false;
     rc = wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done,
-            record->control, record->attempt_id);
+            funding, funding_id);
     if (rc) return rc;
     if (done) {
         record->phase = record->phase ==
