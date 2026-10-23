@@ -2602,6 +2602,217 @@ diff_entry_next_generation(uint64_t generation)
     return generation == UINT64_MAX ? UINT64_MAX : generation + 1u;
 }
 
+static int
+diff_registry_entry_metadata_size(const char *rel_name, uint32_t key_count,
+    uint64_t *bytes)
+{
+    uint64_t name_bytes;
+    uint64_t key_bytes;
+    if (!rel_name || !bytes)
+        return EINVAL;
+    size_t name_length = strlen(rel_name);
+    if (name_length >= UINT64_MAX
+        || !wl_columnar_memory_size_add((uint64_t)name_length, 1u,
+        &name_bytes)
+        || !wl_columnar_memory_size_mul(key_count, sizeof(uint32_t),
+        &key_bytes)
+        || !wl_columnar_memory_size_add(name_bytes, key_bytes, bytes)
+        || *bytes > SIZE_MAX)
+        return EOVERFLOW;
+    return 0;
+}
+
+static int
+diff_registry_metadata_begin(wl_col_session_t *cs, uint64_t bytes,
+    bool *governed)
+{
+    uint64_t expected_bytes;
+    wl_columnar_memory_admission_status_t status;
+    if (!cs || !governed)
+        return EINVAL;
+    *governed = false;
+    if (bytes == 0 || !cs->memory_governor)
+        return 0;
+    if (!wl_columnar_memory_size_add(cs->diff_arr_registry_reserved_bytes,
+        cs->diff_arr_registry_metadata_reserved_bytes, &expected_bytes)
+        || cs->diff_arr_registry_reservation.identity
+        != &cs->diff_arr_registry_reservation
+        || cs->diff_arr_registry_reservation.bytes != expected_bytes
+        || atomic_load_explicit(&cs->diff_arr_registry_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+        return EBUSY;
+    status = wl_columnar_memory_begin_growth(
+        &cs->diff_arr_registry_reservation, bytes);
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+        cs->memory_budget_denied = true;
+    if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+            : EINVAL;
+    *governed = true;
+    return 0;
+}
+
+static void
+diff_registry_metadata_rollback(wl_col_session_t *cs, bool governed)
+{
+    if (governed
+        && !wl_columnar_memory_rollback_growth(
+            &cs->diff_arr_registry_reservation))
+        abort();
+}
+
+static void
+diff_registry_metadata_commit(wl_col_session_t *cs, uint64_t bytes,
+    bool governed)
+{
+    uint64_t metadata_bytes;
+    if (!wl_columnar_memory_size_add(
+            cs->diff_arr_registry_metadata_reserved_bytes, bytes,
+            &metadata_bytes))
+        abort();
+    if (governed
+        && !wl_columnar_memory_commit_growth(
+            &cs->diff_arr_registry_reservation))
+        abort();
+    cs->diff_arr_registry_metadata_reserved_bytes = metadata_bytes;
+    wl_mem_ledger_alloc(&cs->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
+}
+
+static void
+diff_registry_metadata_release(wl_col_session_t *cs, uint64_t bytes)
+{
+    uint64_t metadata_bytes;
+    uint64_t reservation_bytes;
+    if (!cs || bytes > cs->diff_arr_registry_metadata_reserved_bytes)
+        abort();
+    metadata_bytes = cs->diff_arr_registry_metadata_reserved_bytes - bytes;
+    if (cs->memory_governor) {
+        if (!wl_columnar_memory_size_add(
+                cs->diff_arr_registry_reserved_bytes, metadata_bytes,
+                &reservation_bytes)
+            || !wl_columnar_memory_reservation_downsize(
+                &cs->diff_arr_registry_reservation, reservation_bytes))
+            abort();
+    }
+    cs->diff_arr_registry_metadata_reserved_bytes = metadata_bytes;
+    wl_mem_ledger_free(&cs->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
+}
+
+static int
+diff_registry_grow(wl_col_session_t *cs, uint32_t new_capacity)
+{
+    uint64_t bytes;
+    uint64_t old_bytes;
+    uint64_t old_total_bytes;
+    uint64_t new_total_bytes;
+    bool has_reservation;
+    bool growing_reservation;
+    wl_columnar_memory_reservation_t pending;
+    if (!cs || new_capacity <= cs->diff_arr_cap
+        || diff_registry_has_pins(cs) || cs->diff_txn_count != 0)
+        return EBUSY;
+    if (cs->base.evaluation_control
+        && wl_evaluation_control_active_attempt_id(
+            cs->base.evaluation_control) != 0)
+        return ENOTSUP;
+    if (!wl_columnar_memory_size_mul(new_capacity,
+        sizeof(*cs->diff_arr_entries), &bytes) || bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(
+            cs->diff_arr_registry_reserved_bytes,
+            cs->diff_arr_registry_metadata_reserved_bytes,
+            &old_total_bytes)
+        || !wl_columnar_memory_size_add(bytes,
+        cs->diff_arr_registry_metadata_reserved_bytes,
+        &new_total_bytes))
+        return EOVERFLOW;
+
+    wl_columnar_memory_reservation_init(&pending);
+    old_bytes = cs->diff_arr_registry_reserved_bytes;
+    growing_reservation = cs->memory_governor && old_total_bytes > 0;
+    has_reservation = cs->memory_governor != NULL;
+    if (growing_reservation) {
+        if (cs->diff_arr_registry_reservation.identity
+            != &cs->diff_arr_registry_reservation
+            || cs->diff_arr_registry_reservation.bytes != old_total_bytes)
+            return EINVAL;
+        uint64_t old_state = atomic_load_explicit(
+            &cs->diff_arr_registry_reservation.state, memory_order_acquire);
+        if (old_state != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED)
+            return EBUSY;
+    } else if (has_reservation
+        && cs->diff_arr_registry_reservation.identity
+        != &cs->diff_arr_registry_reservation) {
+        wl_columnar_memory_reservation_init(
+            &cs->diff_arr_registry_reservation);
+    }
+    if (has_reservation) {
+        wl_columnar_memory_admission_status_t status;
+        if (growing_reservation)
+            status = wl_columnar_memory_begin_growth(
+                &cs->diff_arr_registry_reservation, bytes);
+        else
+            status = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(cs->memory_governor),
+                bytes, &pending);
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+            if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                cs->memory_budget_denied = true;
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+        }
+    }
+
+    col_diff_arr_entry_t *entries = (col_diff_arr_entry_t *)calloc(
+        new_capacity, sizeof(*entries));
+    if (!entries) {
+        if (growing_reservation) {
+            if (!wl_columnar_memory_rollback_growth(
+                    &cs->diff_arr_registry_reservation))
+                abort();
+        } else if (pending.identity == &pending
+            && atomic_load_explicit(&pending.state, memory_order_acquire)
+            == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            && !wl_columnar_memory_rollback(&pending)) {
+            abort();
+        }
+        return ENOMEM;
+    }
+    if (cs->diff_arr_count > 0)
+        memcpy(entries, cs->diff_arr_entries,
+            (size_t)cs->diff_arr_count * sizeof(*entries));
+
+    if (growing_reservation) {
+        if (!wl_columnar_memory_commit_growth(
+                &cs->diff_arr_registry_reservation))
+            abort();
+    } else if (has_reservation) {
+        if (!wl_columnar_memory_reservation_move(
+                &cs->diff_arr_registry_reservation, &pending))
+            abort();
+        if (!wl_columnar_memory_commit(
+                &cs->diff_arr_registry_reservation, cs))
+            abort();
+    }
+
+    free(cs->diff_arr_entries);
+    cs->diff_arr_entries = entries;
+    cs->diff_arr_cap = new_capacity;
+    cs->diff_arr_registry_reserved_bytes = bytes;
+    if (cs->memory_governor
+        && !wl_columnar_memory_reservation_downsize(
+            &cs->diff_arr_registry_reservation, new_total_bytes))
+        abort();
+    wl_mem_ledger_alloc(&cs->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT, bytes);
+    wl_mem_ledger_free(&cs->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        old_bytes);
+    return 0;
+}
+
 void
 wl_columnar_arrangement_diff_reset_state(col_diff_arrangement_t *arr)
 {
@@ -2639,17 +2850,25 @@ diff_entry_reset(col_diff_arr_entry_t *entry)
  * chains and progress counters are cleared and the token is poisoned, so
  * the caller re-indexes from row 0 (Issue #1438).
  *
- * Returns NULL on allocation failure.
+ * Returns NULL on failure and reports the typed failure through status_out.
  */
 col_diff_arrangement_t *
 col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
-    const uint32_t *key_cols, uint32_t key_count)
+    const uint32_t *key_cols, uint32_t key_count, int *status_out)
 {
-    if (!cs || !rel_name || !source_rel || key_count == 0)
+    if (status_out)
+        *status_out = 0;
+    if (!cs || !rel_name || !source_rel || !key_cols || key_count == 0) {
+        if (status_out)
+            *status_out = EINVAL;
         return NULL;
-    if (cs->diff_txn_count > 0)
+    }
+    if (cs->diff_txn_count > 0) {
+        if (status_out)
+            *status_out = EBUSY;
         return NULL;
+    }
 
     /* Search existing entries. */
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
@@ -2666,16 +2885,24 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
             }
         }
         if (match) {
-            if (e->transaction_pending)
+            if (e->transaction_pending) {
+                if (status_out)
+                    *status_out = EBUSY;
                 return NULL;
-            if (e->generation == UINT64_MAX)
+            }
+            if (e->generation == UINT64_MAX) {
+                if (status_out)
+                    *status_out = EOVERFLOW;
                 return NULL;
+            }
             col_diff_arrangement_t *arr = e->diff_arr;
             if (!wl_columnar_relation_snapshot_equal(
                     arr->source_snapshot,
                     wl_columnar_relation_snapshot(source_rel))) {
                 if (e->pin_count > 0) {
                     e->invalidation_deferred = true;
+                    if (status_out)
+                        *status_out = EBUSY;
                     return NULL;
                 }
                 diff_entry_reset(e);
@@ -2688,31 +2915,65 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
      * stores an entry address, so never relocate the flat registry beneath
      * an active lease. */
     if (cs->diff_arr_count >= cs->diff_arr_cap) {
-        if (diff_registry_has_pins(cs))
+        if (diff_registry_has_pins(cs)) {
+            if (status_out)
+                *status_out = EBUSY;
             return NULL;
-        uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
-        col_diff_arr_entry_t *ne = (col_diff_arr_entry_t *)realloc(
-            cs->diff_arr_entries, new_cap * sizeof(col_diff_arr_entry_t));
-        if (!ne)
+        }
+        if (cs->diff_arr_cap > UINT32_MAX / 2u) {
+            if (status_out)
+                *status_out = EOVERFLOW;
             return NULL;
-        cs->diff_arr_entries = ne;
-        cs->diff_arr_cap = new_cap;
+        }
+        int grow_rc = diff_registry_grow(cs, cs->diff_arr_cap
+            ? cs->diff_arr_cap * 2u : WL_DIFF_ARR_REGISTRY_INITIAL_CAP);
+        if (grow_rc != 0) {
+            if (status_out)
+                *status_out = grow_rc;
+            return NULL;
+        }
+    }
+
+    uint64_t metadata_bytes;
+    int metadata_rc = diff_registry_entry_metadata_size(rel_name, key_count,
+            &metadata_bytes);
+    if (metadata_rc != 0) {
+        if (status_out)
+            *status_out = metadata_rc;
+        return NULL;
+    }
+    bool metadata_governed;
+    metadata_rc = diff_registry_metadata_begin(cs, metadata_bytes,
+            &metadata_governed);
+    if (metadata_rc != 0) {
+        if (status_out)
+            *status_out = metadata_rc;
+        return NULL;
     }
 
     col_diff_arr_entry_t *e = &cs->diff_arr_entries[cs->diff_arr_count];
     memset(e, 0, sizeof(*e));
 
     e->rel_name = wl_strdup(rel_name);
-    if (!e->rel_name)
+    if (!e->rel_name) {
+        diff_registry_metadata_rollback(cs, metadata_governed);
+        if (status_out)
+            *status_out = ENOMEM;
         return NULL;
+    }
 
-    e->key_cols = (uint32_t *)malloc(key_count * sizeof(uint32_t));
+    e->key_cols = (uint32_t *)malloc(
+        (size_t)key_count * sizeof(uint32_t));
     if (!e->key_cols) {
         free(e->rel_name);
         e->rel_name = NULL;
+        diff_registry_metadata_rollback(cs, metadata_governed);
+        if (status_out)
+            *status_out = ENOMEM;
         return NULL;
     }
-    memcpy(e->key_cols, key_cols, key_count * sizeof(uint32_t));
+    memcpy(e->key_cols, key_cols,
+        (size_t)key_count * sizeof(uint32_t));
     e->key_count = key_count;
     e->generation = 1u;
 
@@ -2726,8 +2987,16 @@ col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
         free(e->rel_name);
         free(e->key_cols);
         memset(e, 0, sizeof(*e));
+        diff_registry_metadata_rollback(cs, metadata_governed);
+        if (status_out)
+            *status_out =
+                admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                ? ENOSPC
+                : admission_status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : ENOMEM;
         return NULL;
     }
+    diff_registry_metadata_commit(cs, metadata_bytes, metadata_governed);
     e->diff_arr->source_snapshot = (col_relation_snapshot_t){ 0, 0, 0 };
     col_diff_arrangement_attach_ledger(e->diff_arr, &cs->mem_ledger);
     cs->diff_arr_count++;
@@ -2751,11 +3020,12 @@ col_session_pin_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     memset(pin, 0, sizeof(*pin));
     if (col_rel_source_reader_acquire(source_rel, &pin->source_reader) != 0)
         return EBUSY;
+    int get_rc = 0;
     arr = col_session_get_diff_arrangement(cs, rel_name, source_rel,
-            key_cols, key_count);
+            key_cols, key_count, &get_rc);
     if (!arr) {
         (void)col_rel_source_reader_release(&pin->source_reader);
-        return EBUSY;
+        return get_rc ? get_rc : EBUSY;
     }
     for (uint32_t i = 0; i < cs->diff_arr_count; i++) {
         col_diff_arr_entry_t *candidate = &cs->diff_arr_entries[i];
@@ -2853,14 +3123,23 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         if (cs->diff_arr_count >= cs->diff_arr_cap) {
             if (diff_registry_has_pins(cs))
                 return EBUSY;
-            uint32_t new_cap = cs->diff_arr_cap ? cs->diff_arr_cap * 2u : 4u;
-            col_diff_arr_entry_t *entries = (col_diff_arr_entry_t *)realloc(
-                cs->diff_arr_entries, new_cap * sizeof(*entries));
-            if (!entries)
-                return ENOMEM;
-            cs->diff_arr_entries = entries;
-            cs->diff_arr_cap = new_cap;
+            if (cs->diff_arr_cap > UINT32_MAX / 2u)
+                return EOVERFLOW;
+            int grow_rc = diff_registry_grow(cs, cs->diff_arr_cap
+                ? cs->diff_arr_cap * 2u : 4u);
+            if (grow_rc != 0)
+                return grow_rc;
         }
+        uint64_t metadata_bytes;
+        int metadata_rc = diff_registry_entry_metadata_size(rel_name,
+                key_count, &metadata_bytes);
+        if (metadata_rc != 0)
+            return metadata_rc;
+        bool metadata_governed;
+        metadata_rc = diff_registry_metadata_begin(cs, metadata_bytes,
+                &metadata_governed);
+        if (metadata_rc != 0)
+            return metadata_rc;
         entry_index = cs->diff_arr_count;
         entry = &cs->diff_arr_entries[entry_index];
         memset(entry, 0, sizeof(*entry));
@@ -2871,6 +3150,7 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             free(entry->rel_name);
             free(entry->key_cols);
             memset(entry, 0, sizeof(*entry));
+            diff_registry_metadata_rollback(cs, metadata_governed);
             return ENOMEM;
         }
         memcpy(entry->key_cols, key_cols,
@@ -2890,8 +3170,15 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
             free(entry->rel_name);
             free(entry->key_cols);
             memset(entry, 0, sizeof(*entry));
-            return ENOMEM;
+            diff_registry_metadata_rollback(cs, metadata_governed);
+            return admission_status
+                   == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : admission_status
+                   == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : ENOMEM;
         }
+        diff_registry_metadata_commit(cs, metadata_bytes,
+            metadata_governed);
         txn->entry = entry;
         txn->pending_entry = true;
         slot = &entry->diff_arr;
@@ -2915,8 +3202,13 @@ wl_columnar_arrangement_diff_txn_begin(wl_col_session_t *cs,
         if (admission_status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
             cs->memory_budget_denied = true;
         if (txn->pending_entry) {
+            uint64_t metadata_bytes;
+            if (diff_registry_entry_metadata_size(entry->rel_name,
+                entry->key_count, &metadata_bytes) != 0)
+                abort();
             free(entry->rel_name);
             free(entry->key_cols);
+            diff_registry_metadata_release(cs, metadata_bytes);
             col_diff_arrangement_destroy(txn->persistent);
             memset(entry, 0, sizeof(*entry));
             cs->diff_arr_count--;
@@ -2976,8 +3268,13 @@ wl_columnar_arrangement_diff_txn_abort(
         && txn->entry_index < txn->session->diff_arr_cap) {
         col_diff_arr_entry_t *entry
             = &txn->session->diff_arr_entries[txn->entry_index];
+        uint64_t metadata_bytes;
+        if (diff_registry_entry_metadata_size(entry->rel_name,
+            entry->key_count, &metadata_bytes) != 0)
+            abort();
         free(entry->rel_name);
         free(entry->key_cols);
+        diff_registry_metadata_release(txn->session, metadata_bytes);
         col_diff_arrangement_destroy(txn->persistent);
         memset(entry, 0, sizeof(*entry));
         txn->session->diff_arr_count--;
@@ -3015,6 +3312,33 @@ col_session_free_diff_arrangements(wl_col_session_t *cs)
         col_diff_arrangement_destroy(cs->diff_arr_entries[i].diff_arr);
     }
     free(cs->diff_arr_entries);
+    uint64_t metadata_and_array_bytes;
+    if (!wl_columnar_memory_size_add(
+            cs->diff_arr_registry_reserved_bytes,
+            cs->diff_arr_registry_metadata_reserved_bytes,
+            &metadata_and_array_bytes))
+        abort();
+    if (metadata_and_array_bytes > 0)
+        wl_mem_ledger_free(&cs->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+            metadata_and_array_bytes);
+    if (cs->diff_arr_registry_reservation.identity
+        == &cs->diff_arr_registry_reservation) {
+        uint64_t state = atomic_load_explicit(
+            &cs->diff_arr_registry_reservation.state, memory_order_acquire);
+        if (state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED) {
+            if (!wl_columnar_memory_rollback(
+                    &cs->diff_arr_registry_reservation))
+                abort();
+        } else if (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED) {
+            if (!wl_columnar_memory_release(
+                    &cs->diff_arr_registry_reservation))
+                abort();
+        }
+    }
+    wl_columnar_memory_reservation_init(
+        &cs->diff_arr_registry_reservation);
+    cs->diff_arr_registry_reserved_bytes = 0;
+    cs->diff_arr_registry_metadata_reserved_bytes = 0;
     cs->diff_arr_entries = NULL;
     cs->diff_arr_count = 0;
     cs->diff_arr_cap = 0;
@@ -3031,7 +3355,8 @@ col_session_free_diff_arrangements(wl_col_session_t *cs)
  */
 static int
 col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
-    col_diff_arr_entry_t *dst)
+    col_diff_arr_entry_t *dst,
+    wl_columnar_memory_governor_ref_t *memory_governor)
 {
     memset(dst, 0, sizeof(*dst));
 
@@ -3055,15 +3380,23 @@ col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
 
     if (src->diff_arr) {
         col_diff_arrangement_t cold = { 0 };
+        wl_columnar_memory_admission_status_t status =
+            WL_COLUMNAR_MEMORY_ADMISSION_OK;
         cold.key_cols = src->diff_arr->key_cols;
         cold.key_count = src->diff_arr->key_count;
         cold.worker_id = src->diff_arr->worker_id;
-        dst->diff_arr = col_diff_arrangement_deep_copy(&cold);
+        dst->diff_arr =
+            col_diff_arrangement_deep_copy_with_memory_governor_status(
+            &cold, memory_governor, &status);
         if (!dst->diff_arr) {
             free(dst->key_cols);
             free(dst->rel_name);
             memset(dst, 0, sizeof(*dst));
-            return ENOMEM;
+            return status
+                   == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status
+                   == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW
+                : ENOMEM;
         }
         dst->diff_arr->source_snapshot
             = (col_relation_snapshot_t){ 0, 0, 0 };
@@ -3078,6 +3411,46 @@ col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
     return 0;
 }
 
+int
+col_diff_arr_entries_registry_size(const col_diff_arr_entry_t *src,
+    uint32_t count, uint64_t *array_bytes, uint64_t *metadata_bytes)
+{
+    uint64_t array_size;
+    uint64_t metadata_size = 0;
+    if (!array_bytes || !metadata_bytes || (count > 0 && !src)
+        || !wl_columnar_memory_size_mul(count, sizeof(*src), &array_size)
+        || array_size > SIZE_MAX)
+        return EOVERFLOW;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t name_size;
+        uint64_t key_size;
+        uint64_t entry_size;
+        if (!src[i].rel_name
+            || (src[i].key_count > 0 && !src[i].key_cols))
+            return EINVAL;
+        size_t name_length = strlen(src[i].rel_name);
+        if (name_length >= UINT64_MAX
+            || !wl_columnar_memory_size_add((uint64_t)name_length, 1u,
+            &name_size)
+            || !wl_columnar_memory_size_mul(src[i].key_count,
+            sizeof(*src[i].key_cols), &key_size)
+            || !wl_columnar_memory_size_add(name_size, key_size,
+            &entry_size)
+            || !wl_columnar_memory_size_add(metadata_size, entry_size,
+            &metadata_size))
+            return EOVERFLOW;
+        if (src[i].diff_arr
+            && src[i].diff_arr->key_count > 0
+            && !src[i].diff_arr->key_cols)
+            return EINVAL;
+    }
+    if (metadata_size > SIZE_MAX)
+        return EOVERFLOW;
+    *array_bytes = array_size;
+    *metadata_bytes = metadata_size;
+    return 0;
+}
+
 /*
  * col_diff_arr_entries_clone - Deep-copy a differential arrangement registry (#274).
  *
@@ -3089,8 +3462,19 @@ col_diff_arr_entry_clone(const col_diff_arr_entry_t *src,
  */
 int
 col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
-    col_diff_arr_entry_t **out_entries, uint32_t *out_cap)
+    col_diff_arr_entry_t **out_entries, uint32_t *out_cap,
+    wl_columnar_memory_governor_ref_t *memory_governor)
 {
+    uint64_t array_bytes;
+    uint64_t metadata_bytes;
+    int size_rc = col_diff_arr_entries_registry_size(src, count,
+            &array_bytes, &metadata_bytes);
+    (void)array_bytes;
+    (void)metadata_bytes;
+    if (size_rc != 0)
+        return size_rc;
+    if (!out_entries || !out_cap)
+        return EINVAL;
     *out_entries = NULL;
     *out_cap = 0;
 
@@ -3103,7 +3487,8 @@ col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
         return ENOMEM;
 
     for (uint32_t i = 0; i < count; i++) {
-        int clone_rc = col_diff_arr_entry_clone(&src[i], &cloned[i]);
+        int clone_rc = col_diff_arr_entry_clone(&src[i], &cloned[i],
+                memory_governor);
         if (clone_rc != 0) {
             for (uint32_t j = 0; j < i; j++) {
                 free(cloned[j].rel_name);

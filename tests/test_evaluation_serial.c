@@ -2209,7 +2209,7 @@ test_controlled_recursive_two_join_step(void)
      * detached result: 18 descriptors, zeroed at 224 per eight-byte chunk.
      * Frames and descriptors embed ABI-dependent thread IDs (e.g. Windows).
      * Keep all other work pinned independently of observed consumption. */
-    const uint64_t expected_work = UINT64_C(1167758) + UINT64_C(3) * 224
+    const uint64_t expected_work = UINT64_C(1271246) + UINT64_C(3) * 224
         * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
         + UINT64_C(18) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
@@ -2225,11 +2225,11 @@ test_controlled_recursive_two_join_step(void)
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0 && report.consumed == expected_work);
+
     wl_session_destroy(session);
     wl_evaluation_control_release(control);
     wl_plan_free(plan);
     wirelog_program_free(program);
-
     session = controlled_recursive_two_join_session(edges, 4, &plan,
             &program, &control);
     CHECK(!wl_evaluation_control_configure(control, expected_work - 1));
@@ -2561,7 +2561,7 @@ test_controlled_recursive_step_after_public_edge_append(void)
         && successor_report.result == 0);
     /* Four edges require five body rounds (including empty convergence),
      * with five operator descriptors per round, using the tariffs above. */
-    const uint64_t successor_work = UINT64_C(1709626) + UINT64_C(5) * 224
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
         + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     CHECK(successor_report.consumed == successor_work);
@@ -2599,7 +2599,7 @@ test_controlled_recursive_successor_work_boundaries(void)
     static const int64_t edges[] = { 1, 2, 2, 3, 3, 4 };
     static const int64_t later_edge[] = { 4, 5 };
     /* Same four-edge recomputation: five frames and 25 descriptors. */
-    const uint64_t successor_work = UINT64_C(1709626) + UINT64_C(5) * 224
+    const uint64_t successor_work = UINT64_C(1859706) + UINT64_C(5) * 224
         * ((wl_columnar_eval_stack_test_frame_size() + 15) / 16)
         + UINT64_C(25) * 224 * ((sizeof(col_rel_t) + 7) / 8);
     wl_plan_t *plan = NULL;
@@ -2696,8 +2696,9 @@ test_controlled_recursive_successor_stop_preserves_published_path(void)
         && old_path->nrows == 6 && !columnar->cleanup_active
         && !columnar->cleanup_pending);
     snapshot_capture_t stale_capture = {0};
-    CHECK(wl_session_snapshot(session, capture_snapshot_tuple,
-        &stale_capture) == EBUSY);
+    int snapshot_rc = wl_session_snapshot(session, capture_snapshot_tuple,
+            &stale_capture);
+    CHECK(snapshot_rc == ENOTSUP && stale_capture.count == 0);
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == rc);

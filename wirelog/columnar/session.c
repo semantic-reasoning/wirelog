@@ -334,6 +334,111 @@ session_rels_release(wl_columnar_memory_reservation_t *reservation)
         abort();
 }
 
+static int
+session_ops_count_controlled_diff_join_candidates(const wl_plan_op_t *ops,
+    uint32_t count, uint64_t *candidates)
+{
+    if (!candidates)
+        return EINVAL;
+    for (uint32_t i = 0; ops && i < count; i++) {
+        const wl_plan_op_t *op = &ops[i];
+        if (op->op == WL_PLAN_OP_JOIN && op->right_relation
+            && !op->materialized && op->key_count == 1
+            && op->left_keys && op->left_keys[0]
+            && op->right_keys && op->right_keys[0]) {
+            if (*candidates == UINT64_MAX)
+                return EOVERFLOW;
+            (*candidates)++;
+        }
+    }
+    return 0;
+}
+
+static int
+session_plan_controlled_diff_join_capacity(const wl_plan_t *plan,
+    uint32_t *capacity)
+{
+    uint64_t candidates = 0;
+    int rc;
+    if (!capacity)
+        return EINVAL;
+    *capacity = 0;
+    if (!plan || !plan->strata)
+        return 0;
+    for (uint32_t s = 0; s < plan->stratum_count; s++) {
+        const wl_plan_stratum_t *stratum = &plan->strata[s];
+        for (uint32_t r = 0; stratum->relations
+            && r < stratum->relation_count; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            rc = session_ops_count_controlled_diff_join_candidates(
+                relation->ops, relation->op_count, &candidates);
+            if (rc != 0)
+                return rc;
+        }
+        for (uint32_t r = 0; stratum->bodies
+            && r < stratum->relation_count; r++) {
+            const wl_plan_body_t *body = &stratum->bodies[r];
+            rc = session_ops_count_controlled_diff_join_candidates(
+                body->ops, body->op_count, &candidates);
+            if (rc != 0)
+                return rc;
+        }
+    }
+    if (candidates == 0)
+        return 0;
+    if (candidates > UINT32_MAX)
+        return EOVERFLOW;
+    *capacity = candidates < WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        ? WL_DIFF_ARR_REGISTRY_INITIAL_CAP : (uint32_t)candidates;
+    return 0;
+}
+
+static int
+session_diff_arr_registry_init(wl_col_session_t *sess)
+{
+    uint32_t capacity;
+    uint64_t bytes;
+    if (!sess || sess->diff_arr_entries || sess->diff_arr_cap != 0)
+        return EINVAL;
+    int rc = session_plan_controlled_diff_join_capacity(sess->plan,
+            &capacity);
+    if (rc != 0 || capacity == 0)
+        return rc;
+    if (!wl_columnar_memory_size_mul(capacity,
+        sizeof(*sess->diff_arr_entries), &bytes) || bytes > SIZE_MAX)
+        return EOVERFLOW;
+
+    wl_columnar_memory_reservation_init(
+        &sess->diff_arr_registry_reservation);
+    rc = session_rels_admit(sess, bytes,
+            &sess->diff_arr_registry_reservation);
+    if (rc != 0)
+        return rc;
+    col_diff_arr_entry_t *entries = (col_diff_arr_entry_t *)calloc(
+        capacity, sizeof(*entries));
+    if (!entries) {
+        session_rels_release(&sess->diff_arr_registry_reservation);
+        return ENOMEM;
+    }
+
+    sess->diff_arr_entries = entries;
+    sess->diff_arr_cap = capacity;
+    sess->diff_arr_registry_reserved_bytes = bytes;
+    if (sess->memory_governor
+        && !wl_columnar_memory_commit(
+            &sess->diff_arr_registry_reservation, sess)) {
+        free(sess->diff_arr_entries);
+        sess->diff_arr_entries = NULL;
+        sess->diff_arr_cap = 0;
+        sess->diff_arr_registry_reserved_bytes = 0;
+        session_rels_release(&sess->diff_arr_registry_reservation);
+        return EINVAL;
+    }
+    wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        bytes);
+    return 0;
+}
+
 static void
 session_invalidate_relation_caches(wl_col_session_t *sess, const char *name)
 {
@@ -3263,6 +3368,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     wl_columnar_memory_reservation_init(
         &sess->delta_observer_retirement_metadata);
     wl_columnar_memory_reservation_init(&sess->delta_queue_ring_reservation);
+    wl_columnar_memory_reservation_init(
+        &sess->diff_arr_registry_reservation);
 
     sess->frontier_ops = &col_frontier_epoch_ops;
 
@@ -3519,6 +3626,10 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     sess->mat_cache.ledger = &sess->mem_ledger;
     (void)col_mat_cache_attach_reclaimer(&sess->mat_cache);
     ledger_charge_allocators(sess);
+    relation_create_rc = session_diff_arr_registry_init(sess);
+    if (relation_create_rc != 0)
+        goto oom;
+    relation_create_rc = ENOMEM;
 
     /* Issue #264: Initialize differential path master switch.
      * Default: enabled (true). Users can disable via WIRELOG_DIFF_ENABLED=0
@@ -3752,6 +3863,7 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     return 0;
 
 oom:
+    (void)col_session_free_diff_arrangements(sess);
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, true);
     (void)session_destroy_relation_array_pass(sess->rels, sess->nrels, false);
     free((void *)sess->rels);
@@ -4243,6 +4355,10 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->diff_arr_entries = NULL;
     out_worker->diff_arr_count = 0;
     out_worker->diff_arr_cap = 0;
+    wl_columnar_memory_reservation_init(
+        &out_worker->diff_arr_registry_reservation);
+    out_worker->diff_arr_registry_reserved_bytes = 0;
+    out_worker->diff_arr_registry_metadata_reserved_bytes = 0;
     out_worker->darr_entries = NULL;
     out_worker->darr_count = 0;
     out_worker->darr_cap = 0;
@@ -4416,12 +4532,48 @@ col_worker_session_create(wl_col_session_t *coordinator,
                 &out_worker->mem_ledger);
     }
     if (coordinator->diff_arr_count > 0) {
-        int rc = col_diff_arr_entries_clone(coordinator->diff_arr_entries,
-                coordinator->diff_arr_count, &out_worker->diff_arr_entries,
-                &out_worker->diff_arr_cap);
-        if (rc != 0)
+        uint64_t array_bytes;
+        uint64_t metadata_bytes;
+        uint64_t bytes;
+        wl_columnar_memory_reservation_t pending;
+        wl_columnar_memory_reservation_init(&pending);
+        int rc = col_diff_arr_entries_registry_size(
+            coordinator->diff_arr_entries, coordinator->diff_arr_count,
+            &array_bytes, &metadata_bytes);
+        if (rc != 0 || !wl_columnar_memory_size_add(array_bytes,
+            metadata_bytes, &bytes)) {
+            failure_rc = rc != 0 ? rc : EOVERFLOW;
             goto cleanup;
+        }
+        rc = session_rels_admit(out_worker, bytes, &pending);
+        if (rc != 0) {
+            failure_rc = rc;
+            goto cleanup;
+        }
+        rc = col_diff_arr_entries_clone(coordinator->diff_arr_entries,
+                coordinator->diff_arr_count, &out_worker->diff_arr_entries,
+                &out_worker->diff_arr_cap, out_worker->memory_governor);
+        if (rc != 0) {
+            session_rels_release(&pending);
+            if (rc == ENOSPC)
+                out_worker->memory_budget_denied = true;
+            failure_rc = rc;
+            goto cleanup;
+        }
         out_worker->diff_arr_count = coordinator->diff_arr_count;
+        out_worker->diff_arr_registry_reserved_bytes = array_bytes;
+        out_worker->diff_arr_registry_metadata_reserved_bytes =
+            metadata_bytes;
+        if (out_worker->memory_governor) {
+            if (!wl_columnar_memory_reservation_move(
+                    &out_worker->diff_arr_registry_reservation, &pending))
+                abort();
+            if (!wl_columnar_memory_commit(
+                    &out_worker->diff_arr_registry_reservation, out_worker))
+                abort();
+        }
+        wl_mem_ledger_alloc(&out_worker->mem_ledger,
+            WL_MEM_SUBSYS_ARRANGEMENT, bytes);
         for (uint32_t i = 0; i < out_worker->diff_arr_count; i++)
             col_diff_arrangement_attach_ledger(
                 out_worker->diff_arr_entries[i].diff_arr,
@@ -7796,9 +7948,11 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             sess->has_evaluated = true;
             sess->uncommitted_strata_done = 0;
             sess->snapshot_stable_valid = true;
-            for (uint32_t i = 0; i < sess->nrels; ++i)
-                if (sess->rels[i])
-                    sess->rels[i]->base_nrows = sess->rels[i]->nrows;
+            for (uint32_t i = 0; i < sess->nrels; ++i) {
+                col_rel_t *rel = sess->rels[i];
+                if (rel)
+                    rel->base_nrows = rel->nrows;
+            }
             session_retired_rows_clear(sess);
             recursive->committed = true;
             recursive->phase = COL_CONTROLLED_RECURSIVE_FINALIZE_COMMITTED;

@@ -1104,6 +1104,146 @@ test_worker_registry_pointer_admission(void)
     PASS();
 }
 
+static void
+test_worker_diff_registry_accounting(void)
+{
+    TEST("worker differential registry clone is governed and ledger-accounted");
+    wl_plan_t *plan = build_plan(".decl right(x: int64)\n"
+            ".decl out(x: int64)\n"
+            "out(x) :- right(x).\n");
+    wl_session_t *session = NULL;
+    wl_col_session_t worker = { 0 };
+    int64_t value = 17;
+    uint32_t key_col = 0;
+    const char *failure = NULL;
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 2,
+        &session) != 0 || !session) {
+        failure = "session fixture";
+        goto cleanup;
+    }
+    wl_col_session_t *coordinator = COL_SESSION(session);
+    if (wl_session_insert(session, "right", &value, 1, 1) != 0) {
+        failure = "source relation setup";
+        goto cleanup;
+    }
+    col_rel_t *right = session_find_rel(coordinator, "right");
+    if (!right || !col_session_get_diff_arrangement(coordinator, "right",
+        right, &key_col, 1, NULL)) {
+        failure = "coordinator differential arrangement setup";
+        goto cleanup;
+    }
+    wl_columnar_memory_governor_ref_t *governor_ref =
+        coordinator->memory_governor;
+    wl_columnar_memory_governor_t *governor =
+        wl_columnar_memory_governor_ref_get(governor_ref);
+    uint64_t governor_baseline = wl_columnar_memory_reserved(governor);
+    uint64_t expected_array_bytes;
+    uint64_t expected_metadata_bytes;
+    if (col_diff_arr_entries_registry_size(coordinator->diff_arr_entries,
+        coordinator->diff_arr_count, &expected_array_bytes,
+        &expected_metadata_bytes) != 0) {
+        failure = "worker registry clone size";
+        goto cleanup;
+    }
+    uint64_t expected_bytes = expected_array_bytes + expected_metadata_bytes;
+    uint64_t clone_arrangement_bytes;
+    uint64_t clone_key_bytes;
+    if (!wl_columnar_memory_size_mul(
+            coordinator->diff_arr_entries[0].diff_arr->key_count,
+            sizeof(uint32_t), &clone_key_bytes)
+        || !wl_columnar_memory_size_add(sizeof(col_diff_arrangement_t),
+        clone_key_bytes, &clone_arrangement_bytes)) {
+        failure = "worker arrangement clone size";
+        goto cleanup;
+    }
+    wl_columnar_memory_reservation_t registry_reservation;
+    wl_columnar_memory_reservation_init(&registry_reservation);
+    wl_columnar_memory_admission_status_t admission_status
+        = wl_columnar_memory_reserve_checked(governor, expected_bytes,
+            &registry_reservation);
+    if (admission_status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+        && admission_status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        failure = "worker registry reservation fixture";
+        goto cleanup;
+    }
+    if (!wl_columnar_memory_commit(&registry_reservation,
+        &registry_reservation)) {
+        (void)wl_columnar_memory_rollback(&registry_reservation);
+        failure = "worker registry reservation commit";
+        goto cleanup;
+    }
+    uint64_t clone_baseline = wl_columnar_memory_reserved(governor);
+    uint64_t usable_before = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_acquire);
+    if (clone_arrangement_bytes == 0
+        || clone_baseline > UINT64_MAX - clone_arrangement_bytes) {
+        failure = "worker arrangement clone budget size";
+        (void)wl_columnar_memory_release(&registry_reservation);
+        goto cleanup;
+    }
+    atomic_store_explicit(&governor->usable_bytes,
+        clone_baseline + clone_arrangement_bytes - 1u,
+        memory_order_release);
+    col_diff_arr_entry_t *denied_clone = NULL;
+    uint32_t denied_clone_capacity = 0;
+    int clone_rc = col_diff_arr_entries_clone(coordinator->diff_arr_entries,
+            coordinator->diff_arr_count, &denied_clone, &denied_clone_capacity,
+            governor_ref);
+    atomic_store_explicit(&governor->usable_bytes, usable_before,
+        memory_order_release);
+    bool clone_denial_balanced = clone_rc == ENOSPC && !denied_clone
+        && denied_clone_capacity == 0
+        && wl_columnar_memory_reserved(governor) == clone_baseline;
+    if (!wl_columnar_memory_release(&registry_reservation)
+        || !clone_denial_balanced
+        || wl_columnar_memory_reserved(governor) != governor_baseline) {
+        failure = "worker arrangement clone denial did not roll back";
+        goto cleanup;
+    }
+    if (col_worker_session_create(coordinator, 0, NULL, 0, &worker) != 0) {
+        failure = "worker clone";
+        goto cleanup;
+    }
+    wl_mem_ledger_snapshot_t worker_ledger;
+    wl_mem_ledger_snapshot(&worker.mem_ledger, &worker_ledger);
+    if (!worker.diff_arr_entries
+        || worker.diff_arr_count != coordinator->diff_arr_count
+        || worker.diff_arr_registry_reserved_bytes != expected_array_bytes
+        || worker.diff_arr_registry_metadata_reserved_bytes
+        != expected_metadata_bytes
+        || worker.diff_arr_registry_reservation.bytes != expected_bytes
+        || atomic_load_explicit(&worker.diff_arr_registry_reservation.state,
+        memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || worker_ledger.subsys_bytes[WL_MEM_SUBSYS_ARRANGEMENT]
+        < expected_bytes) {
+        failure = "worker registry clone accounting";
+        goto cleanup;
+    }
+    if (col_worker_session_destroy(&worker) != 0) {
+        failure = "worker cleanup";
+        goto cleanup;
+    }
+    if (wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(coordinator->memory_governor))
+        != governor_baseline) {
+        failure = "worker clone cleanup leaked reservation";
+        goto cleanup;
+    }
+cleanup:
+    if (worker.memory_governor)
+        (void)col_worker_session_destroy(&worker);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+}
+
 static uint64_t
 test_auto_metadata_bytes(uint32_t ncols)
 {
@@ -2097,8 +2237,9 @@ static void
 test_session_create_destroy_impl(const wl_compute_backend_t *backend)
 {
     wl_plan_t *ffi = build_plan(".decl a(x: int32)\n"
+            ".decl b(x: int32)\n"
             ".decl r(x: int32)\n"
-            "r(x) :- a(x).\n");
+            "r(x) :- a(x), b(x).\n");
     if (!ffi) {
         FAIL("could not generate FFI plan");
         return;
@@ -2112,6 +2253,24 @@ test_session_create_destroy_impl(const wl_compute_backend_t *backend)
         return;
     }
 
+    wl_col_session_t *col_session = COL_SESSION(session);
+    uint64_t expected_registry_bytes = WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        * sizeof(col_diff_arr_entry_t);
+    wl_mem_ledger_snapshot_t ledger;
+    wl_mem_ledger_snapshot(&col_session->mem_ledger, &ledger);
+    if (!col_session->diff_arr_entries
+        || col_session->diff_arr_count != 0
+        || col_session->diff_arr_cap != WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        || col_session->diff_arr_registry_reserved_bytes
+        != expected_registry_bytes
+        || ledger.subsys_bytes[WL_MEM_SUBSYS_ARRANGEMENT]
+        < expected_registry_bytes) {
+        wl_session_destroy(session);
+        wl_plan_free(ffi);
+        FAIL("controlled differential registry was not pre-admitted");
+        return;
+    }
+
     wl_session_destroy(session);
     wl_plan_free(ffi);
     PASS();
@@ -2122,6 +2281,304 @@ test_session_create_destroy(void)
 {
     TEST("session(columnar): create and destroy");
     test_session_create_destroy_impl(wl_backend_columnar());
+}
+
+static void
+test_session_nonjoin_skips_diff_registry_admission(void)
+{
+    TEST("session: non-JOIN plan skips differential registry admission");
+    wl_plan_t *plan = build_plan(".decl input(x: int64)\n"
+            ".decl output(x: int64)\n"
+            "output(x) :- input(x).\n");
+    wl_session_t *session = NULL;
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) != 0 || !session) {
+        if (plan)
+            wl_plan_free(plan);
+        FAIL("session fixture");
+        return;
+    }
+    wl_col_session_t *col_session = COL_SESSION(session);
+    bool skipped = !col_session->diff_arr_entries
+        && col_session->diff_arr_count == 0 && col_session->diff_arr_cap == 0
+        && col_session->diff_arr_registry_reserved_bytes == 0
+        && col_session->diff_arr_registry_metadata_reserved_bytes == 0;
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (!skipped) {
+        FAIL("unrelated plan retained a differential registry reservation");
+        return;
+    }
+    PASS();
+}
+
+static void
+test_session_preallocates_registry_for_join_candidates(void)
+{
+    TEST("session: differential registry covers all JOIN candidates");
+    wl_plan_t *plan = build_plan(
+        ".decl a(x: int64)\n"
+        ".decl b(x: int64)\n"
+        ".decl c(x: int64)\n"
+        ".decl d(x: int64)\n"
+        ".decl e(x: int64)\n"
+        ".decl f(x: int64)\n"
+        ".decl output(x: int64)\n"
+        "output(x) :- a(x), b(x), c(x), d(x), e(x), f(x).\n");
+    wl_session_t *session = NULL;
+    if (!plan || wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) != 0 || !session) {
+        if (plan)
+            wl_plan_free(plan);
+        FAIL("session fixture");
+        return;
+    }
+    wl_col_session_t *columnar = COL_SESSION(session);
+    bool admitted = columnar->diff_arr_entries
+        && columnar->diff_arr_cap > WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_registry_reserved_bytes
+        == (uint64_t)columnar->diff_arr_cap
+        * sizeof(*columnar->diff_arr_entries);
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    if (!admitted) {
+        FAIL("JOIN candidate registry did not pre-admit its full capacity");
+        return;
+    }
+    PASS();
+}
+
+static wl_columnar_memory_governor_ref_t *enforcing_governor(uint64_t usable);
+
+static void
+test_diff_registry_growth_admission(void)
+{
+    TEST("differential registry growth admits overlap and fails closed");
+#define REGISTRY_CHECK(c, m) do { if (!(c)) { failure = (m); goto cleanup; \
+                                  } } while (0)
+    static const char source[] =
+        ".decl a(x: int64)\n"
+        ".decl b(x: int64)\n"
+        ".decl c(x: int64)\n"
+        ".decl d(x: int64)\n"
+        ".decl e(x: int64)\n"
+        ".decl oa(x: int64)\n"
+        ".decl ob(x: int64)\n"
+        ".decl oc(x: int64)\n"
+        ".decl od(x: int64)\n"
+        ".decl oe(x: int64)\n"
+        "oa(x) :- a(x).\n"
+        "ob(x) :- b(x).\n"
+        "oc(x) :- c(x).\n"
+        "od(x) :- d(x).\n"
+        "oe(x) :- e(x).\n";
+    static const char *const names[] = { "a", "b", "c", "d", "e" };
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    wl_session_options_t options;
+    wl_columnar_memory_governor_ref_t *memory_ref = NULL;
+    wl_evaluation_control_t *control = NULL;
+    wl_col_session_t *columnar = NULL;
+    wl_columnar_memory_governor_t *governor = NULL;
+    bool control_active = false;
+    uint64_t usable_before = UINT64_MAX;
+    uint64_t registry_reserved_before_destroy = 0;
+    uint64_t reserved_before_destroy = 0;
+    uint32_t key_col = 0;
+    int64_t value = 1;
+    const char *failure = NULL;
+
+    plan = build_plan(source);
+    memory_ref = enforcing_governor(UINT64_MAX);
+    REGISTRY_CHECK(plan && memory_ref, "fixture");
+    REGISTRY_CHECK(wl_evaluation_control_create(0, &control) == 0,
+        "control creation");
+    wl_session_options_init(&options);
+    options.memory_governor = memory_ref;
+    options.evaluation_control = control;
+    REGISTRY_CHECK(wl_session_create_with_options(wl_backend_columnar(),
+        plan, 1, &options, &session) == 0 && session, "session creation");
+    columnar = COL_SESSION(session);
+    governor = wl_columnar_memory_governor_ref_get(memory_ref);
+    usable_before = atomic_load_explicit(&governor->usable_bytes,
+            memory_order_acquire);
+    for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        REGISTRY_CHECK(wl_session_insert(session, names[i], &value, 1, 1)
+            == 0, "source insertion");
+
+    for (uint32_t i = 0; i < WL_DIFF_ARR_REGISTRY_INITIAL_CAP; i++) {
+        col_rel_t *rel = session_find_rel(columnar, names[i]);
+        REGISTRY_CHECK(rel && col_session_get_diff_arrangement(columnar,
+            names[i], rel, &key_col, 1, NULL), "initial registry entry");
+    }
+    REGISTRY_CHECK(columnar->diff_arr_cap == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP,
+        "initial capacity fixture");
+
+    col_diff_arr_entry_t *old_entries = columnar->diff_arr_entries;
+    uint64_t old_registry_bytes = columnar->diff_arr_registry_reserved_bytes;
+    uint64_t old_metadata_bytes =
+        columnar->diff_arr_registry_metadata_reserved_bytes;
+    uint64_t old_reserved = wl_columnar_memory_reserved(governor);
+    wl_mem_ledger_snapshot_t old_ledger;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &old_ledger);
+    uint64_t old_ledger_bytes =
+        old_ledger.subsys_bytes[WL_MEM_SUBSYS_ARRANGEMENT];
+    uint64_t grown_registry_bytes;
+    REGISTRY_CHECK(wl_columnar_memory_size_mul(2u
+        * WL_DIFF_ARR_REGISTRY_INITIAL_CAP,
+        sizeof(*columnar->diff_arr_entries), &grown_registry_bytes),
+        "growth size");
+
+    const void *owner = session->operation_admission;
+    REGISTRY_CHECK(wl_evaluation_control_begin(control, owner) == 0,
+        "controlled attempt begin");
+    control_active = true;
+    col_rel_t *fifth = session_find_rel(columnar, "e");
+    wl_columnar_arrangement_diff_txn_t txn = { 0 };
+    int rc = wl_columnar_arrangement_diff_txn_begin(columnar, "e", fifth,
+            &key_col, 1, &txn);
+    REGISTRY_CHECK(rc == ENOTSUP
+        && columnar->diff_arr_entries == old_entries
+        && columnar->diff_arr_cap == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP,
+        "controlled attempt did not fail closed before growth");
+    REGISTRY_CHECK(wl_evaluation_control_finish(control, owner, rc, 0)
+        == ENOTSUP,
+        "controlled attempt finish");
+    control_active = false;
+    REGISTRY_CHECK(wl_columnar_memory_reserved(governor) == old_reserved,
+        "controlled refusal changed reservation");
+
+    REGISTRY_CHECK(old_reserved <= UINT64_MAX - grown_registry_bytes,
+        "short growth threshold overflow");
+    atomic_store_explicit(&governor->usable_bytes,
+        old_reserved + grown_registry_bytes - 1u, memory_order_release);
+    int status = 0;
+    REGISTRY_CHECK(!col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && status == ENOSPC
+        && columnar->diff_arr_entries == old_entries
+        && columnar->diff_arr_cap == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && wl_columnar_memory_reserved(governor) == old_reserved
+        && columnar->diff_arr_registry_reserved_bytes == old_registry_bytes
+        && columnar->diff_arr_registry_metadata_reserved_bytes
+        == old_metadata_bytes,
+        "one-byte-short overlap admission changed the registry");
+    wl_mem_ledger_snapshot_t after_denial;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &after_denial);
+    REGISTRY_CHECK(after_denial.subsys_bytes[WL_MEM_SUBSYS_ARRANGEMENT]
+        == old_ledger_bytes, "denied growth changed arrangement ledger");
+    atomic_store_explicit(&governor->usable_bytes, usable_before,
+        memory_order_release);
+
+#if defined(WL_TEST_ALLOC_WRAP)
+    fail_calloc_size = (size_t)grown_registry_bytes;
+    status = 0;
+    REGISTRY_CHECK(!col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && status == ENOMEM && fail_calloc_size == 0
+        && columnar->diff_arr_entries == old_entries
+        && columnar->diff_arr_cap == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && wl_columnar_memory_reserved(governor) == old_reserved,
+        "allocator failure did not roll back growth reservation");
+#endif
+
+    REGISTRY_CHECK(old_reserved <= UINT64_MAX - grown_registry_bytes,
+        "exact growth threshold overflow");
+    atomic_store_explicit(&governor->usable_bytes,
+        old_reserved + grown_registry_bytes, memory_order_release);
+    status = 0;
+    REGISTRY_CHECK(!col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && status == ENOSPC
+        && columnar->diff_arr_entries != old_entries
+        && columnar->diff_arr_cap
+        == 2u * WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_registry_reserved_bytes
+        == grown_registry_bytes
+        && columnar->diff_arr_registry_metadata_reserved_bytes
+        == old_metadata_bytes
+        && columnar->diff_arr_registry_reservation.bytes
+        == grown_registry_bytes + old_metadata_bytes,
+        "exact overlap fit did not publish only the grown registry");
+    uint64_t grown_reserved = wl_columnar_memory_reserved(governor);
+    REGISTRY_CHECK(grown_reserved == old_reserved
+        + grown_registry_bytes - old_registry_bytes,
+        "old registry credit did not follow the storage swap");
+
+    uint64_t fifth_metadata_bytes = strlen("e") + 1u + sizeof(key_col);
+    REGISTRY_CHECK(grown_reserved <= UINT64_MAX - fifth_metadata_bytes,
+        "metadata threshold overflow");
+    atomic_store_explicit(&governor->usable_bytes,
+        grown_reserved + fifth_metadata_bytes - 1u, memory_order_release);
+    status = 0;
+    REGISTRY_CHECK(!col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && status == ENOSPC
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_registry_metadata_reserved_bytes
+        == old_metadata_bytes
+        && wl_columnar_memory_reserved(governor) == grown_reserved,
+        "one-byte-short entry metadata admission changed the registry");
+
+#if defined(WL_TEST_ALLOC_WRAP)
+    atomic_store_explicit(&governor->usable_bytes, usable_before,
+        memory_order_release);
+    fail_malloc_size = sizeof(key_col);
+    status = 0;
+    REGISTRY_CHECK(!col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && status == ENOMEM && fail_malloc_size == 0
+        && columnar->diff_arr_count == WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+        && columnar->diff_arr_registry_metadata_reserved_bytes
+        == old_metadata_bytes
+        && wl_columnar_memory_reserved(governor) == grown_reserved,
+        "entry key allocation failure leaked admitted metadata");
+#endif
+    atomic_store_explicit(&governor->usable_bytes, usable_before,
+        memory_order_release);
+    REGISTRY_CHECK(col_session_get_diff_arrangement(columnar, "e", fifth,
+        &key_col, 1, &status) && columnar->diff_arr_count
+        == WL_DIFF_ARR_REGISTRY_INITIAL_CAP + 1u
+        && columnar->diff_arr_registry_metadata_reserved_bytes
+        == old_metadata_bytes + fifth_metadata_bytes,
+        "registry entry creation after admission failed");
+
+cleanup:
+#if defined(WL_TEST_ALLOC_WRAP)
+    fail_calloc_size = 0;
+    fail_malloc_size = 0;
+#endif
+    if (governor && control_active)
+        (void)wl_evaluation_control_finish(control,
+            session ? session->operation_admission : NULL, EFAULT, 0);
+    if (governor)
+        atomic_store_explicit(&governor->usable_bytes, usable_before,
+            memory_order_release);
+    if (columnar && !failure) {
+        registry_reserved_before_destroy =
+            columnar->diff_arr_registry_reservation.bytes;
+        reserved_before_destroy = wl_columnar_memory_reserved(governor);
+    }
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (memory_ref && !failure
+        && (registry_reserved_before_destroy > reserved_before_destroy
+        || wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(memory_ref))
+        > reserved_before_destroy - registry_reserved_before_destroy))
+        failure = "registry cleanup leaked governor reservation";
+    if (control)
+        wl_evaluation_control_release(control);
+    if (memory_ref)
+        wl_columnar_memory_governor_ref_release(memory_ref);
+#undef REGISTRY_CHECK
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
 }
 
 static void
@@ -2304,7 +2761,8 @@ test_session_injected_governor_admission(void)
     /* The intern table fits but the compound arena does not: creation fails
      * and the oom path detaches the table it attached. */
     TEST("session(#1473): injected governor denies below the compound floor");
-    ref = enforcing_governor(intern_bytes + compound_bytes - 1u);
+    ref = enforcing_governor(intern_bytes + 16u * sizeof(col_rel_t *)
+            + compound_bytes - 1u);
     options.memory_governor = ref;
     session = NULL;
     rc = ref ? wl_session_create_with_options(wl_backend_columnar(), plan, 1,
@@ -2344,8 +2802,8 @@ test_session_injected_governor_admission(void)
     PASS();
 
     /* Exact fit includes the EDB descriptor/name alongside the existing
-     * intern, compound and registry floor. Destroy releases everything but the
-     * program-owned intern reservation. */
+     * intern, compound and both session registry floors. Destroy releases
+     * everything but the program-owned intern reservation. */
     TEST("session(#1473): injected governor admits the exact floor");
     ref = enforcing_governor(intern_bytes + compound_bytes
             + registry_bytes + descriptor_bytes);
@@ -16610,6 +17068,7 @@ main(void)
     test_session_registry_pointer_admission();
     test_retraction_registry_pointer_admission();
     test_worker_registry_pointer_admission();
+    test_worker_diff_registry_accounting();
     test_retained_relation_admission();
     test_bulk_relation_append_transaction();
     test_governed_compaction_transaction();
@@ -16617,6 +17076,9 @@ main(void)
     test_intern_rebinds_to_next_session();
     test_intern_rebind_waits_for_last_holder();
     test_session_create_destroy();
+    test_session_nonjoin_skips_diff_registry_admission();
+    test_session_preallocates_registry_for_join_candidates();
+    test_diff_registry_growth_admission();
     test_session_create_destroy_columnar();
     test_session_create_with_options();
     test_session_injected_governor_admission();

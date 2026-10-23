@@ -3610,8 +3610,19 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 op->right_relation, right, rk, kc, &diff_txn);
         if (txn_rc == 0)
             darr = diff_txn.working;
-        else
+        else {
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
+            if (txn_rc == ENOTSUP) {
+                WL_DIFF_RELEASE_TMP();
+                col_rel_destroy(out);
+                wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+                wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(
+                    stack, &left_e, txn_rc);
+            }
+        }
     }
 
     if (darr && darr->indexed_rows != right->nrows) {
