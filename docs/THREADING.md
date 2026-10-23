@@ -893,6 +893,23 @@ starting retirement and must not use any other raw pointer afterward.
 
 The complete source audit now contains **245 atomic call sites**.
 
+### 5.25 Managed binary candidate merge (#1821)
+
+The managed candidate attempt acquires descriptor and storage reader gates for
+both input relations in one all-or-release round. Its receipt, input pointers,
+output builders, and retirement receipts are address- and creator-thread-bound;
+the caller keeps both input descriptors alive and excludes raw-pointer use until
+cleanup reaches DONE. Source and candidate remain immutable for the full round.
+
+`take_result` transfers the replacement and delta together once. Before that
+cutoff the attempt owns every output allocation; after it the caller owns both
+outputs, while the attempt retains the scratch builder and both input gates
+through charged maintenance cleanup. A terminal evaluation stop keeps those
+resources reachable and requires abort cleanup with a fresh maintenance
+control. ACK is valid only after every retirement receipt is DONE and the input
+reader round is released. Calls, including cleanup and ACK, stay on the thread
+that began the attempt.
+
 ---
 
 ## 6. Lock-free SPSC delta queue

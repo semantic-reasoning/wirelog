@@ -2783,6 +2783,31 @@ lifetime before retirement and must not use outstanding raw pointers after
 that handoff. Allocator/free latency remains a non-preemptible library call;
 the protocol bounds engine work between those calls, not wall-clock time.
 
+### Managed binary candidate replacement (#1821 increment)
+
+`wl_columnar_managed_candidate_merge_t` is a separate, immutable-input path
+for unnamed private two-column INT64 relations. It rejects shared, aliased,
+timestamped, compound, schema-bearing, ledger-attached, or delta-baseline inputs
+before allocating output. Source must already be globally sorted; candidate rows may
+be unsorted and duplicated. Both relations must use the same governor (or both
+be ungoverned). The path copies both inputs into a private replacement and
+scratch relation, performs bottom-up numeric sorting and deduplication, then
+subtracts source rows with a resumable binary search to create the novel delta.
+
+Every comparison cell, copied cell, builder action and state transition spends
+the original attempt's work allowance, under one 64-action maximum per call.
+The nested relation builders use that same attempt. Allocation and allocator
+latency remain non-preemptible calls, but every allocation/admission action is
+charged and every partial pointer/token remains reachable through the attempt.
+The canonical union and delta stay private until `take_result` transfers both
+outputs together at its no-fail cutoff. Before that cutoff, stop cleanup retires
+all private builders; after it, the caller owns both outputs while the attempt
+retires only scratch and releases its input-reader round. Cleanup uses a fresh
+maintenance attempt and retains each retirement receipt until ACK.
+
+This restricted primitive does not itself wire candidate replacement into all
+operator paths or complete issue #1821.
+
 ## Persistent unary result replacement
 
 The internal `wl_columnar_eval_stack_unary_*` protocol keeps the original
