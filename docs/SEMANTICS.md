@@ -810,13 +810,17 @@ still leaves the already admitted tariff in the attempt's work count. This is
 a logical admission cost, not an allocator-time estimate: `malloc`/`free`
 latency remains synchronous and has no wall-clock bound.
 
-Controlled initial STEP now supports the generated two-column INT64 reachability
-plan `path(x,y) :- edge(x,y); path(x,z) :- path(x,y), edge(y,z)`, including its
-exact terminal zero-worker `EXCHANGE`. That terminal node is a charged fixed-cost
-no-op in this single-session evaluator; it preserves the result stack and never
-invokes redistribution. Other `EXCHANGE` positions or metadata remain
-unsupported. Eligibility requires the exact one-stratum, one-target plan and a
-single registered `edge` input. The evaluator snapshots and leases `edge` from
+Controlled initial STEP supports the generated two-column INT64 path plans with
+either recursive rule `path(x,z) :- path(x,y), edge(y,z)` or
+`path(x,w) :- path(x,y), edge(y,z), edge(z,w)`, together with the base rule
+`path(x,y) :- edge(x,y)`. The two-edge form extends each recursive path by two
+edges per round, matching the rule's semantics; it is not a general transitive
+closure rewrite. Both forms require the exact one-stratum, one-target plan and a
+single registered `edge` input. Other recursive join counts and operators are
+rejected before an evaluation attempt. The terminal zero-worker `EXCHANGE` is a
+charged fixed-cost no-op in this single-session evaluator; it preserves the
+result stack and never invokes redistribution. Other `EXCHANGE` positions or
+metadata remain unsupported. The evaluator snapshots and leases `edge` from
 before the first recursive body read through convergence, then checks that the
 snapshot still matches after acquiring the lease.
 
@@ -1546,8 +1550,8 @@ cancellation. Output cells and B2 append work contribute between pair
 checkpoints, so this fixture measurement is not a general source tariff.
 
 Supported serial nonrecursive STEP now uses the bounded default proof described
-above. The single-relation INT64 reachability STEP described above is the only
-recursive route admitted; other recursive plans and unsupported whole-session
+above. The single-relation INT64 path plans described above are the only
+recursive routes admitted; other recursive plans and unsupported whole-session
 routes are rejected before evaluation. Controlled SNAPSHOT remains unsupported.
 TDD/multiworker, differential, and whole controlled observer delivery remain
 outside this slice.
