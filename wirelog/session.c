@@ -147,13 +147,15 @@ wl_session_operation_begin(wl_session_t *session)
 
 static void wl_session_operation_end(wl_session_t *session);
 
+/* Reserve the operation before querying backend mutation policy, so neither
+ * STEP nor an exclusive attempt can race authorization and commit. */
 static int
-wl_session_operation_begin_insert(wl_session_t *session,
-    const char *relation, uint32_t num_rows, uint32_t num_cols)
+wl_session_operation_begin_mutation(wl_session_t *session, bool insert,
+    const char *relation, uint32_t num_rows, uint32_t num_cols,
+    bool *controlled_mutation)
 {
+    *controlled_mutation = false;
     wl_session_admission_t *admission = session->operation_admission;
-    bool controlled_complete;
-
     if (!admission)
         return 0;
     if (wl_session_admission_lock(admission) != 0)
@@ -165,19 +167,34 @@ wl_session_operation_begin_insert(wl_session_t *session,
         wl_session_checked_unlock(admission);
         return EBUSY;
     }
-    controlled_complete = admission->controlled_step_complete;
+    bool controlled_complete = admission->controlled_step_complete;
     admission->active_operations++;
     wl_session_checked_unlock(admission);
+    if (!controlled_complete)
+        return 0;
 
-    if (controlled_complete
-        && (!session->backend
-        || !session->backend->session_controlled_step_authorize_insert
-        || !session->backend->session_controlled_step_authorize_insert(
-            session, relation, num_rows, num_cols))) {
-        wl_session_operation_end(session);
-        return EBUSY;
+    wl_controlled_step_state_t state =
+        session->backend && session->backend->session_controlled_step_state
+        ? session->backend->session_controlled_step_state(session)
+        : WL_CONTROLLED_STEP_IDLE;
+    int rc = EBUSY;
+    if (state == WL_CONTROLLED_STEP_COMPLETE
+        || state == WL_CONTROLLED_STEP_RETRYABLE) {
+        if (insert && session->backend->session_controlled_step_authorize_insert
+            && session->backend->session_controlled_step_authorize_insert(
+                session, relation, num_rows, num_cols))
+            return 0;
+        if (session->backend->session_controlled_mutation_admit
+            && session->backend->session_controlled_mutation_committed) {
+            rc = session->backend->session_controlled_mutation_admit(session,
+                    insert, relation, num_rows, num_cols);
+            if (!rc)
+                *controlled_mutation = true;
+        }
     }
-    return 0;
+    if (rc)
+        wl_session_operation_end(session);
+    return rc;
 }
 
 /* A controlled step owns the session across calls while its framed host
@@ -722,10 +739,11 @@ wl_session_insert(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
 {
     int rc;
+    bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin_insert(session, relation, num_rows,
-            num_cols);
+    rc = wl_session_operation_begin_mutation(session, true, relation,
+            num_rows, num_cols, &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_insert
@@ -737,6 +755,10 @@ wl_session_insert(wl_session_t *session, const char *relation,
         rc = session->backend->session_insert(session, relation, data,
                 num_rows, num_cols);
     }
+    if (controlled_mutation && rc == 0 && num_rows != 0
+        && session->backend->session_controlled_mutation_committed)
+        session->backend->session_controlled_mutation_committed(session, true,
+            relation, num_rows, num_cols);
     wl_session_operation_end(session);
     return rc;
 }
@@ -780,9 +802,11 @@ wl_session_remove(wl_session_t *session, const char *relation,
     const int64_t *data, uint32_t num_rows, uint32_t num_cols)
 {
     int rc;
+    bool controlled_mutation = false;
     if (!session)
         return -1;
-    rc = wl_session_operation_begin(session);
+    rc = wl_session_operation_begin_mutation(session, false, relation,
+            num_rows, num_cols, &controlled_mutation);
     if (rc != 0)
         return rc;
     if (!session->backend || !session->backend->session_remove)
@@ -793,6 +817,10 @@ wl_session_remove(wl_session_t *session, const char *relation,
         rc = session->backend->session_remove(session, relation, data,
                 num_rows, num_cols);
     }
+    if (controlled_mutation && rc == 0 && num_rows != 0
+        && session->backend->session_controlled_mutation_committed)
+        session->backend->session_controlled_mutation_committed(session, false,
+            relation, num_rows, num_cols);
     wl_session_operation_end(session);
     return rc;
 }
