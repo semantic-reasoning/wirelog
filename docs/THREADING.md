@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **401**).
+match the script's count (currently **407**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -657,7 +657,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 401 sites.
+symbol-anchored inventory below covers 407 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1652,8 +1652,27 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_release_try#4` | reservation state | `atomic_store_explicit` | release | Preserve retryable ownership after bounded release refusal |
 | `memory_governor.c:wl_columnar_memory_release_try#5` | reservation state | `atomic_store_explicit` | release | Restore reservation state after a stopped release attempt |
 | `memory_governor.c:wl_columnar_memory_release_try#6` | reservation state | `atomic_store_explicit` | release | Publish RELEASED after owned credit is refunded |
+| `memory_governor.c:wl_columnar_memory_retirement_step` | `token->state` | `atomic_compare_exchange_strong_explicit` | acquire/release | Claim the exact original RESERVED or COMMITTED state once before reading mutable payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#2` | `governor->reserved_bytes` | `atomic_load_explicit` | acquire | Snapshot the aggregate before one separately funded credit CAS |
+| `memory_governor.c:wl_columnar_memory_retirement_step#3` | `token->state` | `atomic_store_explicit` | release | Restore original state after validation rejects a claimed token without refund |
+| `memory_governor.c:wl_columnar_memory_retirement_step#4` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate the expected owner after the state claim protects token payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#5` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Subtract captured credit once; failed contention leaves receipt phase and claim unchanged |
+| `memory_governor.c:wl_columnar_memory_retirement_step#6` | `token->state` | `atomic_store_explicit` | release | Publish RELEASED after credit and token metadata are finalized |
 
-The complete current atomic-source inventory contains 401 call sites.
+### Resumable reservation retirement
+
+The retirement receipt is bound to its original address and creating thread.
+Every step admits 64 conservative logical work units, below the 256-unit
+evaluation quantum. Begin reads only immutable token identity; a funded step
+claims the expected state before reading mutable payload. Claim and aggregate-
+credit CAS operations are each one-shot strong operations. A failed aggregate
+CAS retains CREDIT authority for a later step; successful credit is followed
+by finite metadata stores and RELEASED publication before the receipt becomes
+DONE. If a stop leaves the receipt holding a claim, its caller preserves that
+receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
+reinitialize the receipt/token while the claim remains held.
+
+The complete current atomic-source inventory contains 407 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
