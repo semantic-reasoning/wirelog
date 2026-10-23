@@ -27,6 +27,31 @@ writer_move_on_thread(void *opaque)
                                 return; } \
 } while (0)
 
+static void
+test_atomic_strong_compare_exchange(void)
+{
+    wl_atomic_u64 state = 3;
+    uint64_t expected = 3;
+
+    CHECK(atomic_compare_exchange_strong_explicit(&state, &expected, 5,
+        memory_order_acq_rel, memory_order_relaxed),
+        "strong compare-exchange success");
+    CHECK(atomic_load_explicit(&state, memory_order_relaxed) == 5
+        && expected == 3, "strong compare-exchange success values");
+
+    expected = 2;
+    CHECK(!atomic_compare_exchange_strong_explicit(&state, &expected, 7,
+        memory_order_acq_rel, memory_order_relaxed),
+        "strong compare-exchange mismatch");
+    CHECK(atomic_load_explicit(&state, memory_order_relaxed) == 5
+        && expected == 5, "strong compare-exchange mismatch values");
+
+    atomic_store_explicit(&state, 4, memory_order_relaxed);
+    CHECK(atomic_fetch_sub_explicit(&state, 1, memory_order_release) == 4
+        && atomic_load_explicit(&state, memory_order_relaxed) == 3,
+        "atomic reader decrement preserves peer readers");
+}
+
 static int
 paired_reader_acquire(wl_columnar_source_access_gate_t *source,
     wl_columnar_source_access_gate_t *descriptor,
@@ -1074,6 +1099,7 @@ int
 main(void)
 {
     printf("Source access gate tests (#1492)\n");
+    test_atomic_strong_compare_exchange();
     test_lifecycle();
     test_writer_move();
     test_invalid_and_cross_thread();
