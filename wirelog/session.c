@@ -844,6 +844,12 @@ wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
 {
     if (!session)
         return;
+    if (wl_session_delta_callback_is_current(session)) {
+        if (session->backend && session->backend->session_set_delta_cb)
+            session->backend->session_set_delta_cb(session, callback,
+                user_data);
+        return;
+    }
     if (wl_session_operation_begin(session) != 0)
         return;
     if (session->backend && session->backend->session_set_delta_cb)

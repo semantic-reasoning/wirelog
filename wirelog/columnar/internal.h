@@ -2986,6 +2986,8 @@ typedef struct {
  * A fresh attempt may resume with its own current ID. Only READY publishes.
  * Discard is one unmetered mandatory cleanup unit, EAGAIN until drained. */
 int wl_columnar_eval_delta_observer_build_start(wl_col_session_t *, uint64_t);
+int wl_columnar_eval_delta_observer_build_start_missing_head(
+    wl_col_session_t *, uint64_t, const char *);
 int wl_columnar_eval_delta_observer_build_advance(wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, bool *ready);
 int wl_columnar_eval_delta_observer_build_discard(wl_col_session_t *);
@@ -3013,6 +3015,8 @@ int
 wl_columnar_eval_delta_observer_prepare(wl_col_session_t *sess);
 void
 wl_columnar_eval_delta_observer_publish(wl_col_session_t *sess);
+size_t
+wl_columnar_eval_delta_observer_event_count(const wl_col_session_t *sess);
 int
 wl_columnar_eval_delta_observer_finish(wl_col_session_t *sess);
 int

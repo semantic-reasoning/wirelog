@@ -44,6 +44,12 @@ extern "C" {
  */
 typedef struct wl_session wl_session_t;
 
+/* Permit callback replacement from the callback thread while retaining the
+ * ordinary session admission gate for every other caller. */
+wl_session_t *wl_session_delta_callback_enter(wl_session_t *session);
+void wl_session_delta_callback_leave(wl_session_t *previous);
+bool wl_session_delta_callback_is_current(const wl_session_t *session);
+
 /* Internal state of an attached-control STEP continuation. */
 typedef enum {
     WL_CONTROLLED_STEP_IDLE = 0,
