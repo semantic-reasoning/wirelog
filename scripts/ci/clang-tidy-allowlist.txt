@@ -112,6 +112,7 @@ wirelog/passes/magic_sets.c
 wirelog/passes/sip.c
 wirelog/passes/subsumption.c
 wirelog/session.c
+wirelog/session_delta_callback.c
 wirelog/session_facts.c
 wirelog/string_ops.c
 wirelog/thread_c11.c
