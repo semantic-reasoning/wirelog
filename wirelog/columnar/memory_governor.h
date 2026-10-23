@@ -118,6 +118,7 @@ typedef enum {
     WL_COLUMNAR_MEMORY_RESERVATION_REPLACING = 10,
     WL_COLUMNAR_MEMORY_RESERVATION_GROWTH_REFUNDING = 11,
     WL_COLUMNAR_MEMORY_RESERVATION_RELEASE_PREPARING = 12,
+    WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED = 13,
 } wl_columnar_memory_reservation_state_t;
 
 typedef enum {
@@ -319,6 +320,54 @@ int wl_columnar_memory_growth_refund_attempt_begin(
  * Success is idempotent only after the receipt reaches DONE. */
 int wl_columnar_memory_growth_refund_attempt_advance(
     wl_columnar_memory_growth_refund_attempt_t *attempt);
+
+typedef enum {
+    WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED = 1,
+    WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED = 2,
+} wl_columnar_memory_retirement_operation_t;
+
+typedef enum {
+    WL_COLUMNAR_MEMORY_RETIREMENT_EMPTY = 0,
+    WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM = 1,
+    WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE = 2,
+    WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT = 3,
+    WL_COLUMNAR_MEMORY_RETIREMENT_DONE = 4,
+    WL_COLUMNAR_MEMORY_RETIREMENT_FAILED = 5,
+} wl_columnar_memory_retirement_phase_t;
+
+enum {
+    WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK = 64,
+};
+typedef char wl_columnar_memory_retirement_step_quantum_bound[
+        (WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK
+        <= WL_EVALUATION_CONTROL_QUANTUM) ? 1 : -1];
+
+/* Zero-initialize this stable-address, thread-affine receipt. The caller keeps
+ * the token and governor alive through acknowledgement and completes physical
+ * storage retirement before beginning. Each funded step admits 64
+ * conservative work units and advances at most one phase/CAS; the supplied
+ * control is never kept. Failed aggregate CAS keeps CREDIT authority for a
+ * later funded retry. */
+typedef struct {
+    const void *identity;
+    wl_columnar_memory_reservation_t *token;
+    wl_columnar_memory_governor_t *expected_governor;
+    uint64_t expected_owner_bits;
+    uint64_t captured_bytes;
+    wl_columnar_memory_governor_t *captured_governor;
+    uint64_t original_state;
+    wl_columnar_memory_retirement_operation_t operation;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid;
+    int terminal_status;
+    wl_columnar_memory_retirement_phase_t phase;
+} wl_columnar_memory_retirement_receipt_t;
 
 /* Bounded post-retirement reduction of a committed reservation. Zero-init
  * the receipt. The caller must have physically retired exactly
@@ -585,6 +634,33 @@ wl_columnar_memory_reservation_finish_step(
 
 bool
 wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation);
+
+/* Begin reads only immutable token identity. A funded step claims the expected
+ * state before reading mutable payload; one aggregate CAS contention retains
+ * CREDIT authority for a later step. DONE must be acknowledged before receipt
+ * reuse. */
+int
+wl_columnar_memory_retirement_begin(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_retirement_operation_t operation,
+    wl_columnar_memory_retirement_receipt_t *receipt);
+
+int
+wl_columnar_memory_retirement_step(
+    wl_columnar_memory_retirement_receipt_t *receipt,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
+
+int
+wl_columnar_memory_retirement_status(
+    const wl_columnar_memory_retirement_receipt_t *receipt,
+    wl_columnar_memory_retirement_phase_t *phase, bool *owns_claim,
+    int *terminal_status);
+
+int
+wl_columnar_memory_retirement_acknowledge(
+    wl_columnar_memory_retirement_receipt_t *receipt);
 
 /* Non-spinning release for resumable cleanup. Makes at most one token-state
  * CAS and one aggregate-credit CAS. RETRY denotes contention; INVALID and

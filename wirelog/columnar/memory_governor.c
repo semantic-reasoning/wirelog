@@ -2903,6 +2903,182 @@ wl_columnar_memory_release(wl_columnar_memory_reservation_t *reservation)
     return finish_reservation(reservation, false);
 }
 
+static bool
+wl_columnar_memory_retirement_thread_valid(
+    const wl_columnar_memory_retirement_receipt_t *receipt)
+{
+    if (!receipt || receipt->identity != receipt || !receipt->thread_valid)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(receipt->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return receipt->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(receipt->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+int
+wl_columnar_memory_retirement_begin(
+    wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *expected_governor,
+    const void *expected_owner,
+    wl_columnar_memory_retirement_operation_t operation,
+    wl_columnar_memory_retirement_receipt_t *receipt)
+{
+    uintptr_t token_address = (uintptr_t)token;
+    uintptr_t receipt_address = (uintptr_t)receipt;
+    uint64_t original_state;
+
+    if (!receipt || receipt->identity || !token || !expected_governor
+        || token->identity != token
+        || (operation != WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED
+        && operation != WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED))
+        return EINVAL;
+    if ((token_address <= receipt_address
+        && receipt_address - token_address < sizeof(*token))
+        || (receipt_address < token_address
+        && token_address - receipt_address < sizeof(*receipt)))
+        return EINVAL;
+    original_state = operation == WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED
+        ? WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        : WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED;
+    memset(receipt, 0, sizeof(*receipt));
+    receipt->identity = receipt;
+    receipt->token = token;
+    receipt->expected_governor = expected_governor;
+    receipt->expected_owner_bits = (uint64_t)(uintptr_t)expected_owner;
+    receipt->original_state = original_state;
+    receipt->operation = operation;
+#if defined(WL_HAVE_C11_THREADS)
+    receipt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    receipt->owner_thread = GetCurrentThreadId();
+#else
+    receipt->owner_thread = pthread_self();
+#endif
+    receipt->thread_valid = true;
+    receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM;
+    return 0;
+}
+
+int
+wl_columnar_memory_retirement_step(
+    wl_columnar_memory_retirement_receipt_t *receipt,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+{
+    wl_columnar_memory_reservation_t *token;
+    uint64_t expected_state;
+    int rc;
+
+    if (!wl_columnar_memory_retirement_thread_valid(receipt)
+        || !receipt->token || !receipt->expected_governor
+        || !expected_attempt_id)
+        return EINVAL;
+    if (receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE)
+        return 0;
+    if (receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_FAILED)
+        return receipt->terminal_status ? receipt->terminal_status : EINVAL;
+    if (receipt->phase != WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM
+        && receipt->phase != WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        && receipt->phase != WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT)
+        return EINVAL;
+
+    /* The active ID check and precharge precede all receipt/token mutation. */
+    rc = wl_evaluation_control_charge_attempt(control, expected_attempt_id,
+            WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    if (rc)
+        return rc;
+    token = receipt->token;
+
+    if (receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_CLAIM) {
+        expected_state = receipt->original_state;
+        if (!atomic_compare_exchange_strong_explicit(&token->state,
+            &expected_state,
+            WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED,
+            memory_order_acq_rel, memory_order_acquire)) {
+            receipt->terminal_status = EBUSY;
+            receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_FAILED;
+            return EBUSY;
+        }
+        receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE;
+        return 0;
+    }
+
+    if (receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE) {
+        receipt->captured_governor = token->governor;
+        receipt->captured_bytes = token->bytes;
+        if (token->identity != token
+            || receipt->captured_governor != receipt->expected_governor
+            || receipt->captured_bytes == 0
+            || token->replacement_bytes != 0
+            || token->transition_kind != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+            || atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+            != receipt->expected_owner_bits) {
+            atomic_store_explicit(&token->state, receipt->original_state,
+                memory_order_release);
+            receipt->terminal_status = EINVAL;
+            receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_FAILED;
+            return EINVAL;
+        }
+        receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT;
+        return 0;
+    }
+
+    /* This is deliberately a one-shot strong CAS. Contention keeps the
+     * claimed token and CREDIT phase for a separately funded retry. */
+    uint64_t old = atomic_load_explicit(
+        &receipt->captured_governor->reserved_bytes, memory_order_acquire);
+    if (old < receipt->captured_bytes)
+        return EOVERFLOW;
+    uint64_t desired = old - receipt->captured_bytes;
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+    if (wl_columnar_memory_governor_test_before_total_cas)
+        wl_columnar_memory_governor_test_before_total_cas(control,
+            receipt->captured_governor, old, false);
+#endif
+    if (!atomic_compare_exchange_strong_explicit(
+            &receipt->captured_governor->reserved_bytes, &old, desired,
+            memory_order_release, memory_order_relaxed))
+        return EAGAIN;
+
+    token->replacement_bytes = 0;
+    token->transition_kind = WL_COLUMNAR_MEMORY_TRANSITION_NONE;
+    atomic_store_explicit(&token->state,
+        WL_COLUMNAR_MEMORY_RESERVATION_RELEASED, memory_order_release);
+    receipt->phase = WL_COLUMNAR_MEMORY_RETIREMENT_DONE;
+    receipt->terminal_status = 0;
+    return 0;
+}
+
+int
+wl_columnar_memory_retirement_status(
+    const wl_columnar_memory_retirement_receipt_t *receipt,
+    wl_columnar_memory_retirement_phase_t *phase, bool *owns_claim,
+    int *terminal_status)
+{
+    if (!wl_columnar_memory_retirement_thread_valid(receipt)
+        || !phase || !owns_claim || !terminal_status)
+        return EINVAL;
+    *phase = receipt->phase;
+    *owns_claim = receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        || receipt->phase == WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT;
+    *terminal_status = receipt->terminal_status;
+    return 0;
+}
+
+int
+wl_columnar_memory_retirement_acknowledge(
+    wl_columnar_memory_retirement_receipt_t *receipt)
+{
+    if (!wl_columnar_memory_retirement_thread_valid(receipt)
+        || (receipt->phase != WL_COLUMNAR_MEMORY_RETIREMENT_DONE
+        && receipt->phase != WL_COLUMNAR_MEMORY_RETIREMENT_FAILED))
+        return EINVAL;
+    memset(receipt, 0, sizeof(*receipt));
+    return 0;
+}
+
 uint64_t
 wl_columnar_memory_reserved(const wl_columnar_memory_governor_t *governor)
 {
