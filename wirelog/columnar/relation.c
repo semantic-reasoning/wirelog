@@ -3594,6 +3594,8 @@ wl_columnar_relation_managed_binary_build_fail_allocation(void)
     return false;
 }
 
+static int wl_columnar_relation_init_arrow_schema(col_rel_t *r);
+
 int
 wl_columnar_relation_managed_binary_build_step_budgeted(
     wl_columnar_relation_managed_binary_build_t *build,
@@ -3861,6 +3863,115 @@ wl_columnar_relation_managed_binary_build_step(
                control, expected_attempt_id, &remaining);
 }
 
+int
+wl_columnar_relation_managed_binary_build_adopt_schema(
+    wl_columnar_relation_managed_binary_build_t *build,
+    const char *const *column_names)
+{
+    wl_columnar_memory_reservation_t pending = { 0 }, old_metadata = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *relation, *owner = NULL;
+    col_rel_t schema_image = { 0 };
+    char **names = NULL;
+    uint64_t metadata_bytes = 0;
+    int rc;
+
+    if (!build || build->identity != (uintptr_t)build
+        || build->phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        || !build->relation || !column_names || !column_names[0]
+        || !column_names[1])
+        return EINVAL;
+    relation = build->relation;
+    rc = col_rel_published_writer_acquire(relation, &writer);
+    if (rc != 0)
+        return rc;
+
+    if (col_rel_storage_owner_resolve(relation, &owner) != 0
+        || owner != relation || relation->relation_identity == 0
+        || relation->pool_owned || relation->arena_owned
+        || relation->col_shared
+        || relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || relation->compound_arity_map || relation->compound_arity_len
+        || relation->ncols != 2 || relation->declared_ncols != 2
+        || relation->capacity != build->capacity || relation->nrows != 0
+        || relation->sorted_nrows != 0 || relation->name
+        || relation->schema_ok || relation->schema.release
+        || relation->col_names || relation->metadata_reserved_bytes
+        || !relation->column_types || !relation->columns
+        || !relation->columns[0] || !relation->columns[1]
+        || !relation->merge_columns || !relation->merge_columns[0]
+        || !relation->merge_columns[1] || !relation->row_scratch
+        || relation->column_types[0] != WIRELOG_TYPE_INT64
+        || relation->column_types[1] != WIRELOG_TYPE_INT64
+        || build->allocation_control_identity
+        || build->allocation_attempt_id
+        || !col_rel_compound_map_valid_for(relation, 2)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (!col_rel_prospective_metadata_bytes(2, column_names, true, false,
+        true, true, relation->compound_arity_len, false, &metadata_bytes)) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    relation->memory_budget_denial_pending = false;
+    rc = col_rel_reserve_metadata(relation, metadata_bytes, &pending);
+    if (rc != 0)
+        goto clear_denial;
+
+    names = (char **)calloc(2, sizeof(*names));
+    if (!names) {
+        rc = ENOMEM;
+        goto rollback;
+    }
+    names[0] = wl_strdup(column_names[0]);
+    names[1] = wl_strdup(column_names[1]);
+    if (!names[0] || !names[1]) {
+        rc = ENOMEM;
+        goto rollback;
+    }
+
+    schema_image.ncols = relation->ncols;
+    schema_image.col_names = names;
+    schema_image.column_types = relation->column_types;
+    schema_image.schema_ok = false;
+    rc = wl_columnar_relation_init_arrow_schema(&schema_image);
+    if (rc != 0)
+        goto rollback;
+
+    col_rel_publish_metadata(relation, &pending, metadata_bytes,
+        &old_metadata);
+    relation->col_names = names;
+    relation->schema = schema_image.schema;
+    relation->schema_ok = true;
+    names = NULL;
+    memset(&schema_image.schema, 0, sizeof(schema_image.schema));
+    wl_columnar_relation_touch_view(relation);
+    col_rel_release_reservation_or_abort(&old_metadata);
+    rc = 0;
+    goto done;
+
+rollback:
+    if (schema_image.schema.release)
+        ArrowSchemaRelease(&schema_image.schema);
+    if (names) {
+        free(names[0]);
+        free(names[1]);
+        free((void *)names);
+    }
+    col_rel_reservation_rollback(&pending);
+clear_denial:
+    if (rc == ENOSPC)
+        relation->memory_budget_denial_pending = false;
+done:
+    {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (rc == 0 && release_rc != 0)
+            rc = release_rc;
+    }
+    return rc;
+}
+
 static bool
 wl_columnar_relation_managed_token_valid(
     const wl_columnar_memory_reservation_t *token,
@@ -3924,7 +4035,7 @@ wl_columnar_relation_managed_retirement_validate(
     const struct ArrowSchema *schema = &relation->schema;
 
     if (relation->ncols != 2 || relation->pool_owned || relation->arena_owned
-        || relation->name || relation->col_names || relation->timestamps
+        || relation->name || relation->timestamps
         || relation->timestamp_capacity || relation->retract_backup_columns
         || relation->retract_backup_timestamps
         || relation->retract_backup_timestamp_capacity
@@ -3953,8 +4064,16 @@ wl_columnar_relation_managed_retirement_validate(
         && (relation->column_types[0] != WIRELOG_TYPE_INT64
         || relation->column_types[1] != WIRELOG_TYPE_INT64))
         return ENOTSUP;
-    if (relation->schema_ok || schema->release || schema->children
-        || schema->n_children != 0) {
+    if (relation->schema_ok) {
+        if (!schema->release || !schema->children
+            || schema->n_children != relation->ncols
+            || !relation->col_names || !relation->col_names[0]
+            || !relation->col_names[1]
+            || (relation->memory_governor
+            && relation->metadata_reserved_bytes == 0))
+            return EINVAL;
+    } else if (schema->release || schema->children
+        || schema->n_children != 0 || relation->col_names) {
         return EINVAL;
     }
     if (relation->memory_governor) {
@@ -4289,7 +4408,16 @@ wl_columnar_relation_managed_retirement_step(
                 control, expected_attempt_id);
         if (rc != 0)
             return rc;
-        /* This managed representation never installs an ArrowSchema. */
+        if (relation->schema_ok) {
+            ArrowSchemaRelease(&relation->schema);
+            relation->schema_ok = false;
+        }
+        if (relation->col_names) {
+            free(relation->col_names[0]);
+            free(relation->col_names[1]);
+            free((void *)relation->col_names);
+            relation->col_names = NULL;
+        }
         retirement->phase++;
         return 0;
     case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ZERO_DESCRIPTOR:
