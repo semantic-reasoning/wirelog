@@ -3959,6 +3959,33 @@ static wl_columnar_memory_governor_ref_t *composed_governor(fixture_t *);
 static void composed_close(fixture_t *);
 
 static void
+composed_until_stopped_child(fixture_t *f,
+    wl_columnar_eval_plan_numeric_phase_t child_phase,
+    wl_columnar_eval_plan_numeric_phase_t start_phase)
+{
+    bool consumed_stop_receipt = false;
+    for (unsigned turns = 0; f->record.phase != child_phase; ++turns) {
+        CHECK(turns < 100000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        if (f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) {
+            composed_action(f);
+            continue;
+        }
+        int receipt = f->pending_protocol;
+        if (f->record.pending_action == start_phase) {
+            CHECK(f->record.child_status.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(composed_abort_request(f, 0) == EBUSY);
+            consumed_stop_receipt = true;
+        }
+        CHECK(!composed_host_turn(f, false));
+        CHECK(f->record.protocol_result == receipt);
+    }
+    CHECK(consumed_stop_receipt);
+}
+
+static void
 composed_lftj_finish_stop(fixture_t *f, int stop, int result)
 {
     CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
@@ -4250,6 +4277,27 @@ composed_action(fixture_t *f)
     f->pending_protocol = composed_host_turn(f, false);
     CHECK(!f->pending_protocol ||
         f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+}
+
+static void
+composed_drain_stopped_child(fixture_t *f,
+    wl_columnar_eval_plan_numeric_phase_t child_phase,
+    wl_columnar_eval_plan_numeric_phase_t ack_phase)
+{
+    for (unsigned turns = 0; f->record.phase != ack_phase; ++turns) {
+        CHECK(turns < 100000 && f->record.phase == child_phase
+            && f->record.child_status.semantic_result ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        composed_action(f);
+        CHECK(f->record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && f->record.pending_action == child_phase);
+        int receipt = f->pending_protocol;
+        CHECK(composed_abort_request(f, 0) == EBUSY);
+        CHECK(!composed_host_turn(f, false));
+        CHECK(f->record.protocol_result == receipt);
+    }
+    CHECK(f->record.child_status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
 }
 
 static void
@@ -6037,9 +6085,120 @@ test_composed_controlled_batch_fallback_owner(void)
     wirelog_program_free(program);
 }
 
+static void
+test_composed_unary_work_limit_cleanup(void)
+{
+    static const char text[] =
+        ".decl input(x:int64)\n.decl output(y:int64)\n"
+        "output(x + 1) :- input(x), x > 0.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *body = composed_find_relation(plan, "output");
+    CHECK(body && body->ops[1].op == WL_PLAN_OP_FILTER);
+    double values[256];
+    for (unsigned i = 0; i < 256; ++i) values[i] = i + 1;
+    fixture_t f;
+    /* This cap passes composed preflight and exhausts during the owned FILTER
+     * child's bounded setup/row work; its step path then drains the stop. */
+    composed_fixture(&f, composed_source("input", 1, values, 256, false),
+        30000);
+    col_rel_t *registry[] = {f.input};
+    composed_begin(&f, body, registry, 1, 0);
+    composed_until_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    CHECK(f.record.cursor == 1 && f.record.completed == 1);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1);
+    col_rel_t *candidate = stack->items[0].rel;
+    bool owned = stack->items[0].owned;
+    CHECK(f.record.child_status.semantic_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT
+        && wl_evaluation_control_charge_attempt(f.operation, f.operation_id,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    composed_drain_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK);
+    CHECK(!f.record.child_status.committed
+        && stack->top == 1 && stack->items[0].rel == candidate
+        && stack->items[0].owned == owned
+        && f.record.cursor == 1 && f.record.completed == 1);
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.cursor == 1 && f.record.completed == 1
+        && !f.record.child_status.committed
+        && stack->top == 1 && stack->items[0].rel == candidate
+        && stack->items[0].owned == owned
+        && !session_find_rel(&f.session, "output"));
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_composed_concat_work_limit_cleanup(void)
+{
+    static const double values[256] = {0};
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b"},
+        {.op = WL_PLAN_OP_CONCAT},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    col_rel_t *a = composed_source("a", 1, values, 256, false);
+    col_rel_t *b = composed_source("b", 1, values, 256, false);
+    fixture_t f;
+    /* The separate parent and CONCAT grants fund the child action. This cap
+     * stops the original operation during CONCAT's bounded owned start path. */
+    composed_fixture(&f, a, 30000);
+    col_rel_t *registry[] = {a, b};
+    composed_begin(&f, &body, registry, 2, 0);
+    composed_until_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START);
+    CHECK(f.record.cursor == 2 && f.record.completed == 2);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 2);
+    col_rel_t *left = stack->items[0].rel;
+    col_rel_t *right = stack->items[1].rel;
+    bool left_owned = stack->items[0].owned;
+    bool right_owned = stack->items[1].owned;
+    CHECK(wl_evaluation_control_charge_attempt(f.operation, f.operation_id,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    composed_drain_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK);
+    CHECK(!f.record.child_status.committed
+        && stack->top == 2 && stack->items[0].rel == left
+        && stack->items[1].rel == right
+        && stack->items[0].owned == left_owned
+        && stack->items[1].owned == right_owned
+        && f.record.cursor == 2 && f.record.completed == 2);
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.cursor == 2 && f.record.completed == 2
+        && !f.record.child_status.committed
+        && stack->top == 2 && stack->items[0].rel == left
+        && stack->items[1].rel == right
+        && stack->items[0].owned == left_owned
+        && stack->items[1].owned == right_owned
+        && !session_find_rel(&f.session, "output"));
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    col_rel_destroy(b);
+}
+
 int
 main(void)
 {
+    test_composed_unary_work_limit_cleanup();
+    test_composed_concat_work_limit_cleanup();
     test_composed_private_input_binding();
     test_composed_recursive_terminal_exchange();
     test_composed_lftj_stopped_cleanup();
