@@ -2683,8 +2683,9 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     if (wl_intern_detach_memory_governor(intern, probe) != 0
         || reserved_on(probe) != 0)
         goto out;
-    arena = wl_compound_arena_create_managed(0x53455353u, 4096u, 0u,
-            wl_columnar_memory_governor_ref_get(probe));
+    /* Match session creation, including the ref-owned admission context. */
+    arena = wl_arena_compound_arena_create_managed_ref(0x53455353u,
+            4096u, 0u, probe);
     if (!arena)
         goto out;
     *compound_bytes = reserved_on(probe);
