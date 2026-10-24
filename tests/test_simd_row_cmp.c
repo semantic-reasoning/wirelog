@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "../wirelog/columnar/source_access.h"
+#include "../wirelog/columnar/memory_governor.h"
 
 /*
  * ArrowSchema stub: replicates the layout used in test_consolidate_kway_merge.c
@@ -84,61 +85,19 @@ typedef struct {
     bool pool_owned;
     bool arena_owned;
     void *mem_ledger;
-    /* Issue #1430 retained-EDB admission: memory_governor is an opaque
-     * pointer; retained_reservation mirrors wl_columnar_memory_reservation_t
-     * (memory_governor.h) field for field, with the two wl_atomic_u64
-     * members represented as plain uint64_t of identical size/alignment. */
+    /* Keep this private layout mirror in sync by using the real reservation
+     * type. Its cache-line-aligned atomics affect the size and offsets. */
     void *memory_governor;
-    struct {
-        void *governor;
-        uint64_t bytes;
-        uint64_t replacement_bytes;
-        uint8_t transition_kind;
-        uint64_t owner_bits;
-        uint64_t state;
-        const void *identity;
-    } descriptor_reservation;
+    wl_columnar_memory_reservation_t descriptor_reservation;
     uint64_t descriptor_reserved_bytes;
-    struct {
-        void *governor;
-        uint64_t bytes;
-        uint64_t replacement_bytes;
-        uint8_t transition_kind;
-        uint64_t owner_bits;
-        uint64_t state;
-        const void *identity;
-    } metadata_reservation;
+    wl_columnar_memory_reservation_t metadata_reservation;
     uint64_t metadata_reserved_bytes;
-    struct {
-        void *governor;
-        uint64_t bytes;
-        uint64_t replacement_bytes;
-        uint8_t transition_kind;
-        uint64_t owner_bits;
-        uint64_t state;
-        const void *identity;
-    } pool_name_reservation;
+    wl_columnar_memory_reservation_t pool_name_reservation;
     uint64_t pool_name_reserved_bytes;
-    struct {
-        void *governor;
-        uint64_t bytes;
-        uint64_t replacement_bytes;
-        uint8_t transition_kind;
-        uint64_t owner_bits;
-        uint64_t state;
-        const void *identity;
-    } dedup_reservation;
+    wl_columnar_memory_reservation_t dedup_reservation;
     uint64_t dedup_reserved_bytes;
     uint8_t memory_budget_denial_pending;
-    struct {
-        void *governor;
-        uint64_t bytes;
-        uint64_t replacement_bytes;
-        uint8_t transition_kind;
-        uint64_t owner_bits;
-        uint64_t state;
-        const void *identity;
-    } retained_reservation;
+    wl_columnar_memory_reservation_t retained_reservation;
     uint64_t retained_reserved_bytes;
     /* Issue #1380: bytes charged to TIMESTAMP for timestamps[]. */
     uint64_t ledger_ts_bytes;
@@ -179,6 +138,8 @@ typedef struct {
     wl_atomic_u64 storage_alias_borrows;
     wl_columnar_source_access_gate_t source_access;
     wl_columnar_source_access_gate_t descriptor_access;
+    struct col_rel *deferred_relation_next;
+    struct wl_col_session_t *deferred_relation_session;
 } col_rel_t;
 
 /* Column-major helpers (inline, matching internal.h) */
@@ -283,6 +244,7 @@ test_rel_alloc(uint32_t ncols)
     r->storage_owner_identity = r->relation_identity;
     r->storage_owner_generation = r->storage_generation;
     wl_columnar_source_access_gate_init(&r->source_access);
+    wl_columnar_source_access_gate_init(&r->descriptor_access);
     r->ncols = ncols;
     if (ncols > 0) {
         r->col_names = (char **)calloc(ncols, sizeof(char *));

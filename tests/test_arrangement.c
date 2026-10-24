@@ -276,18 +276,18 @@ find_rel_mirror(wl_session_t *sess, const char *rel_name)
  *   (4 bytes padding)
  *   struct wl_mem_ledger *ledger 8 (offset 56, Issue #1380)
  *   memory governor pointer 8 (offset 64)
- *   retained reservation 56 (offset 72)
- *   reserved byte count 8 (offset 128)
- *                         = 136 bytes total
+ *   retained reservation 88 (offset 72)
+ *   reserved byte count 8 (offset 160)
+ *                         = 168 bytes total
  * ================================================================ */
 static void
 test_arrangement_struct_size(void)
 {
     TEST("col_arrangement_t struct size (layout sentinel)");
-    /* 136 bytes: legacy fields plus governor reference, replacement
-     * reservation, and reserved byte count. */
-    ASSERT(sizeof(col_arrangement_t) == 136,
-        "col_arrangement_t must be 136 bytes; update if struct changes");
+    /* 168 bytes: legacy fields plus governor reference, cache-line-aligned
+     * replacement reservation, and reserved byte count. */
+    ASSERT(sizeof(col_arrangement_t) == 168,
+        "col_arrangement_t must be 168 bytes; update if struct changes");
     ASSERT(offsetof(col_arrangement_t, ht_head) == 16,
         "ht_head layout changed unexpectedly");
     ASSERT(offsetof(col_arrangement_t, generation) == 48,
