@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **383**).
+match the script's count (currently **398**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -483,17 +483,20 @@ the relocation paths preserve identity and transfer ownership explicitly.
 | `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
 | `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
 
-### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and GC holds (7 rows)
+### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and lifetime references (10 rows)
 
 | Anchor (`file:function[#N]`) | Field | Op | Order | Justification |
 |---|---|---|---|---|
-| `compound_arena.c:compound_gate_load` | `arena->access_gate`, `arena->gc_hold_count` | `atomic_load_explicit` | `acquire` | Observe the access gate or lifetime count; collectors pair acquire loads with hold release |
-| `compound_arena.c:compound_gate_store` | `arena->access_gate`, `arena->gc_hold_count` | `atomic_store_explicit` | `release` | Initialize the gate and hold count before publication; on portable builds this helper is also the release-side gate store |
-| `compound_arena.c:wl_compound_arena_borrow` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Admit one reader only while no writer owns the gate |
+| `compound_arena.c:compound_gate_load` | `arena->access_gate`, `arena->gc_hold_count`, `arena->lifetime_state` | `atomic_load_explicit` | `acquire` | Observe the access gate or lifetime count; collectors pair acquire loads with hold release |
+| `compound_arena.c:compound_gate_store` | `arena->access_gate`, `arena->gc_hold_count`, `arena->lifetime_state` | `atomic_store_explicit` | `release` | Initialize the gate and hold count before publication; on portable builds this helper is also the release-side gate store |
+| `compound_arena.c:compound_borrow` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Admit one reader only while no writer owns the gate |
 | `compound_arena.c:wl_compound_arena_borrow_release` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Remove exactly one reader lease without reopening a writer-owned gate |
 | `compound_arena.c:wl_compound_arena_mutation_begin` | `arena->access_gate` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Claim exclusive mutation ownership after all reader leases have drained |
 | `compound_arena.c:wl_arena_compound_arena_gc_hold_acquire` | `arena->gc_hold_count` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Publish a bounded lifetime contribution while a temporary reader prevents collection or destruction |
-| `compound_arena.c:wl_arena_compound_arena_gc_hold_release` | `arena->gc_hold_count` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Publish completion before removing the lifetime contribution; no arena access follows success |
+| `compound_arena.c:wl_arena_compound_arena_gc_hold_release` | `arena->gc_hold_count` | `atomic_compare_exchange_weak_explicit` | `release`/`relaxed` | Remove GC exclusion before dropping the separate lifetime reference |
+| `compound_arena.c:compound_reference_acquire` | `arena->lifetime_state` | `atomic_compare_exchange_weak_explicit` | `acquire`/`relaxed` | Retain an operation or hold; ordinary admission rejects retirement, detached borrows require an existing hold |
+| `compound_arena.c:compound_reference_release` | `arena->lifetime_state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Drop one reference after gate/token cleanup; the last retired reference alone destroys storage |
+| `compound_arena.c:wl_arena_compound_arena_retire` | `arena->lifetime_state` | `atomic_compare_exchange_weak_explicit` | `acq_rel`/`acquire` | Atomically close admission and consume the unique owner; elect destruction when no lease remains |
 
 GC holds preserve handle IDs without changing multiplicities or retaining raw
 payload pointers. Acquisition requires an independently live arena and publishes
@@ -1369,12 +1372,37 @@ advisory leg); issue #826 (native TSan SEGV triage);
 the lease twice is rejected. The coordinator cannot allocate, retain, freeze,
 unfreeze, advance the epoch, or destroy the arena while any read lease is
 active. Coordinator mutation must be completed before worker leases are
-opened, and workers must release their leases before coordinator teardown.
+opened, and workers must release their leases before coordinator teardown. Detached
+handle consumers may retain separate GC holds across session teardown.
 
 This gate protects pointer lifetime across both append-only metadata changes
 and replacement-buffer growth. `frozen` remains a semantic read-only guard,
 not a synchronization primitive. The unmanaged compound-arena constructor
 and standalone fuzz target do not link the memory governor.
+
+### Deferred compound arena destruction (#1372)
+
+The high bit of `lifetime_state` marks retirement; its remaining bits count
+one owner plus each hold, read borrow, and admitted mutation. Admission rejects
+count overflow. Owner retirement atomically sets the bit and removes the owner;
+ordinary new operations then fail. Operations admitted before that transition
+may complete. No caller may race initial raw-pointer admission against loss of
+its external lifetime authority. Owner teardown itself is serialized.
+
+A stable GC hold authorizes `wl_arena_compound_arena_gc_hold_borrow` even after
+retirement. Acquiring this borrow must not race release of the same hold; once
+acquired, the borrow owns a separate reference and may outlive the hold. Holds
+preserve handle identity, while borrows additionally prevent relocation.
+
+Release clears the stable token and its access/GC gate contribution before an
+acq_rel lifetime decrement. Retirement and decrements share one CAS state, so
+exactly the transition to retired-with-zero-references destroys the arena.
+The last releaser observes all preceding releases and never touches the arena
+after dropping its reference. The existing MSVC CAS shim supplies interlocked
+ordering; portable builds use the orders in the inventory above. There is no
+wait for external readers and no allocation during retirement. Managed session
+arenas retain their governor independently, until physical cleanup and refunds
+finish. This does not keep a program or nested intern references alive.
 
 ## 12. References
 
@@ -1653,7 +1681,7 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_release_try#5` | reservation state | `atomic_store_explicit` | release | Restore reservation state after a stopped release attempt |
 | `memory_governor.c:wl_columnar_memory_release_try#6` | reservation state | `atomic_store_explicit` | release | Publish RELEASED after owned credit is refunded |
 
-The complete current atomic-source inventory contains 383 call sites.
+The complete current atomic-source inventory contains 398 call sites.
 
 ### Caller-attempt-bound single mutation admission
 

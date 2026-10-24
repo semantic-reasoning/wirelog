@@ -30,6 +30,8 @@
 /* Initial entry-index capacity per generation.  Small (16) because we
  * lazy-grow; most epochs with a handful of compounds pay only this much. */
 #define WL_COMPOUND_DEFAULT_ENTRY_CAP 16u
+#define WL_COMPOUND_RETIRED (UINT64_C(1) << 63)
+#define WL_COMPOUND_REFS_MAX (WL_COMPOUND_RETIRED - 1u)
 #define WL_COMPOUND_GATE_WRITER UINT64_MAX
 #define WL_COMPOUND_GATE_READERS_MAX (WL_COMPOUND_GATE_WRITER - 1u)
 
@@ -59,6 +61,61 @@ compound_gate_store(wl_atomic_u64 *gate, uint64_t value)
     atomic_store_explicit(gate, value, memory_order_release);
 }
 #endif
+
+static void compound_arena_destroy(wl_compound_arena_t *arena);
+
+/* The caller already owns an owner/hold/operation reference. Initial raw
+ * pointer admission must not race loss of that external lifetime authority. */
+static bool
+compound_reference_acquire(wl_compound_arena_t *arena, bool detached)
+{
+    uint64_t observed = compound_gate_load(&arena->lifetime_state);
+    for (;;) {
+        if ((!detached && (observed & WL_COMPOUND_RETIRED))
+            || (observed & WL_COMPOUND_REFS_MAX) == WL_COMPOUND_REFS_MAX
+            || (observed & WL_COMPOUND_REFS_MAX) == 0)
+            return false;
+        if (atomic_compare_exchange_weak_explicit(&arena->lifetime_state,
+            &observed, observed + 1u, memory_order_acquire,
+            memory_order_relaxed))
+            return true;
+    }
+}
+
+static void
+compound_reference_release(wl_compound_arena_t *arena)
+{
+    uint64_t observed = compound_gate_load(&arena->lifetime_state);
+    for (;;) {
+        if (atomic_compare_exchange_weak_explicit(&arena->lifetime_state,
+            &observed, observed - 1u, memory_order_acq_rel,
+            memory_order_acquire)) {
+            if (observed == (WL_COMPOUND_RETIRED | UINT64_C(1)))
+                compound_arena_destroy(arena);
+            return;
+        }
+    }
+}
+
+void
+wl_arena_compound_arena_retire(wl_compound_arena_t *arena)
+{
+    uint64_t observed;
+    if (!arena)
+        return;
+    observed = compound_gate_load(&arena->lifetime_state);
+    for (;;) {
+        if (observed & WL_COMPOUND_RETIRED)
+            return;
+        if (atomic_compare_exchange_weak_explicit(&arena->lifetime_state,
+            &observed, (observed - 1u) | WL_COMPOUND_RETIRED,
+            memory_order_acq_rel, memory_order_acquire)) {
+            if (observed == 1u)
+                compound_arena_destroy(arena);
+            return;
+        }
+    }
+}
 
 /* ======================================================================== */
 /* Internal helpers                                                         */
@@ -278,15 +335,6 @@ fail:
 }
 
 static void
-gen_free(wl_compound_gen_t *gen)
-{
-    free(gen->base);
-    free(gen->entry_offsets);
-    free(gen->multiplicity);
-    memset(gen, 0, sizeof(*gen));
-}
-
-static void
 gen_release_admission(wl_compound_arena_t *arena, wl_compound_gen_t *gen)
 {
     if (gen->payload_admission) {
@@ -339,6 +387,7 @@ compound_arena_create_impl(uint32_t session_seed, uint32_t default_gen_cap,
     arena->live_handles = 0;
     compound_gate_store(&arena->access_gate, 0);
     compound_gate_store(&arena->gc_hold_count, 0);
+    compound_gate_store(&arena->lifetime_state, 1);
     arena->test_failpoint = WL_COMPOUND_FAIL_NONE;
     arena->admission_context = admission_context;
     arena->admission_release = admission_release;
@@ -372,19 +421,23 @@ wl_compound_arena_create_with_admission(uint32_t session_seed,
                release_reservation);
 }
 
-bool
-wl_compound_arena_borrow(wl_compound_arena_t *arena,
-    wl_compound_arena_borrow_t *borrow)
+static bool
+compound_borrow(wl_compound_arena_t *arena,
+    wl_compound_arena_borrow_t *borrow, bool detached)
 {
     uint64_t observed;
 
     if (!arena || !borrow || borrow->arena || borrow->identity != 0)
         return false;
+    if (!compound_reference_acquire(arena, detached))
+        return false;
     observed = compound_gate_load(&arena->access_gate);
     for (;;) {
         if (observed == WL_COMPOUND_GATE_WRITER
-            || observed >= WL_COMPOUND_GATE_READERS_MAX)
+            || observed >= WL_COMPOUND_GATE_READERS_MAX) {
+            compound_reference_release(arena);
             return false;
+        }
         if (atomic_compare_exchange_weak_explicit(&arena->access_gate,
             &observed, observed + 1u, memory_order_acquire,
             memory_order_relaxed))
@@ -393,6 +446,23 @@ wl_compound_arena_borrow(wl_compound_arena_t *arena,
     borrow->arena = arena;
     borrow->identity = (uintptr_t)borrow;
     return true;
+}
+
+bool
+wl_compound_arena_borrow(wl_compound_arena_t *arena,
+    wl_compound_arena_borrow_t *borrow)
+{
+    return compound_borrow(arena, borrow, false);
+}
+
+bool
+wl_arena_compound_arena_gc_hold_borrow(
+    const wl_arena_compound_arena_gc_hold_t *hold,
+    wl_compound_arena_borrow_t *borrow)
+{
+    if (!hold || !hold->arena || hold->identity != (uintptr_t)hold)
+        return false;
+    return compound_borrow(hold->arena, borrow, true);
 }
 
 bool
@@ -416,6 +486,7 @@ wl_compound_arena_borrow_release(wl_compound_arena_borrow_t *borrow)
     }
     borrow->arena = NULL;
     borrow->identity = 0;
+    compound_reference_release(arena);
     return true;
 }
 
@@ -427,14 +498,18 @@ wl_compound_arena_mutation_begin(wl_compound_arena_t *arena,
 
     if (!arena || !mutation || mutation->arena || mutation->identity != 0)
         return false;
+    if (!compound_reference_acquire(arena, false))
+        return false;
     for (;;) {
         expected = 0;
         if (atomic_compare_exchange_weak_explicit(&arena->access_gate,
             &expected, WL_COMPOUND_GATE_WRITER, memory_order_acquire,
             memory_order_relaxed))
             break;
-        if (expected != 0)
+        if (expected != 0) {
+            compound_reference_release(arena);
             return false;
+        }
     }
     mutation->arena = arena;
     mutation->identity = (uintptr_t)mutation;
@@ -456,6 +531,7 @@ wl_compound_arena_mutation_end(wl_compound_arena_mutation_t *mutation)
     compound_gate_store(&arena->access_gate, 0);
     mutation->arena = NULL;
     mutation->identity = 0;
+    compound_reference_release(arena);
     return true;
 }
 
@@ -478,9 +554,14 @@ wl_arena_compound_arena_gc_hold_acquire(wl_compound_arena_t *arena,
         return EINVAL;
     if (!wl_compound_arena_borrow(arena, &borrow))
         return EBUSY;
+    if (!compound_reference_acquire(arena, false)) {
+        (void)wl_compound_arena_borrow_release(&borrow);
+        return EBUSY;
+    }
     observed = compound_gate_load(&arena->gc_hold_count);
     for (;;) {
         if (observed == UINT64_MAX) {
+            compound_reference_release(arena);
             (void)wl_compound_arena_borrow_release(&borrow);
             return EOVERFLOW;
         }
@@ -510,12 +591,14 @@ wl_arena_compound_arena_gc_hold_release(wl_arena_compound_arena_gc_hold_t *hold)
     hold->arena = NULL;
     hold->identity = 0;
     for (;;) {
-        /* A valid token contributes one count, keeping arena alive through
-         * retries. After publishing its removal, never access arena again. */
+        /* The separate lifetime reference keeps arena alive until both
+         * this GC exclusion count and the stable token have been cleared. */
         if (atomic_compare_exchange_weak_explicit(&arena->gc_hold_count,
             &observed, observed - 1u, memory_order_release,
-            memory_order_relaxed))
+            memory_order_relaxed)) {
+            compound_reference_release(arena);
             return 0;
+        }
         if (observed == 0) {
             hold->arena = arena;
             hold->identity = (uintptr_t)hold;
@@ -537,20 +620,29 @@ wl_compound_arena_free_checked(wl_compound_arena_t *arena)
         (void)wl_compound_arena_mutation_end(&mutation);
         return false;
     }
+    wl_arena_compound_arena_retire(arena);
+    (void)wl_compound_arena_mutation_end(&mutation);
+    return true;
+}
+
+static void
+compound_arena_destroy(wl_compound_arena_t *arena)
+{
+    void *context = arena->admission_context;
+    void (*release)(void *) = arena->admission_release;
     if (arena->gens) {
-        for (uint32_t e = 0; e < arena->max_epochs; e++)
-            gen_release_admission(arena, &arena->gens[e]);
-        for (uint32_t e = 0; e < arena->max_epochs; e++)
-            gen_free(&arena->gens[e]);
+        for (uint32_t e = 0; e < arena->max_epochs; e++) {
+            wl_compound_gen_t *gen = &arena->gens[e];
+            free(gen->base);
+            free(gen->entry_offsets);
+            free(gen->multiplicity);
+            gen_release_admission(arena, gen);
+        }
         free(arena->gens);
     }
-    if (arena->admission_release)
-        arena->admission_release(arena->admission_context);
-    /* Keep the writer gate held until the final free.  No caller can observe
-     * the local mutation token after this function returns, so publishing a
-     * reader-available gate would only create a teardown race. */
     free(arena);
-    return true;
+    if (release)
+        release(context);
 }
 
 void

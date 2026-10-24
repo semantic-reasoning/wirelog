@@ -4086,3 +4086,26 @@ no separately allocated pin metadata is omitted. This does not serialize string
 bytes into a portable or cross-process spill format. Compound lifetimes, cold
 relation/index execution, public spill configuration and scheduling remain
 outstanding; #1372 and #1385 are not complete.
+
+
+### Compound arena retirement for detached consumers (#1372)
+
+Session compound arenas now use `wl_arena_compound_arena_create_managed_ref`.
+Their separately allocated admission context retains the governor and is charged
+alongside the arena descriptor and generation table. The raw-governor constructor
+keeps its existing accounting and requires caller-owned governor lifetime.
+Generation payload/index reservations remain charged until final arena cleanup;
+existing separately allocated reservation-token overhead is not newly included
+in that accounting. This change does not make those resident bytes spillable.
+
+Session destruction retires the unique arena owner after worker drain. Existing
+stable GC holds and read borrows keep the arena and its governor alive; ordinary
+new holds/mutations/borrows are closed. A live hold can acquire a short detached
+borrow, and that borrow can survive release of its originating hold. The final
+lease frees arena storage, refunds reservations, and releases the governor.
+`free_checked` retains its refusal contract while holds or borrows exist.
+
+Compound payload capture/spill still rejects compound layouts. Retaining arena
+bytes does not retain nested intern references or establish logical layout and
+provenance. Those contracts, cold indexed readers, public spill configuration,
+and scheduler integration remain follow-up work; #1372 is not complete.

@@ -211,6 +211,7 @@ struct wl_compound_arena {
     wl_compound_admission_release_fn admission_release_reservation;
     wl_atomic_u64 access_gate;
     wl_atomic_u64 gc_hold_count;
+    wl_atomic_u64 lifetime_state; /* retired bit + owner/hold/operation refs */
     uint32_t test_failpoint;
 };
 
@@ -240,6 +241,30 @@ wl_compound_arena_t *
 wl_compound_arena_create_managed(uint32_t session_seed,
     uint32_t default_gen_cap, uint32_t max_epochs,
     wl_columnar_memory_governor_t *governor);
+
+/** Ref-owned form: retains governor until the last retired arena lease drains.
+ * Charges its admission context as well as arena and generation metadata.
+ * The raw-governor form above requires the caller to keep the governor alive. */
+wl_compound_arena_t *
+wl_arena_compound_arena_create_managed_ref(uint32_t session_seed,
+    uint32_t default_gen_cap, uint32_t max_epochs,
+    wl_columnar_memory_governor_ref_t *governor);
+
+/** Consume the unique owner, close new ordinary admission, and reclaim after
+ * all admitted operations/holds drain. NULL-safe. Owner teardown is serialized;
+ * never call again through an unowned pointer. Initial raw-pointer admission
+ * requires external ownership spanning the call. Already admitted mutations
+ * may finish after retirement. Retirement never waits for leases. */
+void
+wl_arena_compound_arena_retire(wl_compound_arena_t *arena);
+
+/** Borrow using a live stable hold, including after retirement. Do not race
+ * this call with release of that same hold. The resulting borrow has its own
+ * lifetime reference and may outlive the hold. No nested intern state is pinned. */
+bool
+wl_arena_compound_arena_gc_hold_borrow(
+    const wl_arena_compound_arena_gc_hold_t *hold,
+    wl_compound_arena_borrow_t *borrow);
 
 /* Internal callback form used by the governor glue translation unit. */
 wl_compound_arena_t *

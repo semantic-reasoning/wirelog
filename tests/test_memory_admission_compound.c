@@ -395,9 +395,57 @@ test_denial_and_legacy_contract(void)
     wl_compound_arena_free(arena);
 }
 
+static void
+test_owned_governor(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    make_resolution(&resolution, 1048576);
+    wl_columnar_memory_governor_ref_t *owner
+        = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(owner != NULL, "governor owner");
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(owner);
+    wl_compound_arena_t *arena = wl_arena_compound_arena_create_managed_ref(
+        21, 64, 2, owner);
+    CHECK(arena != NULL, "owned arena");
+    CHECK(!wl_columnar_memory_governor_ref_is_sole(owner), "retained governor");
+    CHECK(wl_columnar_memory_reserved(governor) > fixed_bytes(2),
+        "owned context is charged");
+    CHECK(wl_compound_arena_alloc(arena, 64) != 0, "owned allocation");
+    uint64_t retained = wl_columnar_memory_reserved(governor);
+    wl_arena_compound_arena_gc_hold_t hold = { 0 };
+    CHECK(wl_arena_compound_arena_gc_hold_acquire(arena, &hold) == 0, "hold");
+    wl_arena_compound_arena_retire(arena);
+    CHECK(wl_columnar_memory_reserved(governor) == retained, "held floor");
+    CHECK(wl_arena_compound_arena_gc_hold_release(&hold) == 0, "last hold");
+    CHECK(wl_columnar_memory_reserved(governor) == 0, "all bytes refunded");
+    CHECK(wl_columnar_memory_governor_ref_is_sole(owner),
+        "arena owner released");
+    arena = wl_arena_compound_arena_create_managed_ref(22, 64, 2, owner);
+    CHECK(arena != NULL, "second owned arena");
+    wl_columnar_memory_governor_ref_release(owner);
+    CHECK(wl_compound_arena_alloc(arena, 64) != 0, "governor outlives caller");
+    wl_arena_compound_arena_retire(arena);
+
+    make_resolution(&resolution, 1);
+    owner = wl_columnar_memory_governor_ref_create(&resolution);
+    governor = wl_columnar_memory_governor_ref_get(owner);
+    CHECK(wl_arena_compound_arena_create_managed_ref(23, 64, 2, owner) == NULL,
+        "fixed admission refusal");
+    CHECK(wl_arena_compound_arena_create_managed_ref(23, 0, 2, owner) == NULL,
+        "invalid capacity");
+    CHECK(wl_arena_compound_arena_create_managed_ref(23, 64, 2, NULL) == NULL,
+        "missing owner");
+    CHECK(wl_columnar_memory_reserved(governor) == 0, "failure refunds");
+    CHECK(wl_columnar_memory_governor_ref_is_sole(owner),
+        "no failed retention");
+    wl_columnar_memory_governor_ref_release(owner);
+}
+
 int
 main(void)
 {
+    test_owned_governor();
     test_managed_lifecycle();
     test_growth_peak_and_rollback();
     test_entry_growth();

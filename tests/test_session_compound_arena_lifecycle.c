@@ -26,6 +26,7 @@
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 #include "plan_fixture.h"
+#include "../wirelog/thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,90 @@ test_session_compound_arena_lifecycle(void)
     PASS();
 }
 
+typedef struct {
+    wl_arena_compound_arena_gc_hold_t hold;
+    uint64_t handle;
+    int errors;
+} detached_reader_t;
+
+static void *
+read_detached_arena(void *arg)
+{
+    detached_reader_t *reader = arg;
+    for (unsigned i = 0; i < 10000; i++) {
+        wl_compound_arena_borrow_t borrow = { 0 };
+        if (!wl_arena_compound_arena_gc_hold_borrow(&reader->hold, &borrow)) {
+            reader->errors++;
+            break;
+        }
+        const void *data = wl_compound_arena_lookup_borrowed(&borrow,
+                reader->handle, NULL);
+        if (!data || memcmp(data, "detached", 8) != 0)
+            reader->errors++;
+        if (!wl_compound_arena_borrow_release(&borrow))
+            reader->errors++;
+    }
+    if (wl_arena_compound_arena_gc_hold_release(&reader->hold) != 0)
+        reader->errors++;
+    return NULL;
+}
+
+static void
+test_detached_session_arena(void)
+{
+    TEST("detached compound readers survive real session destruction");
+    wl_plan_t *plan = build_plan(".decl a(x: int32)\n"
+            ".decl r(x: int32)\nr(x) :- a(x).\n");
+    ASSERT(plan != NULL, "plan");
+    wl_session_t *session = NULL;
+    ASSERT(wl_session_create(wl_backend_columnar(), plan, 1, &session) == 0,
+        "session");
+    wl_col_session_t *cs = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *owner = cs->memory_governor;
+    wl_columnar_memory_governor_ref_retain(owner);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(owner);
+    uint64_t handle = wl_compound_arena_alloc(cs->compound_arena, 8);
+    ASSERT(handle != 0, "handle");
+    memcpy((void *)wl_compound_arena_lookup(cs->compound_arena, handle, NULL),
+        "detached", 8);
+    detached_reader_t readers[2] = { 0 };
+    wl_thread_t threads[2];
+    bool started[2];
+    wl_arena_compound_arena_gc_hold_t last = { 0 };
+    ASSERT(wl_arena_compound_arena_gc_hold_acquire(cs->compound_arena,
+        &last) == 0, "last hold");
+    for (unsigned i = 0; i < 2; i++) {
+        readers[i].handle = handle;
+        ASSERT(wl_arena_compound_arena_gc_hold_acquire(cs->compound_arena,
+            &readers[i].hold) == 0, "reader hold");
+        started[i] = wl_thread_create(&threads[i], read_detached_arena,
+                &readers[i]) == 0;
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    plan_fixture_release();
+    for (unsigned i = 0; i < 2; i++) {
+        if (started[i])
+            wl_thread_join(&threads[i]);
+        else
+            read_detached_arena(&readers[i]);
+        ASSERT(readers[i].errors == 0, "concurrent retained reads");
+    }
+    ASSERT(wl_columnar_memory_reserved(governor) > 0, "arena remains charged");
+    wl_compound_arena_borrow_t borrow = { 0 };
+    ASSERT(wl_arena_compound_arena_gc_hold_borrow(&last, &borrow),
+        "borrow after destruction");
+    ASSERT(wl_arena_compound_arena_gc_hold_release(&last) == 0, "last hold");
+    const void *data = wl_compound_arena_lookup_borrowed(&borrow, handle, NULL);
+    ASSERT(data && memcmp(data, "detached", 8) == 0, "borrow outlives hold");
+    ASSERT(wl_compound_arena_borrow_release(&borrow), "final borrow");
+    ASSERT(wl_columnar_memory_reserved(governor) == 0, "complete refunds");
+    ASSERT(wl_columnar_memory_governor_ref_is_sole(owner), "governor released");
+    wl_columnar_memory_governor_ref_release(owner);
+    PASS();
+}
+
 /* ======================================================================== */
 /* main                                                                     */
 /* ======================================================================== */
@@ -145,6 +230,7 @@ main(void)
 {
     printf("test_session_compound_arena_lifecycle (Issue #559)\n");
     test_session_compound_arena_lifecycle();
+    test_detached_session_arena();
     printf("\n%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed == 0 ? 0 : 1;
