@@ -276,18 +276,22 @@ find_rel_mirror(wl_session_t *sess, const char *rel_name)
  *   (4 bytes padding)
  *   struct wl_mem_ledger *ledger 8 (offset 56, Issue #1380)
  *   memory governor pointer 8 (offset 64)
- *   retained reservation 88 (offset 72)
- *   reserved byte count 8 (offset 160)
- *                         = 168 bytes total
+ *   retained reservation (offset 72; size depends on atomic storage ABI)
+ *   reserved byte count 8
+ *   total = 80 + sizeof(wl_columnar_memory_reservation_t)
  * ================================================================ */
 static void
 test_arrangement_struct_size(void)
 {
     TEST("col_arrangement_t struct size (layout sentinel)");
-    /* 168 bytes: legacy fields plus governor reference, cache-line-aligned
-     * replacement reservation, and reserved byte count. */
-    ASSERT(sizeof(col_arrangement_t) == 168,
-        "col_arrangement_t must be 168 bytes; update if struct changes");
+    /* The reservation's atomic fields have ABI-dependent alignment (MSVC
+     * uses volatile uint64_t; C11 builds use _Atomic uint64_t). Keep the
+     * stable prefix fixed and derive the final size from the actual token. */
+    ASSERT(offsetof(col_arrangement_t, reservation) == 72,
+        "col_arrangement_t reservation offset changed unexpectedly");
+    ASSERT(sizeof(col_arrangement_t)
+        == 80 + sizeof(wl_columnar_memory_reservation_t),
+        "col_arrangement_t size changed; update if fields change");
     ASSERT(offsetof(col_arrangement_t, ht_head) == 16,
         "ht_head layout changed unexpectedly");
     ASSERT(offsetof(col_arrangement_t, generation) == 48,
