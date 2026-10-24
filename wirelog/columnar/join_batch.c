@@ -1906,8 +1906,10 @@ wl_columnar_join_batch_payload_reserve(void *context, uint64_t bytes,
         s->error = WL_COLUMNAR_SPILL_INVALID;
         return WL_COLUMNAR_CONTINUATION_INVALID;
     }
-    s->error = wl_columnar_batch_payload_capture(s->governor, s->store,
-            s->source, rows, s->storage, s->cancel, s->cancel_context,
+    s->error = wl_columnar_batch_payload_capture_with_intern(s->governor,
+            s->store,
+            s->source, rows, s->storage, s->intern, s->cancel,
+            s->cancel_context,
             &s->staged);
     return s->error == WL_COLUMNAR_SPILL_OK ? WL_COLUMNAR_CONTINUATION_OK
         : s->error ==
@@ -1969,6 +1971,19 @@ wl_columnar_join_batch_payload_sink_init(
         .commit = wl_columnar_join_batch_payload_commit,
         .abort = wl_columnar_join_batch_payload_abort,
     };
+}
+
+void
+wl_columnar_join_batch_payload_sink_init_with_intern(
+    wl_columnar_join_batch_payload_sink_t *context,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage, wl_intern_t *intern)
+{
+    wl_columnar_join_batch_payload_sink_init(context, sink, governor, store,
+        storage);
+    context->intern = intern;
 }
 
 wl_columnar_batch_payload_t *

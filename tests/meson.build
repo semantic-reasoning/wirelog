@@ -6527,6 +6527,7 @@ test('evaluation_serial', test_evaluation_serial_exe,
 test_spill_segments_exe = executable(
   'test_spill_segments',
   files('test_spill_segments.c', '../wirelog/columnar/spill.c',
+        '../wirelog/intern.c',
         '../wirelog/columnar/memory_governor.c', '../wirelog/evaluation_control.c') + thread_src,
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [threads_dep],

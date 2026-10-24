@@ -40,6 +40,7 @@ struct wl_columnar_spill_store {
 struct wl_columnar_spill_segment {
     wl_columnar_spill_allocation_t allocation;
     wl_columnar_spill_store_t *store;
+    wl_intern_t *intern;
     uint64_t nrows, row_bytes, data_offset, file_bytes, readers;
     uint32_t ncols;
     wl_mutex_t io_lock;
@@ -418,12 +419,28 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_spill_segment_t **out)
 {
+    return wl_columnar_spill_create_with_intern(store, types, ncols, nrows,
+               source, source_context, NULL, cancel, cancel_context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
+    const wirelog_column_type_t *types, uint32_t ncols, uint64_t nrows,
+    wl_columnar_spill_source_fn source, void *source_context,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_spill_segment_t **out)
+{
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
     if (!store || !types || !ncols || (nrows && !source))
         return WL_COLUMNAR_SPILL_INVALID;
     if (store->retired) return WL_COLUMNAR_SPILL_CLOSED;
+    bool strings = false;
     for (uint32_t i = 0; i < ncols; i++) {
+        if (types[i] == WIRELOG_TYPE_STRING && intern) {
+            strings = true; continue;
+        }
         if (types[i] != WIRELOG_TYPE_INT32 && types[i] != WIRELOG_TYPE_INT64
             && types[i] != WIRELOG_TYPE_UINT32 &&
             types[i] != WIRELOG_TYPE_UINT64
@@ -442,11 +459,21 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
     wl_columnar_spill_status_t rc = wl_columnar_spill_floor(store->directory,
             ncols, &floor);
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    if (strings) {
+        int pin = wl_intern_pin_acquire(intern, store->governor);
+        if (pin) return pin == EPIPE ? WL_COLUMNAR_SPILL_CLOSED
+            : pin == EOVERFLOW ? WL_COLUMNAR_SPILL_OVERFLOW
+            : WL_COLUMNAR_SPILL_INVALID;
+    }
     void *allocation = NULL;
     rc = wl_columnar_spill_allocate(store, floor.segment_bytes, &allocation);
-    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    if (rc != WL_COLUMNAR_SPILL_OK) {
+        if (strings) wl_intern_pin_release(intern);
+        return rc;
+    }
     wl_columnar_spill_segment_t *s = allocation;
     s->store = store;
+    s->intern = strings ? intern : NULL;
     s->nrows = nrows;
     s->ncols = ncols;
     s->row_bytes = row_bytes;
@@ -455,6 +482,7 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
     memcpy(s->types, types, (size_t)ncols * sizeof(*types));
     if (wl_mutex_init(&s->io_lock) != 0) {
         wl_columnar_spill_free(s);
+        if (strings) wl_intern_pin_release(intern);
         return WL_COLUMNAR_SPILL_ALLOCATION;
     }
     void *scratch = NULL;
@@ -495,6 +523,11 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
         for (uint32_t c = 0; c < ncols; c++) {
             uint64_t lane;
             memcpy(&lane, buffer + (size_t)c * 8, 8);
+            if (types[c] == WIRELOG_TYPE_STRING &&
+                (lane > INT64_MAX || !wl_intern_reverse(intern,
+                (int64_t)lane))) {
+                rc = WL_COLUMNAR_SPILL_INVALID; goto reserved_fail;
+            }
             wl_columnar_spill_put(buffer + (size_t)c * 8, lane, 8);
         }
         unsigned char *tail = buffer + (size_t)ncols * 8;
@@ -524,6 +557,7 @@ fail:
     wl_columnar_spill_free(scratch);
     wl_mutex_destroy(&s->io_lock);
     wl_columnar_spill_free(s);
+    if (strings) wl_intern_pin_release(intern);
     return rc;
 }
 
@@ -534,10 +568,12 @@ wl_columnar_spill_release(wl_columnar_spill_segment_t *s)
     if (s->readers) return WL_COLUMNAR_SPILL_BUSY;
     wl_columnar_spill_close_file(s);
     wl_columnar_spill_store_t *store = s->store;
+    wl_intern_t *intern = s->intern;
     store->used -= s->file_bytes;
     store->segments--;
     wl_mutex_destroy(&s->io_lock);
     wl_columnar_spill_free(s);
+    if (intern) wl_intern_pin_release(intern);
     if (store->retired && !store->segments) {
         wl_columnar_memory_governor_ref_t *governor = store->governor;
         wl_columnar_spill_free(store);
@@ -604,6 +640,9 @@ wl_columnar_spill_read(wl_columnar_spill_reader_t *reader, uint64_t ordinal,
     memcpy(&decoded.multiplicity, &difference, 8);
     for (uint32_t c = 0; c < s->ncols; c++) {
         uint64_t lane = wl_columnar_spill_get(buffer + (size_t)c * 8, 8);
+        if (s->types[c] == WIRELOG_TYPE_STRING &&
+            (lane > INT64_MAX || !wl_intern_reverse(s->intern, (int64_t)lane)))
+            return WL_COLUMNAR_SPILL_IO;
         memcpy(buffer + (size_t)c * 8, &lane, 8);
     }
     *metadata = decoded;
@@ -619,4 +658,16 @@ wl_columnar_spill_schema(const wl_columnar_spill_segment_t *s,
     *ncols = s->ncols;
     *nrows = s->nrows;
     return s->types;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_resolve_string(wl_columnar_spill_reader_t *reader,
+    uint64_t id, const char **out)
+{
+    if (!out) return WL_COLUMNAR_SPILL_INVALID;
+    *out = NULL;
+    if (!reader || !reader->segment->intern || id > INT64_MAX)
+        return WL_COLUMNAR_SPILL_INVALID;
+    *out = wl_intern_reverse(reader->segment->intern, (int64_t)id);
+    return *out ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_INVALID;
 }

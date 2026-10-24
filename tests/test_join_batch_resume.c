@@ -23,6 +23,7 @@
 #include "../wirelog/session.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
+#include "../wirelog/ir/program.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -6930,6 +6931,100 @@ test_owned_payload_demotion_budget(void)
     }
     PASS();
 }
+
+static void
+test_owned_string_payloads(void)
+{
+    TEST(
+        "STRING JOIN payloads retain provenance after producer/program teardown");
+    const int64_t keys[] = {0, 1, 0};
+    fixture_t f;
+    PAYLOAD_CHECK(fixture_init(&f, 1u<<24, keys, 3, 2, 4));
+    wl_columnar_memory_governor_ref_t *g = f.sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(g);
+    struct wirelog_program *program = wl_ir_program_create();
+    PAYLOAD_CHECK(program);
+    wl_intern_t *intern = program->intern;
+    PAYLOAD_CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    PAYLOAD_CHECK(wl_intern_put(intern, "alpha") == 0 && wl_intern_put(intern,
+        "beta") == 1);
+    f.sess->intern = intern;
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT64};
+    PAYLOAD_CHECK(col_rel_set_column_types(f.left, types, 2) == 0);
+    PAYLOAD_CHECK(col_rel_set_column_types(f.right, types, 2) == 0);
+    wl_columnar_spill_store_t *store;
+    PAYLOAD_CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 56,
+        &store) == WL_COLUMNAR_SPILL_OK);
+    wl_columnar_continuation_t *cont = NULL;
+    PAYLOAD_CHECK(col_join_batch_producer_create(f.sess, &f.op, f.left, false,
+        KEY0, KEY0, 1, 64, &cont) == 0);
+    wl_columnar_join_batch_payload_sink_t context;
+    wl_columnar_continuation_sink_t sink;
+    wl_columnar_join_batch_payload_sink_init_with_intern(&context, &sink, g,
+        store,
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+    wl_columnar_batch_payload_t *payloads[8];
+    wl_columnar_batch_payload_reader_t *readers[8];
+    unsigned count = 0;
+    while (!wl_columnar_continuation_is_done(cont)) {
+        context.storage = count %
+            2 ? WL_COLUMNAR_BATCH_PAYLOAD_SPILLED :
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT;
+        wl_columnar_continuation_status_t rc =
+            wl_columnar_continuation_publish(cont, &sink);
+        PAYLOAD_CHECK(rc == WL_COLUMNAR_CONTINUATION_OK ||
+            rc == WL_COLUMNAR_CONTINUATION_DONE);
+        wl_columnar_batch_payload_t *p =
+            wl_columnar_join_batch_payload_sink_take(&context);
+        if (!p) continue;
+        PAYLOAD_CHECK(count < 8);
+        if (count % 3 == 0 && count % 2 == 0)
+            PAYLOAD_CHECK(wl_columnar_batch_payload_spill(&p, store, NULL,
+                NULL) == WL_COLUMNAR_SPILL_OK);
+        PAYLOAD_CHECK(wl_columnar_batch_payload_acquire(p,
+            &readers[count]) == WL_COLUMNAR_SPILL_OK);
+        payloads[count++] = p;
+    }
+    PAYLOAD_CHECK(count == 6);
+    wl_columnar_continuation_destroy(cont);
+    wl_columnar_join_batch_payload_sink_cleanup(&context);
+    fixture_fini(&f);
+    wl_ir_program_free(program);
+    wl_columnar_spill_store_retire(store);
+    bool seen[12] = {false}; unsigned total = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t cols, rows;
+        const wirelog_column_type_t *schema =
+            wl_columnar_batch_payload_schema(payloads[i], &cols, &rows);
+        PAYLOAD_CHECK(cols == 4 && schema[0] == WIRELOG_TYPE_STRING &&
+            schema[2] == WIRELOG_TYPE_STRING);
+        for (uint32_t row = 0; row < rows; row++) {
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            const char *value;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_read(readers[i], row, NULL,
+                NULL, &lanes, &meta) == WL_COLUMNAR_SPILL_OK);
+            PAYLOAD_CHECK(lanes[1] < 3 &&
+                lanes[0] == (uint64_t)keys[lanes[1]] && lanes[2] == lanes[0]);
+            PAYLOAD_CHECK(lanes[3] >= lanes[0] * 1000 &&
+                lanes[3] < lanes[0] * 1000 + 4);
+            unsigned index = (unsigned)(lanes[1] * 4 + lanes[3] - lanes[0] *
+                1000);
+            PAYLOAD_CHECK(!seen[index] && meta.multiplicity == 1);
+            seen[index] = true; total++;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_resolve_string(readers[i],
+                lanes[0], &value) == WL_COLUMNAR_SPILL_OK);
+            PAYLOAD_CHECK(strcmp(value, lanes[0] ? "beta" : "alpha") == 0);
+        }
+        wl_columnar_batch_payload_reader_release(readers[i]);
+        PAYLOAD_CHECK(wl_columnar_batch_payload_release(payloads[i]) ==
+            WL_COLUMNAR_SPILL_OK);
+    }
+    PAYLOAD_CHECK(total == 12 &&
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g)) ==
+        0);
+    wl_columnar_memory_governor_ref_release(g);
+    PASS();
+}
 #undef PAYLOAD_CHECK
 
 int
@@ -6937,6 +7032,7 @@ main(void)
 {
     printf("test_join_batch_resume: bounded keyed-join sub-batches (#1446)\n");
     test_owned_mixed_payloads();
+    test_owned_string_payloads();
     test_owned_payload_demotion_budget();
     test_high_fanout_spans_batches();
     test_boundaries_collision_and_last_match();

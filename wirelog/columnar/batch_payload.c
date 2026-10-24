@@ -12,6 +12,7 @@ struct wl_columnar_batch_payload {
     wl_columnar_batch_payload_allocation_t allocation;
     wl_columnar_memory_governor_ref_t *governor;
     wl_columnar_spill_segment_t *segment;
+    wl_intern_t *intern;
     uint64_t readers, data_offset, row_bytes;
     uint32_t ncols, nrows;
     wirelog_column_type_t types[];
@@ -122,6 +123,19 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out)
 {
+    return wl_columnar_batch_payload_capture_with_intern(g, store, source,
+               rows, storage, NULL, cancel, cancel_context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_capture_with_intern(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, const col_rel_t *source, uint32_t rows,
+    wl_columnar_batch_payload_storage_t storage,
+    wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context,
+    wl_columnar_batch_payload_t **out)
+{
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
     if (!g || !source || (storage == WL_COLUMNAR_BATCH_PAYLOAD_SPILLED
@@ -134,6 +148,7 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_status_t rc = WL_COLUMNAR_SPILL_UNSUPPORTED;
     wl_columnar_batch_payload_t *p = NULL;
     uint64_t bytes, reader_bytes, header;
+    bool strings = false;
     if (source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || source->compound_count || source->compound_arity_map
         || source->compound_arity_len || source->inline_physical_offset
@@ -146,6 +161,9 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
         if (!source->columns[c]) goto done;
         wirelog_column_type_t type = source->column_types
             ? source->column_types[c] : WIRELOG_TYPE_INT64;
+        if (type == WIRELOG_TYPE_STRING && intern) {
+            strings = true; continue;
+        }
         if (type != WIRELOG_TYPE_INT32 && type != WIRELOG_TYPE_INT64
             && type != WIRELOG_TYPE_UINT32 && type != WIRELOG_TYPE_UINT64
             && type != WIRELOG_TYPE_FLOAT && type != WIRELOG_TYPE_BOOL) {
@@ -166,6 +184,16 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
     if (rc != WL_COLUMNAR_SPILL_OK) goto done;
     p = allocation; p->governor = g;
     wl_columnar_memory_governor_ref_retain(g);
+    if (strings) {
+        int pin = wl_intern_pin_acquire(intern, g);
+        if (pin) {
+            rc = pin == EPIPE ? WL_COLUMNAR_SPILL_CLOSED
+                : pin == EOVERFLOW ? WL_COLUMNAR_SPILL_OVERFLOW
+                : WL_COLUMNAR_SPILL_INVALID;
+            goto done;
+        }
+        p->intern = intern;
+    }
     p->ncols = source->ncols; p->nrows = rows; p->data_offset = header;
     p->row_bytes = (uint64_t)p->ncols * 8 +
         sizeof(wl_columnar_spill_metadata_t);
@@ -173,8 +201,10 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
         p->types[c] =
             source->column_types ? source->column_types[c] : WIRELOG_TYPE_INT64;
     if (storage == WL_COLUMNAR_BATCH_PAYLOAD_SPILLED) {
-        rc = wl_columnar_spill_create(store, p->types, p->ncols, rows,
-                wl_columnar_batch_payload_source, (void *)source, cancel,
+        rc = wl_columnar_spill_create_with_intern(store, p->types, p->ncols,
+                rows,
+                wl_columnar_batch_payload_source, (void *)source, p->intern,
+                cancel,
                 cancel_context,
                 &p->segment);
     } else {
@@ -187,6 +217,14 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
             wl_columnar_spill_metadata_t metadata;
             (void)wl_columnar_batch_payload_source((void *)source, row, lanes,
                 &metadata);
+            for (uint32_t c = 0; c < p->ncols; c++) {
+                if (p->types[c] == WIRELOG_TYPE_STRING &&
+                    (lanes[c] > INT64_MAX ||
+                    !wl_intern_reverse(p->intern, (int64_t)lanes[c]))) {
+                    rc = WL_COLUMNAR_SPILL_INVALID; break;
+                }
+            }
+            if (rc != WL_COLUMNAR_SPILL_OK) break;
             memcpy(lanes + p->ncols, &metadata, sizeof(metadata));
         }
     }
@@ -194,8 +232,13 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
         rc = WL_COLUMNAR_SPILL_CANCELLED;
 done:
     if (col_rel_source_reader_release(&lease) != 0) abort();
-    if (rc == WL_COLUMNAR_SPILL_OK) *out = p;
-    else if (p &&
+    if (rc == WL_COLUMNAR_SPILL_OK) {
+        if (p->segment && p->intern) {
+            wl_intern_pin_release(p->intern);
+            p->intern = NULL; /* Segment now owns the pin. */
+        }
+        *out = p;
+    }else if (p &&
         wl_columnar_batch_payload_release(p) != WL_COLUMNAR_SPILL_OK) abort();
     return rc;
 }
@@ -238,8 +281,10 @@ wl_columnar_batch_payload_spill(wl_columnar_batch_payload_t **owner,
     replacement->nrows = old->nrows;
     memcpy(replacement->types, old->types,
         (size_t)old->ncols * sizeof(*old->types));
-    rc = wl_columnar_spill_create(store, old->types, old->ncols, old->nrows,
-            wl_columnar_batch_payload_resident_row, old, cancel, cancel_context,
+    rc = wl_columnar_spill_create_with_intern(store, old->types, old->ncols,
+            old->nrows,
+            wl_columnar_batch_payload_resident_row, old, old->intern, cancel,
+            cancel_context,
             &replacement->segment);
     if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(cancel_context))
         rc = WL_COLUMNAR_SPILL_CANCELLED;
@@ -263,7 +308,9 @@ wl_columnar_batch_payload_release(wl_columnar_batch_payload_t *p)
         if (rc != WL_COLUMNAR_SPILL_OK) return rc;
     }
     wl_columnar_memory_governor_ref_t *g = p->governor;
+    wl_intern_t *intern = p->intern;
     wl_columnar_batch_payload_free(p);
+    if (intern) wl_intern_pin_release(intern);
     wl_columnar_memory_governor_ref_release(g);
     return WL_COLUMNAR_SPILL_OK;
 }
@@ -329,4 +376,19 @@ wl_columnar_batch_payload_schema(const wl_columnar_batch_payload_t *p,
     if (ncols) *ncols = p ? p->ncols : 0;
     if (nrows) *nrows = p ? p->nrows : 0;
     return p ? p->types : NULL;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_resolve_string(wl_columnar_batch_payload_reader_t *r,
+    uint64_t id, const char **out)
+{
+    if (!out) return WL_COLUMNAR_SPILL_INVALID;
+    *out = NULL;
+    if (!r) return WL_COLUMNAR_SPILL_INVALID;
+    if (r->spill_reader) return wl_columnar_spill_resolve_string(
+            r->spill_reader,
+            id, out);
+    if (!r->payload->intern || id > INT64_MAX) return WL_COLUMNAR_SPILL_INVALID;
+    *out = wl_intern_reverse(r->payload->intern, (int64_t)id);
+    return *out ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_INVALID;
 }

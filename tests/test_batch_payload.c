@@ -3,8 +3,10 @@
 #include "columnar/internal.h"
 #include "columnar/columnar_nanoarrow.h"
 #include "session.h"
+#include "ir/program.h"
 #include "test_tmpdir.h"
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -405,10 +407,208 @@ demotion_floor(void)
     wl_columnar_memory_governor_ref_release(g);
 }
 
+typedef struct {
+    wl_columnar_batch_payload_reader_t *reader;
+    const char **values;
+} string_job_t;
+
+static void *
+string_reader_thread(void *context)
+{
+    string_job_t *job = context;
+    for (unsigned i = 0; i < 1000; i++) {
+        const uint64_t *lanes; wl_columnar_spill_metadata_t metadata;
+        uint32_t row = i % 8;
+        CHECK(wl_columnar_batch_payload_read(job->reader, row, NULL, NULL,
+            &lanes, &metadata) == OK);
+        CHECK(lanes[0] == row % 3 && metadata.iteration == row &&
+            metadata.stratum == 7 && metadata.worker == 3 &&
+            metadata.multiplicity == (row % 2 ? -2 : 1));
+        const char *value;
+        CHECK(wl_columnar_batch_payload_resolve_string(job->reader, lanes[0],
+            &value) == OK);
+        CHECK(strcmp(value, job->values[row % 3]) == 0);
+    }
+    return NULL;
+}
+
+static void
+string_payloads(void)
+{
+    char long_value[4097]; memset(long_value, 'x', sizeof(long_value) - 1);
+    long_value[sizeof(long_value) - 1] = 0;
+    const char *values[] = {"", "\xeb\xac\xb8\xec\x9e\x90\xec\x97\xb4",
+                            long_value};
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1u<<24),
+            *other = governor(1u<<20);
+        wl_intern_t *intern = wl_intern_create();
+        CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+        for (unsigned i = 0; i < 3;
+            i++) CHECK(wl_intern_put(intern, values[i]) == i);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 48,
+            &store) == OK);
+        col_rel_t *r = source(); r->column_types[0] = WIRELOG_TYPE_STRING;
+        for (unsigned i = 0; i < 8; i++) r->columns[0][i] = i % 3;
+        wl_columnar_batch_payload_t *p;
+        wl_columnar_batch_payload_storage_t storage = mode == 1 ?
+            WL_COLUMNAR_BATCH_PAYLOAD_SPILLED :
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT;
+        CHECK(wl_columnar_batch_payload_capture(g, store, r, 8, storage,
+            NULL, NULL, &p) == WL_COLUMNAR_SPILL_UNSUPPORTED && !p);
+        CHECK(wl_columnar_batch_payload_capture_with_intern(other, NULL, r, 8,
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_INVALID && !p);
+        CHECK(reserved(other) == 0);
+        wl_columnar_spill_store_t *quota_store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1, 48,
+            &quota_store) == OK);
+        CHECK(wl_columnar_batch_payload_capture_with_intern(g, quota_store, r,
+            8,
+            WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, intern, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_QUOTA && !p);
+        CHECK(wl_columnar_spill_store_close(quota_store) == OK);
+        CHECK(wl_intern_detach_memory_governor(intern, g) == 0);
+        CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+        wl_columnar_batch_payload_test_fail_allocation(1);
+        CHECK(wl_columnar_batch_payload_capture_with_intern(g, store, r, 8,
+            storage, intern, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_ALLOCATION && !p);
+        uint64_t baseline = reserved(g);
+        r->columns[0][7] = -1;
+        CHECK(wl_columnar_batch_payload_capture_with_intern(g, store, r, 8,
+            storage, intern, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_INVALID && !p);
+        r->columns[0][7] = 3;
+        CHECK(wl_columnar_batch_payload_capture_with_intern(g, store, r, 8,
+            storage, intern, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_INVALID && !p);
+        CHECK(reserved(g) == baseline &&
+            wl_columnar_spill_store_bytes(store) == 0);
+        CHECK(wl_intern_detach_memory_governor(intern, g) == 0);
+        CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+        r->columns[0][7] = 1;
+        /* Every cancellation point refunds both private storage and pins. */
+        bool captured = false;
+        for (unsigned point = 0; point < 128; point++) {
+            unsigned remaining = point;
+            wl_columnar_spill_status_t rc =
+                wl_columnar_batch_payload_capture_with_intern(
+                g, store, r, 8, storage, intern, cancel, &remaining, &p);
+            if (rc == OK) {
+                captured = true; break;
+            }
+            CHECK(rc == WL_COLUMNAR_SPILL_CANCELLED && !p &&
+                reserved(g) == baseline &&
+                wl_columnar_spill_store_bytes(store) == 0);
+            CHECK(wl_intern_detach_memory_governor(intern, g) == 0);
+            CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+        }
+        CHECK(captured);
+        col_rel_destroy(r);
+        if (mode == 2) {
+            wl_columnar_batch_payload_t *original = p;
+            baseline = reserved(g);
+            wl_columnar_batch_payload_test_fail_allocation(1);
+            CHECK(wl_columnar_batch_payload_spill(&p, store, NULL,
+                NULL) == WL_COLUMNAR_SPILL_ALLOCATION);
+            CHECK(p == original && reserved(g) == baseline);
+            bool spilled = false;
+            for (unsigned point = 0; point < 128; point++) {
+                unsigned remaining = point;
+                wl_columnar_spill_status_t rc =
+                    wl_columnar_batch_payload_spill(&p, store, cancel,
+                        &remaining);
+                if (rc == OK) {
+                    spilled = true; break;
+                }
+                CHECK(rc == WL_COLUMNAR_SPILL_CANCELLED && p == original &&
+                    reserved(g) == baseline &&
+                    wl_columnar_spill_store_bytes(store) == 0);
+            }
+            CHECK(spilled);
+        }
+        uint32_t cols, rows;
+        CHECK(wl_columnar_batch_payload_schema(p, &cols,
+            &rows)[0] == WIRELOG_TYPE_STRING && cols == 3 && rows == 8);
+        CHECK(wl_intern_detach_memory_governor(intern, g) == EBUSY);
+        for (unsigned i = 0; i < 1024; i++) {
+            char value[32]; snprintf(value, sizeof(value), "growth-%u", i);
+            CHECK(wl_intern_put(intern, value) >= 3);
+        }
+        if (mode != 1) wl_intern_free(intern);
+        if (mode == 0) {
+            wl_columnar_batch_payload_t *original = p;
+            baseline = reserved(g);
+            CHECK(wl_columnar_batch_payload_spill(&p, store, NULL,
+                NULL) == WL_COLUMNAR_SPILL_CLOSED);
+            CHECK(p == original && reserved(g) == baseline);
+        }
+        wl_columnar_batch_payload_reader_t *a, *b;
+        CHECK(wl_columnar_batch_payload_acquire(p, &a) == OK);
+        CHECK(wl_columnar_batch_payload_acquire(p, &b) == OK);
+        string_job_t jobs[] = {{a, values}, {b, values}};
+        wl_thread_t threads[2];
+        CHECK(wl_thread_create(&threads[0], string_reader_thread,
+            &jobs[0]) == 0);
+        CHECK(wl_thread_create(&threads[1], string_reader_thread,
+            &jobs[1]) == 0);
+        if (mode == 1) wl_intern_free(intern); /* Retire while pinned readers run. */
+        wl_columnar_spill_store_retire(store);
+        CHECK(wl_columnar_batch_payload_release(p) == WL_COLUMNAR_SPILL_BUSY);
+        wl_thread_join(&threads[0]); wl_thread_join(&threads[1]);
+        const char *bad = "sentinel";
+        CHECK(wl_columnar_batch_payload_resolve_string(a, UINT64_MAX,
+            &bad) == WL_COLUMNAR_SPILL_INVALID && !bad);
+        wl_columnar_batch_payload_reader_release(a);
+        wl_columnar_batch_payload_reader_release(b);
+        CHECK(wl_columnar_batch_payload_release(p) == OK && reserved(g) == 0);
+        wl_columnar_memory_governor_ref_release(g);
+        wl_columnar_memory_governor_ref_release(other);
+    }
+}
+
+static void
+string_session_lifetime(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1u<<24);
+    struct wirelog_program *program = wl_ir_program_create(); CHECK(program);
+    wl_intern_t *intern = program->intern;
+    CHECK(wl_intern_put(intern, "alpha") == 0 && wl_intern_put(intern,
+        "beta") == 1);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.memory_governor = g; options.spill_directory = test_tmpdir();
+    options.spill_quota_bytes = 4096; options.spill_max_row_bytes = 48;
+    wl_plan_t plan = {.intern = intern}; wl_session_t *session;
+    CHECK(wl_session_create_with_options(wl_backend_columnar(), &plan, 1,
+        &options, &session) == 0);
+    col_rel_t *r = source(); r->column_types[0] = WIRELOG_TYPE_STRING;
+    for (unsigned i = 0; i < 8; i++) r->columns[0][i] = i % 2;
+    wl_columnar_batch_payload_t *p;
+    CHECK(wl_columnar_batch_payload_capture_with_intern(g,
+        COL_SESSION(session)->spill_store,
+        r, 8, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, intern, NULL, NULL, &p) == OK);
+    wl_columnar_batch_payload_reader_t *reader;
+    CHECK(wl_columnar_batch_payload_acquire(p, &reader) == OK);
+    col_rel_destroy(r); wl_session_destroy(session);
+    wl_ir_program_free(program);
+    const uint64_t *lanes; wl_columnar_spill_metadata_t meta; const char *value;
+    CHECK(wl_columnar_batch_payload_read(reader, 7, NULL, NULL, &lanes,
+        &meta) == OK);
+    CHECK(meta.multiplicity == -2 && lanes[0] == 1);
+    CHECK(wl_columnar_batch_payload_resolve_string(reader, lanes[0],
+        &value) == OK && strcmp(value, "beta") == 0);
+    wl_columnar_batch_payload_reader_release(reader);
+    CHECK(wl_columnar_batch_payload_release(p) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT);
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_SPILLED);
     failures(); session_lifetime(); demotion(); demotion_floor();
+    string_payloads(); string_session_lifetime();
     puts("batch_payload: OK"); return 0;
 }

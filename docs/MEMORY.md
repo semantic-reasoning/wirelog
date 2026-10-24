@@ -3864,7 +3864,8 @@ restart/import API or durability guarantee. Scalar INT32/INT64/UINT32/UINT64,
 FLOAT and BOOL schemas have identical logical and physical columns; the caller
 supplies valid self-contained lanes. STRING, compound schemas, intern IDs and
 pointers are unsupported. An integer type is not permission to encode a borrowed
-reference. Reference-bearing payloads require a later session-lifetime design.
+reference. The explicit STRING-capable entry points described below add intern
+table pins; compound references still require a separate lifetime design.
 
 Readers acquire separate handles and one-row buffers. Stable segment-relative
 ordinals support sequential range iteration and individual row lookup without
@@ -3992,7 +3993,7 @@ blocked overwrite and untaken-output cleanup. Payload tests cover numeric bits,
 signed metadata, partial cancellation, quota and allocation/admission failure,
 reader pins, concurrent reads during retirement, and session teardown. This is
 mixed batch storage evidence, not full mixed relation/index evaluation or a
-working-set pressure completion claim. Reference-bearing pins, automatic policy,
+working-set pressure completion claim. Compound-reference pins, automatic policy,
 public configuration and bounded relation/index consumers remain outstanding.
 
 ### Reclaiming owned resident batches (#1372, partial)
@@ -4027,5 +4028,58 @@ test stack, allocator overhead and OS file cache are outside this managed
 measurement. This proves bounded batch reclamation, not whole-process RSS or
 cold relation/index execution. A separate boundary test denies a transition
 one byte below its calculated floor and succeeds exactly at the floor.
-Automatic scheduling, reference-bearing lifetimes, public spill configuration
+Automatic scheduling, compound-reference lifetimes, public spill configuration
 and the remaining #1372/#1385 acceptance criteria are still outstanding.
+
+
+### Reference-safe STRING batches (#1372, partial)
+
+The explicit `wl_columnar_batch_payload_capture_with_intern` and
+`wl_columnar_spill_create_with_intern` entry points additionally accept STRING
+columns. The caller supplies the originating intern table for every STRING ID;
+matching integer IDs in an unrelated table do not establish provenance. The
+table must already be attached to the same governor. Logical STRING types are
+stored unchanged, and every ID must resolve before publication. Numeric-only
+entry points continue to reject STRING. Compound and graph layouts remain
+unsupported; integer lanes must not disguise reference-bearing values.
+
+`wl_intern_pin_acquire` validates admission under the intern mutex. A pin prevents
+table destruction and governor detach/rebind; it does not freeze append-only
+intern growth or add locking to ordinary reverse lookup. `wl_intern_free`
+relinquishes the original owner and closes new pin admission. Existing pins keep
+strings and their stable addresses alive until the final release. Every user
+must hold either the original owner or a pin throughout its access. Owner
+retirement may overlap independently pinned reads; a pin's release must not
+race reads using that pin. The final destruction frees storage before refunding
+its governor reservation.
+
+Resident STRING payloads own a pin; spilled payloads rely on their segment's
+pin. Readers retain their payload/segment and resolve IDs with
+`wl_columnar_batch_payload_resolve_string` or `wl_columnar_spill_resolve_string`.
+The returned string is borrowed through reader release, including after the
+program and session have been destroyed. Store retirement still rejects new
+spilled readers. Intern owner retirement rejects new STRING capture/demotion
+with CLOSED when a new pin is needed; an unsuccessful demotion leaves the
+resident payload and its existing pin unchanged. Initial acquisition must not
+race original-owner destruction. Callbacks must not reenter lifecycle operations
+or destroy their source intern owner.
+
+`wl_columnar_join_batch_payload_sink_init_with_intern` opts a real JOIN sink into
+this contract. The producing table is borrowed during synchronous publication;
+taken outputs independently retain their pins. The real JOIN test mixes
+resident capture, direct spill and demotion, destroys its producer and program,
+and resolves every retained row. Another test destroys an actual spill-enabled
+session and program before reading. Tests cover partial I/O and allocation
+failures, every cancellation point, invalid IDs, repeated/empty/long/UTF-8
+strings, signed metadata, concurrent readers, owner retirement and final refunds.
+
+Pinned slots, reverse-map segments and string bytes remain charged to the
+original governor, even after its program owner is gone. They remain resident
+and can exceed a requested working-set budget. Existing intern accounting does
+not include the table descriptor (`sizeof(wl_intern)`); that descriptor,
+allocator overhead and OS resources are additional resident costs. Pin counters
+are embedded, and the payload/segment floor includes its new intern pointer;
+no separately allocated pin metadata is omitted. This does not serialize string
+bytes into a portable or cross-process spill format. Compound lifetimes, cold
+relation/index execution, public spill configuration and scheduling remain
+outstanding; #1372 and #1385 are not complete.

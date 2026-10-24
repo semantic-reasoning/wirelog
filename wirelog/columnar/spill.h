@@ -6,6 +6,7 @@
 #include "wirelog/wirelog-types.h"
 #include <stddef.h>
 #include <stdint.h>
+#include "intern.h"
 
 typedef struct wl_columnar_spill_store wl_columnar_spill_store_t;
 typedef struct wl_columnar_spill_segment wl_columnar_spill_segment_t;
@@ -33,7 +34,8 @@ typedef struct {
 
 /* Source fills exactly ncols self-contained lanes and metadata for ordinal.
  * It must keep its own input alive/accounted, and must not reenter this store.
- * STRING, compounds, intern IDs and pointers are NOT supported payloads. */
+ * Numeric create rejects STRING/IDs; create_with_intern accepts validated
+ * STRING IDs with explicit provenance. Compounds and pointers are unsupported. */
 typedef wl_columnar_spill_status_t (*wl_columnar_spill_source_fn)(void *,
     uint64_t ordinal, uint64_t *lanes, wl_columnar_spill_metadata_t *metadata);
 typedef bool (*wl_columnar_spill_cancel_fn)(void *);
@@ -67,7 +69,7 @@ wl_columnar_spill_status_t wl_columnar_spill_store_close(
  * A store pointer borrowed through a live segment may only inspect bytes or
  * attempt create (CLOSED), never close/retire again. Lifecycle calls, including
  * retirement, remain externally serialized. Numeric handles retain no session,
- * callback context, intern table or compound arena. */
+ * callback context or compound arena; STRING segments additionally pin intern. */
 void wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store);
 /* Live-store identity check for adapters sharing admission with the store. */
 bool wl_columnar_spill_store_uses_governor(
@@ -82,6 +84,22 @@ wl_columnar_spill_status_t wl_columnar_spill_create(
     uint32_t ncols, uint64_t nrows, wl_columnar_spill_source_fn source,
     void *source_context, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_spill_segment_t **out);
+/* Explicit process-local STRING capability. Caller guarantees every STRING ID
+ * originates in intern, already attached to the store's governor. IDs are
+ * validated, STRING schema persists, and the segment pins the table. Owner
+ * retirement closes new pins (CLOSED); existing readers can resolve afterward.
+ * Compounds remain unsupported. The retained intern table is an additional
+ * resident floor, not bounded row scratch. */
+wl_columnar_spill_status_t wl_columnar_spill_create_with_intern(
+    wl_columnar_spill_store_t *store, const wirelog_column_type_t *types,
+    uint32_t ncols, uint64_t nrows, wl_columnar_spill_source_fn source,
+    void *source_context, wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_spill_segment_t **out);
+/* Borrowed STRING remains valid through reader release; clears *out on error.
+ * Caller supplies an ID from a STRING lane, not a numeric lane. */
+wl_columnar_spill_status_t wl_columnar_spill_resolve_string(
+    wl_columnar_spill_reader_t *reader, uint64_t id, const char **out);
 /* BUSY leaves the owner unchanged while any acquired reader exists. */
 wl_columnar_spill_status_t wl_columnar_spill_release(
     wl_columnar_spill_segment_t *segment);

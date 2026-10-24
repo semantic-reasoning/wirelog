@@ -279,6 +279,7 @@ typedef struct {
     uint32_t rows;
     bool begun;
     wl_columnar_batch_payload_t *staged, *ready;
+    wl_intern_t *intern; /* Explicit STRING provenance; borrowed during use. */
 } wl_columnar_join_batch_payload_sink_t;
 
 void wl_columnar_join_batch_payload_sink_init(
@@ -287,6 +288,15 @@ void wl_columnar_join_batch_payload_sink_init(
     wl_columnar_memory_governor_ref_t *governor,
     wl_columnar_spill_store_t *store,
     wl_columnar_batch_payload_storage_t storage);
+/* STRING-capable sink: caller guarantees this is the producing table for all
+ * STRING columns. Keep its owner alive during publication. Taken payloads own
+ * their pins independently; cleanup does not free the intern owner. */
+void wl_columnar_join_batch_payload_sink_init_with_intern(
+    wl_columnar_join_batch_payload_sink_t *context,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage, wl_intern_t *intern);
 wl_columnar_batch_payload_t *wl_columnar_join_batch_payload_sink_take(
     wl_columnar_join_batch_payload_sink_t *context);
 void wl_columnar_join_batch_payload_sink_cleanup(
