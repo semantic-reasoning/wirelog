@@ -1040,6 +1040,198 @@ test_issue_2129_program_same_model_at_every_width(void)
 }
 
 /* ================================================================
+ * Issue #2261: a K-Fusion branch session must not share the coordinator's
+ * sorted-arrangement (LFTJ) cache.  Pin counts on its entries are plain
+ * integers, so branches pinning the same entry on worker threads race, and
+ * a branch that grew the array would reallocate the coordinator's storage.
+ * ================================================================ */
+
+struct branch_sarr_probe {
+    wl_col_session_t *parent;
+    wl_col_session_t *child;
+    col_sorted_arr_entry_t *parent_entries;
+    uint32_t parent_count;
+    uint32_t parent_cap;
+    uint32_t parent_pins;
+    unsigned clones;
+    unsigned primed;
+    unsigned inherited;
+    unsigned child_built;
+    unsigned parent_changed;
+};
+
+static struct branch_sarr_probe sarr_probe;
+
+/* Runs right after the shallow copy of branch d, before its resets. */
+static void
+record_parent_sarr(wl_col_session_t *parent, wl_col_session_t *child,
+    bool before)
+{
+    if (before)
+        return;
+    sarr_probe.parent = parent;
+    sarr_probe.child = child;
+    sarr_probe.clones++;
+    sarr_probe.parent_entries = parent->sarr_entries;
+    sarr_probe.parent_count = parent->sarr_count;
+    sarr_probe.parent_cap = parent->sarr_cap;
+    sarr_probe.parent_pins = parent->sarr_active_pins;
+    if (parent->sarr_count > 0)
+        sarr_probe.primed++;
+}
+
+/* Runs branch d inline on the coordinator thread, after all of its resets.
+ * Clearing an inherited cache here keeps the unfixed code from pinning or
+ * growing the coordinator's entries, so the test reports the inheritance
+ * instead of corrupting the coordinator's cache. */
+static int
+run_sarr_branch_inline(wl_work_queue_t *wq, void (*work_fn)(void *ctx),
+    void *ctx)
+{
+    wl_col_session_t *child = sarr_probe.child;
+    wl_col_session_t *parent = sarr_probe.parent;
+
+    (void)wq;
+    if (child->sarr_entries != NULL || child->sarr_count != 0
+        || child->sarr_cap != 0 || child->sarr_active_pins != 0) {
+        sarr_probe.inherited++;
+        child->sarr_entries = NULL;
+        child->sarr_count = 0;
+        child->sarr_cap = 0;
+        child->sarr_active_pins = 0;
+    }
+    work_fn(ctx);
+    if (child->sarr_count > 0)
+        sarr_probe.child_built++;
+    if (parent->sarr_entries != sarr_probe.parent_entries
+        || parent->sarr_count != sarr_probe.parent_count
+        || parent->sarr_cap != sarr_probe.parent_cap
+        || parent->sarr_active_pins != sarr_probe.parent_pins)
+        sarr_probe.parent_changed++;
+    for (uint32_t i = 0; i < parent->sarr_count; i++) {
+        if (parent->sarr_entries[i].sarr.pin_count != 0)
+            sarr_probe.parent_changed++;
+    }
+    return 0;
+}
+
+/* Runs src at width w without the fusion/JPP/SIP passes, which would break
+ * the EDB join chains that the LFTJ rewrite looks for.  Returns the snapshot
+ * rc and stores the number of tuples of r. */
+static int
+run_lftj_program(const char *src, uint32_t w, int64_t *out_count)
+{
+    wirelog_error_t err;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    struct result_ctx ctx = { 0, 0, "r" };
+    int rc = -1;
+
+    if (prog && wl_plan_from_program(prog, &plan) == 0
+        && wl_session_create(wl_backend_columnar(), plan, w, &sess) == 0
+        && wl_session_load_facts(sess, prog) == 0)
+        rc = wl_session_snapshot(sess, count_tuples_cb, &ctx);
+    if (sess)
+        wl_session_destroy(sess);
+    if (plan)
+        wl_plan_free(plan);
+    if (prog)
+        wirelog_program_free(prog);
+    *out_count = ctx.rel_count;
+    return rc;
+}
+
+static void
+test_k4_branch_sorted_arrangements_are_branch_owned(void)
+{
+    TEST("K-Fusion branches own their sorted arrangements (#2261)");
+
+    /* s is a lower stratum whose a/b/c chain becomes an LFTJ operator, so
+     * the coordinator holds sorted arrangements before dispatch; the
+     * recursive rule's a/b/c chain is an LFTJ operator inside every
+     * branch. */
+    const char *src = ".decl a(k: int32, x: int32)\n"
+        ".decl b(k: int32, x: int32)\n"
+        ".decl c(k: int32, x: int32)\n"
+        ".decl e(x: int32, y: int32)\n"
+        ".decl s(x: int32)\n"
+        ".decl r(x: int32, y: int32)\n"
+        "a(1, 1). a(2, 2). a(3, 3). b(1, 1). b(2, 2). b(3, 3).\n"
+        "c(1, 1). c(2, 2). c(3, 3).\n"
+        "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
+        "s(x) :- a(k, x), b(k, y), c(k, z).\n"
+        "r(x, y) :- e(x, y).\n"
+        "r(x, w) :- a(x, k), b(y, k), c(z, k), r(x, v), r(v, w).\n";
+    /* W=1 runs the branches serially without cloning: the control. */
+    static const uint32_t workers[] = { 1, 4, 2 };
+    int64_t control = -1;
+    int64_t count = 0;
+    char why[256];
+    int rc;
+
+    why[0] = '\0';
+    unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
+    unsetenv("WIRELOG_JOIN_BATCH_BYTES");
+    unsetenv("WIRELOG_JOIN_BATCH_STRICT");
+    for (size_t wi = 0; wi < sizeof(workers) / sizeof(workers[0]); wi++) {
+        uint32_t w = workers[wi];
+
+        memset(&sarr_probe, 0, sizeof(sarr_probe));
+        wl_columnar_kfusion_test_clone = record_parent_sarr;
+        wl_columnar_kfusion_test_submit = run_sarr_branch_inline;
+        count = 0;
+        rc = run_lftj_program(src, w, &count);
+        wl_columnar_kfusion_test_clone = NULL;
+        wl_columnar_kfusion_test_submit = NULL;
+        if (w == 1)
+            control = count;
+
+        printf("\n    W=%u count=%" PRId64 " clones=%u primed=%u "
+            "inherited=%u built=%u parent_changed=%u ", w, count,
+            sarr_probe.clones, sarr_probe.primed, sarr_probe.inherited,
+            sarr_probe.child_built, sarr_probe.parent_changed);
+        if (rc != 0)
+            snprintf(why, sizeof(why), "W=%u: snapshot failed (rc %d)", w,
+                rc);
+        else if (count != control || count <= 0)
+            snprintf(why, sizeof(why), "W=%u: %" PRId64 " tuples of r, "
+                "W=1 derived %" PRId64, w, count, control);
+        else if (w == 1 && sarr_probe.clones != 0)
+            snprintf(why, sizeof(why), "W=1 cloned a branch session");
+        else if (w > 1 && (sarr_probe.clones == 0 || sarr_probe.primed == 0))
+            snprintf(why, sizeof(why), "W=%u: no branch was cloned while "
+                "the coordinator held sorted arrangements", w);
+        else if (w > 1 && sarr_probe.child_built == 0)
+            snprintf(why, sizeof(why), "W=%u: no branch built a sorted "
+                "arrangement", w);
+        else if (sarr_probe.inherited != 0)
+            snprintf(why, sizeof(why), "W=%u: a branch session inherited "
+                "the coordinator's sorted-arrangement cache", w);
+        else if (sarr_probe.parent_changed != 0)
+            snprintf(why, sizeof(why), "W=%u: a branch changed the "
+                "coordinator's sorted-arrangement cache", w);
+        if (why[0] != '\0')
+            break;
+    }
+
+    /* Real worker threads, for ThreadSanitizer: before the fix, branches
+     * pinned and unpinned the coordinator's entries concurrently.  Runs
+     * even after a failure above, so the race stays visible. */
+    {
+        count = 0;
+        rc = run_lftj_program(src, 4, &count);
+        printf("\n    W=4 threaded count=%" PRId64 " ", count);
+        if (why[0] == '\0' && (rc != 0 || count != control))
+            snprintf(why, sizeof(why), "threaded W=4: rc %d, %" PRId64
+                " tuples of r, W=1 derived %" PRId64, rc, count, control);
+    }
+    printf("\n    ");
+    ASSERT(why[0] == '\0', why);
+    PASS();
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -1062,6 +1254,7 @@ main(void)
     test_k4_join_batch_knob_runs_branches_serially();
     test_k4_branch_filter_cache_tokens_are_branch_owned();
     test_issue_2129_program_same_model_at_every_width();
+    test_k4_branch_sorted_arrangements_are_branch_owned();
 
     printf("\nResults: %d/%d passed", pass_count, test_count);
     if (fail_count > 0)

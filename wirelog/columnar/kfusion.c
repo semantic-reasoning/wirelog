@@ -384,7 +384,11 @@ col_kfusion_cleanup_cohort(struct wl_columnar_kfusion_cohort *cohort)
         rc = col_session_free_diff_arrangements(worker);
         if (rc != 0)
             return rc;
-        if (worker->filt_cache_active_pins != 0)
+        /* Issue #2261: col_session_free_sorted_arrangements aborts on an
+         * active probe, so a pinned sorted arrangement is refused here,
+         * before the release pass below. */
+        if (worker->filt_cache_active_pins != 0
+            || worker->sarr_active_pins != 0)
             return EBUSY;
     }
 
@@ -423,6 +427,7 @@ col_kfusion_cleanup_cohort(struct wl_columnar_kfusion_cohort *cohort)
         worker->arr_count = worker->arr_cap = 0;
         col_session_free_delta_arrangements(worker);
         col_session_free_filt_arrangements(worker);
+        col_session_free_sorted_arrangements(worker);
         for (uint32_t i = 0; i < worker->filt_cache_count; i++) {
             col_filt_cache_entry_t *entry = &worker->filt_cache[i];
             if (entry->filtered) {
@@ -1097,6 +1102,13 @@ col_op_k_fusion_dispatch(const wl_plan_op_t *op, eval_stack_t *stack,
          * that grows its own cache reserves a token of its own, which
          * col_kfusion_cleanup_cohort releases. */
         worker_sess[d].filt_cache_array_reservation = NULL;
+        /* Issue #2261: the sorted-arrangement (LFTJ) cache belongs to the
+         * coordinator, and its pin counts are not atomic.  A branch builds
+         * entries of its own, which col_kfusion_cleanup_cohort frees. */
+        worker_sess[d].sarr_entries = NULL;
+        worker_sess[d].sarr_count = 0;
+        worker_sess[d].sarr_cap = 0;
+        worker_sess[d].sarr_active_pins = 0;
         /* Issue #196: Workers start with empty mat_cache.  Divergent rule
          * copies have ~0% cache hit rate, so inheriting parent entries
          * wastes memory without benefit. */

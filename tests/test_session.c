@@ -14685,6 +14685,145 @@ kfusion_cohort_cleanup:
 #undef KCOHORT_CHECK
 }
 
+/* #2261: a sorted-arrangement probe that branch 0 still holds when cleanup
+ * starts.  Cleanup must refuse instead of freeing the pinned entry, and the
+ * pass after the probe is released must free the branch's entries. */
+static col_rel_t *kfusion_sarr_source;
+static col_sorted_arrangement_probe_t kfusion_sarr_probe;
+static int kfusion_sarr_acquire_rc;
+static uint32_t kfusion_sarr_count_seen;
+static uint32_t kfusion_sarr_pins_seen;
+
+static int
+kfusion_sarr_inline_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx),
+    void *ctx)
+{
+    (void)wq;
+    work_fn(ctx);
+    return 0;
+}
+
+static void
+kfusion_sarr_pin_before_cleanup(wl_col_session_t *sess, eval_stack_t *stack,
+    col_rel_t **results, uint32_t result_count)
+{
+    (void)stack;
+    (void)results;
+    (void)result_count;
+    kfusion_sarr_acquire_rc = col_session_acquire_sorted_arrangement_probe(
+        (wl_session_t *)sess, kfusion_sarr_source, 0, &kfusion_sarr_probe);
+    /* Read here: on a cleanup that does not refuse, the branch session is
+     * freed before col_op_k_fusion returns. */
+    kfusion_sarr_count_seen = sess->sarr_count;
+    kfusion_sarr_pins_seen = sess->sarr_active_pins;
+}
+
+static void
+test_kfusion_cohort_refuses_pinned_sorted_arrangement(void)
+{
+    TEST("K-Fusion cleanup refuses a pinned branch sorted arrangement");
+    const char *failure = NULL;
+#define KSARR_CHECK(c, m) \
+        do { if (!(c)) { failure = (m); goto kfusion_sarr_cleanup; \
+             } } while (0)
+    wl_col_session_t sess = { 0 };
+    wl_plan_op_t branches[4][2] = { 0 };
+    wl_plan_op_t *branch_ptrs[4];
+    uint32_t branch_counts[4] = { 2, 2, 2, 2 };
+    wl_plan_op_k_fusion_t meta = { 4, branch_ptrs, branch_counts };
+    wl_plan_op_t op = { 0 };
+    eval_stack_t stack;
+    int rc;
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    eval_stack_init(&stack);
+    memset(&kfusion_sarr_probe, 0, sizeof(kfusion_sarr_probe));
+    kfusion_sarr_acquire_rc = -1;
+    kfusion_sarr_count_seen = 0;
+    kfusion_sarr_pins_seen = 0;
+    KSARR_CHECK(input != NULL, "input allocation failed");
+    KSARR_CHECK(col_rel_append_row(input, (int64_t[]){ 7 }) == 0,
+        "input append failed");
+    sess.num_workers = 4;
+    sess.callback_configured_workers = 4;
+    sess.callback_active_workers = 1;
+    sess.delta_pool = delta_pool_create(32, sizeof(col_rel_t), 16384);
+    KSARR_CHECK(sess.delta_pool != NULL, "delta pool allocation failed");
+    KSARR_CHECK(session_add_rel(&sess, input) == 0,
+        "input registration failed");
+    for (uint32_t i = 0; i < 4; i++) {
+        branches[i][0].op = WL_PLAN_OP_VARIABLE;
+        branches[i][0].relation_name = "input";
+        branches[i][0].delta_mode = WL_DELTA_FORCE_FULL;
+        branches[i][1].op = WL_PLAN_OP_CONSOLIDATE;
+        branch_ptrs[i] = branches[i];
+    }
+    op.op = WL_PLAN_OP_K_FUSION;
+    op.relation_name = "out";
+    op.opaque_data = &meta;
+    kfusion_sarr_source = input;
+    wl_columnar_kfusion_test_submit = kfusion_sarr_inline_submit;
+    wl_columnar_kfusion_test_before_cleanup = kfusion_sarr_pin_before_cleanup;
+    rc = col_op_k_fusion(&op, &stack, &sess);
+    wl_columnar_kfusion_test_submit = NULL;
+    wl_columnar_kfusion_test_before_cleanup = NULL;
+    KSARR_CHECK(kfusion_sarr_acquire_rc == 0,
+        "branch sorted-arrangement probe was not acquired");
+    KSARR_CHECK(kfusion_sarr_count_seen == 1 && kfusion_sarr_pins_seen == 1,
+        "branch did not own exactly one pinned sorted arrangement");
+    KSARR_CHECK(rc == EBUSY && sess.kfusion_pending_cohort != NULL,
+        "cleanup freed a cohort with a pinned sorted arrangement");
+    KSARR_CHECK(wl_columnar_kfusion_retry_pending(&sess) == EBUSY
+        && sess.kfusion_pending_cohort != NULL,
+        "retry freed a cohort with a pinned sorted arrangement");
+    KSARR_CHECK(col_sorted_arrangement_probe_release(&kfusion_sarr_probe)
+        == 0, "branch sorted-arrangement probe release failed");
+    KSARR_CHECK(wl_columnar_kfusion_retry_pending(&sess) == 0
+        && sess.kfusion_pending_cohort == NULL,
+        "retry after the probe release did not complete cleanup");
+    KSARR_CHECK(eval_stack_drain(&stack) == 0,
+        "merged result cleanup failed");
+
+kfusion_sarr_cleanup:
+    wl_columnar_kfusion_test_submit = NULL;
+    wl_columnar_kfusion_test_before_cleanup = NULL;
+    kfusion_sarr_source = NULL;
+    if (kfusion_sarr_probe.active) {
+        /* The probe's session is the branch: release through it only while
+         * the cohort still exists. */
+        if (sess.kfusion_pending_cohort)
+            (void)col_sorted_arrangement_probe_release(&kfusion_sarr_probe);
+        else if (kfusion_sarr_probe.source_reader.owner)
+            (void)col_rel_source_reader_release(
+                &kfusion_sarr_probe.source_reader);
+        memset(&kfusion_sarr_probe, 0, sizeof(kfusion_sarr_probe));
+    }
+    if (sess.kfusion_pending_cohort)
+        (void)wl_columnar_kfusion_retry_pending(&sess);
+    (void)eval_stack_drain(&stack);
+    if (sess.wq)
+        wl_workqueue_destroy(sess.wq);
+    if (sess.delta_pool) {
+        (void)col_rel_pool_destroy_aliases_checked(sess.delta_pool, 0,
+            sess.delta_pool->slot_used);
+        (void)col_rel_pool_destroy_roots_checked(sess.delta_pool, 0,
+            sess.delta_pool->slot_used);
+        delta_pool_destroy(sess.delta_pool);
+    }
+    session_rel_free_hash(&sess);
+    free(sess.rels);
+    if (atomic_load_explicit(&sess.rels_reservation.state,
+        memory_order_acquire) == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        (void)wl_columnar_memory_rollback(&sess.rels_reservation);
+    if (input)
+        col_rel_destroy(input);
+    if (failure) {
+        FAIL(failure);
+        return;
+    }
+    PASS();
+#undef KSARR_CHECK
+}
+
 static bool map_dispose_hook_hit;
 static wl_columnar_source_access_reader_t map_dispose_reader;
 
@@ -16503,6 +16642,7 @@ main(void)
 #ifdef WL_SESSION_TEST_HOOKS
     test_kfusion_retained_pool_entry_retry();
     test_kfusion_parallel_cohort_refusal_retry();
+    test_kfusion_cohort_refuses_pinned_sorted_arrangement();
     test_map_input_cleanup_retry();
 #endif
     test_map_entry_storage_modes();
