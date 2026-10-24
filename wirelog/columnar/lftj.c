@@ -769,7 +769,7 @@ wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
             uint64_t allocation_work;
             if (!wl_columnar_memory_size_mul(cells, 2u, &allocation_work)
                 || !wl_columnar_memory_size_add(allocation_work,
-                2u * WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS,
+                UINT64_C(2) * WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS,
                 &allocation_work)
                 || !wl_columnar_lftj_allocation_work_add(
                     &a->allocation_work_total, allocation_work))
