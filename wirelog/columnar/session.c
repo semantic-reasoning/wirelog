@@ -3493,9 +3493,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
      * tests/test_compound_arena.c; max_epochs=0 selects the library
      * default (WL_COMPOUND_EPOCH_MAX + 1). */
     uint32_t compound_max_epochs = session_compound_max_epochs_from_env();
-    sess->compound_arena = wl_compound_arena_create_managed(0x53455353u,
-            4096u, compound_max_epochs,
-            wl_columnar_memory_governor_ref_get(sess->memory_governor));
+    sess->compound_arena = wl_arena_compound_arena_create_managed_ref(
+        0x53455353u, 4096u, compound_max_epochs, sess->memory_governor);
     if (!sess->compound_arena)
         goto oom;
     WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_INFO,
@@ -3956,9 +3955,8 @@ col_session_destroy(wl_session_t *session)
         sess->compound_arena
             ? (unsigned long long)sess->compound_arena->live_handles
             : 0ULL);
-    if (!wl_compound_arena_free_checked(sess->compound_arena))
-        WL_LOG(WL_LOG_SEC_SESSION, WL_LOG_ERROR,
-            "compound arena still has active worker leases");
+    wl_arena_compound_arena_retire(sess->compound_arena);
+    sess->compound_arena = NULL;
     if (sess->owns_spill_store)
         wl_columnar_spill_store_retire(sess->spill_store);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);

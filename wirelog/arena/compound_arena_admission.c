@@ -8,6 +8,7 @@
 
 typedef struct {
     wl_columnar_memory_governor_t *governor;
+    wl_columnar_memory_governor_ref_t *owner;
     wl_columnar_memory_reservation_t reservation;
 } wl_compound_arena_admission_t;
 
@@ -18,8 +19,14 @@ release_compound_arena_admission(void *context)
 
     if (!admission)
         return;
-    (void)wl_columnar_memory_release(&admission->reservation);
+    wl_columnar_memory_governor_ref_t *owner = admission->owner;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    (void)wl_columnar_memory_reservation_move(&reservation,
+        &admission->reservation);
     free(admission);
+    (void)wl_columnar_memory_release(&reservation);
+    wl_columnar_memory_governor_ref_release(owner);
 }
 
 static int
@@ -82,10 +89,11 @@ normalize_max_epochs(uint32_t max_epochs)
     return max_epochs;
 }
 
-wl_compound_arena_t *
-wl_compound_arena_create_managed(uint32_t session_seed,
+static wl_compound_arena_t *
+compound_arena_create_managed(uint32_t session_seed,
     uint32_t default_gen_cap, uint32_t max_epochs,
-    wl_columnar_memory_governor_t *governor)
+    wl_columnar_memory_governor_t *governor,
+    wl_columnar_memory_governor_ref_t *owner)
 {
     wl_compound_arena_admission_t *admission;
     wl_columnar_memory_admission_status_t status;
@@ -105,10 +113,14 @@ wl_compound_arena_create_managed(uint32_t session_seed,
         gens_bytes, &fixed_bytes))
         return NULL;
 
+    if (owner && !wl_columnar_memory_size_add(fixed_bytes,
+        sizeof(*admission), &fixed_bytes))
+        return NULL;
     admission = (wl_compound_arena_admission_t *)malloc(sizeof(*admission));
     if (!admission)
         return NULL;
     admission->governor = governor;
+    admission->owner = owner;
     wl_columnar_memory_reservation_init(&admission->reservation);
     status = wl_columnar_memory_reserve_checked(governor, fixed_bytes,
             &admission->reservation);
@@ -118,14 +130,14 @@ wl_compound_arena_create_managed(uint32_t session_seed,
         return NULL;
     }
 
+    wl_columnar_memory_governor_ref_retain(owner);
     arena = wl_compound_arena_create_with_admission(session_seed,
             default_gen_cap, max_epochs, admission,
             release_compound_arena_admission, prepare_compound_growth,
             publish_compound_growth, abort_compound_growth,
             release_compound_growth);
     if (!arena) {
-        (void)wl_columnar_memory_rollback(&admission->reservation);
-        free(admission);
+        release_compound_arena_admission(admission);
         return NULL;
     }
     if (!wl_columnar_memory_commit(&admission->reservation, arena)) {
@@ -133,4 +145,25 @@ wl_compound_arena_create_managed(uint32_t session_seed,
         return NULL;
     }
     return arena;
+}
+
+wl_compound_arena_t *
+wl_compound_arena_create_managed(uint32_t session_seed,
+    uint32_t default_gen_cap, uint32_t max_epochs,
+    wl_columnar_memory_governor_t *governor)
+{
+    return compound_arena_create_managed(session_seed, default_gen_cap,
+               max_epochs, governor, NULL);
+}
+
+wl_compound_arena_t *
+wl_arena_compound_arena_create_managed_ref(uint32_t session_seed,
+    uint32_t default_gen_cap, uint32_t max_epochs,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    if (!governor)
+        return NULL;
+    return compound_arena_create_managed(session_seed, default_gen_cap,
+               max_epochs, wl_columnar_memory_governor_ref_get(governor),
+               governor);
 }

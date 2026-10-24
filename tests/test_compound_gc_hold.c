@@ -197,9 +197,92 @@ test_concurrency(void)
     CHECK(wl_compound_arena_free_checked(context.arena));
 }
 
+static void
+test_retirement(void)
+{
+    wl_compound_arena_t *arena = wl_compound_arena_create(12, 16, 1);
+    CHECK(arena != NULL);
+    if (!arena)
+        return;
+    uint64_t handle = wl_compound_arena_alloc(arena, 8);
+    CHECK(handle != 0);
+    memcpy((void *)wl_compound_arena_lookup(arena, handle, NULL), "retained",
+        8);
+    wl_arena_compound_arena_gc_hold_t hold = { 0 }, refused = { 0 };
+    wl_compound_arena_borrow_t borrow = { 0 }, refused_borrow = { 0 };
+    CHECK(wl_arena_compound_arena_gc_hold_acquire(arena, &hold) == 0);
+    CHECK(!wl_compound_arena_free_checked(arena));
+    wl_arena_compound_arena_retire(arena);
+    CHECK(!wl_compound_arena_borrow(arena, &refused_borrow));
+    CHECK(wl_arena_compound_arena_gc_hold_acquire(arena, &refused) == EBUSY);
+    CHECK(wl_compound_arena_alloc(arena, 8) == 0);
+    CHECK(!wl_compound_arena_free_checked(arena));
+    wl_arena_compound_arena_gc_hold_t copied = hold;
+    CHECK(!wl_arena_compound_arena_gc_hold_borrow(&copied, &borrow));
+    CHECK(wl_arena_compound_arena_gc_hold_borrow(&hold, &borrow));
+    CHECK(wl_arena_compound_arena_gc_hold_release(&hold) == 0);
+    const void *data = wl_compound_arena_lookup_borrowed(&borrow, handle, NULL);
+    CHECK(data && memcmp(data, "retained", 8) == 0);
+    CHECK(wl_compound_arena_borrow_release(&borrow));
+    CHECK(!wl_compound_arena_borrow_release(&borrow));
+    CHECK(!wl_arena_compound_arena_gc_hold_borrow(&copied, &borrow));
+
+    /* Already admitted operations carry lifetime authority across retirement. */
+    arena = wl_compound_arena_create(13, 16, 1);
+    CHECK(arena != NULL);
+    wl_compound_arena_mutation_t mutation = { 0 };
+    CHECK(wl_compound_arena_mutation_begin(arena, &mutation));
+    wl_arena_compound_arena_retire(arena);
+    CHECK(wl_compound_arena_mutation_end(&mutation));
+    arena = wl_compound_arena_create(14, 16, 1);
+    CHECK(wl_compound_arena_borrow(arena, &borrow));
+    wl_arena_compound_arena_retire(arena);
+    CHECK(wl_compound_arena_borrow_release(&borrow));
+
+    arena = wl_compound_arena_create(15, 16, 1);
+    atomic_init(&arena->lifetime_state, (UINT64_C(1) << 63) - 1);
+    CHECK(!wl_compound_arena_borrow(arena, &borrow));
+    CHECK(!wl_compound_arena_mutation_begin(arena, &mutation));
+    atomic_init(&arena->lifetime_state, 1);
+    CHECK(wl_compound_arena_free_checked(arena));
+}
+
+static void
+test_retired_concurrent_release(void)
+{
+    for (unsigned attempt = 0; attempt < 200; attempt++) {
+        wl_compound_arena_t *arena = wl_compound_arena_create(16, 16, 1);
+        thread_context_t contexts[2] = { 0 };
+        wl_thread_t threads[2];
+        bool started[2];
+        CHECK(arena != NULL);
+        if (!arena)
+            return;
+        for (unsigned i = 0; i < 2; i++)
+            CHECK(wl_arena_compound_arena_gc_hold_acquire(arena,
+                &contexts[i].hold) == 0);
+        for (unsigned i = 0; i < 2; i++) {
+            started[i] = wl_thread_create(&threads[i], release_worker,
+                    &contexts[i]) == 0;
+            CHECK(started[i]);
+            if (!started[i])
+                release_worker(&contexts[i]);
+        }
+        /* Race the unique owner release against independent final holds. */
+        wl_arena_compound_arena_retire(arena);
+        for (unsigned i = 0; i < 2; i++) {
+            if (started[i])
+                wl_thread_join(&threads[i]);
+            CHECK(contexts[i].errors == 0);
+        }
+    }
+}
+
 int
 main(void)
 {
+    test_retirement();
+    test_retired_concurrent_release();
     test_lifetime();
     test_tokens();
     test_concurrency();
