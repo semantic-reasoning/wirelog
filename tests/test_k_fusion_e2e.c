@@ -1150,7 +1150,10 @@ test_k4_branch_sorted_arrangements_are_branch_owned(void)
     /* s is a lower stratum whose a/b/c chain becomes an LFTJ operator, so
      * the coordinator holds sorted arrangements before dispatch; the
      * recursive rule's a/b/c chain is an LFTJ operator inside every
-     * branch. */
+     * branch.  Four r atoms make K=4, which dispatches in parallel without
+     * consulting the adaptive scheduler.  That scheduler times each run,
+     * and in the MSVC CI job a K=2 version of this fixture never
+     * dispatched in parallel. */
     const char *src = ".decl a(k: int32, x: int32)\n"
         ".decl b(k: int32, x: int32)\n"
         ".decl c(k: int32, x: int32)\n"
@@ -1162,7 +1165,8 @@ test_k4_branch_sorted_arrangements_are_branch_owned(void)
         "e(1, 2). e(2, 3). e(3, 4). e(4, 5).\n"
         "s(x) :- a(k, x), b(k, y), c(k, z).\n"
         "r(x, y) :- e(x, y).\n"
-        "r(x, w) :- a(x, k), b(y, k), c(z, k), r(x, v), r(v, w).\n";
+        "r(x, w) :- a(x, k), b(y, k), c(z, k), r(x, t), r(t, u), r(u, v),"
+        " r(v, w).\n";
     /* W=1 runs the branches serially without cloning: the control. */
     static const uint32_t workers[] = { 1, 4, 2 };
     int64_t control = -1;
