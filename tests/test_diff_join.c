@@ -1008,7 +1008,7 @@ test_arrangement_generation_rebuild(void)
 
     uint32_t right_key = 0;
     col_diff_arrangement_t *arr = col_session_get_diff_arrangement(sess,
-            "right", right_ref, &right_key, 1);
+            "right", right_ref, &right_key, 1, NULL);
     ASSERT_TRUE(arr != NULL && arr->indexed_rows == 0,
         "generation change must reset differential index before rebuild");
 
@@ -1104,21 +1104,29 @@ test_diff_arrangement_txn_ledger_accounting(void)
         "right relation allocated");
     ASSERT_TRUE(session_add_rel(sess, right) == 0, "right registered");
 
+    uint64_t baseline_bytes = diff_arrangement_ledger_bytes(sess);
     wl_columnar_arrangement_diff_txn_t txn = {0};
     ASSERT_TRUE(wl_columnar_arrangement_diff_txn_begin(sess, "right", right,
         &key_col, 1, &txn) == 0, "pending transaction begins");
     uint64_t working_bytes = col_diff_arrangement_bytes(txn.working);
+    uint64_t registry_bytes = sess->diff_arr_registry_reserved_bytes;
+    uint64_t metadata_bytes =
+        sess->diff_arr_registry_metadata_reserved_bytes;
     ASSERT_TRUE(txn.working->ledger == &sess->mem_ledger,
         "pending working copy is ledger-attached");
     ASSERT_TRUE(sess->diff_arr_count == 1
         && sess->diff_arr_entries[0].transaction_pending,
         "pending arrangement remains unpublished");
-    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess) == working_bytes,
+    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess)
+        == baseline_bytes + registry_bytes + metadata_bytes + working_bytes,
         "pending working copy is charged");
     wl_columnar_arrangement_diff_txn_abort(&txn);
     ASSERT_TRUE(sess->diff_arr_count == 0,
         "pending abort leaves no cache entry");
-    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess) == 0,
+    ASSERT_TRUE(sess->diff_arr_registry_metadata_reserved_bytes == 0,
+        "pending abort releases entry metadata");
+    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess)
+        == baseline_bytes + registry_bytes,
         "pending abort credits working copy");
 
     ASSERT_TRUE(wl_columnar_arrangement_diff_txn_begin(sess, "right", right,
@@ -1126,7 +1134,10 @@ test_diff_arrangement_txn_ledger_accounting(void)
     working_bytes = col_diff_arrangement_bytes(txn.working);
     wl_columnar_arrangement_diff_txn_commit(&txn);
     ASSERT_TRUE(sess->diff_arr_count == 1, "pending commit publishes entry");
-    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess) == working_bytes,
+    ASSERT_TRUE(diff_arrangement_ledger_bytes(sess)
+        == baseline_bytes + registry_bytes
+        + sess->diff_arr_registry_metadata_reserved_bytes
+        + working_bytes,
         "pending commit does not double-charge");
 
     uint64_t persistent_bytes = diff_arrangement_ledger_bytes(sess);

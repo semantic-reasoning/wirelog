@@ -2567,7 +2567,7 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
 
 static int measure_create_floor(wirelog_program_t *prog,
     uint64_t *intern_bytes, uint64_t *compound_bytes,
-    uint64_t *descriptor_bytes);
+    uint64_t *descriptor_bytes, uint64_t *diff_registry_bytes);
 
 static int
 test_inline_fact_budget_denial_maps(void)
@@ -2580,14 +2580,17 @@ test_inline_fact_budget_denial_maps(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
     uint64_t descriptor_bytes = 0;
+    uint64_t diff_registry_bytes = 0;
     uint64_t floor;
     int rc = 1;
 
     if (!prog || measure_create_floor(prog, &intern_bytes, &compound_bytes,
-        &descriptor_bytes) != 0)
+        &descriptor_bytes, &diff_registry_bytes) != 0)
         goto out;
     if (!wl_columnar_memory_size_add(intern_bytes, compound_bytes, &floor)
         || !wl_columnar_memory_size_add(floor, SESSION_REGISTRY_BYTES,
+        &floor)
+        || !wl_columnar_memory_size_add(floor, diff_registry_bytes,
         &floor)
         || !wl_columnar_memory_size_add(floor, descriptor_bytes, &floor))
         goto out;
@@ -2637,7 +2640,8 @@ out:
 }
 
 /* Measure the intern table admitted when a session attaches it (#1431),
- * the fixed compound arena, and planned EDB descriptor/name charges.
+ * the fixed compound arena, planned EDB descriptor/name charges, and the
+ * pre-admitted differential JOIN registry from the generated plan.
  * Callers add the initial 16-pointer session registry to obtain the floor.
  * The arena is probed with the
  * library-default epoch count, so the budget tests assume
@@ -2646,8 +2650,28 @@ out:
  * once first so the table measured is the one the facade's own plan
  * generation will attach. */
 static int
+test_count_controlled_diff_join_candidates(const wl_plan_op_t *ops,
+    uint32_t count, uint64_t *candidates)
+{
+    if (!candidates)
+        return EINVAL;
+    for (uint32_t i = 0; ops && i < count; i++) {
+        const wl_plan_op_t *op = &ops[i];
+        if (op->op != WL_PLAN_OP_JOIN || !op->right_relation
+            || op->materialized || op->key_count != 1 || !op->left_keys
+            || !op->left_keys[0] || !op->right_keys || !op->right_keys[0])
+            continue;
+        if (*candidates == UINT64_MAX)
+            return EOVERFLOW;
+        (*candidates)++;
+    }
+    return 0;
+}
+
+static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
-    uint64_t *compound_bytes, uint64_t *descriptor_bytes)
+    uint64_t *compound_bytes, uint64_t *descriptor_bytes,
+    uint64_t *diff_registry_bytes)
 {
     wl_columnar_memory_governor_ref_t *probe
         = enforcing_governor(UINT64_MAX / 4u);
@@ -2658,11 +2682,12 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     wl_intern_t *intern = (wl_intern_t *)wirelog_program_get_intern(prog);
     int ok = 0;
 
-    if (!probe || !intern)
+    if (!probe || !intern || !diff_registry_bytes)
         goto out;
     if (wl_plan_from_program(prog, &warm) != 0 || !warm)
         goto out;
     *descriptor_bytes = 0;
+    *diff_registry_bytes = 0;
     for (uint32_t i = 0; i < warm->edb_count; i++) {
         size_t name_len = strlen(warm->edb_relations[i]);
         uint64_t name_bytes, relation_bytes;
@@ -2673,6 +2698,32 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
             &relation_bytes)
             || !wl_columnar_memory_size_add(*descriptor_bytes,
             relation_bytes, descriptor_bytes))
+            goto out;
+    }
+    uint64_t candidates = 0;
+    for (uint32_t s = 0; s < warm->stratum_count; s++) {
+        const wl_plan_stratum_t *stratum = &warm->strata[s];
+        for (uint32_t r = 0; stratum->relations
+            && r < stratum->relation_count; r++) {
+            const wl_plan_relation_t *relation = &stratum->relations[r];
+            if (test_count_controlled_diff_join_candidates(relation->ops,
+                relation->op_count, &candidates) != 0)
+                goto out;
+        }
+        for (uint32_t r = 0; stratum->bodies
+            && r < stratum->relation_count; r++) {
+            const wl_plan_body_t *body = &stratum->bodies[r];
+            if (test_count_controlled_diff_join_candidates(body->ops,
+                body->op_count, &candidates) != 0)
+                goto out;
+        }
+    }
+    if (candidates > 0) {
+        uint64_t capacity = candidates < WL_DIFF_ARR_REGISTRY_INITIAL_CAP
+            ? WL_DIFF_ARR_REGISTRY_INITIAL_CAP : candidates;
+        if (candidates > UINT32_MAX
+            || !wl_columnar_memory_size_mul(capacity,
+            sizeof(col_diff_arr_entry_t), diff_registry_bytes))
             goto out;
     }
     wl_plan_free(warm);
@@ -2712,18 +2763,20 @@ test_bulk_insert_error_mapping(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
     uint64_t descriptor_bytes = 0;
+    uint64_t diff_registry_bytes = 0;
     const int64_t one[] = { 1 };
     const int64_t two[] = { 1, 2 };
     int rc = 1;
 
     if (!prog || measure_create_floor(prog, &intern_bytes,
-        &compound_bytes, &descriptor_bytes) != 0) {
+        &compound_bytes, &descriptor_bytes, &diff_registry_bytes) != 0) {
         fprintf(stderr, "T-1938: could not measure session floor\n");
         goto out;
     }
     wl_session_options_init(&options);
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES + descriptor_bytes);
+            + SESSION_REGISTRY_BYTES + diff_registry_bytes
+            + descriptor_bytes);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -2874,19 +2927,21 @@ test_denied_eval_interning_maps_to_memory(void)
         uint64_t intern_bytes = 0;
         uint64_t compound_bytes = 0;
         uint64_t descriptor_bytes = 0;
+        uint64_t diff_registry_bytes = 0;
         bool denying = slacks[i] == DENY_SLACK;
 
         if (!prog)
             return 1;
         if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
-            &descriptor_bytes) != 0) {
+            &descriptor_bytes, &diff_registry_bytes) != 0) {
             fprintf(stderr, "T-1521: could not measure the create floor\n");
             wirelog_program_free(prog);
             return 1;
         }
         wl_session_options_init(&options);
         ref = enforcing_governor(intern_bytes + compound_bytes
-                + SESSION_REGISTRY_BYTES + descriptor_bytes + slacks[i]);
+                + SESSION_REGISTRY_BYTES + diff_registry_bytes
+                + descriptor_bytes + slacks[i]);
         if (!ref) {
             wirelog_program_free(prog);
             return 1;
@@ -2948,12 +3003,13 @@ test_injected_governor_denial_maps_to_memory(void)
     uint64_t intern_bytes = 0;
     uint64_t compound_bytes = 0;
     uint64_t descriptor_bytes = 0;
+    uint64_t diff_registry_bytes = 0;
     int rc = 1;
 
     if (!prog)
         return 1;
     if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
-        &descriptor_bytes) != 0) {
+        &descriptor_bytes, &diff_registry_bytes) != 0) {
         fprintf(stderr, "T-1473: could not measure the create-time floor\n");
         goto out;
     }
@@ -2990,7 +3046,8 @@ test_injected_governor_denial_maps_to_memory(void)
     /* Exact floor: creation succeeds, destroy leaves the program-owned
      * intern reservation, and freeing the program releases it. */
     ref = enforcing_governor(intern_bytes + compound_bytes
-            + SESSION_REGISTRY_BYTES + descriptor_bytes);
+            + SESSION_REGISTRY_BYTES + diff_registry_bytes
+            + descriptor_bytes);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -3000,7 +3057,8 @@ test_injected_governor_denial_maps_to_memory(void)
     wl_session_testhook_set_default_options(NULL);
     if (error != WIRELOG_OK || !session
         || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES + descriptor_bytes) {
+        + SESSION_REGISTRY_BYTES + diff_registry_bytes
+        + descriptor_bytes) {
         fprintf(stderr, "T-1473: exact-fit create err=%d reserved=%llu\n",
             error, (unsigned long long)reserved_on(ref));
         goto out;

@@ -3829,6 +3829,11 @@ composed_host_turn(fixture_t *f, bool ack)
     return rc;
 }
 
+static col_rel_t *composed_source(const char *, uint32_t, const double *,
+    uint32_t, bool);
+static void composed_fixture(fixture_t *, col_rel_t *, uint64_t);
+static void composed_action(fixture_t *);
+
 static int
 composed_abort_request(fixture_t *f, uint64_t funding_limit)
 {
@@ -3851,12 +3856,448 @@ composed_abort_request(fixture_t *f, uint64_t funding_limit)
     return rc;
 }
 
+static int
+composed_cleanup_lftj_turn(fixture_t *f, uint64_t funding_limit,
+    uint64_t funding_id_adjustment)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(funding_limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    bool eligible = (f->record.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        || f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
+        && f->record.lftj.identity;
+    int rc = wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+        &f->record, funding, id + funding_id_adjustment);
+    int finish = wl_evaluation_control_finish(funding, &owner,
+            rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0, 0);
+    CHECK(finish == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
+    wl_evaluation_control_report_t report;
+    int report_rc = wl_evaluation_control_report(funding, &report);
+    CHECK(!report_rc
+        && report.attempt_id == id && !report.cleanup_status
+        && (funding_limit == 383 || funding_id_adjustment || !eligible
+        ? report.consumed == 0
+        : report.consumed >= 384 && report.consumed <= 386));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static uint32_t
+composed_lftj_reader_count(const wl_columnar_lftj_attempt_t *attempt)
+{
+    uint32_t count = 0;
+    if (attempt->inputs)
+        for (uint32_t i = 0; i < attempt->input_count; ++i)
+            count += attempt->inputs[i].reader.owner != NULL;
+    return count;
+}
+
+static void
+composed_lftj_fixture(fixture_t *f, uint64_t limit,
+    wl_plan_relation_t *body, wl_plan_op_t *op, wl_plan_op_lftj_t *metadata,
+    char **names, uint32_t *key_cols, col_rel_t **relations)
+{
+    static const double values[] = {1, 10, 2, 20};
+    names[0] = "a"; names[1] = "b"; names[2] = "c";
+    key_cols[0] = key_cols[1] = key_cols[2] = 0;
+    metadata->k = 3; metadata->rel_names = names;
+    metadata->key_cols = key_cols;
+    *op = (wl_plan_op_t){.op = WL_PLAN_OP_LFTJ, .opaque_data = metadata};
+    *body = (wl_plan_relation_t){.ops = op, .op_count = 1};
+    for (uint32_t i = 0; i < 3; ++i)
+        relations[i] = composed_source(names[i], 2, values, 2, false);
+    composed_fixture(f, source_new(2, 0), limit);
+    f->session.base.evaluation_control = f->operation;
+    f->session.rels = relations; f->session.nrels = 3; f->session.rel_cap = 3;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(&f->record,
+        body, 0, body->op_count, f->frame, &f->session, 0, f->operation,
+        f->operation_id, f->funding, f->funding_id));
+}
+
+static int
+composed_cleanup_source_turn(fixture_t *f, uint64_t funding_limit,
+    uint64_t funding_id_adjustment)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(funding_limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    bool receipt_pending = f->record.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+    bool aborting = f->record.phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+    int original_stop = aborting ? wl_evaluation_control_charge_attempt(
+        f->operation, f->operation_id, 0) : 0;
+    bool abort_stop = original_stop == WL_EVALUATION_CONTROL_CANCELLED
+        || original_stop == WL_EVALUATION_CONTROL_WORK_LIMIT;
+    int rc = wl_columnar_eval_plan_numeric_composed_cleanup_source(
+        &f->record, funding, id + funding_id_adjustment);
+    int finish = wl_evaluation_control_finish(funding, &owner,
+            rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0, 0);
+    CHECK(finish == (rc == WL_EVALUATION_CONTROL_WORK_LIMIT ? rc : 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report)
+        && report.attempt_id == id && !report.cleanup_status
+        && report.consumed == (funding_limit == 383
+        || funding_id_adjustment || receipt_pending
+        || (aborting && !abort_stop) ? 0 : 384));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static const wl_plan_relation_t *composed_find_relation(const wl_plan_t *,
+    const char *);
+static void composed_begin(fixture_t *, const wl_plan_relation_t *,
+    col_rel_t **, uint32_t, uint32_t);
+static void composed_until_phase(fixture_t *,
+    wl_columnar_eval_plan_numeric_phase_t);
+static void composed_until(fixture_t *,
+    wl_columnar_eval_plan_numeric_phase_t, uint32_t);
+static wl_columnar_memory_governor_ref_t *composed_governor(fixture_t *);
+static void composed_close(fixture_t *);
+
+static void
+composed_until_stopped_child(fixture_t *f,
+    wl_columnar_eval_plan_numeric_phase_t child_phase,
+    wl_columnar_eval_plan_numeric_phase_t start_phase)
+{
+    bool consumed_stop_receipt = false;
+    for (unsigned turns = 0; f->record.phase != child_phase; ++turns) {
+        CHECK(turns < 100000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        if (f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) {
+            composed_action(f);
+            continue;
+        }
+        int receipt = f->pending_protocol;
+        if (f->record.pending_action == start_phase) {
+            CHECK(f->record.child_status.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+            CHECK(composed_abort_request(f, 0) == EBUSY);
+            consumed_stop_receipt = true;
+        }
+        CHECK(!composed_host_turn(f, false));
+        CHECK(f->record.protocol_result == receipt);
+    }
+    CHECK(consumed_stop_receipt);
+}
+
+static void
+composed_lftj_finish_stop(fixture_t *f, int stop, int result)
+{
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f->record.semantic_result == result);
+    CHECK(!composed_host_turn(f, true));
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(!f->session.cleanup_active_count
+        && !f->session.cleanup_reserved_bytes);
+    session_rel_free_hash(&f->session);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner,
+        result, 0) == result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f->operation, &report)
+        && report.stop_reason == stop && report.result == result);
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    CHECK(!wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->operation);
+    wl_evaluation_control_release(f->funding);
+    col_rel_destroy(f->input);
+}
+
+static void
+test_composed_source_stopped_cleanup(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n.decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    static const double values[] = {3, 1, 4};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *body = composed_find_relation(plan, "output");
+    CHECK(body && body->ops[0].op == WL_PLAN_OP_VARIABLE);
+    fixture_t f;
+    composed_fixture(&f, composed_source("input", 1, values, 3, false), 0);
+    col_rel_t *registry[] = {f.input};
+    composed_begin(&f, body, registry, 1, 0);
+    composed_until_phase(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END);
+    CHECK(f.record.source_initialized && !f.record.source_slot_borrowed);
+    wl_columnar_eval_plan_numeric_attempt_t before = f.record;
+    CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
+    CHECK(f.record.phase == before.phase
+        && f.record.cursor == before.cursor
+        && f.record.completed == before.completed
+        && !f.record.semantic_result
+        && f.record.source.phase == before.source.phase);
+    CHECK(composed_cleanup_source_turn(&f, 0, 1) == EINVAL);
+    CHECK(f.record.phase == before.phase
+        && f.record.cursor == before.cursor
+        && f.record.completed == before.completed
+        && !f.record.semantic_result
+        && f.record.source.phase == before.source.phase);
+
+    wl_evaluation_control_request_cancel(f.operation);
+    CHECK(composed_cleanup_source_turn(&f, 383, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(f.record.phase == before.phase
+        && f.record.cursor == before.cursor
+        && f.record.completed == before.completed
+        && !f.record.semantic_result
+        && f.record.source.phase == before.source.phase);
+    int rc = composed_cleanup_source_turn(&f, 0, 0);
+    f.pending_protocol = rc;
+    CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && f.record.pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+        && f.record.source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+        && f.record.source_initialized && f.record.cursor == before.cursor
+        && f.record.completed == before.completed);
+    wl_columnar_eval_plan_numeric_attempt_t pending = f.record;
+    CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
+    CHECK(f.record.phase == pending.phase
+        && f.record.pending_action == pending.pending_action
+        && f.record.source.phase == pending.source.phase
+        && f.record.cursor == pending.cursor
+        && f.record.completed == pending.completed);
+    CHECK(!composed_host_turn(&f, false));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && !f.record.source_initialized
+        && f.record.source.phase == WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.cursor == before.cursor
+        && f.record.completed == before.completed);
+    CHECK(!composed_host_turn(&f, false));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top
+        && !session_find_rel(&f.session, "output"));
+    composed_close(&f);
+    session_rel_free_hash(&f.session);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_composed_source_cleanup_abort_retry(void)
+{
+    static const double a_values[] = {3, 1, 4};
+    static const double b_values[] = {2, 6};
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b",
+         .delta_mode = WL_DELTA_FORCE_EMPTY},
+        {.op = WL_PLAN_OP_CONCAT},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    col_rel_t *a = composed_source("a", 1, a_values, 3, false);
+    col_rel_t *b = composed_source("b", 1, b_values, 2, false);
+    fixture_t f;
+    composed_fixture(&f, a, 0);
+    col_rel_t *sources[] = {a, b};
+    composed_begin(&f, &body, sources, 2, 0);
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL,
+        1);
+    eval_entry_t *result = wl_columnar_eval_stack_cleanup_result(f.frame);
+    col_rel_t *candidate = result->rel;
+    CHECK(candidate && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel
+        && !f.record.source_initialized);
+
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(candidate, &reader));
+    /* The install phase must not create a session result without a stop; it
+     * pays for the host action but leaves its borrowed candidate untouched. */
+    CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+        && !f.record.semantic_result && result->rel == candidate
+        && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel);
+
+    /* Stage a source-abort owner with a live borrowed slot. Direct cleanup
+     * without a sticky control stop is completely inert and uncharged. */
+    f.record.phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        && !f.record.semantic_result && result->rel == candidate
+        && f.record.source_slot_borrowed);
+    CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        && !f.record.semantic_result && result->rel == candidate
+        && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel);
+    f.record.phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL;
+
+    wl_evaluation_control_request_cancel(f.operation);
+    CHECK(composed_cleanup_source_turn(&f, 0, 1) == EINVAL);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+        && !f.record.semantic_result && result->rel == candidate
+        && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel);
+    CHECK(composed_cleanup_source_turn(&f, 383, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
+        && !f.record.semantic_result && result->rel == candidate
+        && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel);
+    CHECK(!composed_cleanup_source_turn(&f, 0, 0));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && result->rel == candidate && result->owned
+        && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel
+        && !session_find_rel(&f.session, "output"));
+
+    /* The funded disposal attempt is refused by the held reader, consuming
+     * the host action while retaining every borrowed-slot ownership marker. */
+    CHECK(composed_cleanup_source_turn(&f, 0, 0) == EBUSY);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && result->rel == candidate
+        && result->owned && f.record.source_slot_borrowed
+        && f.record.source_output == &result->rel);
+    CHECK(!col_rel_source_reader_release(&reader));
+    CHECK(!composed_cleanup_source_turn(&f, 0, 0));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && !result->rel && !result->owned && !f.record.source_slot_borrowed
+        && !f.record.source_output
+        && !session_find_rel(&f.session, "output"));
+    CHECK(!composed_host_turn(&f, false));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+    composed_close(&f);
+    session_rel_free_hash(&f.session);
+    col_rel_destroy(b);
+}
+
+static void
+test_composed_source_cleanup_pre_action_phases(void)
+{
+    static const double values[] = {3, 1, 4};
+    static const wl_columnar_eval_plan_numeric_phase_t phases[] = {
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW
+    };
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+        wl_plan_op_t op = {.op = WL_PLAN_OP_VARIABLE,
+                           .relation_name = "input",
+                           .delta_mode = WL_DELTA_FORCE_EMPTY};
+        wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+        fixture_t f;
+        composed_fixture(&f, composed_source("input", 1, values, 3, false),
+            0);
+        col_rel_t *registry[] = {f.input};
+        composed_begin(&f, &body, registry, 1, 0);
+        composed_until_phase(&f, phases[i]);
+        CHECK(f.record.phase == phases[i]);
+        uint32_t cursor = f.record.cursor, completed = f.record.completed;
+        bool initialized = f.record.source_initialized;
+        bool borrowed = f.record.source_slot_borrowed;
+        col_rel_t *slot = wl_columnar_eval_stack_cleanup_result(f.frame)->rel;
+
+        wl_evaluation_control_request_cancel(f.operation);
+        CHECK(!composed_cleanup_source_turn(&f, 0, 0));
+        wl_columnar_eval_plan_numeric_phase_t routed = initialized
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+            : borrowed
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        CHECK(f.record.phase == routed
+            && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+            && f.record.cursor == cursor && f.record.completed == completed
+            && f.record.source_initialized == initialized
+            && f.record.source_slot_borrowed == borrowed
+            && wl_columnar_eval_stack_cleanup_result(f.frame)->rel == slot
+            && !session_find_rel(&f.session, "output"));
+
+        if (routed == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+            int protocol = composed_cleanup_source_turn(&f, 0, 0);
+            f.pending_protocol = protocol;
+            CHECK(protocol == WL_EVALUATION_CONTROL_CANCELLED
+                && f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                && f.record.pending_action ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+                && f.record.cursor == cursor
+                && f.record.completed == completed);
+            CHECK(!composed_host_turn(&f, false));
+            if (f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT)
+                CHECK(!composed_cleanup_source_turn(&f, 0, 0));
+        } else if (routed ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT) {
+            CHECK(!composed_cleanup_source_turn(&f, 0, 0));
+        }
+        CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            && f.record.cursor == cursor && f.record.completed == completed
+            && !session_find_rel(&f.session, "output"));
+        CHECK(!composed_host_turn(&f, false));
+        CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+            && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+            && !session_find_rel(&f.session, "output"));
+        composed_close(&f);
+        session_rel_free_hash(&f.session);
+    }
+}
+
+static void
+composed_lftj_until_reader(fixture_t *f)
+{
+    for (unsigned turns = 0; f->record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD; ++turns) {
+        CHECK(turns < 1000 && f->record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(f);
+    }
+    for (unsigned turns = 0; !composed_lftj_reader_count(&f->record.lftj);
+        ++turns) {
+        CHECK(turns < 1000 && f->record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD);
+        composed_action(f);
+    }
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && f->record.lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+}
+
 static void
 composed_action(fixture_t *f)
 {
     f->pending_protocol = composed_host_turn(f, false);
     CHECK(!f->pending_protocol ||
         f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+}
+
+static void
+composed_drain_stopped_child(fixture_t *f,
+    wl_columnar_eval_plan_numeric_phase_t child_phase,
+    wl_columnar_eval_plan_numeric_phase_t ack_phase)
+{
+    for (unsigned turns = 0; f->record.phase != ack_phase; ++turns) {
+        CHECK(turns < 100000 && f->record.phase == child_phase
+            && f->record.child_status.semantic_result ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+        composed_action(f);
+        CHECK(f->record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && f->record.pending_action == child_phase);
+        int receipt = f->pending_protocol;
+        CHECK(composed_abort_request(f, 0) == EBUSY);
+        CHECK(!composed_host_turn(f, false));
+        CHECK(f->record.protocol_result == receipt);
+    }
+    CHECK(f->record.child_status.progress == WL_COLUMNAR_FILTER_PROGRESS_DONE);
 }
 
 static void
@@ -4173,12 +4614,438 @@ composed_begin(fixture_t *f, const wl_plan_relation_t *plan,
 }
 
 static void
+test_composed_private_input_binding(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    static const double private_values[] = {17, 29, 43};
+    static const double public_values[] = {80, 90};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *output = composed_find_relation(plan, "output");
+    CHECK(output && output->op_count >= 3
+        && output->ops[0].op == WL_PLAN_OP_VARIABLE);
+
+    col_rel_t *private_input = composed_source("private", 1, private_values,
+            3, false);
+    free(private_input->name);
+    private_input->name = NULL;
+    col_rel_t *public_input = composed_source("input", 1, public_values, 2,
+            false);
+    col_rel_t *registry[] = {public_input};
+    fixture_t f;
+    composed_fixture(&f, private_input, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const names[] = {"input"};
+    col_rel_t *relations[] = {private_input};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        output, f.operation, f.operation_id, names, relations, 1));
+    f.session.rels = registry;
+    f.session.nrels = 1;
+    f.session.rel_cap = 1;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, output, 0, output->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == output->op_count);
+    CHECK(session_find_rel(&f.session, "input") == public_input);
+    session_rel_free_hash(&f.session);
+    CHECK(private_input->name == NULL);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 3
+        && stack->items[0].rel->ncols == 1);
+    for (uint32_t row = 0; row < 3; ++row)
+        CHECK(stack->items[0].rel->columns[0][row]
+            == (int64_t)private_values[row]);
+    composed_close(&f);
+    col_rel_destroy(public_input);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+
+    static const char join_source[] =
+        ".decl a(k:int64)\n"
+        ".decl b(k:int64)\n"
+        ".decl output(k:int64)\n"
+        "output(k) :- a(k), b(k).\n";
+    static const double a_values[] = {1, 3};
+    static const double b_private_values[] = {1, 2};
+    static const double b_public_values[] = {3, 3};
+    wirelog_program_t *join_program = wirelog_parse_string(join_source,
+            &error);
+    wl_plan_t *join_plan = NULL;
+    CHECK(join_program && !wl_plan_from_program(join_program, &join_plan));
+    const wl_plan_relation_t *join = composed_find_relation(join_plan,
+            "output");
+    CHECK(join && join->op_count >= 3
+        && join->ops[0].op == WL_PLAN_OP_VARIABLE
+        && join->ops[1].op == WL_PLAN_OP_JOIN
+        && !strcmp(join->ops[1].right_relation, "b"));
+    col_rel_t *private_a = composed_source("private-a", 1, a_values, 2,
+            false);
+    col_rel_t *private_b = composed_source("private-b", 1,
+            b_private_values, 2, false);
+    col_rel_t *public_b = composed_source("b", 1, b_public_values, 2,
+            false);
+    free(private_a->name);
+    private_a->name = NULL;
+    free(private_b->name);
+    private_b->name = NULL;
+    col_rel_t *join_registry[] = {public_b};
+    composed_fixture(&f, private_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const join_names[] = {"a", "b"};
+    col_rel_t *join_relations[] = {private_a, private_b};
+    wl_columnar_eval_private_bindings_t join_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&join_bindings, &f.session,
+        join, f.operation, f.operation_id, join_names, join_relations, 2));
+    f.session.rels = join_registry;
+    f.session.nrels = 1;
+    f.session.rel_cap = 1;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, join, 0, join->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &join_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "b") == public_b);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(private_b);
+    col_rel_destroy(public_b);
+
+    static const double a_public_values[] = {2, 2};
+    static const double b_public_mixed_values[] = {1, 2};
+    col_rel_t *private_a_mixed = composed_source("private-a", 1, a_values,
+            2, false);
+    free(private_a_mixed->name);
+    private_a_mixed->name = NULL;
+    col_rel_t *public_a = composed_source("a", 1, a_public_values, 2,
+            false);
+    col_rel_t *public_b_mixed = composed_source("b", 1,
+            b_public_mixed_values, 2, false);
+    col_rel_t *mixed_registry[] = {public_a, public_b_mixed};
+    composed_fixture(&f, private_a_mixed, 0);
+    f.session.base.evaluation_control = f.operation;
+    static const char *const mixed_names[] = {"a"};
+    col_rel_t *mixed_relations[] = {private_a_mixed};
+    wl_columnar_eval_private_bindings_t mixed_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&mixed_bindings,
+        &f.session, join, f.operation, f.operation_id, mixed_names,
+        mixed_relations, 1));
+    f.session.rels = mixed_registry;
+    f.session.nrels = 2;
+    f.session.rel_cap = 2;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, join, 0, join->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &mixed_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "a") == public_a);
+    CHECK(session_find_rel(&f.session, "b") == public_b_mixed);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(public_a);
+    col_rel_destroy(public_b_mixed);
+
+    static const double private_delta_a_values[] = {1};
+    static const double private_delta_b_values[] = {1};
+    static const double private_full_b_values[] = {2};
+    static const double public_delta_values[] = {3};
+    col_rel_t *private_full_a = composed_source("private-full-a", 1,
+            a_values, 2, false);
+    col_rel_t *private_delta_a = composed_source("private-delta-a", 1,
+            private_delta_a_values, 1, false);
+    col_rel_t *private_full_b = composed_source("private-full-b", 1,
+            private_full_b_values, 1, false);
+    col_rel_t *private_delta_b = composed_source("private-delta-b", 1,
+            private_delta_b_values, 1, false);
+    col_rel_t *public_full_a = composed_source("a", 1, a_values, 2, false);
+    col_rel_t *public_full_b = composed_source("b", 1,
+            b_private_values, 2, false);
+    col_rel_t *public_a_delta = composed_source("$d$a", 1,
+            public_delta_values, 1, false);
+    col_rel_t *public_b_delta = composed_source("$d$b", 1,
+            public_delta_values, 1, false);
+    free(private_full_a->name);
+    private_full_a->name = NULL;
+    free(private_delta_a->name);
+    private_delta_a->name = NULL;
+    free(private_full_b->name);
+    private_full_b->name = NULL;
+    free(private_delta_b->name);
+    private_delta_b->name = NULL;
+    wl_plan_relation_t delta_plan = *join;
+    wl_plan_op_t *delta_ops = malloc((size_t)join->op_count
+            * sizeof(*delta_ops));
+    CHECK(delta_ops);
+    memcpy(delta_ops, join->ops,
+        (size_t)join->op_count * sizeof(*delta_ops));
+    delta_ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+    delta_ops[1].delta_mode = WL_DELTA_FORCE_DELTA;
+    delta_plan.ops = delta_ops;
+    col_rel_t *delta_registry[] = {public_full_a, public_full_b,
+                                   public_a_delta, public_b_delta};
+    composed_fixture(&f, private_full_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    f.session.delta_seeded = true;
+    static const char *const delta_names[] = {"a", "$d$a", "b", "$d$b"};
+    col_rel_t *delta_relations[] = {private_full_a, private_delta_a,
+                                    private_full_b, private_delta_b};
+    wl_columnar_eval_private_bindings_t delta_bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&delta_bindings,
+        &f.session, &delta_plan, f.operation, f.operation_id, delta_names,
+        delta_relations, 4));
+    f.session.rels = delta_registry;
+    f.session.nrels = 4;
+    f.session.rel_cap = 4;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, &delta_plan, 0, delta_plan.op_count, f.frame,
+            &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id,
+            &delta_bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result
+        && f.record.completed == join->op_count);
+    CHECK(session_find_rel(&f.session, "$d$a") == public_a_delta);
+    CHECK(session_find_rel(&f.session, "$d$b") == public_b_delta);
+    session_rel_free_hash(&f.session);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    composed_close(&f);
+    col_rel_destroy(private_delta_a);
+    col_rel_destroy(private_full_b);
+    col_rel_destroy(private_delta_b);
+    col_rel_destroy(public_full_a);
+    col_rel_destroy(public_full_b);
+    col_rel_destroy(public_a_delta);
+    col_rel_destroy(public_b_delta);
+    free(delta_ops);
+    wl_plan_free(join_plan);
+    wirelog_program_free(join_program);
+}
+
+static void cancel_after_terminal_exchange(wl_evaluation_control_t *, uint64_t);
+
+static void
+reject_composed_recursive_manifest(const wl_plan_relation_t *original,
+    wl_plan_op_t *ops, const char *const *names, col_rel_t **relations)
+{
+    wl_plan_relation_t changed = *original;
+    changed.ops = ops;
+    fixture_t f;
+    composed_fixture(&f, source_new(2, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        &changed, f.operation, f.operation_id, names, relations, 2));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, &changed, 0, changed.op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == ENOTSUP
+        && !f.record.completed
+        && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+    composed_close(&f);
+}
+
+static void
+test_composed_recursive_terminal_exchange(void)
+{
+    static const char source[] =
+        ".decl edge(x:int64, y:int64)\n"
+        ".decl path(x:int64, y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    static const double edge_values[] = {1, 2, 2, 3, 2, 3};
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *path = composed_find_relation(plan, "path");
+    CHECK(path && path->op_count == 7
+        && path->ops[5].op == WL_PLAN_OP_CONSOLIDATE
+        && path->ops[6].op == WL_PLAN_OP_EXCHANGE);
+
+    col_rel_t *edge = composed_source("private-edge", 2, edge_values, 3,
+            false);
+    col_rel_t *seed = composed_source("private-path", 2, NULL, 0, false);
+    free(edge->name); edge->name = NULL;
+    free(seed->name); seed->name = NULL;
+    col_rel_t *public_edge = composed_source("edge", 2, NULL, 0, false);
+    col_rel_t *registry[] = {public_edge};
+    fixture_t f;
+    composed_fixture(&f, source_new(2, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    f.session.rels = registry; f.session.nrels = 1; f.session.rel_cap = 1;
+    static const char *const names[] = {"edge", "path"};
+    col_rel_t *relations[] = {edge, seed};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        path, f.operation, f.operation_id, names, relations, 2));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, path, 0, path->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 6);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1);
+    col_rel_t *before_exchange = stack->items[0].rel;
+    bool owned_before_exchange = stack->items[0].owned;
+    composed_action(&f);
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && f.record.cursor == 7 && f.record.completed == 7
+        && stack->top == 1 && stack->items[0].rel == before_exchange
+        && stack->items[0].owned == owned_before_exchange);
+    composed_run(&f);
+    CHECK(!f.record.semantic_result && f.record.completed == path->op_count);
+    CHECK(session_find_rel(&f.session, "edge") == public_edge);
+    session_rel_free_hash(&f.session);
+    CHECK(stack->top == 1 && stack->items[0].owned
+        && stack->items[0].rel->nrows == 2
+        && stack->items[0].rel->ncols == 2);
+    CHECK(stack->items[0].rel->columns[0][0] == 1
+        && stack->items[0].rel->columns[1][0] == 2
+        && stack->items[0].rel->columns[0][1] == 2
+        && stack->items[0].rel->columns[1][1] == 3);
+    composed_close(&f);
+    col_rel_destroy(edge); col_rel_destroy(seed); col_rel_destroy(public_edge);
+
+    /* The same plan with an empty private EDB produces an empty candidate;
+     * the terminal bridge still advances exactly once. */
+    edge = composed_source("private-edge", 2, NULL, 0, false);
+    seed = composed_source("private-path", 2, NULL, 0, false);
+    free(edge->name); edge->name = NULL;
+    free(seed->name); seed->name = NULL;
+    composed_fixture(&f, source_new(2, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    relations[0] = edge; relations[1] = seed;
+    memset(&bindings, 0, sizeof(bindings));
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        path, f.operation, f.operation_id, names, relations, 2));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, path, 0, path->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_run(&f);
+    CHECK(!f.record.semantic_result && f.record.completed == path->op_count);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 0);
+    composed_close(&f);
+    col_rel_destroy(edge); col_rel_destroy(seed);
+
+    /* A stop arriving between the no-op and its post-action poll records the
+     * completed node once while preserving the completed candidate stack. */
+    edge = composed_source("private-edge", 2, edge_values, 3, false);
+    seed = composed_source("private-path", 2, NULL, 0, false);
+    free(edge->name); edge->name = NULL;
+    free(seed->name); seed->name = NULL;
+    relations[0] = edge; relations[1] = seed;
+    composed_fixture(&f, source_new(2, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    memset(&bindings, 0, sizeof(bindings));
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        path, f.operation, f.operation_id, names, relations, 2));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, path, 0, path->op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 6);
+    wl_columnar_eval_plan_test_after_terminal_exchange =
+        cancel_after_terminal_exchange;
+    composed_action(&f);
+    wl_columnar_eval_plan_test_after_terminal_exchange = NULL;
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.completed == path->op_count && f.record.cursor == 7);
+    composed_run(&f);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 2);
+    composed_close(&f);
+    col_rel_destroy(edge); col_rel_destroy(seed);
+
+    /* EXCHANGE metadata drift is rejected during full-plan preflight, before
+     * any input is consumed or installed in the public registry. */
+    edge = composed_source("private-edge", 2, edge_values, 3, false);
+    seed = composed_source("private-path", 2, NULL, 0, false);
+    free(edge->name); edge->name = NULL;
+    free(seed->name); seed->name = NULL;
+    wl_plan_relation_t changed = *path;
+    wl_plan_op_t changed_ops[7];
+    memcpy(changed_ops, path->ops, sizeof(changed_ops));
+    wl_plan_op_exchange_t changed_exchange =
+        *(const wl_plan_op_exchange_t *)path->ops[6].opaque_data;
+    changed_exchange.num_workers = 1;
+    changed_ops[6].opaque_data = &changed_exchange;
+    changed.ops = changed_ops;
+    relations[0] = edge; relations[1] = seed;
+    composed_fixture(&f, source_new(2, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    memset(&bindings, 0, sizeof(bindings));
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+        &changed, f.operation, f.operation_id, names, relations, 2));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f.record, &changed, 0, changed.op_count, f.frame, &f.session, 0,
+            f.operation, f.operation_id, f.funding, f.funding_id, &bindings));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == ENOTSUP
+        && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+    composed_close(&f);
+
+    /* Moving EXCHANGE ahead of terminal CONSOLIDATE is rejected during
+    * preflight, before any operator completes or changes the stack. */
+    memcpy(changed_ops, path->ops, sizeof(changed_ops));
+    wl_plan_op_t misplaced_exchange = changed_ops[6];
+    changed_ops[6] = changed_ops[5];
+    changed_ops[5] = misplaced_exchange;
+    reject_composed_recursive_manifest(path, changed_ops, names, relations);
+
+    /* Every behavior-bearing operator field is pinned, not merely the final
+     * EXCHANGE descriptor. Changed MAP and JOIN metadata reject preflight. */
+    memcpy(changed_ops, path->ops, sizeof(changed_ops));
+    changed_ops[1].materialized = true;
+    reject_composed_recursive_manifest(path, changed_ops, names, relations);
+    memcpy(changed_ops, path->ops, sizeof(changed_ops));
+    static uint8_t right_filter = 1;
+    changed_ops[3].right_filter_expr.data = &right_filter;
+    changed_ops[3].right_filter_expr.size = sizeof(right_filter);
+    reject_composed_recursive_manifest(path, changed_ops, names, relations);
+    col_rel_destroy(edge); col_rel_destroy(seed);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+cancel_after_terminal_exchange(wl_evaluation_control_t *control,
+    uint64_t expected_id)
+{
+    CHECK(control && wl_evaluation_control_active_attempt_id(control)
+        == expected_id);
+    wl_evaluation_control_request_cancel(control);
+}
+
+static void
 composed_close(fixture_t *f)
 {
-    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
-    CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+    bool acknowledged = !f->record.composed_mode && !f->record.identity;
+    CHECK(acknowledged
+        ? f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+        : f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+    if (!acknowledged)
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
     int result = f->record.semantic_result;
-    CHECK(!composed_host_turn(f, true));
+    if (!acknowledged) CHECK(!composed_host_turn(f, true));
     CHECK(!f->record.composed_mode && !f->record.identity);
     CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
     CHECK(!f->session.cleanup_active_count &&
@@ -4401,6 +5268,122 @@ test_composed_generated_union(void)
                 }
         wl_plan_free(plan); wirelog_program_free(program);
     }
+}
+
+static void
+test_composed_lftj_stopped_cleanup(void)
+{
+    wl_plan_relation_t body;
+    wl_plan_op_t op;
+    wl_plan_op_lftj_t metadata;
+    char *names[3];
+    uint32_t key_cols[3];
+    col_rel_t *relations[3];
+    fixture_t f;
+
+    /* A work-limit stop can arrive while LFTJ owns source readers, before its
+     * next semantic action observes the stop. Cleanup is host-funded and
+     * drains at most one child release action per call. */
+    composed_lftj_fixture(&f, UINT64_C(1) << 20, &body, &op, &metadata,
+        names, key_cols, relations);
+    wl_columnar_eval_plan_numeric_attempt_t before_record = f.record;
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 0) == EBUSY);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    composed_lftj_until_reader(&f);
+    wl_columnar_lftj_attempt_t before_lftj = f.record.lftj;
+    before_record = f.record;
+    CHECK(composed_cleanup_lftj_turn(&f, 383, 0)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!memcmp(&before_lftj, &f.record.lftj, sizeof(before_lftj))
+        && !memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 1) == EINVAL);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(composed_cleanup_lftj_turn(&f, 0, 0) == EBUSY);
+    CHECK(!memcmp(&before_record, &f.record, sizeof(before_record)));
+    CHECK(wl_evaluation_control_charge_attempt(f.operation,
+        f.operation_id, UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100 && (f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+            || f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE));
+        uint32_t readers_before = composed_lftj_reader_count(&f.record.lftj);
+        int cleanup_rc = composed_cleanup_lftj_turn(&f, 0, 0);
+        CHECK(!cleanup_rc);
+        uint32_t readers_after = composed_lftj_reader_count(&f.record.lftj);
+        CHECK(readers_before >= readers_after
+            && readers_before - readers_after <= 1);
+    }
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.lftj.semantic_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT
+        && !session_find_rel(&f.session, "result"));
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_WORK_LIMIT,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* Abort-request cancellation and direct cancellation both use the same
+     * cleanup drain; the LFTJ child has not yet polled this stop. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    composed_lftj_until_reader(&f);
+    CHECK(!composed_abort_request(&f, 0));
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100);
+        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    }
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* A direct cancellation is copied to the child before its first abort
+     * action, even while that child still owns readers. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    composed_lftj_until_reader(&f);
+    wl_evaluation_control_request_cancel(f.operation);
+    uint32_t readers_before = composed_lftj_reader_count(&f.record.lftj);
+    CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    CHECK(f.record.lftj.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && composed_lftj_reader_count(&f.record.lftj) < readers_before);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE; ++turns) {
+        CHECK(turns < 100);
+        CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    }
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+
+    /* A completed LFTJ result is still private to the cleanup frame. A stop
+     * before the parent advances to DONE makes cleanup discard that result. */
+    composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, key_cols,
+        relations);
+    for (unsigned turns = 0; f.record.phase !=
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE; ++turns) {
+        CHECK(turns < 10000 && f.record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(&f);
+    }
+    CHECK(f.record.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].owned);
+    CHECK(!session_find_rel(&f.session, "result"));
+    f.record.semantic_result = EDOM;
+    f.record.lftj.semantic_result = EINVAL;
+    wl_evaluation_control_request_cancel(f.operation);
+    CHECK(!composed_cleanup_lftj_turn(&f, 0, 0));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
+        && f.record.semantic_result == EDOM
+        && f.record.lftj.semantic_result == EINVAL
+        && stack->top == 1 && stack->items[0].owned);
+    CHECK(!session_find_rel(&f.session, "result"));
+    composed_lftj_finish_stop(&f, WL_EVALUATION_CONTROL_CANCELLED,
+        EDOM);
+    for (uint32_t i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
 }
 
 static void
@@ -5107,9 +6090,195 @@ test_composed_controlled_batch_fallback_owner(void)
     wirelog_program_free(program);
 }
 
+static void
+test_composed_unary_work_limit_cleanup(void)
+{
+    static const char text[] =
+        ".decl input(x:int64)\n.decl output(y:int64)\n"
+        "output(x + 1) :- input(x), x > 0.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *body = composed_find_relation(plan, "output");
+    CHECK(body && body->ops[1].op == WL_PLAN_OP_FILTER);
+    double values[256];
+    for (unsigned i = 0; i < 256; ++i) values[i] = i + 1;
+    fixture_t f;
+    /* This cap passes composed preflight and exhausts during the owned FILTER
+     * child's bounded setup/row work; its step path then drains the stop. */
+    composed_fixture(&f, composed_source("input", 1, values, 256, false),
+        30000);
+    col_rel_t *registry[] = {f.input};
+    composed_begin(&f, body, registry, 1, 0);
+    composed_until_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    CHECK(f.record.cursor == 1 && f.record.completed == 1);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1);
+    col_rel_t *candidate = stack->items[0].rel;
+    bool owned = stack->items[0].owned;
+    CHECK(f.record.child_status.semantic_result ==
+        WL_EVALUATION_CONTROL_WORK_LIMIT
+        && wl_evaluation_control_charge_attempt(f.operation, f.operation_id,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    composed_drain_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK);
+    CHECK(!f.record.child_status.committed
+        && stack->top == 1 && stack->items[0].rel == candidate
+        && stack->items[0].owned == owned
+        && f.record.cursor == 1 && f.record.completed == 1);
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.cursor == 1 && f.record.completed == 1
+        && !f.record.child_status.committed
+        && stack->top == 1 && stack->items[0].rel == candidate
+        && stack->items[0].owned == owned
+        && !session_find_rel(&f.session, "output"));
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+static void
+test_composed_concat_work_limit_cleanup(void)
+{
+    static const double values[256] = {0};
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "b"},
+        {.op = WL_PLAN_OP_CONCAT},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    wl_plan_relation_t body = {.ops = ops, .op_count = 4};
+    col_rel_t *a = composed_source("a", 1, values, 256, false);
+    col_rel_t *b = composed_source("b", 1, values, 256, false);
+    fixture_t f;
+    /* The separate parent and CONCAT grants fund the child action. This cap
+     * stops the original operation during CONCAT's bounded owned start path. */
+    composed_fixture(&f, a, 30000);
+    col_rel_t *registry[] = {a, b};
+    composed_begin(&f, &body, registry, 2, 0);
+    composed_until_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_START);
+    CHECK(f.record.cursor == 2 && f.record.completed == 2);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 2);
+    col_rel_t *left = stack->items[0].rel;
+    col_rel_t *right = stack->items[1].rel;
+    bool left_owned = stack->items[0].owned;
+    bool right_owned = stack->items[1].owned;
+    CHECK(wl_evaluation_control_charge_attempt(f.operation, f.operation_id,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    composed_drain_stopped_child(&f,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD,
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK);
+    CHECK(!f.record.child_status.committed
+        && stack->top == 2 && stack->items[0].rel == left
+        && stack->items[1].rel == right
+        && stack->items[0].owned == left_owned
+        && stack->items[1].owned == right_owned
+        && f.record.cursor == 2 && f.record.completed == 2);
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && f.record.cursor == 2 && f.record.completed == 2
+        && !f.record.child_status.committed
+        && stack->top == 2 && stack->items[0].rel == left
+        && stack->items[1].rel == right
+        && stack->items[0].owned == left_owned
+        && stack->items[1].owned == right_owned
+        && !session_find_rel(&f.session, "output"));
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    col_rel_destroy(b);
+}
+
+static void
+test_composed_concat_stopped_retirement_retry(void)
+{
+    static const double a_values[] = {3, 1, 3, -2};
+    static const double b_values[] = {1, 4, 0};
+    wl_plan_op_t concat = {.op = WL_PLAN_OP_CONCAT};
+    wl_plan_relation_t body = {.ops = &concat, .op_count = 1};
+    col_rel_t *a = composed_source("a", 1, a_values, 4, false);
+    col_rel_t *b = composed_source("b", 1, b_values, 3, false);
+    fixture_t f;
+    composed_fixture(&f, a, 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(!eval_stack_push(stack, a, true));
+    CHECK(!eval_stack_push(stack, b, true));
+    composed_begin(&f, &body, NULL, 0, 2);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(b, &reader));
+
+    for (unsigned turns = 0;
+        !(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+        && f.record.child_status.progress ==
+        WL_COLUMNAR_FILTER_PROGRESS_RETAINED); ++turns) {
+        CHECK(turns < 100000 && f.record.phase !=
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+        composed_action(&f);
+    }
+    CHECK(f.record.child_status.committed && stack->top == 1
+        && stack->items[0].owned && stack->items[0].rel);
+    col_rel_t *published = stack->items[0].rel;
+
+    /* Stop while the committed private result is retained behind an input
+     * reader. Every refusal must preserve that result until the reader goes. */
+    CHECK(!composed_abort_request(&f, 0));
+    for (unsigned retry = 0; retry < 3; ++retry) {
+        composed_action(&f);
+        CHECK(f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && f.record.pending_action ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD);
+        int receipt = f.pending_protocol;
+        CHECK(composed_abort_request(&f, 0) == EBUSY);
+        CHECK(!composed_host_turn(&f, false));
+        CHECK(f.record.protocol_result == receipt
+            && f.record.phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+            && f.record.child_status.progress ==
+            WL_COLUMNAR_FILTER_PROGRESS_RETAINED
+            && f.record.child_status.committed
+            && stack->top == 1 && stack->items[0].rel == published
+            && stack->items[0].owned);
+    }
+
+    CHECK(!col_rel_source_reader_release(&reader));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && f.record.cursor == 0 && f.record.completed == 0
+        && stack->top == 1 && stack->items[0].rel == published
+        && stack->items[0].owned);
+    CHECK(!composed_host_turn(&f, true));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT
+        && !f.record.composed_mode && !f.record.identity
+        && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+        && stack->top == 1 && stack->items[0].rel == published
+        && stack->items[0].owned);
+    f.input = NULL;
+    composed_close(&f);
+}
+
 int
 main(void)
 {
+    test_composed_unary_work_limit_cleanup();
+    test_composed_concat_work_limit_cleanup();
+    test_composed_concat_stopped_retirement_retry();
+    test_composed_private_input_binding();
+    test_composed_recursive_terminal_exchange();
+    test_composed_lftj_stopped_cleanup();
+    test_composed_source_stopped_cleanup();
+    test_composed_source_cleanup_abort_retry();
+    test_composed_source_cleanup_pre_action_phases();
     test_composed_domain_and_repeated_source();
     test_composed_controlled_batch_fallback_owner();
     test_composed_abort_request();

@@ -41,6 +41,21 @@
  */
 #include "../wirelog/columnar/internal.h"
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* This standalone backend target has no generic session implementation. */
+void
+wl_session_testhook_before_workqueue_drain(wl_session_t *session)
+{
+    (void)session;
+}
+
+void
+wl_session_testhook_after_worker_lease_release(wl_session_t *session)
+{
+    (void)session;
+}
+#endif
+
 /*
  * Forward declaration of the function under test.
  * RED phase: does not exist -> link error (expected).
@@ -2207,6 +2222,982 @@ attempt_test_pair_is(const col_rel_t *rel, uint32_t row,
            && rel->columns[1][row] == second;
 }
 
+static col_rel_t *
+attempt_test_managed_retirement_relation(
+    wl_columnar_memory_governor_ref_t *governor_ref)
+{
+    int owner = 0;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    if (!control || wl_columnar_relation_managed_binary_build_begin(&build,
+        2, governor_ref) != 0)
+        return NULL;
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t build_steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && build_steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        if (rc != 0 && rc != EAGAIN)
+            break;
+        build_steps++;
+    }
+    col_rel_t *relation = build.relation;
+    if (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        || !relation) {
+        if (relation)
+            (void)col_rel_destroy_checked(relation);
+        attempt_test_control_destroy(control, &owner, 0);
+        return NULL;
+    }
+    relation->nrows = 2;
+    relation->sorted_nrows = 2;
+    attempt_test_control_destroy(control, &owner, 0);
+    return relation;
+}
+
+static void
+test_managed_binary_builder_resumes_each_allocation_action(void)
+{
+    TEST("managed binary builder resumes after a work-limited allocation step");
+
+    int owner = 0;
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(1, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        2, NULL) == 0,
+        "managed binary builder accepts a stable zeroed receipt");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == 0
+        && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE
+        && build.relation != NULL,
+        "first funded action allocates a private descriptor");
+    col_rel_t *relation = build.relation;
+    ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE
+        && build.relation == relation && relation->ncols == 0,
+        "work refusal leaves the next constructor action and descriptor unchanged");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control, "fresh attempt funds the remaining construction phases");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "funded allocation admission or initialization advances");
+        steps++;
+    }
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && relation->ncols == 2 && relation->capacity == 2
+        && relation->name == NULL && relation->columns
+        && relation->columns[0] && relation->columns[1]
+        && relation->merge_columns && relation->merge_columns[0]
+        && relation->merge_columns[1] && relation->row_scratch
+        && relation->column_types[0] == WIRELOG_TYPE_INT64
+        && relation->column_types[1] == WIRELOG_TYPE_INT64,
+        "constructor yields the exact private binary INT64 relation shape");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "fully built relation enters managed physical retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "constructed relation retires through funded phases");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "constructed relation reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_preadmits_large_lanes(void)
+{
+    TEST(
+        "large managed lanes are refused before allocation without enough work");
+
+    int owner = 0;
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(12, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        4096, NULL) == 0,
+        "large builder records its requested lane capacity without allocating it");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    while (build.phase < WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0) {
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+            attempt_id) == 0,
+            "fixed setup actions fit the deliberately small work allowance");
+    }
+    col_rel_t *partial = build.relation;
+    ASSERT(partial && partial->columns && !partial->columns[0]
+        && wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0
+        && partial->columns && !partial->columns[0]
+        && build.allocation_units_remaining == 4096,
+        "capacity-proportional precharge refuses before the large lane allocation");
+    attempt_test_control_destroy(control, &owner,
+        WL_EVALUATION_CONTROL_WORK_LIMIT);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, partial) == 0,
+        "partial builder ownership remains available for managed retirement");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "funded cleanup retires the partial descriptor");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "all partial constructor storage is retired");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    memset(&build, 0, sizeof(build));
+    memset(&retirement, 0, sizeof(retirement));
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        2, NULL) == 0,
+        "cancellation fixture reaches the allocation admission boundary");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0)
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build,
+            control, attempt_id) == 0,
+            "unlimited work reaches the first lane allocation");
+    uint64_t lane_budget = 2;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &lane_budget) == EAGAIN && lane_budget == 0,
+        "exact lane tariff consumes its quantum and yields before allocation");
+    col_rel_t *cancelled = build.relation;
+    ASSERT(cancelled && cancelled->columns
+        && !cancelled->columns[0],
+        "the fully admitted fresh lane has not been allocated yet");
+    wl_evaluation_control_request_cancel(control);
+    ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == WL_EVALUATION_CONTROL_CANCELLED
+        && !cancelled->columns[0],
+        "cancellation is observed after admission but before allocation");
+    attempt_test_control_destroy(control, &owner,
+        WL_EVALUATION_CONTROL_CANCELLED);
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, cancelled) == 0,
+        "cancelled partial relation remains under managed cleanup");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "cancelled lane admission drains through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "cancelled partial relation reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    memset(&build, 0, sizeof(build));
+    memset(&retirement, 0, sizeof(retirement));
+    control = attempt_test_control_create(20, &owner);
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        2, NULL) == 0,
+        "exact-limit fixture requests four two-cell backing lanes");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "exact allowance admits each setup and capacity cell");
+        steps++;
+    }
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY,
+        "the exact work allowance completes all four bounded lane allocations");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0,
+        "exact-limit constructor attempt finishes successfully");
+    wl_evaluation_control_report_t report;
+    ASSERT(wl_evaluation_control_report(control, &report) == 0
+        && report.limit == 20 && report.consumed == 20 && report.result == 0,
+        "the allocation tariff consumes its exact documented work");
+    ASSERT(wl_evaluation_control_detach(control, &owner) == 0,
+        "completed constructor control detaches cleanly");
+    wl_evaluation_control_release(control);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control && wl_columnar_relation_managed_retirement_begin(
+            &retirement, build.relation) == 0,
+        "exact-limit result remains available for managed retirement");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "exact-limit result retires through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "exact-limit result reaches terminal retirement");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_respects_budget_and_attempt_binding(void)
+{
+    TEST("managed lane precharge obeys caller budget and attempt identity");
+
+    int owner = 0, other_owner = 0;
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_evaluation_control_t *other = attempt_test_control_create(0,
+            &other_owner);
+    ASSERT(control && other && wl_evaluation_control_identity(control)
+        != wl_evaluation_control_identity(other),
+        "distinct controls carry distinct process identities");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint64_t other_attempt_id
+        = wl_evaluation_control_active_attempt_id(other);
+    ASSERT(attempt_id == other_attempt_id,
+        "fixture gives separate controls colliding local attempt IDs");
+    ASSERT(wl_columnar_relation_managed_binary_build_begin(&build, 257,
+        NULL) == 0,
+        "large capacity builder starts without allocating lane storage");
+    while (build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0) {
+        ASSERT(wl_columnar_relation_managed_binary_build_step(&build,
+            control, attempt_id) == 0,
+            "fixed setup reaches first lane allocation");
+    }
+    uint64_t remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &remaining) == EAGAIN && remaining == 0
+        && build.allocation_units_remaining == 256,
+        "originating control begins partial lane precharge");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        other, other_attempt_id, &remaining) == EINVAL
+        && remaining == 1 && !build.relation->columns[0],
+        "another control with the same attempt ID cannot resume precharge");
+
+    for (uint32_t unit = 1; unit < 257; unit++) {
+        remaining = 1;
+        int rc = wl_columnar_relation_managed_binary_build_step_budgeted(
+            &build, control, attempt_id, &remaining);
+        ASSERT(rc == EAGAIN && remaining == 0
+            && build.allocation_units_remaining == 256u - unit
+            && !build.relation->columns[0],
+            "each one-unit call admits at most one cell and yields before allocation");
+    }
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(&build,
+        control, attempt_id, &remaining) == 0 && remaining == 0
+        && build.relation->columns[0]
+        && build.allocation_control_identity == 0
+        && build.allocation_attempt_id == 0,
+        "same control and attempt resume then separately admit the allocator");
+
+    wl_columnar_relation_managed_binary_build_t successor_build = { 0 };
+    ASSERT(wl_columnar_relation_managed_binary_build_begin(&successor_build,
+        4, NULL) == 0,
+        "successor-attempt fixture begins a second private builder");
+    while (successor_build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0)
+        ASSERT(wl_columnar_relation_managed_binary_build_step(
+                &successor_build, control, attempt_id) == 0,
+            "successor fixture reaches first lane");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(
+            &successor_build, control, attempt_id, &remaining) == EAGAIN
+        && remaining == 0
+        && successor_build.allocation_control_identity
+        == wl_evaluation_control_identity(control),
+        "partial precharge captures its originating attempt");
+    ASSERT(wl_evaluation_control_finish(control, &owner, 0, 0) == 0
+        && wl_evaluation_control_begin(control, &owner) == 0,
+        "same control advances to a distinct successor attempt");
+    uint64_t successor_attempt_id
+        = wl_evaluation_control_active_attempt_id(control);
+    ASSERT(successor_attempt_id != attempt_id,
+        "control assigns the successor a fresh attempt ID");
+    remaining = 1;
+    ASSERT(wl_columnar_relation_managed_binary_build_step_budgeted(
+            &successor_build, control, successor_attempt_id,
+            &remaining) == EINVAL
+        && remaining == 1 && !successor_build.relation->columns[0],
+        "successor attempt cannot resume prior partial precharge");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        successor_build.relation) == 0,
+        "rejected partial builder remains available for managed retirement");
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, successor_attempt_id) == 0,
+            "managed retirement accepts the successor cleanup attempt");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && retirement.relation == NULL,
+        "rejected builder reaches terminal cleanup without lane allocation");
+
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        build.relation) == 0,
+        "successfully resumed result is also managed-retireable");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, successor_attempt_id) == 0,
+            "constructed result retires through funded cleanup");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "constructed result reaches terminal retirement");
+    attempt_test_control_destroy(other, &other_owner, 0);
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_adopts_schema_without_reallocation(void)
+{
+    TEST("managed builder adopts schema without rebuilding funded lanes");
+
+    static const char *const column_names[] = { "x", "y" };
+    const uint32_t capacity = 2;
+    uint64_t lane_bytes = (uint64_t)capacity * sizeof(int64_t);
+    uint64_t retained_bytes = lane_bytes * 4u
+        + 2u * sizeof(int64_t *) + 2u * sizeof(int64_t *)
+        + 2u * sizeof(int64_t) + 2u * sizeof(wirelog_column_type_t);
+    uint64_t metadata_bytes = 3u + 2u * sizeof(char *)
+        + 2u * sizeof(wirelog_column_type_t)
+        + 2u * (sizeof(struct ArrowSchema *) + sizeof(struct ArrowSchema) + 2u)
+        + 2u * (sizeof("x") + sizeof("y"));
+    uint64_t descriptor_bytes = sizeof(col_rel_t);
+    uint64_t exact_budget = descriptor_bytes + retained_bytes
+        + metadata_bytes;
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor_ref
+        = test_ts_governor_create(exact_budget);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(governor_ref);
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    ASSERT(governor_ref && governor && control
+        && wl_columnar_relation_managed_binary_build_begin(&build, capacity,
+        governor_ref) == 0,
+        "exact-budget fixture starts a managed binary builder");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "exact builder budget admits descriptor, payload, and lanes");
+    }
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && build.relation && build.relation->capacity == capacity
+        && build.relation->retained_reserved_bytes == retained_bytes
+        && wl_columnar_memory_reserved(governor)
+        == descriptor_bytes + retained_bytes,
+        "ready builder holds exactly its precharged descriptor and lanes");
+    col_rel_t *relation = build.relation;
+    int64_t *columns0 = relation->columns[0];
+    int64_t *columns1 = relation->columns[1];
+    int64_t *merge0 = relation->merge_columns[0];
+    int64_t *merge1 = relation->merge_columns[1];
+    uint64_t retained_before = relation->retained_reserved_bytes;
+    ASSERT(wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == 0,
+        "schema metadata is admitted at the exact remaining governor limit");
+    ASSERT(relation->schema_ok && relation->col_names
+        && !strcmp(relation->col_names[0], "x")
+        && !strcmp(relation->col_names[1], "y")
+        && relation->capacity == capacity
+        && relation->columns[0] == columns0
+        && relation->columns[1] == columns1
+        && relation->merge_columns[0] == merge0
+        && relation->merge_columns[1] == merge1
+        && relation->retained_reserved_bytes == retained_before
+        && relation->metadata_reserved_bytes == metadata_bytes
+        && wl_columnar_memory_reserved(governor) == exact_budget,
+        "schema adoption preserves all lanes and charges metadata separately");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "schema-adopted relation enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64) {
+        int retire_rc = wl_columnar_relation_managed_retirement_step(
+            &retirement, control, attempt_id);
+        ASSERT(retire_rc == 0,
+            "schema-adopted relation retires every managed component");
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(governor) == 0,
+        "schema metadata and precharged lanes release exactly once");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+
+    owner = 0;
+    governor_ref = test_ts_governor_create(descriptor_bytes + retained_bytes);
+    governor = wl_columnar_memory_governor_ref_get(governor_ref);
+    control = attempt_test_control_create(0, &owner);
+    build = (wl_columnar_relation_managed_binary_build_t){ 0 };
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(governor_ref && governor && control
+        && wl_columnar_relation_managed_binary_build_begin(&build, capacity,
+        governor_ref) == 0,
+        "short-budget fixture starts with lane-only governor credit");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "short-budget builder admits all precharged lane storage");
+    }
+    relation = build.relation;
+    columns0 = relation->columns[0];
+    columns1 = relation->columns[1];
+    merge0 = relation->merge_columns[0];
+    merge1 = relation->merge_columns[1];
+    retained_before = relation->retained_reserved_bytes;
+    uint64_t reserved_before = wl_columnar_memory_reserved(governor);
+    ASSERT(wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == ENOSPC
+        && !relation->schema_ok && !relation->col_names
+        && relation->capacity == capacity
+        && relation->columns[0] == columns0
+        && relation->columns[1] == columns1
+        && relation->merge_columns[0] == merge0
+        && relation->merge_columns[1] == merge1
+        && relation->retained_reserved_bytes == retained_before
+        && relation->metadata_reserved_bytes == 0
+        && wl_columnar_memory_reserved(governor) == reserved_before,
+        "metadata refusal leaves builder lanes unchanged and retireable");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "metadata-refused builder enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64)
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "metadata-refused builder retires without leaked reservation");
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(governor) == 0,
+        "metadata denial cleanup returns the exact lane and descriptor credit");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+
+    owner = 0;
+    control = attempt_test_control_create(0, &owner);
+    build = (wl_columnar_relation_managed_binary_build_t){ 0 };
+    retirement = (wl_columnar_relation_managed_retirement_t){ 0 };
+    ASSERT(control && wl_columnar_relation_managed_binary_build_begin(&build,
+        capacity, NULL) == 0,
+        "unmetered builder also accepts schema metadata");
+    attempt_id = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && steps++ < 128) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        ASSERT(rc == 0 || rc == EAGAIN,
+            "unmetered builder reaches its ready phase");
+    }
+    relation = build.relation;
+    ASSERT(build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && relation
+        && wl_columnar_relation_managed_binary_build_adopt_schema(&build,
+        column_names) == 0
+        && relation->schema_ok && relation->metadata_reserved_bytes == 0,
+        "schema adoption preserves the unmetered relation contract");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "unmetered schema relation enters managed retirement");
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps++ < 64)
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == 0,
+            "unmetered schema metadata is released during retirement");
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE,
+        "unmetered managed retirement finishes with its schema released");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_binary_builder_partial_allocation_failures_are_retireable(void)
+{
+    TEST("partial managed binary construction survives allocation failures");
+
+    const wl_columnar_relation_managed_binary_build_phase_t allocation_phases[]
+        = {
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMNS_ARRAY,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMNS_ARRAY,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_ROW_SCRATCH,
+        WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_TYPES
+        };
+
+    for (size_t i = 0; i < sizeof(allocation_phases)
+        / sizeof(allocation_phases[0]); i++) {
+        int owner = 0;
+        wl_columnar_relation_managed_binary_build_t build = { 0 };
+        wl_columnar_relation_managed_retirement_t retirement = { 0 };
+        wl_evaluation_control_t *control = attempt_test_control_create(0,
+                &owner);
+        ASSERT(control && wl_columnar_relation_managed_binary_build_begin(
+                &build, 2, NULL) == 0,
+            "start a fresh managed constructor for each fault site");
+        uint64_t attempt_id
+            = wl_evaluation_control_active_attempt_id(control);
+        while (build.phase != allocation_phases[i]) {
+            int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                    control, attempt_id);
+            ASSERT(rc == 0 || rc == EAGAIN,
+                "advance to the selected physical allocation action");
+        }
+
+        wl_columnar_relation_test_constructor_fail_allocation = 1;
+        int allocation_rc = EAGAIN;
+        for (uint32_t allocation_step = 0; allocation_step < 128
+            && allocation_rc == EAGAIN; allocation_step++)
+            allocation_rc = wl_columnar_relation_managed_binary_build_step(
+                &build, control, attempt_id);
+        ASSERT(allocation_rc == ENOMEM
+            && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED
+            && !wl_columnar_relation_test_constructor_fail_allocation
+            && build.relation,
+            "injected allocation failure retains the partial descriptor");
+        ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+            build.relation) == 0,
+            "partial output enters the managed retirement protocol");
+        uint32_t retire_steps = 0;
+        while (retirement.phase
+            != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+            && retire_steps < 64) {
+            int rc = wl_columnar_relation_managed_retirement_step(&retirement,
+                    control, attempt_id);
+            ASSERT(rc == 0,
+                "partial physical state retires one funded action at a time");
+            if (rc != 0)
+                break;
+            retire_steps++;
+        }
+        ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+            && retirement.relation == NULL,
+            "failed allocation leaves no unreachable partial ownership");
+        attempt_test_control_destroy(control, &owner, 0);
+    }
+
+    int owner = 0;
+    wl_columnar_memory_governor_ref_t *governor_ref
+        = test_ts_governor_create(sizeof(col_rel_t));
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    ASSERT(governor_ref && control
+        && wl_columnar_relation_managed_binary_build_begin(&build, 2,
+        governor_ref) == 0,
+        "governed partial-construction fixture starts with descriptor-only capacity");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    ASSERT(wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == 0
+        && wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == 0
+        && wl_columnar_relation_managed_binary_build_step(&build, control,
+        attempt_id) == ENOSPC
+        && build.phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED
+        && build.relation && build.relation->retained_reserved_bytes == 0,
+        "retained-payload admission refusal preserves a retireable descriptor");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        build.relation) == 0,
+        "admission-refused descriptor enters managed retirement");
+    uint32_t retire_steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && retire_steps < 64) {
+        int rc = wl_columnar_relation_managed_retirement_step(&retirement,
+                control, attempt_id);
+        ASSERT(rc == 0,
+            "admission-refused descriptor retires without leaked ownership");
+        if (rc != 0)
+            break;
+        retire_steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor_ref)) == 0
+        && wl_columnar_memory_governor_ref_is_sole(governor_ref),
+        "partial retirement returns descriptor admission and its governor hold");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+    PASS();
+}
+
+static void
+test_managed_relation_retirement_fixed_components(void)
+{
+    TEST("managed relation retirement frees fixed components in funded steps");
+
+    int owner = 0;
+    col_rel_t *relation = attempt_test_managed_retirement_relation(NULL);
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    ASSERT(relation && control,
+        "managed relation and maintenance control allocate");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "managed retirement begins at a stable relation address");
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    wl_columnar_relation_managed_retirement_phase_t initial = retirement.phase;
+    wl_columnar_source_access_gate_t *contended_gates[] = {
+        &relation->descriptor_access, &relation->source_access
+    };
+    for (size_t i = 0; i < sizeof(contended_gates)
+        / sizeof(contended_gates[0]); i++) {
+        ASSERT(wl_columnar_source_access_gate_reader_acquire(
+                contended_gates[i]) == 0,
+            "fixture installs one pre-existing gate reader");
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id) == EAGAIN
+            && retirement.phase == initial
+            && atomic_load_explicit(&relation->descriptor_access.state,
+            memory_order_acquire)
+            == (contended_gates[i] == &relation->descriptor_access ? 1u : 0u)
+            && atomic_load_explicit(&relation->source_access.state,
+            memory_order_acquire)
+            == (contended_gates[i] == &relation->source_access ? 1u : 0u),
+            "writer gate round refuses without a partial terminal hold");
+        ASSERT(wl_columnar_source_access_gate_reader_release(
+                contended_gates[i]) == 0,
+            "fixture releases the pre-existing gate reader");
+    }
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        attempt_id + 1u) == EINVAL
+        && retirement.phase == initial && retirement.relation == relation
+        && relation->columns && relation->columns[0],
+        "stale maintenance funding leaves phase and physical resources unchanged");
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        attempt_id) == 0
+        && retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE,
+        "retirement acquires both writer gates before inspecting shape");
+    relation->name = malloc(sizeof("unsupported"));
+    ASSERT(relation->name, "invalid-shape marker allocates");
+    memcpy(relation->name, "unsupported", sizeof("unsupported"));
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        attempt_id) == EINVAL
+        && retirement.phase
+        == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS
+        && !wl_columnar_source_access_gate_busy(&relation->descriptor_access)
+        && !wl_columnar_source_access_gate_busy(&relation->source_access)
+        && relation->columns && relation->columns[0],
+        "locked shape rejection releases both gates before ownership changes");
+    free(relation->name);
+    relation->name = NULL;
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        attempt_id) == 0
+        && retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE
+        && wl_columnar_relation_managed_retirement_step(&retirement, control,
+        attempt_id) == 0
+        && retirement.phase
+        == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR,
+        "repaired relation retries validation under both writer gates");
+    ASSERT(wl_columnar_source_access_gate_reader_acquire(
+            &relation->descriptor_access) == EBUSY
+        && wl_columnar_source_access_gate_reader_acquire(
+            &relation->source_access) == EBUSY,
+        "held writer round prevents new descriptor and storage readers");
+    wl_columnar_relation_managed_retirement_t copied = retirement;
+    ASSERT(wl_columnar_relation_managed_retirement_step(&copied, control,
+        attempt_id) == EINVAL
+        && retirement.phase
+        == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR
+        && relation->columns && relation->columns[0],
+        "copied receipt cannot release or advance the held writer round");
+
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        wl_columnar_relation_managed_retirement_phase_t phase
+            = retirement.phase;
+        int rc = wl_columnar_relation_managed_retirement_step(&retirement,
+                control, attempt_id);
+        ASSERT(rc == 0, "one funded retirement action completes");
+        if (phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_0)
+            ASSERT(!relation->columns[0] && relation->columns[1],
+                "each physical lane clears only after its own free");
+        else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMNS_ARRAY)
+            ASSERT(relation->columns == NULL,
+                "column pointer array clears after both lane frees");
+        else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMNS_ARRAY)
+            ASSERT(relation->merge_columns == NULL,
+                "merge pointer array clears after both merge lane frees");
+        else if (phase ==
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR)
+            ASSERT(retirement.relation == NULL
+                && retirement.phase
+                ==
+                WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS,
+                "descriptor free preserves a gate receipt for local-only consume");
+        else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS)
+            ASSERT(retirement.gate_round.identity == 0,
+                "terminal consume clears receipt-local fields without reopening gates");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && retirement.relation == NULL && retirement.governor_ref == NULL,
+        "all fixed components retire before the descriptor is released");
+    for (size_t i = 0; i < 4; i++)
+        ASSERT(retirement.token_empty[i] && !retirement.receipt_started[i],
+            "ungoverned fixture retains explicit empty token slots");
+    attempt_test_control_destroy(control, &owner, 0);
+    PASS();
+}
+
+static void
+test_managed_relation_retirement_refunds_detached_tokens(void)
+{
+    TEST(
+        "managed relation retirement detaches before refund and frees descriptor first");
+
+    int owner = 0;
+    uint64_t descriptor_bytes;
+    uint64_t metadata_bytes = 32;
+    wl_columnar_memory_governor_ref_t *governor_ref
+        = test_ts_governor_create(1u << 20);
+    col_rel_t *relation = attempt_test_managed_retirement_relation(
+        governor_ref);
+    uint64_t retained_bytes = relation
+        ? relation->retained_reserved_bytes : 0;
+    uint64_t expected_retained_bytes =
+        4u * 2u * sizeof(int64_t)
+        + 2u * sizeof(*relation->columns)
+        + 2u * sizeof(*relation->merge_columns)
+        + 2u * sizeof(*relation->row_scratch)
+        + 2u * sizeof(*relation->column_types);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(governor_ref);
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    ASSERT(relation && governor_ref && control,
+        "governed managed relation and maintenance control allocate");
+    descriptor_bytes = relation->descriptor_reserved_bytes;
+    ASSERT(descriptor_bytes > 0 && retained_bytes == expected_retained_bytes,
+        "managed constructor reserves both payload lanes and all fixed metadata");
+    ASSERT(wl_columnar_memory_reserve(governor, metadata_bytes,
+        &relation->metadata_reservation)
+        && wl_columnar_memory_commit(&relation->metadata_reservation,
+        relation),
+        "metadata reservation is committed to its original relation");
+    relation->metadata_reserved_bytes = metadata_bytes;
+    ASSERT(wl_columnar_memory_reserved(governor)
+        == descriptor_bytes + metadata_bytes + retained_bytes,
+        "fixture starts at the exact admitted total");
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "managed retirement starts for an independently governed relation");
+
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 64) {
+        wl_columnar_relation_managed_retirement_phase_t phase
+            = retirement.phase;
+        uint64_t reserved_before = wl_columnar_memory_reserved(governor);
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, attempt_id + 1u) == EINVAL
+            && retirement.phase == phase
+            && wl_columnar_memory_reserved(governor) == reserved_before,
+            "stale funding leaves every cleanup phase and credit unchanged");
+        if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_GOVERNOR) {
+            ASSERT(!wl_columnar_memory_governor_ref_is_sole(governor_ref),
+                "receipt-owned governor reference survives until every token ACK");
+        }
+        int rc = wl_columnar_relation_managed_retirement_step(&retirement,
+                control, attempt_id);
+        ASSERT(rc == 0, "funded token or component phase completes");
+        uint64_t reserved_after = wl_columnar_memory_reserved(governor);
+        if (reserved_after != reserved_before) {
+            uint64_t refunded = reserved_before - reserved_after;
+            ASSERT((phase ==
+                WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA
+                && refunded == metadata_bytes)
+                || (phase ==
+                WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED
+                && refunded == retained_bytes)
+                || (phase ==
+                WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DESCRIPTOR
+                && refunded == descriptor_bytes),
+                "each successful credit CAS refunds exactly one token");
+        }
+        if (phase ==
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR) {
+            ASSERT(retirement.tokens[0].identity == &retirement.tokens[0]
+                && atomic_load_explicit(&retirement.tokens[0].owner_bits,
+                memory_order_acquire) == (uint64_t)(uintptr_t)relation
+                && relation->descriptor_reserved_bytes == 0,
+                "descriptor token detaches with original owner before free");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_METADATA) {
+            ASSERT(retirement.tokens[1].identity == &retirement.tokens[1]
+                && atomic_load_explicit(&retirement.tokens[1].owner_bits,
+                memory_order_acquire) == (uint64_t)(uintptr_t)relation
+                && relation->metadata_reserved_bytes == 0,
+                "metadata token detaches with original owner before free");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_RETAINED) {
+            ASSERT(retirement.tokens[3].identity == &retirement.tokens[3]
+                && atomic_load_explicit(&retirement.tokens[3].owner_bits,
+                memory_order_acquire) == (uint64_t)(uintptr_t)relation
+                && relation->retained_reserved_bytes == 0,
+                "committed payload token detaches with its original owner");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_GOVERNOR) {
+            ASSERT(retirement.governor_ref == governor_ref
+                && relation->memory_governor == NULL,
+                "governor reference remains owned by retirement record");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR) {
+            ASSERT(wl_columnar_memory_reserved(governor)
+                == descriptor_bytes + metadata_bytes + retained_bytes,
+                "descriptor credit stays charged through physical free");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA
+            || phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED) {
+            ASSERT(retirement.relation == NULL
+                && !wl_columnar_memory_governor_ref_is_sole(governor_ref),
+                "covered storage is gone while its governor reference remains held");
+        } else if (phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_GOVERNOR) {
+            ASSERT(wl_columnar_memory_governor_ref_is_sole(governor_ref),
+                "governor reference releases only after all token ACKs");
+        }
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && retirement.relation == NULL
+        && wl_columnar_memory_reserved(governor) == 0
+        && wl_columnar_memory_governor_ref_is_sole(governor_ref),
+        "all detached credits retire after storage and descriptor free");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+    PASS();
+}
+
+static void
+test_managed_relation_retirement_resumes_claimed_credit(void)
+{
+    TEST("managed relation retirement resumes after a claimed credit limit");
+
+    int owner = 0;
+    uint64_t metadata_bytes = 32;
+    wl_columnar_memory_governor_ref_t *governor_ref
+        = test_ts_governor_create(1u << 20);
+    wl_columnar_memory_governor_t *governor
+        = wl_columnar_memory_governor_ref_get(governor_ref);
+    col_rel_t *relation =
+        attempt_test_managed_retirement_relation(governor_ref);
+    wl_columnar_relation_managed_retirement_t retirement = { 0 };
+    wl_evaluation_control_t *control = attempt_test_control_create(84, &owner);
+    ASSERT(relation && governor_ref && control,
+        "managed relation and bounded maintenance control allocate");
+    ASSERT(wl_columnar_memory_reserve(governor, metadata_bytes,
+        &relation->metadata_reservation)
+        && wl_columnar_memory_commit(&relation->metadata_reservation, relation),
+        "metadata credit is committed to the managed relation");
+    relation->metadata_reserved_bytes = metadata_bytes;
+    ASSERT(wl_columnar_relation_managed_retirement_begin(&retirement,
+        relation) == 0,
+        "retirement receipt begins with stable gate and token storage");
+    uint64_t first_attempt = wl_evaluation_control_active_attempt_id(control);
+    uint32_t steps = 0;
+    while (retirement.phase
+        != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA
+        && steps < 32) {
+        int rc = wl_columnar_relation_managed_retirement_step(&retirement,
+                control, first_attempt);
+        ASSERT(rc == 0, "bounded work advances to the first token refund");
+        steps++;
+    }
+    ASSERT(retirement.phase
+        == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA
+        && retirement.relation == NULL,
+        "all physical storage is gone before metadata retirement starts");
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        first_attempt) == 0 && retirement.receipt_started[1],
+        "first funded action creates a stable token receipt");
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        first_attempt) == 0
+        && retirement.receipts[1].phase
+        == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        && atomic_load_explicit(&retirement.tokens[1].state,
+        memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED,
+        "one-shot claim is held while the next receipt phase is pending");
+    uint64_t reserved_before_retry = wl_columnar_memory_reserved(governor);
+    ASSERT(wl_columnar_relation_managed_retirement_step(&retirement, control,
+        first_attempt) == WL_EVALUATION_CONTROL_WORK_LIMIT
+        && retirement.phase
+        == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA
+        && retirement.receipts[1].phase
+        == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        && wl_columnar_memory_reserved(governor) == reserved_before_retry,
+        "exhausted work leaves the claimed credit and receipt cursor unchanged");
+    attempt_test_control_destroy(control, &owner, 0);
+
+    control = attempt_test_control_create(0, &owner);
+    ASSERT(control, "fresh maintenance attempt is available for cleanup");
+    uint64_t retry_attempt = wl_evaluation_control_active_attempt_id(control);
+    steps = 0;
+    while (retirement.phase != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && steps < 32) {
+        ASSERT(wl_columnar_relation_managed_retirement_step(&retirement,
+            control, retry_attempt) == 0,
+            "fresh funding resumes and acknowledges each retained receipt");
+        steps++;
+    }
+    ASSERT(retirement.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+        && wl_columnar_memory_reserved(governor) == 0
+        && wl_columnar_memory_governor_ref_is_sole(governor_ref),
+        "resumed cleanup refunds exactly once and releases its governor hold");
+    attempt_test_control_destroy(control, &owner, 0);
+    wl_columnar_memory_governor_ref_release(governor_ref);
+    PASS();
+}
+
 static void
 test_controlled_incremental_delta_resumes_and_commits(void)
 {
@@ -2326,10 +3317,428 @@ attempt_test_int64_relation_width(const int64_t *values, uint32_t count,
     return rel;
 }
 
+static void
+attempt_test_managed_candidate_relation_destroy(col_rel_t *relation)
+{
+    if (relation)
+        (void)col_rel_destroy_checked(relation);
+}
+
+static col_rel_t *
+attempt_test_managed_candidate_relation(const int64_t *values,
+    uint32_t rows, bool canonical, wl_columnar_memory_governor_ref_t *governor)
+{
+    int owner = 0;
+    wl_evaluation_control_t *control = attempt_test_control_create(0, &owner);
+    wl_columnar_relation_managed_binary_build_t build = { 0 };
+    col_rel_t *relation = NULL;
+
+    if (!control || wl_columnar_relation_managed_binary_build_begin(&build,
+        rows ? rows : 1u, governor) != 0)
+        goto done;
+    uint64_t attempt_id = wl_evaluation_control_active_attempt_id(control);
+    uint32_t max_build_steps = 64
+        + ((rows ? rows : 1u) + WL_EVALUATION_CONTROL_QUANTUM - 1u)
+        / WL_EVALUATION_CONTROL_QUANTUM * 4u;
+    for (uint32_t i = 0; build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        && i < max_build_steps; i++) {
+        int rc = wl_columnar_relation_managed_binary_build_step(&build,
+                control, attempt_id);
+        if (rc != 0 && rc != EAGAIN)
+            goto done;
+    }
+    if (build.phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        || !build.relation)
+        goto done;
+    relation = build.relation;
+    for (uint32_t row = 0; row < rows; row++)
+        for (uint32_t column = 0; column < 2; column++)
+            relation->columns[column][row] = values[2u * row + column];
+    relation->nrows = rows;
+    relation->sorted_nrows = canonical ? rows : 0;
+    relation->run_count = rows ? 1u : 0u;
+    if (rows)
+        relation->run_ends[0] = rows;
+    if (wl_evaluation_control_finish(control, &owner, 0, 0) != 0) {
+        attempt_test_managed_candidate_relation_destroy(relation);
+        relation = NULL;
+        goto done;
+    }
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    return relation;
+
+done:
+    if (build.relation && build.phase
+        != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY)
+        attempt_test_managed_candidate_relation_destroy(build.relation);
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    return NULL;
+}
+
 static col_rel_t *
 attempt_test_int64_relation(const int64_t *values, uint32_t count)
 {
     return attempt_test_int64_relation_width(values, count, 1);
+}
+
+static bool
+attempt_test_managed_candidate_case(uint64_t quantum, uint64_t *work_out,
+    const int64_t *source_values, uint32_t source_rows,
+    const int64_t *candidate_values, uint32_t candidate_rows,
+    const int64_t *expected_union, uint32_t expected_union_rows,
+    const int64_t *expected_delta, uint32_t expected_delta_rows)
+{
+    int owner = 0, maintenance_owner = 0;
+    wl_columnar_memory_governor_ref_t *governor
+        = test_ts_governor_create(16u << 20);
+    wl_evaluation_control_t *control = attempt_test_control_create(0,
+            &owner);
+    wl_evaluation_control_t *maintenance = NULL;
+    col_rel_t *legacy = attempt_test_int64_relation_width(source_values,
+            source_rows, 2);
+    col_rel_t *legacy_delta = test_rel_alloc(2);
+    col_rel_t *source = attempt_test_managed_candidate_relation(source_values,
+            source_rows, true, governor);
+    col_rel_t *candidate = attempt_test_managed_candidate_relation(
+        candidate_values, candidate_rows, false, governor);
+    col_rel_t *replacement = NULL, *delta = NULL;
+    wl_columnar_managed_candidate_merge_t attempt = { 0 };
+    bool ok = false;
+    int rc = 0;
+
+    if (!governor || !control || !legacy || !legacy_delta || !source
+        || !candidate) {
+        goto done;
+    }
+    int legacy_fast = -1;
+    if (col_op_consolidate_incremental_delta(legacy, 0, NULL,
+        &legacy_fast) != 0 || legacy_fast != 1)
+        goto done;
+    uint32_t legacy_source_rows = legacy->nrows;
+    for (uint32_t row = 0; row < candidate_rows; row++)
+        if (test_rel_append_row(legacy,
+            &candidate_values[2u * row]) != 0)
+            goto done;
+    if (col_op_consolidate_incremental_delta(legacy, legacy_source_rows,
+        legacy_delta, &legacy_fast) != 0)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_begin(&attempt, source,
+            candidate, control,
+            wl_evaluation_control_active_attempt_id(control));
+    if (rc != 0) {
+        goto done;
+    }
+    col_relation_snapshot_t source_before
+        = wl_columnar_relation_snapshot(source);
+    col_relation_snapshot_t candidate_before
+        = wl_columnar_relation_snapshot(candidate);
+    uint32_t slices = 0;
+    while (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        && slices++ < 10000) {
+        rc = wl_columnar_managed_candidate_merge_advance(&attempt, quantum);
+        if (rc != 0 && rc != EAGAIN)
+            goto done;
+    }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || !wl_columnar_relation_snapshot_equal(source_before,
+        wl_columnar_relation_snapshot(source))
+        || !wl_columnar_relation_snapshot_equal(candidate_before,
+        wl_columnar_relation_snapshot(candidate))
+        || wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != 0)
+        goto done;
+    if (!replacement || replacement->nrows != expected_union_rows
+        || !delta || delta->nrows != expected_delta_rows)
+        goto done;
+    for (uint32_t i = 0; i < expected_union_rows; i++)
+        if (!attempt_test_pair_is(replacement, i, expected_union[2 * i],
+            expected_union[2 * i + 1]))
+            goto done;
+    for (uint32_t i = 0; i < expected_delta_rows; i++)
+        if (!attempt_test_pair_is(delta, i, expected_delta[2 * i],
+            expected_delta[2 * i + 1]))
+            goto done;
+    if (legacy->nrows != replacement->nrows
+        || legacy_delta->nrows != delta->nrows)
+        goto done;
+    for (uint32_t i = 0; i < replacement->nrows; i++)
+        if (!attempt_test_pair_is(legacy, i,
+            replacement->columns[0][i], replacement->columns[1][i]))
+            goto done;
+    for (uint32_t i = 0; i < delta->nrows; i++)
+        if (!attempt_test_pair_is(legacy_delta, i,
+            delta->columns[0][i], delta->columns[1][i]))
+            goto done;
+    if (wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != EINVAL)
+        goto done;
+    if (wl_evaluation_control_finish(control, &owner, 0, 0) != 0)
+        goto done;
+    wl_evaluation_control_report_t report;
+    if (wl_evaluation_control_report(control, &report) != 0)
+        goto done;
+    if (work_out)
+        *work_out = report.consumed;
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    uint64_t maintenance_id
+        = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0) {
+            goto done;
+        }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || replacement->nrows != expected_union_rows
+        || delta->nrows != expected_delta_rows
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    control = attempt_test_control_create(0, &owner);
+    if (!control || wl_columnar_managed_candidate_merge_begin(&attempt,
+        source, candidate, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0)
+        goto done;
+    wl_evaluation_control_request_cancel(control);
+    if (wl_columnar_managed_candidate_merge_advance(&attempt, 1)
+        != WL_EVALUATION_CONTROL_CANCELLED
+        || attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        || !attempt.input_gates.identity)
+        goto done;
+    attempt_test_control_destroy(control, &owner, 0);
+    control = NULL;
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    maintenance_id = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 16; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    ok = true;
+
+done:
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (attempt.identity
+        && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) {
+        if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+            && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+            (void)wl_columnar_managed_candidate_merge_abort(&attempt);
+        if (!maintenance)
+            maintenance = attempt_test_control_create(0,
+                    &maintenance_owner);
+        if (maintenance) {
+            uint64_t maintenance_id
+                = wl_evaluation_control_active_attempt_id(maintenance);
+            for (uint32_t i = 0; attempt.phase
+                != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+                if (wl_columnar_managed_candidate_merge_cleanup_step(
+                        &attempt, maintenance, maintenance_id) != 0)
+                    break;
+            if (attempt.phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+                (void)wl_columnar_managed_candidate_merge_ack(&attempt);
+        }
+    }
+    if (maintenance)
+        attempt_test_control_destroy(maintenance, &maintenance_owner, 0);
+    test_rel_free(delta);
+    test_rel_free(replacement);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    test_rel_free(legacy_delta);
+    test_rel_free(legacy);
+    if (governor)
+        wl_columnar_memory_governor_ref_release(governor);
+    return ok;
+}
+
+static void
+test_managed_candidate_terminal_cleanup(void)
+{
+    TEST(
+        "managed candidate work exhaustion retains gates through cleanup (#1821)");
+    const int64_t values[] = { 1, 1 };
+    int owner = 0, maintenance_owner = 0;
+    wl_evaluation_control_t *control = attempt_test_control_create(2, &owner);
+    wl_evaluation_control_t *maintenance = NULL;
+    col_rel_t *source = attempt_test_managed_candidate_relation(values, 1,
+            true, NULL);
+    col_rel_t *candidate = attempt_test_managed_candidate_relation(values, 1,
+            false, NULL);
+    col_rel_t *replacement = NULL, *delta = NULL;
+    wl_columnar_managed_candidate_merge_t attempt = { 0 };
+    bool ok = false;
+    int rc = 0;
+
+    if (!control || !source || !candidate)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_begin(&attempt, source,
+            candidate, control,
+            wl_evaluation_control_active_attempt_id(control));
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_managed_candidate_merge_advance(&attempt, 1);
+    if (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+        || attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+        || attempt.terminal_status != WL_EVALUATION_CONTROL_WORK_LIMIT
+        || !attempt.input_gates.identity)
+        goto done;
+    attempt_test_control_destroy(control, &owner, 0);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    uint64_t maintenance_id
+        = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 16; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+
+    control = attempt_test_control_create(0, &owner);
+    if (!control || wl_columnar_managed_candidate_merge_begin(&attempt,
+        source, candidate, control,
+        wl_evaluation_control_active_attempt_id(control)) != 0)
+        goto done;
+    uint32_t slices = 0;
+    while (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        && slices++ < 10000) {
+        rc = wl_columnar_managed_candidate_merge_advance(&attempt, 1);
+        if (rc != 0 && rc != EAGAIN)
+            goto done;
+    }
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_READY
+        || wl_columnar_managed_candidate_merge_take_result(&attempt,
+        &replacement, &delta) != 0
+        || !replacement || replacement->nrows != 1
+        || !attempt_test_pair_is(replacement, 0, 1, 1)
+        || !delta || delta->nrows != 0
+        || wl_evaluation_control_finish(control, &owner, 0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(control, &owner);
+    wl_evaluation_control_release(control);
+    control = NULL;
+
+    maintenance = attempt_test_control_create(0, &maintenance_owner);
+    if (!maintenance)
+        goto done;
+    maintenance_id = wl_evaluation_control_active_attempt_id(maintenance);
+    for (uint32_t i = 0; attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+        if (wl_columnar_managed_candidate_merge_cleanup_step(&attempt,
+            maintenance, maintenance_id) != 0)
+            goto done;
+    if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+        || wl_columnar_managed_candidate_merge_ack(&attempt) != 0
+        || wl_evaluation_control_finish(maintenance, &maintenance_owner,
+        0, 0) != 0)
+        goto done;
+    (void)wl_evaluation_control_detach(maintenance, &maintenance_owner);
+    wl_evaluation_control_release(maintenance);
+    maintenance = NULL;
+    ok = true;
+
+done:
+    if (control)
+        attempt_test_control_destroy(control, &owner, 0);
+    if (attempt.identity && attempt.phase
+        != WL_COLUMNAR_MANAGED_CANDIDATE_DONE) {
+        if (attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP
+            && attempt.phase != WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP)
+            (void)wl_columnar_managed_candidate_merge_abort(&attempt);
+        if (!maintenance)
+            maintenance = attempt_test_control_create(0,
+                    &maintenance_owner);
+        if (maintenance) {
+            uint64_t maintenance_id
+                = wl_evaluation_control_active_attempt_id(maintenance);
+            for (uint32_t i = 0; attempt.phase
+                != WL_COLUMNAR_MANAGED_CANDIDATE_DONE && i < 10000; i++)
+                if (wl_columnar_managed_candidate_merge_cleanup_step(
+                        &attempt, maintenance, maintenance_id) != 0)
+                    break;
+            if (attempt.phase == WL_COLUMNAR_MANAGED_CANDIDATE_DONE)
+                (void)wl_columnar_managed_candidate_merge_ack(&attempt);
+        }
+    }
+    if (maintenance)
+        attempt_test_control_destroy(maintenance, &maintenance_owner, 0);
+    test_rel_free(delta);
+    test_rel_free(replacement);
+    test_rel_free(candidate);
+    test_rel_free(source);
+    ASSERT(ok, "a stopped candidate keeps ownership until charged cleanup");
+    PASS();
+}
+
+static void
+test_managed_binary_candidate_merge_result_and_funding(void)
+{
+    TEST(
+        "managed binary candidate merge transfers union and delta once (#1821)");
+    const int64_t source[] = { 1, 1, 2, 1 };
+    const int64_t candidate[] = { 3, 0, 1, 1, 2, 2, 3, 0 };
+    const int64_t expected_union[] = { 1, 1, 2, 1, 2, 2, 3, 0 };
+    const int64_t expected_delta[] = { 2, 2, 3, 0 };
+    uint64_t one_unit_work = 0, wide_work = 0;
+    ASSERT(attempt_test_managed_candidate_case(1, &one_unit_work, source, 2,
+        candidate, 4, expected_union, 4, expected_delta, 2),
+        "one-action slices preserve both inputs and transfer valid outputs");
+    ASSERT(attempt_test_managed_candidate_case(64, &wide_work, source, 2,
+        candidate, 4, expected_union, 4, expected_delta, 2),
+        "wide slices produce the same managed merge result");
+    ASSERT(one_unit_work == wide_work,
+        "quantum size does not change original-attempt work accounting");
+    const int64_t overlap[] = { 1, 1, 2, 1, 2, 1 };
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, source, 2,
+        overlap, 3, source, 2, NULL, 0),
+        "duplicate candidate rows already in the source produce empty delta");
+    const int64_t signed_source[] = { -9, 1, 2, 0 };
+    const int64_t signed_candidates[] = { 0, 7, -10, 3, -9, 1 };
+    const int64_t signed_union[] = { -10, 3, -9, 1, 0, 7, 2, 0 };
+    const int64_t signed_delta[] = { -10, 3, 0, 7 };
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, signed_source, 2,
+        signed_candidates, 3, signed_union, 4, signed_delta, 2),
+        "signed INT64 candidates use numeric row ordering");
+    ASSERT(attempt_test_managed_candidate_case(1, NULL, NULL, 0, NULL, 0,
+        NULL, 0, NULL, 0),
+        "empty binary relations produce canonical empty outputs");
+    PASS();
 }
 
 static void
@@ -4234,6 +5643,16 @@ main(void)
 {
     printf("=== test_consolidate_incremental_delta ===\n\n");
 
+    test_managed_binary_builder_resumes_each_allocation_action();
+    test_managed_binary_builder_preadmits_large_lanes();
+    test_managed_binary_builder_respects_budget_and_attempt_binding();
+    test_managed_binary_builder_adopts_schema_without_reallocation();
+    test_managed_binary_builder_partial_allocation_failures_are_retireable();
+    test_managed_candidate_terminal_cleanup();
+    test_managed_binary_candidate_merge_result_and_funding();
+    test_managed_relation_retirement_fixed_components();
+    test_managed_relation_retirement_refunds_detached_tokens();
+    test_managed_relation_retirement_resumes_claimed_credit();
     test_controlled_incremental_delta_resumes_and_commits();
     test_controlled_staged_delta_merges_and_resumes();
     test_controlled_staged_delta_multi_column();

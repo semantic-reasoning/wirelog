@@ -49,6 +49,11 @@ typedef enum {
     WL_CONTROLLED_STEP_IDLE = 0,
     WL_CONTROLLED_STEP_PENDING,
     WL_CONTROLLED_STEP_COMPLETE,
+    /* A completed recursive route may admit only backend-approved input
+     * appends before its next controlled STEP. */
+    WL_CONTROLLED_STEP_RETRYABLE,
+    /* Provenance changed outside the authorized retryable input path. */
+    WL_CONTROLLED_STEP_INVALIDATED,
 } wl_controlled_step_state_t;
 
 /**
@@ -120,6 +125,12 @@ typedef struct {
      * closed between stopped attempts; COMPLETE rejects later mutations. */
     wl_controlled_step_state_t (*session_controlled_step_state)(
         const wl_session_t *session);
+    /* Pure preauthorization for the narrowly supported input append that can
+     * follow a completed controlled STEP. Called with a public operation
+     * reservation active and without the admission mutex held. */
+    bool (*session_controlled_step_authorize_insert)(
+        const wl_session_t *session, const char *relation,
+        uint32_t num_rows, uint32_t num_cols);
 } wl_compute_backend_t;
 
 /**

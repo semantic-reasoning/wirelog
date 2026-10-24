@@ -20,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_plan_test_after_terminal_exchange)(
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
 /* ======================================================================== */
 /* Stratum Evaluator                                                         */
 /* ======================================================================== */
@@ -565,7 +570,101 @@ wl_columnar_eval_plan_numeric_validate(
     if (!record || !wl_columnar_eval_plan_numeric_owner_valid(record,
         record->frame)) return EINVAL;
     if (record->session->cleanup_active != record->frame) return EBUSY;
+    if (record->private_bindings) {
+        const wl_columnar_eval_private_bindings_t *bindings =
+            record->private_bindings;
+        if (bindings->identity != (uintptr_t)bindings
+            || bindings->session != record->session
+            || bindings->plan != record->plan
+            || bindings->control != record->control
+            || bindings->attempt_id != record->attempt_id
+            || !bindings->count
+            || bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+            || wl_evaluation_control_active_attempt_id(record->control)
+            != record->attempt_id)
+            return EINVAL;
+        for (uint32_t i = 0; i < bindings->count; ++i) {
+            const wl_columnar_eval_private_binding_t *entry =
+                &bindings->entries[i];
+            if (!entry->name[0] || !memchr(entry->name, '\0',
+                sizeof(entry->name)) || !entry->relation
+                || !wl_columnar_relation_snapshot_equal(entry->snapshot,
+                wl_columnar_relation_snapshot(entry->relation)))
+                return EINVAL;
+            for (uint32_t j = 0; j < i; ++j)
+                if (!strcmp(bindings->entries[j].name, entry->name))
+                    return EINVAL;
+        }
+    }
     return wl_columnar_eval_stack_numeric_owner(record->frame, record);
+}
+
+int
+wl_columnar_eval_private_bindings_begin(
+    wl_columnar_eval_private_bindings_t *bindings, wl_col_session_t *session,
+    const wl_plan_relation_t *plan, wl_evaluation_control_t *control,
+    uint64_t attempt_id, const char *const *names,
+    col_rel_t *const *relations, uint32_t count)
+{
+    if (!bindings || bindings->identity || !session || !plan || !plan->ops
+        || !control || !attempt_id || !names || !relations || !count
+        || count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+        || session->base.evaluation_control != control
+        || wl_evaluation_control_active_attempt_id(control) != attempt_id)
+        return EINVAL;
+    memset(bindings, 0, sizeof(*bindings));
+    bindings->identity = (uintptr_t)bindings;
+    bindings->session = session;
+    bindings->plan = plan;
+    bindings->control = control;
+    bindings->attempt_id = attempt_id;
+    bindings->count = count;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!names[i] || !relations[i]) goto invalid;
+        size_t length = strnlen(names[i], sizeof(bindings->entries[i].name));
+        if (!length || length == sizeof(bindings->entries[i].name))
+            goto invalid;
+        memcpy(bindings->entries[i].name, names[i], length + 1);
+        bindings->entries[i].relation = relations[i];
+        bindings->entries[i].snapshot =
+            wl_columnar_relation_snapshot(relations[i]);
+        if (!wl_columnar_relation_snapshot_valid(
+                bindings->entries[i].snapshot)) goto invalid;
+        for (uint32_t j = 0; j < i; ++j)
+            if (!strcmp(bindings->entries[j].name,
+                bindings->entries[i].name)) goto invalid;
+    }
+    return 0;
+
+invalid:
+    memset(bindings, 0, sizeof(*bindings));
+    return EINVAL;
+}
+
+int
+wl_columnar_eval_plan_numeric_private_bindings_get(const void *owner,
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_col_session_t *session, wl_evaluation_control_t *control, uint64_t id,
+    const wl_columnar_eval_private_bindings_t **out)
+{
+    if (!out) return EINVAL;
+    *out = NULL;
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (!record || record->identity != owner || record->frame != frame
+        || record->session != session || record->control != control
+        || record->attempt_id != id
+        || wl_columnar_eval_plan_numeric_validate(record))
+        return EINVAL;
+    if (record->private_bindings) {
+        const wl_columnar_eval_private_bindings_t *bindings =
+            record->private_bindings;
+        if (bindings->identity != (uintptr_t)bindings
+            || bindings->session != session || bindings->plan != record->plan
+            || bindings->control != control || bindings->attempt_id != id)
+            return EINVAL;
+        *out = bindings;
+    }
+    return 0;
 }
 
 static int
@@ -579,6 +678,133 @@ wl_columnar_eval_plan_numeric_forward(
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(record->control)
            == record->attempt_id ? 0 : EINVAL;
+}
+
+/* The parsed one-edge and two-edge recursive reachability rules lower to
+ * these exact seven- and eight-op relations. Their final zero-worker EXCHANGE
+ * is metadata for the ordinary multi-worker planner; under the controlled,
+ * single-session composed evaluator it has no redistribution work to do.
+ * Keep this bridge narrower than generic EXCHANGE support. */
+static bool
+wl_columnar_eval_plan_composed_terminal_exchange_valid(
+    const wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    static const uint8_t map_col0[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'
+    };
+    static const uint8_t map_col1[] = {
+        WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1'
+    };
+    if (!record || !record->composed_mode || !record->private_bindings
+        || record->begin != 0 || !record->plan || !record->plan->ops
+        || (record->end != 7 && record->end != 8)
+        || record->plan->op_count != record->end)
+        return false;
+    const wl_plan_relation_t *plan = record->plan;
+    const wl_plan_op_t *ops = plan->ops;
+    uint32_t join_count = record->end == 7 ? 1 : 2;
+    uint32_t last_join = 2 + join_count;
+    uint32_t concat = last_join + 1;
+    uint32_t consolidate = concat + 1;
+    uint32_t exchange_index = consolidate + 1;
+    for (uint32_t i = 0; i < record->end; ++i) {
+        const wl_plan_op_t *op = &ops[i];
+        bool join = i >= 3 && i <= last_join;
+        bool projected = i == 1 || (join
+            && (join_count == 1 || i == last_join));
+        if (op->filter_expr.data || op->filter_expr.size
+            || op->agg_expr.data || op->agg_expr.size
+            || op->agg_fn != WIRELOG_AGG_COUNT
+            || op->group_by_indices || op->group_by_count
+            || op->aggregate_index || op->right_filter_expr.data
+            || op->right_filter_expr.size
+            || op->agg_operand_type != WL_PLAN_AGG_OPERAND_UNKNOWN
+            || op->agg_result_type != WL_PLAN_AGG_OPERAND_UNKNOWN
+            || op->delta_mode != WL_DELTA_AUTO || op->materialized
+            || (i != 0 && i != 2 && op->relation_name)
+            || (!join && (op->right_relation || op->left_keys
+            || op->right_keys || op->key_count))
+            || (!projected
+            && (op->project_indices || op->project_count))
+            || (i != 1 && (op->map_exprs || op->map_expr_count))
+            || (i != exchange_index && op->opaque_data))
+            return false;
+    }
+    if (!plan->name || strcmp(plan->name, "path") != 0 || !plan->delta_name
+        || strcmp(plan->delta_name, "$d$path") != 0
+        || ops[0].op != WL_PLAN_OP_VARIABLE || !ops[0].relation_name
+        || strcmp(ops[0].relation_name, "edge") != 0
+        || ops[0].delta_mode != WL_DELTA_AUTO
+        || ops[1].op != WL_PLAN_OP_MAP
+        || ops[2].op != WL_PLAN_OP_VARIABLE || !ops[2].relation_name
+        || strcmp(ops[2].relation_name, "path") != 0
+        || ops[2].delta_mode != WL_DELTA_AUTO
+        || ops[1].project_count != 2 || !ops[1].project_indices
+        || ops[1].project_indices[0] != 0 || ops[1].project_indices[1] != 1
+        || ops[1].map_expr_count != 2 || !ops[1].map_exprs
+        || ops[1].map_exprs[0].size != sizeof(map_col0)
+        || !ops[1].map_exprs[0].data
+        || memcmp(ops[1].map_exprs[0].data, map_col0, sizeof(map_col0))
+        || ops[1].map_exprs[1].size != sizeof(map_col1)
+        || !ops[1].map_exprs[1].data
+        || memcmp(ops[1].map_exprs[1].data, map_col1, sizeof(map_col1))
+        || ops[concat].op != WL_PLAN_OP_CONCAT
+        || ops[consolidate].op != WL_PLAN_OP_CONSOLIDATE
+        || ops[exchange_index].op != WL_PLAN_OP_EXCHANGE
+        || !ops[exchange_index].opaque_data)
+        return false;
+    for (uint32_t i = 3; i <= last_join; ++i) {
+        if (ops[i].op != WL_PLAN_OP_JOIN || !ops[i].right_relation
+            || strcmp(ops[i].right_relation, "edge") != 0
+            || ops[i].key_count != 1 || !ops[i].left_keys
+            || !ops[i].right_keys || !ops[i].left_keys[0]
+            || !ops[i].right_keys[0]
+            || strcmp(ops[i].right_keys[0], "col0") != 0
+            || ops[i].materialized || ops[i].delta_mode != WL_DELTA_AUTO)
+            return false;
+    }
+    if (join_count == 1) {
+        if (strcmp(ops[3].left_keys[0], "col1") != 0
+            || ops[3].project_count != 2 || !ops[3].project_indices
+            || ops[3].project_indices[0] != 0
+            || ops[3].project_indices[1] != 3)
+            return false;
+    } else if (strcmp(ops[3].left_keys[0], "col1") != 0
+        || ops[3].project_count || ops[3].project_indices
+        || strcmp(ops[4].left_keys[0], "col3") != 0
+        || ops[4].project_count != 2 || !ops[4].project_indices
+        || ops[4].project_indices[0] != 0
+        || ops[4].project_indices[1] != 5) {
+        return false;
+    }
+    const wl_plan_op_exchange_t *exchange =
+        (const wl_plan_op_exchange_t *)ops[exchange_index].opaque_data;
+    bool valid = exchange->num_workers == 0 && exchange->key_col_count == 1
+        && exchange->key_col_idxs && exchange->key_col_idxs[0] == 1
+        && !exchange->edb_rel_name;
+    if (join_count == 1)
+        valid = valid && exchange->edb_key_col_count == 1
+            && exchange->edb_key_col_idxs
+            && exchange->edb_key_col_idxs[0] == 0;
+    else
+        valid = valid && exchange->edb_key_col_count == 0
+            && !exchange->edb_key_col_idxs;
+    return valid;
+}
+
+bool
+wl_columnar_eval_plan_numeric_recursive_path_supported(
+    const wl_plan_relation_t *plan)
+{
+    if (!plan || !plan->ops) return false;
+    wl_columnar_eval_plan_numeric_attempt_t shape = {0};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    shape.composed_mode = true;
+    shape.private_bindings = &bindings;
+    shape.begin = 0;
+    shape.plan = plan;
+    shape.end = plan->op_count;
+    return wl_columnar_eval_plan_composed_terminal_exchange_valid(&shape);
 }
 
 void
@@ -636,6 +862,26 @@ wl_columnar_eval_plan_numeric_attempt_begin(
  * names and descriptors are immutable under the serialized host contract.
  * The virtual delta name matches snprintf(dname,256,"$d$%s",name), including
  * its 252-byte source-name truncation; full names remain unbounded. */
+static col_rel_t *
+wl_columnar_eval_plan_numeric_source_candidate(
+    wl_columnar_eval_plan_numeric_attempt_t *record, uint32_t slot,
+    const char **actual_name)
+{
+    if (record->private_bindings) {
+        const wl_columnar_eval_private_binding_t *entry =
+            slot < record->private_bindings->count
+            ? &record->private_bindings->entries[slot] : NULL;
+        if (entry) {
+            *actual_name = entry->name;
+            return entry->relation;
+        }
+        slot -= record->private_bindings->count;
+    }
+    col_rel_t *candidate = record->source_registry[slot];
+    *actual_name = candidate ? candidate->name : NULL;
+    return candidate;
+}
+
 static void
 wl_columnar_eval_plan_numeric_source_lookup(
     wl_columnar_eval_plan_numeric_attempt_t *record)
@@ -650,8 +896,10 @@ wl_columnar_eval_plan_numeric_source_lookup(
         }
         return;
     }
-    col_rel_t *candidate = record->source_registry[record->source_slot];
-    if (!candidate || !candidate->name) {
+    const char *actual_name = NULL;
+    col_rel_t *candidate = wl_columnar_eval_plan_numeric_source_candidate(
+        record, record->source_slot, &actual_name);
+    if (!candidate || !actual_name) {
         ++record->source_slot;
         record->source_byte = 0;
         return;
@@ -663,7 +911,7 @@ wl_columnar_eval_plan_numeric_source_lookup(
     else if (byte < 3) wanted = "$d$"[byte];
     else if (byte == 255) wanted = '\0';
     else wanted = name[byte - 3];
-    char actual = candidate->name[byte];
+    char actual = actual_name[byte];
     if (actual != wanted) {
         ++record->source_slot;
         record->source_byte = 0;
@@ -1216,12 +1464,35 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
     wl_evaluation_control_t *funding, uint64_t funding_id,
-    bool controlled_materialized_batch_fallback)
+    bool controlled_materialized_batch_fallback,
+    const wl_columnar_eval_private_bindings_t *private_bindings)
 {
     if (!record || record->identity || record->phase || !plan || !plan->ops
         || begin >= end || end > plan->op_count || !frame || !session
         || !control || !id || initial_depth > COL_STACK_MAX
         || (session->nrels && !session->rels)) return EINVAL;
+    if (private_bindings && (private_bindings->identity
+        != (uintptr_t)private_bindings || private_bindings->session != session
+        || private_bindings->plan != plan
+        || private_bindings->control != control
+        || private_bindings->attempt_id != id
+        || !private_bindings->count
+        || private_bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX))
+        return EINVAL;
+    if (private_bindings
+        && session->nrels > UINT32_MAX - private_bindings->count)
+        return EOVERFLOW;
+    if (private_bindings) {
+        for (uint32_t i = 0; i < private_bindings->count; ++i) {
+            const wl_columnar_eval_private_binding_t *entry =
+                &private_bindings->entries[i];
+            if (!entry->name[0] || !memchr(entry->name, '\0',
+                sizeof(entry->name)) || !entry->relation
+                || !wl_columnar_relation_snapshot_equal(entry->snapshot,
+                wl_columnar_relation_snapshot(entry->relation)))
+                return EINVAL;
+        }
+    }
     if (controlled_materialized_batch_fallback) {
         if (!session->join_batch_bytes || session->join_batch_strict
             || session->join_output_limit
@@ -1266,6 +1537,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->identity = record; record->frame = frame;
     record->session = session; record->plan = plan;
     record->control = control; record->attempt_id = id;
+    record->private_bindings = private_bindings;
     record->begin = begin; record->end = end; record->cursor = begin;
     record->completed = 0; record->semantic_result = 0;
     record->protocol_result = 0;
@@ -1274,7 +1546,9 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->source_empty = false; record->source_is_delta = false;
     record->source_initialized = false; record->source_slot_borrowed = false;
     record->source_registry = session->rels;
-    record->source_count = session->nrels;
+    record->source_count = private_bindings ? private_bindings->count
+        : session->nrels;
+    if (private_bindings) record->source_count += session->nrels;
     record->source_slot = 0; record->source_byte = 0;
     record->source_begin = begin;
     record->source_full = NULL; record->source_delta = NULL;
@@ -1304,6 +1578,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         record->thread_valid = false; record->frame = NULL;
         record->session = NULL; record->plan = NULL;
         record->source_registry = NULL; record->source_mode = false;
+        record->private_bindings = NULL;
         record->composed_mode = false;
         record->controlled_materialized_batch_fallback = false;
         record->preflight_depth = 0; record->runtime_depth = 0;
@@ -1322,7 +1597,22 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin(
 {
     return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         record, plan, begin, end, frame, session, initial_depth, control, id,
-        funding, funding_id, false);
+        funding, funding_id, false, NULL);
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    const wl_plan_relation_t *plan, uint32_t begin, uint32_t end,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    uint32_t initial_depth, wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id,
+    const wl_columnar_eval_private_bindings_t *private_bindings)
+{
+    if (!private_bindings) return EINVAL;
+    return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
+        record, plan, begin, end, frame, session, initial_depth, control, id,
+        funding, funding_id, false, private_bindings);
 }
 
 int
@@ -1335,7 +1625,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
 {
     return wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         record, plan, begin, end, frame, session, initial_depth, control, id,
-        funding, funding_id, true);
+        funding, funding_id, true, NULL);
 }
 
 static void
@@ -1353,8 +1643,10 @@ wl_columnar_eval_plan_composed_source_lookup(
         }
         return;
     }
-    col_rel_t *candidate = record->source_registry[record->source_slot];
-    if (!candidate || !candidate->name) {
+    const char *actual_name = NULL;
+    col_rel_t *candidate = wl_columnar_eval_plan_numeric_source_candidate(
+        record, record->source_slot, &actual_name);
+    if (!candidate || !actual_name) {
         ++record->source_slot;
         record->source_byte = 0;
         return;
@@ -1366,7 +1658,7 @@ wl_columnar_eval_plan_composed_source_lookup(
     else if (byte < 3) wanted = "$d$"[byte];
     else if (byte == 255) wanted = '\0';
     else wanted = name[byte - 3];
-    char actual = candidate->name[byte];
+    char actual = actual_name[byte];
     if (actual != wanted) {
         ++record->source_slot;
         record->source_byte = 0;
@@ -1611,7 +1903,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                 && kind != WL_PLAN_OP_LFTJ
                 && kind != WL_PLAN_OP_CONCAT
                 && !(kind == WL_PLAN_OP_CONSOLIDATE
-                && record->cursor + 1 == record->end))
+                && record->cursor + 1 == record->end)
+                && !(kind == WL_PLAN_OP_EXCHANGE
+                && record->cursor + 1 == record->end
+                && wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                    record)))
                 record->abort_supported = false;
             if (kind == WL_PLAN_OP_VARIABLE) {
                 if (record->preflight_depth == COL_STACK_MAX) rc = ENOBUFS;
@@ -1629,6 +1925,12 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                 || kind == WL_PLAN_OP_ANTIJOIN || kind == WL_PLAN_OP_REDUCE
                 || kind == WL_PLAN_OP_CONSOLIDATE) {
                 if (!record->preflight_depth) rc = EINVAL;
+            } else if (kind == WL_PLAN_OP_EXCHANGE) {
+                if (record->cursor + 1 != record->end
+                    || !record->preflight_depth
+                    || !wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                        record))
+                    rc = ENOTSUP;
             } else rc = ENOTSUP;
         }
         if (!rc && ++record->cursor == record->end) {
@@ -1661,6 +1963,29 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
             record->source_slot_borrowed = false;
             record->source_installed = false;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL;
+            return 0;
+        }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_EXCHANGE) {
+            /* The exact terminal zero-worker bridge is a charged, fixed-cost
+             * no-op. Preflight authenticated it before any child ran. */
+            if (record->cursor + 1 != record->end
+                || !wl_columnar_eval_plan_composed_terminal_exchange_valid(
+                    record)) {
+                record->semantic_result = ENOTSUP;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            } else {
+                ++record->completed;
+                ++record->cursor;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+#ifdef WL_SESSION_TEST_HOOKS
+                if (wl_columnar_eval_plan_test_after_terminal_exchange)
+                    wl_columnar_eval_plan_test_after_terminal_exchange(
+                        record->control, record->attempt_id);
+#endif
+                rc = wl_columnar_eval_plan_composed_charge(record->control,
+                        record->attempt_id, 0);
+                if (rc) record->semantic_result = rc;
+            }
             return 0;
         }
         if (record->plan->ops[record->cursor].op == WL_PLAN_OP_CONCAT) {
@@ -1820,6 +2145,147 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
 }
 
 int
+wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if ((record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
+        || !record->lftj.identity || record->lftj.identity != &record->lftj)
+        return EBUSY;
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+
+    /* Cleanup is authorized only by a terminal stop on the original
+     * operation. A zero-work probe observes that sticky disposition without
+     * spending or resetting its exhausted allowance. */
+    rc = wl_evaluation_control_charge_attempt(record->control,
+            record->attempt_id, 0);
+    if (rc != WL_EVALUATION_CONTROL_CANCELLED
+        && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return rc ? rc : EBUSY;
+    if (!record->semantic_result) record->semantic_result = rc;
+    if (!record->lftj.semantic_result) record->lftj.semantic_result = rc;
+
+    bool done = false;
+    rc = wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done,
+            funding, funding_id);
+    if (rc) return rc;
+    if (done) {
+        record->phase = record->phase ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_eval_plan_composed_cleanup_stop(
+    const wl_columnar_eval_plan_numeric_attempt_t *record, int *stop)
+{
+    int rc = wl_evaluation_control_charge_attempt(record->control,
+            record->attempt_id, 0);
+    if (rc != WL_EVALUATION_CONTROL_CANCELLED
+        && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
+        return rc ? rc : EBUSY;
+    *stop = rc;
+    return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_cleanup_source(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    switch (record->phase) {
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SLOT:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL:
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT:
+        break;
+    /* Pending child results are receipts. Cleanup must not consume or
+     * replace the exact result the framed host still has to deliver. */
+    case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING:
+    default:
+        return EBUSY;
+    }
+
+    bool aborting = record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT;
+    if (aborting) {
+        rc = wl_columnar_eval_stack_composed_source_abort_validate(
+            record->frame, record->session, record);
+        if (rc) return rc;
+        if (!funding || funding == record->control || !funding_id
+            || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+            return EINVAL;
+    } else if (record->phase ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+        if (!record->source_initialized || record->source.identity !=
+            &record->source || record->source.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED)
+            return EBUSY;
+    }
+
+    int stop = 0;
+    if (aborting) {
+        /* An ABORT that was reached for an earlier semantic error still
+         * needs a sticky control stop before this direct cleanup is allowed. */
+        rc = wl_columnar_eval_plan_composed_cleanup_stop(record, &stop);
+        if (rc) return rc;
+    }
+
+    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+            record->control);
+    if (rc) return rc;
+
+    if (!aborting) {
+        rc = wl_columnar_eval_plan_composed_cleanup_stop(record, &stop);
+        if (rc) return rc;
+    }
+
+    if (!record->semantic_result) record->semantic_result = stop;
+    if (aborting) {
+        rc = wl_columnar_eval_stack_composed_source_abort_funded(
+            record->frame, record->session, record);
+        if (rc) return rc;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        return 0;
+    }
+    if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END) {
+        /* End is a child protocol of its own. Preserve its receipt and let the
+         * caller consume it with separate host funding before routing to an
+         * abort or release action. */
+        record->pending_action =
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_relation_scalar_source_end(&record->source,
+                   record->semantic_result);
+    }
+
+    /* Lookup/selection, slot creation, and installation are all skipped
+     * after the stop. Only an already-owned source or output is drained. */
+    record->phase = record->source_initialized
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END
+        : record->source_slot_borrowed
+        ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
+        : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+    return 0;
+}
+
+int
 wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
     wl_evaluation_control_t *funding, uint64_t funding_id)
@@ -1864,7 +2330,8 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
             : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD;
         break;
     case WL_COLUMNAR_FILTER_PROGRESS_DONE:
-        record->semantic_result = record->child_status.semantic_result;
+        if (!record->semantic_result)
+            record->semantic_result = record->child_status.semantic_result;
         record->phase =
             concat ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ACK
             : WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK;
@@ -1951,6 +2418,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->composed_mode = false; record->preflight_depth = 0;
     record->runtime_depth = 0;
     record->controlled_materialized_batch_fallback = false;
+    record->private_bindings = NULL;
     record->abort_supported = false; record->abort_requested = false;
     memset(&record->lftj, 0, sizeof(record->lftj));
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;

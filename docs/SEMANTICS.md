@@ -726,13 +726,26 @@ coordinator; final tails check too. This limits work between checks, not elapsed
 return time. Bulk reservation must disclose unused admitted slack (at most one
 quantum per active worker), never report it as measured completed work.
 
+Fresh contiguous relation lanes have a separate allocation tariff: before an
+allocator call, admit one logical work unit for each requested 64-bit cell,
+across slices capped by both the caller's remaining quantum and 256 units. A
+slice never charges more than its caller can admit. If it exhausts that caller
+quantum, the builder yields even when the tariff is complete; the allocator
+action is admitted by a later call. Partial precharge is bound to the exact
+control identity and attempt ID that began it, so a different control or a
+successor attempt cannot resume it. The allocator call itself is a finite,
+noninterruptible region and copies no existing relation cells; failed
+allocations do not refund the admitted work. This tariff bounds the capacity a
+finite attempt can request before allocation, while row copies remain charged
+and resumable independently.
+
 | Engine path | Charged primitive and checkpoint obligation |
 |---|---|
 | `columnar/eval_plan.c`, `eval_serial.c`, `eval.c` | One operator dispatch or recursive progress transition, including empty progress; internal replay keeps the same attempt |
 | `columnar/ops.c`, `filter.c`, `expr.c` | One input-row visit/expression evaluation; rejected rows count |
 | `columnar/join.c`, `join_batch.c`, `diff_join_batch.c`, `join_pipeline.c` | One hash/build/probe-chain visit or candidate-pair inspection; unsuccessful probes and rejected candidates count |
 | `columnar/lftj.c` | One seek/comparison/traversal action, including unsuccessful seeks |
-| `columnar/relation.c`, `arrangement.c`, `eval_dedup.c`, `merge.c`, `partition.c` | One compare/hash action or copied/visited scalar cell; sort, consolidation, materialization and coordinator partitioning require bounded chunks |
+| `columnar/relation.c`, `arrangement.c`, `eval_dedup.c`, `merge.c`, `partition.c` | One compare/hash action or copied/visited scalar cell; fresh contiguous relation lanes additionally admit one unit per requested 64-bit cell before allocation; sort, consolidation, materialization and coordinator partitioning require bounded chunks |
 | `columnar/eval_tdd_plan.c`, `eval_tdd_queue.c`, `kfusion.c`, `workqueue.c` | One dispatch/exchange/progress action; payload processing additionally charges rows/cells, and blocking waits must observe stop |
 
 The internal `wl_columnar_merge_incremental_delta_attempt_advance` path charges
@@ -796,6 +809,83 @@ begin; a one-unit-short limit stops before allocation. A later governor denial
 still leaves the already admitted tariff in the attempt's work count. This is
 a logical admission cost, not an allocator-time estimate: `malloc`/`free`
 latency remains synchronous and has no wall-clock bound.
+
+Controlled initial STEP supports the generated two-column INT64 path plans with
+either recursive rule `path(x,z) :- path(x,y), edge(y,z)` or
+`path(x,w) :- path(x,y), edge(y,z), edge(z,w)`, together with the base rule
+`path(x,y) :- edge(x,y)`. The two-edge form extends each recursive path by two
+edges per round, matching the rule's semantics; it is not a general transitive
+closure rewrite. Both forms require the exact one-stratum, one-target plan and a
+single registered `edge` input. Other recursive join counts and operators are
+rejected before an evaluation attempt. The terminal zero-worker `EXCHANGE` is a
+charged fixed-cost no-op in this single-session evaluator; it preserves the
+result stack and never invokes redistribution. Other `EXCHANGE` positions or
+metadata remain unsupported. The evaluator snapshots and leases `edge` from
+before the first recursive body read through convergence, then checks that the
+snapshot still matches after acquiring the lease.
+
+All recursive body evaluations, private captures, cumulative union and exact
+new-row delta work use the root STEP control and attempt. Frontier and
+publication relations are built through the managed binary builder, which
+admits each fresh lane's requested cells within the caller quantum before
+allocation. On initial evaluation, `path` remains absent from the registry
+until the frontier is empty, when one final schemaful relation is published.
+On a completed route, positive two-column appends to the registered `edge`
+relation through `wl_session_insert` are the only mutations admitted. Their
+relation snapshot is recorded only after the complete append succeeds. A later
+controlled `STEP` recomputes the closure privately and replaces `path` only
+after convergence; snapshots and mutations remain gated while that attempt is
+pending. The edge reader lease remains held through replacement registration
+preparation, a final edge snapshot check, and the registry commit. A stop before
+that commit drains child cleanup receipts before releasing the lease. The
+prepared registration, merge state and managed private relations are then
+cleaned while the session remains pending and supported mutations stay gated;
+the previous `path` remains registered for retry. Commit is the publication
+point: afterward the new `path` is authoritative, and lease release plus final
+private retirement resume as pending cleanup without publishing again. If
+relation storage changes outside the admitted append path, the route is
+invalidated and neither stale `path` snapshots nor further appends are
+admitted. Other recursive plans and mutation shapes remain unsupported, so
+#1821 still requires additional operator coverage.
+
+When a composed attempt owns an LFTJ child at the moment its original
+operation control latches cancellation or work-limit, the internal
+`wl_columnar_eval_plan_numeric_composed_cleanup_lftj()` path can drain that
+child without resuming semantic evaluation. Each call requires a fresh
+384-unit host grant, verifies the original sticky stop with a zero-work poll,
+and performs at most one LFTJ release action. Cleanup preserves an earlier
+semantic error; otherwise it records the exact original stop in both parent
+and child, so a work-limit is not changed into cancellation. A missing stop
+returns `EBUSY` after consuming the host grant. Other control errors are
+returned without treating them as cleanup authorization.
+
+After LFTJ cleanup reaches `DONE`, the composed attempt is ACKed and its
+cleanup frame is explicitly finished. This discards any private result that
+LFTJ had already placed on that frame's stack; it does not publish the result
+to the session registry. This cleanup route covers only composed LFTJ owners.
+
+Admitted composed FILTER/MAP unary children and CONCAT children use their
+owned step/ACK state machines to drain bounded cleanup after cancellation or
+work exhaustion. A child step returns a pending receipt to the parent; the
+host must consume that exact receipt in a separate funded action before the
+parent continues. ACK validates child cleanup and ownership before resetting
+the child context. These routes cover only the admitted composed owners; they
+do not enable other composed children, public/session APIs, or a shared
+host/scheduler action envelope.
+
+Composed scalar-source owners have a separate
+`wl_columnar_eval_plan_numeric_composed_cleanup_source()` route. It skips
+source lookup, output-slot creation, and installation once the original
+operation has latched cancellation or work-limit. If source end must release
+readers, cleanup returns its exact child protocol as a pending receipt; the
+caller must consume that receipt under a separate host action before cleanup
+can abort a borrowed result slot or release the attempt. Cleanup refuses an
+already-pending child receipt without changing it or spending funding. Other
+source cleanup actions consume one fresh 384-unit host grant before polling
+the original sticky stop. A source-slot abort first checks for the stop, then
+charges one 384-unit grant; if result disposal is refused, its borrowed slot
+remains owned and can be retried with fresh funding. Neither route installs or
+publishes a partial source result.
 
 Fixed serial plan/data/configuration must give reproducible admitted work.
 Worker schedules, optimizer choices and releases can change totals; cross-width
@@ -977,11 +1067,11 @@ call.
 
 | field | written by | read by | verdict |
 |---|---|---|---|
-| `last_inserted_relation` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
-| `pending_input_change` | `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `pending_full_input_eval` | `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `has_evaluated` | `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
-| `snapshot_stable_valid` | `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
+| `last_inserted_relation` | `col_controlled_step_recursive_drive`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert` | PRESERVE |
+| `pending_input_change` | `col_controlled_step_recursive_drive`, `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `pending_full_input_eval` | `col_controlled_step_recursive_drive`, `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `has_evaluated` | `col_controlled_step_recursive_drive`, `col_session_snapshot_impl`, `col_session_step_impl` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
+| `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl` | PRESERVE |
 | `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation` | PRESERVE |
@@ -989,7 +1079,7 @@ call.
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
 | `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
-| `col_rel_t::base_nrows` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_merge_incremental_delta_attempt_advance`, `wl_columnar_relation_new_empty_governed_like_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_snapshot_insert`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `wl_columnar_eval_delta_observer_begin`, `wl_retraction_stage_prepare`, `wl_columnar_eval_delta_build_action`, `wl_columnar_merge_incremental_delta_attempt_advance` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. That is the whole verified consequence; see the note below before adding another |
+| `col_rel_t::base_nrows` | `col_controlled_step_recursive_drive`, `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_merge_incremental_delta_attempt_advance`, `wl_columnar_relation_new_empty_governed_like_locked`, `wl_retraction_restore` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_snapshot_insert`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `wl_columnar_eval_delta_observer_begin`, `wl_retraction_stage_prepare`, `wl_columnar_eval_delta_build_action`, `wl_columnar_managed_candidate_input_shape`, `wl_columnar_merge_incremental_delta_attempt_advance` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. `col_controlled_step_recursive_drive` advances this boundary only in `FINALIZE_COMMITTED`, after successful publication; a stopped attempt retains the old boundary. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
 `col_session_reclaim_quiescent` is **COMMIT**: the step cutoff's unwind calls
@@ -1460,14 +1550,16 @@ cancellation. Output cells and B2 append work contribute between pair
 checkpoints, so this fixture measurement is not a general source tariff.
 
 Supported serial nonrecursive STEP now uses the bounded default proof described
-above. STEP still rejects recursive plans and unsupported whole-session routes
-before evaluation; controlled SNAPSHOT remains unsupported. TDD/multiworker,
-differential, and whole controlled observer delivery remain outside this slice.
+above. The single-relation INT64 path plans described above are the only
+recursive routes admitted; other recursive plans and unsupported whole-session
+routes are rejected before evaluation. Controlled SNAPSHOT remains unsupported.
+TDD/multiworker, differential, and whole controlled observer delivery remain
+outside this slice.
 Raw references and coverage for those routes remain, with this split:
 
 | Former whole controlled expectation | Replacement or remaining scope |
 |---|---|
-| STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive/observer routes remain fail-closed |
+| STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive and observer routes remain fail-closed |
 | STEP observer cutoff and retry | Raw observer reference and unchanged-state refusal coverage; whole controlled observer delivery/resume remains deferred |
 | Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence | Raw evaluating/stable references and direct lower quiescent/reclaimer checks; whole controlled snapshot bookkeeping/precedence remains deferred |
 
@@ -1553,7 +1645,23 @@ is retained and a fresh attempt completes READY without committing twice.
 This is still a preparation primitive, not whole-plan observer delivery or
 callback scheduling, and does not complete #1821 acceptance coverage.
 
-Whole-plan observer delivery, recursive STEP, and other unsupported controlled
-execution paths remain disabled. The controlled initial single-rule STEP
-entrypoint is documented above; this increment does not claim complete #1821
-coverage or enable unrestricted public dispatch.
+Whole-plan observer delivery and other unsupported controlled execution paths
+remain disabled. The restricted recursive reachability route and controlled
+single-rule STEP entrypoint are documented above; this increment does not claim
+complete #1821 coverage or enable unrestricted public dispatch.
+
+### Managed binary candidate union and novel delta (#1821 increment)
+
+The internal managed candidate merge accepts unnamed, private binary INT64
+relations without schema, ledger, or delta-baseline metadata. It requires a canonical sorted source; the candidate may
+arrive unsorted and contain duplicates. The result is the numerically sorted,
+distinct union of both inputs, and the delta contains exactly the union rows not
+present in the original source. Neither input changes. The replacement and
+delta are transferred together exactly once; until then both remain private.
+
+The operation is resumable under one shared attempt allowance and a maximum of
+64 charged comparison, copy, builder, or state actions per advance. A terminal
+stop before transfer retains every partial allocation and gate until charged
+maintenance cleanup completes. This is a restricted internal preparation
+primitive; it does not activate unsupported evaluator routes or satisfy all of
+issue #1821.

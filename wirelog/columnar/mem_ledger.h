@@ -114,7 +114,7 @@ wl_atomic_fetch_add_internal(volatile void *ptr, uint64_t inc, size_t width)
 /* On failure the observed value is written back through `expected` at the
  * operand's width, so a `bool *` or `int *` expected is never widened. */
 static inline bool
-wl_atomic_compare_exchange_weak_internal(volatile void *ptr, void *expected,
+wl_atomic_compare_exchange_internal(volatile void *ptr, void *expected,
     __int64 desired, size_t width)
 {
     switch (width) {
@@ -163,14 +163,14 @@ wl_atomic_compare_exchange_weak_internal(volatile void *ptr, void *expected,
 
 #define atomic_compare_exchange_weak_explicit(ptr, expected, desired,        \
             succ_order, fail_order)        \
-        wl_atomic_compare_exchange_weak_internal((ptr), (expected),           \
+        wl_atomic_compare_exchange_internal((ptr), (expected),                \
             (__int64)(desired), sizeof(*(ptr)))
 
 /* InterlockedCompareExchange cannot fail spuriously, so the weak-spelled
  * shim above also provides the strong C11 compare-exchange contract. */
 #define atomic_compare_exchange_strong_explicit(ptr, expected, desired,     \
             succ_order, fail_order)        \
-        wl_atomic_compare_exchange_weak_internal((ptr), (expected),           \
+        wl_atomic_compare_exchange_internal((ptr), (expected),                \
             (__int64)(desired), sizeof(*(ptr)))
 
 static inline __int64

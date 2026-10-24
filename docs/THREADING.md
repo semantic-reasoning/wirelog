@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **383**).
+match the script's count (currently **422**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -469,7 +469,7 @@ non-atomic payload reads require external synchronization.
 | `memory_governor.c:wl_columnar_memory_reservation_move#6` | `source->owner_bits` | `atomic_store_explicit` | `relaxed` | Clear the source owner after ownership has moved |
 | `memory_governor.c:wl_columnar_memory_reservation_move#7` | `source->state` | `atomic_store_explicit` | `release` | Publish the empty source state after clearing its ownership |
 
-### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation (5 rows)
+### 5.9 `wirelog/columnar/arrangement.c` — reservation relocation and registry admission (9 rows)
 
 Arrangement registry entries embed non-copyable memory reservations. These
 loads validate the reservation state before moving or publishing a token;
@@ -482,6 +482,10 @@ the relocation paths preserve identity and transfer ownership explicitly.
 | `arrangement.c:arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved token before transferring its owner |
 | `arrangement.c:filt_arr_entry_relocate` | `src->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Validate the filtered source token before relocation |
 | `arrangement.c:filt_arr_entry_relocate#2` | `dst->arr.reservation.state` | `atomic_load_explicit` | `acquire` | Revalidate the moved filtered token before owner transfer |
+| `arrangement.c:diff_registry_metadata_begin` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Confirm the committed registry token before reserving entry metadata growth |
+| `arrangement.c:diff_registry_grow` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Validate the committed registry token before beginning an overlapping array growth |
+| `arrangement.c:diff_registry_grow#2` | `pending.state` | `atomic_load_explicit` | `acquire` | Roll back an independently reserved replacement array after allocation failure |
+| `arrangement.c:col_session_free_diff_arrangements` | `cs->diff_arr_registry_reservation.state` | `atomic_load_explicit` | `acquire` | Choose rollback or release from the token's current ownership state during teardown |
 
 ### 5.10 `wirelog/arena/compound_arena.c` — mutation gate and GC holds (7 rows)
 
@@ -657,7 +661,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 388 sites.
+symbol-anchored inventory below covers 422 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -863,6 +867,52 @@ lease validations a batch append takes.  Other builds compile neither row.
 | `relation.c:col_rel_mutation_lease_validate` | `wl_lease_validations` | `atomic_fetch_add_explicit` | `relaxed` | Test builds only (`WL_TEST_MUTATION_SET_HOOK`): count one full lease validation; the counter is read only as a delta and publishes no other state |
 
 The complete source audit now contains **234 atomic call sites**.
+
+### 5.24 Managed binary relation retirement (#1821 prerequisite, 11 rows)
+
+The managed binary builder creates private two-column INT64 storage one
+funded allocation or initialization action at a time. Retirement first takes
+the relation's descriptor and storage writer gates as one all-or-release round.
+That address-bound round stays on the creating thread through every cleanup
+yield, including token-credit retries. Before freeing the descriptor, the
+round is armed while both writer sentinels are still present. After the free,
+the receipt is consumed locally: it clears only its own fields and never
+dereferences either gate address. This closes the relation permanently before
+its storage can be reclaimed; callers must transfer exclusive lifetime before
+starting retirement and must not use any other raw pointer afterward.
+
+| Anchor (file:function[#N]) | Field | Op | Order | Justification |
+|---|---|---|---|---|
+| `relation.c:wl_columnar_relation_managed_empty_token` | `token->state` | `atomic_load_explicit` | acquire | Validate an EMPTY embedded token while both relation writer gates exclude concurrent reservation mutation |
+| `relation.c:wl_columnar_relation_managed_empty_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Require no owner to survive an EMPTY token before moving it into the stable receipt |
+| `relation.c:wl_columnar_relation_managed_token_valid` | `token->state` | `atomic_load_explicit` | acquire | Snapshot the token state under exclusive relation authority before selecting committed release or reserved rollback |
+| `relation.c:wl_columnar_relation_managed_token_valid#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Preserve the original relation owner identity in the detached retirement receipt |
+| `relation.c:wl_columnar_relation_managed_gate_round_validate` | `request->gate->state` | `atomic_load_explicit` | acquire | Revalidate both held writer sentinels before each pre-free cleanup action; never used after descriptor free |
+| `relation.c:wl_columnar_relation_managed_retirement_validate` | `storage_alias_borrows` | `atomic_load_explicit` | acquire | Reject aliases while descriptor and storage writers prevent a borrow from racing validation |
+| `relation.c:wl_columnar_relation_managed_retirement_detach` | `source->state` | `atomic_load_explicit` | acquire | Distinguish an explicit EMPTY slot from a live token before moving exactly one reservation |
+| `relation.c:wl_columnar_relation_managed_retirement_detach#2` | `retirement->tokens[index].owner_bits` | `atomic_load_explicit` | acquire | Capture the original token owner before the relation descriptor is eventually freed |
+| `relation.c:wl_columnar_relation_managed_retirement_credit` | `retirement->tokens[index].state` | `atomic_load_explicit` | acquire | Choose reserved rollback or committed release without rereading relation storage |
+| `relation.c:wl_columnar_relation_managed_retirement_credit#2` | `retirement->tokens[index].owner_bits` | `atomic_load_explicit` | acquire | Confirm detached owner identity immediately before the receipt begins its one-shot claim |
+| `source_access.h:wl_columnar_source_access_gate_round_arm_terminal_consume` | `request->gate->state` | `atomic_load_explicit` | acquire | Verify every writer sentinel before arming local-only receipt consumption after the protected relation is freed |
+
+The complete source audit now contains **245 atomic call sites**.
+
+### 5.25 Managed binary candidate merge (#1821)
+
+The managed candidate attempt acquires descriptor and storage reader gates for
+both input relations in one all-or-release round. Its receipt, input pointers,
+output builders, and retirement receipts are address- and creator-thread-bound;
+the caller keeps both input descriptors alive and excludes raw-pointer use until
+cleanup reaches DONE. Source and candidate remain immutable for the full round.
+
+`take_result` transfers the replacement and delta together once. Before that
+cutoff the attempt owns every output allocation; after it the caller owns both
+outputs, while the attempt retains the scratch builder and both input gates
+through charged maintenance cleanup. A terminal evaluation stop keeps those
+resources reachable and requires abort cleanup with a fresh maintenance
+control. ACK is valid only after every retirement receipt is DONE and the input
+reader round is released. Calls, including cleanup and ACK, stay on the thread
+that began the attempt.
 
 ---
 
@@ -1652,8 +1702,27 @@ and the conservative168-slot forward no-poll ceiling.
 | `memory_governor.c:wl_columnar_memory_release_try#4` | reservation state | `atomic_store_explicit` | release | Preserve retryable ownership after bounded release refusal |
 | `memory_governor.c:wl_columnar_memory_release_try#5` | reservation state | `atomic_store_explicit` | release | Restore reservation state after a stopped release attempt |
 | `memory_governor.c:wl_columnar_memory_release_try#6` | reservation state | `atomic_store_explicit` | release | Publish RELEASED after owned credit is refunded |
+| `memory_governor.c:wl_columnar_memory_retirement_step` | `token->state` | `atomic_compare_exchange_strong_explicit` | acquire/release | Claim the exact original RESERVED or COMMITTED state once before reading mutable payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#2` | `governor->reserved_bytes` | `atomic_load_explicit` | acquire | Snapshot the aggregate before one separately funded credit CAS |
+| `memory_governor.c:wl_columnar_memory_retirement_step#3` | `token->state` | `atomic_store_explicit` | release | Restore original state after validation rejects a claimed token without refund |
+| `memory_governor.c:wl_columnar_memory_retirement_step#4` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate the expected owner after the state claim protects token payload |
+| `memory_governor.c:wl_columnar_memory_retirement_step#5` | `governor->reserved_bytes` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Subtract captured credit once; failed contention leaves receipt phase and claim unchanged |
+| `memory_governor.c:wl_columnar_memory_retirement_step#6` | `token->state` | `atomic_store_explicit` | release | Publish RELEASED after credit and token metadata are finalized |
 
-The complete current atomic-source inventory contains 383 call sites.
+### Resumable reservation retirement
+
+The retirement receipt is bound to its original address and creating thread.
+Every step admits 64 conservative logical work units, below the 256-unit
+evaluation quantum. Begin reads only immutable token identity; a funded step
+claims the expected state before reading mutable payload. Claim and aggregate-
+credit CAS operations are each one-shot strong operations. A failed aggregate
+CAS retains CREDIT authority for a later step; successful credit is followed
+by finite metadata stores and RELEASED publication before the receipt becomes
+DONE. If a stop leaves the receipt holding a claim, its caller preserves that
+receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
+reinitialize the receipt/token while the claim remains held.
+
+The complete current atomic-source inventory contains 422 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2007,6 +2076,23 @@ more source sites. The test hook resets that counter only in isolated tests.
 | `session_hash.c:wl_columnar_session_hash_registry_token#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Reject leased/transition credit before a reversible journal move |
 | `session_hash.c:wl_columnar_session_hash_registry_inert` | `token->state` | `atomic_load_explicit` | acquire | Prove one private or retired token inert before the image drain seal |
 | `session_hash.c:wl_columnar_session_hash_registry_inert#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Verify no lease remains while the original parent marker still protects retirement |
+
+The bounded mixed-gate receipt takes at most four non-spurious CAS attempts,
+then releases any acquired prefix in reverse order before returning. Reader
+rollback uses one atomic decrement so concurrent peer readers keep their own
+counts; only an exclusively held writer sentinel is cleared with a store. Its
+receipt is bound to its original address and creating thread, and must be
+zero-initialized with `{0}` before its first acquire. A failed acquire or
+successful release clears it for reuse.
+
+| Anchor | Object | Operation | Ordering | Purpose |
+|--------|--------|-----------|----------|---------|
+| `source_access.h:wl_columnar_source_access_gate_round_unwind` | `request->gate->state` | `atomic_load_explicit` | acquire | Validate the owned gate state before bounded rollback |
+| `source_access.h:wl_columnar_source_access_gate_round_unwind#2` | `request->gate->state` | `atomic_fetch_sub_explicit` | release | Remove exactly this receipt's reader hold while preserving peer readers |
+| `source_access.h:wl_columnar_source_access_gate_round_unwind#3` | `request->gate->state` | `atomic_store_explicit` | release | Release a writer sentinel held exclusively by this receipt |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire` | `request->gate->state` | `atomic_load_explicit` | acquire | Check reader count and writer sentinel before its one admission CAS |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire#2` | `request->gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Add one reader hold without retrying a failed round |
+| `source_access.h:wl_columnar_source_access_gate_round_acquire#3` | `request->gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Claim one writer gate without retrying a failed round |
 
 The private fresh-head publisher creates registry/hash arrays offside, one slot
 or name byte per action. Its original-address four-move journal reverses before

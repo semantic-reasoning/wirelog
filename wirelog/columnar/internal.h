@@ -783,6 +783,170 @@ typedef struct col_rel_mutable_image {
     wl_columnar_source_access_writer_t writer;
 } col_rel_mutable_image_t;
 
+/* Private, resumable retirement for the deliberately narrow managed-merge
+ * relation shape. The relation and this record remain at stable addresses on
+ * the creating thread until every token receipt is acknowledged. */
+typedef enum wl_columnar_relation_managed_retirement_phase {
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_INERT = 0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_GOVERNOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_ROW_SCRATCH,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_TYPES,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_SCHEMA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ZERO_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_METADATA,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DEDUP,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_GOVERNOR,
+    WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE
+} wl_columnar_relation_managed_retirement_phase_t;
+
+typedef struct wl_columnar_relation_managed_retirement {
+    uintptr_t identity;
+    col_rel_t *relation;
+    uintptr_t original_relation_address;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    wl_columnar_memory_governor_t *governor;
+    wl_columnar_source_access_gate_round_t gate_round;
+    wl_columnar_relation_managed_retirement_phase_t phase;
+    wl_columnar_memory_reservation_t tokens[4];
+    wl_columnar_memory_retirement_receipt_t receipts[4];
+    uint64_t token_bytes[4];
+    uint64_t token_owner_bits[4];
+    bool receipt_started[4];
+    bool token_empty[4];
+} wl_columnar_relation_managed_retirement_t;
+
+/* One-funded-action-at-a-time builder for a private, unnamed binary INT64
+ * relation. On a terminal allocation failure, relation retains all partial
+ * ownership so it can be passed to managed_retirement_begin(). */
+typedef enum wl_columnar_relation_managed_binary_build_phase {
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT = 0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_RESERVE_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COMMIT_RETAINED,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMNS_ARRAY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_ROW_SCRATCH,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_TYPES,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY,
+    WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED
+} wl_columnar_relation_managed_binary_build_phase_t;
+
+typedef struct wl_columnar_relation_managed_binary_build {
+    uintptr_t identity;
+    col_rel_t *relation;
+    wl_columnar_memory_governor_ref_t *governor_ref;
+    wl_columnar_relation_managed_binary_build_phase_t phase;
+    uint64_t retained_bytes;
+    uint64_t allocation_units_remaining;
+    wl_columnar_relation_managed_binary_build_phase_t allocation_phase;
+    uint64_t allocation_control_identity;
+    uint64_t allocation_attempt_id;
+    uint32_t capacity;
+    int failure_status;
+} wl_columnar_relation_managed_binary_build_t;
+
+/* Resumable private union of an unnamed, private two-column INT64 source and
+ * candidate. Source rows must be canonical and sorted; candidate rows may be
+ * arbitrary-order and duplicated. Both inputs are read-only. The caller keeps
+ * both descriptors alive and excludes all raw-pointer use until cleanup DONE.
+ * Initialize the address-bound record with { 0 }; all calls stay on its creator
+ * thread. Both inputs must share the same governor, including both NULL. */
+typedef enum wl_columnar_managed_candidate_phase {
+    WL_COLUMNAR_MANAGED_CANDIDATE_INERT = 0,
+    WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_REPLACEMENT,
+    WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_SCRATCH,
+    WL_COLUMNAR_MANAGED_CANDIDATE_COPY_SOURCE,
+    WL_COLUMNAR_MANAGED_CANDIDATE_COPY_CANDIDATE,
+    WL_COLUMNAR_MANAGED_CANDIDATE_SORT,
+    WL_COLUMNAR_MANAGED_CANDIDATE_DEDUP,
+    WL_COLUMNAR_MANAGED_CANDIDATE_COUNT_NOVEL,
+    WL_COLUMNAR_MANAGED_CANDIDATE_BUILD_DELTA,
+    WL_COLUMNAR_MANAGED_CANDIDATE_EMIT_DELTA,
+    WL_COLUMNAR_MANAGED_CANDIDATE_READY,
+    WL_COLUMNAR_MANAGED_CANDIDATE_ABORT_CLEANUP,
+    WL_COLUMNAR_MANAGED_CANDIDATE_SUCCESS_CLEANUP,
+    WL_COLUMNAR_MANAGED_CANDIDATE_DONE
+} wl_columnar_managed_candidate_phase_t;
+
+typedef struct wl_columnar_managed_candidate_merge {
+    uintptr_t identity;
+    col_rel_t *source;
+    const col_rel_t *candidate;
+    wl_evaluation_control_t *control;
+    uint64_t control_attempt_id;
+    col_relation_snapshot_t source_snapshot;
+    col_relation_snapshot_t candidate_snapshot;
+    wl_columnar_source_access_gate_round_t input_gates;
+    wl_columnar_relation_managed_binary_build_t replacement_build;
+    wl_columnar_relation_managed_binary_build_t scratch_build;
+    wl_columnar_relation_managed_binary_build_t delta_build;
+    wl_columnar_relation_managed_retirement_t retirements[3];
+    wl_columnar_managed_candidate_phase_t phase;
+    uint32_t source_rows;
+    uint32_t candidate_rows;
+    uint32_t input_rows;
+    uint32_t capacity;
+    uint32_t copy_row;
+    uint32_t copy_column;
+    uint32_t sort_width;
+    uint32_t sort_left;
+    uint32_t sort_mid;
+    uint32_t sort_right;
+    uint32_t sort_i;
+    uint32_t sort_j;
+    uint32_t sort_out;
+    uint32_t sort_selected_row;
+    uint32_t sort_copy_column;
+    uint32_t sort_compare_column;
+    uint32_t dedup_read;
+    uint32_t dedup_write;
+    uint32_t dedup_compare_column;
+    uint32_t dedup_copy_column;
+    uint32_t search_row;
+    uint32_t search_low;
+    uint32_t search_high;
+    uint32_t search_mid;
+    uint32_t search_column;
+    uint32_t novel_count;
+    uint32_t emit_row;
+    uint32_t emit_write;
+    uint32_t emit_column;
+    uint32_t cleanup_index;
+    int terminal_status;
+    bool sort_source_scratch;
+    bool sort_selected;
+    bool dedup_copy_active;
+    bool search_active;
+    bool search_found;
+    bool retirement_started[3];
+    bool result_transferred;
+} wl_columnar_managed_candidate_merge_t;
+
 /* A resumable, private incremental consolidation. Initialize the object with
  * { 0 } before begin. The object and its writer are address- and thread-bound;
  * keep it in one frame and pass by pointer.
@@ -1852,6 +2016,8 @@ typedef struct {
 /* Differential Arrangement Registry (Issue #263)                           */
 /* ======================================================================== */
 
+#define WL_DIFF_ARR_REGISTRY_INITIAL_CAP 4u
+
 /*
  * col_diff_arr_entry_t: one (rel_name, key_cols) -> diff_arrangement mapping.
  * Stored in the session's flat differential arrangement registry.
@@ -2480,6 +2646,9 @@ typedef struct wl_col_session_t {
     col_diff_arr_entry_t *diff_arr_entries;
     uint32_t diff_arr_count;
     uint32_t diff_arr_cap;
+    wl_columnar_memory_reservation_t diff_arr_registry_reservation;
+    uint64_t diff_arr_registry_reserved_bytes;
+    uint64_t diff_arr_registry_metadata_reserved_bytes;
     uint32_t diff_txn_count;      /* active differential replacement txns */
     /* Session-level differential path master switch (Issue #264).
      * When true, differential operators may be activated based on guard logic.
@@ -3002,6 +3171,73 @@ int
 wl_columnar_relation_rename_checked(col_rel_t *rel, const char *name);
 void
 col_rel_free_contents(col_rel_t *r);
+/* Both receipts are address- and creator-thread-bound. Initialize each with
+ * { 0 } before begin; keep it at one stable address through READY/DONE. */
+int
+wl_columnar_relation_managed_binary_build_begin(
+    wl_columnar_relation_managed_binary_build_t *build, uint32_t capacity,
+    wl_columnar_memory_governor_ref_t *governor_ref);
+int
+wl_columnar_relation_managed_binary_build_step(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
+int
+wl_columnar_relation_managed_binary_build_step_budgeted(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id,
+    uint64_t *remaining);
+int
+wl_columnar_relation_managed_binary_build_adopt_schema(
+    wl_columnar_relation_managed_binary_build_t *build,
+    const char *const *column_names);
+/* Caller must transfer exclusive relation lifetime before begin: stop new
+ * raw-pointer operations and drain/join existing ones. Keep the descriptor at
+ * a stable address until FREE_DESCRIPTOR runs, never dereference it afterward,
+ * and keep the receipt stable through DONE. Do not use another relation
+ * pointer or reuse the descriptor after retirement begins. */
+int
+wl_columnar_relation_managed_retirement_begin(
+    wl_columnar_relation_managed_retirement_t *retirement, col_rel_t *relation);
+int
+wl_columnar_relation_managed_retirement_step(
+    wl_columnar_relation_managed_retirement_t *retirement,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id);
+/* source must be canonical and globally sorted; candidate may be unsorted.
+ * Begin acquires descriptor and storage reader gates for both inputs as one
+ * all-or-release round. Advance charges each comparison cell, copy cell,
+ * builder action, and phase action against the original attempt and executes
+ * at most 64 actions per call. EAGAIN retains progress; terminal stops require
+ * abort or cleanup. take_result transfers both outputs exactly once; cleanup
+ * retires all remaining private builders and releases input gates under fresh
+ * maintenance control, then ACK clears completed receipts. take_result
+ * requires distinct output slots whose values are both NULL on entry. */
+int
+wl_columnar_managed_candidate_merge_begin(
+    wl_columnar_managed_candidate_merge_t *attempt, col_rel_t *source,
+    const col_rel_t *candidate, wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id);
+int
+wl_columnar_managed_candidate_merge_advance(
+    wl_columnar_managed_candidate_merge_t *attempt, uint64_t quantum);
+int
+wl_columnar_managed_candidate_merge_take_result(
+    wl_columnar_managed_candidate_merge_t *attempt,
+    col_rel_t **replacement_out, col_rel_t **delta_out);
+int
+wl_columnar_managed_candidate_merge_abort(
+    wl_columnar_managed_candidate_merge_t *attempt);
+int
+wl_columnar_managed_candidate_merge_cleanup_step(
+    wl_columnar_managed_candidate_merge_t *attempt,
+    wl_evaluation_control_t *maintenance_control,
+    uint64_t maintenance_attempt_id);
+int
+wl_columnar_managed_candidate_merge_status(
+    const wl_columnar_managed_candidate_merge_t *attempt,
+    wl_columnar_managed_candidate_phase_t *phase, int *terminal_status);
+int
+wl_columnar_managed_candidate_merge_ack(
+    wl_columnar_managed_candidate_merge_t *attempt);
 uint64_t
 col_rel_owned_ledger_bytes(const col_rel_t *r);
 /* Checked flat-grid size for ncols pointer slots and owned INT64 lanes. */
@@ -4722,7 +4958,7 @@ typedef struct wl_columnar_arrangement_diff_txn {
 col_diff_arrangement_t *
 col_session_get_diff_arrangement(wl_col_session_t *cs, const char *rel_name,
     const col_rel_t *source_rel,
-    const uint32_t *key_cols, uint32_t key_count);
+    const uint32_t *key_cols, uint32_t key_count, int *status_out);
 void
 wl_columnar_arrangement_diff_reset_state(col_diff_arrangement_t *arr);
 int
@@ -4753,7 +4989,11 @@ col_arr_entries_clone(const col_arr_entry_t *src, uint32_t count,
 /* Issue #274: Deep-copy differential arrangement entries for K-fusion worker isolation. */
 int
 col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
-    col_diff_arr_entry_t **out_entries, uint32_t *out_cap);
+    col_diff_arr_entry_t **out_entries, uint32_t *out_cap,
+    wl_columnar_memory_governor_ref_t *memory_governor);
+int
+col_diff_arr_entries_registry_size(const col_diff_arr_entry_t *src,
+    uint32_t count, uint64_t *array_bytes, uint64_t *metadata_bytes);
 col_sorted_arr_t *
 col_session_get_sorted_arrangement(wl_col_session_t *cs, const char *rel_name,
     uint32_t key_col);
@@ -6414,6 +6654,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     bool composed_mode;
     /* Set only by the exact framed controlled STEP fallback preflight. */
     bool controlled_materialized_batch_fallback;
+    const struct wl_columnar_eval_private_bindings *private_bindings;
     wl_columnar_lftj_attempt_t lftj;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
@@ -6423,6 +6664,33 @@ typedef struct {
     int semantic_result, protocol_result;
     bool retained;
 } wl_columnar_eval_plan_numeric_status_t;
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_plan_test_after_terminal_exchange)(
+    wl_evaluation_control_t *, uint64_t);
+#endif
+
+/* Authenticated name-to-owner overlay for one serialized evaluator attempt.
+ * Keys are copied into this address-bound record; relation descriptors stay
+ * private and may be unnamed. The caller borrows these descriptors and must
+ * keep them alive and immutable until the child attempt is acknowledged.
+ * Keep this record stable and immutable for the same interval. */
+#define WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX 4u
+typedef struct {
+    char name[256];
+    col_rel_t *relation;
+    col_relation_snapshot_t snapshot;
+} wl_columnar_eval_private_binding_t;
+
+typedef struct wl_columnar_eval_private_bindings {
+    uintptr_t identity;
+    wl_col_session_t *session;
+    const wl_plan_relation_t *plan;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    uint32_t count;
+    wl_columnar_eval_private_binding_t entries[
+        WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX];
+} wl_columnar_eval_private_bindings_t;
 
 void wl_columnar_eval_plan_numeric_attempt_init(
     wl_columnar_eval_plan_numeric_attempt_t *);
@@ -6571,6 +6839,22 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_private_bindings_begin(
+    wl_columnar_eval_private_bindings_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    const char *const *, col_rel_t *const *, uint32_t);
+int wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+    wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
+    uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t *);
+int wl_columnar_eval_plan_numeric_private_bindings_get(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t **);
+bool wl_columnar_eval_plan_numeric_recursive_path_supported(
+    const wl_plan_relation_t *);
 int wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     wl_columnar_eval_plan_numeric_attempt_t *, const wl_plan_relation_t *,
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
@@ -6586,6 +6870,17 @@ int wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *, bool *,
 int wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *, bool *,
     wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_plan_numeric_composed_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* Drain an owned LFTJ child after the original operation has latched a
+ * cancellation or work-limit stop. Each call performs at most one child
+ * cleanup action under fresh host funding; it never resumes evaluation. */
+int wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+/* Cooperatively stop a composed source owner without starting pending child
+ * work, publishing output, or consuming an outstanding child receipt. */
+int wl_columnar_eval_plan_numeric_composed_cleanup_source(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
 /* Latch a funded abort request without advancing an owner. The next step
@@ -6620,6 +6915,15 @@ int wl_columnar_eval_stack_composed_source_abort(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Validate or perform the result-slot abort after the caller has already
+ * charged one 384-unit host action. Both share the charged wrapper's checks
+ * and preserve the borrowed slot when disposal is refused. */
+int wl_columnar_eval_stack_composed_source_abort_validate(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_composed_source_abort_funded(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_plan_numeric_attempt_t *);
 int wl_columnar_eval_stack_composed_source_release(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_plan_numeric_attempt_t *);
@@ -6763,6 +7067,10 @@ typedef struct wl_columnar_eval_serial_framed_attempt {
     bool candidate_owned, materialized, committed, pending_inner_consume;
     bool close_proven, abort_supported, abort_requested;
     bool controlled_materialized_batch_fallback;
+    const wl_columnar_eval_private_bindings_t *private_bindings;
+    col_rel_t **capture_out;
+    bool capture_only;
+    bool capture_done;
     wl_columnar_session_hash_registry_attempt_t publication;
 } wl_columnar_eval_serial_framed_attempt_t;
 
@@ -6827,6 +7135,11 @@ struct wl_columnar_eval_serial_framed_host_request {
     uint64_t operation_identity;
     /* Frozen authorization from the controlled initial-STEP classifier. */
     bool controlled_materialized_batch_fallback;
+    /* Private body evaluation is authenticated by the address-bound binding
+     * record and captures its materialized result without registry publish. */
+    const wl_columnar_eval_private_bindings_t *private_bindings;
+    bool capture_only;
+    col_rel_t **capture_out;
     wl_columnar_eval_serial_framed_host_action_t action;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     bool previous_valid;
@@ -6864,6 +7177,11 @@ int wl_columnar_eval_serial_framed_attempt_begin(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
     uint64_t, bool, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_serial_framed_attempt_begin_bound(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    const wl_plan_relation_t *, wl_evaluation_control_t *, uint64_t,
+    uint64_t, bool, const wl_columnar_eval_private_bindings_t *, bool,
+    col_rel_t **, wl_evaluation_control_t *, uint64_t);
 int wl_columnar_eval_serial_framed_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -6876,6 +7194,17 @@ int wl_columnar_session_hash_registry_attempt_begin(
     wl_columnar_eval_serial_framed_attempt_t *);
 int wl_columnar_session_hash_registry_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *);
+enum {
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_BODY = 1,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_MERGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_DURING_MERGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_CONVERGENCE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_PRECHARGE,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_ALLOCATION_ADMITTED,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_SCHEMA_ADOPTED,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_BEFORE_COMMIT,
+    WL_COLUMNAR_SESSION_TEST_RECURSIVE_AFTER_COMMIT
+};
 #ifdef WL_SESSION_TEST_HOOKS
 typedef struct {
     uint32_t phase;
@@ -6894,6 +7223,8 @@ typedef struct {
     bool entry_charged;
 } wl_columnar_session_test_preflight_state_t;
 extern unsigned wl_columnar_session_test_preflight_quantum;
+extern void (*wl_columnar_session_test_recursive_step_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t);
 int wl_columnar_session_test_preflight_snapshot(wl_session_t *,
     wl_columnar_session_test_preflight_state_t *);
 /* Fail one controlled STEP funding creation before it reaches the host. */

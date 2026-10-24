@@ -417,7 +417,7 @@ every stratum that ran under TDD.
 | `RELATION` | event | Column buffers of operator output relations whose `col_rel_t.mem_ledger` is attached; today that is every join output (`col_join_attach_ledger`). Capacity-based (`capacity × owned columns × 8`). | `relation.c` growth, compaction and free paths |
 | `ARENA` | event | Fixed capacity of the session's delta pool (slot slab + data arena) and eval arena, plus the compound arena object, generation table, payload buffers, and entry metadata. Each retained capacity is admitted before allocation with old/new peak overlap and released at destruction; the ledger remains attribution-only. `delta_pool_reset()`/`wl_arena_reset()` and compound epoch GC do not return retained capacity. K-fusion branch sessions charge their per-branch pool/arena to the parent. | `session.c`, `kfusion.c`, `arena.c`, `delta_pool.c`, `compound_arena.c` |
 | `CACHE` | event | Materialization-cache entries. On insert the cached result is re-parented: its RELATION (and TIMESTAMP) charge is credited and the same bytes are charged to CACHE, so a cached join is counted once. Credited on eviction, truncation and clear. | `cache.c` |
-| `ARRANGEMENT` | event | Hash arrangements (`ht_head` + `ht_next`), delta and filtered arrangements, sorted copies for LFTJ (`nrows × ncols × 8`, a full duplicate of the relation) and differential arrangements (struct + keys + buckets + chain). Worker clones are charged to the worker ledger. | `arrangement.c`, `diff_arrangement.c` |
+| `ARRANGEMENT` | event | Hash arrangements (`ht_head` + `ht_next`), delta and filtered arrangements, sorted copies for LFTJ (`nrows × ncols × 8`, a full duplicate of the relation), differential arrangements (struct + keys + buckets + chain), and differential-registry arrays plus each entry's relation name and key columns. Worker clones are charged to the worker ledger. | `arrangement.c`, `diff_arrangement.c` |
 | `TIMESTAMP` | event | `timestamps[]` arrays (24 bytes per row of capacity) of ledger-attached relations. Reconciled together with RELATION. | `relation.c` |
 | `CHANNEL` | event | TDD delta transport: the MPSC ring storage for the stratum (charged at queue creation) plus every delta payload (columns + timestamps) between the worker's enqueue and the coordinator's drain or discard. Charged on the coordinator's ledger because ownership transfers on enqueue. | `eval.c`, `eval_tdd_queue.c` |
 | `STORED` | gauge | Session-owned relations in `rels[]`: EDB and IDB relations on the coordinator, partitions on a worker. Column buffers plus timestamps; arena-owned columns count 0. | sampled, see §2.2 |
@@ -683,6 +683,17 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Delta transport payload | Producer transfers owned relation to queue, then coordinator matrix/consumer | Reconstruction deduplicates malformed aliases; discard destroys each owned queued payload; current matrix retains one payload per worker/relation, not an arbitrary batch stream | `eval_tdd_queue.c`, `eval.c` |
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
+
+Differential-registry memory is admitted before allocation. A session plan with
+keyed JOIN candidates reserves a flat registry large enough for the candidate
+JOIN count (at least four entries); each entry's copied relation name and key
+columns are admitted before construction. Worker clones reserve their own
+registry and entry metadata, while each cloned differential arrangement
+reserves its own storage. Registry growth outside a controlled attempt admits
+the complete old-plus-new allocation overlap before copying and releases the
+old-array charge after the swap. Growth remains a synchronous allocation and
+copy; a controlled attempt that unexpectedly needs registry growth fails
+closed instead of entering that unbounded region.
 
 ### Residual lifetime evidence (#1812)
 
@@ -2717,6 +2728,96 @@ mandatory, receives NULL control and cannot debit a successor attempt.
 Attempt admission preserves the raw quota policy. Unary transactions extend
 the private frame storage: both raw and controlled admission charge its actual
 current size. Neither helper activates FILTER/MAP or default evaluation routes.
+
+### Resumable reservation retirement receipt (#1821 prerequisite)
+
+Replacement cleanup that must survive work limits uses a zero-initialized
+`wl_columnar_memory_retirement_receipt_t` at its original address and on its
+creating thread. Begin binds the token address, expected governor, expected
+owner and either RESERVED rollback or COMMITTED release without reading the
+token's mutable payload. Each step receives a live maintenance control and its
+expected attempt ID, admits 64 conservative work units before changing
+authority, and keeps no control pointer after return. The per-step admission is
+below the 256-unit evaluation quantum, including the bounded phase dispatch,
+thread/identity checks and one possible atomic transition.
+
+The receipt claims the exact token state with one strong CAS, captures and
+validates the positive byte count and non-overlap shape only after winning, then
+subtracts that captured credit with one strong aggregate CAS. A lost claim
+fails without reading token payload; malformed claimed payload restores the
+original state without refund. Aggregate contention returns `EAGAIN` while
+keeping the claim and CREDIT phase for a fresh funded retry. Underflow returns
+`EOVERFLOW` with that authority still reachable. A successful subtraction
+immediately publishes RELEASED and marks DONE, so a later step cannot refund
+twice. ACK is receipt-local and permits receipt reuse without inspecting a
+released or reused token. Status exposes phase, retained-claim authority and
+terminal disposition from the receipt alone. If cancellation or work exhaustion
+stops a step while the receipt owns the claim, the caller must preserve the
+receipt and resume it with a fresh live maintenance attempt; it must not abandon
+or reinitialize the receipt/token while the claim remains held.
+
+The caller must finish freeing the corresponding physical storage before
+beginning retirement and retain the token and governor through ACK. This
+protocol bounds its own reservation transitions; it does not bound allocator,
+destructor, physical teardown, overlap/downsize, or merge lifecycle work. Those
+remain separate obligations for the integrating replacement path.
+
+### Managed binary relation construction and retirement (#1821 prerequisite)
+
+`wl_columnar_relation_managed_binary_build_t` constructs an unnamed private
+binary INT64 relation through address-stable, one-action steps. A stopped step
+leaves its cursor and allocations unchanged; the caller may continue the same
+receipt with a fresh live attempt. A terminal allocation failure leaves every
+partial pointer and committed token reachable through `build.relation`, which
+must enter the managed retirement path. The builder reserves and commits one
+retained token for all four payload lanes (two output columns and two merge
+columns), both pointer arrays, row scratch, and the type array before
+allocating those components. The descriptor reservation remains embedded
+until descriptor storage is physically freed.
+
+`wl_columnar_relation_managed_retirement_t` accepts only the narrow private
+shape produced by that builder. It acquires descriptor and storage writer gates
+as one round before inspecting mutable shape. A validation refusal releases
+both gates and changes no ownership. Once the first token detaches, the receipt
+keeps both writer sentinels, detached token slots, receipt addresses, and the
+governor reference stable across every yield. Each physical pointer is freed
+and cleared in its own action. Retained credit is refunded only after all
+accounted arrays and lanes are gone; descriptor credit remains charged until
+the descriptor allocation itself is freed.
+
+The relation gates remain WRITER through descriptor free. The round is armed
+before that free and then consumed by a local-only step that clears only the
+round record; it never reads or releases gate pointers after their relation
+has been reclaimed. Receipt and builder objects are creator-thread-bound and
+must stay at their original addresses. Callers transfer exclusive relation
+lifetime before retirement and must not use outstanding raw pointers after
+that handoff. Allocator/free latency remains a non-preemptible library call;
+the protocol bounds engine work between those calls, not wall-clock time.
+
+### Managed binary candidate replacement (#1821 increment)
+
+`wl_columnar_managed_candidate_merge_t` is a separate, immutable-input path
+for unnamed private two-column INT64 relations. It rejects shared, aliased,
+timestamped, compound, schema-bearing, ledger-attached, or delta-baseline inputs
+before allocating output. Source must already be globally sorted; candidate rows may
+be unsorted and duplicated. Both relations must use the same governor (or both
+be ungoverned). The path copies both inputs into a private replacement and
+scratch relation, performs bottom-up numeric sorting and deduplication, then
+subtracts source rows with a resumable binary search to create the novel delta.
+
+Every comparison cell, copied cell, builder action and state transition spends
+the original attempt's work allowance, under one 64-action maximum per call.
+The nested relation builders use that same attempt. Allocation and allocator
+latency remain non-preemptible calls, but every allocation/admission action is
+charged and every partial pointer/token remains reachable through the attempt.
+The canonical union and delta stay private until `take_result` transfers both
+outputs together at its no-fail cutoff. Before that cutoff, stop cleanup retires
+all private builders; after it, the caller owns both outputs while the attempt
+retires only scratch and releases its input-reader round. Cleanup uses a fresh
+maintenance attempt and retains each retirement receipt until ACK.
+
+This restricted primitive does not itself wire candidate replacement into all
+operator paths or complete issue #1821.
 
 ## Persistent unary result replacement
 

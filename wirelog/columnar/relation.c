@@ -3555,6 +3555,964 @@ col_rel_free_contents(col_rel_t *r)
     col_rel_free_contents_impl(r, false);
 }
 
+static bool
+wl_columnar_relation_managed_empty_token(
+    const wl_columnar_memory_reservation_t *token)
+{
+    return token && (token->identity == token || token->identity == NULL)
+           && atomic_load_explicit(&token->state, memory_order_acquire)
+           == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY
+           && token->governor == NULL && token->bytes == 0
+           && token->transition_kind == WL_COLUMNAR_MEMORY_TRANSITION_NONE
+           && atomic_load_explicit(&token->owner_bits,
+               memory_order_acquire) == 0;
+}
+
+int
+wl_columnar_relation_managed_binary_build_begin(
+    wl_columnar_relation_managed_binary_build_t *build, uint32_t capacity,
+    wl_columnar_memory_governor_ref_t *governor_ref)
+{
+    if (!build || build->identity || capacity == 0)
+        return EINVAL;
+    memset(build, 0, sizeof(*build));
+    build->identity = (uintptr_t)build;
+    build->governor_ref = governor_ref;
+    build->capacity = capacity;
+    build->phase = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR;
+    return 0;
+}
+
+static bool
+wl_columnar_relation_managed_binary_build_fail_allocation(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_constructor_fail_allocation
+        && --wl_columnar_relation_test_constructor_fail_allocation == 0)
+        return true;
+#endif
+    return false;
+}
+
+static int wl_columnar_relation_init_arrow_schema(col_rel_t *r);
+
+int
+wl_columnar_relation_managed_binary_build_step_budgeted(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id,
+    uint64_t *remaining)
+{
+    uint64_t lane_bytes, buffer_bytes, part_bytes;
+    wl_columnar_memory_admission_status_t admission;
+    int rc;
+
+    if (!build || build->identity != (uintptr_t)build
+        || !expected_attempt_id || !remaining)
+        return EINVAL;
+    if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY)
+        return 0;
+    if (build->phase == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED)
+        return build->failure_status ? build->failure_status : EINVAL;
+    bool lane_allocation = build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0
+        || build->phase
+        == WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1;
+    if (lane_allocation) {
+        if (build->allocation_phase != build->phase) {
+            if (build->allocation_control_identity
+                || build->allocation_attempt_id)
+                return EINVAL;
+            build->allocation_phase = build->phase;
+            build->allocation_units_remaining = build->capacity;
+        }
+        if ((build->allocation_control_identity
+            && build->allocation_control_identity
+            != wl_evaluation_control_identity(control))
+            || (build->allocation_attempt_id
+            && build->allocation_attempt_id != expected_attempt_id))
+            return EINVAL;
+        if (build->allocation_units_remaining) {
+            uint64_t work = build->allocation_units_remaining;
+            if (work > *remaining)
+                work = *remaining;
+            if (work > WL_EVALUATION_CONTROL_QUANTUM)
+                work = WL_EVALUATION_CONTROL_QUANTUM;
+            if (!work)
+                return EAGAIN;
+            rc = wl_evaluation_control_charge_attempt(control,
+                    expected_attempt_id, work);
+            if (rc != 0)
+                return rc;
+            if (!build->allocation_control_identity) {
+                build->allocation_control_identity
+                    = wl_evaluation_control_identity(control);
+                build->allocation_attempt_id = expected_attempt_id;
+            }
+            build->allocation_units_remaining -= work;
+            *remaining -= work;
+            /* Reserve logical cell work before the fresh backing allocation.
+            * The allocation itself is a single noninterruptible allocator
+            * action; no existing relation cells are copied in this phase. */
+            if (!*remaining || build->allocation_units_remaining)
+                return EAGAIN;
+        } else if (build->allocation_control_identity
+            && (build->allocation_control_identity
+            != wl_evaluation_control_identity(control)
+            || build->allocation_attempt_id != expected_attempt_id)) {
+            return EINVAL;
+        }
+    }
+    if (!*remaining)
+        return EAGAIN;
+    rc = wl_evaluation_control_charge_attempt(control, expected_attempt_id, 1);
+    if (rc != 0)
+        return rc;
+    (*remaining)--;
+    switch (build->phase) {
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_DESCRIPTOR:
+        if (build->governor_ref)
+            rc = wl_columnar_relation_alloc_governed(&build->relation, NULL,
+                    build->governor_ref);
+        else {
+            rc = col_rel_alloc(&build->relation, "");
+            if (rc == 0) {
+                free(build->relation->name);
+                build->relation->name = NULL;
+            }
+        }
+        if (rc != 0)
+            goto failed;
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_SHAPE:
+        build->relation->ncols = 2;
+        build->relation->declared_ncols = 2;
+        build->relation->capacity = build->capacity;
+        build->relation->merge_buf_cap = build->capacity;
+        build->relation->nrows = 0;
+        build->relation->sorted_nrows = 0;
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_RESERVE_RETAINED:
+        if (!wl_columnar_memory_size_mul(build->capacity, sizeof(int64_t),
+            &lane_bytes)
+            || !wl_columnar_memory_size_mul(lane_bytes, 4, &buffer_bytes)
+            || !wl_columnar_memory_size_add(buffer_bytes,
+            2u * sizeof(*build->relation->columns), &buffer_bytes)
+            || !wl_columnar_memory_size_add(buffer_bytes,
+            2u * sizeof(*build->relation->merge_columns), &buffer_bytes)
+            || !wl_columnar_memory_size_mul(2,
+            sizeof(*build->relation->row_scratch), &part_bytes)
+            || !wl_columnar_memory_size_add(buffer_bytes, part_bytes,
+            &buffer_bytes)
+            || !wl_columnar_memory_size_mul(2,
+            sizeof(*build->relation->column_types), &part_bytes)
+            || !wl_columnar_memory_size_add(buffer_bytes, part_bytes,
+            &buffer_bytes)) {
+            rc = EOVERFLOW;
+            goto failed;
+        }
+        build->retained_bytes = buffer_bytes;
+        if (build->governor_ref) {
+            admission = wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(build->governor_ref),
+                buffer_bytes, &build->relation->retained_reservation);
+            if (admission != WL_COLUMNAR_MEMORY_ADMISSION_OK
+                && admission != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                wl_columnar_memory_reservation_init(
+                    &build->relation->retained_reservation);
+                rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC : admission ==
+                    WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : EINVAL;
+                goto failed;
+            }
+        }
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COMMIT_RETAINED:
+        if (build->governor_ref) {
+            if (!wl_columnar_memory_commit(
+                    &build->relation->retained_reservation, build->relation)) {
+                (void)wl_columnar_memory_rollback(
+                    &build->relation->retained_reservation);
+                wl_columnar_memory_reservation_init(
+                    &build->relation->retained_reservation);
+                rc = EINVAL;
+                goto failed;
+            }
+            build->relation->retained_reserved_bytes = build->retained_bytes;
+        }
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMNS_ARRAY:
+        if (wl_columnar_relation_managed_binary_build_fail_allocation()) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->relation->columns = (int64_t **)calloc(2,
+                sizeof(*build->relation->columns));
+        if (!build->relation->columns) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0:
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_1:
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0:
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_1: {
+        bool merge_column = build->phase
+            >= WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0;
+        size_t column = merge_column
+            ? build->phase
+            - WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMN_0
+            : build->phase
+            - WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_0;
+        int64_t **columns = merge_column ? build->relation->merge_columns
+            : build->relation->columns;
+        if (wl_columnar_relation_managed_binary_build_fail_allocation()) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        if (!wl_columnar_memory_size_mul(build->capacity, sizeof(int64_t),
+            &lane_bytes) || lane_bytes > SIZE_MAX) {
+            rc = EOVERFLOW;
+            goto failed;
+        }
+        columns[column] = malloc((size_t)lane_bytes);
+        if (!columns[column]) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->allocation_phase
+            = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT;
+        build->allocation_control_identity = 0;
+        build->allocation_attempt_id = 0;
+        build->phase++;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_MERGE_COLUMNS_ARRAY:
+        if (wl_columnar_relation_managed_binary_build_fail_allocation()) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->relation->merge_columns = (int64_t **)calloc(2,
+                sizeof(*build->relation->merge_columns));
+        if (!build->relation->merge_columns) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_ROW_SCRATCH:
+        if (wl_columnar_relation_managed_binary_build_fail_allocation()) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->relation->row_scratch = calloc(2,
+                sizeof(*build->relation->row_scratch));
+        if (!build->relation->row_scratch) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_COLUMN_TYPES:
+        if (wl_columnar_relation_managed_binary_build_fail_allocation()) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->relation->column_types = malloc(2
+                * sizeof(*build->relation->column_types));
+        if (!build->relation->column_types) {
+            rc = ENOMEM;
+            goto failed;
+        }
+        build->relation->column_types[0] = WIRELOG_TYPE_INT64;
+        build->relation->column_types[1] = WIRELOG_TYPE_INT64;
+        build->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY:
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_INERT:
+    case WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED:
+    default:
+        return EINVAL;
+    }
+failed:
+    build->failure_status = rc;
+    build->phase = WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_FAILED;
+    build->allocation_control_identity = 0;
+    build->allocation_attempt_id = 0;
+    return rc;
+}
+
+int
+wl_columnar_relation_managed_binary_build_step(
+    wl_columnar_relation_managed_binary_build_t *build,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+{
+    uint64_t remaining = WL_EVALUATION_CONTROL_QUANTUM;
+
+    return wl_columnar_relation_managed_binary_build_step_budgeted(build,
+               control, expected_attempt_id, &remaining);
+}
+
+int
+wl_columnar_relation_managed_binary_build_adopt_schema(
+    wl_columnar_relation_managed_binary_build_t *build,
+    const char *const *column_names)
+{
+    wl_columnar_memory_reservation_t pending = { 0 }, old_metadata = { 0 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    col_rel_t *relation, *owner = NULL;
+    col_rel_t schema_image = { 0 };
+    char **names = NULL;
+    uint64_t metadata_bytes = 0;
+    int rc;
+
+    if (!build || build->identity != (uintptr_t)build
+        || build->phase != WL_COLUMNAR_RELATION_MANAGED_BINARY_BUILD_READY
+        || !build->relation || !column_names || !column_names[0]
+        || !column_names[1])
+        return EINVAL;
+    relation = build->relation;
+    rc = col_rel_published_writer_acquire(relation, &writer);
+    if (rc != 0)
+        return rc;
+
+    if (col_rel_storage_owner_resolve(relation, &owner) != 0
+        || owner != relation || relation->relation_identity == 0
+        || relation->pool_owned || relation->arena_owned
+        || relation->col_shared
+        || relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || relation->compound_arity_map || relation->compound_arity_len
+        || relation->ncols != 2 || relation->declared_ncols != 2
+        || relation->capacity != build->capacity || relation->nrows != 0
+        || relation->sorted_nrows != 0 || relation->name
+        || relation->schema_ok || relation->schema.release
+        || relation->col_names || relation->metadata_reserved_bytes
+        || !relation->column_types || !relation->columns
+        || !relation->columns[0] || !relation->columns[1]
+        || !relation->merge_columns || !relation->merge_columns[0]
+        || !relation->merge_columns[1] || !relation->row_scratch
+        || relation->column_types[0] != WIRELOG_TYPE_INT64
+        || relation->column_types[1] != WIRELOG_TYPE_INT64
+        || build->allocation_control_identity
+        || build->allocation_attempt_id
+        || !col_rel_compound_map_valid_for(relation, 2)) {
+        rc = EINVAL;
+        goto done;
+    }
+    if (!col_rel_prospective_metadata_bytes(2, column_names, true, false,
+        true, true, relation->compound_arity_len, false, &metadata_bytes)) {
+        rc = EOVERFLOW;
+        goto done;
+    }
+    relation->memory_budget_denial_pending = false;
+    rc = col_rel_reserve_metadata(relation, metadata_bytes, &pending);
+    if (rc != 0)
+        goto clear_denial;
+
+    names = (char **)calloc(2, sizeof(*names));
+    if (!names) {
+        rc = ENOMEM;
+        goto rollback;
+    }
+    names[0] = wl_strdup(column_names[0]);
+    names[1] = wl_strdup(column_names[1]);
+    if (!names[0] || !names[1]) {
+        rc = ENOMEM;
+        goto rollback;
+    }
+
+    schema_image.ncols = relation->ncols;
+    schema_image.col_names = names;
+    schema_image.column_types = relation->column_types;
+    schema_image.schema_ok = false;
+    rc = wl_columnar_relation_init_arrow_schema(&schema_image);
+    if (rc != 0)
+        goto rollback;
+
+    col_rel_publish_metadata(relation, &pending, metadata_bytes,
+        &old_metadata);
+    relation->col_names = names;
+    relation->schema = schema_image.schema;
+    relation->schema_ok = true;
+    names = NULL;
+    memset(&schema_image.schema, 0, sizeof(schema_image.schema));
+    wl_columnar_relation_touch_view(relation);
+    col_rel_release_reservation_or_abort(&old_metadata);
+    rc = 0;
+    goto done;
+
+rollback:
+    if (schema_image.schema.release)
+        ArrowSchemaRelease(&schema_image.schema);
+    if (names) {
+        free(names[0]);
+        free(names[1]);
+        free((void *)names);
+    }
+    col_rel_reservation_rollback(&pending);
+clear_denial:
+    if (rc == ENOSPC)
+        relation->memory_budget_denial_pending = false;
+done:
+    {
+        int release_rc = wl_columnar_source_access_writer_release(&writer);
+        if (rc == 0 && release_rc != 0)
+            rc = release_rc;
+    }
+    return rc;
+}
+
+static bool
+wl_columnar_relation_managed_token_valid(
+    const wl_columnar_memory_reservation_t *token,
+    wl_columnar_memory_governor_t *governor, const col_rel_t *relation,
+    uint64_t bytes)
+{
+    uint64_t state;
+    uint64_t owner_bits;
+    if (!token)
+        return false;
+    state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (bytes == 0)
+        return wl_columnar_relation_managed_empty_token(token);
+    owner_bits = atomic_load_explicit(&token->owner_bits, memory_order_acquire);
+    return governor && token->identity == token && token->governor == governor
+           && token->bytes == bytes
+           && token->transition_kind == WL_COLUMNAR_MEMORY_TRANSITION_NONE
+           && ((state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+           && owner_bits == 0)
+           || (state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+           && owner_bits == (uint64_t)(uintptr_t)relation));
+}
+
+static int
+wl_columnar_relation_managed_gate_round_validate(
+    const wl_columnar_source_access_gate_round_t *round,
+    const col_rel_t *relation)
+{
+    bool descriptor_seen = false;
+    bool source_seen = false;
+
+    if (!round || !relation || round->identity != (uintptr_t)round
+        || !wl_columnar_source_access_gate_round_thread_equal(round)
+        || round->terminal_consume_armed || round->request_count != 2
+        || round->acquired_count != 2)
+        return EINVAL;
+    for (size_t i = 0; i < round->request_count; i++) {
+        const wl_columnar_source_access_gate_request_t *request
+            = &round->requests[i];
+        if (request->mode != WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER)
+            return EINVAL;
+        if (request->gate == &relation->descriptor_access)
+            descriptor_seen = true;
+        else if (request->gate == &relation->source_access)
+            source_seen = true;
+        else
+            return EINVAL;
+        if (atomic_load_explicit(&request->gate->state, memory_order_acquire)
+            != WL_COLUMNAR_SOURCE_ACCESS_WRITER)
+            return EBUSY;
+    }
+    return descriptor_seen && source_seen ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_relation_managed_retirement_validate(
+    const col_rel_t *relation)
+{
+    wl_columnar_memory_governor_t *governor = relation->memory_governor
+        ? wl_columnar_memory_governor_ref_get(relation->memory_governor) : NULL;
+    const struct ArrowSchema *schema = &relation->schema;
+
+    if (relation->ncols != 2 || relation->pool_owned || relation->arena_owned
+        || relation->name || relation->timestamps
+        || relation->timestamp_capacity || relation->retract_backup_columns
+        || relation->retract_backup_timestamps
+        || relation->retract_backup_timestamp_capacity
+        || relation->retract_backup_nrows || relation->retract_backup_base_nrows
+        || relation->retract_backup_capacity
+        || relation->retract_backup_sorted_nrows || relation->col_shared
+        || relation->dedup_slots || relation->dedup_cap || relation->dedup_count
+        || relation->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || relation->compound_count || relation->compound_arity_map
+        || relation->compound_arity_len || relation->inline_physical_offset
+        || relation->has_graph_column || relation->graph_col_idx
+        || relation->memory_budget_denial_pending
+        || relation->pool_name_reserved_bytes || relation->mem_ledger
+        || relation->ledger_ts_bytes || relation->deferred_relation_next
+        || relation->deferred_relation_session
+        || relation->storage_owner != relation
+        || relation->storage_owner_identity != relation->relation_identity
+        || atomic_load_explicit(&relation->storage_alias_borrows,
+        memory_order_acquire) != 0
+        || (relation->columns && relation->columns[0]
+        && relation->columns[0] == relation->columns[1])
+        || (relation->merge_columns && relation->merge_columns[0]
+        && relation->merge_columns[0] == relation->merge_columns[1]))
+        return EINVAL;
+    if (relation->column_types
+        && (relation->column_types[0] != WIRELOG_TYPE_INT64
+        || relation->column_types[1] != WIRELOG_TYPE_INT64))
+        return ENOTSUP;
+    if (relation->schema_ok) {
+        if (!schema->release || !schema->children
+            || schema->n_children != relation->ncols
+            || !relation->col_names || !relation->col_names[0]
+            || !relation->col_names[1]
+            || (relation->memory_governor
+            && relation->metadata_reserved_bytes == 0))
+            return EINVAL;
+    } else if (schema->release || schema->children
+        || schema->n_children != 0 || relation->col_names) {
+        return EINVAL;
+    }
+    if (relation->memory_governor) {
+        if (!wl_columnar_relation_managed_token_valid(
+                &relation->descriptor_reservation, governor, relation,
+                relation->descriptor_reserved_bytes)
+            || !wl_columnar_relation_managed_token_valid(
+                &relation->metadata_reservation, governor, relation,
+                relation->metadata_reserved_bytes)
+            || !wl_columnar_relation_managed_token_valid(
+                &relation->dedup_reservation, governor, relation,
+                relation->dedup_reserved_bytes)
+            || !wl_columnar_relation_managed_token_valid(
+                &relation->retained_reservation, governor, relation,
+                relation->retained_reserved_bytes))
+            return EINVAL;
+    } else if (relation->descriptor_reserved_bytes
+        || relation->metadata_reserved_bytes || relation->dedup_reserved_bytes
+        || relation->retained_reserved_bytes
+        || !wl_columnar_relation_managed_empty_token(
+            &relation->descriptor_reservation)
+        || !wl_columnar_relation_managed_empty_token(
+            &relation->metadata_reservation)
+        || !wl_columnar_relation_managed_empty_token(
+            &relation->dedup_reservation)
+        || !wl_columnar_relation_managed_empty_token(
+            &relation->retained_reservation))
+        return EINVAL;
+    if (relation->pool_name_reserved_bytes
+        || !wl_columnar_relation_managed_empty_token(
+            &relation->pool_name_reservation))
+        return EINVAL;
+    return 0;
+}
+
+static wl_columnar_memory_reservation_t *
+wl_columnar_relation_managed_token_at(col_rel_t *relation, size_t index,
+    uint64_t **bytes)
+{
+    switch (index) {
+    case 0:
+        *bytes = &relation->descriptor_reserved_bytes;
+        return &relation->descriptor_reservation;
+    case 1:
+        *bytes = &relation->metadata_reserved_bytes;
+        return &relation->metadata_reservation;
+    case 2:
+        *bytes = &relation->dedup_reserved_bytes;
+        return &relation->dedup_reservation;
+    default:
+        *bytes = &relation->retained_reserved_bytes;
+        return &relation->retained_reservation;
+    }
+}
+
+static int
+wl_columnar_relation_managed_retirement_detach(
+    wl_columnar_relation_managed_retirement_t *retirement, size_t index)
+{
+    uint64_t *bytes = NULL;
+    wl_columnar_memory_reservation_t *source =
+        wl_columnar_relation_managed_token_at(retirement->relation, index,
+            &bytes);
+    uint64_t state = atomic_load_explicit(&source->state, memory_order_acquire);
+
+    if (state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY) {
+        retirement->token_empty[index] = true;
+        wl_columnar_memory_reservation_init(source);
+        *bytes = 0;
+        return 0;
+    }
+    if (!wl_columnar_memory_reservation_move(&retirement->tokens[index],
+        source))
+        return EINVAL;
+    retirement->token_empty[index] = false;
+    retirement->token_bytes[index] = retirement->tokens[index].bytes;
+    retirement->token_owner_bits[index] = atomic_load_explicit(
+        &retirement->tokens[index].owner_bits, memory_order_acquire);
+    *bytes = 0;
+    return 0;
+}
+
+int
+wl_columnar_relation_managed_retirement_begin(
+    wl_columnar_relation_managed_retirement_t *retirement, col_rel_t *relation)
+{
+    if (!retirement || !relation || retirement->identity)
+        return EINVAL;
+    memset(retirement, 0, sizeof(*retirement));
+    retirement->identity = (uintptr_t)retirement;
+    retirement->relation = relation;
+    retirement->original_relation_address = (uintptr_t)relation;
+    retirement->phase
+        = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
+    for (size_t i = 0; i < 4; i++)
+        wl_columnar_memory_reservation_init(&retirement->tokens[i]);
+    return 0;
+}
+
+static int
+wl_columnar_relation_managed_retirement_charge(
+    wl_columnar_relation_managed_retirement_t *retirement,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+{
+    (void)retirement;
+    return wl_evaluation_control_charge_attempt(control, expected_attempt_id,
+               1);
+}
+
+static int
+wl_columnar_relation_managed_retirement_credit(
+    wl_columnar_relation_managed_retirement_t *retirement, size_t index,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id,
+    wl_columnar_relation_managed_retirement_phase_t next_phase)
+{
+    wl_columnar_memory_retirement_receipt_t *receipt =
+        &retirement->receipts[index];
+    wl_columnar_memory_retirement_phase_t phase;
+    bool owns_claim;
+    int terminal_status, rc;
+
+    if (retirement->token_empty[index]) {
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc == 0)
+            retirement->phase = next_phase;
+        return rc;
+    }
+    if (!retirement->receipt_started[index]) {
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        uint64_t state = atomic_load_explicit(
+            &retirement->tokens[index].state, memory_order_acquire);
+        if (retirement->tokens[index].bytes != retirement->token_bytes[index]
+            || atomic_load_explicit(&retirement->tokens[index].owner_bits,
+            memory_order_acquire) != retirement->token_owner_bits[index])
+            return EINVAL;
+        wl_columnar_memory_retirement_operation_t operation =
+            state == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+            ? WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED
+            : WL_COLUMNAR_MEMORY_RETIRE_RELEASE_COMMITTED;
+        const void *expected_owner = (const void *)(uintptr_t)
+            retirement->token_owner_bits[index];
+        rc = wl_columnar_memory_retirement_begin(&retirement->tokens[index],
+                retirement->governor, expected_owner, operation,
+                receipt);
+        if (rc == 0)
+            retirement->receipt_started[index] = true;
+        return rc;
+    }
+    rc = wl_columnar_memory_retirement_step(receipt, control,
+            expected_attempt_id);
+    if (rc != 0)
+        return rc;
+    rc = wl_columnar_memory_retirement_status(receipt, &phase, &owns_claim,
+            &terminal_status);
+    if (rc != 0)
+        return rc;
+    if (phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE) {
+        if (owns_claim || terminal_status)
+            return EINVAL;
+        retirement->phase = next_phase;
+    } else if (phase == WL_COLUMNAR_MEMORY_RETIREMENT_FAILED) {
+        return terminal_status ? terminal_status : EINVAL;
+    } else if ((phase == WL_COLUMNAR_MEMORY_RETIREMENT_CAPTURE
+        || phase == WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT) && !owns_claim) {
+        return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_relation_managed_retirement_step(
+    wl_columnar_relation_managed_retirement_t *retirement,
+    wl_evaluation_control_t *control, uint64_t expected_attempt_id)
+{
+    col_rel_t *relation;
+    int rc;
+
+    if (!retirement || retirement->identity != (uintptr_t)retirement
+        || retirement->original_relation_address == 0
+        || (!retirement->relation
+        && retirement->phase
+        < WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS)
+        || !expected_attempt_id)
+        return EINVAL;
+    if (retirement->phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE)
+        return 0;
+    relation = retirement->relation;
+    if (relation
+        && retirement->phase >= WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE
+        && retirement->phase
+        <= WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR) {
+        rc = wl_columnar_relation_managed_gate_round_validate(
+            &retirement->gate_round, relation);
+        if (rc != 0)
+            return rc;
+    }
+    switch (retirement->phase) {
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS: {
+        wl_columnar_source_access_gate_request_t requests[2] = {
+            { &relation->descriptor_access,
+              WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER },
+            { &relation->source_access,
+              WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER }
+        };
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_source_access_gate_round_acquire(
+            &retirement->gate_round, requests, 1, 1);
+        if (rc == 0)
+            retirement->phase++;
+        return rc;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_VALIDATE:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_relation_managed_retirement_validate(relation);
+        if (rc != 0) {
+            int release_rc = wl_columnar_source_access_gate_round_release(
+                &retirement->gate_round);
+            if (release_rc != 0)
+                return release_rc;
+            retirement->phase
+                = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
+            return rc;
+        }
+        retirement->phase
+            = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR;
+        return rc;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_METADATA:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DEDUP:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_RETAINED: {
+        size_t index = retirement->phase
+            - WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_DESCRIPTOR;
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_relation_managed_retirement_detach(retirement, index);
+        if (rc == 0)
+            retirement->phase++;
+        return rc;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DETACH_GOVERNOR:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        retirement->governor_ref = relation->memory_governor;
+        retirement->governor = retirement->governor_ref
+            ? wl_columnar_memory_governor_ref_get(retirement->governor_ref)
+            : NULL;
+        relation->memory_governor = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_0:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_1: {
+        size_t column = retirement->phase
+            - WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_0;
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (relation->columns && relation->columns[column]) {
+            free(relation->columns[column]);
+            relation->columns[column] = NULL;
+        }
+        retirement->phase++;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMNS_ARRAY:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        free((void *)relation->columns);
+        relation->columns = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_0:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_1: {
+        size_t column = retirement->phase
+            - WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMN_0;
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (relation->merge_columns && relation->merge_columns[column]) {
+            free(relation->merge_columns[column]);
+            relation->merge_columns[column] = NULL;
+        }
+        retirement->phase++;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_MERGE_COLUMNS_ARRAY:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        free((void *)relation->merge_columns);
+        relation->merge_columns = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_ROW_SCRATCH:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        free(relation->row_scratch);
+        relation->row_scratch = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_COLUMN_TYPES:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        free(relation->column_types);
+        relation->column_types = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_SCHEMA:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (relation->schema_ok) {
+            ArrowSchemaRelease(&relation->schema);
+            relation->schema_ok = false;
+        }
+        if (relation->col_names) {
+            free(relation->col_names[0]);
+            free(relation->col_names[1]);
+            free((void *)relation->col_names);
+            relation->col_names = NULL;
+        }
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ZERO_DESCRIPTOR:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (relation->columns || relation->merge_columns
+            || relation->row_scratch || relation->column_types
+            || relation->schema_ok || relation->descriptor_reserved_bytes
+            || relation->metadata_reserved_bytes
+            || relation->dedup_reserved_bytes
+            || relation->retained_reserved_bytes || relation->memory_governor)
+            return EINVAL;
+        memset(relation, 0, offsetof(col_rel_t, storage_alias_borrows));
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_FREE_DESCRIPTOR:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_source_access_gate_round_arm_terminal_consume(
+            &retirement->gate_round);
+        if (rc != 0)
+            return rc;
+        free(relation);
+        retirement->relation = NULL;
+        retirement->phase
+            = WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        rc = wl_columnar_source_access_gate_round_consume_terminal(
+            &retirement->gate_round);
+        if (rc != 0)
+            return rc;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_METADATA:
+        return wl_columnar_relation_managed_retirement_credit(retirement, 1,
+                   control, expected_attempt_id,
+                   WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DEDUP);
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DEDUP:
+        return wl_columnar_relation_managed_retirement_credit(retirement, 2,
+                   control, expected_attempt_id,
+                   WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED);
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_RETAINED:
+        return wl_columnar_relation_managed_retirement_credit(retirement, 3,
+                   control, expected_attempt_id,
+                   WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DESCRIPTOR);
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RETIRE_DESCRIPTOR:
+        return wl_columnar_relation_managed_retirement_credit(retirement, 0,
+                   control, expected_attempt_id,
+                   WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_METADATA);
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_METADATA:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DEDUP:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_RETAINED:
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DESCRIPTOR: {
+        size_t index = retirement->phase
+            == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_DESCRIPTOR
+            ? 0u : retirement->phase
+            - WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACK_METADATA + 1u;
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (retirement->receipt_started[index]
+            && wl_columnar_memory_retirement_acknowledge(
+                &retirement->receipts[index]) != 0)
+            return EINVAL;
+        retirement->phase++;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_RELEASE_GOVERNOR:
+        rc = wl_columnar_relation_managed_retirement_charge(retirement,
+                control, expected_attempt_id);
+        if (rc != 0)
+            return rc;
+        if (retirement->governor_ref)
+            wl_columnar_memory_governor_ref_release(retirement->governor_ref);
+        retirement->governor_ref = NULL;
+        retirement->governor = NULL;
+        retirement->phase++;
+        return 0;
+    case WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE:
+        return 0;
+    default:
+        return EINVAL;
+    }
+}
+
 /* Checked destruction and retirement leave the descriptor token embedded
  * through content cleanup. Return its credit only after the physical struct
  * has been freed. */

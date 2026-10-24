@@ -3610,8 +3610,19 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 op->right_relation, right, rk, kc, &diff_txn);
         if (txn_rc == 0)
             darr = diff_txn.working;
-        else
+        else {
             (void)col_arrangement_probe_bundle_release(&diff_bundle);
+            if (txn_rc == ENOTSUP) {
+                WL_DIFF_RELEASE_TMP();
+                col_rel_destroy(out);
+                wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+                wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+                if (right_filtered)
+                    col_rel_destroy(right_filtered);
+                return wl_columnar_join_dispose_left(
+                    stack, &left_e, txn_rc);
+            }
+        }
     }
 
     if (darr && darr->indexed_rows != right->nrows) {
@@ -4205,16 +4216,29 @@ wl_columnar_join_attempt_allocate(size_t bytes)
 * One registry slot and one byte each have their own actual admission. */
 static int
 wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
-    bool delta, col_rel_t **out, wl_evaluation_control_t *control, uint64_t id)
+    bool delta, col_rel_t **out, wl_evaluation_control_t *control, uint64_t id,
+    const wl_columnar_eval_private_bindings_t *private_bindings)
 {
     *out = NULL;
     if (!name) return 0;
-    for (uint32_t slot = 0; slot < session->nrels; ++slot) {
+    if (private_bindings
+        && session->nrels > UINT32_MAX - private_bindings->count)
+        return EOVERFLOW;
+    uint32_t count = private_bindings
+        ? private_bindings->count + session->nrels : session->nrels;
+    for (uint32_t slot = 0; slot < count; ++slot) {
         int rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
         if (rc) return rc;
-        col_rel_t *candidate = session->rels[slot];
-        const char *actual = candidate ? candidate->name : NULL;
+        bool private_entry = private_bindings
+            && slot < private_bindings->count;
+        col_rel_t *candidate = private_entry
+            ? private_bindings->entries[slot].relation
+            : session->rels[private_bindings
+                ? slot - private_bindings->count : slot];
+        const char *actual = private_entry
+            ? private_bindings->entries[slot].name
+            : candidate ? candidate->name : NULL;
         rc = wl_columnar_join_attempt_tail(control, id, 5, slot);
         if (rc) return rc;
         if (!actual) continue;
@@ -4642,6 +4666,12 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
         if (record->control != control || record->attempt_id != id)
             return EINVAL;
     }
+    const wl_columnar_eval_private_bindings_t *private_bindings = NULL;
+    if (owner) {
+        rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner, frame,
+                session, control, id, &private_bindings);
+        if (rc) return rc;
+    }
     if (!control) {
         int result = col_op_join(op, stack, session);
         status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
@@ -4770,7 +4800,7 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_lookup(session, op->right_relation, false,
-            &right, control, id);
+            &right, control, id, private_bindings);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     bool left_delta = stack->items[stack->top - 1].is_delta;
@@ -4780,7 +4810,7 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
         if (rc) goto done;
         rc = wl_columnar_join_attempt_lookup(session, op->right_relation, true,
-                &delta, control, id);
+                &delta, control, id, private_bindings);
         rc = wl_columnar_join_attempt_return(control, id, rc);
         if (rc) goto done;
     }
@@ -5174,6 +5204,12 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
         if (record->control != control || record->attempt_id != id)
             return EINVAL;
     }
+    const wl_columnar_eval_private_bindings_t *private_bindings = NULL;
+    if (owner) {
+        rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner, frame,
+                session, control, id, &private_bindings);
+        if (rc) return rc;
+    }
     if (!control) {
         int result = op->op == WL_PLAN_OP_SEMIJOIN
             ? col_op_semijoin(op, stack, session)
@@ -5305,7 +5341,7 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_lookup(session, op->right_relation, false,
-            &right, control, id);
+            &right, control, id, private_bindings);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
     rc = wl_columnar_join_attempt_charge(control, id,
