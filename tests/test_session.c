@@ -2217,8 +2217,9 @@ probe_compound_bytes(uint64_t *out)
     int rc = 0;
     if (!probe)
         return -1;
-    arena = wl_compound_arena_create_managed(0x53455353u, 4096u, 0u,
-            wl_columnar_memory_governor_ref_get(probe));
+    /* Match session creation, including the ref-owned admission context. */
+    arena = wl_arena_compound_arena_create_managed_ref(0x53455353u,
+            4096u, 0u, probe);
     if (!arena) {
         rc = -1;
     } else {
