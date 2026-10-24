@@ -24,8 +24,8 @@
  * can give a different answer on a different run at W > 1.  Those are
  * pre-existing defects tracked separately; they are reachable now
  * because the same programs used to crash instead.
- * wl_intern_create() and wl_intern_free() are not thread-safe and must
- * not overlap any other call on the same table.
+ * Creation and unpinned owner destruction must not overlap other calls.
+ * Owner retirement may overlap reads protected by independently held pins.
  */
 
 #ifndef WIRELOG_INTERN_H
@@ -77,10 +77,24 @@ wl_intern_create(void);
  * wl_intern_free:
  * @intern: (transfer full): Intern table to free (NULL-safe).
  *
- * Free an intern table and all interned strings.
+ * Relinquish the original owner and close new pin admission. Free the table
+ * and strings immediately without pins, otherwise when the last pin releases.
+ * This consumes the owner exactly once; ordinary unpinned borrowers must stop.
  */
 void
 wl_intern_free(wl_intern_t *intern);
+
+/* A pin keeps the table and immutable string addresses alive after the original
+ * owner calls free. Acquire only from a live owner, without racing its free;
+ * the table must already be attached to the matching governor. Returns EINVAL
+ * for missing/mismatched admission, EPIPE after owner retirement, EOVERFLOW on
+ * saturation. Pin state is mutex-protected. Each successful acquire needs one
+ * release; no release may overlap reads using that pin. Free closes new pins,
+ * and the last pin then destroys the table. Detach/rebind are BUSY while pinned.
+ * Existing put/get/reverse users still need their owner or pin to remain live. */
+int wl_intern_pin_acquire(wl_intern_t *intern,
+    wl_columnar_memory_governor_ref_t *governor);
+void wl_intern_pin_release(wl_intern_t *intern);
 
 /**
  * wl_intern_put:

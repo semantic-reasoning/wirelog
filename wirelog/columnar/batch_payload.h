@@ -35,6 +35,23 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out);
 
+/* Explicit STRING provenance: caller guarantees all STRING IDs originate in
+ * intern, already attached to governor. Pins retain strings beyond owner
+ * teardown; invalid IDs fail atomically. Numeric capture above still rejects
+ * STRING. Compound/graph layouts remain unsupported. Callbacks must not free
+ * the intern owner. Retained table storage is an additional resident floor. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_capture_with_intern(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, const struct col_rel *source,
+    uint32_t rows, wl_columnar_batch_payload_storage_t storage,
+    wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context,
+    wl_columnar_batch_payload_t **out);
+/* Resolve an ID read from a STRING lane. Borrowed result lives through reader
+ * release, even after intern owner retirement. Invalid IDs clear *out. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_resolve_string(
+    wl_columnar_batch_payload_reader_t *reader, uint64_t id, const char **out);
+
 /* Demote an exclusively owned resident payload. On success replaces *owner,
  * invalidating the old address and borrowed schema pointers; ordinals, types,
  * lane bits and metadata remain identical. Active readers return BUSY; an
@@ -43,7 +60,8 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture(
  * payload/store lifecycle operations. The store must remain live through this
  * call. Peak admission includes the old payload plus a spilled payload floor,
  * spill segment and writer floor (including path scratch); reserve that slack
- * before pressure exhausts it. Small/empty payloads may not save memory. */
+ * before pressure exhausts it. Small/empty payloads may not save memory.
+ * STRING demotion needs a new pin; intern owner retirement returns CLOSED. */
 wl_columnar_spill_status_t wl_columnar_batch_payload_spill(
     wl_columnar_batch_payload_t **owner, wl_columnar_spill_store_t *store,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context);

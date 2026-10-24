@@ -357,6 +357,86 @@ fd_count(void)
 }
 #endif
 
+static wl_columnar_spill_status_t
+string_source(void *context, uint64_t row, uint64_t *lanes,
+    wl_columnar_spill_metadata_t *metadata)
+{
+    lanes[0] = ((const uint64_t *)context)[row % 3];
+    *metadata = (wl_columnar_spill_metadata_t){7, 3, 1, -2};
+    return OK;
+}
+
+static void
+string_segments(const char *directory)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1u<<20);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    CHECK(wl_intern_put(intern, "") == 0);
+    CHECK(wl_intern_put(intern, "\xeb\xac\xb8\xec\x9e\x90\xec\x97\xb4") == 1);
+    uint64_t ids[] = {1, 0, 1};
+    wirelog_column_type_t schema[] = {WIRELOG_TYPE_STRING};
+    wl_columnar_spill_store_t *store; wl_columnar_spill_segment_t *s;
+    CHECK(wl_columnar_spill_store_open(directory, g, 4096, 32, &store) == OK);
+    uint64_t baseline = reserved(g);
+    CHECK(wl_columnar_spill_create(store, schema, 1, 3, string_source, ids,
+        NULL, NULL, &s) == WL_COLUMNAR_SPILL_UNSUPPORTED && !s);
+    for (int f = 1; f <= 5; f++) {
+        fault = f; calls = 0;
+        wl_columnar_spill_status_t rc = wl_columnar_spill_create_with_intern(
+            store, schema, 1, 3, string_source, ids, intern, NULL, NULL, &s);
+        fault = 0;
+        if (f == 1) {
+            CHECK(rc == OK); CHECK(wl_columnar_spill_release(s) == OK);
+        }else CHECK(rc != OK && !s);
+        CHECK(reserved(g) == baseline &&
+            wl_columnar_spill_store_bytes(store) == 0);
+        CHECK(wl_intern_detach_memory_governor(intern, g) == 0);
+        CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    }
+    for (unsigned fail = 1; fail <= 2; fail++) {
+        allocation_count = 0; allocation_fail = fail;
+        CHECK(wl_columnar_spill_create_with_intern(store, schema, 1, 3,
+            string_source, ids, intern, NULL, NULL,
+            &s) == WL_COLUMNAR_SPILL_ALLOCATION && !s);
+        allocation_fail = 0;
+        CHECK(reserved(g) == baseline);
+        CHECK(wl_intern_detach_memory_governor(intern, g) == 0);
+        CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    }
+    ids[2] = UINT64_MAX;
+    CHECK(wl_columnar_spill_create_with_intern(store, schema, 1, 3,
+        string_source, ids, intern, NULL, NULL,
+        &s) == WL_COLUMNAR_SPILL_INVALID && !s);
+    CHECK(reserved(g) == baseline && wl_columnar_spill_store_bytes(store) == 0);
+    ids[2] = 1;
+    CHECK(wl_columnar_spill_create_with_intern(store, schema, 1, 3,
+        string_source, ids, intern, NULL, NULL, &s) == OK);
+    uint32_t cols; uint64_t rows;
+    CHECK(wl_columnar_spill_schema(s, &cols,
+        &rows)[0] == WIRELOG_TYPE_STRING && cols == 1 && rows == 3);
+    wl_columnar_spill_reader_t *reader;
+    CHECK(wl_columnar_spill_acquire(s, &reader) == OK);
+    wl_intern_free(intern);
+    wl_columnar_spill_store_retire(store);
+    for (unsigned i = 0; i < 3; i++) {
+        const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+        const char *value;
+        CHECK(wl_columnar_spill_read(reader, i, NULL, NULL, &lanes,
+            &meta) == OK);
+        CHECK(meta.multiplicity == -2 && lanes[0] == ids[i]);
+        CHECK(wl_columnar_spill_resolve_string(reader, lanes[0], &value) == OK);
+        CHECK(strcmp(value,
+            ids[i] ? "\xeb\xac\xb8\xec\x9e\x90\xec\x97\xb4" : "") == 0);
+    }
+    const char *value = "sentinel";
+    CHECK(wl_columnar_spill_resolve_string(reader, UINT64_MAX,
+        &value) == WL_COLUMNAR_SPILL_INVALID && !value);
+    wl_columnar_spill_reader_release(reader);
+    CHECK(wl_columnar_spill_release(s) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(void)
 {
@@ -375,6 +455,7 @@ main(void)
     round_trip(directory, false);
     round_trip(directory, true);
     failures(directory);
+    string_segments(directory);
     wide_rows(directory);
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);

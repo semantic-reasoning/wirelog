@@ -567,10 +567,68 @@ test_denied_rebind_leaves_both_unchanged(void)
     return ok ? 0 : 1;
 }
 
+static int
+test_pinned_owner_retirement(void)
+{
+#define PIN_CHECK(x) do { if (!(x)) { fprintf(stderr, "pin: %d\n", __LINE__); \
+                                      return 1; } } while (0)
+    wl_intern_t *intern = wl_intern_create();
+    wl_columnar_memory_governor_ref_t *g = test_governor(1u<<20);
+    wl_columnar_memory_governor_ref_t *other = test_governor(1u<<20);
+    PIN_CHECK(intern && g && other);
+    PIN_CHECK(wl_intern_pin_acquire(intern, g) == EINVAL);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    PIN_CHECK(wl_intern_put(intern, "pinned") == 0);
+    const char *stable = wl_intern_reverse(intern, 0);
+    PIN_CHECK(wl_intern_pin_acquire(intern, other) == EINVAL);
+    PIN_CHECK(wl_intern_pin_acquire(intern, g) == 0);
+    PIN_CHECK(wl_intern_pin_acquire(intern, g) == 0);
+    PIN_CHECK(wl_intern_detach_memory_governor(intern, g) == EBUSY);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, other) == EBUSY);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, g) == EALREADY);
+    for (unsigned i = 0; i < 1024; i++) {
+        char value[32]; snprintf(value, sizeof(value), "value-%u", i);
+        PIN_CHECK(wl_intern_put(intern, value) > 0);
+    }
+    PIN_CHECK(stable == wl_intern_reverse(intern, 0));
+    uint64_t before =
+        wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g));
+    wl_intern_free(intern);
+    PIN_CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            g)) == before);
+    PIN_CHECK(wl_intern_pin_acquire(intern, g) == EPIPE);
+    PIN_CHECK(strcmp(stable, "pinned") == 0);
+    wl_intern_pin_release(intern);
+    PIN_CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            g)) == before);
+    PIN_CHECK(strcmp(wl_intern_reverse(intern, 0), "pinned") == 0);
+    wl_intern_pin_release(intern);
+    PIN_CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            g)) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_memory_governor_ref_release(other);
+    /* A pin must block orphan rebinding even when the table is sole governor holder. */
+    intern = wl_intern_create(); g = test_governor(1u<<20);
+    other = test_governor(1u<<20);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, g) == 0);
+    PIN_CHECK(wl_intern_pin_acquire(intern, g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, other) == EBUSY);
+    wl_intern_pin_release(intern);
+    PIN_CHECK(wl_intern_attach_memory_governor(intern, other) == 0);
+    wl_intern_free(intern);
+    PIN_CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            other)) == 0);
+    wl_columnar_memory_governor_ref_release(other);
+#undef PIN_CHECK
+    return 0;
+}
+
 int
 main(void)
 {
     int failures = 0;
+    failures += test_pinned_owner_retirement();
     failures += test_attach_and_release();
     failures += test_denied_growth_preserves_table();
     failures += test_duplicate_is_uncharged();

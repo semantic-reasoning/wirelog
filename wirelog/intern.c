@@ -45,9 +45,9 @@
  *      sees id < count therefore also sees the segment pointer and the
  *      string bytes it names.
  *
- * wl_intern_create() and wl_intern_free() are not concurrent with
- * anything: the table is created before workers start and destroyed
- * after they join.
+ * Creation and unpinned owner destruction are externally serialized.
+ * Owner retirement may overlap accesses protected by independent pins; final
+ * destruction occurs only when the owner and every pin have relinquished use.
  *
  * The per-put cost of the writer lock and of the governor admission
  * (Issue #1431) is measured by bench/bench_intern.c; the baseline numbers
@@ -159,6 +159,8 @@ struct wl_intern {
     wl_columnar_memory_governor_ref_t *memory_governor;
     wl_columnar_memory_reservation_t reservation;
     uint64_t reserved_bytes;
+    uint64_t pins;
+    bool owner_released;
 };
 
 static inline uint32_t intern_seg_size(uint32_t seg);
@@ -425,8 +427,8 @@ wl_intern_attach_memory_governor(
      * any more (the table is its only reference) is orphaned; rebind the
      * table to the caller's governor.  A held owner stays in charge. */
     bool rebind = intern->memory_governor != NULL;
-    if (rebind
-        && !wl_columnar_memory_governor_ref_is_sole(intern->memory_governor)) {
+    if (rebind && (intern->pins
+        || !wl_columnar_memory_governor_ref_is_sole(intern->memory_governor))) {
         wl_mutex_unlock(&intern->lock);
         return EBUSY;
     }
@@ -507,6 +509,10 @@ wl_intern_detach_memory_governor(
         wl_mutex_unlock(&intern->lock);
         return EBUSY;
     }
+    if (intern->pins) {
+        wl_mutex_unlock(&intern->lock);
+        return EBUSY;
+    }
     if (intern->reserved_bytes > 0)
         (void)wl_columnar_memory_release(&intern->reservation);
     intern->reserved_bytes = 0;
@@ -516,22 +522,16 @@ wl_intern_detach_memory_governor(
     return 0;
 }
 
-void
-wl_intern_free(wl_intern_t *intern)
+static void
+wl_intern_destroy(wl_intern_t *intern)
 {
-    if (!intern)
-        return;
-
-    uint32_t count;
-
-    wl_mutex_lock(&intern->lock);
-    count = WL_INTERN_LOAD_RELAXED(&intern->count);
-    if (intern->reserved_bytes > 0)
-        (void)wl_columnar_memory_release(&intern->reservation);
-    intern->reserved_bytes = 0;
-    wl_columnar_memory_governor_ref_release(intern->memory_governor);
-    intern->memory_governor = NULL;
-    wl_mutex_unlock(&intern->lock);
+    uint32_t count = WL_INTERN_LOAD_RELAXED(&intern->count);
+    wl_columnar_memory_governor_ref_t *governor = intern->memory_governor;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    bool admitted = intern->reserved_bytes > 0;
+    if (admitted && !wl_columnar_memory_reservation_move(&reservation,
+        &intern->reservation)) abort();
     for (uint32_t i = 0; i < count; i++)
         free(intern_string_at(intern, i));
 
@@ -541,6 +541,47 @@ wl_intern_free(wl_intern_t *intern)
     free(intern->slots);
     wl_mutex_destroy(&intern->lock);
     free(intern);
+    if (admitted && !wl_columnar_memory_release(&reservation)) abort();
+    wl_columnar_memory_governor_ref_release(governor);
+}
+
+void
+wl_intern_free(wl_intern_t *intern)
+{
+    if (!intern) return;
+    wl_mutex_lock(&intern->lock);
+    if (intern->owner_released) abort();
+    intern->owner_released = true;
+    bool destroy = intern->pins == 0;
+    wl_mutex_unlock(&intern->lock);
+    if (destroy) wl_intern_destroy(intern);
+}
+
+int
+wl_intern_pin_acquire(wl_intern_t *intern,
+    wl_columnar_memory_governor_ref_t *governor)
+{
+    if (!intern || !governor) return EINVAL;
+    wl_mutex_lock(&intern->lock);
+    int rc = 0;
+    if (intern->owner_released) rc = EPIPE;
+    else if (intern->memory_governor != governor) rc = EINVAL;
+    else if (intern->pins == UINT64_MAX) rc = EOVERFLOW;
+    else intern->pins++;
+    wl_mutex_unlock(&intern->lock);
+    return rc;
+}
+
+void
+wl_intern_pin_release(wl_intern_t *intern)
+{
+    if (!intern) return;
+    wl_mutex_lock(&intern->lock);
+    if (!intern->pins) abort();
+    intern->pins--;
+    bool destroy = intern->owner_released && !intern->pins;
+    wl_mutex_unlock(&intern->lock);
+    if (destroy) wl_intern_destroy(intern);
 }
 
 int64_t
