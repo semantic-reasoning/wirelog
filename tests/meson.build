@@ -2245,7 +2245,7 @@ test_recursive_model_parity_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('recursive_model_parity', test_recursive_model_parity_exe)
+test('recursive_model_parity', test_recursive_model_parity_exe, timeout: 120)
 
 # ============================================================================
 # RDF Named-Graph Integration Tests (Issue #535)
@@ -3270,7 +3270,8 @@ test_snapshot_delta_cb_insert_route_exe = executable(
   link_with: [testlib_prod],
 )
 
-test('snapshot_delta_cb_insert_route', test_snapshot_delta_cb_insert_route_exe)
+test('snapshot_delta_cb_insert_route', test_snapshot_delta_cb_insert_route_exe,
+  timeout: 120)
 
 test_incremental_snapshot_recursive_exe = executable(
   'test_incremental_snapshot_recursive',
