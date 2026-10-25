@@ -3489,13 +3489,286 @@ test_controlled_observed_step(void)
     wirelog_program_free(program);
 }
 
+static const char controlled_observed_filter_source[] =
+    ".decl input(x:int64)\n"
+    ".decl output(x:int64)\n"
+    "output(x) :- input(x), x > 0.\n";
+
+static wl_plan_t *
+controlled_observed_filter_plan(wirelog_program_t **program)
+{
+    wirelog_error_t error;
+    *program = wirelog_parse_string(controlled_observed_filter_source, &error);
+    CHECK(*program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(*program, &plan));
+    CHECK(plan->stratum_count == 1 && plan->strata[0].relation_count == 1);
+    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+    CHECK(r->op_count == 4 && r->ops[0].op == WL_PLAN_OP_VARIABLE
+        && r->ops[1].op == WL_PLAN_OP_FILTER
+        && r->ops[1].filter_expr.data && r->ops[1].filter_expr.size
+        && r->ops[2].op == WL_PLAN_OP_MAP
+        && r->ops[3].op == WL_PLAN_OP_CONSOLIDATE);
+    return plan;
+}
+
+static bool
+controlled_observed_filter_has(const col_rel_t *r, int64_t value)
+{
+    for (uint32_t i = 0; i < r->nrows; ++i)
+        if (r->columns[0][i] == value) return true;
+    return false;
+}
+
+static void
+controlled_observed_filter_compare(wl_session_t *controlled,
+    wl_session_t *reference)
+{
+    const col_rel_t *actual = session_find_rel((wl_col_session_t *)controlled,
+            "output");
+    const col_rel_t *expected = session_find_rel((wl_col_session_t *)reference,
+            "output");
+    CHECK(actual && expected && actual->ncols == 1 && expected->ncols == 1
+        && actual->nrows == expected->nrows);
+    for (uint32_t i = 0; i < actual->nrows; ++i) {
+        CHECK(controlled_observed_filter_has(expected, actual->columns[0][i]));
+        CHECK(!i || actual->columns[0][i - 1] < actual->columns[0][i]);
+    }
+}
+
+static void
+test_controlled_observed_filter_successors(void)
+{
+    const int64_t changes[] = {-9, -9, 3, 3, 12, 8};
+    const bool inserts[] = {true, false, true, false, true, false};
+    for (unsigned i = 0; i < 6; ++i) {
+        wirelog_program_t *program = NULL;
+        wl_plan_t *plan = controlled_observed_filter_plan(&program);
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL, *reference = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        wl_session_options_init(&options);
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &reference));
+        const int64_t rows[] = {-9, 0, 3, 3, 8};
+        CHECK(!wl_session_insert(session, "input", rows, 5, 1));
+        CHECK(!wl_session_insert(reference, "input", rows, 5, 1));
+        controlled_observer_capture_t capture = {.control = control};
+        wl_session_set_delta_cb(session, controlled_observer_capture, &capture);
+        CHECK(!controlled_recursive_run(session, control));
+        CHECK(!wl_session_step(reference));
+        CHECK(capture.count == 2 && capture.rows[0] == 3 && capture.rows[1] == 8
+            && capture.diffs[0] == 1 && capture.diffs[1] == 1);
+        controlled_observed_filter_compare(session, reference);
+        const col_rel_t *old = session_find_rel((wl_col_session_t *)session,
+                "output");
+        uint64_t identity = old->relation_identity;
+        bool before = controlled_observed_filter_has(old, changes[i]);
+        uint32_t events = capture.count;
+        int (*mutate)(wl_session_t *, const char *, const int64_t *,
+            uint32_t, uint32_t) = inserts[i] ? wl_session_insert
+            : wl_session_remove;
+        CHECK(!mutate(session, "input", &changes[i], 1, 1));
+        CHECK(!mutate(reference, "input", &changes[i], 1, 1));
+        CHECK(session_find_rel((wl_col_session_t *)session, "output") == old
+            && old->relation_identity == identity && capture.count == events);
+        CHECK(wl_session_snapshot(session, controlled_observer_snapshot_capture,
+            NULL) == EBUSY);
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!controlled_recursive_run(session, control));
+        CHECK(!wl_session_step(reference));
+        controlled_observed_filter_compare(session, reference);
+        bool after = controlled_observed_filter_has(session_find_rel(
+                    (wl_col_session_t *)reference, "output"), changes[i]);
+        CHECK(capture.count == events + (before != after));
+        if (before != after)
+            CHECK(capture.rows[events] == changes[i]
+                && capture.diffs[events] == (after ? 1 : -1));
+        CHECK(!wl_session_step(session) && capture.count == events
+            + (before != after));
+        /* Retained removal staging can exhaust the existing three-slot
+         * successor domain. Keep that refusal explicit; do not bypass it. */
+        if (((wl_col_session_t *)session)->nrels > 3) {
+            wl_col_session_t *col = (wl_col_session_t *)session;
+            CHECK(session_find_rel(col, "$r$input"));
+            const col_rel_t *input = session_find_rel(col, "input");
+            const col_rel_t *published = session_find_rel(col, "output");
+            uint32_t input_rows = input->nrows;
+            uint64_t input_generation = input->view_generation;
+            int64_t later = 17;
+            CHECK(wl_session_insert(session, "input", &later, 1, 1) == ENOTSUP);
+            CHECK(input->nrows == input_rows
+                && input->view_generation == input_generation
+                && !controlled_observed_filter_has(input, later));
+            CHECK(session_find_rel(col, "output") == published);
+            controlled_observed_filter_compare(session, reference);
+            CHECK(capture.count == events + (before != after));
+        }
+        wl_session_destroy(reference);
+        wl_session_destroy(session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
+static wl_evaluation_control_t *controlled_observed_filter_control;
+static uint64_t controlled_observed_filter_visits;
+static bool controlled_observed_filter_cancel;
+static wl_col_session_t *controlled_observed_filter_session;
+static const void *controlled_observed_filter_baseline;
+
+static void
+controlled_observed_filter_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    if (control != controlled_observed_filter_control || phase != 13) return;
+    if (controlled_observed_filter_baseline)
+        CHECK(controlled_observed_filter_session->delta_observer
+            == controlled_observed_filter_baseline);
+    CHECK(progress == controlled_observed_filter_visits);
+    controlled_observed_filter_visits++;
+    if (controlled_observed_filter_cancel && progress == 127)
+        wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_controlled_observed_filter_stops(void)
+{
+    enum { ROWS = 512 };
+    int64_t rows[ROWS];
+    for (unsigned i = 0; i < ROWS; ++i) rows[i] = -(int64_t)i - 1;
+    /* All initial rows are rejected. A successor inserts one qualifying row
+     * after that rejected prefix, so stopping the scan cannot emit it. */
+    for (unsigned successor = 0; successor < 2; ++successor) {
+        uint64_t calibrated_limit = 0;
+        for (unsigned trial = 0; trial < 4; ++trial) {
+            bool limited = (trial & 1) != 0;
+            bool destroy_stopped = trial >= 2;
+            wirelog_program_t *program = NULL;
+            wl_plan_t *plan = controlled_observed_filter_plan(&program);
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            wl_session_t *session = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1, &options, &session));
+            CHECK(!wl_session_insert(session, "input", rows, ROWS, 1));
+            controlled_observer_capture_t capture = {.control = control};
+            wl_session_set_delta_cb(session, controlled_observer_capture,
+                &capture);
+            const col_rel_t *old = NULL;
+            uint64_t old_identity = 0;
+            if (successor) {
+                CHECK(!controlled_recursive_run(session, control));
+                old = session_find_rel((wl_col_session_t *)session, "output");
+                CHECK(old && !old->nrows && !capture.count);
+                old_identity = old->relation_identity;
+                int64_t value = 9;
+                CHECK(!wl_session_insert(session, "input", &value, 1, 1));
+                CHECK(!wl_evaluation_control_reset(control));
+            }
+            CHECK(!wl_evaluation_control_configure(control,
+                limited ? calibrated_limit : 0));
+            controlled_observed_filter_control = control;
+            controlled_observed_filter_visits = 0;
+            controlled_observed_filter_cancel = !limited;
+            wl_columnar_filter_test_attempt_checkpoint =
+                controlled_observed_filter_checkpoint;
+            int rc = controlled_recursive_run(session, control);
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            controlled_observed_filter_control = NULL;
+            CHECK(rc == (limited ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                    : WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(!capture.count && controlled_observed_filter_visits > 0
+                && controlled_observed_filter_visits < ROWS);
+            if (!limited) CHECK(controlled_observed_filter_visits == 128);
+            const col_rel_t *head =
+                session_find_rel((wl_col_session_t *)session,
+                    "output");
+            CHECK(head == old);
+            if (head) CHECK(head->relation_identity == old_identity
+                    && head->nrows == 0);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == rc && !report.cleanup_status);
+            /* Empirical allowance for reaching the rejected scan, not an
+             * independent exact-cost oracle: cancellation includes cleanup. */
+            if (!limited) calibrated_limit = report.consumed;
+            CHECK(calibrated_limit > 0);
+            if (destroy_stopped) {
+                controlled_observed_filter_control = control;
+                controlled_observed_filter_cancel = false;
+                wl_columnar_filter_test_attempt_checkpoint =
+                    controlled_observed_filter_checkpoint;
+                if (limited) {
+                    CHECK(wl_session_try_destroy(&session) == EBUSY && session);
+                    CHECK(!wl_evaluation_control_reset(control));
+                    CHECK(!wl_evaluation_control_configure(control, 0));
+                    wl_evaluation_control_request_cancel(control);
+                    CHECK(controlled_recursive_run(session, control)
+                        == WL_EVALUATION_CONTROL_CANCELLED);
+                }
+                uint64_t visits = controlled_observed_filter_visits;
+                CHECK(!wl_session_try_destroy(&session) && !session);
+                CHECK(!capture.count && controlled_observed_filter_visits
+                    == visits);
+                wl_columnar_filter_test_attempt_checkpoint = NULL;
+                controlled_observed_filter_control = NULL;
+                wl_evaluation_control_release(control);
+                wl_plan_free(plan);
+                wirelog_program_free(program);
+                continue;
+            }
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            controlled_observed_filter_session = (wl_col_session_t *)session;
+            controlled_observed_filter_baseline =
+                controlled_observed_filter_session->delta_observer;
+            CHECK(controlled_observed_filter_baseline);
+            controlled_observed_filter_control = control;
+            controlled_observed_filter_cancel = false;
+            controlled_observed_filter_visits = 0;
+            wl_columnar_filter_test_attempt_checkpoint =
+                controlled_observed_filter_checkpoint;
+            CHECK(!controlled_recursive_run(session, control));
+            CHECK(controlled_observed_filter_visits == ROWS + successor);
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            controlled_observed_filter_control = NULL;
+            controlled_observed_filter_baseline = NULL;
+            controlled_observed_filter_session = NULL;
+            head = session_find_rel((wl_col_session_t *)session, "output");
+            CHECK(head && head->nrows == successor &&
+                capture.count == successor);
+            if (successor) CHECK(capture.rows[0] == 9 && capture.diffs[0] == 1);
+            CHECK(!wl_session_step(session) && capture.count == successor);
+            col_rel_t *input = session_find_rel((wl_col_session_t *)session,
+                    "input");
+            wl_columnar_source_access_writer_t writer = {0};
+            CHECK(!col_rel_source_writer_acquire(input, &writer));
+            CHECK(!wl_columnar_source_access_writer_release(&writer));
+            wl_session_destroy(session);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan);
+            wirelog_program_free(program);
+        }
+    }
+}
+
 static void
 test_controlled_observed_preflight_rejections(void)
 {
     static const char unsupported[] =
         ".decl input(x:int64)\n"
         ".decl output(x:int64)\n"
-        "output(x) :- input(x), x > 0.\n";
+        "output(x+1) :- input(x), x > 0.\n";
     static const char wrong_type[] =
         ".decl input(x:float)\n"
         ".decl output(x:float)\n"
@@ -3504,8 +3777,8 @@ test_controlled_observed_preflight_rejections(void)
         ".decl input(x:int64)\n"
         ".decl output(x:int64)\n"
         "output(x) :- input(x).\n";
-    const char *sources[] = { unsupported, wrong_type, valid };
-    for (unsigned i = 0; i < 3; ++i) {
+    const char *sources[] = { unsupported, wrong_type, valid, valid };
+    for (unsigned i = 0; i < 4; ++i) {
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(sources[i], &error);
         CHECK(program);
@@ -3530,6 +3803,9 @@ test_controlled_observed_preflight_rejections(void)
             CHECK(!session_add_rel((wl_col_session_t *)session,
                 registered_empty));
         }
+        if (i == 3)
+            CHECK(!wl_columnar_eval_delta_observer_begin(
+                    (wl_col_session_t *)session, UINT64_MAX));
         controlled_observer_capture_t capture = { .control = control };
         wl_session_set_delta_cb(session, controlled_observer_capture,
             &capture);
@@ -3540,6 +3816,12 @@ test_controlled_observed_preflight_rejections(void)
         if (registered_empty) {
             CHECK(session_find_rel((wl_col_session_t *)session, "output")
                 == registered_empty && registered_empty->nrows == 0);
+        }
+        if (i == 3) {
+            wl_columnar_eval_delta_observer_set_active(
+                (wl_col_session_t *)session, false);
+            CHECK(!wl_columnar_eval_delta_observer_discard(
+                    (wl_col_session_t *)session));
         }
         wl_session_destroy(session);
         wl_evaluation_control_release(control);
@@ -8659,6 +8941,8 @@ main(void)
     test_controlled_recursive_step_rejects_unsupported_shape();
     test_controlled_session_step_resume();
     test_controlled_observed_step();
+    test_controlled_observed_filter_successors();
+    test_controlled_observed_filter_stops();
     test_controlled_observed_preflight_rejections();
     test_controlled_observed_large_output();
     test_controlled_session_join_step();

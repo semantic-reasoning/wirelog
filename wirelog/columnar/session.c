@@ -174,7 +174,7 @@ struct wl_columnar_controlled_step {
     col_rel_t *successor_candidate;
     wl_columnar_source_access_reader_t successor_input_reader;
     wl_plan_relation_t successor_relation;
-    wl_plan_op_t successor_ops[3];
+    wl_plan_op_t successor_ops[4];
     wl_columnar_eval_serial_framed_host_reply_kind_t previous_kind;
     int previous_protocol;
     int primary_result;
@@ -6318,10 +6318,20 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
     const wl_plan_t *plan = sess->plan;
     const wl_plan_relation_t *only_relation = NULL;
     uint32_t relation_count = 0;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    /* A stopped rule retains its own baseline for the next control attempt.
+     * Do not mistake that owned, unevaluated baseline for a foreign observer. */
+    bool retained_baseline = step && step->observed && step->baseline_ready
+        && !step->operation_active && !step->complete && !step->published
+        && !step->observer_evaluated && !step->observer_preparing
+        && !step->observer_prepare_discard && !step->observer_prepared
+        && !step->observer_cleanup_pending
+        && !wl_columnar_eval_delta_observer_evaluated(sess);
     if (sess->cleanup_active || sess->cleanup_pending)
         return EBUSY;
     if (!plan || !plan->strata || !sess->base.evaluation_control
-        || sess->delta_observer || sess->current_iteration
+        || (sess->delta_observer && !retained_baseline)
+        || sess->current_iteration
         || sess->retraction_seeded || sess->retraction_right_pass
         || sess->tdd_input_run || sess->tdd_subpass_active
         || sess->tdd_outbound_only_active || sess->diff_operators_active
@@ -6330,7 +6340,7 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
         || sess->coordinator || sess->num_workers > 1
         || sess->cleanup_active || sess->cleanup_pending
         || wl_columnar_eval_delta_rollback_active(sess)
-        || wl_columnar_eval_delta_observer_active(sess))
+        || (wl_columnar_eval_delta_observer_active(sess) && !retained_baseline))
         return ENOTSUP;
 
     /* The first controlled recursive route is intentionally exact: one
@@ -6381,16 +6391,22 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
             return ENOTSUP;
         if (plan->stratum_count != 1 || relation_count != 1
             || !only_relation || !only_relation->name
-            || only_relation->op_count != 3 || !only_relation->ops
+            || (only_relation->op_count != 3 && only_relation->op_count != 4)
+            || !only_relation->ops
             || only_relation->ops[0].op != WL_PLAN_OP_VARIABLE
-            || only_relation->ops[1].op != WL_PLAN_OP_MAP
-            || only_relation->ops[2].op != WL_PLAN_OP_CONSOLIDATE
+            || (only_relation->op_count == 4
+            && only_relation->ops[1].op != WL_PLAN_OP_FILTER)
+            || only_relation->ops[only_relation->op_count - 2].op
+            != WL_PLAN_OP_MAP
+            || only_relation->ops[only_relation->op_count - 1].op
+            != WL_PLAN_OP_CONSOLIDATE
             || !only_relation->ops[0].relation_name
             || (successor
             ? !session_find_rel(sess, only_relation->name)
             : session_find_rel(sess, only_relation->name) != NULL))
             return ENOTSUP;
-        const wl_plan_op_t *map = &only_relation->ops[1];
+        const wl_plan_op_t *map =
+            &only_relation->ops[only_relation->op_count - 2];
         if (map->project_count != 1 || !map->project_indices
             || map->project_indices[0] != 0
             || (map->map_expr_count && (!map->map_exprs
@@ -8707,6 +8723,9 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step,
     const wl_plan_relation_t *source_relation)
 {
+    if (!source_relation || !source_relation->ops
+        || (source_relation->op_count != 3 && source_relation->op_count != 4))
+        return ENOTSUP;
     const char *input_name = source_relation->ops[0].relation_name;
     col_rel_t *input = session_find_rel(sess, input_name);
     col_rel_t *head = session_find_rel(sess, source_relation->name);
@@ -8734,7 +8753,7 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
         step->successor_relation = *source_relation;
         step->successor_relation.name = step->successor_private_name;
         memcpy(step->successor_ops, source_relation->ops,
-            sizeof(step->successor_ops));
+            source_relation->op_count * sizeof(step->successor_ops[0]));
         step->successor_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
         step->successor_relation.ops = step->successor_ops;
         return 0;
@@ -8842,6 +8861,11 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
         if (reader_rc != 0)
             return reader_rc;
     }
+    /* The drained host relinquishes its retained baseline before generic
+     * observer disposal. No evaluation or publication remains in flight. */
+    if (step->observed && step->baseline_ready && !step->observer_evaluated
+        && !step->published && !wl_columnar_eval_delta_observer_evaluated(sess))
+        wl_columnar_eval_delta_observer_set_active(sess, false);
     col_controlled_step_grant_release(step, &step->previous_funding);
     free(step->successor_private_name);
     free(step);

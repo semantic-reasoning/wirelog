@@ -625,6 +625,9 @@ testing the actual optimizer pipeline.
 
 ## Evaluation-control foundation and controlled initial STEP (#1819, #1821)
 
+The [#1821 closure plan](implementation/1821/CLOSURE_PLAN.md) tracks serial
+coverage, remaining work packages, and the evidence required for closure.
+
 `wirelog/evaluation_control.h` is internal and uninstalled. It provides a
 retained control, exclusive logical-session ownership, attempt accounting,
 cooperative cancellation requests and completed reports. Internal session
@@ -635,11 +638,13 @@ only during creation. A control on a backend without the options hook is refused
 
 An attached control enables a limited controlled initial `wl_session_step()`
 for an acyclic plan using the columnar backend. Before evaluation, the session
-checks every stratum, rule head, and operator kind. Recursive plans, parallel
+checks every stratum, rule head, and operator kind. Unsupported recursive plans, parallel
 execution, differential/retraction state, unsupported operator kinds, and
 pre-existing rule-head relations return `ENOTSUP` without evaluation. The
 observed callback route is currently limited further to one unary INT64 EDB
-rule with the exact `VARIABLE -> MAP(identity col0) -> CONSOLIDATE` plan shape.
+rule with `VARIABLE -> MAP(identity col0) -> CONSOLIDATE`, optionally with
+one FILTER between VARIABLE and MAP. Predicate validation and execution use
+the existing charged numeric FILTER path, including rejected rows.
 Its missing IDB head is represented by a virtual empty observer baseline; that
 baseline does not register or publish the relation. The framed evaluator
 registers the output only with its normal commit. A separately registered
@@ -651,7 +656,9 @@ The framed evaluator validates each operator's detailed metadata before
 executing that operator; a later execution error can therefore follow an
 already published rule prefix. A work stop at a rule boundary preserves that
 committed prefix, and a fresh STEP attempt resumes at the first unfinished
-rule. In the observed route, a stop after rule commit resumes observer
+rule. In the observed route, a stop inside FILTER retains the unevaluated baseline
+for a reset/retry of the same logical STEP; unrelated observer state is still
+rejected. A stop after rule commit resumes observer
 preparation or delivery without rerunning the rule. Before callbacks begin,
 the complete event batch is charged and a final cancellation cutoff is polled.
 Publication then latches before entering user code and delivers the full batch
@@ -1570,15 +1577,16 @@ checkpoints, so this fixture measurement is not a general source tariff.
 Supported serial nonrecursive STEP now uses the bounded default proof described
 above. The single-relation INT64 path plans described above are the only
 recursive routes admitted; other recursive plans and unsupported whole-session
-routes are rejected before evaluation. Controlled SNAPSHOT remains unsupported.
-TDD/multiworker, differential, and whole controlled observer delivery remain
-outside this slice.
+routes are rejected before evaluation. Controlled SNAPSHOT can deliver an
+already completed STEP; evaluating fresh or dirty state remains unsupported.
+TDD/multiworker, general differential, and unrestricted observer composition
+remain outside this slice. The restricted unary observed routes are described below.
 Raw references and coverage for those routes remain, with this split:
 
 | Former whole controlled expectation | Replacement or remaining scope |
 |---|---|
 | STEP admission owner and same-attempt pre-cancellation | Bounded default proof and real aware-entry retry/cancellation coverage; unsupported recursive and observer routes remain fail-closed |
-| STEP observer cutoff and retry | Raw observer reference and unchanged-state refusal coverage; whole controlled observer delivery/resume remains deferred |
+| STEP observer cutoff and retry | Restricted unary identity/optional-FILTER initial and successor delivery; general observer composition remains deferred |
 | Snapshot evaluating/stable cutoffs preserve `base_nrows`, stable flags, pin/reclaim unwind and cancellation precedence | Raw evaluating/stable references and direct lower quiescent/reclaimer checks; whole controlled snapshot bookkeeping/precedence remains deferred |
 
 This adds bounded preflight for supported serial nonrecursive controlled STEP
@@ -1666,7 +1674,9 @@ callback scheduling, and does not complete #1821 acceptance coverage.
 The controlled observed STEP host also admits a narrow successor after its
 initial STEP has completed: exactly one nonzero row insert or remove on the
 unary INT64 input of the supported one-rule `VARIABLE -> MAP(identity) ->
-CONSOLIDATE` plan. Unsupported mutation shapes fail before backend mutation;
+CONSOLIDATE` or `VARIABLE -> FILTER -> MAP(identity) -> CONSOLIDATE` plan.
+The optional FILTER uses the existing charged numeric predicate path: rejected
+rows consume work and observe cancellation even when no output is produced. Unsupported mutation shapes fail before backend mutation;
 zero-row calls do not create successor work. A supported mutation makes
 snapshots busy until the next controlled STEP. That STEP recomputes into a
 private relation, compares it with the last committed output, and emits the
@@ -1680,7 +1690,11 @@ plan shapes, weighted rows, JOIN, recursion or the remaining #1821 acceptance
 criteria.
 This host also bounds that shape to three registered relation slots (input,
 committed output and one private candidate); sessions exceeding that bound
-reject successor mutation before it enters the backend.
+reject successor mutation before it enters the backend. Removal can retain
+`$r$input` staging and exhaust that bound after a successful successor; the
+next mutation then returns `ENOTSUP` without changing input or output. Repeated
+mutation cycles need bounded staging retirement/reuse coordinated with #1820;
+this support does not establish indefinitely reusable successor sequences.
 
 Other observer plans remain disabled. The restricted recursive reachability
 route and controlled initial single-rule STEP entrypoint are documented above. For that route, the committed unary INT64
