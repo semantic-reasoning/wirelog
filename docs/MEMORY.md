@@ -4339,3 +4339,52 @@ Automatic evaluator routing, cold relation eviction, bounded partitioned index
 access, SIDE/nested values, public spill options and scheduling remain follow-up
 work. A workload whose resident index cannot fit remains unsupported; #1385 is
 not qualified and #1372 is not complete.
+
+### Signed-weighted payload JOIN (#1372)
+
+`wl_columnar_payload_join_create_weighted` explicitly opts into the zero-coordinate
+Z-set algebra used by `col_op_join_weighted`: every matching pair emits the
+concatenated tuple with the product of its two int64 multiplicities. Negative
+weights represent retractions. Zero products are emitted too; the producer does
+not consolidate equal tuples or apply deletions. Cancellation of equal tuple
+weights is a downstream aggregation operation. Numeric physical types and exact
+lane bits are retained across resident, spilled and demoted inputs and outputs.
+
+The weighted capability accepts signed weights only when iteration, stratum and
+worker coordinates are zero on every row of both inputs, including unmatched
+rows. Missing input timestamps still mean weight +1. Nonzero logical times remain
+UNSUPPORTED: no time ordering, epoch/frontier composition or timed differential
+JOIN is inferred. The ordinary payload JOIN constructor retains its stricter
+`{0,0,0,+1}` metadata requirement. Existing ordinary and differential evaluator
+JOIN paths are unchanged; the rows-only differential producer is not a metadata
+oracle for this capability.
+
+Products use the existing portable checked int64 arithmetic helper, and only
+matching keys are multiplied. An out-of-range product produces sticky OVERFLOW,
+clears the current private output batch and publishes none of that batch. Earlier
+committed batches remain visible: this is batch-level atomic publication, not
+whole-JOIN rollback. Retry and ambiguous-commit behavior follow the same frozen
+pending-batch contract as the ordinary producer, preserving each weight exactly
+once. Output timestamps are fully initialized with zero coordinates and the
+checked product. Left multiplicity is retained with its current probe row across
+scan progress and publication retries.
+
+`batch_bytes` still bounds output lane storage. Weighted output additionally
+reserves timestamp capacity through the existing governed relation constructor;
+that storage, retained input readers, the ordinal index and producer metadata
+must all fit. Tests check exact admission and one-byte-below refusal, including
+the extra timestamp capacity, and run both ordinary and weighted output under
+the existing 64 KiB prepared-payload execution budget. The O(right rows) resident
+index, externally prepared input floor and generic continuation's fixed
+ungoverned descriptor remain as previously documented. Cancellation of an active
+continuation releases input readers, index and timestamped scratch. After DONE,
+`destroy` is required to release retained resources.
+
+Coverage includes signed/zero products through resident/direct-spilled/demoted
+publication, duplicate tuple cancellation, first/last and arithmetic boundary
+values, nonmatching extreme weights, a partial-batch overflow after an earlier
+commit, concurrent self-JOIN consumers, I/O failure, cancellation and complete
+reservation refunds. General logical-time support, automatic evaluator cold
+relation routing, bounded partitioned indexes, public spill configuration and
+#1373 scheduling remain separate work. This advances signed-difference indexed
+execution but does not complete #1372 or qualify #1385.
