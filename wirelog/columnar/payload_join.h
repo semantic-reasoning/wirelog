@@ -1,0 +1,45 @@
+/* Explicit indexed JOIN over pinned immutable payloads; internal API. */
+#ifndef WL_COLUMNAR_PAYLOAD_JOIN_H
+#define WL_COLUMNAR_PAYLOAD_JOIN_H
+
+#include "columnar/batch_payload.h"
+#include "columnar/continuation.h"
+
+/* Both owners remain caller-owned. Separate readers pin them (also for self
+ * JOIN), so release/demotion is BUSY until active cancellation or destruction.
+ * The same governor is required. Inputs must have scalar numeric schemas,
+ * INT64 keys and default
+ * metadata {0,0,0,+1}; constructor checks ALL rows before publication.
+ * Output concatenates left then right lanes with their original physical types.
+ * STRING/INLINE, FLOAT keys and differential metadata are UNSUPPORTED.
+ *
+ * batch_bytes bounds output lane storage, not total memory. Producer, index,
+ * types, readers and output relation are governed. The resident ordinal hash
+ * index is O(right rows); it must fit in addition to input payloads and bounded
+ * reader/output scratch. The generic continuation's fixed descriptor remains
+ * an additional ungoverned allocation, as in other continuation producers.
+ * Construction streams both inputs; cancel is checked per row. Publication
+ * scans at most 256 row/chain actions per call, returning PROGRESS if no output.
+ * Pending batches remain frozen on sink failure. Read/cancel errors are sticky
+ * and available via error(); they never become DONE or absent matches.
+ *
+ * Serialized lifecycle/publication; independently created producers can run
+ * concurrently over the same immutable inputs. Cancel frees readers, index and
+ * output scratch while active. After DONE, cancel is a no-op: destroy is
+ * required to release all retained resources. Destroy also frees the producer
+ * and generic continuation.
+ * Callbacks must not reenter or tear down input/store/producer lifecycle.
+ * No automatic evaluator routing, controlled-attempt or scheduler integration.
+ */
+wl_columnar_spill_status_t wl_columnar_payload_join_create(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_continuation_t **out);
+/* Only for a continuation returned by create(); NULL returns INVALID.
+ * Reports producer errors, not errors owned by the publication sink. */
+wl_columnar_spill_status_t wl_columnar_payload_join_error(
+    const wl_columnar_continuation_t *continuation);
+
+#endif

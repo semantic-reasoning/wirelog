@@ -136,6 +136,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/join.c',
     '../wirelog/columnar/join_batch.c',
     '../wirelog/columnar/batch_payload.c',
+    '../wirelog/columnar/payload_join.c',
     '../wirelog/columnar/join_pipeline.c',
     '../wirelog/columnar/diff_join_batch.c',
     '../wirelog/columnar/kfusion.c',
@@ -2081,6 +2082,7 @@ backend_src = files(
   '../wirelog/columnar/continuation.c',
   '../wirelog/columnar/join_batch.c',
   '../wirelog/columnar/batch_payload.c',
+  '../wirelog/columnar/payload_join.c',
   '../wirelog/columnar/join_pipeline.c',
   '../wirelog/columnar/diff_join_batch.c',
   '../wirelog/columnar/lftj.c',
@@ -6566,3 +6568,14 @@ test_batch_payload_exe = executable(
   link_with: [testlib_prod],
 )
 test('batch_payload', test_batch_payload_exe, suite: ['unit', 'tsan'], timeout: 120)
+
+# #1372 explicit indexed JOIN over immutable resident/spilled payloads.
+test_payload_join_exe = executable(
+  'test_payload_join', files('test_payload_join.c',
+    '../wirelog/columnar/payload_join.c', '../wirelog/columnar/spill.c'),
+  c_args: ['-DWL_TEST_PAYLOAD_JOIN=1', '-DWL_TEST_SPILL=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('payload_join', test_payload_join_exe, suite: ['unit', 'tsan'], timeout: 120)
