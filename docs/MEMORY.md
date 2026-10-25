@@ -4210,3 +4210,56 @@ Compound payload capture/spill still rejects compound layouts. Retaining arena
 bytes does not retain nested intern references or establish logical layout and
 provenance. Those contracts, cold indexed readers, public spill configuration,
 and scheduler integration remain follow-up work; #1372 is not complete.
+
+
+### Flat INLINE compound spill with explicit provenance (#1372)
+
+`wl_columnar_batch_payload_capture_with_inline` accepts originating
+`wirelog_column_t` declarations and their intern table. The source relation must
+have reliable physical column types and matching INLINE arity map, compound
+count and first offset. Declarations distinguish unary compounds from scalars
+and expose SIDE columns hidden by an aggregate INLINE summary. Scalar types,
+physical offsets, total widths and the supported arity bound are checked.
+
+This is an explicit trusted producer capability: declarations and table must
+originate from the source, and expanded arguments must be flat self-contained
+scalars. Neither `wirelog_column_t` nor integer lane bits can prove that an
+arbitrary value is not a nested handle. Observable SIDE and graph layouts are
+rejected; nested references are outside the capability. The older numeric and
+STRING capture entry points continue rejecting compound layouts.
+
+Payloads own immutable copies of kind, type, functor ID, arity and physical
+offset. Column names are excluded (`name == NULL`), as with the existing scalar
+payload schema contract. Physical types remain separately accessible. The
+INLINE spill format records those five fields explicitly as 20-byte records,
+with a logical count and version marker; no pointers or struct padding are
+written. Every read checks the persisted schema against the retained descriptors.
+Verification streams one record through the already-admitted row scratch
+(minimum 32 bytes), even when the full logical schema exceeds that scratch.
+
+The `_floor_with_inline` helpers include copied logical descriptors. Spill quota
+includes the logical count and encoded descriptors; creation and demotion check
+that quota before publication. Both the payload and its segment retain their
+own charged schema copies in spilled mode. Per-reader and writer scratch depend
+on physical row width, not row count or total encoded schema size. The full
+intern table remains a separately admitted resident floor and is pinned for
+functor IDs even when all argument lanes are numeric. Source relations,
+declaration arrays, column names, sessions and programs are not retained.
+
+Resident capture, direct spill and transactional demotion preserve the same
+semantic descriptors, lane bits and signed timestamp metadata. Demotion needs
+a new intern pin and therefore returns CLOSED after the intern owner retires,
+leaving the original resident payload unchanged. Already acquired readers can
+resolve functors and STRING arguments after source/session/program teardown.
+The explicit INLINE initializer on the existing transactional payload sink
+borrows its configuration only during synchronous publication; it does not
+infer JOIN output declarations or change the global batch payload convention.
+
+The integration test evaluates a parsed program with typed INLINE input,
+explicitly binds its parsed logical declaration through the existing relation
+layout API, and publishes it through the transactional sink in resident, spilled and
+demoted forms, then destroys the session and program before reading the results.
+This proves that relation-backed sink path, not automatic INLINE JOIN scheduling.
+SIDE contents live in side relations and are not preserved by merely holding
+arena handles. SIDE/nested capture, cold indexed execution, public spill options
+and scheduler integration remain outstanding; #1372 stays open.

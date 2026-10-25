@@ -1,4 +1,4 @@
-/* Internal immutable numeric spill segments; not a durable interchange format. */
+/* Internal immutable spill segments; not a durable interchange format. */
 #ifndef WL_COLUMNAR_SPILL_H
 #define WL_COLUMNAR_SPILL_H
 
@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "intern.h"
+
+#define WL_COLUMNAR_SPILL_INLINE_MAX_ARITY 4u
 
 typedef struct wl_columnar_spill_store wl_columnar_spill_store_t;
 typedef struct wl_columnar_spill_segment wl_columnar_spill_segment_t;
@@ -50,6 +52,17 @@ typedef struct {
 wl_columnar_spill_status_t wl_columnar_spill_floor(const char *directory,
     uint32_t ncols, wl_columnar_spill_floor_t *out);
 
+/* INLINE semantic metadata floor. Logical descriptors are copied without
+ * names. Verification streams one 20-byte record at a time through row scratch;
+ * schema size does not create a whole-schema scratch allocation. */
+wl_columnar_spill_status_t wl_columnar_spill_floor_with_inline(
+    const char *directory, uint32_t ncols, uint32_t logical_count,
+    wl_columnar_spill_floor_t *out);
+/* Structural check shared by relation capture; does not pin/inspect intern. */
+wl_columnar_spill_status_t wl_columnar_spill_validate_inline_schema(
+    const wirelog_column_type_t *types, uint32_t ncols,
+    const wirelog_column_t *columns, uint32_t logical_count);
+
 /* Explicit opt-in only. Directory must already exist and remain under caller
  * control. max_row_bytes bounds each reader/writer scratch, quota includes
  * header/schema. Governor must be non-NULL and is retained until close.
@@ -69,7 +82,7 @@ wl_columnar_spill_status_t wl_columnar_spill_store_close(
  * A store pointer borrowed through a live segment may only inspect bytes or
  * attempt create (CLOSED), never close/retire again. Lifecycle calls, including
  * retirement, remain externally serialized. Numeric handles retain no session,
- * callback context or compound arena; STRING segments additionally pin intern. */
+ * callback context or compound arena; STRING/INLINE segments additionally pin intern. */
 void wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store);
 /* Live-store identity check for adapters sharing admission with the store. */
 bool wl_columnar_spill_store_uses_governor(
@@ -96,8 +109,30 @@ wl_columnar_spill_status_t wl_columnar_spill_create_with_intern(
     void *source_context, wl_intern_t *intern,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_spill_segment_t **out);
+/* Explicit flat INLINE capability. Originating declarations and physical
+ * types must describe self-contained scalar arguments, never nested handles.
+ * The caller guarantees that provenance: integer bits cannot prove flatness.
+ * Declarations/types and the intern owner remain live and unchanged during
+ * creation, including source/cancellation callbacks.
+ * SIDE declarations are rejected. Names are excluded; all five semantic fields
+ * are copied and persisted. Intern is required and pinned for functor IDs even
+ * when every physical argument is numeric. Scalar APIs still reject compounds.
+ * Owner retirement closes new captures; existing readers resolve functors via
+ * resolve_string. Retained intern storage is additional resident floor. */
+wl_columnar_spill_status_t wl_columnar_spill_create_with_inline(
+    wl_columnar_spill_store_t *store, const wirelog_column_type_t *types,
+    uint32_t ncols, uint64_t nrows, wl_columnar_spill_source_fn source,
+    void *source_context, const wirelog_column_t *columns,
+    uint32_t logical_count, wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_spill_segment_t **out);
+/* Borrowed immutable semantic declarations (name == NULL), or NULL/count0
+ * for scalar captures. Physical schema remains available separately. */
+const wirelog_column_t *wl_columnar_spill_inline_schema(
+    const wl_columnar_spill_segment_t *segment, uint32_t *logical_count);
+
 /* Borrowed STRING remains valid through reader release; clears *out on error.
- * Caller supplies an ID from a STRING lane, not a numeric lane. */
+ * Caller supplies an ID from a STRING lane or INLINE functor descriptor. */
 wl_columnar_spill_status_t wl_columnar_spill_resolve_string(
     wl_columnar_spill_reader_t *reader, uint64_t id, const char **out);
 /* BUSY leaves the owner unchanged while any acquired reader exists. */

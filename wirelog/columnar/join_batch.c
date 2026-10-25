@@ -1906,11 +1906,17 @@ wl_columnar_join_batch_payload_reserve(void *context, uint64_t bytes,
         s->error = WL_COLUMNAR_SPILL_INVALID;
         return WL_COLUMNAR_CONTINUATION_INVALID;
     }
-    s->error = wl_columnar_batch_payload_capture_with_intern(s->governor,
-            s->store,
-            s->source, rows, s->storage, s->intern, s->cancel,
-            s->cancel_context,
-            &s->staged);
+    if (s->inline_schema)
+        s->error = wl_columnar_batch_payload_capture_with_inline(s->governor,
+                s->store, s->source, rows, s->storage, s->inline_columns,
+                s->inline_column_count, s->intern, s->cancel, s->cancel_context,
+                &s->staged);
+    else
+        s->error = wl_columnar_batch_payload_capture_with_intern(s->governor,
+                s->store,
+                s->source, rows, s->storage, s->intern, s->cancel,
+                s->cancel_context,
+                &s->staged);
     return s->error == WL_COLUMNAR_SPILL_OK ? WL_COLUMNAR_CONTINUATION_OK
         : s->error ==
            WL_COLUMNAR_SPILL_MEMORY ?
@@ -2006,4 +2012,21 @@ wl_columnar_join_batch_payload_sink_cleanup(
         wl_columnar_batch_payload_release(s->ready) != WL_COLUMNAR_SPILL_OK)
         abort();
     s->ready = NULL;
+}
+
+void
+wl_columnar_join_batch_payload_sink_init_with_inline(
+    wl_columnar_join_batch_payload_sink_t *context,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern)
+{
+    wl_columnar_join_batch_payload_sink_init_with_intern(context, sink,
+        governor, store, storage, intern);
+    context->inline_schema = true;
+    context->inline_columns = columns;
+    context->inline_column_count = logical_count;
 }

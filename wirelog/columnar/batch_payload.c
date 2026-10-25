@@ -4,6 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+typedef char wl_columnar_batch_payload_inline_arity_check_
+    [(WL_COMPOUND_INLINE_MAX_ARITY ==
+        WL_COLUMNAR_SPILL_INLINE_MAX_ARITY) ? 1 : -1];
+#else
+_Static_assert(WL_COMPOUND_INLINE_MAX_ARITY ==
+    WL_COLUMNAR_SPILL_INLINE_MAX_ARITY,
+    "spill and relation INLINE arity bounds must agree");
+#endif
+
 typedef struct {
     wl_columnar_memory_reservation_t reservation;
 } wl_columnar_batch_payload_allocation_t;
@@ -14,7 +24,7 @@ struct wl_columnar_batch_payload {
     wl_columnar_spill_segment_t *segment;
     wl_intern_t *intern;
     uint64_t readers, data_offset, row_bytes;
-    uint32_t ncols, nrows;
+    uint32_t ncols, nrows, logical_count;
     wirelog_column_type_t types[];
 };
 
@@ -75,18 +85,43 @@ wl_columnar_batch_payload_free(void *ptr)
     if (!wl_columnar_memory_release(&token)) abort();
 }
 
+static uint64_t
+wl_columnar_batch_payload_logical_offset(uint32_t ncols)
+{
+    return (sizeof(wl_columnar_batch_payload_t)
+           + (uint64_t)ncols * sizeof(wirelog_column_type_t) + 7)
+           & ~UINT64_C(7);
+}
+
+static wirelog_column_t *
+wl_columnar_batch_payload_logical(wl_columnar_batch_payload_t *p)
+{
+    return (wirelog_column_t *)((char *)p
+           + wl_columnar_batch_payload_logical_offset(p->ncols));
+}
+
 wl_columnar_spill_status_t
 wl_columnar_batch_payload_floor(uint32_t ncols, uint32_t nrows,
     wl_columnar_batch_payload_storage_t storage, uint64_t *payload_bytes,
     uint64_t *reader_bytes)
 {
+    return wl_columnar_batch_payload_floor_with_inline(ncols, nrows, 0,
+               storage, payload_bytes, reader_bytes);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_floor_with_inline(uint32_t ncols, uint32_t nrows,
+    uint32_t logical_count, wl_columnar_batch_payload_storage_t storage,
+    uint64_t *payload_bytes, uint64_t *reader_bytes)
+{
     if (!payload_bytes || !reader_bytes) return WL_COLUMNAR_SPILL_INVALID;
     *payload_bytes = 0; *reader_bytes = 0;
-    if (!ncols || (storage != WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT
+    if (!ncols || logical_count > ncols ||
+        (storage != WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT
         && storage != WL_COLUMNAR_BATCH_PAYLOAD_SPILLED))
         return WL_COLUMNAR_SPILL_INVALID;
-    uint64_t header = (sizeof(wl_columnar_batch_payload_t)
-        + (uint64_t)ncols * sizeof(wirelog_column_type_t) + 7) & ~UINT64_C(7);
+    uint64_t header = wl_columnar_batch_payload_logical_offset(ncols)
+        + (uint64_t)logical_count * sizeof(wirelog_column_t);
     uint64_t row = (uint64_t)ncols * 8 + sizeof(wl_columnar_spill_metadata_t);
     uint64_t bytes = 0;
     if (storage == WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT
@@ -127,12 +162,13 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
                rows, storage, NULL, cancel, cancel_context, out);
 }
 
-wl_columnar_spill_status_t
-wl_columnar_batch_payload_capture_with_intern(
+static wl_columnar_spill_status_t
+wl_columnar_batch_payload_capture_impl(
     wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_store_t *store, const col_rel_t *source, uint32_t rows,
     wl_columnar_batch_payload_storage_t storage,
-    wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    wl_intern_t *intern, const wirelog_column_t *columns,
+    uint32_t logical_count, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context,
     wl_columnar_batch_payload_t **out)
 {
@@ -148,11 +184,35 @@ wl_columnar_batch_payload_capture_with_intern(
     wl_columnar_spill_status_t rc = WL_COLUMNAR_SPILL_UNSUPPORTED;
     wl_columnar_batch_payload_t *p = NULL;
     uint64_t bytes, reader_bytes, header;
-    bool strings = false;
-    if (source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+    bool strings = logical_count != 0;
+    if (source->has_graph_column || !source->ncols) goto done;
+    if (logical_count) {
+        rc = WL_COLUMNAR_SPILL_INVALID;
+        if (!intern || !source->column_types || !source->compound_arity_map
+            || source->compound_kind != WIRELOG_COMPOUND_KIND_INLINE
+            || source->compound_arity_len != logical_count) goto done;
+        rc = wl_columnar_spill_validate_inline_schema(source->column_types,
+                source->ncols, columns, logical_count);
+        if (rc != WL_COLUMNAR_SPILL_OK) goto done;
+        uint32_t compounds = 0, first = 0;
+        for (uint32_t i = 0; i < logical_count; i++) {
+            bool inlined = columns[i].compound_kind ==
+                WIRELOG_COMPOUND_KIND_INLINE;
+            uint32_t width = inlined ? columns[i].compound_arity : 1;
+            if (width != source->compound_arity_map[i]) {
+                rc = WL_COLUMNAR_SPILL_INVALID; goto done;
+            }
+            if (inlined && compounds++ == 0)
+                first = columns[i].compound_inline_col_offset;
+        }
+        if (compounds != source->compound_count ||
+            first != source->inline_physical_offset){
+            rc = WL_COLUMNAR_SPILL_INVALID; goto done;
+        }
+    } else if (source->compound_kind != WIRELOG_COMPOUND_KIND_NONE
         || source->compound_count || source->compound_arity_map
-        || source->compound_arity_len || source->inline_physical_offset
-        || source->has_graph_column || !source->ncols) goto done;
+        || source->compound_arity_len ||
+        source->inline_physical_offset) goto done;
     rc = WL_COLUMNAR_SPILL_INVALID;
     if (rows > source->nrows || source->nrows > source->capacity
         || !source->columns || (source->timestamps
@@ -170,10 +230,12 @@ wl_columnar_batch_payload_capture_with_intern(
             rc = WL_COLUMNAR_SPILL_UNSUPPORTED; goto done;
         }
     }
-    rc = wl_columnar_batch_payload_floor(source->ncols, rows, storage,
+    rc = wl_columnar_batch_payload_floor_with_inline(source->ncols, rows,
+            logical_count, storage,
             &bytes, &reader_bytes);
     if (rc != WL_COLUMNAR_SPILL_OK) goto done;
-    rc = wl_columnar_batch_payload_floor(source->ncols, 0, storage,
+    rc = wl_columnar_batch_payload_floor_with_inline(source->ncols, 0,
+            logical_count, storage,
             &header, &reader_bytes);
     if (rc != WL_COLUMNAR_SPILL_OK) goto done;
     if (cancel && cancel(cancel_context)) {
@@ -195,18 +257,32 @@ wl_columnar_batch_payload_capture_with_intern(
         p->intern = intern;
     }
     p->ncols = source->ncols; p->nrows = rows; p->data_offset = header;
+    p->logical_count = logical_count;
+    for (uint32_t i = 0; i < logical_count; i++) {
+        if (columns[i].compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && !wl_intern_reverse(intern, columns[i].compound_functor_id)) {
+            rc = WL_COLUMNAR_SPILL_INVALID; goto done;
+        }
+        wl_columnar_batch_payload_logical(p)[i] = columns[i];
+        wl_columnar_batch_payload_logical(p)[i].name = NULL;
+    }
     p->row_bytes = (uint64_t)p->ncols * 8 +
         sizeof(wl_columnar_spill_metadata_t);
     for (uint32_t c = 0; c < p->ncols; c++)
         p->types[c] =
             source->column_types ? source->column_types[c] : WIRELOG_TYPE_INT64;
     if (storage == WL_COLUMNAR_BATCH_PAYLOAD_SPILLED) {
-        rc = wl_columnar_spill_create_with_intern(store, p->types, p->ncols,
-                rows,
-                wl_columnar_batch_payload_source, (void *)source, p->intern,
-                cancel,
-                cancel_context,
-                &p->segment);
+        if (logical_count)
+            rc = wl_columnar_spill_create_with_inline(store, p->types, p->ncols,
+                    rows, wl_columnar_batch_payload_source, (void *)source,
+                    wl_columnar_batch_payload_logical(p), logical_count,
+                    p->intern,
+                    cancel, cancel_context, &p->segment);
+        else
+            rc = wl_columnar_spill_create_with_intern(store, p->types, p->ncols,
+                    rows, wl_columnar_batch_payload_source, (void *)source,
+                    p->intern,
+                    cancel, cancel_context, &p->segment);
     } else {
         for (uint32_t row = 0; row < rows; row++) {
             if (cancel && cancel(cancel_context)) {
@@ -267,8 +343,10 @@ wl_columnar_batch_payload_spill(wl_columnar_batch_payload_t **owner,
     if (old->readers) return WL_COLUMNAR_SPILL_BUSY;
     if (cancel && cancel(cancel_context)) return WL_COLUMNAR_SPILL_CANCELLED;
     uint64_t bytes, reader_bytes;
-    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_floor(old->ncols,
-            old->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, &bytes,
+    wl_columnar_spill_status_t rc =
+        wl_columnar_batch_payload_floor_with_inline(old->ncols,
+            old->nrows, old->logical_count, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+            &bytes,
             &reader_bytes);
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
     void *allocation = NULL;
@@ -281,11 +359,22 @@ wl_columnar_batch_payload_spill(wl_columnar_batch_payload_t **owner,
     replacement->nrows = old->nrows;
     memcpy(replacement->types, old->types,
         (size_t)old->ncols * sizeof(*old->types));
-    rc = wl_columnar_spill_create_with_intern(store, old->types, old->ncols,
-            old->nrows,
-            wl_columnar_batch_payload_resident_row, old, old->intern, cancel,
-            cancel_context,
-            &replacement->segment);
+    replacement->logical_count = old->logical_count;
+    if (old->logical_count) {
+        memcpy(wl_columnar_batch_payload_logical(replacement),
+            wl_columnar_batch_payload_logical(old),
+            (size_t)old->logical_count * sizeof(wirelog_column_t));
+        rc = wl_columnar_spill_create_with_inline(store, old->types, old->ncols,
+                old->nrows, wl_columnar_batch_payload_resident_row, old,
+                wl_columnar_batch_payload_logical(old), old->logical_count,
+                old->intern,
+                cancel, cancel_context, &replacement->segment);
+    } else {
+        rc = wl_columnar_spill_create_with_intern(store, old->types, old->ncols,
+                old->nrows, wl_columnar_batch_payload_resident_row, old,
+                old->intern,
+                cancel, cancel_context, &replacement->segment);
+    }
     if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(cancel_context))
         rc = WL_COLUMNAR_SPILL_CANCELLED;
     if (rc != WL_COLUMNAR_SPILL_OK) {
@@ -391,4 +480,46 @@ wl_columnar_batch_payload_resolve_string(wl_columnar_batch_payload_reader_t *r,
     if (!r->payload->intern || id > INT64_MAX) return WL_COLUMNAR_SPILL_INVALID;
     *out = wl_intern_reverse(r->payload->intern, (int64_t)id);
     return *out ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_INVALID;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_capture_with_intern(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_spill_store_t *store,
+    const col_rel_t *source, uint32_t rows,
+    wl_columnar_batch_payload_storage_t storage,
+    wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context,
+    wl_columnar_batch_payload_t **out)
+{
+    return wl_columnar_batch_payload_capture_impl(g, store, source, rows,
+               storage, intern, NULL, 0, cancel, cancel_context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_capture_with_inline(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_spill_store_t *store,
+    const col_rel_t *source, uint32_t rows,
+    wl_columnar_batch_payload_storage_t storage,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out)
+{
+    if (!columns || !logical_count || !intern) {
+        if (out) *out = NULL;
+        return WL_COLUMNAR_SPILL_INVALID;
+    }
+    return wl_columnar_batch_payload_capture_impl(g, store, source, rows,
+               storage, intern, columns, logical_count, cancel, cancel_context,
+               out);
+}
+
+const wirelog_column_t *
+wl_columnar_batch_payload_inline_schema(const wl_columnar_batch_payload_t *p,
+    uint32_t *logical_count)
+{
+    if (logical_count) *logical_count = p ? p->logical_count : 0;
+    if (!p || !logical_count || !p->logical_count) return NULL;
+    return (const wirelog_column_t *)((const char *)p
+           + wl_columnar_batch_payload_logical_offset(p->ncols));
 }

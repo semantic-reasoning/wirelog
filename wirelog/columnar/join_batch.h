@@ -279,7 +279,10 @@ typedef struct {
     uint32_t rows;
     bool begun;
     wl_columnar_batch_payload_t *staged, *ready;
-    wl_intern_t *intern; /* Explicit STRING provenance; borrowed during use. */
+    wl_intern_t *intern; /* Explicit STRING/functor provenance. */
+    const wirelog_column_t *inline_columns; /* Borrowed during publication. */
+    uint32_t inline_column_count;
+    bool inline_schema;
 } wl_columnar_join_batch_payload_sink_t;
 
 void wl_columnar_join_batch_payload_sink_init(
@@ -297,6 +300,17 @@ void wl_columnar_join_batch_payload_sink_init_with_intern(
     wl_columnar_memory_governor_ref_t *governor,
     wl_columnar_spill_store_t *store,
     wl_columnar_batch_payload_storage_t storage, wl_intern_t *intern);
+/* Explicit flat INLINE declarations; same provenance contract as capture.
+ * Keep declarations/intern immutable and live throughout synchronous sink use.
+ * No automatic JOIN output declaration inference is performed. */
+void wl_columnar_join_batch_payload_sink_init_with_inline(
+    wl_columnar_join_batch_payload_sink_t *context,
+    wl_columnar_continuation_sink_t *sink,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_batch_payload_storage_t storage,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern);
 wl_columnar_batch_payload_t *wl_columnar_join_batch_payload_sink_take(
     wl_columnar_join_batch_payload_sink_t *context);
 void wl_columnar_join_batch_payload_sink_cleanup(
