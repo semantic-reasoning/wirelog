@@ -37,7 +37,25 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create(
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out);
-/* Only for a continuation returned by create(); NULL returns INVALID.
+/* Explicit zero-coordinate Z-set JOIN. Same ownership, schema/key and
+ * publication contract as create(), but arbitrary int64 multiplicities are
+ * accepted only with iteration/stratum/worker all zero on BOTH complete inputs.
+ * Each matching pair emits checked lhs_weight * rhs_weight, including zero,
+ * in zero-initialized timestamp metadata. No consolidation is performed.
+ * Nonzero logical times remain UNSUPPORTED; this is not timed differential JOIN.
+ * Overflow is sticky OVERFLOW: the current private batch is discarded without
+ * publication, while earlier committed batches remain visible (no whole-JOIN
+ * rollback). Products are evaluated only for matching keys.
+ * batch_bytes still bounds lane storage only. Governed timestamp capacity is
+ * additional resident memory, as are the index, readers and producer state.
+ * The ordinary constructor retains its default-metadata restriction. */
+wl_columnar_spill_status_t wl_columnar_payload_join_create_weighted(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_continuation_t **out);
+/* Only for a continuation returned by either constructor; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */
 wl_columnar_spill_status_t wl_columnar_payload_join_error(
     const wl_columnar_continuation_t *continuation);
