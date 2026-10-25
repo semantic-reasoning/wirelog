@@ -523,3 +523,10 @@ wl_columnar_batch_payload_inline_schema(const wl_columnar_batch_payload_t *p,
     return (const wirelog_column_t *)((const char *)p
            + wl_columnar_batch_payload_logical_offset(p->ncols));
 }
+
+bool
+wl_columnar_batch_payload_uses_governor(const wl_columnar_batch_payload_t *p,
+    const wl_columnar_memory_governor_ref_t *g)
+{
+    return p && g && p->governor == g;
+}

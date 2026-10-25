@@ -112,4 +112,9 @@ const wirelog_column_type_t *wl_columnar_batch_payload_schema(
     const wl_columnar_batch_payload_t *payload, uint32_t *ncols,
     uint32_t *nrows);
 
+/* Exact admission owner identity; no ownership transfer. */
+bool wl_columnar_batch_payload_uses_governor(
+    const wl_columnar_batch_payload_t *payload,
+    const wl_columnar_memory_governor_ref_t *governor);
+
 #endif

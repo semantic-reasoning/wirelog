@@ -4278,3 +4278,64 @@ This proves that relation-backed sink path, not automatic INLINE JOIN scheduling
 SIDE contents live in side relations and are not preserved by merely holding
 arena handles. SIDE/nested capture, cold indexed execution, public spill options
 and scheduler integration remain outstanding; #1372 stays open.
+
+### Explicit indexed JOIN over immutable payloads (#1372)
+
+`wl_columnar_payload_join_create` executes a bounded JOIN over two caller-owned
+payloads, independently of the resident relation/arrangement registry. Each input
+may be resident or spilled. Two distinct readers pin the owners, including a
+self-JOIN; source relations may already be destroyed. Payload release/demotion
+remains BUSY until the producer releases those readers. Already acquired readers
+survive spill-store retirement.
+
+The initial capability accepts one INT64 equality key and scalar numeric lanes.
+It concatenates complete left/right rows, retaining physical types and exact lane
+bits. STRING and logical INLINE schemas, FLOAT keys, and any input timestamp or
+signed difference other than `{0,0,0,+1}` are rejected explicitly. Both complete
+inputs are validated before publication; a retraction in the last row cannot be
+silently discarded. Differential JOIN semantics require separate integration.
+
+Construction streams right rows into a governed hash index of stable ordinals.
+It retains bucket heads and one next-ordinal per right row, never reconstructed
+right columns or copied keys. Candidate lookup reads the original immutable
+payload by ordinal and checks exact equality, including hash collisions. Both
+input readers and output relation scratch are governed. The index is an explicit
+O(right rows) resident floor: bucket count is the next power of two, capped at
+2^31, with at least one bucket; slot storage is `4 * (buckets + right_rows)` bytes
+plus its reservation descriptor. Producer/schema copies, input payload floors,
+reader buffers and output relation metadata/columns are additional. The generic
+continuation's existing fixed descriptor is an additional ungoverned allocation.
+`batch_bytes` bounds output lane storage only, not this full resident floor.
+
+Each publication call examines at most 256 row/chain actions, returning PROGRESS
+when no output is ready. This is a bound on scan actions, not an evaluation-control
+work charge or a bound on OS I/O latency. The existing continuation freezes a
+pending batch through sink reserve/append/commit failures. Durable ambiguous
+commits advance once; retries do not replay their tuples. Producer I/O and
+cancellation errors remain sticky in `wl_columnar_payload_join_error`, never
+turning into an empty match or DONE. Cancellation of an active continuation frees
+reader pins, index and output scratch. After DONE, cancellation is a no-op and
+destroy is required to release those resources. Destroy also frees the producer
+and continuation descriptor. Callbacks and lifecycle operations remain
+synchronous and externally serialized.
+
+Tests compare resident, direct-spilled and demoted inputs against an independent
+nested-loop oracle, including boundary and duplicate keys, collisions, exact
+numeric bits, concurrent self-JOIN readers, sink retries, read errors and refunds.
+The fixed-budget JOIN fixture uses a 64 KiB governor with more than 512 KiB of
+spilled build rows: resident payload capture is refused while the ordinal index,
+input readers and streamed output fit. Its externally owned source fixture is
+preparation memory and is destroyed before execution, with no governor reset or
+budget increase. This establishes bounded JOIN execution over prepared payloads,
+not bounded ingestion or a whole-program peak-memory claim. Preparing a payload
+from a full source relation still requires that source's own resident floor.
+
+Access audit boundary: `arrangement.c` hashes/probes resident relation columns;
+`join.c`, ordinary `join_batch.c`, differential consumers and LFTJ use relation
+row indexes/direct columns and retain their existing source leases. None accepts
+this payload implicitly and none is marked cold. The explicit producer uses the
+existing relation-backed publication sink only for its private output batch.
+Automatic evaluator routing, cold relation eviction, bounded partitioned index
+access, SIDE/nested values, public spill options and scheduling remain follow-up
+work. A workload whose resident index cannot fit remains unsupported; #1385 is
+not qualified and #1372 is not complete.

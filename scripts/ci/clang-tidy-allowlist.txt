@@ -47,6 +47,7 @@ wirelog/arena/compound_arena_admission.c
 wirelog/columnar/arithmetic.c
 wirelog/columnar/arrangement.c
 wirelog/columnar/batch_payload.c
+wirelog/columnar/payload_join.c
 wirelog/columnar/cache.c
 wirelog/columnar/compound_side.c
 wirelog/columnar/continuation.c
