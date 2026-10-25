@@ -28,6 +28,7 @@ static const wirelog_column_type_t types[] = {
 };
 
 int wl_columnar_spill_test_damage(wl_columnar_spill_segment_t *, bool);
+int wl_columnar_spill_test_damage_logical(wl_columnar_spill_segment_t *);
 
 bool
 wl_columnar_spill_test_allocation(void)
@@ -437,6 +438,107 @@ string_segments(const char *directory)
     wl_columnar_memory_governor_ref_release(g);
 }
 
+static void
+inline_segments(const char *directory)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1<<24);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    CHECK(wl_intern_put(intern, "unary") == 0);
+    wirelog_column_t columns[] = {
+        {.type = WIRELOG_TYPE_INT64},
+        {.type = WIRELOG_TYPE_INT64,
+         .compound_kind = WIRELOG_COMPOUND_KIND_INLINE,
+         .compound_functor_id = 0, .compound_arity = 1,
+         .compound_inline_col_offset = 1},
+        {.type = WIRELOG_TYPE_BOOL}
+    };
+    const uint64_t file_bytes = 32 + 3*4 + 4 + 3*20 + 8*48;
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(directory, g, file_bytes - 1, 48,
+        &store) == OK);
+    wl_columnar_spill_segment_t *s = NULL;
+    uint64_t before = reserved(g);
+    CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source, NULL,
+        columns, 3, intern, NULL, NULL, &s) == WL_COLUMNAR_SPILL_QUOTA);
+    CHECK(!s && reserved(g) == before &&
+        wl_columnar_spill_store_bytes(store) == 0);
+    CHECK(wl_columnar_spill_store_close(store) == OK);
+    CHECK(wl_columnar_spill_store_open(directory, g, file_bytes, 48,
+        &store) == OK);
+    before = reserved(g);
+    for (unsigned mode = 2; mode <= 5; mode++) {
+        fault = (int)mode; calls = 0;
+        CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source,
+            NULL,
+            columns, 3, intern, NULL, NULL, &s) != OK);
+        fault = 0;
+        CHECK(!s && reserved(g) == before &&
+            wl_columnar_spill_store_bytes(store) == 0);
+    }
+    for (unsigned at = 1; at <= 2; at++) {
+        allocation_count = 0; allocation_fail = at;
+        CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source,
+            NULL,
+            columns, 3, intern, NULL, NULL,
+            &s) == WL_COLUMNAR_SPILL_ALLOCATION);
+        allocation_fail = 0;
+        CHECK(!s && reserved(g) == before &&
+            wl_columnar_spill_store_bytes(store) == 0);
+    }
+    unsigned remaining = 5;
+    CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source, NULL,
+        columns, 3, intern, cancel, &remaining,
+        &s) == WL_COLUMNAR_SPILL_CANCELLED);
+    CHECK(!s && reserved(g) == before &&
+        wl_columnar_spill_store_bytes(store) == 0);
+    wl_columnar_spill_floor_t floor;
+    CHECK(wl_columnar_spill_floor_with_inline(directory, 3, 3, &floor) == OK);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(g)->usable_bytes,
+        before + floor.segment_bytes + floor.writer_bytes - 1,
+        memory_order_release);
+    CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source, NULL,
+        columns, 3, intern, NULL, NULL, &s) == WL_COLUMNAR_SPILL_MEMORY);
+    CHECK(!s && reserved(g) == before);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(g)->usable_bytes,
+        before + floor.segment_bytes + floor.writer_bytes,
+        memory_order_release);
+    fault = 1; calls = 0;
+    CHECK(wl_columnar_spill_create_with_inline(store, types, 3, 8, source, NULL,
+        columns, 3, intern, NULL, NULL, &s) == OK);
+    fault = 0;
+    CHECK(reserved(g) == before + floor.segment_bytes);
+    CHECK(wl_columnar_spill_store_bytes(store) == file_bytes);
+    atomic_store_explicit(&wl_columnar_memory_governor_ref_get(g)->usable_bytes,
+        1<<24, memory_order_release);
+    columns[1].compound_functor_id = 99;
+    uint32_t count;
+    const wirelog_column_t *logical = wl_columnar_spill_inline_schema(s,
+            &count);
+    CHECK(count == 3 && logical[1].compound_arity == 1
+        && logical[1].compound_functor_id == 0 && !logical[1].name);
+    wl_columnar_spill_reader_t *reader;
+    CHECK(wl_columnar_spill_acquire(s, &reader) == OK);
+    wl_intern_free(intern); /* Numeric arguments still need the functor pin. */
+    wl_columnar_spill_store_retire(store);
+    const uint64_t *lanes; wl_columnar_spill_metadata_t metadata;
+    const char *name;
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(wl_columnar_spill_read(reader, i, NULL, NULL, &lanes,
+            &metadata) == OK);
+        CHECK((int64_t)lanes[0] == -(int64_t)i
+            && metadata.multiplicity == (i % 2 ? -2 : 1));
+    }
+    CHECK(wl_columnar_spill_resolve_string(reader, 0, &name) == OK
+        && strcmp(name, "unary") == 0);
+    CHECK(wl_columnar_spill_test_damage_logical(s) == 0);
+    CHECK(wl_columnar_spill_read(reader, 0, NULL, NULL, &lanes, &metadata)
+        == WL_COLUMNAR_SPILL_IO && !lanes && !metadata.multiplicity);
+    wl_columnar_spill_reader_release(reader);
+    CHECK(wl_columnar_spill_release(s) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(void)
 {
@@ -456,6 +558,7 @@ main(void)
     round_trip(directory, true);
     failures(directory);
     string_segments(directory);
+    inline_segments(directory);
     wide_rows(directory);
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);

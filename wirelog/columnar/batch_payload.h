@@ -1,4 +1,4 @@
-/* Internal owned numeric batches for bounded, synchronous publication. */
+/* Internal owned immutable batches for bounded, synchronous publication. */
 #ifndef WL_COLUMNAR_BATCH_PAYLOAD_H
 #define WL_COLUMNAR_BATCH_PAYLOAD_H
 
@@ -47,7 +47,29 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture_with_intern(
     wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context,
     wl_columnar_batch_payload_t **out);
-/* Resolve an ID read from a STRING lane. Borrowed result lives through reader
+/* Explicit flat INLINE capture. Declarations and intern must originate from
+ * source; caller guarantees every expanded argument is self-contained (no
+ * nested handles). Source metadata, offsets, arities and physical types must
+ * agree. SIDE/graph layouts are rejected. Names are not retained. Functor IDs
+ * pin intern even with numeric-only arguments. Declarations are borrowed only
+ * during this call; callbacks must not mutate them or retire intern. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_capture_with_inline(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, const struct col_rel *source,
+    uint32_t rows, wl_columnar_batch_payload_storage_t storage,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out);
+wl_columnar_spill_status_t wl_columnar_batch_payload_floor_with_inline(
+    uint32_t ncols, uint32_t nrows, uint32_t logical_count,
+    wl_columnar_batch_payload_storage_t storage,
+    uint64_t *payload_bytes, uint64_t *reader_bytes);
+/* Borrowed semantic fields, name == NULL; scalar capture returns NULL/count0. */
+const wirelog_column_t *wl_columnar_batch_payload_inline_schema(
+    const wl_columnar_batch_payload_t *payload, uint32_t *logical_count);
+
+/* Resolve an ID read from a STRING lane or INLINE functor descriptor. Borrowed result lives through reader
  * release, even after intern owner retirement. Invalid IDs clear *out. */
 wl_columnar_spill_status_t wl_columnar_batch_payload_resolve_string(
     wl_columnar_batch_payload_reader_t *reader, uint64_t id, const char **out);
@@ -61,7 +83,7 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_resolve_string(
  * call. Peak admission includes the old payload plus a spilled payload floor,
  * spill segment and writer floor (including path scratch); reserve that slack
  * before pressure exhausts it. Small/empty payloads may not save memory.
- * STRING demotion needs a new pin; intern owner retirement returns CLOSED. */
+ * STRING/INLINE demotion needs a new pin; intern owner retirement returns CLOSED. */
 wl_columnar_spill_status_t wl_columnar_batch_payload_spill(
     wl_columnar_batch_payload_t **owner, wl_columnar_spill_store_t *store,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context);

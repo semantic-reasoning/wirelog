@@ -42,7 +42,7 @@ struct wl_columnar_spill_segment {
     wl_columnar_spill_store_t *store;
     wl_intern_t *intern;
     uint64_t nrows, row_bytes, data_offset, file_bytes, readers;
-    uint32_t ncols;
+    uint32_t ncols, logical_count;
     wl_mutex_t io_lock;
 #ifdef _WIN32
     HANDLE file;
@@ -128,11 +128,80 @@ wl_columnar_spill_get(const unsigned char *p, unsigned bytes)
     return value;
 }
 
+static uint64_t
+wl_columnar_spill_logical_offset(uint32_t ncols)
+{
+    return (sizeof(wl_columnar_spill_segment_t)
+           + (uint64_t)ncols * sizeof(wirelog_column_type_t) + 7)
+           & ~UINT64_C(7);
+}
+
+static wirelog_column_t *
+wl_columnar_spill_logical(wl_columnar_spill_segment_t *s)
+{
+    return (wirelog_column_t *)((char *)s
+           + wl_columnar_spill_logical_offset(s->ncols));
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_validate_inline_schema(const wirelog_column_type_t *types,
+    uint32_t ncols, const wirelog_column_t *columns, uint32_t logical_count)
+{
+    if (!types || !columns || !logical_count || logical_count > ncols)
+        return WL_COLUMNAR_SPILL_INVALID;
+    uint64_t offset = 0;
+    uint32_t compounds = 0;
+    for (uint32_t i = 0; i < logical_count; i++) {
+        const wirelog_column_t *c = &columns[i];
+        if ((unsigned)c->type > WIRELOG_TYPE_BOOL)
+            return WL_COLUMNAR_SPILL_UNSUPPORTED;
+        uint32_t width = 1;
+        if (c->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+            if (!c->compound_arity ||
+                c->compound_arity > WL_COLUMNAR_SPILL_INLINE_MAX_ARITY)
+                return WL_COLUMNAR_SPILL_UNSUPPORTED;
+            if (c->compound_inline_col_offset != offset)
+                return WL_COLUMNAR_SPILL_INVALID;
+            width = c->compound_arity;
+            compounds++;
+        } else if (c->compound_kind != WIRELOG_COMPOUND_KIND_NONE) {
+            return WL_COLUMNAR_SPILL_UNSUPPORTED;
+        } else if (c->compound_arity || c->compound_functor_id
+            || c->compound_inline_col_offset || offset >= ncols
+            || c->type != types[offset]) {
+            return WL_COLUMNAR_SPILL_INVALID;
+        }
+        offset += width;
+        if (offset > ncols) return WL_COLUMNAR_SPILL_INVALID;
+    }
+    return compounds && offset == ncols ? WL_COLUMNAR_SPILL_OK
+        : WL_COLUMNAR_SPILL_INVALID;
+}
+
+static void
+wl_columnar_spill_encode_logical(unsigned char *buffer,
+    const wirelog_column_t *c)
+{
+    wl_columnar_spill_put(buffer, c->type, 4);
+    wl_columnar_spill_put(buffer + 4, c->compound_kind, 4);
+    wl_columnar_spill_put(buffer + 8, c->compound_functor_id, 4);
+    wl_columnar_spill_put(buffer + 12, c->compound_arity, 4);
+    wl_columnar_spill_put(buffer + 16, c->compound_inline_col_offset, 4);
+}
+
 wl_columnar_spill_status_t
 wl_columnar_spill_floor(const char *directory, uint32_t ncols,
     wl_columnar_spill_floor_t *out)
 {
-    if (!directory || !directory[0] || !out || ncols == 0)
+    return wl_columnar_spill_floor_with_inline(directory, ncols, 0, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_floor_with_inline(const char *directory, uint32_t ncols,
+    uint32_t logical_count, wl_columnar_spill_floor_t *out)
+{
+    if (!directory || !directory[0] || !out || ncols == 0
+        || logical_count > ncols)
         return WL_COLUMNAR_SPILL_INVALID;
     size_t length = strlen(directory);
     if (length > 4096) return WL_COLUMNAR_SPILL_INVALID;
@@ -140,6 +209,9 @@ wl_columnar_spill_floor(const char *directory, uint32_t ncols,
     out->store_bytes = sizeof(wl_columnar_spill_store_t) + length + 1;
     out->segment_bytes = sizeof(wl_columnar_spill_segment_t)
         + (uint64_t)ncols * sizeof(wirelog_column_type_t);
+    if (logical_count)
+        out->segment_bytes = wl_columnar_spill_logical_offset(ncols)
+            + (uint64_t)logical_count * sizeof(wirelog_column_t);
     out->writer_bytes = sizeof(wl_columnar_spill_allocation_t) + row
         + length + WL_COLUMNAR_SPILL_PATH_EXTRA;
     out->reader_bytes = sizeof(wl_columnar_spill_reader_t) + row;
@@ -379,7 +451,7 @@ wl_columnar_spill_validate_file(wl_columnar_spill_segment_t *s,
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
     if (memcmp(buffer, wl_columnar_spill_magic,
         sizeof(wl_columnar_spill_magic)) != 0
-        || wl_columnar_spill_get(buffer + 8, 4) != 1
+        || wl_columnar_spill_get(buffer + 8, 4) != (s->logical_count ? 2u : 1u)
         || wl_columnar_spill_get(buffer + 12, 4) != s->ncols
         || wl_columnar_spill_get(buffer + 16, 8) != s->nrows
         || wl_columnar_spill_get(buffer + 24, 8) != s->row_bytes)
@@ -390,10 +462,42 @@ wl_columnar_spill_validate_file(wl_columnar_spill_segment_t *s,
     for (uint32_t c = 0; c < s->ncols; c++)
         if (wl_columnar_spill_get(buffer + (size_t)c * 4, 4)
             != (uint32_t)s->types[c]) return WL_COLUMNAR_SPILL_IO;
+    if (s->logical_count) {
+        uint64_t offset = WL_COLUMNAR_SPILL_HEADER + (uint64_t)s->ncols * 4;
+        rc = wl_columnar_spill_io(s, false, offset, buffer, 4, cancel, context);
+        if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+        if (wl_columnar_spill_get(buffer, 4) != s->logical_count)
+            return WL_COLUMNAR_SPILL_IO;
+        const wirelog_column_t *columns = wl_columnar_spill_logical(s);
+        for (uint32_t i = 0; i < s->logical_count; i++) {
+            rc = wl_columnar_spill_io(s, false, offset + 4 + (uint64_t)i * 20,
+                    buffer, 20, cancel, context);
+            if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+            const wirelog_column_t *c = &columns[i];
+            if (wl_columnar_spill_get(buffer, 4) != (uint32_t)c->type
+                || wl_columnar_spill_get(buffer + 4,
+                4) != (uint32_t)c->compound_kind
+                || wl_columnar_spill_get(buffer + 8,
+                4) != c->compound_functor_id
+                || wl_columnar_spill_get(buffer + 12, 4) != c->compound_arity
+                || wl_columnar_spill_get(buffer + 16,
+                4) != c->compound_inline_col_offset)
+                return WL_COLUMNAR_SPILL_IO;
+        }
+    }
     return WL_COLUMNAR_SPILL_OK;
 }
 
 #ifdef WL_TEST_SPILL
+int
+wl_columnar_spill_test_damage_logical(wl_columnar_spill_segment_t *s)
+{
+    unsigned char value = 255;
+    return wl_columnar_spill_io(s, true,
+               WL_COLUMNAR_SPILL_HEADER + (uint64_t)s->ncols * 4 + 4 + 8,
+               &value, 1, NULL, NULL) == WL_COLUMNAR_SPILL_OK ? 0 : -1;
+}
+
 /* Called only with no concurrent I/O by the direct-source test target. */
 int
 wl_columnar_spill_test_damage(wl_columnar_spill_segment_t *s, bool truncate)
@@ -423,12 +527,13 @@ wl_columnar_spill_create(wl_columnar_spill_store_t *store,
                source, source_context, NULL, cancel, cancel_context, out);
 }
 
-wl_columnar_spill_status_t
-wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
+static wl_columnar_spill_status_t
+wl_columnar_spill_create_impl(wl_columnar_spill_store_t *store,
     const wirelog_column_type_t *types, uint32_t ncols, uint64_t nrows,
     wl_columnar_spill_source_fn source, void *source_context,
-    wl_intern_t *intern,
-    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_intern_t *intern, const wirelog_column_t *columns,
+    uint32_t logical_count, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context,
     wl_columnar_spill_segment_t **out)
 {
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
@@ -436,7 +541,14 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
     if (!store || !types || !ncols || (nrows && !source))
         return WL_COLUMNAR_SPILL_INVALID;
     if (store->retired) return WL_COLUMNAR_SPILL_CLOSED;
-    bool strings = false;
+    bool strings = logical_count != 0;
+    if (logical_count) {
+        if (!intern) return WL_COLUMNAR_SPILL_INVALID;
+        wl_columnar_spill_status_t checked =
+            wl_columnar_spill_validate_inline_schema(
+            types, ncols, columns, logical_count);
+        if (checked != WL_COLUMNAR_SPILL_OK) return checked;
+    }
     for (uint32_t i = 0; i < ncols; i++) {
         if (types[i] == WIRELOG_TYPE_STRING && intern) {
             strings = true; continue;
@@ -448,7 +560,8 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
             return WL_COLUMNAR_SPILL_UNSUPPORTED;
     }
     uint64_t row_bytes = (uint64_t)ncols * 8 + 24;
-    uint64_t data_offset = WL_COLUMNAR_SPILL_HEADER + (uint64_t)ncols * 4;
+    uint64_t data_offset = WL_COLUMNAR_SPILL_HEADER + (uint64_t)ncols * 4
+        + (logical_count ? 4 + (uint64_t)logical_count * 20 : 0);
     if (nrows > (INT64_MAX - data_offset) / row_bytes)
         return WL_COLUMNAR_SPILL_OVERFLOW;
     uint64_t bytes = data_offset + nrows * row_bytes;
@@ -456,14 +569,22 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
     if (bytes > store->quota - store->used) return WL_COLUMNAR_SPILL_QUOTA;
     if (cancel && cancel(cancel_context)) return WL_COLUMNAR_SPILL_CANCELLED;
     wl_columnar_spill_floor_t floor;
-    wl_columnar_spill_status_t rc = wl_columnar_spill_floor(store->directory,
-            ncols, &floor);
+    wl_columnar_spill_status_t rc =
+        wl_columnar_spill_floor_with_inline(store->directory,
+            ncols, logical_count, &floor);
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
     if (strings) {
         int pin = wl_intern_pin_acquire(intern, store->governor);
         if (pin) return pin == EPIPE ? WL_COLUMNAR_SPILL_CLOSED
             : pin == EOVERFLOW ? WL_COLUMNAR_SPILL_OVERFLOW
             : WL_COLUMNAR_SPILL_INVALID;
+    }
+    for (uint32_t i = 0; i < logical_count; i++) {
+        if (columns[i].compound_kind == WIRELOG_COMPOUND_KIND_INLINE
+            && !wl_intern_reverse(intern, columns[i].compound_functor_id)) {
+            wl_intern_pin_release(intern);
+            return WL_COLUMNAR_SPILL_INVALID;
+        }
     }
     void *allocation = NULL;
     rc = wl_columnar_spill_allocate(store, floor.segment_bytes, &allocation);
@@ -476,6 +597,11 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
     s->intern = strings ? intern : NULL;
     s->nrows = nrows;
     s->ncols = ncols;
+    s->logical_count = logical_count;
+    for (uint32_t i = 0; i < logical_count; i++) {
+        wl_columnar_spill_logical(s)[i] = columns[i];
+        wl_columnar_spill_logical(s)[i].name = NULL;
+    }
     s->row_bytes = row_bytes;
     s->data_offset = data_offset;
     s->file_bytes = bytes;
@@ -500,7 +626,7 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
     rc = wl_columnar_spill_capacity(s, bytes);
     if (rc != WL_COLUMNAR_SPILL_OK) goto reserved_fail;
     memcpy(buffer, wl_columnar_spill_magic, sizeof(wl_columnar_spill_magic));
-    wl_columnar_spill_put(buffer + 8, 1, 4);
+    wl_columnar_spill_put(buffer + 8, logical_count ? 2 : 1, 4);
     wl_columnar_spill_put(buffer + 12, ncols, 4);
     wl_columnar_spill_put(buffer + 16, nrows, 8);
     wl_columnar_spill_put(buffer + 24, row_bytes, 8);
@@ -513,6 +639,20 @@ wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
             (size_t)ncols * 4,
             cancel, cancel_context);
     if (rc != WL_COLUMNAR_SPILL_OK) goto reserved_fail;
+    if (logical_count) {
+        uint64_t offset = WL_COLUMNAR_SPILL_HEADER + (uint64_t)ncols * 4;
+        wl_columnar_spill_put(buffer, logical_count, 4);
+        rc = wl_columnar_spill_io(s, true, offset, buffer, 4, cancel,
+                cancel_context);
+        if (rc != WL_COLUMNAR_SPILL_OK) goto reserved_fail;
+        for (uint32_t i = 0; i < logical_count; i++) {
+            wl_columnar_spill_encode_logical(buffer,
+                &wl_columnar_spill_logical(s)[i]);
+            rc = wl_columnar_spill_io(s, true, offset + 4 + (uint64_t)i * 20,
+                    buffer, 20, cancel, cancel_context);
+            if (rc != WL_COLUMNAR_SPILL_OK) goto reserved_fail;
+        }
+    }
     for (uint64_t i = 0; i < nrows; i++) {
         if (cancel && cancel(cancel_context)) {
             rc = WL_COLUMNAR_SPILL_CANCELLED; goto reserved_fail;
@@ -670,4 +810,44 @@ wl_columnar_spill_resolve_string(wl_columnar_spill_reader_t *reader,
         return WL_COLUMNAR_SPILL_INVALID;
     *out = wl_intern_reverse(reader->segment->intern, (int64_t)id);
     return *out ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_INVALID;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_create_with_intern(wl_columnar_spill_store_t *store,
+    const wirelog_column_type_t *types, uint32_t ncols, uint64_t nrows,
+    wl_columnar_spill_source_fn source, void *source_context,
+    wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context,
+    wl_columnar_spill_segment_t **out)
+{
+    return wl_columnar_spill_create_impl(store, types, ncols, nrows, source,
+               source_context, intern, NULL, 0, cancel, cancel_context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_spill_create_with_inline(wl_columnar_spill_store_t *store,
+    const wirelog_column_type_t *types, uint32_t ncols, uint64_t nrows,
+    wl_columnar_spill_source_fn source, void *source_context,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_spill_segment_t **out)
+{
+    if (!columns || !logical_count || !intern) {
+        if (out) *out = NULL;
+        return WL_COLUMNAR_SPILL_INVALID;
+    }
+    return wl_columnar_spill_create_impl(store, types, ncols, nrows, source,
+               source_context, intern, columns, logical_count, cancel,
+               cancel_context, out);
+}
+
+const wirelog_column_t *
+wl_columnar_spill_inline_schema(const wl_columnar_spill_segment_t *s,
+    uint32_t *logical_count)
+{
+    if (logical_count) *logical_count = s ? s->logical_count : 0;
+    if (!s || !logical_count || !s->logical_count) return NULL;
+    return (const wirelog_column_t *)((const char *)s
+           + wl_columnar_spill_logical_offset(s->ncols));
 }

@@ -21,6 +21,7 @@
 #include "../wirelog/util/log.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
+#include "../wirelog/session_facts.h"
 #include "../wirelog/wirelog-parser.h"
 #include "../wirelog/wirelog.h"
 #include "../wirelog/ir/program.h"
@@ -7025,6 +7026,132 @@ test_owned_string_payloads(void)
     wl_columnar_memory_governor_ref_release(g);
     PASS();
 }
+
+static void
+test_owned_inline_relation(void)
+{
+    TEST(
+        "evaluated INLINE relation survives transactional spill and program teardown");
+    const char *src =
+        ".decl ev(id: int64, p: pair(symbol, int64) inline, flag: float)\n"
+        "ev(1, \"alpha\", 5, 10.0).\n"
+        "ev(2, \"beta\", 6, 11.0).\n"
+        ".decl seen(id: int64)\nseen(i) :- ev(i, pair(s, n), k).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(src, &error);
+    PAYLOAD_CHECK(program);
+    const wirelog_schema_t *schema = wirelog_program_get_schema(program, "ev");
+    PAYLOAD_CHECK(schema && schema->column_count == 3);
+    uint32_t functor = schema->columns[1].compound_functor_id;
+    wl_plan_t *plan = NULL;
+    PAYLOAD_CHECK(wl_plan_from_program(program, &plan) == 0);
+    wl_session_t *session = NULL;
+    PAYLOAD_CHECK(wl_session_create(wl_backend_columnar(), plan, 1,
+        &session) == 0);
+    PAYLOAD_CHECK(wl_session_load_facts(session, program) == 0);
+    PAYLOAD_CHECK(wl_session_step(session) == 0);
+    wl_col_session_t *cs = COL_SESSION(session);
+    col_rel_t *source_rel = session_find_rel(cs, "ev");
+    col_rel_t *seen = session_find_rel(cs, "seen");
+    PAYLOAD_CHECK(source_rel && source_rel->nrows == 2 && source_rel->ncols == 4
+        && source_rel->column_types
+        && source_rel->column_types[1] == WIRELOG_TYPE_STRING);
+    PAYLOAD_CHECK(seen && seen->nrows == 2);
+    /* The internal session does not install logical compound metadata. Bind
+    * the originating parsed declaration through the existing layout API. */
+    col_rel_logical_col_t layout[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        layout[i].kind = schema->columns[i].compound_kind;
+        layout[i].arity = schema->columns[i].compound_arity;
+        layout[i].depth = layout[i].kind ==
+            WIRELOG_COMPOUND_KIND_INLINE ? 1 : 0;
+    }
+    PAYLOAD_CHECK(col_rel_apply_compound_schema(source_rel, layout, 3) == 0);
+    wl_columnar_memory_governor_ref_t *g = cs->memory_governor;
+    wl_columnar_memory_governor_ref_retain(g);
+    wl_columnar_spill_store_t *store;
+    PAYLOAD_CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 56,
+        &store)
+        == WL_COLUMNAR_SPILL_OK);
+    wl_columnar_batch_payload_t *payloads[3];
+    wl_columnar_batch_payload_reader_t *readers[3];
+    for (unsigned mode = 0; mode < 3; mode++) {
+        wl_columnar_join_batch_payload_sink_t context;
+        wl_columnar_continuation_sink_t sink;
+        wl_columnar_join_batch_payload_sink_init_with_inline(&context, &sink, g,
+            store, mode == 1 ? WL_COLUMNAR_BATCH_PAYLOAD_SPILLED
+                            : WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+            schema->columns, schema->column_count, cs->intern);
+        wl_columnar_continuation_batch_t batch = {.payload = source_rel,
+                                                  .rows = 2};
+        PAYLOAD_CHECK(sink.begin(sink.context,
+            &batch) == WL_COLUMNAR_CONTINUATION_OK);
+        PAYLOAD_CHECK(sink.reserve(sink.context, 64,
+            2) == WL_COLUMNAR_CONTINUATION_OK);
+        PAYLOAD_CHECK(!context.ready && context.staged);
+        sink.abort(sink.context); /* No private stage may become visible. */
+        PAYLOAD_CHECK(!context.ready && !context.staged);
+        PAYLOAD_CHECK(sink.begin(sink.context,
+            &batch) == WL_COLUMNAR_CONTINUATION_OK);
+        PAYLOAD_CHECK(sink.reserve(sink.context, 64,
+            2) == WL_COLUMNAR_CONTINUATION_OK);
+        PAYLOAD_CHECK(sink.append(sink.context,
+            &batch) == WL_COLUMNAR_CONTINUATION_OK);
+        bool committed = false;
+        PAYLOAD_CHECK(sink.commit(sink.context,
+            &committed) == WL_COLUMNAR_CONTINUATION_OK && committed);
+        payloads[mode] = wl_columnar_join_batch_payload_sink_take(&context);
+        PAYLOAD_CHECK(payloads[mode]);
+        if (mode == 2)
+            PAYLOAD_CHECK(wl_columnar_batch_payload_spill(&payloads[mode],
+                store,
+                NULL, NULL) == WL_COLUMNAR_SPILL_OK);
+        PAYLOAD_CHECK(wl_columnar_batch_payload_acquire(payloads[mode],
+            &readers[mode])
+            == WL_COLUMNAR_SPILL_OK);
+        wl_columnar_join_batch_payload_sink_cleanup(&context);
+    }
+    wl_session_destroy(session);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+    wl_columnar_spill_store_retire(store);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        uint32_t count;
+        const wirelog_column_t *logical =
+            wl_columnar_batch_payload_inline_schema(payloads[mode], &count);
+        PAYLOAD_CHECK(count == 3 && !logical[1].name
+            && logical[1].compound_functor_id == functor
+            && logical[1].compound_arity == 2 &&
+            logical[1].compound_inline_col_offset == 1);
+        for (unsigned row = 0; row < 2; row++) {
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            const char *text;
+            PAYLOAD_CHECK(wl_columnar_batch_payload_read(readers[mode], row,
+                NULL, NULL,
+                &lanes, &meta) == WL_COLUMNAR_SPILL_OK);
+            double flag;
+            memcpy(&flag, &lanes[3], sizeof(flag));
+            PAYLOAD_CHECK(lanes[0] == row + 1 && lanes[2] == row + 5
+                && flag == (double)(row + 10));
+            PAYLOAD_CHECK(wl_columnar_batch_payload_resolve_string(
+                    readers[mode], lanes[1],
+                    &text) == WL_COLUMNAR_SPILL_OK && strcmp(text,
+                row ? "beta" : "alpha") == 0);
+            PAYLOAD_CHECK(wl_columnar_batch_payload_resolve_string(
+                    readers[mode], functor,
+                    &text) == WL_COLUMNAR_SPILL_OK && strcmp(text,
+                "pair") == 0);
+        }
+        wl_columnar_batch_payload_reader_release(readers[mode]);
+        PAYLOAD_CHECK(wl_columnar_batch_payload_release(payloads[mode]) ==
+            WL_COLUMNAR_SPILL_OK);
+    }
+    PAYLOAD_CHECK(wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(g)) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    PASS();
+}
+
 #undef PAYLOAD_CHECK
 
 int
@@ -7033,6 +7160,7 @@ main(void)
     printf("test_join_batch_resume: bounded keyed-join sub-batches (#1446)\n");
     test_owned_mixed_payloads();
     test_owned_string_payloads();
+    test_owned_inline_relation();
     test_owned_payload_demotion_budget();
     test_high_fanout_spans_batches();
     test_boundaries_collision_and_last_match();
