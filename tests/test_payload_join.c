@@ -28,6 +28,37 @@ int wl_columnar_spill_test_io(bool writing, uint64_t offset, size_t *length)
            (read_fail || (read_fail_after && --read_fail_after == 0)) ? EIO : 0;
 }
 
+/* Run the same storage/ownership oracles against full and capped indexes. */
+static uint64_t index_limit;
+static uint64_t index_cap(uint32_t rows)
+{
+    uint64_t buckets = 1;
+    while (buckets < rows && buckets < (UINT64_C(1) << 31)) buckets *= 2;
+    return sizeof(wl_columnar_memory_reservation_t) + 4 * (buckets + rows);
+}
+static wl_columnar_spill_status_t create_join(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_batch_payload_t *l,
+    wl_columnar_batch_payload_t *r, uint32_t lk, uint32_t rk, uint64_t bytes,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_continuation_t **out)
+{
+    return index_limit ? wl_columnar_payload_join_create_bounded(g, l, r,
+               lk, rk, bytes, index_limit, cancel, context, out)
+        : wl_columnar_payload_join_create(g, l, r, lk, rk, bytes, cancel,
+               context, out);
+}
+static wl_columnar_spill_status_t create_weighted_join(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_batch_payload_t *l,
+    wl_columnar_batch_payload_t *r, uint32_t lk, uint32_t rk, uint64_t bytes,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_continuation_t **out)
+{
+    return index_limit ? wl_columnar_payload_join_create_weighted_bounded(g,
+               l, r, lk, rk, bytes, index_limit, cancel, context, out)
+        : wl_columnar_payload_join_create_weighted(g, l, r, lk, rk, bytes,
+               cancel, context, out);
+}
+
 static wl_columnar_memory_governor_ref_t *governor(uint64_t budget)
 {
     wl_columnar_memory_resolution_t r = {.budget_bytes = budget,
@@ -203,7 +234,7 @@ static void combinations(void)
             col_rel_destroy(l); col_rel_destroy(r);
             uint64_t before = reserved(g);
             wl_columnar_continuation_t *join;
-            CHECK(wl_columnar_payload_join_create(g, left, right, 0, 0,
+            CHECK(create_join(g, left, right, 0, 0,
                 7 * 8 * 2, NULL, NULL, &join) == OK);
             CHECK(wl_columnar_batch_payload_release(left) ==
                 WL_COLUMNAR_SPILL_BUSY);
@@ -251,22 +282,22 @@ static void failures(void)
     col_rel_t *r = source(8, 3);
     wl_columnar_batch_payload_t *p = capture(g, store, r, 1);
     uint64_t before = reserved(g); wl_columnar_continuation_t *join = (void *)1;
-    CHECK(wl_columnar_payload_join_create(other, p, p, 0, 0, 100, NULL, NULL,
+    CHECK(create_join(other, p, p, 0, 0, 100, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_INVALID && !join);
-    CHECK(wl_columnar_payload_join_create(g, p, p, 9, 0, 100, NULL, NULL,
+    CHECK(create_join(g, p, p, 9, 0, 100, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_INVALID);
-    CHECK(wl_columnar_payload_join_create(g, p, p, 2, 0, 100, NULL, NULL,
+    CHECK(create_join(g, p, p, 2, 0, 100, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 47, NULL, NULL,
+    CHECK(create_join(g, p, p, 0, 0, 47, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_MEMORY);
     for (unsigned n = 1; n <= 2; n++) {
         allocation_fail = n;
-        CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 96, NULL, NULL,
+        CHECK(create_join(g, p, p, 0, 0, 96, NULL, NULL,
             &join) == WL_COLUMNAR_SPILL_ALLOCATION);
         CHECK(!join && reserved(g) == before);
     }
     read_fail = true;
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 96, NULL, NULL,
+    CHECK(create_join(g, p, p, 0, 0, 96, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_IO);
     read_fail = false;
     CHECK(!join && reserved(g) == before);
@@ -280,7 +311,7 @@ static void failures(void)
                 wl_columnar_memory_governor_ref_get(g),
                 (1 << 20) - before - available,
                 &held) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
-        wl_columnar_spill_status_t status = wl_columnar_payload_join_create(g,
+        wl_columnar_spill_status_t status = create_join(g,
                 p, p, 0, 0, 96, NULL, NULL, &join);
         if (status == OK) {
             wl_columnar_continuation_destroy(join); admitted = true;
@@ -291,11 +322,11 @@ static void failures(void)
     }
     CHECK(admitted);
     bool stop = true;
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 96, cancelled, &stop,
+    CHECK(create_join(g, p, p, 0, 0, 96, cancelled, &stop,
         &join) == WL_COLUMNAR_SPILL_CANCELLED);
     CHECK(!join && reserved(g) == before); stop = false;
     for (unsigned mode = 0; mode < 2; mode++) {
-        CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 96, cancelled,
+        CHECK(create_join(g, p, p, 0, 0, 96, cancelled,
             &stop, &join) == OK);
         sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
         read_fail_after = mode == 0 ? 4 : 0; stop = mode == 1;
@@ -318,14 +349,14 @@ static void failures(void)
         i++) r->timestamps[i] = (col_delta_timestamp_t){0, 0, 0, 0, 1};
     r->timestamps[7].multiplicity = -1;
     wl_columnar_batch_payload_t *bad = capture(g, store, r, 0);
-    CHECK(wl_columnar_payload_join_create(g, p, bad, 0, 0, 96, NULL, NULL,
+    CHECK(create_join(g, p, bad, 0, 0, 96, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
-    CHECK(wl_columnar_payload_join_create(g, bad, p, 0, 0, 96, NULL, NULL,
+    CHECK(create_join(g, bad, p, 0, 0, 96, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
     CHECK(wl_columnar_batch_payload_release(bad) == OK); col_rel_destroy(r);
     CHECK(reserved(g) == before);
     wl_columnar_spill_store_retire(store);
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 96, NULL, NULL,
+    CHECK(create_join(g, p, p, 0, 0, 96, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_CLOSED);
     CHECK(!join && reserved(g) == before);
     CHECK(wl_columnar_batch_payload_release(p) == OK); CHECK(reserved(g) == 0);
@@ -351,8 +382,8 @@ static void budget(bool weighted)
     CHECK(!right && reserved(g) == before);
     right = capture(g, store, r, 1); col_rel_destroy(l); col_rel_destroy(r);
     wl_columnar_continuation_t *join;
-    CHECK((weighted ? wl_columnar_payload_join_create_weighted :
-        wl_columnar_payload_join_create)(g, left, right, 0, 0, 67 * 8 * 2,
+    CHECK((weighted ? create_weighted_join :
+        create_join)(g, left, right, 0, 0, 67 * 8 * 2,
         NULL, NULL, &join) == OK);
     CHECK(reserved(g) < limit);
     /* Refuse a second index/scratch while all remaining budget is held. */
@@ -362,8 +393,8 @@ static void budget(bool weighted)
             wl_columnar_memory_governor_ref_get(g), limit - reserved(g),
             &slack) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
     wl_columnar_continuation_t *denied;
-    CHECK((weighted ? wl_columnar_payload_join_create_weighted :
-        wl_columnar_payload_join_create)(g, left, right, 0, 0, 67 * 8, NULL,
+    CHECK((weighted ? create_weighted_join :
+        create_join)(g, left, right, 0, 0, 67 * 8, NULL,
         NULL, &denied) == WL_COLUMNAR_SPILL_MEMORY && !denied);
     CHECK(wl_columnar_memory_rollback(&slack));
     sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
@@ -384,7 +415,7 @@ static void misses(void)
         *right = capture(g, NULL, r, 0);
     col_rel_destroy(l); col_rel_destroy(r);
     wl_columnar_continuation_t *join;
-    CHECK(wl_columnar_payload_join_create(g, left, right, 0, 0, 32, NULL, NULL,
+    CHECK(create_join(g, left, right, 0, 0, 32, NULL, NULL,
         &join) == OK);
     sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
     unsigned progress = 0;
@@ -426,8 +457,8 @@ static void concurrent_self_join(bool weighted)
     col_rel_destroy(r);
     job_t jobs[2]; wl_thread_t threads[2];
     for (unsigned i = 0; i < 2; i++) {
-        CHECK((weighted ? wl_columnar_payload_join_create_weighted :
-            wl_columnar_payload_join_create)(g, p, p, 0, 0, 96, NULL, NULL,
+        CHECK((weighted ? create_weighted_join :
+            create_join)(g, p, p, 0, 0, 96, NULL, NULL,
             &jobs[i].join) == OK);
         sink_init(&jobs[i].sink_context, &jobs[i].sink, g);
     }
@@ -455,7 +486,7 @@ static void unsupported_and_empty(void)
     CHECK(wl_columnar_batch_payload_capture_with_intern(g, NULL, r, 2,
         WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern, NULL, NULL, &p) == OK);
     wl_columnar_continuation_t *join;
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 64, NULL, NULL,
+    CHECK(create_join(g, p, p, 0, 0, 64, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
     CHECK(wl_columnar_batch_payload_release(p) == OK);
     types[1] = WIRELOG_TYPE_INT64;
@@ -472,7 +503,7 @@ static void unsupported_and_empty(void)
     CHECK(wl_columnar_batch_payload_capture_with_inline(g, NULL, r, 2,
         WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, columns, 2, intern, NULL, NULL,
         &p) == OK);
-    CHECK(wl_columnar_payload_join_create(g, p, p, 0, 0, 64, NULL, NULL,
+    CHECK(create_join(g, p, p, 0, 0, 64, NULL, NULL,
         &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
     CHECK(wl_columnar_batch_payload_release(p) == OK); col_rel_destroy(r);
     wl_intern_free(intern);
@@ -481,7 +512,7 @@ static void unsupported_and_empty(void)
     col_rel_destroy(r);
     r = source(1, 2); p = capture(g, NULL, r, 0); col_rel_destroy(r);
     for (unsigned side = 0; side < 2; side++) {
-        CHECK(wl_columnar_payload_join_create(g, side ? p : empty,
+        CHECK(create_join(g, side ? p : empty,
             side ? empty : p,
             0, 0, 64, NULL, NULL, &join) == OK);
         sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
@@ -541,9 +572,9 @@ static void weighted_storage(void)
                 uint64_t float_bits; memcpy(&float_bits, &l->columns[2][0], 8);
                 col_rel_destroy(l); col_rel_destroy(r);
                 wl_columnar_continuation_t *join;
-                CHECK(wl_columnar_payload_join_create(g, left, right, 0, 0, 80,
+                CHECK(create_join(g, left, right, 0, 0, 80,
                     NULL, NULL, &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
-                CHECK(wl_columnar_payload_join_create_weighted(g, left, right,
+                CHECK(create_weighted_join(g, left, right,
                     0, 0, 80, NULL, NULL, &join) == OK);
                 sink_t s; wl_columnar_continuation_sink_t sink;
                 sink_init(&s, &sink, g);
@@ -633,7 +664,7 @@ static void weighted_boundaries(void)
                 *right = capture(g, NULL, r, 0);
             col_rel_destroy(l); col_rel_destroy(r);
             wl_columnar_continuation_t *join;
-            CHECK(wl_columnar_payload_join_create_weighted(g, left, right, 0, 0,
+            CHECK(create_weighted_join(g, left, right, 0, 0,
                 32, NULL, NULL, &join) == OK);
             sink_t s; wl_columnar_continuation_sink_t sink;
             sink_init(&s, &sink, g);
@@ -681,7 +712,7 @@ static void weighted_partial_overflow(void)
         *right = capture(g, store, r, 1);
     col_rel_destroy(l); col_rel_destroy(r);
     wl_columnar_continuation_t *join;
-    CHECK(wl_columnar_payload_join_create_weighted(g, left, right, 0, 0, 64,
+    CHECK(create_weighted_join(g, left, right, 0, 0, 64,
         NULL, NULL, &join) == OK);
     sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
     CHECK(wl_columnar_continuation_publish(join,
@@ -728,9 +759,9 @@ static void weighted_coordinates(void)
         r->columns[0][2] = 99; /* Unsupported final row has no matching key. */
         wl_columnar_batch_payload_t *bad = capture(g, NULL, r, 0);
         uint64_t before = reserved(g); wl_columnar_continuation_t *join;
-        CHECK(wl_columnar_payload_join_create_weighted(g, plain, bad, 0, 0, 64,
+        CHECK(create_weighted_join(g, plain, bad, 0, 0, 64,
             NULL, NULL, &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
-        CHECK(wl_columnar_payload_join_create_weighted(g, bad, plain, 0, 0, 64,
+        CHECK(create_weighted_join(g, bad, plain, 0, 0, 64,
             NULL, NULL, &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
         CHECK(reserved(g) == before);
         CHECK(wl_columnar_batch_payload_release(bad) == OK);
@@ -750,8 +781,8 @@ static bool weighted_admit_at(wl_columnar_memory_governor_ref_t *g,
             &held) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
     wl_columnar_continuation_t *join;
     wl_columnar_spill_status_t status =
-        (weighted ? wl_columnar_payload_join_create_weighted :
-        wl_columnar_payload_join_create)(g, p, p, 0, 0, 32 * 64, NULL, NULL,
+        (weighted ? create_weighted_join :
+        create_join)(g, p, p, 0, 0, 32 * 64, NULL, NULL,
             &join);
     if (status == OK) wl_columnar_continuation_destroy(join);
     else CHECK(status == WL_COLUMNAR_SPILL_MEMORY && !join);
@@ -795,7 +826,7 @@ static void weighted_stop(void)
     uint64_t before = reserved(g);
     for (unsigned mode = 0; mode < 2; mode++) {
         bool stop = false; wl_columnar_continuation_t *join;
-        CHECK(wl_columnar_payload_join_create_weighted(g, p, p, 0, 0, 64,
+        CHECK(create_weighted_join(g, p, p, 0, 0, 64,
             cancelled, &stop, &join) == OK);
         sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
         read_fail_after = mode == 0 ? 4 : 0; stop = mode == 1;
@@ -816,6 +847,278 @@ static void weighted_stop(void)
     CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
 }
 
+/* Narrow build rows make the full ordinal index alone exceed the allowance.
+ * Verification uses constant state and releases each output before proceeding. */
+static void window_budget(bool weighted)
+{
+    const uint64_t limit = 65536;
+    const uint32_t rows = 16385, window = 127;
+    CHECK(index_cap(rows) > limit);
+    wl_columnar_memory_governor_ref_t *g = governor(limit);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22, 1024,
+        &store) == OK);
+    col_rel_t *l = source(1, 2), *r = source(rows, 2);
+    l->columns[0][0] = 7;
+    if (weighted) {
+        const int64_t weight = -2; weights(l, &weight);
+        CHECK(col_rel_enable_timestamps(r) == 0);
+    }
+    for (uint32_t i = 0; i < rows; i++) {
+        r->columns[0][i] = 7;
+        if (weighted) r->timestamps[i] = (col_delta_timestamp_t){
+                .multiplicity = (int64_t)(i % 3) - 1
+            };
+    }
+    wl_columnar_batch_payload_t *left = capture(g, store, l, 1),
+        *right = capture(g, store, r, 1);
+    col_rel_destroy(l); col_rel_destroy(r);
+    uint64_t before = reserved(g); wl_columnar_continuation_t *join;
+    CHECK((weighted ? wl_columnar_payload_join_create_weighted :
+        wl_columnar_payload_join_create)(g, left, right, 0, 0, 32 * 64,
+        NULL, NULL, &join) == WL_COLUMNAR_SPILL_MEMORY && !join);
+    CHECK(reserved(g) == before);
+    CHECK((weighted ? wl_columnar_payload_join_create_weighted_bounded :
+        wl_columnar_payload_join_create_bounded)(g, left, right, 0, 0,
+        32 * 64, index_cap(window), NULL, NULL, &join) == OK);
+    sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+    uint32_t count = 0, calls = 0;
+    for (;;) {
+        CHECK(++calls < 10000);
+        wl_columnar_continuation_status_t status =
+            wl_columnar_continuation_publish(join, &sink);
+        CHECK(status == WL_COLUMNAR_CONTINUATION_OK ||
+            status == WL_COLUMNAR_CONTINUATION_PROGRESS ||
+            status == WL_COLUMNAR_CONTINUATION_DONE);
+        wl_columnar_batch_payload_t *out =
+            wl_columnar_join_batch_payload_sink_take(&s.owned);
+        if (out) {
+            uint32_t n; wl_columnar_batch_payload_schema(out, NULL, &n);
+            wl_columnar_batch_payload_reader_t *reader;
+            CHECK(wl_columnar_batch_payload_acquire(out, &reader) == OK);
+            CHECK(reserved(g) <= limit);
+            for (uint32_t i = 0; i < n; i++) {
+                CHECK(count < rows);
+                uint32_t start = count / window * window;
+                uint32_t end = rows - start < window ? rows : start + window;
+                uint32_t expected = end - 1 - count % window;
+                const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                CHECK(wl_columnar_batch_payload_read(reader, i, NULL, NULL,
+                    &lanes, &meta) == OK);
+                CHECK(lanes[0] == 7 && lanes[1] == 0 && lanes[2] == 7 &&
+                    lanes[3] == expected);
+                CHECK(meta.multiplicity == (weighted
+                    ? -2 * ((int64_t)(expected % 3) - 1) : 1));
+                CHECK(!meta.iteration && !meta.stratum && !meta.worker);
+                count++;
+            }
+            wl_columnar_batch_payload_reader_release(reader);
+            CHECK(wl_columnar_batch_payload_release(out) == OK);
+        }
+        if (status == WL_COLUMNAR_CONTINUATION_DONE) break;
+    }
+    CHECK(count == rows && wl_columnar_payload_join_error(join) == OK);
+    wl_columnar_continuation_destroy(join); CHECK(reserved(g) == before);
+    CHECK(wl_columnar_batch_payload_release(left) == OK);
+    CHECK(wl_columnar_batch_payload_release(right) == OK);
+    wl_columnar_spill_store_retire(store); CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void window_limits(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    col_rel_t *r = source(5, 2);
+    wl_columnar_batch_payload_t *p = capture(g, NULL, r, 0);
+    col_rel_destroy(r);
+    uint64_t before = reserved(g), fixed = 0;
+    wl_columnar_continuation_t *join;
+    for (uint64_t cap = 0; cap <= index_cap(5) + 1; cap++) {
+        wl_columnar_spill_status_t status =
+            wl_columnar_payload_join_create_bounded(g, p, p, 0, 0, 32,
+                cap, NULL, NULL, &join);
+        if (cap < index_cap(1)) CHECK(status == WL_COLUMNAR_SPILL_MEMORY &&
+                !join);
+        else {
+            CHECK(status == OK);
+            uint32_t rows = 1;
+            while (rows < 5 && index_cap(rows + 1) <= cap) rows++;
+            if (!fixed) fixed = reserved(g) - before - index_cap(rows);
+            CHECK(reserved(g) - before == fixed + index_cap(rows));
+            wl_columnar_continuation_destroy(join);
+        }
+        CHECK(reserved(g) == before);
+    }
+    CHECK(wl_columnar_payload_join_create_bounded(g, p, p, 0, 0, 32,
+        UINT64_MAX, NULL, NULL, &join) == OK);
+    CHECK(reserved(g) - before == fixed + index_cap(5));
+    wl_columnar_continuation_destroy(join);
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    r = source(0, 2); p = capture(g, NULL, r, 0); col_rel_destroy(r);
+    CHECK(wl_columnar_payload_join_create_bounded(g, p, p, 0, 0, 32,
+        index_cap(0) - 1, NULL, NULL,
+        &join) == WL_COLUMNAR_SPILL_MEMORY && !join);
+    CHECK(wl_columnar_payload_join_create_bounded(g, p, p, 0, 0, 32,
+        index_cap(0), NULL, NULL, &join) == OK);
+    sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+    CHECK(wl_columnar_continuation_publish(join,
+        &sink) == WL_COLUMNAR_CONTINUATION_DONE);
+    wl_columnar_continuation_destroy(join);
+    CHECK(wl_columnar_batch_payload_release(p) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* Two calls clear 512 buckets; the next call performs bounded build work.
+ * No output is published while initialization yields. */
+static void window_build_progress(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 1024,
+        &store) == OK);
+    col_rel_t *r = source(600, 2);
+    wl_columnar_batch_payload_t *p = capture(g, store, r, 1);
+    col_rel_destroy(r);
+    uint64_t before = reserved(g);
+    for (unsigned mode = 0; mode < 3; mode++) {
+        bool stop = false; wl_columnar_continuation_t *join;
+        CHECK(wl_columnar_payload_join_create_bounded(g, p, p, 0, 0, 32,
+            index_cap(300), cancelled, &stop, &join) == OK);
+        sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+        /* Clearing must not read any row, or this injected fault fires early. */
+        read_fail = true;
+        for (unsigned i = 0; i < 2; i++) {
+            CHECK(wl_columnar_continuation_publish(join, &sink) ==
+                WL_COLUMNAR_CONTINUATION_PROGRESS);
+            CHECK(!s.owned.ready &&
+                !wl_columnar_continuation_cursor(join)->sequence);
+        }
+        if (mode != 0) read_fail = false;
+        if (mode == 1) stop = true; /* Cancellation at CLEAR -> BUILD. */
+        if (mode == 2) {
+            CHECK(wl_columnar_continuation_publish(join, &sink) ==
+                WL_COLUMNAR_CONTINUATION_PROGRESS);
+            CHECK(!s.owned.ready);
+            stop = true; /* Cancellation during a partially populated index. */
+        }
+        CHECK(wl_columnar_continuation_publish(join, &sink) ==
+            WL_COLUMNAR_CONTINUATION_INVALID);
+        CHECK(wl_columnar_payload_join_error(join) ==
+            (mode ? WL_COLUMNAR_SPILL_CANCELLED : WL_COLUMNAR_SPILL_IO));
+        read_fail = false; stop = false;
+        CHECK(wl_columnar_continuation_publish(join, &sink) ==
+            WL_COLUMNAR_CONTINUATION_INVALID);
+        wl_columnar_continuation_cancel(join);
+        wl_columnar_continuation_destroy(join);
+        CHECK(reserved(g) == before);
+    }
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    wl_columnar_spill_store_retire(store); CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void window_misses(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    col_rel_t *r = source(600, 2);
+    for (uint32_t i = 0; i < r->nrows; i++) r->columns[0][i] = -1;
+    wl_columnar_batch_payload_t *p = capture(g, NULL, r, 0);
+    col_rel_destroy(r);
+    wl_columnar_continuation_t *join;
+    CHECK(wl_columnar_payload_join_create_bounded(g, p, p, 1, 0, 32,
+        index_cap(300), NULL, NULL, &join) == OK);
+    sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+    unsigned progress = 0;
+    for (;;) {
+        wl_columnar_continuation_status_t status =
+            wl_columnar_continuation_publish(join, &sink);
+        CHECK(!s.owned.ready &&
+            !wl_columnar_continuation_cursor(join)->sequence);
+        if (status == WL_COLUMNAR_CONTINUATION_DONE) break;
+        CHECK(status == WL_COLUMNAR_CONTINUATION_PROGRESS &&
+            ++progress < 10000);
+    }
+    CHECK(progress > 4 && wl_columnar_payload_join_error(join) == OK);
+    wl_columnar_continuation_destroy(join);
+    CHECK(wl_columnar_batch_payload_release(p) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* A one-row output and one-row index put each publication in another window. */
+static void window_publication(void)
+{
+    for (unsigned mode = 0; mode < 4; mode++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 1024,
+            &store) == OK);
+        col_rel_t *l = source(1, 2), *r = source(3, 2);
+        const int64_t lw = 2, rw[] = {1, -1, 0};
+        weights(l, &lw); weights(r, rw); l->columns[0][0] = 7;
+        for (uint32_t i = 0; i < 3; i++) r->columns[0][i] = 7;
+        if (mode == 3) r->timestamps[1].multiplicity = INT64_MAX;
+        wl_columnar_batch_payload_t *left = capture(g, store, l, 1),
+            *right = capture(g, store, r, 1);
+        col_rel_destroy(l); col_rel_destroy(r);
+        bool stop = false; wl_columnar_continuation_t *join;
+        CHECK(wl_columnar_payload_join_create_weighted_bounded(g, left, right,
+            0, 0, 32, index_cap(1), cancelled, &stop, &join) == OK);
+        sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+        wl_columnar_batch_payload_t *outputs[3] = {0};
+        for (unsigned i = 0; i < (mode ? 1u : 3u); i++) {
+            wl_columnar_continuation_cursor_t cursor =
+                *wl_columnar_continuation_cursor(join);
+            for (unsigned fault = 1; fault <= 2; fault++) {
+                s.failure = fault;
+                CHECK(wl_columnar_continuation_publish(join, &sink) ==
+                    (fault == 1 ? WL_COLUMNAR_CONTINUATION_SINK_FAILURE :
+                    WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE));
+                CHECK(!s.owned.ready && !s.owned.staged);
+                CHECK(!memcmp(&cursor, wl_columnar_continuation_cursor(join),
+                    sizeof(cursor)));
+            }
+            s.failure = 3;
+            CHECK(wl_columnar_continuation_publish(join, &sink) ==
+                WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS);
+            outputs[i] = wl_columnar_join_batch_payload_sink_take(&s.owned);
+            CHECK(outputs[i]);
+        }
+        wl_columnar_continuation_cursor_t cursor =
+            *wl_columnar_continuation_cursor(join);
+        s.failure = 0;
+        read_fail = mode == 1; stop = mode == 2;
+        CHECK(wl_columnar_continuation_publish(join, &sink) ==
+            (mode ? WL_COLUMNAR_CONTINUATION_INVALID :
+            WL_COLUMNAR_CONTINUATION_DONE));
+        CHECK(!s.owned.ready && !s.owned.staged);
+        if (mode) {
+            CHECK(wl_columnar_payload_join_error(join) ==
+                (mode == 1 ? WL_COLUMNAR_SPILL_IO : mode == 2
+                 ? WL_COLUMNAR_SPILL_CANCELLED : WL_COLUMNAR_SPILL_OVERFLOW));
+            CHECK(!memcmp(&cursor, wl_columnar_continuation_cursor(join),
+                sizeof(cursor)));
+            read_fail = false; stop = false;
+            CHECK(wl_columnar_continuation_publish(join, &sink) ==
+                WL_COLUMNAR_CONTINUATION_INVALID);
+        }
+        wl_columnar_continuation_destroy(join);
+        CHECK(wl_columnar_batch_payload_release(left) == OK);
+        CHECK(wl_columnar_batch_payload_release(right) == OK);
+        wl_columnar_spill_store_retire(store);
+        for (unsigned i = 0; i < (mode ? 1u : 3u); i++) {
+            wl_columnar_batch_payload_reader_t *reader;
+            CHECK(wl_columnar_batch_payload_acquire(outputs[i], &reader) == OK);
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL,
+                &lanes, &meta) == OK);
+            CHECK(lanes[3] == i && meta.multiplicity == 2 * rw[i]);
+            wl_columnar_batch_payload_reader_release(reader);
+            CHECK(wl_columnar_batch_payload_release(outputs[i]) == OK);
+        }
+        CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void)
 {
     combinations(); failures(); budget(false); budget(true); misses();
@@ -823,5 +1126,15 @@ int main(void)
     unsupported_and_empty();
     weighted_storage(); weighted_boundaries(); weighted_partial_overflow();
     weighted_coordinates(); weighted_floor(); weighted_stop();
+    for (uint32_t window = 1; window <= 3; window += 2) {
+        index_limit = index_cap(window);
+        combinations(); weighted_storage(); failures(); unsupported_and_empty();
+        weighted_boundaries(); weighted_coordinates(); weighted_floor();
+        weighted_partial_overflow(); weighted_stop();
+        concurrent_self_join(false); concurrent_self_join(true);
+    }
+    index_limit = 0;
+    window_budget(false); window_budget(true); window_limits();
+    window_build_progress(); window_publication(); window_misses();
     puts("payload_join: PASS"); return 0;
 }
