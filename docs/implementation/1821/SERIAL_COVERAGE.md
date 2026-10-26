@@ -45,8 +45,8 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 |---|---|---|---|
 | E01 / S11 | Control absent: ordinary `col_session_step`; control attached: `col_controlled_step` | R; raw execution is the disabled-control reference, not an enforcement route | `test_controlled_session_step_resume`; preserve raw semantics in every later group |
 | E02 / S11 | Default acyclic, no observer: static checks → `col_controlled_step_default_preflight` → framed relation host | R, implemented restricted route; Q64 for operator/registry/name traversal and scheduler; S/F | `test_controlled_step_preflight_byte_cursor`, `test_controlled_step_preflight_work_limit_boundary`, `test_controlled_step_scheduler_empty_strata`; nested frame/cleanup regions remain U (G1/G6) |
-| E03 / S10,S11 | Delta callback present: static one-rule unary INT64 identity/optional FILTER validation → missing-head baseline → frame → observer | R, restricted; count-only shape refusal before attempt; EDB/registry/name admission uses charged Q64 cursors; S/F/O | `test_controlled_observed_step`, `test_controlled_observed_filter_stops`, `test_controlled_observed_admission_work`; exact/one-short long-name boundary and retry; G2 handles general composition |
-| E04 / S10 | Completed observed STEP plus one-row input insert/remove → private candidate → signed comparison/publication | R, restricted; three-slot registry cap; candidate copy/publish charges present but entire mutation/preparation boundary U; S/O | `test_controlled_observed_filter_successors`; retained `$r$input` and registry holes limit subsequent mutations; G2, #1820 |
+| E03 / S10,S11 | Delta callback: legacy unary route or ordinary acyclic transaction → private captured heads → baseline/events → coordinated publication | R, ordinary scalar host implemented; charged byte/slot/schema/metadata cursors, A/Q64; 32 inherited strata maximum, child domains remain authoritative; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_wide_public`, `test_controlled_observed_transaction_budget`; typed/wide/nullary/dependent-head and empty-input execution, stops and reference parity. New expressions/representations and configurations remain G5/G6 |
+| E04 / S10 | Completed observed STEP plus declared-input insert/remove → private full candidates → signed comparison and atomic registry image | R, reusable ordinary route; no three-slot/four-binding cap; charged preparation, reversible old-head/staging claims, prepaid cutoff, retained cleanup; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_filter_successors`; repeated signed cycles, later-claim cancellation, no replay, reference output and stable/zero governor balances. #1820 recovery contract retained |
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Other recursive manifests or multihead/SCC patterns | R, refused by manifest/static or charged preflight; no general recursive stop owner | `test_controlled_recursive_step_rejects_unsupported_shape`; required actual execution/stop/retry absent, G3 |
 | E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
@@ -99,7 +99,7 @@ controlled fallback.
 | F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit |
 | F08 / S05,S07 | Legacy recursive merge/dedup versus managed incremental candidate/union | R; `wl_columnar_merge_incremental_delta_attempt_advance` caps a call at Q256; generic legacy recursive path remains U; S/F | Restricted recursive session tests and `evaluation_work`/`evaluation_consolidate` primitives; general frontier/retraction integration G3 |
 | F09 / S11 | Governor admission, allocator/Arrow release, CAS/control references, receipt retirement and registry replacement | R engine setup/cleanup; external allocator body is noninterruptible, engine copies/scans are not thereby excluded; U unless separately precharged/bounded | Allocation/copy/receipt tests establish local tariffs, not all nested bounds; G6 must name each finite region, charge before allocation, retain resources on every failure |
-| F10 / S10,S12 | Observer/snapshot publication after final poll → callbacks | H for user callback duration; R for engine preparation, tuple assembly, traversal, lookup and cleanup; O / U for full engine loop | Completed snapshot uses charged tuple staging and finite prepaid dispatch (`test_controlled_snapshot_preparation`); observer composition/preparation remains G2 |
+| F10 / S10,S12 | Observer/snapshot preparation → final poll → prepaid callback batch | H for callback duration; R for charged engine preparation/assembly/traversal/lookup, retained mandatory cleanup; O, A/Q64 before cutoff | `test_controlled_snapshot_preparation` and the G2 multihead/wide/budget fixtures cover preparation stops, late cancellation and finite publication. Nested policy/configuration obligations remain G6 |
 
 ### Concrete fallback predicates within F01–F07
 
@@ -146,8 +146,8 @@ amends a row before implementation, rather than silently enlarging the scope.
 
 | Group | Owned rows / work | Exit tests and dependencies |
 |---|---|---|
-| G1 — bounded session admission and snapshot engine work | E02/E03/E10/F10; S11/S12 | Long names, many strata/EDBs/registry slots and large snapshot sources stop at deterministic checkpoints before callbacks; exact/one-short admission boundaries, unchanged output on stop, retry. Preserve #1820 publication cutoff. Implemented in this bundle for the restricted admitted session domain; fresh/dirty evaluation stays with #1820/G3 |
-| G2 — reusable signed observer composition | E03/E04/F10; S10 plus scalar composition | Repeated insert/remove cycles retire/reuse staging without registry exhaustion; typed/multi-column/multihead canonical signed deltas, no replay, retained resource baseline. #1820 recovery prerequisite |
+| G1 — bounded session admission and snapshot engine work | E02/E03/E10/F10; S11/S12 | Long names, many strata/EDBs/registry slots and large snapshot sources stop at deterministic checkpoints before callbacks; exact/one-short admission boundaries, unchanged output on stop, retry. Preserve #1820 publication cutoff. Merged in PR #2272 for the restricted admitted session domain; fresh/dirty evaluation stays with #1820/G3 |
+| G2 — reusable signed observer composition | E03/E04/F10; S10 plus already controlled ordinary scalar composition | Implemented and qualified in this bundle: repeated signed cycles, typed/wide/nullary/dependent heads, stops/retry, no replay and resource baselines. New child domains/configurations retain G5/G6 ownership; #1820 cutoff and recovery preserved |
 | G3 — general serial recursive/differential execution | E05–E07/O10/O12/F04/F08 | Actual SCC/frontier, trace, retraction and serial fallback interruption; signed reference parity and reset/retry. Integrate #1820 safe state ownership, leave parallel scheduler to #1822 |
 | G4 — host LFTJ and batch/pipeline/fallback integration | E08/E09/O11/F01–F03/F06/C04 | Actual chosen pipeline/LFTJ/decline destination must run and stop; one allowance across suspension/replay, no-output candidates, error distinctions, reference parity; reuse existing producers |
 | G5 — scalar/expression/representation closure | O01–O09/F05/F07/C01/C02/C05/C07 | Each required type/expression/materialized/retained/segmented/weighted representation has actual-path limits, cancellation, canonical reference and ownership tests; unsupported external bodies get explicit finite admission/cooperative disposition |
@@ -157,10 +157,12 @@ amends a row before implementation, rather than silently enlarging the scope.
 These are seven implementation/qualification groups, not seven guaranteed PRs.
 The differential recovery and representation groups still require design
 sizing; a fixed remaining PR count is not supported. Each PR must name the
-rows it closes and update this ledger. G1 is delivered as admission and completed-snapshot atomic commits in the
-same PR bundle. G2 is the next implementation group.
+rows it closes and update this ledger. G1 was merged in PR #2272. G2 is delivered
+as one four-commit bundle. G3 is next; G3–G7 are five work groups, not five
+promised PRs. The G2 production audit uses `a76b8ff5`; other rows retain their
+original audit and explicit gaps.
 
-## Evidence produced by this increment
+## Historical coverage-contract evidence
 
 `test_controlled_session_admission_matrix` covers nine host restrictions:
 iteration, two retraction flags, differential mode, strict batching, an
@@ -175,12 +177,12 @@ recursive/observer/batch/snapshot positive fixtures provide the corresponding
 admitted-route evidence. Execution results for this increment are recorded in
 the closure plan; other suite references above are inspected evidence only.
 
-### G1 admission implementation
+### G1 admission implementation (merged PR #2272)
 
 Observed admission now charges declared-EDB visits, registry slots and name
 bytes inside the existing STEP attempt, with at most 64 cursor actions per
-host return. Unsupported stratum/rule counts are rejected without walking
-the arrays. Initial-result lookup and successor-name collision scans also
+host return. The historical restricted route rejected unsupported stratum/rule counts
+without walking the arrays; G2 adds charged ordinary composition traversal. Initial-result lookup and successor-name collision scans also
 charge before reading names. Successor metadata copies use at most 128-byte
 chunks; the fixed generated name lives in the STEP record. Retired hash
 credits become canonical empty tokens without relying on a lazy lookup.
@@ -190,8 +192,8 @@ pointers and compares names only through the previously validated immutable
 name lengths. This API argument validation is O(validated name length),
 outside the STEP attempt; it is not a constant-time or 256-action polling
 claim. Successor STEP revalidates the actual relations under its attempt.
-Observer baseline/preparation and general signed composition remain G2;
-completed-snapshot staging is the other G1 unit in the same PR bundle.
+G2 below replaces the restricted composition and staging limits; the legacy
+route retains its existing admission tariffs.
 
 ### G1 completed-snapshot implementation
 
@@ -201,6 +203,26 @@ source gathering and finite dispatch admission are charged. No callbacks
 escape a preparation stop; every initialized source drains before cutoff.
 The full prepared batch is delivered after cutoff, preserving late sticky
 cancellation and raw ordering. That finite tail has no new polling claim.
-G1 is complete for the currently admitted serial host routes. General signed
-composition, fresh/dirty snapshot evaluation and nested resource/configuration
-qualification remain in G2–G7 and their existing #1820 dependencies.
+G1 is complete for the currently admitted serial host routes. Recursive/differential
+observed composition, new child expressions/representations, fresh/dirty snapshot
+evaluation and nested resource/configuration qualification remain in G3–G7 and
+their existing #1820 dependencies.
+
+### G2 ordinary observed composition
+
+The [closure plan](CLOSURE_PLAN.md#g2-implementation-bundle-2026-10-26) records
+scope, ownership, named tests and local validation. General observed STEP now
+uses authenticated dynamic bindings and capture-only ordinary frames. Every
+child terminal receipt is acknowledged before a binding changes. Baseline/current
+preparation and one coordinated registry image precede the final poll; old-head
+and consumed-staging claims remain reversible until publication. Mandatory
+cleanup retains its owners after the cutoff.
+
+E03/E04/F10 have integrated session evidence for multiinput and dependent heads,
+private JOIN, typed/wide/nullary rows, empty inputs, long names, repeated signed
+cycles, work exhaustion, cancellation and resource baselines. The calibrated
+whole-transaction exact/one-short test is empirical; it does not replace the
+independent cost-oracle obligations of G7. Callback execution and finite prepaid
+publication tails retain their existing cutoff semantics. No generic child
+expression, optional representation, recursive/differential or batching claim
+is inferred from host admission.
