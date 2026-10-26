@@ -847,6 +847,167 @@ inline_failures(void)
     CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
 }
 
+typedef struct {
+    wl_columnar_memory_governor_ref_t *g;
+    uint64_t peak, settled;
+    unsigned calls, fail_at, cancel_mode;
+} stream_t;
+static wl_columnar_spill_status_t stream_row(void *v, uint64_t ordinal,
+    uint64_t *lanes, wl_columnar_spill_metadata_t *meta)
+{
+    stream_t *s = v;
+    CHECK(ordinal == s->calls++);
+    uint64_t current = reserved(s->g);
+    if (current > s->peak) s->peak = current;
+    if (s->fail_at && s->calls == s->fail_at) return WL_COLUMNAR_SPILL_IO;
+    int64_t integer = -(int64_t)ordinal;
+    double floating = -(double)ordinal / 2;
+    memcpy(lanes, &integer, 8); memcpy(lanes + 1, &floating, 8);
+    lanes[2] = ordinal % 2;
+    *meta = (wl_columnar_spill_metadata_t){(uint32_t)ordinal, 7, 3,
+                                           ordinal % 2 ? -2 : 1};
+    return OK;
+}
+static bool stream_cancel(void *v)
+{
+    stream_t *s = v;
+    return s->cancel_mode == 1 || (s->cancel_mode == 2 && s->calls >= 3)
+           || (s->cancel_mode == 3 && s->calls == 8 &&
+           reserved(s->g) == s->settled);
+}
+static void streamed_payload(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20),
+        *other = governor(1 << 20);
+    wl_columnar_spill_store_t *store, *tiny, *narrow;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 48,
+        &store) == OK);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1, 48, &tiny) == OK);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 4096, 32,
+        &narrow) == OK);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT,
+                                     WIRELOG_TYPE_BOOL};
+    uint64_t payload_floor, reader_floor;
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+        &payload_floor, &reader_floor) == OK);
+    wl_columnar_spill_floor_t floor;
+    CHECK(wl_columnar_spill_floor(test_tmpdir(), 3, &floor) == OK);
+    uint64_t before = reserved(g);
+    stream_t source_state = {.g = g};
+    wl_columnar_batch_payload_t *p, *out = NULL;
+    CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 3, 8,
+        stream_row, &source_state, NULL, NULL, &p) == OK);
+    CHECK(source_state.calls == 8 && source_state.peak ==
+        before + payload_floor + floor.segment_bytes + floor.writer_bytes);
+    CHECK(reserved(g) == before + payload_floor + floor.segment_bytes);
+    uint64_t owned_bytes = wl_columnar_spill_store_bytes(store);
+    before = reserved(g);
+    /* Every failure preserves a previously published owner and its disk usage. */
+    for (unsigned mode = 0; mode < 13; mode++) {
+        source_state = (stream_t){.g = g,
+                                  .settled = before + payload_floor +
+                                      floor.segment_bytes};
+        wl_columnar_spill_store_t *target = store;
+        wl_columnar_memory_governor_ref_t *owner = g;
+        wl_columnar_spill_source_fn callback = stream_row;
+        uint32_t ncols = 3;
+        const wirelog_column_type_t *schema = types;
+        wl_columnar_spill_status_t expected = WL_COLUMNAR_SPILL_INVALID;
+        if (mode == 0) owner = other;
+        if (mode == 1) schema = NULL;
+        if (mode == 2) ncols = 0;
+        if (mode == 3) callback = NULL;
+        if (mode == 4) {
+            types[0] = WIRELOG_TYPE_STRING;
+            expected = WL_COLUMNAR_SPILL_UNSUPPORTED;
+        }
+        if (mode == 5) {
+            target = tiny; expected = WL_COLUMNAR_SPILL_QUOTA;
+        }
+        if (mode == 6) {
+            target = narrow; expected = WL_COLUMNAR_SPILL_MEMORY;
+        }
+        if (mode == 7) {
+            wl_columnar_batch_payload_test_fail_allocation(1);
+            expected = WL_COLUMNAR_SPILL_ALLOCATION;
+        }
+        if (mode == 8) {
+            source_state.fail_at = 4; expected = WL_COLUMNAR_SPILL_IO;
+        }
+        if (mode >= 9 && mode <= 11) {
+            source_state.cancel_mode = mode - 8;
+            expected = WL_COLUMNAR_SPILL_CANCELLED;
+        }
+        out = (void *)1;
+        CHECK(wl_columnar_batch_payload_create_spilled(owner, target, schema,
+            ncols, 8, callback, &source_state, stream_cancel, &source_state,
+            mode == 12 ? NULL : &out) == expected);
+        if (mode != 12) CHECK(!out);
+        if (mode < 8 || mode == 9 || mode == 12) CHECK(!source_state.calls);
+        if (mode == 8) CHECK(source_state.calls == 4);
+        if (mode == 10) CHECK(source_state.calls == 3);
+        if (mode == 11) CHECK(source_state.calls == 8);
+        CHECK(reserved(g) == before &&
+            wl_columnar_spill_store_bytes(store) == owned_bytes);
+        types[0] = WIRELOG_TYPE_INT64;
+    }
+    /* One byte below the complete creation floor cannot call the source;
+     * exact-floor success includes the first payload's retained charges. */
+    uint64_t need = payload_floor + floor.segment_bytes + floor.writer_bytes;
+    for (unsigned enough = 0; enough < 2; enough++) {
+        wl_columnar_memory_reservation_t held;
+        wl_columnar_memory_reservation_init(&held);
+        uint64_t available = need - 1 + enough;
+        CHECK(wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(g),
+                (1 << 20) - before - available,
+                &held) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        source_state = (stream_t){.g = g};
+        CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 3, 8,
+            stream_row, &source_state, NULL, NULL, &out) ==
+            (enough ? OK : WL_COLUMNAR_SPILL_MEMORY));
+        if (enough) {
+            CHECK(source_state.calls == 8 && source_state.peak == (1 << 20));
+            CHECK(wl_columnar_batch_payload_release(out) == OK);
+        } else CHECK(!out && !source_state.calls);
+        CHECK(wl_columnar_memory_rollback(&held) && reserved(g) == before);
+        CHECK(wl_columnar_spill_store_bytes(store) == owned_bytes);
+    }
+    CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 3, 0,
+        NULL, NULL, NULL, NULL, &out) == OK);
+    uint32_t ncols, nrows;
+    CHECK(wl_columnar_batch_payload_schema(out, &ncols,
+        &nrows) && ncols == 3 && !nrows);
+    CHECK(wl_columnar_batch_payload_release(out) == OK);
+    memset(&source_state, 0, sizeof(source_state));
+    memset(types, 0, sizeof(types));
+    const wirelog_column_type_t *copied = wl_columnar_batch_payload_schema(p,
+            &ncols, &nrows);
+    CHECK(ncols == 3 && nrows == 8 && copied[1] == WIRELOG_TYPE_FLOAT);
+    wl_columnar_batch_payload_reader_t *readers[2];
+    CHECK(wl_columnar_batch_payload_acquire(p, &readers[0]) == OK);
+    CHECK(wl_columnar_batch_payload_acquire(p, &readers[1]) == OK);
+    CHECK(wl_columnar_batch_payload_release(p) == WL_COLUMNAR_SPILL_BUSY);
+    job_t jobs[] = {{readers[0]}, {readers[1]}}; wl_thread_t threads[2];
+    for (unsigned i = 0; i < 2;
+        i++) CHECK(wl_thread_create(&threads[i], read_thread, &jobs[i]) == 0);
+    wl_columnar_spill_store_retire(store);
+    for (unsigned i = 0; i < 2; i++) wl_thread_join(&threads[i]);
+    source_state = (stream_t){.g = g};
+    CHECK(wl_columnar_batch_payload_create_spilled(g, store, copied, 3, 8,
+        stream_row, &source_state, NULL, NULL,
+        &out) == WL_COLUMNAR_SPILL_CLOSED);
+    CHECK(!out && !source_state.calls);
+    for (unsigned i = 0; i < 2;
+        i++) wl_columnar_batch_payload_reader_release(readers[i]);
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    CHECK(wl_columnar_spill_store_close(tiny) == OK);
+    CHECK(wl_columnar_spill_store_close(narrow) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_memory_governor_ref_release(other);
+}
+
 int main(void)
 {
     uint64_t inline_bytes, inline_reader_bytes;
@@ -856,6 +1017,7 @@ int main(void)
     CHECK(wl_columnar_batch_payload_floor_with_inline(2, 1, 3,
         WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, &inline_bytes,
         &inline_reader_bytes) == WL_COLUMNAR_SPILL_INVALID);
+    streamed_payload();
     inline_payloads(); inline_numeric_functors(); inline_failures();
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT);
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_SPILLED);

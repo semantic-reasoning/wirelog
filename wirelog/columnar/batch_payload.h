@@ -35,6 +35,29 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out);
 
+/* Stream a known number of numeric scalar rows directly into a spilled payload,
+ * without a resident relation or rowset. Same-governor store required. Types
+ * are copied; source/types/contexts are borrowed only until return. The source
+ * fills all ncols lanes and complete metadata in the supplied one-row scratch
+ * for ascending ordinals [0, rows). It must supply self-contained numeric bits,
+ * never IDs/pointers/compound handles disguised as integers. STRING is rejected.
+ * An empty payload permits NULL source; nonempty input requires a callback.
+ * Callback state must remain live; callbacks must not reenter/retire any store,
+ * governor or payload lifecycle involved in this call.
+ *
+ * Only the descriptor/schema and existing spill segment/writer scratch are
+ * admitted; source state/stack and governor/OS costs remain additional. Source
+ * errors propagate unchanged. All errors, including late cancellation, leave
+ * *out NULL and refund private storage. Consumed input/callback side effects
+ * cannot be rolled back: retry with a fresh or rewound source. Publication,
+ * pins, retirement and read semantics match spilled relation capture. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_create_spilled(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, const wirelog_column_type_t *types,
+    uint32_t ncols, uint32_t rows, wl_columnar_spill_source_fn source,
+    void *source_context, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_batch_payload_t **out);
+
 /* Explicit STRING provenance: caller guarantees all STRING IDs originate in
  * intern, already attached to governor. Pins retain strings beyond owner
  * teardown; invalid IDs fail atomically. Numeric capture above still rejects

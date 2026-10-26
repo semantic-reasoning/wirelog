@@ -4450,6 +4450,70 @@ automatic evaluator cold routing, general logical time, SIDE/nested values, publ
 spill configuration and scheduler integration remain separate work. #1372 stays
 open and this does not qualify #1385.
 
+### Streamed spilled-payload construction (#1372)
+
+`wl_columnar_batch_payload_create_spilled` connects the spill layer's one-row
+source callback directly to the owned payload interface. It takes an explicit
+numeric scalar schema and a known `uint32_t` row count. It copies the schema,
+admits the payload descriptor, and delegates row encoding, quota/capacity checks,
+writer scratch and file ownership to `wl_columnar_spill_create`. No complete
+source relation, intermediate resident payload or second governor is created.
+STRING, compound and pointer provenance remain unsupported in this entry point;
+existing relation/STRING/INLINE capture APIs retain their contracts.
+
+The source fills every lane and the complete timestamp/signed-difference metadata
+for each ascending ordinal using supplied one-row scratch. Numeric lane bits and
+all metadata coordinates are retained exactly. Zero rows permit a NULL source.
+Types, source contexts and cancellation state are borrowed only during the call;
+the published payload retains none of them. Callbacks must not reenter or retire
+involved lifecycle objects, and must not disguise ephemeral IDs or pointers as
+self-contained numeric values. This API has a known-count contract, not an
+unknown-length append interface.
+
+Source errors propagate as typed statuses. Allocation/admission denial,
+quota/capacity exhaustion, partial I/O errors and cancellation, including after
+the final row and segment creation, leave the output owner NULL and release
+private payload/segment/file resources. Existing published payloads remain valid.
+Consumed source input and callback side effects are not rolled back; a retry
+requires a fresh or rewound source. Reader pins, BUSY release, store retirement
+and independent-reader concurrency use the same payload/segment lifecycle as
+relation capture.
+
+Construction adds `batch_payload_floor(..., SPILLED).payload_bytes` plus
+`spill_floor.segment_bytes + spill_floor.writer_bytes` to the already-live store
+and prior payloads. After construction only the payload and segment remain;
+reader floors are charged on acquisition. Tests measure that exact writer-time
+reservation, reject one byte below it without calling the source, and succeed
+at the floor while preserving a previously published payload. They cover schema
+copy independence, negative-zero bits, signed metadata, empty inputs, unsupported
+schemas, wrong governors, quota/row-width limits, allocator failure, prefix source
+failure, early/mid/late cancellation, concurrent readers and store retirement.
+Existing spill I/O hooks additionally exercise short writes and injected EIO or
+ENOSPC after a second input's private prefix, with unchanged first-owner contents,
+disk accounting and complete refunds.
+
+The streaming variant of the capped JOIN fixture starts with one 64 KiB enforcing
+governor and uses fixed-size pull-source contexts to compute BOTH inputs directly
+into spill scratch. It retains the first payload's charges while constructing
+16,385 right rows; no full input relation or source array is allocated and no
+ledger reset, budget increase or governor swap occurs. The full index alone
+exceeds that allowance and is refused; a 127-row index completes ordinary and
+signed-weighted JOIN. Constant-state output verification checks every ordinal,
+negative/zero weight, duplicate-key match, window boundary and final unmatched
+row; each output is released before continuing. Exhausting the remaining allowance
+also explicitly denies the minimum execution floor without losing either input.
+
+This establishes managed bounded streaming construction AND JOIN execution for
+these supported numeric streams, extending the earlier prepared-input execution
+proof. It is not a whole-process RSS guarantee: source contexts/stack, the governor
+object, the generic continuation's fixed descriptor, allocator overhead and OS
+resources remain explicit additional costs. Arbitrary callbacks can retain their
+own unbounded state and must account for it separately. Existing relation-capture
+paths still require their complete source relation; automatic evaluator/registry
+cold routing, mutable/trace transitions, public spill configuration, broader
+compound support and #1373 scheduling remain separate work. #1372 stays open and
+this does not qualify #1385.
+
 ## Controlled completed-snapshot workspace
 
 Completed controlled snapshots reserve two private workspace allocations: a

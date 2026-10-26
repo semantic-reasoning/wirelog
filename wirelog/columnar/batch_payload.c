@@ -134,6 +134,39 @@ wl_columnar_batch_payload_floor_with_inline(uint32_t ncols, uint32_t nrows,
     return WL_COLUMNAR_SPILL_OK;
 }
 
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_create_spilled(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, const wirelog_column_type_t *types,
+    uint32_t ncols, uint32_t rows, wl_columnar_spill_source_fn source,
+    void *source_context, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_batch_payload_t **out)
+{
+    if (!out) return WL_COLUMNAR_SPILL_INVALID;
+    *out = NULL;
+    if (!g || !types || (rows && !source)
+        || !wl_columnar_spill_store_uses_governor(store, g))
+        return WL_COLUMNAR_SPILL_INVALID;
+    uint64_t bytes, reader_bytes;
+    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_floor(ncols,
+            rows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, &bytes, &reader_bytes);
+    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    void *allocation = NULL;
+    rc = wl_columnar_batch_payload_allocate(g, bytes, &allocation);
+    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    wl_columnar_batch_payload_t *p = allocation;
+    p->governor = g; wl_columnar_memory_governor_ref_retain(g);
+    p->ncols = ncols; p->nrows = rows;
+    memcpy(p->types, types, (size_t)ncols * sizeof(*types));
+    rc = wl_columnar_spill_create(store, p->types, ncols, rows, source,
+            source_context, cancel, cancel_context, &p->segment);
+    if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(cancel_context))
+        rc = WL_COLUMNAR_SPILL_CANCELLED;
+    if (rc == WL_COLUMNAR_SPILL_OK) *out = p;
+    else if (wl_columnar_batch_payload_release(p) != WL_COLUMNAR_SPILL_OK)
+        abort();
+    return rc;
+}
+
 static wl_columnar_spill_status_t
 wl_columnar_batch_payload_source(void *context, uint64_t ordinal,
     uint64_t *lanes, wl_columnar_spill_metadata_t *metadata)
