@@ -45,7 +45,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 |---|---|---|---|
 | E01 / S11 | Control absent: ordinary `col_session_step`; control attached: `col_controlled_step` | R; raw execution is the disabled-control reference, not an enforcement route | `test_controlled_session_step_resume`; preserve raw semantics in every later group |
 | E02 / S11 | Default acyclic, no observer: static checks → `col_controlled_step_default_preflight` → framed relation host | R, implemented restricted route; Q64 for operator/registry/name traversal and scheduler; S/F | `test_controlled_step_preflight_byte_cursor`, `test_controlled_step_preflight_work_limit_boundary`, `test_controlled_step_scheduler_empty_strata`; nested frame/cleanup regions remain U (G1/G6) |
-| E03 / S10,S11 | Delta callback present: static one-rule unary INT64 identity/optional FILTER validation → missing-head baseline → frame → observer | R, restricted; static strata/EDB/registry/name scans are U before attempt; S/F/O | `test_controlled_observed_step`, `test_controlled_observed_filter_stops`; G1 must meter pre-attempt scans, G2 handles general composition |
+| E03 / S10,S11 | Delta callback present: static one-rule unary INT64 identity/optional FILTER validation → missing-head baseline → frame → observer | R, restricted; count-only shape refusal before attempt; EDB/registry/name admission uses charged Q64 cursors; S/F/O | `test_controlled_observed_step`, `test_controlled_observed_filter_stops`, `test_controlled_observed_admission_work`; exact/one-short long-name boundary and retry; G2 handles general composition |
 | E04 / S10 | Completed observed STEP plus one-row input insert/remove → private candidate → signed comparison/publication | R, restricted; three-slot registry cap; candidate copy/publish charges present but entire mutation/preparation boundary U; S/O | `test_controlled_observed_filter_successors`; retained `$r$input` and registry holes limit subsequent mutations; G2, #1820 |
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Other recursive manifests or multihead/SCC patterns | R, refused by manifest/static or charged preflight; no general recursive stop owner | `test_controlled_recursive_step_rejects_unsupported_shape`; required actual execution/stop/retry absent, G3 |
@@ -175,3 +175,21 @@ This test does not claim that the refused algorithms executed. Existing
 recursive/observer/batch/snapshot positive fixtures provide the corresponding
 admitted-route evidence. Execution results for this increment are recorded in
 the closure plan; other suite references above are inspected evidence only.
+
+### G1 admission implementation
+
+Observed admission now charges declared-EDB visits, registry slots and name
+bytes inside the existing STEP attempt, with at most 64 cursor actions per
+host return. Unsupported stratum/rule counts are rejected without walking
+the arrays. Initial-result lookup and successor-name collision scans also
+charge before reading names. Successor metadata copies use at most 128-byte
+chunks; the fixed generated name lives in the STEP record. Retired hash
+credits become canonical empty tokens without relying on a lazy lookup.
+
+Completed observed mutation authorization checks at most three registry
+pointers and compares names only through the previously validated immutable
+name lengths. This API argument validation is O(validated name length),
+outside the STEP attempt; it is not a constant-time or 256-action polling
+claim. Successor STEP revalidates the actual relations under its attempt.
+Observer baseline/preparation and general signed composition remain G2;
+completed-snapshot staging is the other G1 unit in the same PR bundle.

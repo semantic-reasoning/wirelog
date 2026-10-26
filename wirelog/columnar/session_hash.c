@@ -251,6 +251,9 @@ session_rel_free_hash(wl_col_session_t *sess)
     free(sess->rel_hash_head);
     free(sess->rel_hash_next);
     session_reservation_release(&sess->rel_hash_reservation);
+    /* The arrays and their credits are retired; leave a canonical empty
+     * token for publication even when no lookup rebuilds the hash. */
+    wl_columnar_memory_reservation_init(&sess->rel_hash_reservation);
     sess->rel_hash_head = NULL;
     sess->rel_hash_next = NULL;
     sess->rel_hash_nbuckets = 0;
