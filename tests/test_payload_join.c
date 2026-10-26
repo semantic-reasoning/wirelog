@@ -14,6 +14,8 @@
 static unsigned allocation_fail;
 static bool read_fail;
 static unsigned read_fail_after;
+static int write_error;
+static bool short_writes;
 bool wl_columnar_payload_join_test_allocation(void)
 {
     return allocation_fail && --allocation_fail == 0;
@@ -23,7 +25,9 @@ bool wl_columnar_spill_test_allocation(void) {
 }
 int wl_columnar_spill_test_io(bool writing, uint64_t offset, size_t *length)
 {
-    (void)offset; (void)length;
+    (void)offset;
+    if (writing && write_error) return write_error;
+    if (writing && short_writes && *length > 3) *length = 3;
     return !writing &&
            (read_fail || (read_fail_after && --read_fail_after == 0)) ? EIO : 0;
 }
@@ -847,9 +851,30 @@ static void weighted_stop(void)
     CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
 }
 
+typedef struct {
+    uint32_t rows, calls;
+    bool weighted, left;
+    unsigned fault;
+} input_stream_t;
+static wl_columnar_spill_status_t input_stream(void *v, uint64_t ordinal,
+    uint64_t *lanes, wl_columnar_spill_metadata_t *meta)
+{
+    input_stream_t *s = v;
+    CHECK(ordinal == s->calls++ && ordinal < s->rows);
+    if (s->fault && ordinal == 3) {
+        if (s->fault == 1) return WL_COLUMNAR_SPILL_IO;
+        write_error = s->fault == 2 ? EIO : ENOSPC;
+    }
+    lanes[0] = !s->left && ordinal == s->rows - 1 ? 99 : 7;
+    lanes[1] = ordinal;
+    *meta = (wl_columnar_spill_metadata_t){.multiplicity = s->weighted
+        ? s->left ? -2 : (int64_t)(ordinal % 3) - 1 : 1};
+    return OK;
+}
+
 /* Narrow build rows make the full ordinal index alone exceed the allowance.
  * Verification uses constant state and releases each output before proceeding. */
-static void window_budget(bool weighted)
+static void window_budget(bool weighted, bool streamed)
 {
     const uint64_t limit = 65536;
     const uint32_t rows = 16385, window = 127;
@@ -858,26 +883,52 @@ static void window_budget(bool weighted)
     wl_columnar_spill_store_t *store;
     CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22, 1024,
         &store) == OK);
-    col_rel_t *l = source(1, 2), *r = source(rows, 2);
-    l->columns[0][0] = 7;
-    if (weighted) {
-        const int64_t weight = -2; weights(l, &weight);
-        CHECK(col_rel_enable_timestamps(r) == 0);
+    wl_columnar_batch_payload_t *left, *right;
+    if (streamed) {
+        const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                               WIRELOG_TYPE_INT64};
+        input_stream_t lhs = {.rows = 1, .weighted = weighted, .left = true},
+                rhs = {.rows = rows, .weighted = weighted};
+        CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 2, 1,
+            input_stream, &lhs, NULL, NULL, &left) == OK);
+        CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 2, rows,
+            input_stream, &rhs, NULL, NULL, &right) == OK);
+        CHECK(lhs.calls == 1 && rhs.calls == rows && reserved(g) <= limit);
+    } else {
+        col_rel_t *l = source(1, 2), *r = source(rows, 2);
+        l->columns[0][0] = 7;
+        if (weighted) {
+            const int64_t weight = -2; weights(l, &weight);
+            CHECK(col_rel_enable_timestamps(r) == 0);
+        }
+        for (uint32_t i = 0; i < rows; i++) {
+            r->columns[0][i] = 7;
+            if (weighted) r->timestamps[i] = (col_delta_timestamp_t){
+                    .multiplicity = (int64_t)(i % 3) - 1
+                };
+        }
+        left = capture(g, store, l, 1);
+        right = capture(g, store, r, 1);
+        col_rel_destroy(l); col_rel_destroy(r);
     }
-    for (uint32_t i = 0; i < rows; i++) {
-        r->columns[0][i] = 7;
-        if (weighted) r->timestamps[i] = (col_delta_timestamp_t){
-                .multiplicity = (int64_t)(i % 3) - 1
-            };
-    }
-    wl_columnar_batch_payload_t *left = capture(g, store, l, 1),
-        *right = capture(g, store, r, 1);
-    col_rel_destroy(l); col_rel_destroy(r);
+    const uint32_t matches = streamed ? rows - 1 : rows;
     uint64_t before = reserved(g); wl_columnar_continuation_t *join;
     CHECK((weighted ? wl_columnar_payload_join_create_weighted :
         wl_columnar_payload_join_create)(g, left, right, 0, 0, 32 * 64,
         NULL, NULL, &join) == WL_COLUMNAR_SPILL_MEMORY && !join);
     CHECK(reserved(g) == before);
+    if (streamed) {
+        wl_columnar_memory_reservation_t held;
+        wl_columnar_memory_reservation_init(&held);
+        CHECK(wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(g),
+                limit - before, &held) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        CHECK(wl_columnar_payload_join_create_weighted_bounded(g, left, right,
+            0, 0, 32, index_cap(1), NULL, NULL,
+            &join) == WL_COLUMNAR_SPILL_MEMORY && !join);
+        CHECK(reserved(g) == limit && wl_columnar_memory_rollback(&held));
+        CHECK(reserved(g) == before);
+    }
     CHECK((weighted ? wl_columnar_payload_join_create_weighted_bounded :
         wl_columnar_payload_join_create_bounded)(g, left, right, 0, 0,
         32 * 64, index_cap(window), NULL, NULL, &join) == OK);
@@ -898,9 +949,10 @@ static void window_budget(bool weighted)
             CHECK(wl_columnar_batch_payload_acquire(out, &reader) == OK);
             CHECK(reserved(g) <= limit);
             for (uint32_t i = 0; i < n; i++) {
-                CHECK(count < rows);
+                CHECK(count < matches);
                 uint32_t start = count / window * window;
-                uint32_t end = rows - start < window ? rows : start + window;
+                uint32_t end = matches - start <
+                    window ? matches : start + window;
                 uint32_t expected = end - 1 - count % window;
                 const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
                 CHECK(wl_columnar_batch_payload_read(reader, i, NULL, NULL,
@@ -917,11 +969,62 @@ static void window_budget(bool weighted)
         }
         if (status == WL_COLUMNAR_CONTINUATION_DONE) break;
     }
-    CHECK(count == rows && wl_columnar_payload_join_error(join) == OK);
+    CHECK(count == matches && wl_columnar_payload_join_error(join) == OK);
     wl_columnar_continuation_destroy(join); CHECK(reserved(g) == before);
     CHECK(wl_columnar_batch_payload_release(left) == OK);
     CHECK(wl_columnar_batch_payload_release(right) == OK);
     wl_columnar_spill_store_retire(store); CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static void streaming_unwind(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(65536);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 1024,
+        &store) == OK);
+    const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                           WIRELOG_TYPE_INT64};
+    input_stream_t lhs = {.rows = 1, .left = true};
+    wl_columnar_batch_payload_t *left, *right;
+    CHECK(wl_columnar_batch_payload_create_spilled(g, store, types, 2, 1,
+        input_stream, &lhs, NULL, NULL, &left) == OK);
+    uint64_t before = reserved(g), disk = wl_columnar_spill_store_bytes(store);
+    for (unsigned mode = 0; mode < 5; mode++) {
+        input_stream_t rhs = {.rows = 8, .fault = mode == 4 ? 0 : mode};
+        short_writes = true;
+        wl_columnar_spill_status_t status =
+            wl_columnar_batch_payload_create_spilled(g,
+                store, types, 2, 8, input_stream, &rhs, NULL, NULL, &right);
+        short_writes = false; write_error = 0;
+        if (!rhs.fault) {
+            CHECK(status == OK && rhs.calls == 8);
+            wl_columnar_batch_payload_reader_t *reader;
+            CHECK(wl_columnar_batch_payload_acquire(right, &reader) == OK);
+            for (uint32_t i = 0; i < 8; i++) {
+                const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                CHECK(wl_columnar_batch_payload_read(reader, i, NULL, NULL,
+                    &lanes, &meta) == OK);
+                CHECK(lanes[0] == (i == 7 ? 99u : 7u) && lanes[1] == i &&
+                    meta.multiplicity == 1);
+            }
+            wl_columnar_batch_payload_reader_release(reader);
+            CHECK(wl_columnar_batch_payload_release(right) == OK);
+        } else CHECK(status ==
+                (mode == 3 ? WL_COLUMNAR_SPILL_CAPACITY : WL_COLUMNAR_SPILL_IO)
+                && !right && rhs.calls == 4);
+        CHECK(reserved(g) == before &&
+            wl_columnar_spill_store_bytes(store) == disk);
+        wl_columnar_batch_payload_reader_t *reader;
+        CHECK(wl_columnar_batch_payload_acquire(left, &reader) == OK);
+        const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+        CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL, &lanes,
+            &meta) == OK);
+        CHECK(lanes[0] == 7 && !lanes[1] && meta.multiplicity == 1);
+        wl_columnar_batch_payload_reader_release(reader);
+    }
+    CHECK(wl_columnar_batch_payload_release(left) == OK);
+    CHECK(wl_columnar_spill_store_close(store) == OK && reserved(g) == 0);
     wl_columnar_memory_governor_ref_release(g);
 }
 
@@ -1134,7 +1237,9 @@ int main(void)
         concurrent_self_join(false); concurrent_self_join(true);
     }
     index_limit = 0;
-    window_budget(false); window_budget(true); window_limits();
+    window_budget(false, false); window_budget(true, false);
+    window_budget(false, true); window_budget(true, true); window_limits();
+    streaming_unwind();
     window_build_progress(); window_publication(); window_misses();
     puts("payload_join: PASS"); return 0;
 }
