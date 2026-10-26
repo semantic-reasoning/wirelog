@@ -77,12 +77,15 @@ prove every internal branch combination.
 | S12 snapshot | E10, F10 |
 | S13 configurations | E12, C01–C07 |
 
-The next implementation milestone is **G1: bounded session admission and
-snapshot engine work**. Long pre-attempt observer scans and unpolled engine
-snapshot traversal are named enforcement gaps; callback cooperation does not
-exclude engine-owned work. G2–G7 group the remaining signed composition,
-recursive/differential, host batch/LFTJ, scalar/representation, resource/config,
-and final qualification work, with exit tests and #1820 dependencies.
+**G1: bounded session admission and completed-snapshot engine work** is
+implemented in this PR bundle as two atomic commits. Observed admission and
+successor-name setup use charged cursors. Completed snapshots stage their
+callback-ready tuples under work and memory admission, then deliver a finite
+prepaid batch after the cutoff. Callback cooperation does not exclude engine
+preparation. **G2: signed observed composition** is next. G2–G7 retain the
+recursive/differential, host batch/LFTJ, scalar/representation, resource/config
+and final qualification obligations and their #1820 dependencies. These are
+six remaining work groups, not a promise of six remaining PRs.
 
 ## Work packages and exit criteria
 
@@ -90,7 +93,7 @@ and final qualification work, with exit tests and #1820 dependencies.
    dispatch family/configuration axis has a matrix disposition and an open-work
    group where needed. Nine new admission cases distinguish refusal from real
    execution. Implementation and unknown-bound obligations remain open in
-   G1–G7; further scope splits must be recorded before implementation.
+   G2–G7; further scope splits must be recorded before implementation.
 2. **Scalar observed composition.** Batch related required scalar/typed,
    multi-column and multihead host gaps, reusing metered operators and signed
    baseline/current preparation. Exit: every required S01–S05/S10 combination

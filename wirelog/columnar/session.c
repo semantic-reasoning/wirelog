@@ -9942,6 +9942,251 @@ evaluated:;
     return snapshot_rc;
 }
 
+/* Callback-ready snapshot entries remain at stable addresses while scalar
+ * readers and memory reservation tokens are live. Plan names are immutable
+ * for the session lifetime; operation admission excludes session mutation. */
+typedef struct {
+    const char *name;
+    uint32_t width, rows;
+    size_t offset;
+    bool initialized;
+    wl_columnar_relation_scalar_source_t source;
+} wl_session_snapshot_entry_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_session_test_snapshot_checkpoint)(
+    wl_evaluation_control_t *, unsigned, size_t);
+int wl_columnar_session_test_snapshot_allocation = -1;
+#endif
+
+static int
+wl_session_snapshot_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, size_t index)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_snapshot_checkpoint)
+        wl_columnar_session_test_snapshot_checkpoint(control, phase, index);
+#else
+    (void)phase;
+    (void)index;
+#endif
+    return wl_evaluation_control_charge(control, 0);
+}
+
+/* Private workspace credits are RESERVED until their physical storage is
+ * freed. Neither token is moved or exposed to callbacks. Fixed admission
+ * includes allocation bookkeeping and its mandatory free/refund on failure. */
+static int
+wl_session_snapshot_allocate(wl_col_session_t *sess, uint64_t bytes,
+    wl_columnar_memory_reservation_t *credit, void **out)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = wl_evaluation_control_charge(control, 128);
+    if (rc) return rc;
+    if (bytes > SIZE_MAX) return EOVERFLOW;
+    if (sess->memory_governor) {
+        wl_columnar_memory_admission_status_t status;
+        rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+            wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+            credit, &status, control,
+            wl_evaluation_control_active_attempt_id(control));
+        if (rc) return rc;
+        if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
+            && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+            return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                : status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                ? EOVERFLOW : EINVAL;
+    }
+    rc = wl_evaluation_control_charge(control, 1);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_snapshot_allocation == 0) return ENOMEM;
+    if (wl_columnar_session_test_snapshot_allocation > 0)
+        --wl_columnar_session_test_snapshot_allocation;
+#endif
+    *out = malloc((size_t)bytes);
+    if (!*out) return ENOMEM;
+    return wl_session_snapshot_checkpoint(control, 5, (size_t)bytes);
+}
+
+static void
+wl_session_snapshot_free(void *storage,
+    wl_columnar_memory_reservation_t *credit)
+{
+    free(storage);
+    if (atomic_load_explicit(&credit->state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        && !wl_columnar_memory_rollback(credit)) abort();
+}
+
+static int
+wl_session_snapshot_prepare(wl_col_session_t *sess,
+    wirelog_on_tuple_fn callback, void *user_data)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    const wl_plan_t *plan = sess->plan;
+    size_t count = 0, initialized_entries = 0;
+    wl_session_snapshot_entry_t *entries = NULL;
+    int64_t *values = NULL;
+    wl_columnar_memory_reservation_t metadata_credit, values_credit;
+    int rc = wl_evaluation_control_charge(control, 256);
+    if (rc) return rc;
+    wl_columnar_memory_reservation_init(&metadata_credit);
+    wl_columnar_memory_reservation_init(&values_credit);
+    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) goto cleanup;
+            if (count == SIZE_MAX) {
+                rc = EOVERFLOW; goto cleanup;
+            }
+            ++count;
+            rc = wl_session_snapshot_checkpoint(control, 1, count);
+            if (rc) goto cleanup;
+        }
+    }
+    if (!count) goto cutoff;
+    if (count > SIZE_MAX / sizeof(*entries)) {
+        rc = EOVERFLOW; goto cleanup;
+    }
+    size_t metadata_bytes = count * sizeof(*entries);
+    void *metadata_storage = NULL;
+    rc = wl_session_snapshot_allocate(sess, metadata_bytes, &metadata_credit,
+            &metadata_storage);
+    entries = metadata_storage;
+    if (rc) goto cleanup;
+    /* Every initialized entry also prepays its cleanup traversal slot. */
+    for (size_t offset = 0; offset < (size_t)metadata_bytes;) {
+        size_t chunk = (size_t)metadata_bytes - offset;
+        if (chunk > 128) chunk = 128;
+        rc = wl_evaluation_control_charge(control, chunk);
+        if (rc) goto cleanup;
+        memset((unsigned char *)entries + offset, 0, chunk);
+        offset += chunk;
+    }
+    size_t index = 0;
+    uint64_t cells = 0;
+    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri) {
+            rc = wl_evaluation_control_charge(control, 32);
+            if (rc) goto cleanup;
+            if (index >= count) {
+                rc = EOVERFLOW; goto cleanup;
+            }
+            wl_session_snapshot_entry_t *entry = &entries[index++];
+            initialized_entries = index;
+            entry->name = plan->strata[si].relations[ri].name;
+            col_rel_t *relation = NULL;
+            for (uint32_t slot = 0; slot < sess->nrels; ++slot) {
+                rc = wl_evaluation_control_charge(control, 1);
+                if (rc) goto cleanup;
+                col_rel_t *r = sess->rels[slot];
+                if (!r || !r->name || !entry->name) continue;
+                size_t byte = 0;
+                for (;;) {
+                    rc = wl_evaluation_control_charge(control, 1);
+                    if (rc) goto cleanup;
+                    char a = r->name[byte], b = entry->name[byte];
+                    rc = wl_session_snapshot_checkpoint(control, 4, byte);
+                    if (rc) goto cleanup;
+                    if (a != b) break;
+                    if (!a) {
+                        relation = r; break;
+                    }
+                    if (byte == SIZE_MAX) {
+                        rc = EOVERFLOW; goto cleanup;
+                    }
+                    ++byte;
+                }
+                if (relation) break;
+            }
+            if (!relation || !relation->nrows) continue;
+            rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+                &entry->source, &entry->initialized, control, id);
+            if (rc) goto cleanup;
+            rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+                &entry->source, relation, false);
+            if (rc) goto cleanup;
+            bool timestamped;
+            rc = wl_columnar_relation_scalar_source_shape_attempt_controlled(
+                &entry->source, &entry->width, &entry->rows, &timestamped);
+            if (rc) goto cleanup;
+            uint64_t entry_cells;
+            entry->offset = (size_t)cells;
+            if (!wl_columnar_memory_size_mul(entry->rows,
+                entry->width ? entry->width : 1, &entry_cells)
+                || !wl_columnar_memory_size_add(cells, entry_cells, &cells)
+                || cells > SIZE_MAX) {
+                rc = EOVERFLOW; goto cleanup;
+            }
+        }
+    }
+    if (cells) {
+        uint64_t value_bytes;
+        if (!wl_columnar_memory_size_mul(cells, sizeof(*values),
+            &value_bytes)) {
+            rc = EOVERFLOW; goto cleanup;
+        }
+        void *value_storage = NULL;
+        rc = wl_session_snapshot_allocate(sess, value_bytes, &values_credit,
+                &value_storage);
+        values = value_storage;
+        if (rc) goto cleanup;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        rc = wl_evaluation_control_charge(control, 1);
+        if (rc) goto cleanup;
+        wl_session_snapshot_entry_t *entry = &entries[i];
+        if (entry->rows && !values) {
+            rc = EINVAL; goto cleanup;
+        }
+        for (uint32_t row = 0; row < entry->rows; ++row) {
+            /* Prepay the finite, noninterruptible callback dispatch tail. */
+            rc = wl_evaluation_control_charge(control, 8);
+            if (rc) goto cleanup;
+            int64_t *tuple = values + entry->offset
+                + (size_t)row * (entry->width ? entry->width : 1);
+            rc = wl_columnar_relation_scalar_source_gather_attempt_controlled(
+                &entry->source, row, tuple, entry->width);
+            if (rc) goto cleanup;
+            rc = wl_session_snapshot_checkpoint(control, 2, row);
+            if (rc) goto cleanup;
+        }
+        if (entry->initialized) {
+            rc = wl_columnar_relation_scalar_source_end(&entry->source, 0);
+            entry->initialized = false;
+            if (rc) goto cleanup;
+        }
+    }
+cutoff:
+    rc = wl_session_snapshot_checkpoint(control, 3, count);
+    if (!rc && values) {
+        for (size_t i = 0; i < count; ++i) {
+            wl_session_snapshot_entry_t *entry = &entries[i];
+            for (uint32_t row = 0; row < entry->rows; ++row)
+                callback(entry->name, values + entry->offset
+                    + (size_t)row * (entry->width ? entry->width : 1),
+                    entry->width, user_data);
+        }
+    }
+cleanup:
+    for (size_t i = 0; i < initialized_entries; ++i) {
+        if (entries[i].initialized) {
+            int end_rc = wl_columnar_relation_scalar_source_end(
+                &entries[i].source, rc);
+            if (!rc) rc = end_rc;
+        }
+    }
+    wl_session_snapshot_free(values, &values_credit);
+    wl_session_snapshot_free(entries, &metadata_credit);
+    return rc;
+}
+
 static int
 col_session_snapshot_controlled(wl_session_t *session,
     wirelog_on_tuple_fn callback, void *user_data)
@@ -9965,12 +10210,7 @@ col_session_snapshot_controlled(wl_session_t *session,
     if (rc)
         return rc;
 
-    /* This is the publication cutoff. Once the first tuple is delivered,
-     * finish the batch without polling; a later cancel remains sticky for
-     * the next snapshot attempt, as required for all-or-nothing delivery. */
-    rc = wl_evaluation_control_charge(control, 0);
-    if (!rc)
-        rc = col_session_emit_snapshot(sess->plan, sess, callback, user_data);
+    rc = wl_session_snapshot_prepare(sess, callback, user_data);
     return wl_evaluation_control_finish(control, owner, rc, 0);
 }
 
