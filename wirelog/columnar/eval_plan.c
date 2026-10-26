@@ -579,11 +579,17 @@ wl_columnar_eval_plan_numeric_validate(
             || bindings->control != record->control
             || bindings->attempt_id != record->attempt_id
             || !bindings->count
-            || bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+            || (!bindings->dynamic_entries
+            && bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX)
             || wl_evaluation_control_active_attempt_id(record->control)
             != record->attempt_id)
             return EINVAL;
-        for (uint32_t i = 0; i < bindings->count; ++i) {
+        if (bindings->dynamic_entries) {
+            if (!wl_columnar_session_observed_bindings_authorized(
+                    record->session, bindings)) return EINVAL;
+        }
+        for (uint32_t i = 0; !bindings->dynamic_entries
+            && i < bindings->count; ++i) {
             const wl_columnar_eval_private_binding_t *entry =
                 &bindings->entries[i];
             if (!entry->name[0] || !memchr(entry->name, '\0',
@@ -597,6 +603,34 @@ wl_columnar_eval_plan_numeric_validate(
         }
     }
     return wl_columnar_eval_stack_numeric_owner(record->frame, record);
+}
+
+int
+wl_columnar_eval_private_binding_get(
+    const wl_columnar_eval_private_bindings_t *bindings, uint32_t index,
+    const char **name, col_rel_t **relation)
+{
+    if (!bindings || index >= bindings->count || !name || !relation)
+        return EINVAL;
+    col_relation_snapshot_t snapshot;
+    if (bindings->dynamic_entries) {
+        if (!wl_columnar_session_observed_bindings_authorized(
+                bindings->session, bindings)) return EINVAL;
+        const wl_columnar_eval_private_dynamic_binding_t *entry =
+            &bindings->dynamic_entries[index];
+        *name = entry->name;
+        *relation = entry->relation;
+        snapshot = entry->snapshot;
+    } else {
+        if (index >= WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX) return EINVAL;
+        *name = bindings->entries[index].name;
+        *relation = bindings->entries[index].relation;
+        snapshot = bindings->entries[index].snapshot;
+    }
+    if (!*name || (*relation && !wl_columnar_relation_snapshot_equal(
+            snapshot, wl_columnar_relation_snapshot(*relation))))
+        return EINVAL;
+    return 0;
 }
 
 int
@@ -868,12 +902,17 @@ wl_columnar_eval_plan_numeric_source_candidate(
     const char **actual_name)
 {
     if (record->private_bindings) {
-        const wl_columnar_eval_private_binding_t *entry =
-            slot < record->private_bindings->count
-            ? &record->private_bindings->entries[slot] : NULL;
-        if (entry) {
-            *actual_name = entry->name;
-            return entry->relation;
+        if (slot < record->private_bindings->count) {
+            col_rel_t *relation = NULL;
+            int rc = wl_columnar_eval_private_binding_get(
+                record->private_bindings, slot, actual_name, &relation);
+            if (rc) {
+                record->semantic_result = rc;
+                record->phase = record->composed_mode
+                    ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+                    : WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
+            }
+            return relation;
         }
         slot -= record->private_bindings->count;
     }
@@ -899,7 +938,8 @@ wl_columnar_eval_plan_numeric_source_lookup(
     const char *actual_name = NULL;
     col_rel_t *candidate = wl_columnar_eval_plan_numeric_source_candidate(
         record, record->source_slot, &actual_name);
-    if (!candidate || !actual_name) {
+    if (record->semantic_result) return;
+    if (!actual_name) {
         ++record->source_slot;
         record->source_byte = 0;
         return;
@@ -917,6 +957,9 @@ wl_columnar_eval_plan_numeric_source_lookup(
         record->source_byte = 0;
     } else if (actual) {
         ++record->source_byte;
+    } else if (!candidate) {
+        record->semantic_result = ENOENT;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE;
     } else if (delta) {
         record->source_delta = candidate;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_SELECT;
@@ -1477,12 +1520,16 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         || private_bindings->control != control
         || private_bindings->attempt_id != id
         || !private_bindings->count
-        || private_bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX))
+        || (!private_bindings->dynamic_entries
+        && private_bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX)))
         return EINVAL;
     if (private_bindings
         && session->nrels > UINT32_MAX - private_bindings->count)
         return EOVERFLOW;
-    if (private_bindings) {
+    if (private_bindings && private_bindings->dynamic_entries
+        && !wl_columnar_session_observed_bindings_authorized(session,
+        private_bindings)) return EINVAL;
+    if (private_bindings && !private_bindings->dynamic_entries) {
         for (uint32_t i = 0; i < private_bindings->count; ++i) {
             const wl_columnar_eval_private_binding_t *entry =
                 &private_bindings->entries[i];
@@ -1646,7 +1693,8 @@ wl_columnar_eval_plan_composed_source_lookup(
     const char *actual_name = NULL;
     col_rel_t *candidate = wl_columnar_eval_plan_numeric_source_candidate(
         record, record->source_slot, &actual_name);
-    if (!candidate || !actual_name) {
+    if (record->semantic_result) return;
+    if (!actual_name) {
         ++record->source_slot;
         record->source_byte = 0;
         return;
@@ -1664,6 +1712,9 @@ wl_columnar_eval_plan_composed_source_lookup(
         record->source_byte = 0;
     } else if (actual) {
         ++record->source_byte;
+    } else if (!candidate) {
+        record->semantic_result = ENOENT;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
     } else if (delta) {
         record->source_delta = candidate;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_SELECT;

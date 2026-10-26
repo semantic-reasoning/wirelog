@@ -395,8 +395,10 @@ def main() -> int:
         # Right name, wrong place: `expect` is defined in this very repository,
         # but only under tests/, which the library symbol index does not carry.
         row_edit("a symbol defined only under tests/ fails",
-                 "`session_note_inserted_input` | `col_eval_stratum_tdd_recursive`",
-                 "`expect` | `col_eval_stratum_tdd_recursive`")
+                 "`session_note_inserted_input`, `col_controlled_step_staging_finish`,"
+                 " `wl_columnar_session_observed_action` | `col_eval_stratum_tdd_recursive`",
+                 "`expect`, `col_controlled_step_staging_finish`,"
+                 " `wl_columnar_session_observed_action` | `col_eval_stratum_tdd_recursive`")
 
         # The attribution check, read column: a function that exists, is
         # uniquely defined, and never touches the field beside it.
@@ -435,9 +437,10 @@ def main() -> int:
                  " `col_diff_arrangement_reset_delta`,"
                  " `col_rel_compact_impl`,")
         row_edit("an arrangement function is not a col_rel_t reader",
-                 "`wl_retraction_restore` |"
-                 " `col_rel_compact_impl`,",
-                 "`wl_retraction_restore` |"
+                 "`wl_retraction_restore`, `col_controlled_step_staging_finish`,"
+                 " `wl_columnar_session_observed_action` | `col_rel_compact_impl`,",
+                 "`wl_retraction_restore`, `col_controlled_step_staging_finish`,"
+                 " `wl_columnar_session_observed_action` |"
                  " `col_diff_arrangement_has_delta`, `col_rel_compact_impl`,")
 
         # Completeness: dropping a real writer must fail.  Soundness alone would
@@ -453,7 +456,8 @@ def main() -> int:
                  "| `col_controlled_step_recursive_drive`,"
                  " `col_session_insert`, `col_session_remove`,"
                  " `col_session_snapshot_impl`,"
-                 " `col_session_step_impl`, `session_note_inserted_input` |",
+                 " `col_session_step_impl`, `session_note_inserted_input`,"
+                 " `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` |",
                  "| — |")
 
         # The two fail-closed guards are wired to main(), not merely present.

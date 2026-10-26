@@ -2984,6 +2984,447 @@ controlled_observer_order_capture(const char *relation, const int64_t *row,
     capture->count++;
 }
 
+extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
+static bool observed_multi_authenticated;
+static unsigned observed_multi_stop_phase;
+static uint32_t observed_multi_stop_index;
+static void
+observed_multi_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    if (bindings && !observed_multi_authenticated) {
+        const char *name = NULL;
+        col_rel_t *relation = NULL;
+        CHECK(!wl_columnar_eval_private_binding_get(bindings, 0, &name,
+            &relation));
+        CHECK(name && relation);
+        wl_columnar_eval_private_bindings_t forged = *bindings;
+        forged.identity = (uintptr_t)&forged;
+        CHECK(wl_columnar_eval_private_binding_get(&forged, 0, &name,
+            &relation) == EINVAL);
+        wl_columnar_eval_private_bindings_t *live =
+            (wl_columnar_eval_private_bindings_t *)bindings;
+        live->generation++;
+        CHECK(wl_columnar_eval_private_binding_get(bindings, 0, &name,
+            &relation) == EINVAL);
+        live->generation--;
+        CHECK(!wl_columnar_eval_private_binding_get(bindings, 0, &name,
+            &relation));
+        observed_multi_authenticated = true;
+    }
+    if (phase == observed_multi_stop_phase &&
+        index == observed_multi_stop_index){
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+typedef struct {
+    char name[384];
+    int64_t row[257];
+    uint32_t width;
+    int diff;
+} observed_multi_event_t;
+typedef struct {
+    observed_multi_event_t events[128];
+    unsigned count;
+    wl_evaluation_control_t *cancel_control;
+} observed_multi_capture_t;
+
+static void
+observed_multi_capture(const char *name, const int64_t *row, uint32_t width,
+    int diff, void *data)
+{
+    observed_multi_capture_t *capture = data;
+    CHECK(capture->count < 128 && width <= 257 && strlen(name) < 384);
+    observed_multi_event_t *event = &capture->events[capture->count++];
+    memset(event, 0, sizeof(*event));
+    strcpy(event->name, name);
+    memcpy(event->row, row, width * sizeof(*row));
+    event->width = width; event->diff = diff;
+    if (capture->count == 1 && capture->cancel_control)
+        wl_evaluation_control_request_cancel(capture->cancel_control);
+}
+
+static int
+observed_multi_order(const void *a, const void *b)
+{
+    const observed_multi_event_t *left = a, *right = b;
+    int rc = strcmp(left->name, right->name);
+    if (rc) return rc;
+    if (left->width != right->width) return left->width < right->width ? -1 : 1;
+    for (uint32_t i = 0; i < left->width; ++i)
+        if (left->row[i] != right->row[i]) return left->row[i] <
+                   right->row[i] ? -1 : 1;
+    return (left->diff > right->diff) - (left->diff < right->diff);
+}
+
+static int
+observed_multi_step(wl_session_t *session)
+{
+    for (unsigned i = 0; i < 1000000; ++i) {
+        int rc = wl_session_step(session);
+        if (rc != EAGAIN) return rc;
+    }
+    CHECK(false);
+    return EINVAL;
+}
+
+static void
+test_controlled_observed_multi(void)
+{
+    const char *source =
+        ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+        ".decl first(x:int64,y:int64)\n.decl second(x:int64,y:int64)\n"
+        ".decl third(x:int64,y:int64)\n.decl joined(x:int64,y:int64)\n"
+        "first(x,y) :- a(x,y).\nsecond(x,y) :- b(x,y).\n"
+        "third(x,y) :- first(x,y).\njoined(x,y) :- first(x,y), b(x,y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options); options.evaluation_control = control;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor); options.memory_governor = governor;
+    wl_session_t *session = NULL, *reference = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+    observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+    CHECK(actual && expected);
+    uint64_t resource_baseline = 0;
+    const int64_t anchor[2] = {99, 17};
+    CHECK(!wl_session_insert(session, "a", anchor, 1, 2));
+    CHECK(!wl_session_insert(reference, "a", anchor, 1, 2));
+    wl_session_set_delta_cb(session, observed_multi_capture, actual);
+    wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+    for (unsigned cycle = 0; cycle < 24; ++cycle) {
+        const char *input = cycle % 4 < 2 ? "a" : "b";
+        int64_t row[2] = { cycle % 4 < 2 ? (int64_t)(cycle / 4) : 99, 17 };
+        bool insert = !(cycle % 2);
+        if (insert) {
+            CHECK(!wl_session_insert(session, input, row, 1, 2));
+            CHECK(!wl_session_insert(reference, input, row, 1, 2));
+        } else {
+            CHECK(!wl_session_remove(session, input, row, 1, 2));
+            CHECK(!wl_session_remove(reference, input, row, 1, 2));
+        }
+        actual->count = expected->count = 0;
+        actual->cancel_control = cycle == 7 ? control : NULL;
+        if (cycle == 0 || cycle == 3) {
+            observed_multi_stop_phase = cycle ? 13 : 8;
+            observed_multi_stop_index = cycle ? 4 : 1;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                observed_multi_stop;
+            col_rel_t *old = session_find_rel((wl_col_session_t *)session,
+                    "second");
+            CHECK(observed_multi_step(session) ==
+                WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(!wl_columnar_session_test_observed_transaction_checkpoint &&
+                !actual->count);
+            CHECK(session_find_rel((wl_col_session_t *)session,
+                "second") == old);
+            CHECK(!wl_evaluation_control_active_attempt_id(control));
+            CHECK(!wl_evaluation_control_reset(control));
+        }
+        int rc = observed_multi_step(session);
+        if (rc) fprintf(stderr, "multi cycle %u rc %d\n", cycle, rc);
+        CHECK(!rc);
+        CHECK(!wl_session_step(reference));
+        CHECK(actual->count == expected->count);
+        qsort(actual->events, actual->count, sizeof(actual->events[0]),
+            observed_multi_order);
+        qsort(expected->events, expected->count, sizeof(expected->events[0]),
+            observed_multi_order);
+        CHECK(!memcmp(actual->events, expected->events,
+            actual->count * sizeof(actual->events[0])));
+        CHECK(((wl_col_session_t *)session)->nrels == 6);
+        if (cycle == 7) {
+            CHECK(wl_session_snapshot(session,
+                controlled_observer_snapshot_capture, NULL)
+                == WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(!wl_evaluation_control_reset(control));
+        }
+        if (cycle % 4 == 3) {
+            uint64_t reserved =
+                wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                        governor));
+            if (cycle == 3) resource_baseline = reserved;
+            else CHECK(reserved == resource_baseline);
+        }
+        unsigned delivered = actual->count;
+        CHECK(!observed_multi_step(session) && actual->count == delivered);
+        const char *heads[] = {"first", "second", "third", "joined"};
+        for (unsigned h = 0; h < 4; ++h) {
+            col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                    heads[h]);
+            col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                    heads[h]);
+            CHECK(a && a->nrows == (b ? b->nrows : 0)
+                && (!a->nrows || a->ncols == b->ncols));
+            for (uint32_t r = 0; r < a->nrows; ++r)
+                for (uint32_t c = 0; c < a->ncols;
+                    ++c) CHECK(a->columns[c][r] == b->columns[c][r]);
+        }
+    }
+    CHECK(observed_multi_authenticated);
+    wl_session_destroy(session); wl_session_destroy(reference);
+    wl_evaluation_control_release(control); wl_plan_free(plan);
+    wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    free(actual); free(expected);
+}
+
+static char *
+observed_wide_program(unsigned width, bool floating, const char *head)
+{
+    char *source = calloc(1, 65536);
+    CHECK(source);
+    size_t offset = 0;
+    const char *names[] = {"input", head, "mirror"};
+    for (unsigned d = 0; d < 3; ++d) {
+        offset += snprintf(source + offset, 65536 - offset, ".decl %s(",
+                names[d]);
+        for (unsigned c = 0; c < width; ++c)
+            offset += snprintf(source + offset, 65536 - offset, "%sc%u:%s",
+                    c ? "," : "", c, floating ? "float" : "int64");
+        offset += snprintf(source + offset, 65536 - offset, ")\n");
+    }
+    for (unsigned d = 1; d < 3; ++d) {
+        offset += snprintf(source + offset, 65536 - offset, "%s(", names[d]);
+        for (unsigned c = 0; c < width; ++c)
+            offset += snprintf(source + offset, 65536 - offset, "%sx%u",
+                    c ? "," : "", c);
+        offset += snprintf(source + offset, 65536 - offset, ") :- %s(",
+                names[d - 1]);
+        for (unsigned c = 0; c < width; ++c)
+            offset += snprintf(source + offset, 65536 - offset, "%sx%u",
+                    c ? "," : "", c);
+        offset += snprintf(source + offset, 65536 - offset, ").\n");
+    }
+    CHECK(offset < 65536);
+    return source;
+}
+
+static void
+test_controlled_observed_wide_public(void)
+{
+    const unsigned widths[] = {0, 2, 257};
+    for (unsigned fixture = 0; fixture < 3; ++fixture) {
+        unsigned width = widths[fixture];
+        char head[321]; memset(head, 'h', sizeof(head) - 1); head[320] = '\0';
+        char *source = observed_wide_program(width, fixture != 0, head);
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options); options.evaluation_control = control;
+        wl_session_t *session = NULL, *reference = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+        observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+        observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+        CHECK(actual && expected);
+        wl_session_set_delta_cb(session, observed_multi_capture, actual);
+        wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+        CHECK(!observed_multi_step(session));
+        CHECK(!wl_session_step(reference));
+        CHECK(!actual->count && !expected->count);
+        int64_t rows[257];
+        for (unsigned cycle = 0; cycle < 4; ++cycle) {
+            for (unsigned c = 0; c < width; ++c)
+                rows[c] = wl_columnar_float_to_bits((double)(cycle / 2 + c) +
+                        0.5);
+            if (!(cycle % 2)) {
+                CHECK(!wl_session_insert(session, "input", rows, 1, width));
+                CHECK(!wl_session_insert(reference, "input", rows, 1, width));
+            } else {
+                CHECK(!wl_session_remove(session, "input", rows, 1, width));
+                CHECK(!wl_session_remove(reference, "input", rows, 1, width));
+            }
+            actual->count = expected->count = 0;
+            int rc = observed_multi_step(session);
+            if (rc) fprintf(stderr, "wide fixture %u cycle %u rc %d\n", fixture,
+                    cycle, rc);
+            CHECK(!rc);
+            CHECK(!wl_session_step(reference));
+            CHECK(actual->count == expected->count);
+            qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(actual->events, expected->events,
+                actual->count * sizeof(actual->events[0])));
+            const char *heads[] = {head, "mirror"};
+            for (unsigned h = 0; h < 2; ++h) {
+                col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                        heads[h]);
+                col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                        heads[h]);
+                CHECK(a && b && a->ncols == width && a->nrows == b->nrows);
+                for (uint32_t r = 0; r < a->nrows; ++r)
+                    for (uint32_t c = 0; c < width;
+                        ++c) CHECK(a->columns[c][r] == b->columns[c][r]);
+            }
+        }
+        wl_session_destroy(session); wl_session_destroy(reference);
+        wl_evaluation_control_release(control); wl_plan_free(plan);
+        wirelog_program_free(program);
+        free(actual); free(expected); free(source);
+    }
+}
+
+static void
+test_controlled_observed_transaction_budget(void)
+{
+    uint64_t exact = 0;
+    const uint64_t teardown_limits[] = {64, 128, 4096, 12000};
+    for (unsigned trial = 0; trial < 7; ++trial) {
+        bool teardown = trial >= 3;
+        uint64_t limit = teardown ? teardown_limits[trial - 3]
+            : trial == 0 ? 0 : trial == 1 ? exact : exact - 1;
+        char *source = observed_wide_program(2, true, "output");
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(limit, &control));
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor);
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        options.memory_governor = governor;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        const int64_t row[] = { INT64_C(0x3ff0000000000000),
+                                INT64_C(0x4000000000000000) };
+        CHECK(!wl_session_insert(session, "input", row, 1, 2));
+        observed_multi_capture_t *capture = calloc(1, sizeof(*capture));
+        CHECK(capture);
+        wl_session_set_delta_cb(session, observed_multi_capture, capture);
+        int rc = observed_multi_step(session);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report));
+        if (trial == 0) {
+            CHECK(!rc && capture->count == 2);
+            exact = report.consumed;
+            CHECK(exact > teardown_limits[3]);
+        } else if (trial == 1) {
+            CHECK(!rc && report.consumed == exact && capture->count == 2);
+        } else {
+            CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && !capture->count);
+            CHECK(!session_find_rel((wl_col_session_t *)session, "output"));
+            CHECK(!session_find_rel((wl_col_session_t *)session, "mirror"));
+            if (!teardown) {
+                CHECK(!wl_evaluation_control_reset(control));
+                CHECK(!wl_evaluation_control_configure(control, 0));
+                CHECK(!observed_multi_step(session) && capture->count == 2);
+            }
+        }
+        if (teardown) {
+            CHECK(wl_session_try_destroy(&session) == EBUSY && session);
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            wl_evaluation_control_request_cancel(control);
+            CHECK(observed_multi_step(session) ==
+                WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(!capture->count);
+        }
+        unsigned attempts = 0;
+        while (session) {
+            rc = wl_session_try_destroy(&session);
+            CHECK(!rc || rc == EBUSY);
+            CHECK(++attempts < 10000);
+        }
+        wl_evaluation_control_release(control); wl_plan_free(plan);
+        wirelog_program_free(program);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+        free(capture); free(source);
+    }
+}
+
+static void
+test_controlled_observed_missing_private_head(void)
+{
+    char *source = observed_wide_program(2, true, "output");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options); options.evaluation_control = control;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    const int64_t row[] = { INT64_C(0x3ff0000000000000),
+                            INT64_C(0x4000000000000000) };
+    CHECK(!wl_session_insert(session, "input", row, 1, 2));
+    col_rel_t *old = source_new("output", 2, 1, true, 11);
+    CHECK(!session_add_rel((wl_col_session_t *)session, old));
+    col_relation_snapshot_t before = wl_columnar_relation_snapshot(old);
+    observed_multi_capture_t *capture = calloc(1, sizeof(*capture));
+    CHECK(capture);
+    wl_session_set_delta_cb(session, observed_multi_capture, capture);
+    const wl_plan_relation_t *first = &plan->strata[0].relations[0];
+    CHECK(!strcmp(first->name,
+        "output") && first->ops[0].op == WL_PLAN_OP_VARIABLE);
+    wl_plan_op_t *op = (wl_plan_op_t *)&first->ops[0];
+    const char *input_name = op->relation_name;
+    /* A required private head is deliberately not computed yet. Its older
+     * public descriptor must never satisfy the private dependency lookup. */
+    op->relation_name = first->name;
+    int missing_rc = observed_multi_step(session);
+    CHECK(missing_rc == ENOENT);
+    CHECK(!capture->count && session_find_rel((wl_col_session_t *)session,
+        "output") == old);
+    CHECK(wl_columnar_relation_snapshot_equal(before,
+        wl_columnar_relation_snapshot(old)));
+    CHECK(!session_find_rel((wl_col_session_t *)session, "mirror"));
+    op->relation_name = input_name;
+    CHECK(!wl_evaluation_control_reset(control));
+    CHECK(!observed_multi_step(session));
+    CHECK(capture->count == 3); /* old output removed, both new heads inserted */
+    wl_session_destroy(session);
+    wl_evaluation_control_release(control); wl_plan_free(plan);
+    wirelog_program_free(program);
+    free(source); free(capture);
+}
+
 static void
 test_controlled_observed_step(void)
 {
@@ -3872,6 +4313,15 @@ test_controlled_observed_preflight_rejections(void)
         controlled_observer_capture_t capture = { .control = control };
         wl_session_set_delta_cb(session, controlled_observer_capture,
             &capture);
+        if (i == 1) {
+            CHECK(!observed_multi_step(session));
+            CHECK(capture.count == 0);
+            wl_session_destroy(session);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan);
+            wirelog_program_free(program);
+            continue;
+        }
         CHECK(wl_session_step(session) == ENOTSUP);
         CHECK(!wl_evaluation_control_active_attempt_id(control));
         wl_evaluation_control_report_t report;
@@ -9544,6 +9994,10 @@ main(void)
     test_controlled_recursive_step_requires_edge_before_attempt();
     test_controlled_recursive_step_rejects_unsupported_shape();
     test_controlled_session_step_resume();
+    test_controlled_observed_multi();
+    test_controlled_observed_wide_public();
+    test_controlled_observed_transaction_budget();
+    test_controlled_observed_missing_private_head();
     test_controlled_observed_step();
     test_scalar_retirement_receipt();
     test_controlled_observed_filter_successors();

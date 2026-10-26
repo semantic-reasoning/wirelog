@@ -151,12 +151,16 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
         return EINVAL;
     if (capture_only != (private_bindings != NULL)
         || capture_only != (capture_out != NULL)) return EINVAL;
-    if (capture_only
+    bool ordinary_capture = capture_only && private_bindings->dynamic_entries;
+    if (ordinary_capture && !wl_columnar_session_observed_bindings_authorized(
+            session, private_bindings)) return EINVAL;
+    if (capture_only && !ordinary_capture
         ? !wl_columnar_eval_plan_numeric_recursive_path_supported(plan)
         : plan->ops[plan->op_count-1].op != WL_PLAN_OP_CONSOLIDATE)
         return ENOTSUP;
     bool abort_supported = false;
-    uint32_t child_end = capture_only ? plan->op_count - 1 : plan->op_count;
+    uint32_t child_end = capture_only && !ordinary_capture
+        ? plan->op_count - 1 : plan->op_count;
     int rc = wl_columnar_eval_plan_numeric_composed_abort_supported(plan, 0,
             child_end, &abort_supported);
     if (rc) return rc;
@@ -374,7 +378,9 @@ wl_columnar_eval_serial_framed_attempt_step(
             funding_id);
         if (ctx->private_bindings)
             return wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
-                &ctx->child, ctx->plan, 0, ctx->plan->op_count - 1, ctx->frame,
+                &ctx->child, ctx->plan, 0, ctx->plan->op_count
+                - (ctx->private_bindings->dynamic_entries ? 0u : 1u),
+                ctx->frame,
                 ctx->session, 0, ctx->control, ctx->attempt_id, funding,
                 funding_id, ctx->private_bindings);
         if (ctx->controlled_materialized_batch_fallback)
@@ -1470,7 +1476,8 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             || sess->coordinator || sess->num_workers > 1)
             return ENOTSUP;
         if (!rp->name || !rp->ops || !rp->op_count) return EINVAL;
-        if (request->capture_only
+        if (request->capture_only && (!request->private_bindings
+            || !request->private_bindings->dynamic_entries)
             ? !wl_columnar_eval_plan_numeric_recursive_path_supported(rp)
             : rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
             return ENOTSUP;
