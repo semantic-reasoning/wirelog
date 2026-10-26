@@ -126,7 +126,79 @@ typedef struct {
     bool postcommit_yielded;
 } col_controlled_recursive_step_t;
 
+typedef enum {
+    WL_SESSION_OBSERVED_COUNT = 0,
+    WL_SESSION_OBSERVED_ALLOCATE = 1,
+    WL_SESSION_OBSERVED_ZERO = 2,
+    WL_SESSION_OBSERVED_PLAN = 3,
+    WL_SESSION_OBSERVED_NAMES = 4,
+    WL_SESSION_OBSERVED_LOOKUP = 5,
+    WL_SESSION_OBSERVED_LEASES = 6,
+    WL_SESSION_OBSERVED_SCHEMA = 7,
+    WL_SESSION_OBSERVED_EVALUATE = 8,
+    WL_SESSION_OBSERVED_BASELINE = 9,
+    WL_SESSION_OBSERVED_EVENTS = 10,
+    WL_SESSION_OBSERVED_REGISTRY = 11,
+    WL_SESSION_OBSERVED_RELEASE_READERS = 12,
+    WL_SESSION_OBSERVED_CLAIMS = 13,
+    WL_SESSION_OBSERVED_CUTOFF = 14,
+    WL_SESSION_OBSERVED_RETIRE = 15,
+    WL_SESSION_OBSERVED_FINISH = 16,
+    WL_SESSION_OBSERVED_DONE = 17,
+} wl_columnar_session_observed_phase_t;
+
+typedef struct {
+    wl_plan_relation_t plan;
+    col_rel_t *candidate;
+} wl_columnar_session_observed_head_t;
+
+typedef struct {
+    col_rel_t *relation;
+    col_relation_snapshot_t snapshot;
+    wl_columnar_relation_reader_step_t reader;
+    wl_columnar_relation_scalar_retirement_t retirement;
+    bool retire, preserve;
+} wl_columnar_session_observed_original_t;
+
+typedef struct {
+    wl_columnar_eval_private_bindings_t bindings;
+    wl_columnar_eval_cleanup_receipt_key_t receipt_key;
+    wl_columnar_eval_private_dynamic_binding_t *entries;
+    wl_columnar_eval_delta_binding_t *overrides;
+    wl_columnar_session_observed_head_t *heads;
+    wl_columnar_session_observed_original_t *originals;
+    wl_plan_op_t *ops;
+    col_rel_t **image;
+    col_rel_t **old_registry;
+    wl_columnar_memory_reservation_t metadata_credit, image_credit;
+    wl_columnar_memory_reservation_t old_registry_credit, old_hash_credit;
+    uint32_t *old_hash_head, *old_hash_next;
+    bool old_registry_held, old_hash_held, old_physical_freed;
+    bool rollback;
+    uint32_t rollback_index;
+    int rollback_result;
+    uint32_t image_cap, image_count;
+    wl_evaluation_control_t *maintenance;
+    uint64_t maintenance_id, generation;
+    uint32_t head_count, op_count, count, old_count;
+    uint32_t si, ri, index, other, op, head, filled_heads, filled_ops;
+    size_t byte;
+    wl_columnar_session_observed_phase_t phase;
+    unsigned allocation, init_array;
+    size_t init_byte;
+    bool child_active, receipt_pending, receipt_ack, committed;
+    bool metadata_admitted, image_admitted, observer_started;
+    bool observer_ready, prepare_started, prepare_ready;
+    size_t delivery;
+    uint32_t cleanup_index, dispose_index, missing_count;
+    wl_columnar_relation_scalar_retirement_t disposal;
+    int child_result;
+} wl_columnar_session_observed_transaction_t;
+
 struct wl_columnar_controlled_step {
+    wl_columnar_session_observed_transaction_t *transaction;
+    bool general_observed, transaction_initialized, transaction_discard;
+    size_t transaction_initialized_bytes;
     wl_columnar_eval_serial_framed_host_reply_t reply;
     wl_evaluation_control_t *previous_funding;
     uint64_t operation_id, operation_identity;
@@ -233,6 +305,31 @@ struct wl_columnar_controlled_step {
     bool staging_ready, staging_done, staging_tail_prepaid;
 };
 
+bool
+wl_columnar_session_observed_bindings_authorized(
+    const wl_col_session_t *sess,
+    const wl_columnar_eval_private_bindings_t *bindings)
+{
+    const wl_columnar_controlled_step_t *step =
+        sess ? sess->controlled_step : NULL;
+    const wl_columnar_session_observed_transaction_t *tx =
+        step ? step->transaction : NULL;
+    return tx && step->transaction_initialized
+           && step->general_observed && step->operation_active
+           && tx->child_active && tx->head < tx->head_count
+           && bindings == &tx->bindings &&
+           bindings->identity == (uintptr_t)bindings
+           && bindings->dynamic_entries == tx->entries
+           && bindings->count == tx->count &&
+           bindings->generation == tx->generation
+           && bindings->plan == &tx->heads[tx->head].plan
+           && bindings->session == sess &&
+           bindings->control == sess->base.evaluation_control
+           && bindings->attempt_id == step->operation_id
+           && wl_evaluation_control_active_attempt_id(bindings->control)
+           == step->operation_id;
+}
+
 static int col_controlled_step_successor_target_init(wl_col_session_t *,
     wl_columnar_controlled_step_t *, const wl_plan_relation_t *);
 
@@ -272,6 +369,9 @@ void (*wl_columnar_session_test_recursive_step_checkpoint)(
 size_t wl_columnar_session_test_observer_precharged_events;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
 void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
+void (*wl_columnar_session_test_observed_transaction_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint32_t,
+    const wl_columnar_eval_private_bindings_t *);
 void (*wl_columnar_session_test_successor_registry_charge)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 #endif
@@ -6346,12 +6446,18 @@ col_controlled_step_batch_shape(const wl_col_session_t *sess)
 /* Reject whole-session and recursive routes before opening an operation
  * attempt.  This checks only immutable plan shape and session admission state;
  * relation/operator validation and all evaluation work remain charged below. */
+static bool wl_columnar_session_observed_general_shape(
+    const wl_col_session_t *);
+
 static int
 col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
 {
     const wl_plan_t *plan = sess->plan;
     const wl_plan_relation_t *only_relation = NULL;
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (sess->delta_cb && plan && plan->stratum_count > MAX_STRATA)
+        return ENOTSUP;
+    if (step && step->general_observed) return 0;
     /* A stopped rule retains its own baseline for the next control attempt.
      * Do not mistake that owned, unevaluated baseline for a foreign observer. */
     bool retained_baseline = step && step->observed && step->baseline_ready
@@ -6405,7 +6511,11 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
         return 0;
     }
 
+    if (step && step->general_observed) return 0;
     if (!sess->delta_cb) return 0;
+    if (wl_columnar_session_observed_general_shape(sess) ||
+        (successor && sess->nrels > 3)) return 0;
+
     /* This route has exactly one stratum/rule. Reject other counts before
      * traversing metadata; variable-size validation belongs to the attempt. */
     if (plan->stratum_count != 1 || plan->strata[0].is_recursive
@@ -7077,7 +7187,8 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
     /* Recursive capture adds a bound child-begin transition to the relation
      * host's finite call chain. Keep that protocol allowance explicit; all
      * evaluator work remains charged to the independent session operation. */
-    uint64_t host_quanta = step->recursive_route ? 8 : 4;
+    uint64_t host_quanta = step->recursive_route || step->general_observed
+        ? 8 : 4;
     int rc = wl_evaluation_control_create(host_quanta * UINT64_C(384),
             &grant);
     if (rc) return EAGAIN;
@@ -7121,8 +7232,10 @@ col_controlled_step_host_action(wl_col_session_t *sess,
     int rc = col_controlled_step_grant_begin(sess, step, &grant, &grant_id);
     if (rc) return rc;
     col_controlled_recursive_step_t *recursive = step->recursive;
-    bool capture_only = step->recursive_route && recursive
-        && recursive->body_active;
+    bool ordinary_capture = step->general_observed && step->transaction
+        && step->transaction->child_active;
+    bool capture_only = ordinary_capture || (step->recursive_route && recursive
+        && recursive->body_active);
     bool consume = action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
         && col_controlled_step_receipt_consumed(sess, step);
     wl_columnar_eval_serial_framed_host_request_t request = {
@@ -7133,11 +7246,15 @@ col_controlled_step_host_action(wl_col_session_t *sess,
         .operation_identity = step->operation_identity,
         .controlled_materialized_batch_fallback =
             step->controlled_materialized_batch_fallback,
-        .private_bindings = capture_only
-            ? &recursive->body_bindings : NULL,
+        .private_bindings = ordinary_capture ? &step->transaction->bindings
+            : capture_only ? &recursive->body_bindings : NULL,
         .capture_only = capture_only,
-        .capture_out = capture_only ? &recursive->body_result : NULL,
+        .capture_out = ordinary_capture
+            ? &step->transaction->heads[step->transaction->head].candidate
+            : capture_only ? &recursive->body_result : NULL,
         .action = action,
+        .receipt_key = ordinary_capture ? step->transaction->receipt_key
+            : (wl_columnar_eval_cleanup_receipt_key_t){0},
         .previous_valid = step->previous_valid,
         .previous_kind = step->previous_kind,
         .previous_protocol = step->previous_protocol,
@@ -7499,8 +7616,9 @@ col_controlled_step_staging_finish(wl_col_session_t *sess,
     sess->pending_input_change = false;
     sess->pending_full_input_eval = false;
     sess->has_evaluated = true;
-    if (step->observed_input)
-        step->observed_input->base_nrows = step->observed_input->nrows;
+    col_rel_t *input = step->observed_input;
+    if (input)
+        input->base_nrows = input->nrows;
     step->staging_done = true;
     return 0;
 }
@@ -8760,6 +8878,913 @@ col_controlled_step_current_relation(wl_col_session_t *sess,
     return 0;
 }
 
+/* General observed STEP keeps public descriptors unchanged until every head,
+ * signed event and retirement claim is ready. Each metadata action is bounded
+ * by one descriptor, plan op, slot or byte. */
+static bool
+wl_columnar_session_observed_scalar_type(wirelog_column_type_t type)
+{
+    return type == WIRELOG_TYPE_INT32 || type == WIRELOG_TYPE_INT64
+           || type == WIRELOG_TYPE_UINT32 || type == WIRELOG_TYPE_UINT64
+           || type == WIRELOG_TYPE_FLOAT || type == WIRELOG_TYPE_STRING
+           || type == WIRELOG_TYPE_BOOL;
+}
+
+static int
+wl_columnar_session_observed_reserve(wl_col_session_t *sess, uint64_t bytes,
+    wl_columnar_memory_reservation_t *token, uint64_t id)
+{
+    if (!sess->memory_governor) return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+        token, &status, sess->base.evaluation_control, id);
+    if (rc) return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
+        || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        sess->memory_budget_denied = true;
+        return ENOSPC;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+static int
+wl_columnar_session_observed_old_storage_finish(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    if (!tx->old_physical_freed) {
+        free((void *)tx->old_registry);
+        free(tx->old_hash_head);
+        free(tx->old_hash_next);
+        tx->old_registry = NULL;
+        tx->old_hash_head = tx->old_hash_next = NULL;
+        tx->old_physical_freed = true;
+        return EAGAIN;
+    }
+    bool done = false;
+    if (tx->old_registry_held) {
+        int rc = wl_columnar_memory_reservation_finish_step(
+            &tx->old_registry_credit, true, &done);
+        if (rc || !done) return rc ? rc : EAGAIN;
+        tx->old_registry_held = false;
+    }
+    if (tx->old_hash_held) {
+        int rc = wl_columnar_memory_reservation_finish_step(
+            &tx->old_hash_credit, true, &done);
+        if (rc || !done) return rc ? rc : EAGAIN;
+        tx->old_hash_held = false;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_session_observed_maintenance(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    if (tx->maintenance) return 0;
+    int rc = wl_evaluation_control_create(0, &tx->maintenance);
+    if (!rc) rc = wl_evaluation_control_attach(tx->maintenance, tx);
+    if (!rc) rc = wl_evaluation_control_begin(tx->maintenance, tx);
+    if (rc) {
+        if (tx->maintenance) {
+            (void)wl_evaluation_control_detach(tx->maintenance, tx);
+            wl_evaluation_control_release(tx->maintenance);
+            tx->maintenance = NULL;
+        }
+        return rc;
+    }
+    tx->maintenance_id =
+        wl_evaluation_control_active_attempt_id(tx->maintenance);
+    return 0;
+}
+
+static int
+wl_columnar_session_observed_cancel_claims(
+    wl_columnar_session_observed_transaction_t *tx)
+{
+    if (tx->rollback_index < tx->old_count) {
+        wl_columnar_relation_scalar_retirement_t *r =
+            &tx->originals[tx->rollback_index].retirement;
+        if (r->storage.identity && !r->committed) {
+            int rc = wl_columnar_relation_scalar_retirement_cancel(r);
+            if (rc) return rc;
+            memset(r, 0, sizeof(*r));
+        }
+        tx->rollback_index++;
+        return EAGAIN;
+    }
+    return 0;
+}
+
+static int
+wl_columnar_session_observed_child(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
+    if (!tx->child_active) {
+        if (tx->generation == UINT64_MAX) return EOVERFLOW;
+        tx->generation++;
+        tx->bindings.identity = (uintptr_t)&tx->bindings;
+        tx->bindings.session = sess;
+        tx->bindings.plan = &head->plan;
+        tx->bindings.control = sess->base.evaluation_control;
+        tx->bindings.attempt_id = step->operation_id;
+        tx->bindings.count = tx->count;
+        tx->bindings.dynamic_entries = tx->entries;
+        tx->bindings.generation = tx->generation;
+        tx->child_active = true;
+        tx->child_result = 0;
+    }
+    wl_columnar_eval_serial_framed_host_action_t action = tx->receipt_pending
+        ? (tx->receipt_ack ? WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK
+            : WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY)
+        : WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
+    int rc = col_controlled_step_host_action(sess, step, &head->plan, action);
+    if (rc == EAGAIN) return rc;
+    if (step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL_CLEANUP_PENDING){
+        tx->receipt_pending = true;
+        tx->receipt_key = step->reply.cleanup_receipt_key;
+        if (step->reply.execution_result) tx->child_result =
+                step->reply.execution_result;
+        return EAGAIN;
+    }
+    if (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL) {
+        if (step->reply.execution_result) tx->child_result =
+                step->reply.execution_result;
+        if ((!tx->receipt_pending && step->reply.cleanup_receipt_key.receipt_id)
+            || (tx->receipt_pending && !tx->receipt_ack)) {
+            tx->receipt_key = step->reply.cleanup_receipt_key;
+            tx->receipt_pending = true;
+            tx->receipt_ack = true;
+            return EAGAIN;
+        }
+        tx->receipt_pending = tx->receipt_ack = tx->child_active = false;
+        memset(&tx->receipt_key, 0, sizeof(tx->receipt_key));
+        col_controlled_step_grant_release(step, &step->previous_funding);
+        return tx->child_result;
+    }
+    if (rc && step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
+        && !sess->cleanup_active) {
+        tx->child_active = false;
+        return rc;
+    }
+    if (sess->cleanup_active
+        && (step->reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_MORE
+        || step->reply.kind ==
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT)){
+        rc = col_controlled_step_host_action(sess, step, &head->plan,
+                WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS);
+        if (rc == EAGAIN) return rc;
+        if (rc) return rc;
+    }
+    return EAGAIN;
+}
+
+static int
+wl_columnar_session_observed_action(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    const wl_plan_t *plan = sess->plan;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_observed_transaction_checkpoint)
+        wl_columnar_session_test_observed_transaction_checkpoint(control,
+            tx->phase,
+            tx->phase == WL_SESSION_OBSERVED_EVALUATE ? tx->head : tx->index,
+            tx->child_active ? &tx->bindings : NULL);
+#endif
+    if (tx->phase < WL_SESSION_OBSERVED_RETIRE &&
+        !(tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active)){
+        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+                tx->phase == WL_SESSION_OBSERVED_PLAN ? 256 : tx->phase ==
+                WL_SESSION_OBSERVED_ALLOCATE ||
+                tx->phase == WL_SESSION_OBSERVED_ZERO ? 64 : 1);
+        if (rc) return rc;
+    }
+    switch (tx->phase) {
+    case WL_SESSION_OBSERVED_COUNT: /* Count immutable metadata before allocating stable arrays. */
+        if (tx->si == plan->stratum_count) {
+            if (tx->head_count > UINT32_MAX - plan->edb_count) return EOVERFLOW;
+            tx->count = tx->head_count + plan->edb_count;
+            if (!tx->head_count || !tx->count) return ENOTSUP;
+            tx->old_count = sess->nrels;
+            if (tx->old_count > UINT32_MAX - tx->count) return EOVERFLOW;
+            tx->image_cap = tx->count + tx->old_count;
+            tx->image_count = tx->count;
+            tx->old_registry = sess->rels;
+            tx->si = tx->ri = 0;
+            tx->phase = WL_SESSION_OBSERVED_ALLOCATE;
+            return 0;
+        }
+        if (!plan->strata || plan->strata[tx->si].is_recursive) return ENOTSUP;
+        if (plan->strata[tx->si].relation_count &&
+            !plan->strata[tx->si].relations)
+            return EINVAL;
+        if (tx->ri == plan->strata[tx->si].relation_count) {
+            tx->si++; tx->ri = 0; return 0;
+        } else {
+            const wl_plan_relation_t *r =
+                &plan->strata[tx->si].relations[tx->ri++];
+            if (!r->name || !r->ops || !r->op_count
+                || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+                return ENOTSUP;
+            if (tx->head_count == UINT32_MAX ||
+                r->op_count > UINT32_MAX - tx->op_count)
+                return EOVERFLOW;
+            tx->head_count++; tx->op_count += r->op_count;
+            return 0;
+        }
+    case WL_SESSION_OBSERVED_ALLOCATE: {
+        uint64_t bytes = (uint64_t)tx->count * sizeof(*tx->entries)
+            + (uint64_t)tx->head_count *
+            (sizeof(*tx->heads) + sizeof(*tx->overrides))
+            + (uint64_t)tx->old_count * sizeof(*tx->originals)
+            + (uint64_t)tx->op_count * sizeof(*tx->ops);
+        uint64_t image_bytes = (uint64_t)tx->image_cap * sizeof(*tx->image);
+        if (bytes > SIZE_MAX || image_bytes > SIZE_MAX) return EOVERFLOW;
+        switch (tx->allocation) {
+        case 0:
+            wl_columnar_memory_reservation_init(&tx->metadata_credit);
+            rc = wl_columnar_session_observed_reserve(sess, bytes + sizeof(*tx),
+                    &tx->metadata_credit, step->operation_id);
+            if (rc) return rc;
+            tx->metadata_admitted = true;
+            break;
+        case 1:
+            wl_columnar_memory_reservation_init(&tx->image_credit);
+            rc = wl_columnar_session_observed_reserve(sess, image_bytes,
+                    &tx->image_credit, step->operation_id);
+            if (rc) return rc;
+            tx->image_admitted = true;
+            break;
+        case 2:
+            tx->entries = malloc((size_t)tx->count * sizeof(*tx->entries));
+            if (!tx->entries) return ENOMEM;
+            break;
+        case 3:
+            tx->heads = malloc((size_t)tx->head_count * sizeof(*tx->heads));
+            if (!tx->heads) return ENOMEM;
+            break;
+        case 4:
+            tx->overrides = malloc((size_t)tx->head_count *
+                    sizeof(*tx->overrides));
+            if (!tx->overrides) return ENOMEM;
+            break;
+        case 5:
+            if (tx->old_count) {
+                tx->originals = malloc((size_t)tx->old_count *
+                        sizeof(*tx->originals));
+                if (!tx->originals) return ENOMEM;
+            }
+            break;
+        case 6:
+            tx->ops = malloc((size_t)tx->op_count * sizeof(*tx->ops));
+            if (!tx->ops) return ENOMEM;
+            break;
+        case 7:
+            tx->image = (col_rel_t **)malloc((size_t)image_bytes);
+            if (!tx->image) return ENOMEM;
+            break;
+        default: tx->phase = WL_SESSION_OBSERVED_ZERO; return 0;
+        }
+        tx->allocation++;
+        return 0;
+    }
+    case WL_SESSION_OBSERVED_ZERO: { /* No ownership-bearing record is live until zeroing completes. */
+        unsigned char *data;
+        size_t bytes;
+        switch (tx->init_array) {
+        case 0: data = (unsigned char *)tx->entries;
+            bytes = (size_t)tx->count * sizeof(*tx->entries); break;
+        case 1: data = (unsigned char *)tx->heads;
+            bytes = (size_t)tx->head_count * sizeof(*tx->heads); break;
+        case 2: data = (unsigned char *)tx->overrides;
+            bytes = (size_t)tx->head_count * sizeof(*tx->overrides); break;
+        case 3: data = (unsigned char *)tx->originals;
+            bytes = (size_t)tx->old_count * sizeof(*tx->originals); break;
+        default: tx->phase = WL_SESSION_OBSERVED_PLAN; return 0;
+        }
+        size_t chunk = bytes - tx->init_byte;
+        if (chunk > 64) chunk = 64;
+        if (chunk) memset(data + tx->init_byte, 0, chunk);
+        tx->init_byte += chunk;
+        if (tx->init_byte == bytes) {
+            tx->init_array++; tx->init_byte = 0;
+        }
+        return 0;
+    }
+    case WL_SESSION_OBSERVED_PLAN: /* Flatten head metadata without moving live records. */
+        if (tx->index < plan->edb_count) {
+            if (!plan->edb_relations || !plan->edb_relations[tx->index]
+                || !plan->edb_declared_width || !plan->edb_column_type_counts
+                || !plan->edb_column_types) return ENOTSUP;
+            tx->entries[tx->index].name = plan->edb_relations[tx->index];
+            tx->index++; return 0;
+        }
+        if (tx->si == plan->stratum_count) {
+            tx->index = tx->other = 0; tx->phase = WL_SESSION_OBSERVED_NAMES;
+            return 0;
+        }
+        if (tx->ri == plan->strata[tx->si].relation_count) {
+            tx->si++; tx->ri = 0; return 0;
+        } else {
+            const wl_plan_relation_t *source =
+                &plan->strata[tx->si].relations[tx->ri];
+            wl_columnar_session_observed_head_t *head =
+                &tx->heads[tx->filled_heads];
+            if (!tx->op) {
+                head->plan = *source;
+                head->plan.ops = tx->ops + tx->filled_ops;
+                tx->entries[plan->edb_count +
+                    tx->filled_heads].name = source->name;
+            }
+            if (!col_controlled_step_controlled_op(
+                    &source->ops[tx->op])) return ENOTSUP;
+            tx->ops[tx->filled_ops + tx->op] = source->ops[tx->op];
+            tx->ops[tx->filled_ops + tx->op].delta_mode = WL_DELTA_FORCE_FULL;
+            if (++tx->op == source->op_count) {
+                tx->filled_ops += source->op_count; tx->filled_heads++;
+                tx->op = 0; tx->ri++;
+            }
+            return 0;
+        }
+    case WL_SESSION_OBSERVED_NAMES: /* Validate names and detect collisions, byte by byte. */
+        if (tx->index == tx->count) {
+            tx->index = tx->other = 0; tx->phase = WL_SESSION_OBSERVED_LOOKUP;
+            return 0;
+        }
+        if (tx->other == tx->index) {
+            char value = tx->entries[tx->index].name[tx->byte];
+            if (value) {
+                if (tx->byte == SIZE_MAX) {
+                    return EOVERFLOW;
+                }
+                tx->byte++;
+                return 0;
+            }
+            if (!tx->byte) return EINVAL;
+            tx->index++; tx->other = 0; tx->byte = 0; return 0;
+        } else {
+            char a = tx->entries[tx->index].name[tx->byte];
+            char b = tx->entries[tx->other].name[tx->byte];
+            if (a != b) {
+                tx->other++; tx->byte = 0; return 0;
+            }
+            if (!a) return EINVAL;
+            if (tx->byte == SIZE_MAX) return EOVERFLOW;
+            tx->byte++; return 0;
+        }
+    case WL_SESSION_OBSERVED_LOOKUP: /* Match original slots to public bindings or consumed $r$ inputs. */
+        if (sess->rels != tx->old_registry ||
+            sess->nrels != tx->old_count) return EINVAL;
+        if (tx->index == tx->old_count) {
+            tx->index = tx->other = tx->op = 0;
+            tx->phase = WL_SESSION_OBSERVED_LEASES; return 0;
+        } else {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index];
+            original->relation = sess->rels[tx->index];
+            col_rel_t *r = original->relation;
+            if (!r) {
+                tx->index++; return 0;
+            }
+            if (!r->name) return EINVAL;
+            uint32_t limit = tx->op == 1 ? plan->edb_count : tx->count;
+            if (tx->other == limit) {
+                if (tx->op == 3) {
+                    original->preserve = true;
+                    original->snapshot = wl_columnar_relation_snapshot(r);
+                    tx->index++; tx->other = tx->op = 0; tx->byte = 0;
+                    return 0;
+                }
+                tx->op++; tx->other = tx->op > 1 ? plan->edb_count : 0;
+                tx->byte = 0; return 0;
+            }
+            size_t prefix_length = tx->op == 1 ? 3 : tx->op == 2 ? 5 : 4;
+            const char *prefix = tx->op == 1 ? "$r$" : tx->op ==
+                2 ? "$out$" : "$in$";
+            char wanted = (char)(!tx->op ? tx->entries[tx->other].name[tx->byte]
+                : tx->byte < prefix_length ? prefix[tx->byte]
+                : tx->entries[tx->other].name[tx->byte - prefix_length]);
+            char actual = r->name[tx->byte];
+            if (wanted != actual) {
+                tx->other++; tx->byte = 0; return 0;
+            }
+            if (wanted) {
+                if (tx->byte == SIZE_MAX) {
+                    return EOVERFLOW;
+                }
+                tx->byte++;
+                return 0;
+            }
+            if (!tx->op && tx->other < plan->edb_count) {
+                if (tx->entries[tx->other].relation) return EINVAL;
+                tx->entries[tx->other].relation = r;
+                tx->entries[tx->other].public_relation = r;
+            } else {
+                original->retire = true;
+                if (!tx->op) {
+                    if (tx->entries[tx->other].public_relation) return EINVAL;
+                    tx->entries[tx->other].public_relation = r;
+                }
+            }
+            original->snapshot = wl_columnar_relation_snapshot(r);
+            tx->index++; tx->other = tx->op = 0; tx->byte = 0;
+            return 0;
+        }
+    case WL_SESSION_OBSERVED_LEASES: /* Acquire stable descriptor and source readers for the original view. */
+        if (tx->index == tx->old_count) {
+            tx->index = tx->op = 0; tx->phase = WL_SESSION_OBSERVED_SCHEMA;
+            return 0;
+        }
+        if (tx->originals[tx->index].relation) {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index];
+            rc = wl_columnar_relation_reader_step(original->relation,
+                    &original->reader, false, control, step->operation_id);
+            if (rc) return rc;
+            if (!wl_columnar_relation_snapshot_equal(original->snapshot,
+                wl_columnar_relation_snapshot(
+                    original->relation))) return EINVAL;
+        }
+        tx->index++; return 0;
+    case WL_SESSION_OBSERVED_SCHEMA: /* Declared scalar input schemas and private empty input owners. */
+        if (tx->index == plan->edb_count) {
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
+        }
+        {
+            uint32_t i = tx->index, width = plan->edb_declared_width[i];
+            col_rel_t *r = tx->entries[i].relation;
+            if (!r || plan->edb_column_type_counts[i] != width
+                || (width && !plan->edb_column_types[i])) return ENOTSUP;
+            if (tx->op < width) {
+                wirelog_column_type_t type = plan->edb_column_types[i][tx->op];
+                if (!wl_columnar_session_observed_scalar_type(
+                        type)) return ENOTSUP;
+                if (r->ncols && (r->ncols != width
+                    || (r->column_types ? r->column_types[tx->op] :
+                    WIRELOG_TYPE_INT64) != type))
+                    return ENOTSUP;
+                tx->op++; return 0;
+            }
+            if ((!r->ncols && width) || !r->schema_ok) {
+                if (r->nrows) return ENOTSUP;
+                col_rel_t *empty = NULL;
+                rc = wl_columnar_relation_new_typed_operator_attempt_controlled(
+                    tx->entries[i].name, width, plan->edb_column_types[i],
+                    sess->memory_governor, &empty, control, step->operation_id);
+                if (rc) return rc;
+                tx->entries[i].relation = empty;
+            }
+            tx->entries[i].snapshot =
+                wl_columnar_relation_snapshot(tx->entries[i].relation);
+            tx->index++; tx->op = 0; return 0;
+        }
+    case WL_SESSION_OBSERVED_EVALUATE: /* Complete each private child and ACK its cleanup before rebinding. */
+        if (tx->head == tx->head_count) {
+            tx->phase = WL_SESSION_OBSERVED_BASELINE; return 0;
+        }
+        rc = wl_columnar_session_observed_child(sess, step);
+        if (rc) return rc;
+        if (tx->child_active) return EAGAIN;
+        if (!tx->heads[tx->head].candidate) return EINVAL;
+        {
+            col_rel_t *candidate = tx->heads[tx->head].candidate;
+            uint32_t slot = plan->edb_count + tx->head;
+            tx->entries[slot].relation = candidate;
+            tx->entries[slot].snapshot =
+                wl_columnar_relation_snapshot(candidate);
+            if (!tx->entries[slot].public_relation)
+                tx->overrides[tx->missing_count++] =
+                    (wl_columnar_eval_delta_binding_t){
+                    tx->entries[slot].name, NULL, candidate->ncols
+                };
+            tx->head++;
+            return 0;
+        }
+    case WL_SESSION_OBSERVED_BASELINE:
+        if (!tx->observer_started) {
+            rc = tx->missing_count
+                ? wl_columnar_eval_delta_observer_build_start_missing_heads(
+                sess,
+                UINT64_MAX, tx->overrides, tx->missing_count)
+                : wl_columnar_eval_delta_observer_build_start(sess, UINT64_MAX);
+            if (rc) return rc;
+            tx->observer_started = true;
+        }
+        rc = wl_columnar_eval_delta_observer_build_advance(sess, control,
+                step->operation_id, &tx->observer_ready);
+        if (rc) return rc;
+        if (!tx->observer_ready) return EAGAIN;
+        wl_columnar_eval_delta_observer_set_active(sess, false);
+        wl_columnar_eval_delta_observer_set_evaluated(sess);
+        tx->index = 0; tx->phase = WL_SESSION_OBSERVED_EVENTS; return 0;
+    case WL_SESSION_OBSERVED_EVENTS:
+        if (tx->index < tx->head_count) {
+            tx->overrides[tx->index] = (wl_columnar_eval_delta_binding_t){
+                tx->heads[tx->index].plan.name, tx->heads[tx->index].candidate,
+                tx->heads[tx->index].candidate->ncols
+            };
+            tx->index++; return 0;
+        }
+        if (!tx->prepare_started) {
+            rc =
+                wl_columnar_eval_delta_observer_prepare_start_with_bindings(
+                sess,
+                tx->overrides, tx->head_count);
+            if (rc) return rc;
+            tx->prepare_started = true;
+        }
+        rc = wl_columnar_eval_delta_observer_prepare_advance(sess, control,
+                step->operation_id, &tx->prepare_ready);
+        if (rc) return rc;
+        if (!tx->prepare_ready) return EAGAIN;
+        tx->index = 0; tx->phase = WL_SESSION_OBSERVED_REGISTRY; return 0;
+    case WL_SESSION_OBSERVED_REGISTRY: /* Coordinated complete registry image; no independent registrations. */
+        if (tx->index < tx->count) {
+            uint32_t i = tx->index++;
+            tx->image[i] = tx->entries[i].relation;
+            if (i < plan->edb_count) {
+                tx->image[i] = tx->entries[i].public_relation;
+            }
+            return 0;
+        }
+        if (tx->index - tx->count < tx->old_count) {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index++ - tx->count];
+            if (original->preserve) tx->image[tx->image_count++] =
+                    original->relation;
+            return 0;
+        }
+        tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RELEASE_READERS;
+        return 0;
+    case WL_SESSION_OBSERVED_RELEASE_READERS: /* Relinquish readers only for descriptors to be exclusively retired. */
+        if (tx->index == tx->old_count) {
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_CLAIMS; return 0;
+        }
+        if (tx->originals[tx->index].retire) {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index];
+            rc = wl_columnar_relation_reader_step(original->relation,
+                    &original->reader, true, control, step->operation_id);
+            if (rc) return rc;
+        }
+        tx->index++; return 0;
+    case WL_SESSION_OBSERVED_CLAIMS: /* Every claim is reversible until the single publication cutoff. */
+        if (tx->index == tx->old_count) {
+            tx->phase = WL_SESSION_OBSERVED_CUTOFF; return 0;
+        }
+        {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index];
+            if (original->retire) {
+                if (!original->retirement.storage.identity) {
+                    rc = wl_columnar_relation_scalar_retirement_begin(
+                        &original->retirement, original->relation);
+                    if (rc) return rc;
+                }
+                rc = wl_columnar_relation_scalar_retirement_prepare(
+                    &original->retirement, control, step->operation_id);
+                if (rc) return rc;
+                if (!wl_columnar_relation_snapshot_equal(original->snapshot,
+                    wl_columnar_relation_snapshot(
+                        original->relation))) return EINVAL;
+            }
+            tx->index++; return 0;
+        }
+    case WL_SESSION_OBSERVED_CUTOFF: {
+        size_t events = wl_columnar_eval_delta_observer_event_count(sess);
+        if (tx->delivery < events) {
+            tx->delivery++; return 0;
+        }
+        rc = wl_columnar_session_observed_maintenance(tx);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+                (uint64_t)tx->old_count + tx->count + 16);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+                0);
+        if (rc) return rc;
+        for (uint32_t i = 0; i < tx->old_count; ++i) {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[i];
+            if (original->retire) {
+                rc =
+                    wl_columnar_relation_scalar_retirement_commit(
+                    &original->retirement);
+                if (rc) abort(); /* READY claims were verified before cutoff. */
+            }
+        }
+        tx->old_hash_head = sess->rel_hash_head;
+        tx->old_hash_next = sess->rel_hash_next;
+        wl_columnar_memory_reservation_init(&tx->old_registry_credit);
+        wl_columnar_memory_reservation_init(&tx->old_hash_credit);
+        if (sess->memory_governor) {
+            if (sess->rels) {
+                if (!wl_columnar_memory_reservation_move(
+                        &tx->old_registry_credit,
+                        &sess->rels_reservation)) abort();
+                tx->old_registry_held = true;
+            }
+            if (sess->rel_hash_head || sess->rel_hash_next) {
+                if (!wl_columnar_memory_reservation_move(&tx->old_hash_credit,
+                    &sess->rel_hash_reservation)) abort();
+                tx->old_hash_held = true;
+            }
+        }
+        sess->rel_hash_head = sess->rel_hash_next = NULL;
+        sess->rel_hash_nbuckets = sess->rel_hash_chain_cap = 0;
+        if (sess->memory_governor && !wl_columnar_memory_reservation_move(
+                &sess->rels_reservation, &tx->image_credit)) abort();
+        sess->rels = tx->image; tx->image = NULL;
+        sess->nrels = tx->image_count; sess->rel_cap = tx->image_cap;
+        for (uint32_t i = 0; i < tx->count; ++i) {
+            col_rel_t *published = sess->rels[i];
+            published->base_nrows = published->nrows;
+        }
+        sess->last_inserted_relation = sess->last_removed_relation = NULL;
+        sess->pending_input_change = sess->pending_full_input_eval = false;
+        sess->retraction_seeded = false;
+        sess->has_evaluated = true;
+        sess->snapshot_stable_valid = true;
+        sess->uncommitted_strata_done = 0;
+        tx->committed = step->published = true;
+        step->observer_cleanup_pending = true;
+        tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RETIRE;
+        wl_columnar_eval_delta_observer_publish(sess);
+        return 0;
+    }
+    case WL_SESSION_OBSERVED_RETIRE:
+        if (tx->index == tx->old_count) {
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_FINISH; return 0;
+        }
+        {
+            wl_columnar_session_observed_original_t *original =
+                &tx->originals[tx->index];
+            if (original->retire) {
+                rc =
+                    wl_columnar_relation_scalar_retirement_step(
+                    &original->retirement,
+                    tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            } else if (original->relation) {
+                rc = wl_columnar_relation_reader_step(original->relation,
+                        &original->reader, true, tx->maintenance,
+                        tx->maintenance_id);
+                if (rc) return rc;
+            }
+            tx->index++; return 0;
+        }
+    case WL_SESSION_OBSERVED_FINISH:
+        if (tx->index < plan->edb_count) {
+            wl_columnar_eval_private_dynamic_binding_t *entry =
+                &tx->entries[tx->index];
+            if (entry->relation != entry->public_relation) {
+                if (!tx->disposal.storage.identity) {
+                    rc =
+                        wl_columnar_relation_scalar_retirement_begin(
+                        &tx->disposal, entry->relation);
+                    if (rc) return rc;
+                }
+                if (!tx->disposal.committed) {
+                    rc =
+                        wl_columnar_relation_scalar_retirement_prepare(
+                        &tx->disposal,
+                        tx->maintenance, tx->maintenance_id);
+                    if (rc) return rc;
+                    rc =
+                        wl_columnar_relation_scalar_retirement_commit(
+                        &tx->disposal);
+                    if (rc) return rc;
+                }
+                rc = wl_columnar_relation_scalar_retirement_step(&tx->disposal,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+                entry->relation = entry->public_relation;
+                memset(&tx->disposal, 0, sizeof(tx->disposal));
+            }
+            tx->index++; return 0;
+        }
+        rc = wl_columnar_session_observed_old_storage_finish(tx);
+        if (rc) return rc;
+        tx->cleanup_index = tx->old_count;
+        tx->dispose_index = tx->count;
+        rc = wl_columnar_eval_delta_observer_finish(sess);
+        if (rc) return rc;
+        step->observer_cleanup_pending = false;
+        step->complete = true; tx->phase = WL_SESSION_OBSERVED_DONE;
+        return 0;
+    case WL_SESSION_OBSERVED_DONE: return 0;
+    default: return EINVAL;
+    }
+}
+
+static int wl_columnar_session_observed_dispose(wl_col_session_t *,
+    wl_columnar_controlled_step_t *);
+
+static int
+wl_columnar_session_observed_drive(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->transaction_discard) {
+        int rc = wl_columnar_session_observed_dispose(sess, step);
+        if (rc) return EAGAIN;
+        step->transaction_discard = false;
+        step->transaction_initialized = false;
+        step->transaction_initialized_bytes = 0;
+        return col_controlled_step_finish(sess, step, step->primary_result);
+    }
+    if (!step->transaction) {
+        int rc =
+            wl_evaluation_control_charge_attempt(sess->base.evaluation_control,
+                step->operation_id, 64);
+        if (rc) return col_controlled_step_finish(sess, step, rc);
+        step->transaction = malloc(sizeof(*step->transaction));
+        step->transaction_initialized = false;
+        step->transaction_initialized_bytes = 0;
+        if (!step->transaction) return col_controlled_step_finish(sess, step,
+                       ENOMEM);
+    }
+    if (!step->transaction_initialized) {
+        int rc =
+            wl_evaluation_control_charge_attempt(sess->base.evaluation_control,
+                step->operation_id, 64);
+        if (rc) {
+            if (rc != WL_EVALUATION_CONTROL_WORK_LIMIT) {
+                free(step->transaction); step->transaction = NULL;
+                step->transaction_initialized_bytes = 0;
+            }
+            return col_controlled_step_finish(sess, step, rc);
+        }
+        size_t bytes = sizeof(*step->transaction) -
+            step->transaction_initialized_bytes;
+        if (bytes > 64) bytes = 64;
+        memset((unsigned char *)step->transaction +
+            step->transaction_initialized_bytes, 0, bytes);
+        step->transaction_initialized_bytes += bytes;
+        if (step->transaction_initialized_bytes == sizeof(*step->transaction))
+            step->transaction_initialized = true;
+        return EAGAIN;
+    }
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    for (unsigned action = 0; action < 64; ++action) {
+        if (tx->rollback) {
+            int cancel_rc = wl_columnar_session_observed_cancel_claims(tx);
+            if (cancel_rc) return EAGAIN;
+            tx->rollback = false;
+            tx->phase = WL_SESSION_OBSERVED_CLAIMS; tx->index = 0;
+            if (tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT) {
+                step->transaction_discard = true;
+                step->primary_result = tx->rollback_result;
+                return EAGAIN;
+            }
+            return col_controlled_step_finish(sess, step, tx->rollback_result);
+        }
+        int rc = wl_columnar_session_observed_action(sess, step);
+        if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
+        if (rc) {
+            /* An active child must drain on its original attempt before the
+             * operation report is closed. The host sees the sticky stop. */
+            if (tx->child_active) return EAGAIN;
+            if (tx->phase >= WL_SESSION_OBSERVED_CLAIMS &&
+                tx->phase <= WL_SESSION_OBSERVED_CUTOFF) {
+                tx->rollback = true; tx->rollback_index = 0;
+                tx->rollback_result = rc;
+                return EAGAIN;
+            }
+            if (!tx->committed && rc != WL_EVALUATION_CONTROL_WORK_LIMIT) {
+                step->transaction_discard = true;
+                step->primary_result = rc;
+                return EAGAIN;
+            }
+            return col_controlled_step_finish(sess, step, rc);
+        }
+        if (step->complete) return col_controlled_step_finish(sess, step, 0);
+    }
+    return EAGAIN;
+}
+
+static int
+wl_columnar_session_observed_dispose(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx) return 0;
+    if (!step->transaction_initialized) {
+        free(tx); step->transaction = NULL;
+        return 0;
+    }
+    if (tx->child_active || sess->cleanup_active) return EBUSY;
+    int rc = wl_columnar_session_observed_maintenance(tx);
+    if (rc) return rc;
+    uint32_t originals = tx->phase <
+        WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;
+    if (originals > tx->old_count) originals = tx->old_count;
+    if (tx->cleanup_index < originals) {
+        wl_columnar_session_observed_original_t *original =
+            &tx->originals[tx->cleanup_index];
+        if (original->reader.descriptor_held) {
+            rc = wl_columnar_relation_reader_step(original->relation,
+                    &original->reader, true, tx->maintenance,
+                    tx->maintenance_id);
+            if (rc) return rc;
+        }
+        if (original->retirement.committed) {
+            rc =
+                wl_columnar_relation_scalar_retirement_step(
+                &original->retirement,
+                tx->maintenance, tx->maintenance_id);
+            if (rc) return rc;
+        }
+        if (original->retirement.storage.identity &&
+            !original->retirement.committed) {
+            rc =
+                wl_columnar_relation_scalar_retirement_cancel(
+                &original->retirement);
+            if (rc) return rc;
+        }
+        tx->cleanup_index++;
+        return EAGAIN;
+    }
+    if (tx->observer_started && !tx->committed) {
+        rc = wl_columnar_eval_delta_observer_build_discard(sess);
+        if (rc) return rc;
+        rc = wl_columnar_eval_delta_observer_prepare_discard(sess);
+        if (rc) return rc;
+        wl_columnar_eval_delta_observer_set_active(sess, false);
+        rc = wl_columnar_eval_delta_observer_discard(sess);
+        if (rc) return rc;
+        tx->observer_started = false;
+    }
+    uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
+    if (entries > tx->count) entries = tx->count;
+    if (tx->dispose_index < entries) {
+        uint32_t i = tx->dispose_index;
+        col_rel_t *r = i < sess->plan->edb_count
+            ? tx->entries[i].relation != tx->entries[i].public_relation
+                ? tx->entries[i].relation : NULL
+            : tx->committed ? NULL : tx->heads[i -
+                sess->plan->edb_count].candidate;
+        if (r) {
+            if (!tx->disposal.storage.identity) {
+                rc = wl_columnar_relation_scalar_retirement_begin(&tx->disposal,
+                        r);
+                if (rc) return rc;
+            }
+            if (!tx->disposal.committed) {
+                rc =
+                    wl_columnar_relation_scalar_retirement_prepare(
+                    &tx->disposal,
+                    tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+                rc =
+                    wl_columnar_relation_scalar_retirement_commit(
+                    &tx->disposal);
+                if (rc) return rc;
+            }
+            rc = wl_columnar_relation_scalar_retirement_step(&tx->disposal,
+                    tx->maintenance, tx->maintenance_id);
+            if (rc) return rc;
+            memset(&tx->disposal, 0, sizeof(tx->disposal));
+        }
+        tx->dispose_index++;
+        return EAGAIN;
+    }
+    if (tx->committed) {
+        rc = wl_columnar_session_observed_old_storage_finish(tx);
+        if (rc) return rc;
+    }
+    free((void *)tx->image); tx->image = NULL;
+    if (tx->image_admitted && !tx->committed && sess->memory_governor) {
+        bool done = false;
+        rc = wl_columnar_memory_reservation_finish_step(&tx->image_credit, true,
+                &done);
+        if (rc || !done) return rc ? rc : EAGAIN;
+        tx->image_admitted = false;
+    }
+    free(tx->entries); tx->entries = NULL;
+    free(tx->heads); tx->heads = NULL;
+    free(tx->originals); tx->originals = NULL;
+    free(tx->overrides); tx->overrides = NULL;
+    free(tx->ops); tx->ops = NULL;
+    if (tx->metadata_admitted && sess->memory_governor) {
+        bool done = false;
+        rc = wl_columnar_memory_reservation_finish_step(&tx->metadata_credit,
+                true, &done);
+        if (rc || !done) return rc ? rc : EAGAIN;
+    }
+    (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
+    (void)wl_evaluation_control_detach(tx->maintenance, tx);
+    wl_evaluation_control_release(tx->maintenance);
+    free(tx); step->transaction = NULL;
+    return 0;
+}
+
 static int
 col_controlled_step_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool teardown)
@@ -8782,9 +9807,17 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
     if (teardown) wl_evaluation_control_request_cancel(control);
 
+    if (step->general_observed)
+        return wl_columnar_session_observed_drive(sess, step);
+
     if (step->observed && !step->complete) {
         int rc = col_controlled_step_observed_preflight(sess, step);
         if (rc == EAGAIN) return rc;
+        if (rc == ENOTSUP && (step->observed_preflight_phase == 2
+            || step->observed_preflight_phase == 5)) {
+            step->general_observed = true;
+            return wl_columnar_session_observed_drive(sess, step);
+        }
         if (rc) return col_controlled_step_finish(sess, step, rc);
         if (step->successor_attempt) {
             rc = col_controlled_step_successor_target_init(sess, step,
@@ -9141,6 +10174,30 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
     return rc ? rc : EAGAIN;
 }
 
+static bool
+wl_columnar_session_observed_general_shape(const wl_col_session_t *sess)
+{
+    const wl_plan_t *plan = sess->plan;
+    if (!sess->delta_cb) return false;
+    if (!plan || !plan->strata) return true;
+    if (plan->edb_count == 1 && plan->edb_column_type_counts
+        && plan->edb_column_type_counts[0] == 1 && plan->edb_column_types
+        && plan->edb_column_types[0]
+        && plan->edb_column_types[0][0] != WIRELOG_TYPE_INT64) return true;
+    if (plan->stratum_count != 1 || plan->strata[0].relation_count != 1)
+        return true;
+    if (!plan->strata[0].relations) return true;
+    const wl_plan_relation_t *r = &plan->strata[0].relations[0];
+    if (!r->ops || (r->op_count != 3 && r->op_count != 4)) return true;
+    if (r->ops[0].op != WL_PLAN_OP_VARIABLE
+        || (r->op_count == 4 && r->ops[1].op != WL_PLAN_OP_FILTER)
+        || r->ops[r->op_count - 2].op != WL_PLAN_OP_MAP
+        || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return true;
+    const wl_plan_op_t *map = &r->ops[r->op_count - 2];
+    return map->project_count != 1 || !map->project_indices
+           || map->project_indices[0] != 0;
+}
+
 static int
 col_controlled_step(wl_col_session_t *sess)
 {
@@ -9178,10 +10235,28 @@ col_controlled_step(wl_col_session_t *sess)
         int rc = col_controlled_step_static_preflight(sess, true);
         if (rc) return rc;
         uint64_t identity = step->operation_identity;
+        bool general = step->general_observed || sess->nrels > 3;
+        if (step->transaction) {
+            if (!step->operation_active) {
+                rc = wl_evaluation_control_begin(sess->base.evaluation_control,
+                        sess->base.operation_admission);
+                if (rc) return rc;
+                step->operation_active = true;
+                step->operation_id = wl_evaluation_control_active_attempt_id(
+                    sess->base.evaluation_control);
+            }
+            rc = wl_columnar_session_observed_dispose(sess, step);
+            if (rc) return rc;
+        }
         bool observed = step->observed;
+        uint64_t operation_id = step->operation_id;
+        bool operation_active = step->operation_active;
         memset(step, 0, sizeof(*step));
+        step->operation_id = operation_id;
+        step->operation_active = operation_active;
         step->operation_identity = identity;
         step->observed = observed;
+        step->general_observed = general;
         step->successor_attempt = true;
     }
     if (!successor_step
@@ -9205,6 +10280,8 @@ col_controlled_step(wl_col_session_t *sess)
             && wl_columnar_eval_plan_numeric_recursive_path_supported(
             &plan->strata[0].relations[0]);
         sess->controlled_step->observed = sess->delta_cb != NULL;
+        sess->controlled_step->general_observed =
+            wl_columnar_session_observed_general_shape(sess);
     }
     return col_controlled_step_drive(sess, sess->controlled_step, false);
 }
@@ -9218,6 +10295,12 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
     if (step->operation_active)
         rc = col_controlled_step_drive(sess, step, true);
     if (rc == EAGAIN || step->operation_active) return EBUSY;
+    if (step->transaction) {
+        int dispose_rc = EAGAIN;
+        for (unsigned action = 0; action < 16 && dispose_rc == EAGAIN; ++action)
+            dispose_rc = wl_columnar_session_observed_dispose(sess, step);
+        if (dispose_rc) return dispose_rc == EAGAIN ? EBUSY : dispose_rc;
+    }
     if (step->staging_retirement.storage.identity && !step->staging_done) {
         if (step->staging_retirement.committed) {
             int cleanup_rc;
@@ -9281,6 +10364,8 @@ col_session_controlled_step_state(const wl_session_t *session)
         && step->provenance_valid
         && !col_controlled_step_provenance_current(sess, step)))
         return WL_CONTROLLED_STEP_INVALIDATED;
+    if (step->general_observed &&
+        !step->complete) return WL_CONTROLLED_STEP_PENDING;
     if (step->complete) {
         if (step->observed && (!step->published
             || step->observer_cleanup_pending))
@@ -9301,6 +10386,18 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step || !step->observed)
         return EBUSY;
+    if (step->general_observed) {
+        const wl_columnar_session_observed_transaction_t *tx =
+            step->transaction;
+        if (!tx || !relation || !step->complete || !step->published
+            || step->observer_cleanup_pending) return EBUSY;
+        for (uint32_t i = 0; i < sess->plan->edb_count; ++i) {
+            col_rel_t *r = tx->entries[i].public_relation;
+            if (r && num_cols == sess->plan->edb_declared_width[i]
+                && strcmp(relation, tx->entries[i].name) == 0) return 0;
+        }
+        return ENOTSUP;
+    }
     if (!relation || num_cols != 1 || num_rows > 1)
         return ENOTSUP;
     if (!step->complete || !step->published
@@ -9353,6 +10450,10 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         return;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->general_observed && step->complete && step->published) {
+        step->successor_mutation_seen = true;
+        return;
+    }
     if (!step || !step->observed || !step->complete || !step->published
         || !sess->plan || sess->plan->stratum_count != 1
         || !sess->plan->strata || sess->plan->strata[0].relation_count != 1

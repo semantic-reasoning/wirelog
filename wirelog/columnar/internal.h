@@ -6727,6 +6727,15 @@ typedef struct {
     col_relation_snapshot_t snapshot;
 } wl_columnar_eval_private_binding_t;
 
+/* Session transaction owns this stable, charged, unbounded name table.
+ * NULL relations reserve not-yet-computed heads and prohibit public fallback. */
+typedef struct {
+    const char *name;
+    col_rel_t *relation;
+    col_rel_t *public_relation;
+    col_relation_snapshot_t snapshot;
+} wl_columnar_eval_private_dynamic_binding_t;
+
 typedef struct wl_columnar_eval_private_bindings {
     uintptr_t identity;
     wl_col_session_t *session;
@@ -6736,7 +6745,16 @@ typedef struct wl_columnar_eval_private_bindings {
     uint32_t count;
     wl_columnar_eval_private_binding_t entries[
         WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX];
+    const wl_columnar_eval_private_dynamic_binding_t *dynamic_entries;
+    uint64_t generation;
+
 } wl_columnar_eval_private_bindings_t;
+
+bool wl_columnar_session_observed_bindings_authorized(
+    const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
+int wl_columnar_eval_private_binding_get(
+    const wl_columnar_eval_private_bindings_t *, uint32_t,
+    const char **, col_rel_t **);
 
 void wl_columnar_eval_plan_numeric_attempt_init(
     wl_columnar_eval_plan_numeric_attempt_t *);

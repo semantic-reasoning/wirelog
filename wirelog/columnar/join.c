@@ -4232,13 +4232,17 @@ wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
         if (rc) return rc;
         bool private_entry = private_bindings
             && slot < private_bindings->count;
-        col_rel_t *candidate = private_entry
-            ? private_bindings->entries[slot].relation
-            : session->rels[private_bindings
+        col_rel_t *candidate = NULL;
+        const char *actual = NULL;
+        if (private_entry) {
+            rc = wl_columnar_eval_private_binding_get(private_bindings,
+                    slot, &actual, &candidate);
+            if (rc) return rc;
+        } else {
+            candidate = session->rels[private_bindings
                 ? slot - private_bindings->count : slot];
-        const char *actual = private_entry
-            ? private_bindings->entries[slot].name
-            : candidate ? candidate->name : NULL;
+            actual = candidate ? candidate->name : NULL;
+        }
         rc = wl_columnar_join_attempt_tail(control, id, 5, slot);
         if (rc) return rc;
         if (!actual) continue;
@@ -4254,7 +4258,8 @@ wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
             if (rc) return rc;
             if (!match) break;
             if (!value) {
-                *out = candidate; return 0;
+                *out = candidate;
+                return private_entry && !candidate ? ENOENT : 0;
             }
         }
     }
