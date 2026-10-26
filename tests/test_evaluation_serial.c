@@ -25,6 +25,8 @@ extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
 extern bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
 extern uint32_t wl_columnar_eval_delta_test_stream_validation_rows;
 extern size_t wl_columnar_session_test_observer_precharged_events;
+extern void (*wl_columnar_session_test_staging_prepared)(
+    wl_evaluation_control_t *);
 extern void (*wl_columnar_session_test_before_successor_registration)(
     col_rel_t *);
 extern void (*wl_columnar_session_test_successor_registry_charge)(
@@ -3549,6 +3551,13 @@ controlled_observed_filter_compare(wl_session_t *controlled,
 }
 
 static void
+controlled_staging_cancel(wl_evaluation_control_t *control)
+{
+    wl_columnar_session_test_staging_prepared = NULL;
+    wl_evaluation_control_request_cancel(control);
+}
+
+static void
 test_controlled_observed_filter_successors(void)
 {
     const int64_t changes[] = {-9, -9, 3, 3, 12, 8};
@@ -3561,6 +3570,15 @@ test_controlled_observed_filter_successors(void)
         wl_session_options_t options;
         wl_session_options_init(&options);
         options.evaluation_control = control;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor);
+        options.memory_governor = governor;
         wl_session_t *session = NULL, *reference = NULL;
         CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
             &options, &session));
@@ -3603,29 +3621,62 @@ test_controlled_observed_filter_successors(void)
                 && capture.diffs[events] == (after ? 1 : -1));
         CHECK(!wl_session_step(session) && capture.count == events
             + (before != after));
-        /* Retained removal staging can exhaust the existing three-slot
-         * successor domain. Keep that refusal explicit; do not bypass it. */
-        if (((wl_col_session_t *)session)->nrels > 3) {
-            wl_col_session_t *col = (wl_col_session_t *)session;
-            CHECK(session_find_rel(col, "$r$input"));
-            const col_rel_t *input = session_find_rel(col, "input");
-            const col_rel_t *published = session_find_rel(col, "output");
-            uint32_t input_rows = input->nrows;
-            uint64_t input_generation = input->view_generation;
-            int64_t later = 17;
-            CHECK(wl_session_insert(session, "input", &later, 1, 1) == ENOTSUP);
-            CHECK(input->nrows == input_rows
-                && input->view_generation == input_generation
-                && !controlled_observed_filter_has(input, later));
-            CHECK(session_find_rel(col, "output") == published);
+        CHECK(((wl_col_session_t *)session)->nrels == 2);
+        CHECK(!session_find_rel((wl_col_session_t *)session, "$r$input"));
+        uint64_t cycle_baseline = 0;
+        for (unsigned cycle = 0; cycle < 24; ++cycle) {
+            int64_t later = cycle % 4 < 2 ? 17 : -17;
+            bool insert = cycle % 2 == 0;
+            capture.count = 0;
+            capture.cancel_on_first = cycle == 5;
+            mutate = insert ? wl_session_insert : wl_session_remove;
+            CHECK(!mutate(session, "input", &later, 1, 1));
+            CHECK(!mutate(reference, "input", &later, 1, 1));
+            CHECK(!wl_evaluation_control_reset(control));
+            if (cycle == 1) {
+                wl_columnar_session_test_staging_prepared =
+                    controlled_staging_cancel;
+                CHECK(controlled_recursive_run(session,
+                    control) == WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(!wl_columnar_session_test_staging_prepared &&
+                    !capture.count);
+                CHECK(controlled_observed_filter_has(session_find_rel(
+                        (wl_col_session_t *)session, "output"), 17));
+                CHECK(!wl_evaluation_control_reset(control));
+            }
+            CHECK(!controlled_recursive_run(session, control));
+            CHECK(!wl_session_step(reference));
             controlled_observed_filter_compare(session, reference);
-            CHECK(capture.count == events + (before != after));
+            CHECK(capture.count == (later > 0 ? 1u : 0u));
+            if (capture.count) CHECK(capture.rows[0] == later
+                    && capture.diffs[0] == (insert ? 1 : -1));
+            CHECK(((wl_col_session_t *)session)->nrels == 2);
+            CHECK(!session_find_rel((wl_col_session_t *)session, "$r$input"));
+            if (cycle == 5) {
+                CHECK(wl_session_snapshot(session,
+                    controlled_observer_snapshot_capture, NULL) ==
+                    WL_EVALUATION_CONTROL_CANCELLED);
+                CHECK(capture.count == 1);
+                CHECK(!wl_evaluation_control_reset(control));
+            }
+            CHECK(!wl_session_step(session));
+            if (cycle % 4 == 3) {
+                uint64_t current = wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor));
+                if (cycle == 3) cycle_baseline = current;
+                else CHECK(current == cycle_baseline);
+            }
+            CHECK(capture.count == (later > 0 ? 1u : 0u));
         }
         wl_session_destroy(reference);
         wl_session_destroy(session);
         wl_evaluation_control_release(control);
         wl_plan_free(plan);
         wirelog_program_free(program);
+        /* The program's intern table also retains the supplied governor. */
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
     }
 }
 
@@ -9358,6 +9409,126 @@ test_entry_generated_filter_work_boundary(void)
     free(rows);
 }
 
+static void
+scalar_retirement_custom_release(struct ArrowSchema *schema)
+{
+    (void)schema;
+}
+
+static void
+test_scalar_retirement_receipt(void)
+{
+    const uint32_t widths[] = {0, 1, 3, 257};
+    for (unsigned test = 0; test < 4; ++test) {
+        uint32_t width = widths[test];
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor);
+        col_rel_t *relation = NULL;
+        CHECK(!wl_columnar_relation_new_auto_governed("retire", width, 4,
+            false, governor, &relation));
+        int64_t row[257] = {0};
+        CHECK(!col_rel_append_row(relation, row));
+        uint64_t retained = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(governor));
+        CHECK(retained);
+        wl_mem_ledger_t ledger;
+        wl_mem_ledger_init(&ledger, 0);
+        if (width == 3) {
+            relation->mem_ledger = &ledger;
+            wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION,
+                col_rel_owned_ledger_bytes(relation));
+        }
+        int owner;
+        wl_evaluation_control_t *control = control_new(0, &owner);
+        CHECK(!wl_evaluation_control_begin(control, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(control);
+        wl_columnar_relation_scalar_retirement_t receipt = {0};
+        if (width == 1) {
+            wl_columnar_source_access_reader_t pin = {0};
+            CHECK(!col_rel_source_reader_acquire(relation, &pin));
+            CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt,
+                relation));
+            CHECK(wl_columnar_relation_scalar_retirement_prepare(&receipt,
+                control, id) == EAGAIN);
+            CHECK(!wl_columnar_relation_scalar_retirement_cancel(&receipt));
+            CHECK(!col_rel_source_reader_release(&pin));
+            void (*release)(struct ArrowSchema *) = relation->schema.release;
+            relation->schema.release = scalar_retirement_custom_release;
+            CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt,
+                relation));
+            CHECK(wl_columnar_relation_scalar_retirement_prepare(&receipt,
+                control, id) == EAGAIN);
+            CHECK(wl_columnar_relation_scalar_retirement_prepare(&receipt,
+                control, id) == ENOTSUP);
+            CHECK(!wl_columnar_relation_scalar_retirement_cancel(&receipt));
+            relation->schema.release = release;
+        }
+        CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt,
+            relation));
+        int rc;
+        do {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&receipt,
+                    control, id);
+        } while (rc == EAGAIN);
+        CHECK(!rc && receipt.ready && relation->nrows == 1);
+        CHECK(!wl_columnar_relation_scalar_retirement_cancel(&receipt));
+        CHECK(relation->nrows == 1 && !strcmp(relation->name, "retire"));
+        CHECK(wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(governor)) == retained);
+        wl_columnar_source_access_reader_t reader = {0};
+        CHECK(!col_rel_source_reader_acquire(relation, &reader));
+        CHECK(!col_rel_source_reader_release(&reader));
+        CHECK(!wl_columnar_relation_scalar_retirement_begin(&receipt,
+            relation));
+        do {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&receipt,
+                    control, id);
+        } while (rc == EAGAIN);
+        CHECK(!rc && !wl_columnar_relation_scalar_retirement_commit(&receipt));
+        CHECK(wl_columnar_relation_scalar_retirement_cancel(&receipt) ==
+            EINVAL);
+        bool freed = false;
+        unsigned calls = 0;
+        do {
+            /* Physical frees receive one unit; credit/ledger tails alternate
+             * refused one-unit grants with enough funding to make progress. */
+            (void)wl_evaluation_control_finish(control, &owner, 0, 0);
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control,
+                (receipt.storage.relation && receipt.phase != 12)
+                || calls % 2 ? 1 : 1024));
+            CHECK(!wl_evaluation_control_begin(control, &owner));
+            id = wl_evaluation_control_active_attempt_id(control);
+            rc = wl_columnar_relation_scalar_retirement_step(&receipt, control,
+                    id);
+            CHECK(rc == 0 || rc == EAGAIN ||
+                rc == WL_EVALUATION_CONTROL_WORK_LIMIT);
+            if (!receipt.storage.relation) freed = true;
+            CHECK(++calls < 10000);
+        } while (rc);
+        CHECK(freed &&
+            receipt.storage.phase ==
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        CHECK(!wl_columnar_relation_scalar_retirement_step(&receipt, control,
+            id));
+        wl_mem_ledger_snapshot_t snapshot;
+        wl_mem_ledger_snapshot(&ledger, &snapshot);
+        CHECK(snapshot.current_bytes == 0);
+        (void)wl_evaluation_control_finish(control, &owner, 0, 0);
+        CHECK(!wl_evaluation_control_detach(control, &owner));
+        wl_evaluation_control_release(control);
+        wl_columnar_memory_governor_ref_release(governor);
+    }
+}
+
 int
 main(void)
 {
@@ -9374,6 +9545,7 @@ main(void)
     test_controlled_recursive_step_rejects_unsupported_shape();
     test_controlled_session_step_resume();
     test_controlled_observed_step();
+    test_scalar_retirement_receipt();
     test_controlled_observed_filter_successors();
     test_controlled_observed_filter_stops();
     test_controlled_observed_preflight_rejections();

@@ -835,6 +835,31 @@ typedef struct wl_columnar_relation_managed_retirement {
     bool token_empty[4];
 } wl_columnar_relation_managed_retirement_t;
 
+/* Reversible scalar retirement preparation followed by irreversible disposal.
+ * Keep this receipt at its original address. READY holds terminal writer claims;
+ * cancel is allowed only before commit. After commit the descriptor belongs to
+ * the receipt and must never be used by another owner, including after free. */
+typedef struct {
+    wl_columnar_relation_managed_retirement_t storage;
+    wl_mem_ledger_t *ledger;
+    uint64_t ledger_bytes;
+    uint32_t column, prior_column;
+    unsigned phase;
+    bool ready, committed;
+} wl_columnar_relation_scalar_retirement_t;
+int wl_columnar_relation_scalar_retirement_begin(
+    wl_columnar_relation_scalar_retirement_t *, col_rel_t *);
+int wl_columnar_relation_scalar_retirement_prepare(
+    wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_relation_scalar_retirement_cancel(
+    wl_columnar_relation_scalar_retirement_t *);
+int wl_columnar_relation_scalar_retirement_commit(
+    wl_columnar_relation_scalar_retirement_t *);
+int wl_columnar_relation_scalar_retirement_step(
+    wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
+    uint64_t);
+
 /* One-funded-action-at-a-time builder for a private, unnamed binary INT64
  * relation. On a terminal allocation failure, relation retains all partial
  * ownership so it can be passed to managed_retirement_begin(). */

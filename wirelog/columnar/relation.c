@@ -4513,6 +4513,264 @@ wl_columnar_relation_managed_retirement_step(
     }
 }
 
+/* Scalar retirement keeps the binary builder's receipt/tariff unchanged.
+ * All caller-sized metadata is inspected while reversible writer claims hold. */
+int
+wl_columnar_relation_scalar_retirement_begin(
+    wl_columnar_relation_scalar_retirement_t *s, col_rel_t *relation)
+{
+    if (!s || s->storage.identity || !relation) return EINVAL;
+    memset(s, 0, sizeof(*s));
+    return wl_columnar_relation_managed_retirement_begin(&s->storage, relation);
+}
+
+int
+wl_columnar_relation_scalar_retirement_prepare(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || s->committed)
+        return EINVAL;
+    if (s->ready) return 0;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+    if (rc) return rc;
+    col_rel_t *r = s->storage.relation;
+    if (!r) return EINVAL;
+    struct ArrowSchema expected_schema;
+    ArrowSchemaInit(&expected_schema);
+    if (s->phase == 0) {
+        wl_columnar_source_access_gate_request_t requests[2] = {
+            {&r->descriptor_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER},
+            {&r->source_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER}
+        };
+        rc = wl_columnar_source_access_gate_round_acquire(
+            &s->storage.gate_round, requests, 1, 1);
+        if (rc) return rc;
+        s->phase = 1;
+    } else if (s->phase == 1) {
+        if (r->pool_owned || r->arena_owned || r->timestamps
+            || r->timestamp_capacity || r->retract_backup_columns
+            || r->retract_backup_timestamps ||
+            r->retract_backup_timestamp_capacity
+            || r->retract_backup_nrows || r->retract_backup_base_nrows
+            || r->retract_backup_capacity || r->retract_backup_sorted_nrows
+            || r->col_shared || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || r->compound_count || r->compound_arity_map ||
+            r->compound_arity_len
+            || r->inline_physical_offset || r->memory_budget_denial_pending
+            || r->pool_name_reserved_bytes || r->ledger_ts_bytes
+            || r->deferred_relation_next || r->deferred_relation_session
+            || r->storage_owner != r || !r->relation_identity
+            || r->storage_owner_identity != r->relation_identity
+            || r->storage_owner_generation != r->storage_generation
+            || col_rel_storage_alias_borrow_count(r)
+            || r->schema.dictionary || r->schema.private_data
+            || (r->schema_ok && (r->schema.release != expected_schema.release
+            || r->schema.n_children != r->ncols
+            || (r->ncols && (!r->schema.children || !r->col_names))))
+            || (!r->schema_ok && (r->schema.release || r->schema.children
+            || r->schema.n_children || r->col_names))) return ENOTSUP;
+        s->storage.governor = r->memory_governor
+            ? wl_columnar_memory_governor_ref_get(r->memory_governor) : NULL;
+        for (size_t i = 0; i < 4; ++i) {
+            uint64_t *bytes;
+            wl_columnar_memory_reservation_t *token =
+                wl_columnar_relation_managed_token_at(r, i, &bytes);
+            if (s->storage.governor
+                ? !wl_columnar_relation_managed_token_valid(token,
+                s->storage.governor, r, *bytes)
+                : (*bytes || !wl_columnar_relation_managed_empty_token(token)))
+                return EINVAL;
+        }
+        if (!wl_columnar_relation_managed_empty_token(
+                &r->pool_name_reservation))
+            return ENOTSUP;
+        s->ledger = r->mem_ledger;
+        s->phase = 2;
+    } else if (s->phase == 2) {
+        if (s->column == r->ncols) {
+            s->column = 0;
+            s->ready = true;
+            return wl_evaluation_control_charge_attempt(control, id, 0);
+        }
+        uint32_t c = s->column;
+        if ((r->nrows && (!r->columns || !r->columns[c]))
+            || (r->column_types && (r->column_types[c] < WIRELOG_TYPE_INT32
+            || r->column_types[c] > WIRELOG_TYPE_BOOL))) return ENOTSUP;
+        if (r->schema_ok) {
+            const struct ArrowSchema *child = r->schema.children[c];
+            if (!child || child->n_children || child->dictionary
+                || child->private_data ||
+                child->release != expected_schema.release
+                || !r->col_names[c])
+                return ENOTSUP;
+        }
+        if (r->columns && r->columns[c]) {
+            uint64_t bytes = (uint64_t)r->capacity * sizeof(int64_t);
+            if (!wl_columnar_memory_size_add(s->ledger_bytes, bytes,
+                &s->ledger_bytes)) return EOVERFLOW;
+        }
+        s->prior_column = 0;
+        s->phase = 3;
+    } else if (s->phase == 3) {
+        /* Reject duplicate backing pointers before any irreversible free. */
+        if (s->prior_column < s->column) {
+            uint32_t a = s->prior_column++, b = s->column;
+            if ((r->columns && r->columns[a]
+                && r->columns[a] == r->columns[b])
+                || (r->merge_columns && r->merge_columns[a]
+                && r->merge_columns[a] == r->merge_columns[b])) return EINVAL;
+        } else {
+            s->column++; s->phase = 2;
+        }
+    } else return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return rc ? rc : EAGAIN;
+}
+
+int
+wl_columnar_relation_scalar_retirement_cancel(
+    wl_columnar_relation_scalar_retirement_t *s)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || s->committed)
+        return EINVAL;
+    int rc = s->storage.gate_round.identity
+        ? wl_columnar_source_access_gate_round_release(&s->storage.gate_round) :
+        0;
+    if (!rc) memset(s, 0, sizeof(*s));
+    return rc;
+}
+
+int
+wl_columnar_relation_scalar_retirement_commit(
+    wl_columnar_relation_scalar_retirement_t *s)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || !s->ready
+        || s->committed) return EINVAL;
+    s->committed = true;
+    s->column = 0;
+    s->phase = 4;
+    return 0;
+}
+
+int
+wl_columnar_relation_scalar_retirement_step(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || !s->committed)
+        return EINVAL;
+    if (s->phase == 13) {
+        int rc = wl_columnar_relation_managed_retirement_step(&s->storage,
+                control, id);
+        return rc ? rc : s->storage.phase
+               == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE ? 0 : EAGAIN;
+    }
+    int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+    if (rc) return rc;
+    col_rel_t *r = s->storage.relation;
+    if (!r) return EINVAL;
+    switch (s->phase) {
+    case 4:
+        rc = wl_columnar_relation_managed_retirement_detach(&s->storage,
+                s->column);
+        if (rc) return rc;
+        if (++s->column == 4) {
+            s->column = 0; s->phase++;
+        }
+        break;
+    case 5:
+        s->storage.governor_ref = r->memory_governor;
+        r->memory_governor = NULL;
+        s->phase++;
+        break;
+    case 6:
+        if (s->column < r->ncols) {
+            uint32_t c = s->column++;
+            if (r->columns) {
+                free(r->columns[c]); r->columns[c] = NULL;
+            }
+            if (r->merge_columns) {
+                free(r->merge_columns[c]); r->merge_columns[c] = NULL;
+            }
+            if (r->col_names) {
+                free(r->col_names[c]); r->col_names[c] = NULL;
+            }
+        } else s->phase++;
+        break;
+    case 7:
+        if (r->schema_ok && r->schema.n_children) {
+            struct ArrowSchema *child =
+                r->schema.children[--r->schema.n_children];
+            ArrowSchemaRelease(child);
+            ArrowFree(child);
+            r->schema.children[r->schema.n_children] = NULL;
+        } else s->phase++;
+        break;
+    case 8:
+        if (r->schema_ok) {
+            ArrowSchemaRelease(&r->schema); r->schema_ok = false;
+        }
+        free(r->name); r->name = NULL;
+        free((void *)r->columns); r->columns = NULL;
+        free((void *)r->merge_columns); r->merge_columns = NULL;
+        free((void *)r->col_names); r->col_names = NULL;
+        s->phase++;
+        break;
+    case 9:
+        free(r->row_scratch); r->row_scratch = NULL;
+        free(r->column_types); r->column_types = NULL;
+        free(r->dedup_slots); r->dedup_slots = NULL;
+        s->phase = 12;
+        break;
+    case 12:
+        if (s->ledger && s->ledger_bytes) {
+            wl_columnar_mem_ledger_publication_prepared_t ledger = {0};
+            wl_columnar_mem_ledger_publication_request_t request = {
+                WL_MEM_SUBSYS_RELATION, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+                s->ledger_bytes
+            };
+            rc = wl_columnar_mem_ledger_publication_prepare_controlled(
+                s->ledger, &request, 1, &ledger, control);
+            if (!rc) rc =
+                    wl_columnar_mem_ledger_publication_acquire_controlled(
+                    &ledger);
+            if (rc) {
+                if (ledger.phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY
+                    || ledger.phase ==
+                    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_HELD) {
+                    int cancel_rc =
+                        wl_columnar_mem_ledger_publication_cancel(&ledger);
+                    if (cancel_rc) abort();
+                }
+                return rc;
+            }
+            if (wl_columnar_mem_ledger_publication_apply(&ledger)
+                || wl_columnar_mem_ledger_publication_release(&ledger)) abort();
+        }
+        r->mem_ledger = NULL;
+        s->ledger = NULL;
+        s->phase = 10;
+        break;
+    case 10:
+        rc = wl_columnar_source_access_gate_round_arm_terminal_consume(
+            &s->storage.gate_round);
+        if (rc) return rc;
+        s->phase++;
+        break;
+    case 11:
+        free(r);
+        s->storage.relation = NULL;
+        s->storage.phase =
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_CONSUME_TERMINAL_WRITERS;
+        s->phase = 13;
+        break;
+    default: return EINVAL;
+    }
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return rc ? rc : EAGAIN;
+}
+
 /* Checked destruction and retirement leave the descriptor token embedded
  * through content cleanup. Return its credit only after the physical struct
  * has been freed. */

@@ -191,3 +191,11 @@ publication must not replay events. Callback replacement/clearing retains its
 existing semantics. G2 closes only when repeated mutation cycles, typed/wide
 rows and dependent/independent multiple heads pass together through session
 entry points with deterministic stops, reference results and resource checks.
+
+G2 ownership refinement: a separate scalar retirement receipt prepares
+reversible writer claims and validates ordinary scalar backing through charged
+cursors. Commit transfers descriptor lifetime to the receipt; column, name and
+schema-child frees precede the existing memory-credit retirement receipts.
+The binary retirement tariff remains unchanged. Multihead publication will
+use one coordinated registry image and stable dynamically sized private
+bindings, without raising the existing recursive overlay's fixed limit.

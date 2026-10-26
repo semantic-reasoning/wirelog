@@ -224,6 +224,13 @@ struct wl_columnar_controlled_step {
     bool observer_evaluated;
     bool published;
     bool observer_cleanup_pending;
+    wl_columnar_relation_scalar_retirement_t staging_retirement;
+    col_relation_snapshot_t staging_snapshot;
+    wl_evaluation_control_t *staging_maintenance;
+    uint64_t staging_maintenance_id;
+    uint32_t staging_slot;
+    size_t staging_byte;
+    bool staging_ready, staging_done, staging_tail_prepaid;
 };
 
 static int col_controlled_step_successor_target_init(wl_col_session_t *,
@@ -264,6 +271,7 @@ void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 size_t wl_columnar_session_test_observer_precharged_events;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
+void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
 void (*wl_columnar_session_test_successor_registry_charge)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 #endif
@@ -7377,11 +7385,133 @@ col_controlled_step_observed_result(wl_col_session_t *sess,
     return ENOENT;
 }
 
+/* The removal producer owns one $r$ source at a time. Resolve that exact source
+ * under STEP accounting, then retain reversible writer claims until cutoff. */
+static int
+col_controlled_step_staging_prepare(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->staging_ready) return 0;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (!step->successor_attempt || !sess->last_removed_relation) {
+        step->staging_ready = true;
+        return 0;
+    }
+    if (!step->observed_input
+        || sess->last_removed_relation != step->observed_input->name)
+        return ENOTSUP;
+    while (!step->staging_retirement.storage.identity) {
+        int rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id, 1);
+        if (rc) return rc;
+        if (step->staging_slot == sess->nrels) return EINVAL;
+        col_rel_t *r = sess->rels[step->staging_slot];
+        if (!r || !r->name) {
+            step->staging_slot++; continue;
+        }
+        size_t byte = step->staging_byte;
+        char expected = byte < 3 ? "$r$"[byte]
+            : step->observed_input->name[byte - 3];
+        char actual = r->name[byte];
+        if (actual != expected) {
+            step->staging_slot++; step->staging_byte = 0;
+        }else if (actual) step->staging_byte++;
+        else {
+            step->staging_snapshot = wl_columnar_relation_snapshot(r);
+            rc = wl_columnar_relation_scalar_retirement_begin(
+                &step->staging_retirement, r);
+            if (rc) return rc;
+        }
+    }
+    int rc = wl_columnar_relation_scalar_retirement_prepare(
+        &step->staging_retirement, control, step->operation_id);
+    if (rc) return rc;
+    if (!wl_columnar_relation_snapshot_equal(step->staging_snapshot,
+        wl_columnar_relation_snapshot(
+            step->staging_retirement.storage.relation)))
+        return EINVAL;
+    if (!step->staging_maintenance) {
+        rc = wl_evaluation_control_create(0, &step->staging_maintenance);
+        if (rc) return rc;
+        rc = wl_evaluation_control_attach(step->staging_maintenance, step);
+        if (!rc) rc = wl_evaluation_control_begin(step->staging_maintenance,
+                    step);
+        if (rc) {
+            (void)wl_evaluation_control_detach(step->staging_maintenance, step);
+            wl_evaluation_control_release(step->staging_maintenance);
+            step->staging_maintenance = NULL;
+            return rc;
+        }
+        step->staging_maintenance_id = wl_evaluation_control_active_attempt_id(
+            step->staging_maintenance);
+    }
+    step->staging_ready = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_staging_prepared)
+        wl_columnar_session_test_staging_prepared(control);
+#endif
+    return wl_evaluation_control_charge_attempt(control, step->operation_id, 0);
+}
+
+static void
+col_controlled_step_staging_end(wl_columnar_controlled_step_t *step)
+{
+    if (!step->staging_maintenance) return;
+    (void)wl_evaluation_control_finish(step->staging_maintenance, step, 0, 0);
+    (void)wl_evaluation_control_detach(step->staging_maintenance, step);
+    wl_evaluation_control_release(step->staging_maintenance);
+    step->staging_maintenance = NULL;
+}
+
+static int
+col_controlled_step_staging_finish(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->staging_done) return 0;
+    if (!step->successor_attempt) {
+        step->staging_done = true; return 0;
+    }
+    if (step->staging_retirement.storage.identity) {
+        if (!step->staging_retirement.committed) {
+            if (step->staging_slot >= sess->nrels
+                || sess->rels[step->staging_slot]
+                != step->staging_retirement.storage.relation) return EINVAL;
+            int rc = wl_columnar_relation_scalar_retirement_commit(
+                &step->staging_retirement);
+            if (rc) return rc;
+            sess->rels[step->staging_slot] = NULL;
+            session_rel_free_hash(sess);
+            sess->last_removed_relation = NULL;
+            sess->retraction_seeded = false;
+        }
+        int rc = wl_columnar_relation_scalar_retirement_step(
+            &step->staging_retirement, step->staging_maintenance,
+            step->staging_maintenance_id);
+        if (rc) return rc;
+        col_controlled_step_staging_end(step);
+    }
+    /* The legacy observed domain has at most four slots after a removal and
+     * private candidate. Visits were prepaid before publication. No live slot
+     * moves, so the cached input/head proofs remain valid. */
+    while (sess->nrels && !sess->rels[sess->nrels - 1]) sess->nrels--;
+    session_rel_free_hash(sess);
+    sess->last_inserted_relation = NULL;
+    sess->pending_input_change = false;
+    sess->pending_full_input_eval = false;
+    sess->has_evaluated = true;
+    if (step->observed_input)
+        step->observed_input->base_nrows = step->observed_input->nrows;
+    step->staging_done = true;
+    return 0;
+}
+
 static int
 col_controlled_step_observer_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = 0;
+    if (step->published) goto cleanup;
     int lookup_rc = col_controlled_step_observed_result(sess, step);
     if (lookup_rc) return lookup_rc;
     if (!step->observer_evaluated) {
@@ -7443,7 +7573,14 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
             step->delivery_precharge_index;
 #endif
     }
-    int rc = 0;
+    rc = col_controlled_step_staging_prepare(sess, step);
+    if (rc) return rc;
+    if (!step->staging_tail_prepaid) {
+        rc = wl_evaluation_control_charge(control,
+                step->successor_attempt ? sess->nrels : 0);
+        if (rc) return rc;
+        step->staging_tail_prepaid = true;
+    }
     if (!step->published) {
         if (step->successor_attempt) {
             rc = col_controlled_step_successor_publish_candidate(sess, step);
@@ -7456,7 +7593,10 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
         wl_columnar_eval_delta_observer_publish(sess);
         step->observer_cleanup_pending = true;
     }
+cleanup:
     if (step->observer_cleanup_pending) {
+        int cleanup_rc = col_controlled_step_staging_finish(sess, step);
+        if (cleanup_rc) return cleanup_rc;
         rc = wl_columnar_eval_delta_observer_finish(sess);
         if (rc) return rc;
         step->observer_cleanup_pending = false;
@@ -8758,8 +8898,10 @@ col_controlled_step_drive(wl_col_session_t *sess,
     }
 
     if (step->complete) {
-        if (step->observed && !step->published) {
+        if (step->observed &&
+            (!step->published || step->observer_cleanup_pending)) {
             int observer_rc = col_controlled_step_observer_drive(sess, step);
+            if (observer_rc == EAGAIN) return EAGAIN;
             if (observer_rc)
                 return col_controlled_step_finish(sess, step, observer_rc);
         } else if (step->observer_cleanup_pending) {
@@ -8787,6 +8929,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
         if (step->complete) {
             int observer_rc = step->observed
                 ? col_controlled_step_observer_drive(sess, step) : 0;
+            if (observer_rc == EAGAIN) return EAGAIN;
             return col_controlled_step_finish(sess, step, observer_rc);
         }
         const wl_plan_relation_t *relation = NULL;
@@ -8798,9 +8941,11 @@ col_controlled_step_drive(wl_col_session_t *sess,
             return finish_rc;
         }
         if (!relation) {
-            if (step->observed && !step->published) {
+            if (step->observed &&
+                (!step->published || step->observer_cleanup_pending)) {
                 int observer_rc = col_controlled_step_observer_drive(sess,
                         step);
+                if (observer_rc == EAGAIN) return EAGAIN;
                 if (observer_rc)
                     return col_controlled_step_finish(sess, step,
                                observer_rc);
@@ -9073,6 +9218,20 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
     if (step->operation_active)
         rc = col_controlled_step_drive(sess, step, true);
     if (rc == EAGAIN || step->operation_active) return EBUSY;
+    if (step->staging_retirement.storage.identity && !step->staging_done) {
+        if (step->staging_retirement.committed) {
+            int cleanup_rc;
+            do {
+                cleanup_rc = col_controlled_step_staging_finish(sess, step);
+            }while (cleanup_rc == EAGAIN);
+            if (cleanup_rc) return cleanup_rc;
+        } else {
+            int cancel_rc = wl_columnar_relation_scalar_retirement_cancel(
+                &step->staging_retirement);
+            if (cancel_rc) return cancel_rc;
+        }
+    }
+    col_controlled_step_staging_end(step);
     if (step->successor_candidate_detached && step->successor_candidate) {
         int candidate_rc = col_rel_destroy_checked(step->successor_candidate);
         if (candidate_rc != 0)
