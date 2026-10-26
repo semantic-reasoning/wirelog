@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern void (*wl_columnar_relation_test_before_reader_cas)(
@@ -296,6 +297,7 @@ static void unsupported(void)
     wl_plan_stratum_t stratum = { .relations = &head, .relation_count = 1 };
     wl_plan_t plan = { .strata = &stratum, .stratum_count = 1 };
     col_rel_t *r = col_rel_new_auto("bad", 2);
+    r->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
     wl_col_session_t s = { .plan = &plan, .rels = &r, .nrels = 1 };
     assert(!wl_columnar_eval_delta_observer_build_start(&s, 1));
     wl_evaluation_control_t *c = control(0);
@@ -308,6 +310,7 @@ static void unsupported(void)
     assert(!atomic_load_explicit(&r->descriptor_access.state,
         memory_order_relaxed));
     assert(!wl_columnar_eval_delta_observer_build_discard(&s));
+    r->compound_kind = WIRELOG_COMPOUND_KIND_NONE;
     close_control(c); assert(!col_rel_destroy_checked(r));
 }
 static void all_empty_supported_head(void)
@@ -708,9 +711,181 @@ static void session_destroy_drains_live_prepare(void)
     wl_session_destroy(handle);
 }
 
+typedef struct {
+    uint64_t hash;
+    uint32_t count;
+} wide_capture_t;
+
+static void wide_delta(const char *name, const int64_t *row, uint32_t width,
+    int diff, void *data)
+{
+    wide_capture_t *capture = data;
+    capture->count++;
+    capture->hash = capture->hash * 31 + (unsigned char)name[0];
+    capture->hash = capture->hash * 31 + (uint32_t)diff;
+    capture->hash = capture->hash * 31 + width;
+    for (uint32_t col = 0; col < width; ++col)
+        capture->hash = capture->hash * 31 + (uint64_t)row[col];
+}
+
+/* Raw observer is an independent reference for native-byte row identity,
+ * including FLOAT bit patterns, nullary rows and duplicate normalization. */
+static wide_capture_t wide_observer(bool stepped, uint32_t width, bool initial)
+{
+    wl_plan_relation_t heads[] = {{.name = "first"}, {.name = "second"}};
+    wl_plan_stratum_t stratum = {.relations = heads, .relation_count = 2};
+    wl_plan_t plan = {.strata = &stratum, .stratum_count = 1};
+    col_rel_t *relations[4] = {col_rel_new_auto("first", width),
+                               col_rel_new_auto("second", width),
+                               col_rel_new_auto("$out$first", width),
+                               col_rel_new_auto("$in$first", width)};
+    wide_capture_t capture = {0};
+    wl_col_session_t sess = {.plan = &plan, .rels = relations, .nrels = 2,
+                             .delta_cb = wide_delta, .delta_data = &capture};
+    wl_columnar_eval_delta_binding_t bindings[] = {
+        {.name = "second", .width = width},
+        {.name = "first", .width = width}
+    };
+    int64_t row[257];
+    assert(width <= 257 && relations[0] && relations[1]);
+    for (unsigned head = 0; head < 2; ++head) {
+        for (unsigned r = 0; r < 19; ++r) {
+            for (uint32_t c = 0; c < width; ++c)
+                row[c] = (int64_t)((18 - r) % 7) * 103 + c;
+            assert(!col_rel_append_row(relations[head], row));
+        }
+    }
+    for (unsigned head = 0; head < 2; ++head) {
+        relations[head]->column_types = malloc(width *
+                sizeof(wirelog_column_type_t));
+        for (uint32_t c = 0; c < width; ++c)
+            relations[head]->column_types[c] = (wirelog_column_type_t)(c % 7);
+        if (width > 4) {
+            const uint64_t bits[] = {0, UINT64_C(0x8000000000000000),
+                                     UINT64_C(0x7ff8000000000001),
+                                     UINT64_C(0x7ff8000000000002)};
+            for (unsigned r = 0; r < 4; ++r)
+                memcpy(&relations[head]->columns[4][r], &bits[r],
+                    sizeof(bits[r]));
+        }
+    }
+    assert(relations[2] && relations[3]);
+    if (!initial) {
+        for (uint32_t c = 0; c < width; ++c) row[c] = 11 * 103 + c;
+        assert(!col_rel_append_row(relations[2], row));
+        assert(!col_rel_append_row(relations[3], row));
+        relations[3]->base_nrows = 1;
+        for (uint32_t c = 0; c < width; ++c) row[c] = 3 * 103 + c;
+        assert(!col_rel_append_row(relations[3], row));
+        assert(!col_rel_append_row(relations[3], row));
+    }
+    sess.nrels = initial ? 0 : 4;
+    wl_evaluation_control_t *ctl = stepped ? control(17) : NULL;
+    bool ready = false;
+    unsigned stopped = 0;
+    if (stepped) {
+        assert(!(initial
+            ? wl_columnar_eval_delta_observer_build_start_missing_heads(&sess,
+            UINT64_MAX, bindings, 2)
+            : wl_columnar_eval_delta_observer_build_start(&sess, UINT64_MAX)));
+        while (!ready) {
+            int rc = wl_columnar_eval_delta_observer_build_advance(&sess, ctl,
+                    wl_evaluation_control_active_attempt_id(ctl), &ready);
+            if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+                assert(!capture.count);
+                (void)wl_evaluation_control_finish(ctl, &owner, rc, 0);
+                assert(!wl_evaluation_control_reset(ctl));
+                assert(!wl_evaluation_control_begin(ctl, &owner));
+                stopped++;
+            } else assert(rc == EAGAIN || (!rc && ready));
+        }
+    } else assert(!wl_columnar_eval_delta_observer_begin(&sess, UINT64_MAX));
+    sess.nrels = 4;
+    bindings[0].relation = relations[1];
+    bindings[1].relation = relations[0];
+    for (unsigned head = 0; head < 2; ++head) {
+        relations[head]->nrows = 0;
+        for (unsigned r = 0; r < 13; ++r) {
+            for (uint32_t c = 0; c < width; ++c)
+                row[c] = (int64_t)(r % 5 + head * 5) * 103 + c;
+            assert(!col_rel_append_row(relations[head], row));
+        }
+    }
+    if (stepped) {
+        ready = false;
+        assert(!wl_columnar_eval_delta_observer_prepare_start_with_bindings(
+                &sess, bindings, 2));
+        while (!ready) {
+            int rc = wl_columnar_eval_delta_observer_prepare_advance(&sess,
+                    ctl, wl_evaluation_control_active_attempt_id(ctl), &ready);
+            if (rc == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+                assert(!capture.count);
+                (void)wl_evaluation_control_finish(ctl, &owner, rc, 0);
+                assert(!wl_evaluation_control_reset(ctl));
+                assert(!wl_evaluation_control_begin(ctl, &owner));
+                stopped++;
+            } else assert(rc == EAGAIN || (!rc && ready));
+        }
+        assert(stopped > 1);
+        close_control(ctl);
+    } else assert(!wl_columnar_eval_delta_observer_prepare(&sess));
+    wl_columnar_eval_delta_observer_publish(&sess);
+    assert(!wl_columnar_eval_delta_observer_finish(&sess));
+    session_rel_free_hash(&sess);
+    for (unsigned head = 0; head < 4; ++head)
+        assert(!col_rel_destroy_checked(relations[head]));
+    return capture;
+}
+
+static void wide_observer_reference(void)
+{
+    const uint32_t widths[] = {0, 2, 7, 257};
+    for (unsigned i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+        for (unsigned initial = 0; initial < 2; ++initial) {
+            wide_capture_t raw = wide_observer(false, widths[i], initial != 0);
+            wide_capture_t stepped = wide_observer(true, widths[i],
+                    initial != 0);
+            assert(raw.count == stepped.count && raw.hash == stepped.hash);
+        }
+    }
+}
+
+static void wide_schema_exact_boundary(void)
+{
+    enum { WIDTH = 257 };
+    for (unsigned short_by = 0; short_by < 2; ++short_by) {
+        wl_plan_relation_t head = {.name = "head"};
+        wl_plan_stratum_t stratum = {.relations = &head, .relation_count = 1};
+        wl_plan_t plan = {.strata = &stratum, .stratum_count = 1};
+        col_rel_t *r = col_rel_new_auto("head", WIDTH);
+        assert(r);
+        r->column_types = calloc(WIDTH, sizeof(*r->column_types));
+        assert(r->column_types);
+        r->column_types[WIDTH - 1] = (wirelog_column_type_t)99;
+        wl_col_session_t sess = {.plan = &plan, .rels = &r, .nrels = 1};
+        /* HEAD + five NAME bytes + absent missing-binding visit + five
+         * registry name bytes + WIDTH schema cells. No measured budget. */
+        wl_evaluation_control_t *ctl = control(12 + WIDTH - short_by);
+        assert(!wl_columnar_eval_delta_observer_build_start(&sess, UINT64_MAX));
+        bool ready = false;
+        int rc;
+        do {
+            rc = wl_columnar_eval_delta_observer_build_advance(&sess, ctl,
+                    wl_evaluation_control_active_attempt_id(ctl), &ready);
+        } while (rc == EAGAIN);
+        assert(rc == (short_by ? WL_EVALUATION_CONTROL_WORK_LIMIT : ENOTSUP));
+        assert(!ready && !sess.delta_observer);
+        assert(!wl_columnar_eval_delta_observer_build_discard(&sess));
+        close_control(ctl);
+        assert(!col_rel_destroy_checked(r));
+    }
+}
+
 int main(void)
 {
     assert(wl_columnar_eval_delta_observer_prepare(NULL) == EINVAL);
+    wide_schema_exact_boundary();
+    wide_observer_reference();
     reader_steps(); build(false); build(true);
     virtual_missing_head_baseline();
     byte_order_no_change(false); byte_order_no_change(true);

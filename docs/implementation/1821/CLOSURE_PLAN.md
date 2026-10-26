@@ -169,3 +169,25 @@ uncrustify and whitespace checks passed. Other matrix tests were inspected,
 not freshly run. This changes documentation and admission tests only; no
 production dispatch or policy changed. Full-suite, MSVC and optional builds
 remain unclaimed.
+
+## G2 implementation bundle (2026-10-26)
+
+The next bundle groups four atomic units: bounded observer preparation,
+owned reusable mutation staging, coordinated multihead publication, and
+integrated qualification. It targets ordinary nonrecursive compositions of
+already controlled scalar operators, including multiple inputs and heads.
+Scalar row identity remains the raw observer's native-byte identity; FLOAT
+signed zero and NaN payloads do not acquire new equality rules. Intended scalar
+types are INT32, INT64, UINT32, UINT64, FLOAT, STRING and BOOL. Compound,
+timestamped and spill representations and new expression families remain G5;
+recursive and differential execution remains G3. These are planned obligations,
+not implemented coverage claims.
+
+A transaction must prepare one coordinated registry image and all old-head
+retirement claims before its publication cutoff. Independent registrations
+cannot reserve slots independently against the same registry. Failed attempts
+retain the original public heads and notification baseline; cleanup after
+publication must not replay events. Callback replacement/clearing retains its
+existing semantics. G2 closes only when repeated mutation cycles, typed/wide
+rows and dependent/independent multiple heads pass together through session
+entry points with deterministic stops, reference results and resource checks.

@@ -1063,11 +1063,167 @@ wl_columnar_eval_delta_observer_clear_stage(wl_col_session_t *sess)
     return rc;
 }
 
+/* One call visits at most one scalar cell. Row indices, rather than pointers,
+ * survive compaction; the caller charges before each call and polls after it. */
+typedef struct {
+    uint32_t column, begin, count, pending, heap, root, child, next_root;
+    uint32_t input, minus, output;
+    unsigned phase;
+    bool pending_sort;
+} wl_columnar_eval_delta_rows_t;
+
+static bool
+wl_columnar_eval_delta_rows_compare(wl_columnar_eval_delta_rows_t *s,
+    const int64_t *a, const int64_t *b, uint32_t width, int *result)
+{
+    *result = 0;
+    if (s->column < width) {
+        *result = memcmp(a + s->column, b + s->column, sizeof(*a));
+        s->column++;
+        if (!*result && s->column < width) return false;
+    }
+    s->column = 0;
+    return true;
+}
+
+static bool
+wl_columnar_eval_delta_rows_copy(wl_columnar_eval_delta_rows_t *s,
+    int64_t *a, int64_t *b, uint32_t width, bool swap)
+{
+    if (s->column < width) {
+        int64_t value = a[s->column];
+        a[s->column] = b[s->column];
+        if (swap) b[s->column] = value;
+        if (++s->column < width) return false;
+    }
+    s->column = 0;
+    return true;
+}
+
+/* Heap-sort both baseline segments, subtract pending inserts with multiplicity,
+ * then deduplicate. The same cursor normalizes a current set with pending=0. */
+static bool
+wl_columnar_eval_delta_rows_advance(wl_columnar_eval_delta_rows_t *s,
+    int64_t *rows, uint32_t width, uint32_t count, uint32_t pending,
+    uint32_t *result)
+{
+    size_t stride = width;
+    int cmp;
+#define WL_DELTA_ROW(i) (rows + (size_t)(i) * stride)
+    switch (s->phase) {
+    case 0:
+        s->count = count;
+        s->pending = pending;
+        s->heap = count;
+        s->next_root = count / 2;
+        s->phase = 1;
+        break;
+    case 1:
+        if (s->next_root) {
+            s->root = --s->next_root;
+            s->phase = 2;
+        } else s->phase = 6;
+        break;
+    case 2:
+        if (s->root >= s->heap / 2) {
+            s->phase = s->next_root ? 1 : 6;
+            break;
+        }
+        s->child = s->root * 2 + 1;
+        s->phase = 3;
+        break;
+    case 3:
+        if (s->child + 1 < s->heap) {
+            if (!wl_columnar_eval_delta_rows_compare(s,
+                WL_DELTA_ROW(s->begin + s->child),
+                WL_DELTA_ROW(s->begin + s->child + 1), width, &cmp))
+                break;
+            if (cmp < 0) s->child++;
+        }
+        s->phase = 4;
+        break;
+    case 4:
+        if (!wl_columnar_eval_delta_rows_compare(s,
+            WL_DELTA_ROW(s->begin + s->root),
+            WL_DELTA_ROW(s->begin + s->child), width, &cmp)) break;
+        s->phase = cmp < 0 ? 5 : s->next_root ? 1 : 6;
+        break;
+    case 5:
+        if (!wl_columnar_eval_delta_rows_copy(s,
+            WL_DELTA_ROW(s->begin + s->root),
+            WL_DELTA_ROW(s->begin + s->child), width, true)) break;
+        s->root = s->child;
+        s->phase = 2;
+        break;
+    case 6:
+        if (s->heap > 1) {
+            s->phase = 7;
+        } else if (!s->pending_sort && pending) {
+            s->pending_sort = true;
+            s->begin = count;
+            s->heap = pending;
+            s->next_root = pending / 2;
+            s->phase = 1;
+        } else s->phase = 8;
+        break;
+    case 7:
+        if (!wl_columnar_eval_delta_rows_copy(s, WL_DELTA_ROW(s->begin),
+            WL_DELTA_ROW(s->begin + s->heap - 1), width, true)) break;
+        s->heap--;
+        s->root = 0;
+        s->phase = 2;
+        break;
+    case 8:
+        if (s->input == s->count) {
+            s->count = s->output;
+            s->input = s->output = 0;
+            s->phase = 10;
+        } else if (s->minus < s->pending) {
+            if (!wl_columnar_eval_delta_rows_compare(s,
+                WL_DELTA_ROW(count + s->minus), WL_DELTA_ROW(s->input),
+                width, &cmp)) break;
+            if (cmp < 0) s->minus++;
+            else if (!cmp) {
+                s->input++; s->minus++;
+            }else s->phase = 9;
+        } else s->phase = 9;
+        break;
+    case 9:
+        if (!wl_columnar_eval_delta_rows_copy(s, WL_DELTA_ROW(s->output),
+            WL_DELTA_ROW(s->input), width, false)) break;
+        s->output++; s->input++; s->phase = 8;
+        break;
+    case 10:
+        if (s->input == s->count) {
+            *result = s->output;
+            return true;
+        }
+        if (!s->output) s->phase = 11;
+        else {
+            if (!wl_columnar_eval_delta_rows_compare(s,
+                WL_DELTA_ROW(s->output - 1), WL_DELTA_ROW(s->input),
+                width, &cmp)) break;
+            if (cmp) s->phase = 11;
+            else s->input++;
+        }
+        break;
+    case 11:
+        if (!wl_columnar_eval_delta_rows_copy(s, WL_DELTA_ROW(s->output),
+            WL_DELTA_ROW(s->input), width, false)) break;
+        s->output++; s->input++; s->phase = 10;
+        break;
+    default: abort();
+    }
+#undef WL_DELTA_ROW
+    return false;
+}
+
 /* Persistent construction is separate from the published raw observer. All
  * registry/name/cell traversal below has a persistent cursor. */
 enum wl_columnar_eval_delta_build_phase {
     WL_COLUMNAR_DELTA_BUILD_HEAD,
     WL_COLUMNAR_DELTA_BUILD_NAME,
+    WL_COLUMNAR_DELTA_BUILD_MISSING,
     WL_COLUMNAR_DELTA_BUILD_LOOKUP,
     WL_COLUMNAR_DELTA_BUILD_SCHEMA,
     WL_COLUMNAR_DELTA_BUILD_ALLOC,
@@ -1103,6 +1259,9 @@ struct wl_columnar_eval_delta_observer_build {
     const char *prior_name;
     const char *duplicate_name;
     const char *missing_head_name;
+    const wl_columnar_eval_delta_binding_t *missing_heads;
+    uint32_t missing_count, missing_index, missing_width;
+    bool missing_match;
     uint64_t mask, metadata_bytes, payload_bytes, entry_rows;
     size_t length, offset, zero;
     uint32_t si, ri, current_relation_count, registry, kind, count, duplicate;
@@ -1110,6 +1269,8 @@ struct wl_columnar_eval_delta_observer_build {
     uint32_t row, copied, sort_begin, sort_end, heap_size, heap_root,
         heap_child, i, j, out;
     int64_t value;
+    uint32_t width, column, schema_column;
+    wl_columnar_eval_delta_rows_t wide;
     unsigned phase;
     bool preflight, metadata_held, sorting_pending, heap_build, heap_sifting,
         heap_child_selected, allow_missing_head;
@@ -1119,9 +1280,7 @@ static bool
 wl_columnar_eval_delta_build_is_missing_head(
     const wl_columnar_eval_delta_observer_build_t *build)
 {
-    return build->allow_missing_head && build->current_name
-           && build->missing_head_name
-           && strcmp(build->current_name, build->missing_head_name) == 0;
+    return build->missing_match;
 }
 
 /* The published observer's merge compares normalized rows with memcmp. Keep
@@ -1140,9 +1299,8 @@ wl_columnar_eval_delta_build_schema(const col_rel_t *r)
            && r->storage_owner_identity == r->relation_identity
            && r->storage_generation && r->storage_generation != UINT64_MAX
            && r->storage_owner_generation == r->storage_generation
-           && r->ncols == 1 && r->nrows <= r->capacity
-           && (!r->nrows || (r->columns && r->columns[0]))
-           && (!r->column_types || r->column_types[0] == WIRELOG_TYPE_INT64)
+           && r->nrows <= r->capacity
+           && (!r->nrows || !r->ncols || r->columns)
            && !r->timestamps && r->compound_kind == WIRELOG_COMPOUND_KIND_NONE
            && !r->compound_count && !r->compound_arity_map
            && !r->compound_arity_len && !r->inline_physical_offset;
@@ -1196,6 +1354,21 @@ wl_columnar_eval_delta_observer_build_start_missing_head(
                name);
 }
 
+int
+wl_columnar_eval_delta_observer_build_start_missing_heads(
+    wl_col_session_t *sess, uint64_t mask,
+    const wl_columnar_eval_delta_binding_t *heads, uint32_t count)
+{
+    if (!heads || !count) return EINVAL;
+    int rc = wl_columnar_eval_delta_observer_build_start_internal(sess, mask,
+            NULL);
+    if (rc) return rc;
+    sess->delta_observer_build->missing_heads = heads;
+    sess->delta_observer_build->missing_count = count;
+    sess->delta_observer_build->allow_missing_head = true;
+    return 0;
+}
+
 static int
 wl_columnar_eval_delta_build_current_name(
     const wl_columnar_eval_delta_observer_build_t *b,
@@ -1246,6 +1419,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
     }
     switch (b->phase) {
     case WL_COLUMNAR_DELTA_BUILD_NAME:
+    case WL_COLUMNAR_DELTA_BUILD_MISSING:
     case WL_COLUMNAR_DELTA_BUILD_LOOKUP:
     case WL_COLUMNAR_DELTA_BUILD_SCHEMA:
     case WL_COLUMNAR_DELTA_BUILD_PREFLIGHT_DUP:
@@ -1299,6 +1473,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         b->current_name = plan->strata[b->si].relations[b->ri].name;
         b->length = 0;
         b->kind = 0;
+        b->width = b->schema_column = 0;
         b->sources[0] = b->sources[1] = b->sources[2] = NULL;
         b->phase = WL_COLUMNAR_DELTA_BUILD_NAME;
         return 0;
@@ -1310,9 +1485,35 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         } else {
             b->registry = 0;
             b->offset = 0;
-            b->phase = WL_COLUMNAR_DELTA_BUILD_LOOKUP;
+            b->missing_index = 0;
+            b->missing_match = false;
+            b->missing_width = 1;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_MISSING;
         }
         return 0;
+    case WL_COLUMNAR_DELTA_BUILD_MISSING: {
+        uint32_t count = b->missing_heads ? b->missing_count
+            : b->missing_head_name ? 1 : 0;
+        if (b->missing_index == count || b->missing_match) {
+            b->offset = 0;
+            b->phase = WL_COLUMNAR_DELTA_BUILD_LOOKUP;
+            return 0;
+        }
+        const char *wanted = b->missing_heads
+            ? b->missing_heads[b->missing_index].name : b->missing_head_name;
+        if (!wanted) return EINVAL;
+        char actual = name[b->offset], expected = wanted[b->offset];
+        if (actual != expected) {
+            b->missing_index++; b->offset = 0;
+        }else if (!actual) {
+            b->missing_match = true;
+            b->missing_width = b->missing_heads
+                ? b->missing_heads[b->missing_index].width : 1;
+            if (b->missing_heads && b->missing_heads[b->missing_index].relation)
+                return EINVAL;
+        } else b->offset++;
+        return 0;
+    }
     case WL_COLUMNAR_DELTA_BUILD_LOOKUP: {
         /* Raw seed/retired lookup uses a 256-byte prefixed name. Preserve
          * that absence rule without snprintf or an unbounded string scan. */
@@ -1355,6 +1556,16 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
             && wl_columnar_eval_delta_build_is_missing_head(b))
             || (r && !wl_columnar_eval_delta_build_schema(r)))
             return ENOTSUP;
+        if (r && b->schema_column < r->ncols) {
+            uint32_t c = b->schema_column++;
+            if ((r->nrows && !r->columns[c])
+                || (r->column_types && (r->column_types[c] < WIRELOG_TYPE_INT32
+                || r->column_types[c] > WIRELOG_TYPE_BOOL))) return ENOTSUP;
+            return 0;
+        }
+        b->schema_column = 0;
+        if (!b->kind) b->width = r ? r->ncols : b->missing_width;
+        else if (r && r->ncols != b->width) return ENOTSUP;
         if (r && b->kind == 2 && r->base_nrows > r->nrows)
             return EINVAL;
         if (++b->kind != 3) {
@@ -1433,7 +1644,10 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
             return 0;
         }
         {
-            uint64_t add = b->entry_rows * sizeof(int64_t);
+            uint64_t add;
+            if (!wl_columnar_eval_delta_observer_row_bytes(
+                    (uint32_t)b->entry_rows, b->width, &add))
+                return EOVERFLOW;
             if (b->count == UINT32_MAX || b->length == SIZE_MAX
                 || !wl_columnar_memory_size_add(add, b->length + 1, &add)
                 || !wl_columnar_memory_size_add(b->payload_bytes, add,
@@ -1480,7 +1694,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
                 o->governor = sess->memory_governor;
                 wl_columnar_memory_governor_ref_retain(o->governor);
             }
-            o->stream_initial_output = b->allow_missing_head;
+            o->stream_initial_output = b->missing_head_name != NULL;
             o->metadata_bytes = b->metadata_bytes;
             o->affected_mask = b->mask;
             b->phase = WL_COLUMNAR_DELTA_BUILD_PAYLOAD;
@@ -1542,7 +1756,7 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
         if (!e->name) return ENOMEM;
         e->name_length = b->length;
         o->count++;
-        e->ncols = 1;
+        e->ncols = b->width;
         e->nrows = (b->sources[0] ? b->sources[0]->nrows : 0)
             + (b->sources[1] ? b->sources[1]->nrows : 0);
         e->pending_nrows = b->sources[2]
@@ -1562,11 +1776,10 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
             return EINVAL;
         if (e->nrows > UINT32_MAX - e->pending_nrows
             || !wl_columnar_eval_delta_observer_row_bytes(
-                e->nrows + e->pending_nrows, 1, &row_bytes))
+                e->nrows + e->pending_nrows, e->ncols, &row_bytes))
             return EOVERFLOW;
         if (e->nrows + e->pending_nrows) {
-            e->rows = malloc((size_t)(e->nrows + e->pending_nrows) *
-                    sizeof(int64_t));
+            e->rows = malloc((size_t)row_bytes);
             if (!e->rows) return ENOMEM;
         }
         b->kind = b->row = b->copied = 0;
@@ -1587,11 +1800,28 @@ wl_columnar_eval_delta_build_action(wl_col_session_t *sess,
             b->phase = WL_COLUMNAR_DELTA_BUILD_RELEASE;
         else {
             if (!e->rows) return EINVAL;
-            e->rows[b->copied++] = r->columns[0][start + b->row++];
+            size_t stride = e->ncols;
+            if (b->column < e->ncols)
+                e->rows[(size_t)b->copied * stride + b->column]
+                    = r->columns[b->column][start + b->row];
+            if (++b->column >= e->ncols) {
+                b->column = 0; b->copied++; b->row++;
+            }
         }
         return 0;
     }
     case WL_COLUMNAR_DELTA_BUILD_SORT:
+        if (e->ncols != 1) {
+            uint32_t result;
+            if (wl_columnar_eval_delta_rows_advance(&b->wide, e->rows,
+                e->ncols, e->nrows, e->pending_nrows, &result)) {
+                e->nrows = result;
+                memset(&b->wide, 0, sizeof(b->wide));
+                b->ri++; b->current_name = NULL;
+                b->phase = WL_COLUMNAR_DELTA_BUILD_HEAD;
+            }
+            return 0;
+        }
         if (b->sort_end - b->sort_begin < 2
             || (!b->heap_build && !b->heap_sifting && b->heap_size <= 1)) {
             if (!b->sorting_pending && e->pending_nrows) {
@@ -2157,6 +2387,7 @@ wl_columnar_eval_delta_observer_event(
 /* Resumable preparation keeps the observer private until every current row
  * has been captured and the signed event buffer is complete. */
 enum wl_columnar_eval_delta_prepare_phase {
+    WL_COLUMNAR_DELTA_PREPARE_CLEAR,
     WL_COLUMNAR_DELTA_PREPARE_PREFLIGHT,
     WL_COLUMNAR_DELTA_PREPARE_CAPTURE,
     WL_COLUMNAR_DELTA_PREPARE_SORT,
@@ -2173,8 +2404,12 @@ struct wl_columnar_eval_delta_observer_prepare {
     wl_columnar_eval_delta_observer_t *observer;
     const char *override_name;
     col_rel_t *override_relation;
+    const wl_columnar_eval_delta_binding_t *bindings;
+    uint32_t binding_count, binding_index, discard_entry;
     wl_columnar_relation_reader_step_t reader;
-    uint64_t reserve_bytes, row_capacity;
+    uint64_t reserve_bytes, row_capacity, cell_capacity;
+    uint32_t column;
+    wl_columnar_eval_delta_rows_t wide;
     int error;
     col_rel_t *relation;
     uint32_t lookup_registry;
@@ -2183,7 +2418,7 @@ struct wl_columnar_eval_delta_observer_prepare {
     unsigned phase;
     bool reader_held, heap_build, heap_sifting, child_selected,
         sort_initialized, preflight_captured, relation_selected,
-        lookup_done, commit_completed;
+        lookup_done, commit_completed, override_checked;
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -2196,12 +2431,31 @@ static bool
 wl_columnar_eval_delta_prepare_lookup_step(wl_col_session_t *sess,
     wl_columnar_eval_delta_observer_prepare_t *p, const char *name)
 {
-    if (p->override_name && p->override_relation
-        && strcmp(name, p->override_name) == 0) {
-        p->relation = p->override_relation;
-        p->lookup_done = true;
-        return true;
+    uint32_t count = p->bindings ? p->binding_count : p->override_name ? 1 : 0;
+    if (!p->override_checked && p->binding_index < count) {
+        const char *name_override = p->bindings
+            ? p->bindings[p->binding_index].name : p->override_name;
+        if (!name_override) {
+            p->binding_index++;
+            return false;
+        }
+        char actual = name_override[p->lookup_offset];
+        char expected = name[p->lookup_offset];
+        if (actual == expected && actual) {
+            p->lookup_offset++;
+            return false;
+        }
+        p->lookup_offset = 0;
+        if (actual == expected) {
+            p->relation = p->bindings ? p->bindings[p->binding_index].relation
+                : p->override_relation;
+            p->lookup_done = true;
+            return true;
+        }
+        p->binding_index++;
+        return false;
     }
+    p->override_checked = true;
     if (p->lookup_registry == sess->nrels) {
         p->relation = NULL;
         p->lookup_done = true;
@@ -2233,6 +2487,8 @@ wl_columnar_eval_delta_prepare_lookup_reset(
     p->lookup_registry = 0;
     p->lookup_offset = 0;
     p->lookup_done = false;
+    p->override_checked = false;
+    p->binding_index = 0;
     p->relation = NULL;
 }
 
@@ -2248,7 +2504,10 @@ wl_columnar_eval_delta_prepare_current_alloc(
         return ENOMEM;
     }
 #endif
-    entry->current = malloc((size_t)entry->current_nrows * sizeof(int64_t));
+    uint64_t bytes;
+    if (!wl_columnar_eval_delta_observer_row_bytes(entry->current_nrows,
+        entry->current_ncols, &bytes)) return EOVERFLOW;
+    entry->current = malloc((size_t)bytes);
     return entry->current ? 0 : ENOMEM;
 }
 
@@ -2263,10 +2522,6 @@ wl_columnar_eval_delta_observer_prepare_start_with_override(
     wl_columnar_eval_delta_observer_t *o = sess->delta_observer;
     if (o->cancelled || o->delivered)
         return EINVAL;
-    int rc = wl_columnar_eval_delta_observer_readers(o);
-    if (rc) return rc;
-    rc = wl_columnar_eval_delta_observer_clear_stage(sess);
-    if (rc) return rc;
     wl_columnar_eval_delta_observer_prepare_t *p = calloc(1, sizeof(*p));
     if (!p) return ENOMEM;
     p->identity = (uintptr_t)p;
@@ -2274,9 +2529,7 @@ wl_columnar_eval_delta_observer_prepare_start_with_override(
     p->observer = o;
     p->override_name = name;
     p->override_relation = relation;
-    p->phase = o->stream_initial_output
-        ? WL_COLUMNAR_DELTA_PREPARE_STREAM_ACQUIRE
-        : WL_COLUMNAR_DELTA_PREPARE_PREFLIGHT;
+    p->phase = WL_COLUMNAR_DELTA_PREPARE_CLEAR;
 #ifdef WL_SESSION_TEST_HOOKS
     if (o->stream_initial_output)
         wl_columnar_eval_delta_test_stream_validation_rows = 0;
@@ -2290,6 +2543,19 @@ wl_columnar_eval_delta_observer_prepare_start(wl_col_session_t *sess)
 {
     return wl_columnar_eval_delta_observer_prepare_start_with_override(sess,
                NULL, NULL);
+}
+
+int
+wl_columnar_eval_delta_observer_prepare_start_with_bindings(
+    wl_col_session_t *sess, const wl_columnar_eval_delta_binding_t *bindings,
+    uint32_t count)
+{
+    if (!bindings || !count) return EINVAL;
+    int rc = wl_columnar_eval_delta_observer_prepare_start(sess);
+    if (rc) return rc;
+    sess->delta_observer_prepare->bindings = bindings;
+    sess->delta_observer_prepare->binding_count = count;
+    return 0;
 }
 
 static int
@@ -2308,6 +2574,36 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
     if (p->observer->cancelled)
         return ECANCELED;
     wl_columnar_eval_delta_observer_t *o = p->observer;
+    if (p->phase == WL_COLUMNAR_DELTA_PREPARE_CLEAR) {
+        int clear_rc = wl_evaluation_control_charge_attempt(control, id, 1);
+        if (clear_rc) return clear_rc;
+        if (p->entry < o->count) {
+            wl_columnar_eval_delta_observer_entry_t *e = &o->entries[p->entry];
+            if (e->reader.owner) {
+                clear_rc = col_rel_source_reader_release(&e->reader);
+                if (clear_rc) return clear_rc;
+            }
+            free(e->current); e->current = NULL;
+            e->current_nrows = e->current_ncols = 0;
+            p->entry++;
+        } else {
+            free(o->events); o->events = NULL;
+            o->event_count = 0; o->prepared = false;
+            clear_rc = wl_columnar_eval_delta_observer_release_credit(sess,
+                    WL_COLUMNAR_EVAL_DELTA_OBSERVER_CREDIT_STAGING,
+                    &o->staging);
+            if (clear_rc) return clear_rc;
+            o->staging_bytes = 0;
+            sess->delta_observer_reserved_bytes = o->metadata_bytes +
+                o->payload_bytes;
+            p->entry = 0;
+            p->phase = o->stream_initial_output
+                ? WL_COLUMNAR_DELTA_PREPARE_STREAM_ACQUIRE
+                : WL_COLUMNAR_DELTA_PREPARE_PREFLIGHT;
+        }
+        clear_rc = wl_evaluation_control_charge_attempt(control, id, 0);
+        return clear_rc ? clear_rc : EAGAIN;
+    }
     if (p->phase == WL_COLUMNAR_DELTA_PREPARE_STREAM_ACQUIRE) {
         if (o->count != 1 || !o->entries[0].name)
             return EINVAL;
@@ -2322,6 +2618,8 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             return stream_rc;
         col_rel_t *rel = o->stream_relation;
         if (!wl_columnar_eval_delta_build_schema(rel)
+            || rel->ncols != 1
+            || (rel->column_types && rel->column_types[0] != WIRELOG_TYPE_INT64)
             || rel->sorted_nrows != rel->nrows
             || rel->run_count != (rel->nrows != 0)
             || (rel->nrows && rel->run_ends[0] != rel->nrows))
@@ -2368,7 +2666,7 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
     if (p->phase == WL_COLUMNAR_DELTA_PREPARE_PREFLIGHT) {
         if (p->entry == o->count) {
             uint64_t bytes, event_bytes, current_bytes;
-            if (!wl_columnar_memory_size_mul(p->row_capacity,
+            if (!wl_columnar_memory_size_mul(p->cell_capacity,
                 sizeof(int64_t), &current_bytes)
                 || !wl_columnar_memory_size_mul(p->row_capacity,
                 sizeof(*o->events), &event_bytes)
@@ -2391,16 +2689,20 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             wl_columnar_eval_delta_observer_entry_t *e = &o->entries[p->entry];
             if (!p->reader_held) {
                 if (!p->relation_selected) {
-                    if (e->ncols != 1) return ENOTSUP;
                     if (!p->lookup_done) {
                         (void)wl_columnar_eval_delta_prepare_lookup_step(sess,
                             p, e->name);
                         goto action_done;
                     }
                     if (!p->relation) {
-                        e->current_nrows = 0; e->current_ncols = 1;
+                        e->current_nrows = 0; e->current_ncols = e->ncols;
                         if (!wl_columnar_memory_size_add(p->row_capacity,
                             e->nrows, &p->row_capacity)) return EOVERFLOW;
+                        uint64_t cells;
+                        if (!wl_columnar_memory_size_mul(e->nrows,
+                            e->ncols ? e->ncols : 1, &cells)
+                            || !wl_columnar_memory_size_add(p->cell_capacity,
+                            cells, &p->cell_capacity)) return EOVERFLOW;
                         p->entry++;
                         wl_columnar_eval_delta_prepare_lookup_reset(p);
                     } else p->relation_selected = true;
@@ -2436,8 +2738,25 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             } else if (!p->preflight_captured) {
                 if (!wl_columnar_eval_delta_build_schema(p->relation))
                     return ENOTSUP;
+                if (p->relation->ncols != e->ncols) return ENOTSUP;
+                if (p->column < p->relation->ncols) {
+                    uint32_t c = p->column++;
+                    if ((p->relation->nrows && !p->relation->columns[c])
+                        || (p->relation->column_types
+                        && (p->relation->column_types[c] < WIRELOG_TYPE_INT32
+                        || p->relation->column_types[c] > WIRELOG_TYPE_BOOL)))
+                        return ENOTSUP;
+                    goto action_done;
+                }
+                p->column = 0;
                 e->current_nrows = p->relation->nrows;
-                e->current_ncols = 1;
+                e->current_ncols = e->ncols;
+                uint64_t cells;
+                if (!wl_columnar_memory_size_mul(
+                        (uint64_t)e->nrows + e->current_nrows,
+                        e->ncols ? e->ncols : 1, &cells)
+                    || !wl_columnar_memory_size_add(p->cell_capacity, cells,
+                    &p->cell_capacity)) return EOVERFLOW;
                 if (!wl_columnar_memory_size_add(p->row_capacity,
                     (uint64_t)e->nrows + e->current_nrows,
                     &p->row_capacity)) return EOVERFLOW;
@@ -2492,8 +2811,13 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
                 rc = wl_columnar_eval_delta_prepare_current_alloc(e);
                 if (rc) return rc;
             } else if (p->row < e->current_nrows) {
-                e->current[p->row] = p->relation->columns[0][p->row];
-                p->row++;
+                size_t stride = e->ncols;
+                if (p->column < e->ncols)
+                    e->current[(size_t)p->row * stride + p->column]
+                        = p->relation->columns[p->column][p->row];
+                if (++p->column >= e->ncols) {
+                    p->column = 0; p->row++;
+                }
             }
         }
     } else if (p->phase == WL_COLUMNAR_DELTA_PREPARE_SORT) {
@@ -2502,6 +2826,16 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             p->phase = WL_COLUMNAR_DELTA_PREPARE_MERGE;
         } else {
             wl_columnar_eval_delta_observer_entry_t *e = &o->entries[p->entry];
+            if (e->ncols != 1) {
+                uint32_t result;
+                if (wl_columnar_eval_delta_rows_advance(&p->wide, e->current,
+                    e->ncols, e->current_nrows, 0, &result)) {
+                    e->current_nrows = result;
+                    memset(&p->wide, 0, sizeof(p->wide));
+                    p->entry++;
+                }
+                goto action_done;
+            }
             if (!p->sort_initialized) {
                 p->heap_size = e->current_nrows;
                 p->heap_root = p->heap_size / 2;
@@ -2575,16 +2909,20 @@ wl_columnar_eval_delta_observer_prepare_advance_action(wl_col_session_t *sess,
             if (p->old == e->nrows && p->current == e->current_nrows) {
                 p->entry++; p->old = p->current = 0;
             } else {
+                size_t stride = e->ncols;
                 int cmp = p->old == e->nrows ? 1
-                    : p->current == e->current_nrows ? -1
-                    : memcmp(e->rows + p->old, e->current + p->current,
-                        sizeof(int64_t));
+                    : p->current == e->current_nrows ? -1 : 0;
+                if (!cmp && !wl_columnar_eval_delta_rows_compare(&p->wide,
+                    e->rows + (size_t)p->old * stride,
+                    e->current + (size_t)p->current * stride,
+                    e->ncols, &cmp)) goto action_done;
                 if (cmp < 0) {
                     wl_columnar_eval_delta_observer_event(o, e->name,
-                        e->rows + p->old++, 1, -1);
+                        e->rows + (size_t)p->old++ * stride, e->ncols, -1);
                 } else if (cmp > 0) {
                     wl_columnar_eval_delta_observer_event(o, e->name,
-                        e->current + p->current++, 1, +1);
+                        e->current + (size_t)p->current++ * stride,
+                        e->ncols, +1);
                 } else p->old++, p->current++;
             }
         }
@@ -2661,12 +2999,17 @@ wl_columnar_eval_delta_observer_prepare_discard(wl_col_session_t *sess)
     wl_columnar_eval_delta_observer_t *o = p->observer;
     int rc = wl_columnar_eval_delta_observer_stream_reader_release(o);
     if (rc) return rc;
-    rc = wl_columnar_eval_delta_observer_readers(o);
-    if (rc) return rc;
-    for (uint32_t i = 0; i < o->count; i++) {
-        free(o->entries[i].current);
-        o->entries[i].current = NULL;
-        o->entries[i].current_nrows = o->entries[i].current_ncols = 0;
+    if (p->discard_entry < o->count) {
+        wl_columnar_eval_delta_observer_entry_t *e =
+            &o->entries[p->discard_entry];
+        if (e->reader.owner) {
+            rc = col_rel_source_reader_release(&e->reader);
+            if (rc) return rc;
+        }
+        free(e->current); e->current = NULL;
+        e->current_nrows = e->current_ncols = 0;
+        p->discard_entry++;
+        return EAGAIN;
     }
     free(o->events); o->events = NULL; o->event_count = 0; o->prepared = false;
     rc = wl_columnar_eval_delta_observer_release_credit(sess,
