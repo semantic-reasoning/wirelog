@@ -4335,10 +4335,11 @@ Access audit boundary: `arrangement.c` hashes/probes resident relation columns;
 row indexes/direct columns and retain their existing source leases. None accepts
 this payload implicitly and none is marked cold. The explicit producer uses the
 existing relation-backed publication sink only for its private output batch.
-Automatic evaluator routing, cold relation eviction, bounded partitioned index
-access, SIDE/nested values, public spill options and scheduling remain follow-up
-work. A workload whose resident index cannot fit remains unsupported; #1385 is
-not qualified and #1372 is not complete.
+Automatic evaluator routing, cold relation eviction, SIDE/nested values, public
+spill options and scheduling remain follow-up work. These original constructors
+refuse workloads whose full resident index cannot fit; the explicit capped
+variants below provide an alternative. #1385 is not qualified and #1372 is not
+complete.
 
 ### Signed-weighted payload JOIN (#1372)
 
@@ -4385,6 +4386,66 @@ publication, duplicate tuple cancellation, first/last and arithmetic boundary
 values, nonmatching extreme weights, a partial-batch overflow after an earlier
 commit, concurrent self-JOIN consumers, I/O failure, cancellation and complete
 reservation refunds. General logical-time support, automatic evaluator cold
-relation routing, bounded partitioned indexes, public spill configuration and
+relation routing, public spill configuration and
 #1373 scheduling remain separate work. This advances signed-difference indexed
 execution but does not complete #1372 or qualify #1385.
+
+### Capped right-window payload JOIN (#1372)
+
+`wl_columnar_payload_join_create_bounded` and
+`wl_columnar_payload_join_create_weighted_bounded` remove the full-right-index
+requirement for the explicit immutable-payload execution path. They accept an
+`index_bytes` cap independently of `batch_bytes`; ordinary and zero-coordinate
+weighted metadata/schema contracts remain as above. The original constructors
+still request a full index and never silently fall back to another algorithm.
+
+The capped variants choose the largest window of N right rows fitting the cap,
+clamped to the actual right input size. With B the next power of two at least N,
+clamped to [1, 2^31], the allocation is
+`sizeof(wl_columnar_memory_reservation_t) + 4 * (B + N)` bytes. The index
+descriptor contains that reservation token; `sizeof` includes its alignment.
+A nonempty input requires at least one row and bucket; an empty right input
+still requires the descriptor and one bucket. A cap below that floor, including
+zero, returns MEMORY. Very large caps are clamped to input size. Allocation and
+admission use checked, wide arithmetic and the original governor.
+
+One array is reused for disjoint contiguous right-row windows. Links are local
+to a window and reads translate them to stable global payload ordinals. Every
+left row probes each window; exact key comparison handles collisions. Duplicate
+chains split across windows, including all-equal-key skew, cannot grow the index
+or omit/repeat matching pairs. Results are multiset-equivalent to full indexing;
+output ordering can differ. No row/key copies, per-window directory or new spill
+files are retained. Cost is additional left scans: O(left_rows * windows +
+right_rows + candidate probes), plus the constructor's full metadata-validation
+scan. This is bounded window execution, not a fast partitioned external index.
+
+Bucket clearing, index building, probing and window transitions share the
+256-action publication quantum. Large windows yield PROGRESS during clear/build;
+construction and its full validation scan remain synchronous with per-row
+cancellation. Allocation initialization and OS I/O latency are not bounded by
+that publication quantum. Both independent readers remain pinned across windows.
+A pending batch freezes producer execution through rejected or ambiguous commits.
+Cancellation/read errors remain sticky, and weighted overflow discards the whole
+current private batch even when it spans windows; earlier committed batches
+remain visible. Destruction releases the single index and all reader/output
+resources; after DONE, destroy is still required.
+
+The cap bounds index storage only. Input payload/schema floors, governed producer,
+readers, types, output columns and weighted timestamps remain additional. The
+existing generic continuation descriptor is still a fixed ungoverned allocation.
+Tests retain the original full-index cases and exercise one-row, three-row and
+short-final windows across resident/direct-spilled/demoted inputs and outputs,
+concurrent consumers, signed weights, publication faults and teardown. Admission
+checks cover each byte around index sizing boundaries, including bucket power-of-
+two jumps. A 64 KiB enforcing-governor fixture streams 16,385 narrow spilled build
+rows with a 127-row index: the full index alone exceeds the same budget and is
+refused, while capped ordinary and weighted execution complete with constant-state
+output verification and exact refunds. Fixture preparation is external and its
+source relations are destroyed before execution without resetting the governor;
+this proves bounded execution over prepared payloads, not bounded ingestion.
+
+This addresses bounded index access for explicit numeric immutable payload JOIN.
+Ordinary relation/arrangement consumers still use their resident columns/indexes;
+automatic evaluator cold routing, general logical time, SIDE/nested values, public
+spill configuration and scheduler integration remain separate work. #1372 stays
+open and this does not qualify #1385.

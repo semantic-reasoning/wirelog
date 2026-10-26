@@ -13,6 +13,13 @@ typedef struct {
     uint32_t slots[];
 } wl_columnar_payload_join_index_t;
 
+typedef enum {
+    WL_COLUMNAR_PAYLOAD_JOIN_CLEAR,
+    WL_COLUMNAR_PAYLOAD_JOIN_BUILD,
+    WL_COLUMNAR_PAYLOAD_JOIN_PROBE,
+    WL_COLUMNAR_PAYLOAD_JOIN_DONE
+} wl_columnar_payload_join_phase_t;
+
 typedef struct {
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
@@ -26,10 +33,29 @@ typedef struct {
     uint64_t identity;
     uint32_t left_rows, right_rows, left_cols, right_cols, left_key, right_key;
     uint32_t buckets, capacity, row, candidate;
+    uint32_t window_start, window_rows, window_capacity, build_row,
+        clear_bucket;
+    wl_columnar_payload_join_phase_t phase;
     bool started, stopped, weighted;
     int64_t left_multiplicity;
     wirelog_column_type_t types[];
 } wl_columnar_payload_join_t;
+
+static uint32_t
+wl_columnar_payload_join_buckets(uint32_t rows)
+{
+    uint32_t buckets = 1;
+    while (buckets < rows && buckets < (UINT32_C(1) << 31)) buckets <<= 1;
+    return buckets;
+}
+
+static uint64_t
+wl_columnar_payload_join_index_bytes(uint32_t rows)
+{
+    return sizeof(wl_columnar_payload_join_index_t)
+           + ((uint64_t)wl_columnar_payload_join_buckets(rows) + rows)
+           * sizeof(uint32_t);
+}
 
 #ifdef WL_TEST_PAYLOAD_JOIN
 extern bool wl_columnar_payload_join_test_allocation(void);
@@ -142,12 +168,55 @@ wl_columnar_payload_join_produce(void *context,
     if (p->error !=
         WL_COLUMNAR_SPILL_OK) return WL_COLUMNAR_CONTINUATION_INVALID;
     uint32_t work = 0;
-    while (p->row < p->left_rows && work < WL_COLUMNAR_PAYLOAD_JOIN_QUANTUM
+    while (p->phase != WL_COLUMNAR_PAYLOAD_JOIN_DONE
+        && work < WL_COLUMNAR_PAYLOAD_JOIN_QUANTUM
         && p->batch->nrows < p->capacity) {
         if (p->cancel && p->cancel(p->cancel_context)) {
             p->error = WL_COLUMNAR_SPILL_CANCELLED; break;
         }
         work++;
+        if (p->phase == WL_COLUMNAR_PAYLOAD_JOIN_CLEAR) {
+            if (p->clear_bucket < p->buckets)
+                p->index->slots[p->clear_bucket++] =
+                    WL_COLUMNAR_PAYLOAD_JOIN_END;
+            else p->phase = WL_COLUMNAR_PAYLOAD_JOIN_BUILD;
+            continue;
+        }
+        if (p->phase == WL_COLUMNAR_PAYLOAD_JOIN_BUILD) {
+            if (p->build_row == p->window_rows) {
+                p->phase = WL_COLUMNAR_PAYLOAD_JOIN_PROBE;
+                continue;
+            }
+            const uint64_t *lanes;
+            wl_columnar_spill_metadata_t meta;
+            p->error = wl_columnar_batch_payload_read(p->right,
+                    p->window_start + p->build_row, p->cancel,
+                    p->cancel_context, &lanes, &meta);
+            if (p->error != WL_COLUMNAR_SPILL_OK) break;
+            uint32_t hash = wl_columnar_payload_join_hash(
+                lanes[p->right_key], p->buckets);
+            p->index->slots[(uint64_t)p->buckets + p->build_row] =
+                p->index->slots[hash];
+            p->index->slots[hash] = p->build_row++;
+            continue;
+        }
+        if (p->row == p->left_rows) {
+            /* Every window is within [0, right_rows], so this sum fits uint32.
+             * Links are local ordinals; payload reads retain global identity. */
+            p->window_start += p->window_rows;
+            if (p->window_start == p->right_rows) {
+                p->phase = WL_COLUMNAR_PAYLOAD_JOIN_DONE;
+                continue;
+            }
+            p->window_rows = p->right_rows - p->window_start;
+            if (p->window_rows > p->window_capacity)
+                p->window_rows = p->window_capacity;
+            p->row = 0; p->started = false; p->left_lanes = NULL;
+            p->candidate = WL_COLUMNAR_PAYLOAD_JOIN_END;
+            p->clear_bucket = 0; p->build_row = 0;
+            p->phase = WL_COLUMNAR_PAYLOAD_JOIN_CLEAR;
+            continue;
+        }
         if (!p->started) {
             wl_columnar_spill_metadata_t meta;
             p->error = wl_columnar_batch_payload_read(p->left, p->row,
@@ -164,7 +233,8 @@ wl_columnar_payload_join_produce(void *context,
         }
         const uint64_t *right;
         wl_columnar_spill_metadata_t meta;
-        p->error = wl_columnar_batch_payload_read(p->right, p->candidate,
+        p->error = wl_columnar_batch_payload_read(p->right,
+                p->window_start + p->candidate,
                 p->cancel, p->cancel_context, &right, &meta);
         if (p->error != WL_COLUMNAR_SPILL_OK) break;
         p->candidate = p->index->slots[(uint64_t)p->buckets + p->candidate];
@@ -189,7 +259,7 @@ wl_columnar_payload_join_produce(void *context,
         p->batch->nrows = 0;
         return WL_COLUMNAR_CONTINUATION_INVALID;
     }
-    if (!p->batch->nrows && p->row == p->left_rows)
+    if (!p->batch->nrows && p->phase == WL_COLUMNAR_PAYLOAD_JOIN_DONE)
         return WL_COLUMNAR_CONTINUATION_DONE;
     if (cursor->position > UINT64_MAX - work ||
         cursor->sequence == UINT64_MAX){
@@ -203,7 +273,7 @@ wl_columnar_payload_join_produce(void *context,
     if (!p->batch->nrows) return WL_COLUMNAR_CONTINUATION_PROGRESS;
     batch->payload = p->batch; batch->rows = p->batch->nrows;
     batch->bytes = (uint64_t)p->batch->ncols * 8 * batch->rows;
-    batch->complete = p->row == p->left_rows;
+    batch->complete = p->phase == WL_COLUMNAR_PAYLOAD_JOIN_DONE;
     return WL_COLUMNAR_CONTINUATION_OK;
 }
 
@@ -228,7 +298,8 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
-    wl_columnar_continuation_t **out, bool weighted)
+    wl_columnar_continuation_t **out, bool weighted, bool bounded,
+    uint64_t index_bytes)
 {
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
@@ -246,8 +317,20 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     uint64_t capacity = batch_bytes / ((uint64_t)cols * 8);
     if (!capacity) return WL_COLUMNAR_SPILL_MEMORY;
     if (capacity > UINT32_MAX) capacity = UINT32_MAX;
-    uint32_t buckets = 1;
-    while (buckets < rr && buckets < (UINT32_C(1) << 31)) buckets <<= 1;
+    uint32_t window_rows = rr;
+    if (bounded) {
+        if (index_bytes < wl_columnar_payload_join_index_bytes(rr ? 1 : 0))
+            return WL_COLUMNAR_SPILL_MEMORY;
+        uint32_t lo = 0, hi = rr;
+        while (lo < hi) {
+            uint32_t mid = (uint32_t)(((uint64_t)lo + hi + 1) / 2);
+            if (wl_columnar_payload_join_index_bytes(mid) <= index_bytes)
+                lo = mid;
+            else hi = mid - 1;
+        }
+        window_rows = lo;
+    }
+    uint32_t buckets = wl_columnar_payload_join_buckets(window_rows);
     void *allocation;
     status = wl_columnar_payload_join_allocate(g,
             sizeof(wl_columnar_payload_join_t)
@@ -257,6 +340,9 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     p->governor = g; wl_columnar_memory_governor_ref_retain(g);
     p->left_cols = lc; p->right_cols = rc; p->left_rows = lr;
     p->right_rows = rr;
+    p->window_rows = window_rows; p->window_capacity = window_rows;
+    p->phase = !lr || !rr ? WL_COLUMNAR_PAYLOAD_JOIN_DONE : bounded
+        ? WL_COLUMNAR_PAYLOAD_JOIN_CLEAR : WL_COLUMNAR_PAYLOAD_JOIN_PROBE;
     p->left_key = left_key; p->right_key = right_key; p->buckets = buckets;
     p->weighted = weighted;
     p->capacity = (uint32_t)capacity; p->cancel = cancel;
@@ -265,11 +351,11 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     if (status != WL_COLUMNAR_SPILL_OK) goto fail;
     status = wl_columnar_batch_payload_acquire(right, &p->right);
     if (status != WL_COLUMNAR_SPILL_OK) goto fail;
-    status = wl_columnar_payload_join_allocate(g, sizeof(*p->index)
-            + ((uint64_t)buckets + rr) * sizeof(uint32_t), &allocation);
+    status = wl_columnar_payload_join_allocate(g,
+            wl_columnar_payload_join_index_bytes(window_rows), &allocation);
     if (status != WL_COLUMNAR_SPILL_OK) goto fail;
     p->index = allocation;
-    for (uint32_t b = 0; b < buckets;
+    for (uint32_t b = 0; !bounded && b < buckets;
         b++) p->index->slots[b] = WL_COLUMNAR_PAYLOAD_JOIN_END;
     for (unsigned side = 0; side < 2; side++) {
         uint32_t rows = side ? rr : lr;
@@ -282,7 +368,7 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
                 (!weighted && meta.multiplicity != 1)) {
                 status = WL_COLUMNAR_SPILL_UNSUPPORTED; goto fail;
             }
-            if (side) {
+            if (side && !bounded) {
                 uint32_t hash = wl_columnar_payload_join_hash(lanes[right_key],
                         buckets);
                 p->index->slots[(uint64_t)buckets +
@@ -344,7 +430,8 @@ wl_columnar_payload_join_create(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_continuation_t **out)
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
-               right_key, batch_bytes, cancel, cancel_context, out, false);
+               right_key, batch_bytes, cancel, cancel_context, out, false,
+               false, 0);
 }
 
 wl_columnar_spill_status_t
@@ -355,5 +442,31 @@ wl_columnar_payload_join_create_weighted(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_continuation_t **out)
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
-               right_key, batch_bytes, cancel, cancel_context, out, true);
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               false, 0);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_bounded(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, false,
+               true, index_bytes);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_weighted_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               true, index_bytes);
 }

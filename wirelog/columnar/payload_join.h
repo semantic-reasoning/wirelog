@@ -55,7 +55,38 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_weighted(
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out);
-/* Only for a continuation returned by either constructor; NULL is INVALID.
+/* Explicit capped-index variants of create()/create_weighted(). index_bytes
+ * includes the index reservation descriptor and uint32 bucket/link arrays.
+ * For N rows, B is the next power of two >= N, clamped to [1, 2^31]; storage
+ * is sizeof(index descriptor) + 4*(B+N). The descriptor contains one
+ * wl_columnar_memory_reservation_t. Select the largest N <= right_rows fitting
+ * the cap. A nonempty right input requires N >= 1; an empty one still requires
+ * the descriptor and one bucket. An insufficient cap (including zero) is MEMORY.
+ * All other resident floors remain additional, as described above.
+ *
+ * Reuse this index for disjoint right-row windows, rescanning the left input
+ * for each window. Exact result MULTISETS are preserved; order may differ from
+ * full-index constructors. Skew cannot grow the index. Extra read work is
+ * O(left_rows * windows + right_rows + candidate probes), in addition to the
+ * constructor's complete-input metadata validation. Clearing, building, probing
+ * and phase transitions share the 256-action publication quantum; allocation
+ * and constructor validation are synchronous. No new partition files or hidden
+ * full-index fallback. Pending output is frozen through retries. The same
+ * weighted overflow and current-private-batch atomicity contract applies even
+ * if that batch spans windows. Existing full-index constructors are unchanged. */
+wl_columnar_spill_status_t wl_columnar_payload_join_create_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
+wl_columnar_spill_status_t wl_columnar_payload_join_create_weighted_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
+/* Only for a continuation returned by these constructors; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */
 wl_columnar_spill_status_t wl_columnar_payload_join_error(
     const wl_columnar_continuation_t *continuation);
