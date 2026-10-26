@@ -2985,6 +2985,18 @@ typedef struct {
  * EAGAIN is progress/retry. A stop retains the cursor and original readers.
  * A fresh attempt may resume with its own current ID. Only READY publishes.
  * Discard is one unmetered mandatory cleanup unit, EAGAIN until drained. */
+/* Caller-owned immutable bindings remain at stable addresses until build or
+ * prepare drains. NULL relation denotes an absent initial head of width. */
+typedef struct {
+    const char *name;
+    col_rel_t *relation;
+    uint32_t width;
+} wl_columnar_eval_delta_binding_t;
+int wl_columnar_eval_delta_observer_build_start_missing_heads(
+    wl_col_session_t *, uint64_t, const wl_columnar_eval_delta_binding_t *,
+    uint32_t);
+int wl_columnar_eval_delta_observer_prepare_start_with_bindings(
+    wl_col_session_t *, const wl_columnar_eval_delta_binding_t *, uint32_t);
 int wl_columnar_eval_delta_observer_build_start(wl_col_session_t *, uint64_t);
 int wl_columnar_eval_delta_observer_build_start_missing_head(
     wl_col_session_t *, uint64_t, const char *);
