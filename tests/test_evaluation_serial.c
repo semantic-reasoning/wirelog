@@ -5075,7 +5075,7 @@ test_controlled_session_snapshot_publication(void)
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0
         && report.stop_reason == WL_EVALUATION_CONTROL_NONE
-        && report.consumed == 0);
+        && report.consumed > 0);
 
     actual = (snapshot_capture_t){0};
     CHECK(wl_session_snapshot(session, capture_snapshot_tuple, &actual)
@@ -5091,6 +5091,200 @@ test_controlled_session_snapshot_publication(void)
     CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
 
     CHECK(!wl_session_try_destroy(&session) && !session);
+    wl_evaluation_control_release(control);
+    wl_session_destroy(reference);
+    wl_plan_free(plan);
+    wirelog_program_free(program);
+}
+
+extern void (*wl_columnar_session_test_snapshot_checkpoint)(
+    wl_evaluation_control_t *, unsigned, size_t);
+extern int wl_columnar_session_test_snapshot_allocation;
+static unsigned snapshot_stop_phase;
+static unsigned snapshot_checkpoint_hits;
+
+static void
+snapshot_prepare_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, size_t index)
+{
+    if (phase == snapshot_stop_phase && (phase != 2 || index == 2)
+        && (phase != 4 || index == 16)) {
+        ++snapshot_checkpoint_hits;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+typedef struct {
+    size_t rows;
+    uint64_t hash;
+} snapshot_wide_capture_t;
+
+static void
+snapshot_wide_capture(const char *name, const int64_t *row,
+    uint32_t width, void *data)
+{
+    snapshot_wide_capture_t *capture = data;
+    CHECK(name && row && width == 4);
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p)
+        capture->hash = capture->hash * 31 + *p;
+    for (uint32_t i = 0; i < width; ++i)
+        capture->hash = capture->hash * 31 + (uint64_t)row[i];
+    ++capture->rows;
+}
+
+static void
+test_controlled_snapshot_preparation(void)
+{
+    static const char source[] =
+        ".decl input(a:int64,b:int64,c:int64,d:int64)\n"
+        ".decl first_snapshot_result_with_a_long_common_prefix(a:int64,b:int64,c:int64,d:int64)\n"
+        ".decl second_snapshot_result_with_a_long_common_prefix(a:int64,b:int64,c:int64,d:int64)\n"
+        "first_snapshot_result_with_a_long_common_prefix(a,b,c,d) :- input(a,b,c,d).\n"
+        "second_snapshot_result_with_a_long_common_prefix(a,b,c,d) :- input(a,b,c,d).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    int64_t rows[128 * 4];
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+        rows[i] = (int64_t)i;
+    wl_session_t *reference = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    CHECK(!wl_session_insert(reference, "input", rows, 128, 4));
+    CHECK(!wl_session_step(reference));
+    snapshot_wide_capture_t expected = {0};
+    CHECK(!wl_session_snapshot(reference, snapshot_wide_capture, &expected));
+    CHECK(expected.rows == 256);
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(64) << 20,
+            .usable_bytes = UINT64_C(64) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = control;
+    options.memory_governor = governor;
+    wl_session_t *session = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_insert(session, "input", rows, 128, 4));
+    CHECK(!controlled_recursive_run(session, control));
+    wl_col_session_t *col = (wl_col_session_t *)session;
+    wl_columnar_memory_governor_t *g =
+        wl_columnar_memory_governor_ref_get(governor);
+    uint64_t reserved = wl_columnar_memory_reserved(g);
+    col_rel_t **registry = col->rels;
+    uint32_t count = col->nrels;
+    for (unsigned mode = 0; mode < 10; ++mode) {
+        CHECK(!wl_evaluation_control_reset(control));
+        /* Bootstrap256 + stratum1 + first plan entry1. */
+        CHECK(!wl_evaluation_control_configure(control,
+            mode < 2 ? 257 + mode : 0));
+        snapshot_stop_phase = mode < 2 ? 1 : mode == 2 ? 2 : mode ==
+            3 ? 3 : mode == 8 ? 4 : mode == 9 ? 5 : 0;
+        snapshot_checkpoint_hits = 0;
+        wl_columnar_session_test_snapshot_checkpoint =
+            snapshot_prepare_checkpoint;
+        wl_columnar_session_test_snapshot_allocation =
+            mode == 4 ? 0 : mode == 5 ? 1 : -1;
+        wl_columnar_source_access_writer_t writer = {0};
+        if (mode == 6) {
+            col_rel_t *first = session_find_rel(col,
+                    plan->strata[0].relations[0].name);
+            CHECK(first && !col_rel_source_writer_acquire(first, &writer));
+        }
+        wl_columnar_memory_reservation_t pressure;
+        wl_columnar_memory_reservation_init(&pressure);
+        if (mode == 7)
+            CHECK(wl_columnar_memory_reserve_checked(g,
+                g->budget_bytes - reserved, &pressure)
+                == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        snapshot_wide_capture_t actual = {0};
+        int rc = wl_session_snapshot(session, snapshot_wide_capture, &actual);
+        CHECK(rc == (mode == 0 ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : mode < 4 ? WL_EVALUATION_CONTROL_CANCELLED
+            : mode < 6 ? ENOMEM : mode == 6 ? EBUSY : mode == 7 ? ENOSPC
+            : WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(!actual.rows && !actual.hash && col->rels == registry
+            && col->nrels == count && !col->cleanup_pending
+            && !wl_evaluation_control_active_attempt_id(control));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.result == rc && !report.cleanup_status);
+        if (mode < 2)
+            CHECK(report.consumed == 257 + mode
+                && snapshot_checkpoint_hits == mode);
+        if (mode == 2 || mode == 3 || mode >= 8)
+            CHECK(snapshot_checkpoint_hits == 1);
+        if (mode ==
+            6) CHECK(!wl_columnar_source_access_writer_release(&writer));
+        if (mode == 7) CHECK(wl_columnar_memory_rollback(&pressure));
+        CHECK(wl_columnar_memory_reserved(g) == reserved);
+        wl_columnar_session_test_snapshot_checkpoint = NULL;
+        wl_columnar_session_test_snapshot_allocation = -1;
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!wl_session_snapshot(session, snapshot_wide_capture, &actual));
+        CHECK(actual.rows == expected.rows && actual.hash == expected.hash
+            && wl_columnar_memory_reserved(g) == reserved);
+        for (uint32_t i = 0; i < col->nrels; ++i) {
+            if (!col->rels[i]) continue;
+            wl_columnar_source_access_writer_t check = {0};
+            CHECK(!col_rel_source_writer_acquire(col->rels[i], &check));
+            CHECK(!wl_columnar_source_access_writer_release(&check));
+        }
+    }
+    /* Internal immutable projection fixture: compare duplicate entries,
+     * missing names and an empty stratum with the raw cached emitter. The
+     * projection is restored before destroying the original owned plan. */
+    const wl_plan_stratum_t *saved_strata = plan->strata;
+    uint32_t saved_count = plan->stratum_count;
+    wl_plan_relation_t projected_relations[4];
+    projected_relations[0] = saved_strata[0].relations[0];
+    projected_relations[1] = projected_relations[0];
+    projected_relations[2] = projected_relations[0];
+    projected_relations[2].name = "absent_snapshot_relation";
+    projected_relations[3] = projected_relations[0];
+    wl_plan_stratum_t projection[2] = {0};
+    projection[0].relation_count = 4;
+    projection[0].relations = projected_relations;
+    plan->strata = projection;
+    plan->stratum_count = 2;
+    snapshot_wide_capture_t projected_expected = {0}, projected_actual = {0};
+    CHECK(!wl_session_snapshot(reference, snapshot_wide_capture,
+        &projected_expected));
+    CHECK(!wl_session_snapshot(session, snapshot_wide_capture,
+        &projected_actual));
+    CHECK(projected_expected.rows == 384
+        && projected_actual.rows == projected_expected.rows
+        && projected_actual.hash == projected_expected.hash);
+    /* Exercise the staging allocator's optional-governor branch separately
+     * from the still-owned relation storage credits. */
+    col->memory_governor = NULL;
+    projected_actual = (snapshot_wide_capture_t){0};
+    CHECK(!wl_session_snapshot(session, snapshot_wide_capture,
+        &projected_actual));
+    col->memory_governor = governor;
+    CHECK(projected_actual.rows == projected_expected.rows
+        && projected_actual.hash == projected_expected.hash
+        && wl_columnar_memory_reserved(g) == reserved);
+    plan->stratum_count = 0;
+    projected_actual = (snapshot_wide_capture_t){0};
+    CHECK(!wl_session_snapshot(session, snapshot_wide_capture,
+        &projected_actual) && !projected_actual.rows);
+    plan->strata = saved_strata;
+    plan->stratum_count = saved_count;
+    CHECK(!wl_session_try_destroy(&session) && !session);
+    CHECK(!wl_columnar_memory_reserved(g));
+    wl_columnar_memory_governor_ref_release(governor);
     wl_evaluation_control_release(control);
     wl_session_destroy(reference);
     wl_plan_free(plan);
@@ -9198,6 +9392,7 @@ main(void)
     test_controlled_session_step_void_destroy_precondition();
 #endif
     test_controlled_session_snapshot_publication();
+    test_controlled_snapshot_preparation();
     test_controlled_session_admission_matrix();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();

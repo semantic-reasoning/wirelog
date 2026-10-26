@@ -52,7 +52,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
-| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; fresh ENOTSUP / pending EBUSY; completed → `col_session_snapshot_controlled` → `col_session_emit_snapshot`; S | New admission matrix covers fresh and restored/completed state; observed successor tests cover dirty EBUSY; `test_controlled_session_snapshot_publication` covers cutoff/reference. Engine scan/materialization before/during delivery remains U, G1 |
+| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; fresh ENOTSUP / pending EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | New admission matrix covers fresh and restored/completed state; observed successor tests cover dirty EBUSY; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
 | E13 / S11 | JOIN output limit, active rollback, foreign observer, cleanup pending | R policies/admission; preserve error distinction and owner; no unrestricted fallback | `test_controlled_observed_preflight_rejections`, `test_controlled_batch_child_domain_rejection`; cross-policy matrix and post-stop resource baselines still G6 |
@@ -99,7 +99,7 @@ controlled fallback.
 | F07 / S01,S05 | Scalar source/owned output versus retained, segmented, compound, timestamped/weighted or spill-backed relation representations | R; each child/source admission must have a disposition; no blanket representation support claimed; F / U | `evaluation_copy`, `evaluation_relation_creation`, `evaluation_output_materialization`, retained-input fixtures; qualify source rejection/materialization and signed metadata, G5. PR #2270 owns its spill-weight feature, not this audit |
 | F08 / S05,S07 | Legacy recursive merge/dedup versus managed incremental candidate/union | R; `wl_columnar_merge_incremental_delta_attempt_advance` caps a call at Q256; generic legacy recursive path remains U; S/F | Restricted recursive session tests and `evaluation_work`/`evaluation_consolidate` primitives; general frontier/retraction integration G3 |
 | F09 / S11 | Governor admission, allocator/Arrow release, CAS/control references, receipt retirement and registry replacement | R engine setup/cleanup; external allocator body is noninterruptible, engine copies/scans are not thereby excluded; U unless separately precharged/bounded | Allocation/copy/receipt tests establish local tariffs, not all nested bounds; G6 must name each finite region, charge before allocation, retain resources on every failure |
-| F10 / S10,S12 | Observer/snapshot publication after final poll → callbacks | H for user callback duration; R for engine preparation, tuple assembly, traversal, lookup and cleanup; O / U for full engine loop | `test_controlled_session_snapshot_publication` proves all-or-nothing callbacks, not bounded engine delivery. Separate callback exclusion from precharge/engine work in G1/G2 |
+| F10 / S10,S12 | Observer/snapshot publication after final poll → callbacks | H for user callback duration; R for engine preparation, tuple assembly, traversal, lookup and cleanup; O / U for full engine loop | Completed snapshot uses charged tuple staging and finite prepaid dispatch (`test_controlled_snapshot_preparation`); observer composition/preparation remains G2 |
 
 ### Concrete fallback predicates within F01–F07
 
@@ -146,7 +146,7 @@ amends a row before implementation, rather than silently enlarging the scope.
 
 | Group | Owned rows / work | Exit tests and dependencies |
 |---|---|---|
-| G1 — bounded session admission and snapshot engine work | E02/E03/E10/F10; S11/S12 | Long names, many strata/EDBs/registry slots and large snapshot sources stop at deterministic checkpoints before callbacks; exact/one-short admission boundaries, unchanged output on stop, retry. Preserve #1820 publication cutoff. This is the next implementation milestone |
+| G1 — bounded session admission and snapshot engine work | E02/E03/E10/F10; S11/S12 | Long names, many strata/EDBs/registry slots and large snapshot sources stop at deterministic checkpoints before callbacks; exact/one-short admission boundaries, unchanged output on stop, retry. Preserve #1820 publication cutoff. Implemented in this bundle for the restricted admitted session domain; fresh/dirty evaluation stays with #1820/G3 |
 | G2 — reusable signed observer composition | E03/E04/F10; S10 plus scalar composition | Repeated insert/remove cycles retire/reuse staging without registry exhaustion; typed/multi-column/multihead canonical signed deltas, no replay, retained resource baseline. #1820 recovery prerequisite |
 | G3 — general serial recursive/differential execution | E05–E07/O10/O12/F04/F08 | Actual SCC/frontier, trace, retraction and serial fallback interruption; signed reference parity and reset/retry. Integrate #1820 safe state ownership, leave parallel scheduler to #1822 |
 | G4 — host LFTJ and batch/pipeline/fallback integration | E08/E09/O11/F01–F03/F06/C04 | Actual chosen pipeline/LFTJ/decline destination must run and stop; one allowance across suspension/replay, no-output candidates, error distinctions, reference parity; reuse existing producers |
@@ -157,9 +157,8 @@ amends a row before implementation, rather than silently enlarging the scope.
 These are seven implementation/qualification groups, not seven guaranteed PRs.
 The differential recovery and representation groups still require design
 sizing; a fixed remaining PR count is not supported. Each PR must name the
-rows it closes and update this ledger. G1 can be split by admission and snapshot
-publication if reviewable ownership boundaries require it; record the split
-and reason here first.
+rows it closes and update this ledger. G1 is delivered as admission and completed-snapshot atomic commits in the
+same PR bundle. G2 is the next implementation group.
 
 ## Evidence produced by this increment
 
@@ -193,3 +192,15 @@ outside the STEP attempt; it is not a constant-time or 256-action polling
 claim. Successor STEP revalidates the actual relations under its attempt.
 Observer baseline/preparation and general signed composition remain G2;
 completed-snapshot staging is the other G1 unit in the same PR bundle.
+
+### G1 completed-snapshot implementation
+
+E10 now prepares stable metadata and row-major tuples under one control
+attempt. Plan/registry/name traversal, metadata initialization, allocation,
+source gathering and finite dispatch admission are charged. No callbacks
+escape a preparation stop; every initialized source drains before cutoff.
+The full prepared batch is delivered after cutoff, preserving late sticky
+cancellation and raw ordering. That finite tail has no new polling claim.
+G1 is complete for the currently admitted serial host routes. General signed
+composition, fresh/dirty snapshot evaluation and nested resource/configuration
+qualification remain in G2–G7 and their existing #1820 dependencies.

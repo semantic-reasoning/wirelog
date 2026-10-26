@@ -4449,3 +4449,33 @@ Ordinary relation/arrangement consumers still use their resident columns/indexes
 automatic evaluator cold routing, general logical time, SIDE/nested values, public
 spill configuration and scheduler integration remain separate work. #1372 stays
 open and this does not qualify #1385.
+
+## Controlled completed-snapshot workspace
+
+Completed controlled snapshots reserve two private workspace allocations: a
+stable entry array (including scalar-source reader records) and a contiguous
+row-major tuple array. Checked multiplication/addition precedes admission;
+metadata zeroing uses charged chunks of at most 128 bytes. Tokens stay at
+stable stack addresses and remain RESERVED through the last callback.
+Physical storage is freed before its own credits are rolled back. No shared
+ledger snapshot is restored. Both paths share staging/dispatch charges and ownership behavior; enabling
+the governor additionally charges its reservation-admission operations.
+
+The snapshot tariff includes a 256-action fixed bootstrap, one action per
+stratum/entry counting visit, 128-action workspace allocation/retirement
+bookkeeping plus allocation admission, metadata initialization bytes,
+32-action entry setup/cleanup capacity, registry slots and compared name
+bytes, existing controlled scalar-source charges, and eight prepaid dispatch
+actions per row. Each source INIT funds its own End; entry setup additionally
+funds cleanup traversal. Source readers drain before the publication cutoff.
+After cutoff the already-admitted finite callback loop and mandatory workspace
+retirement run without ordinary work polls. Allocator bodies and callback
+bodies remain non-preemptible; this does not exclude engine tuple preparation.
+
+`test_controlled_snapshot_preparation` checks the independent 257/258-action
+first-entry boundary, lookup/gather/cutoff/allocation cancellation, both
+allocation failures, reader contention, enforcing-governor denial and exact
+post-stop credit restoration. Wide multihead results and retry match the raw
+snapshot; internal projection fixtures cover duplicate/missing entries, empty
+strata and the optional-governor branch. These fixtures do not authorize plan
+mutation during a session operation.

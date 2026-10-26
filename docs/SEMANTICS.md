@@ -676,14 +676,24 @@ pending. After completion, read-only snapshot delivery is allowed under a
 separate control attempt; mutation and another concurrent session operation
 remain blocked. A null callback is rejected before a control attempt begins.
 
-Controlled snapshot checks cancellation immediately before the first tuple
-callback. A stop there publishes no tuples. Once publication starts, the full
-callback batch completes without further polls, so cancellation requested from
-a callback remains sticky for the next snapshot. Host callback bodies are a
-cooperative, non-preemptible boundary. The current engine tuple traversal and
-assembly also run without further work polls; bounding or precharging that
-engine-owned work remains an S12 enforcement gap, not a callback exclusion.
-This path does not evaluate or modify session state.
+Controlled completed snapshot prepares a private callback-ready row batch
+inside its own attempt. Plan entries, registry slots and name bytes are
+charged before traversal; scalar-source readers protect the copied tuples.
+Checked workspace sizes are admitted to the memory governor before allocation.
+Cancellation, work exhaustion, reader contention or allocation failure during
+preparation publishes no tuples and releases workspace and readers. Retrying
+starts a fresh snapshot attempt against the unchanged completed result.
+
+Readers are released and finite dispatch work is prepaid before the final
+cancellation check. Once publication starts, the full callback batch completes
+without further polls, so cancellation requested from a callback remains
+sticky for the next snapshot. This finite, already-admitted dispatch tail is
+proportional to the prepared entries and rows; it is not a 256-action polling
+bound across the callback batch. Host callback bodies remain cooperative and
+non-preemptible. No lookup, tuple gathering or allocation occurs after the
+cutoff. Names, row order, duplicate plan entries and empty/missing results
+retain the raw emitter's behavior. This path does not evaluate or modify the
+completed result; fresh/dirty evaluation remains unsupported here.
 Uncontrolled sessions retain existing behavior.
 
 When framed host setup or cleanup must be retried, STEP returns `EAGAIN` with
