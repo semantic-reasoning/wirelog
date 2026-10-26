@@ -4965,6 +4965,113 @@ test_controlled_session_snapshot_publication(void)
     wirelog_program_free(program);
 }
 
+/* Host admission evidence for the serial coverage matrix. These injected
+ * modes exercise refusal only; they do not claim differential/LFTJ execution. */
+static void
+test_controlled_session_admission_matrix(void)
+{
+    static const char source[] =
+        ".decl input(x:int64)\n"
+        ".decl output(x:int64)\n"
+        "output(x) :- input(x).\n";
+    enum {
+        ITERATION, RETRACTION, RIGHT_RETRACTION, DIFFERENTIAL,
+        STRICT_BATCH, OTHER_BATCH_SHAPE, LFTJ, EXCHANGE, K_FUSION, CASES
+    };
+    for (unsigned mode = 0; mode < CASES; ++mode) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        CHECK(plan->stratum_count == 1
+            && plan->strata[0].relation_count == 1);
+        wl_plan_op_t *ops = (wl_plan_op_t *)plan->strata[0].relations[0].ops;
+        CHECK(plan->strata[0].relations[0].op_count == 3
+            && ops[0].op == WL_PLAN_OP_VARIABLE);
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *base = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &base));
+        wl_col_session_t *session = (wl_col_session_t *)base;
+        const int64_t rows[] = {7, 3, 11};
+        CHECK(!wl_session_insert(base, "input", rows, 3, 1));
+        col_rel_t *input = session_find_rel(session, "input");
+        col_relation_snapshot_t before = wl_columnar_relation_snapshot(input);
+        uint32_t registered = session->nrels;
+        snapshot_capture_t capture = {0};
+        CHECK(wl_session_snapshot(base, capture_snapshot_tuple, &capture)
+            == ENOTSUP);
+        CHECK(!capture.count);
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+
+        switch (mode) {
+        case ITERATION: session->current_iteration = 1; break;
+        case RETRACTION: session->retraction_seeded = true; break;
+        case RIGHT_RETRACTION: session->retraction_right_pass = true; break;
+        case DIFFERENTIAL: session->diff_operators_active = true; break;
+        case STRICT_BATCH:
+            session->join_batch_bytes = 224;
+            session->join_batch_strict = true;
+            break;
+        case OTHER_BATCH_SHAPE: session->join_batch_bytes = 224; break;
+        case LFTJ: ops[0].op = WL_PLAN_OP_LFTJ; break;
+        case EXCHANGE: ops[0].op = WL_PLAN_OP_EXCHANGE; break;
+        case K_FUSION: ops[0].op = WL_PLAN_OP_K_FUSION; break;
+        default: CHECK(false);
+        }
+        controlled_observer_framed_lookup_hits = 0;
+        wl_columnar_eval_serial_test_framed_checkpoint =
+            controlled_observer_count_rule_start;
+        CHECK(controlled_recursive_run(base, control) == ENOTSUP);
+        CHECK(!controlled_observer_framed_lookup_hits
+            && !wl_evaluation_control_active_attempt_id(control)
+            && !session_find_rel(session, "output")
+            && session->nrels == registered && !session->delta_observer
+            && !session->cleanup_active && !session->cleanup_pending
+            && !session->cleanup_active_count
+            && !session->cleanup_reserved_bytes);
+        CHECK(wl_columnar_relation_snapshot_equal(before,
+            wl_columnar_relation_snapshot(input)));
+        CHECK(input->nrows == 3 && input->columns[0][0] == 7
+            && input->columns[0][1] == 3 && input->columns[0][2] == 11);
+        if (mode <= STRICT_BATCH) {
+            /* Static exclusions do not begin a control attempt. */
+            CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+        } else {
+            /* Shape/operator rejection occurs in charged preflight. */
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == ENOTSUP && report.consumed > 0
+                && !report.cleanup_status);
+        }
+        session->current_iteration = 0;
+        session->retraction_seeded = false;
+        session->retraction_right_pass = false;
+        session->diff_operators_active = false;
+        session->join_batch_bytes = 0;
+        session->join_batch_strict = false;
+        ops[0].op = WL_PLAN_OP_VARIABLE;
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!controlled_recursive_run(base, control));
+        CHECK(controlled_observer_framed_lookup_hits == 1);
+        wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+        CHECK(!wl_session_snapshot(base, capture_snapshot_tuple, &capture));
+        CHECK(capture.count == 3);
+        const col_rel_t *output = session_find_rel(session, "output");
+        CHECK(output && output->nrows == 3 && output->columns[0][0] == 3
+            && output->columns[0][1] == 7 && output->columns[0][2] == 11);
+        CHECK(!wl_session_try_destroy(&base) && !base);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
 static void
 test_entry_shapes(void)
 {
@@ -8958,6 +9065,7 @@ main(void)
     test_controlled_session_step_void_destroy_precondition();
 #endif
     test_controlled_session_snapshot_publication();
+    test_controlled_session_admission_matrix();
     test_entry_shapes(); test_entry_generated_operators();
     test_entry_generated_right_filter_large();
     test_entry_generated_join_abort_cleanup_retry();
