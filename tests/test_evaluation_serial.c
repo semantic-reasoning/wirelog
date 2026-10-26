@@ -19,6 +19,8 @@
 #include <unistd.h>
 #endif
 
+extern void (*wl_columnar_session_test_observed_preflight_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
 extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
 extern bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
 extern uint32_t wl_columnar_eval_delta_test_stream_validation_rows;
@@ -1240,8 +1242,18 @@ test_publication_failures(void)
         registry_prepare(&f, 1, false, true, false);
         /* A real released token, without fabricated state or live-token copy. */
         wl_columnar_memory_governor_ref_t *temporary = NULL;
-        if (governed) session_rel_free_hash(&f.session);
-        else {
+        if (governed) {
+            session_rel_free_hash(&f.session);
+            CHECK(atomic_load_explicit(&f.session.rel_hash_reservation.state,
+                memory_order_seq_cst)
+                == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY);
+            CHECK(wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        f.session.memory_governor),
+                    1, &f.session.rel_hash_reservation)
+                == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+            CHECK(wl_columnar_memory_rollback(&f.session.rel_hash_reservation));
+        }else {
             wl_columnar_memory_resolution_t resolution = {
                 .budget_bytes = 1024, .usable_bytes = 1024,
                 .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
@@ -3039,7 +3051,7 @@ test_controlled_observed_step(void)
     CHECK(wl_session_snapshot(session,
         controlled_observer_snapshot_capture, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(control));
-    CHECK(!wl_session_step(session));
+    CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == 3 && controlled_observer_framed_lookup_hits == 1);
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0
@@ -3059,7 +3071,7 @@ test_controlled_observed_step(void)
     CHECK(wl_session_snapshot(session,
         controlled_observer_snapshot_capture, NULL) == EBUSY);
     CHECK(!wl_evaluation_control_reset(control));
-    CHECK(!wl_session_step(session));
+    CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == 4 && capture.rows[3] == 13
         && capture.diffs[3] == 1);
     output = session_find_rel((wl_col_session_t *)session, "output");
@@ -3072,7 +3084,7 @@ test_controlled_observed_step(void)
     int64_t removed_row = 3;
     CHECK(!wl_session_remove(session, "input", &removed_row, 1, 1));
     CHECK(!wl_evaluation_control_reset(control));
-    CHECK(!wl_session_step(session));
+    CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == 5 && capture.rows[4] == 3
         && capture.diffs[4] == -1);
     output = session_find_rel((wl_col_session_t *)session, "output");
@@ -3084,7 +3096,7 @@ test_controlled_observed_step(void)
     /* Cancellation requested by user code is after the final cutoff. It does
      * not truncate delivery or change this attempt's successful result. */
     CHECK(!wl_evaluation_control_reset(control));
-    CHECK(!wl_session_step(session));
+    CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == 5);
     CHECK(!wl_evaluation_control_report(control, &report)
         && report.result == 0 && report.consumed == 0);
@@ -3812,7 +3824,11 @@ test_controlled_observed_preflight_rejections(void)
         CHECK(wl_session_step(session) == ENOTSUP);
         CHECK(!wl_evaluation_control_active_attempt_id(control));
         wl_evaluation_control_report_t report;
-        CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+        if (i == 2)
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && report.result == ENOTSUP && report.consumed > 0);
+        else
+            CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
         if (registered_empty) {
             CHECK(session_find_rel((wl_col_session_t *)session, "output")
                 == registered_empty && registered_empty->nrows == 0);
@@ -3829,6 +3845,122 @@ test_controlled_observed_preflight_rejections(void)
         wirelog_program_free(program);
     }
 
+}
+
+static uint64_t observed_admission_max_byte;
+static unsigned observed_admission_events;
+
+static void
+observed_admission_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t byte)
+{
+    if (phase != 2) return;
+    if (byte > observed_admission_max_byte) observed_admission_max_byte = byte;
+    if (byte == 64) wl_evaluation_control_request_cancel(control);
+}
+
+static void
+observed_admission_capture(const char *name, const int64_t *row,
+    uint32_t width, int diff, void *data)
+{
+    (void)data;
+    CHECK(name && row && width == 1 && diff == 1);
+    observed_admission_events++;
+}
+
+static void
+test_controlled_observed_admission_work(void)
+{
+    char prefix[97], source[16384], input_name[128], name[128];
+    memset(prefix, 'a', sizeof(prefix) - 1);
+    prefix[sizeof(prefix) - 1] = 0;
+    int n = snprintf(input_name, sizeof(input_name), "%s_input", prefix);
+    CHECK(n > 0 && (size_t)n < sizeof(input_name));
+    size_t used = 0;
+    for (unsigned i = 0; i < 32; ++i) {
+        n = snprintf(source + used, sizeof(source) - used,
+                ".decl %s_%u(x:int64)\n", prefix, i);
+        CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used,
+            ".decl %s(x:int64)\n.decl output(x:int64)\n"
+            "output(x) :- %s(x).\n", input_name, input_name);
+    CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        CHECK(plan->edb_count == 33 && plan->stratum_count == 1);
+        wl_evaluation_control_t *control = NULL;
+        /* Init + EDB slot + 64 compared bytes = 66 admitted actions.
+         * The one-short budget cannot reach the deterministic cutoff. */
+        CHECK(!wl_evaluation_control_create(exact ? 66 : 65, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        int64_t value = 7;
+        for (unsigned i = 0; i < 31; ++i) {
+            n = snprintf(name, sizeof(name), "%s_%u", prefix, i);
+            CHECK(n > 0 && (size_t)n < sizeof(name));
+            CHECK(!wl_session_insert(session, name, &value, 1, 1));
+        }
+        CHECK(!wl_session_insert(session, input_name, &value, 1, 1));
+        wl_col_session_t *col = (wl_col_session_t *)session;
+        CHECK(col->nrels == 33);
+        observed_admission_events = 0;
+        wl_session_set_delta_cb(session, observed_admission_capture, NULL);
+        /* Unsupported many-stratum shape is rejected by its count without
+         * dereferencing fictitious trailing strata or beginning an attempt. */
+        plan->stratum_count = UINT32_MAX;
+        CHECK(wl_session_step(session) == ENOTSUP);
+        plan->stratum_count = 1;
+        wl_evaluation_control_report_t report;
+        CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
+        controlled_observer_framed_lookup_hits = 0;
+        wl_columnar_eval_serial_test_framed_checkpoint =
+            controlled_observer_count_rule_start;
+        observed_admission_max_byte = 0;
+        wl_columnar_session_test_observed_preflight_checkpoint =
+            observed_admission_checkpoint;
+        CHECK(controlled_recursive_run(session, control)
+            == (exact ? WL_EVALUATION_CONTROL_CANCELLED
+                : WL_EVALUATION_CONTROL_WORK_LIMIT));
+        wl_columnar_session_test_observed_preflight_checkpoint = NULL;
+        CHECK(observed_admission_max_byte == (exact ? 64u : 63u));
+        CHECK(!wl_evaluation_control_report(control, &report)
+            && report.consumed == (exact ? 66u : 65u)
+            && !report.cleanup_status);
+        CHECK(!controlled_observer_framed_lookup_hits
+            && !observed_admission_events && !col->delta_observer
+            && !session_find_rel(col, "output") && col->nrels == 33);
+        /* Cancellation releases an owner-free refusal: adding a registry
+         * entry invalidates the partial cursor before the next attempt. */
+        if (exact) {
+            n = snprintf(name, sizeof(name), "%s_31", prefix);
+            CHECK(n > 0 && (size_t)n < sizeof(name));
+            CHECK(!wl_session_insert(session, name, &value, 1, 1));
+            CHECK(!wl_session_remove(session, name, &value, 1, 1));
+            CHECK(col->nrels == 34);
+        }
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!controlled_recursive_run(session, control));
+        CHECK(controlled_observer_framed_lookup_hits > 0
+            && observed_admission_events == 1);
+        const col_rel_t *output = session_find_rel(col, "output");
+        CHECK(output && output->nrows == 1 && output->columns[0][0] == 7);
+        wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+        CHECK(!wl_session_try_destroy(&session) && !session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
 }
 
 static void
@@ -3865,7 +3997,7 @@ test_controlled_observed_large_output(void)
     };
     wl_session_set_delta_cb(session, controlled_observer_order_capture,
         &capture);
-    CHECK(!wl_session_step(session));
+    CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == LARGE_UNIQUE_ROWS);
     const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
             "output");
@@ -9052,6 +9184,7 @@ main(void)
     test_controlled_observed_filter_stops();
     test_controlled_observed_preflight_rejections();
     test_controlled_observed_large_output();
+    test_controlled_observed_admission_work();
     test_controlled_session_join_step();
     test_controlled_step_preflight_byte_cursor();
     test_controlled_step_preflight_work_limit_boundary();

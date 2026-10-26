@@ -167,10 +167,31 @@ struct wl_columnar_controlled_step {
     uint32_t preflight_join_full_rows;
     uint32_t preflight_join_delta_rows;
     bool controlled_materialized_batch_fallback;
+    uint32_t observed_preflight_phase;
+    uint32_t observed_preflight_slot;
+    size_t observed_preflight_byte;
+    uint32_t observed_preflight_edb;
+    col_rel_t **observed_preflight_registry;
+    uint32_t observed_preflight_registry_count;
+    col_rel_t *observed_input;
+    uint64_t observed_input_identity;
+    col_rel_t *observed_head;
+    uint64_t observed_head_identity;
+    uint32_t observed_result_slot;
+    size_t observed_result_byte;
+    bool observed_result_ready;
+    size_t observed_input_name_length;
+    size_t observed_head_name_length;
     bool default_preflight_target_found;
     bool default_preflight_entry_charged;
     bool cursor_advance_pending;
     char *successor_private_name;
+    char successor_name_buffer[128];
+    uint32_t successor_name_suffix;
+    uint32_t successor_name_slot;
+    uint32_t successor_name_byte;
+    unsigned successor_name_phase;
+    size_t successor_metadata_byte;
     col_rel_t *successor_candidate;
     wl_columnar_source_access_reader_t successor_input_reader;
     wl_plan_relation_t successor_relation;
@@ -205,6 +226,9 @@ struct wl_columnar_controlled_step {
     bool observer_cleanup_pending;
 };
 
+static int col_controlled_step_successor_target_init(wl_col_session_t *,
+    wl_columnar_controlled_step_t *, const wl_plan_relation_t *);
+
 static bool col_controlled_step_provenance_current(
     const wl_col_session_t *sess,
     const wl_columnar_controlled_step_t *step);
@@ -230,6 +254,8 @@ wl_columnar_session_controlled_batch_authorized(
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_session_test_observed_preflight_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
 int wl_columnar_session_test_fail_framed_funding_before_stop;
 int wl_columnar_session_test_fail_framed_funding_after_stop;
 int wl_columnar_session_test_exhaust_after_relation;
@@ -6317,7 +6343,6 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
 {
     const wl_plan_t *plan = sess->plan;
     const wl_plan_relation_t *only_relation = NULL;
-    uint32_t relation_count = 0;
     const wl_columnar_controlled_step_t *step = sess->controlled_step;
     /* A stopped rule retains its own baseline for the next control attempt.
      * Do not mistake that owned, unevaluated baseline for a foreign observer. */
@@ -6373,24 +6398,16 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
     }
 
     if (!sess->delta_cb) return 0;
-    for (uint32_t si = 0; si < plan->stratum_count; ++si) {
-        const wl_plan_stratum_t *stratum = &plan->strata[si];
-        if (stratum->is_recursive
-            || (stratum->relation_count && !stratum->relations))
-            return ENOTSUP;
-        if (stratum->relation_count == 1 && relation_count == 0)
-            only_relation = &stratum->relations[0];
-        else if (stratum->relation_count)
-            only_relation = NULL;
-        if (stratum->relation_count > UINT32_MAX - relation_count)
-            return EOVERFLOW;
-        relation_count += stratum->relation_count;
-    }
-    if (sess->delta_cb || successor) {
-        if (successor && sess->nrels > 3)
-            return ENOTSUP;
-        if (plan->stratum_count != 1 || relation_count != 1
-            || !only_relation || !only_relation->name
+    /* This route has exactly one stratum/rule. Reject other counts before
+     * traversing metadata; variable-size validation belongs to the attempt. */
+    if (plan->stratum_count != 1 || plan->strata[0].is_recursive
+        || plan->strata[0].relation_count != 1 || !plan->strata[0].relations)
+        return ENOTSUP;
+    only_relation = &plan->strata[0].relations[0];
+    if (successor && sess->nrels > 3)
+        return ENOTSUP;
+    {
+        if (!only_relation->name
             || (only_relation->op_count != 3 && only_relation->op_count != 4)
             || !only_relation->ops
             || only_relation->ops[0].op != WL_PLAN_OP_VARIABLE
@@ -6400,10 +6417,7 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
             != WL_PLAN_OP_MAP
             || only_relation->ops[only_relation->op_count - 1].op
             != WL_PLAN_OP_CONSOLIDATE
-            || !only_relation->ops[0].relation_name
-            || (successor
-            ? !session_find_rel(sess, only_relation->name)
-            : session_find_rel(sess, only_relation->name) != NULL))
+            || !only_relation->ops[0].relation_name)
             return ENOTSUP;
         const wl_plan_op_t *map =
             &only_relation->ops[only_relation->op_count - 2];
@@ -6425,39 +6439,167 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
                     return ENOTSUP;
             }
         }
-        const char *source_name = only_relation->ops[0].relation_name;
-        uint32_t source_index = plan->edb_count;
-        for (uint32_t i = 0; i < plan->edb_count; ++i)
-            if (plan->edb_relations && plan->edb_relations[i]
-                && strcmp(plan->edb_relations[i], source_name) == 0) {
-                source_index = i;
+    }
+
+    return 0;
+}
+
+/* Observed admission precedes baseline construction and operator execution.
+ * All caller-sized strings/arrays are visited one charged action at a time. */
+static int
+col_controlled_step_observed_preflight(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    const wl_plan_t *plan = sess->plan;
+    const wl_plan_relation_t *rule = &plan->strata[0].relations[0];
+    const char *source = rule->ops[0].relation_name;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (!step->observed) return 0;
+    /* A refused preflight releases session admission. A later mutation may
+     * replace the registry before retry; discard its partial lookup proof. */
+    if (step->observed_preflight_phase && !step->baseline_ready
+        && !step->relation_active && !step->cursor_advance_pending
+        && (step->observed_preflight_registry != sess->rels
+        || step->observed_preflight_registry_count != sess->nrels)) {
+        step->observed_preflight_phase = 0;
+        step->successor_private_name = NULL;
+        step->successor_name_phase = 0;
+        step->successor_metadata_byte = 0;
+    }
+    if (step->observed_preflight_phase == 8) return 0;
+    for (unsigned action = 0; action < 64; ++action) {
+        int rc = wl_evaluation_control_charge_attempt(control,
+                step->operation_id, 1);
+        if (rc) return rc;
+        switch (step->observed_preflight_phase) {
+        case 0:
+            step->observed_preflight_registry = sess->rels;
+            step->observed_preflight_registry_count = sess->nrels;
+            step->observed_preflight_slot = 0;
+            step->observed_preflight_byte = 0;
+            step->observed_input = NULL;
+            step->observed_head = NULL;
+            step->observed_preflight_phase = 1;
+            break;
+        case 1: /* Find the declared EDB; even absent entries cost a visit. */
+            if (step->observed_preflight_slot >= plan->edb_count)
+                return ENOTSUP;
+            if (!plan->edb_relations
+                || !plan->edb_relations[step->observed_preflight_slot]) {
+                step->observed_preflight_slot++;
                 break;
             }
-        if (source_index == plan->edb_count || !plan->edb_declared_width
-            || !plan->edb_column_type_counts || !plan->edb_column_types
-            || plan->edb_declared_width[source_index] != 1
-            || plan->edb_column_type_counts[source_index] != 1
-            || !plan->edb_column_types[source_index]
-            || plan->edb_column_types[source_index][0]
-            != WIRELOG_TYPE_INT64)
-            return ENOTSUP;
-        col_rel_t *source = session_find_rel(sess, source_name);
-        if (!source || source->nrows > source->capacity
-            || !((source->ncols == 1
-            && (!source->column_types || source->column_types[0]
-            == WIRELOG_TYPE_INT64))
-            || (source->nrows == 0 && source->ncols == 0
-            && source->declared_ncols == 1)))
-            return ENOTSUP;
-        if (successor) {
-            col_rel_t *head = session_find_rel(sess, only_relation->name);
-            if (!head || head->ncols != 1 || head->nrows > head->capacity
-                || (head->column_types && head->column_types[0]
-                != WIRELOG_TYPE_INT64))
-                return ENOTSUP;
+            step->observed_preflight_phase = 2;
+            break;
+        case 2: {
+            size_t byte = step->observed_preflight_byte;
+            char actual =
+                plan->edb_relations[step->observed_preflight_slot][byte];
+            char wanted = source[byte];
+            if (actual != wanted) {
+                step->observed_preflight_slot++;
+                step->observed_preflight_byte = 0;
+                step->observed_preflight_phase = 1;
+            } else if (!wanted) {
+                uint32_t edb = step->observed_preflight_slot;
+                if (!plan->edb_declared_width || !plan->edb_column_type_counts
+                    || !plan->edb_column_types
+                    || plan->edb_declared_width[edb] != 1
+                    || plan->edb_column_type_counts[edb] != 1
+                    || !plan->edb_column_types[edb]
+                    || plan->edb_column_types[edb][0] != WIRELOG_TYPE_INT64)
+                    return ENOTSUP;
+                step->observed_preflight_edb = edb;
+                step->observed_input_name_length = byte;
+                step->observed_preflight_byte = 0;
+                step->observed_preflight_phase = 3;
+            } else {
+                if (byte == SIZE_MAX) return EOVERFLOW;
+                step->observed_preflight_byte++;
+            }
+            break;
         }
+        case 3: /* Establish a finite bound for the immutable head name too. */
+            if (rule->name[step->observed_preflight_byte]) {
+                if (step->observed_preflight_byte == SIZE_MAX) return EOVERFLOW;
+                step->observed_preflight_byte++;
+            } else {
+                step->observed_head_name_length = step->observed_preflight_byte;
+                step->observed_preflight_slot = 0;
+                step->observed_preflight_byte = 0;
+                step->observed_preflight_phase = 4;
+            }
+            break;
+        case 4: /* One registry pass, comparing each candidate with the source. */
+        case 6: /* A second pass resolves the existing/absent public head. */
+            if (step->observed_preflight_registry != sess->rels
+                || step->observed_preflight_registry_count != sess->nrels)
+                return EINVAL;
+            if (step->observed_preflight_slot == sess->nrels) {
+                if (step->observed_preflight_phase == 4) {
+                    if (!step->observed_input) return ENOTSUP;
+                    step->observed_preflight_slot = 0;
+                    step->observed_preflight_phase = 6;
+                } else {
+                    if ((step->observed_head != NULL) !=
+                        step->successor_attempt)
+                        return ENOTSUP;
+                    step->observed_preflight_phase = 8;
+                }
+                break;
+            }
+            if (!sess->rels || !sess->rels[step->observed_preflight_slot]
+                || !sess->rels[step->observed_preflight_slot]->name) {
+                step->observed_preflight_slot++;
+                break;
+            }
+            step->observed_preflight_phase++;
+            break;
+        case 5:
+        case 7: {
+            bool input = step->observed_preflight_phase == 5;
+            col_rel_t *candidate = sess->rels[step->observed_preflight_slot];
+            size_t byte = step->observed_preflight_byte;
+            char wanted = (input ? source : rule->name)[byte];
+            char actual = candidate->name[byte];
+            if (wanted == actual && wanted) {
+                if (byte == SIZE_MAX) return EOVERFLOW;
+                step->observed_preflight_byte++;
+                break;
+            }
+            if (wanted == actual) {
+                if (candidate->nrows > candidate->capacity
+                    || !((candidate->ncols == 1
+                    && (!candidate->column_types || candidate->column_types[0]
+                    == WIRELOG_TYPE_INT64))
+                    || (input && !candidate->nrows && !candidate->ncols
+                    && candidate->declared_ncols == 1))) return ENOTSUP;
+                if (input && !step->observed_input) {
+                    step->observed_input = candidate;
+                    step->observed_input_identity =
+                        candidate->relation_identity;
+                }
+                if (!input &&
+                    !step->observed_head) step->observed_head = candidate;
+            }
+            step->observed_preflight_slot++;
+            step->observed_preflight_byte = 0;
+            step->observed_preflight_phase--;
+            break;
+        }
+        case 8: return wl_evaluation_control_charge_attempt(control,
+                       step->operation_id, 0);
+        default: return EINVAL;
+        }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_observed_preflight_checkpoint)
+            wl_columnar_session_test_observed_preflight_checkpoint(control,
+                step->observed_preflight_phase, step->observed_preflight_byte);
+#endif
     }
-    return 0;
+    int rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
+            0);
+    return rc ? rc : step->observed_preflight_phase == 8 ? 0 : EAGAIN;
 }
 
 static uint32_t
@@ -7058,10 +7200,8 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     const char *public_name = sess->plan->strata[0].relations[0].name;
-    const char *input_name = sess->plan->strata[0].relations[0].ops[0]
-        .relation_name;
-    col_rel_t *input = session_find_rel(sess, input_name);
-    col_rel_t *old_head = session_find_rel(sess, public_name);
+    col_rel_t *input = step->observed_input;
+    col_rel_t *old_head = step->observed_head;
     if (!step->successor_input_reader.owner || !input || !old_head
         || input->relation_identity != step->successor_input_identity
         || input->view_generation != step->successor_input_view_generation
@@ -7072,12 +7212,7 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
         || old_head->storage_generation
         != step->successor_head_storage_generation)
         return EINVAL;
-    if (!step->successor_candidate) {
-        step->successor_candidate = session_find_rel(sess,
-                step->successor_private_name);
-        if (!step->successor_candidate)
-            return ENOENT;
-    }
+    if (!step->successor_candidate) return ENOENT;
     if (!step->successor_candidate_detached) {
         while (step->successor_candidate_scan_index < sess->nrels) {
             uint32_t i = step->successor_candidate_scan_index;
@@ -7150,6 +7285,8 @@ col_controlled_step_successor_publish_candidate(wl_col_session_t *sess,
     }
     session_rel_registration_commit(sess, step->successor_candidate,
         &registration);
+    step->observed_head = step->successor_candidate;
+    step->observed_head_identity = step->observed_head->relation_identity;
     step->successor_candidate = NULL;
     step->successor_candidate_detached = false;
     int release_rc = col_rel_source_reader_release(
@@ -7201,11 +7338,52 @@ col_controlled_step_finish(wl_col_session_t *sess,
     return rc;
 }
 
+/* Resolve the committed result without triggering a lazy hash rebuild.
+ * The session operation admission keeps registry and names stable. */
+static int
+col_controlled_step_observed_result(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->observed_result_ready) return 0;
+    const char *name = step->successor_attempt ? step->successor_private_name
+        : sess->plan->strata[0].relations[0].name;
+    while (step->observed_result_slot < sess->nrels) {
+        int rc = wl_evaluation_control_charge_attempt(
+            sess->base.evaluation_control, step->operation_id, 1);
+        if (rc) return rc;
+        col_rel_t *r = sess->rels[step->observed_result_slot];
+        if (r && r->name) {
+            size_t byte = step->observed_result_byte;
+            char actual = r->name[byte], wanted = name[byte];
+            if (actual == wanted && wanted) {
+                if (byte == SIZE_MAX) return EOVERFLOW;
+                step->observed_result_byte++;
+                continue;
+            }
+            if (actual == wanted) {
+                if (step->successor_attempt) step->successor_candidate = r;
+                else {
+                    step->observed_head = r;
+                    step->observed_head_identity = r->relation_identity;
+                }
+                step->observed_result_ready = true;
+                return wl_evaluation_control_charge_attempt(
+                    sess->base.evaluation_control, step->operation_id, 0);
+            }
+        }
+        step->observed_result_slot++;
+        step->observed_result_byte = 0;
+    }
+    return ENOENT;
+}
+
 static int
 col_controlled_step_observer_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int lookup_rc = col_controlled_step_observed_result(sess, step);
+    if (lookup_rc) return lookup_rc;
     if (!step->observer_evaluated) {
         wl_columnar_eval_delta_observer_set_active(sess, false);
         wl_columnar_eval_delta_observer_set_evaluated(sess);
@@ -7220,9 +7398,6 @@ col_controlled_step_observer_drive(wl_col_session_t *sess,
     }
     if (!step->observer_prepared) {
         if (!step->observer_preparing) {
-            if (step->successor_attempt && !step->successor_candidate)
-                step->successor_candidate = session_find_rel(sess,
-                        step->successor_private_name);
             if (step->successor_attempt && !step->successor_candidate)
                 return ENOENT;
             int rc = step->successor_attempt
@@ -8467,6 +8642,18 @@ col_controlled_step_drive(wl_col_session_t *sess,
 
     if (teardown) wl_evaluation_control_request_cancel(control);
 
+    if (step->observed && !step->complete) {
+        int rc = col_controlled_step_observed_preflight(sess, step);
+        if (rc == EAGAIN) return rc;
+        if (rc) return col_controlled_step_finish(sess, step, rc);
+        if (step->successor_attempt) {
+            rc = col_controlled_step_successor_target_init(sess, step,
+                    &sess->plan->strata[0].relations[0]);
+            if (rc == EAGAIN) return rc;
+            if (rc) return col_controlled_step_finish(sess, step, rc);
+        }
+    }
+
     if (!step->complete && !step->relation_active
         && (sess->join_batch_bytes
             ? step->preflight_phase != COL_CONTROLLED_PREFLIGHT_READY
@@ -8489,10 +8676,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
         return col_controlled_step_recursive_drive(sess, step, teardown);
     if (step->successor_attempt && !step->published
         && !step->successor_input_reader.owner) {
-        const wl_plan_relation_t *plan_relation =
-            &sess->plan->strata[0].relations[0];
-        col_rel_t *source = session_find_rel(sess,
-                plan_relation->ops[0].relation_name);
+        col_rel_t *source = step->observed_input;
         if (!source || source->relation_identity
             != step->successor_input_identity
             || source->view_generation
@@ -8523,10 +8707,7 @@ col_controlled_step_drive(wl_col_session_t *sess,
     }
 
     if (step->observed) {
-        const wl_plan_relation_t *relation =
-            &sess->plan->strata[0].relations[0];
-        col_rel_t *source = session_find_rel(sess,
-                relation->ops[0].relation_name);
+        col_rel_t *source = step->observed_input;
         if (source && source->ncols == 0 && source->nrows == 0) {
             int schema_rc = wl_evaluation_control_charge(control, 1);
             if (schema_rc)
@@ -8723,42 +8904,96 @@ col_controlled_step_successor_target_init(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step,
     const wl_plan_relation_t *source_relation)
 {
+    if (step->successor_private_name) return 0;
     if (!source_relation || !source_relation->ops
-        || (source_relation->op_count != 3 && source_relation->op_count != 4))
-        return ENOTSUP;
-    const char *input_name = source_relation->ops[0].relation_name;
-    col_rel_t *input = session_find_rel(sess, input_name);
-    col_rel_t *head = session_find_rel(sess, source_relation->name);
-    if (!input || !head)
-        return ENOTSUP;
-    step->successor_input_identity = input->relation_identity;
-    step->successor_input_view_generation = input->view_generation;
-    step->successor_input_storage_generation = input->storage_generation;
-    step->successor_head_identity = head->relation_identity;
-    step->successor_head_view_generation = head->view_generation;
-    step->successor_head_storage_generation = head->storage_generation;
-    char name[128];
-    for (uint32_t suffix = 0; suffix < 1024; ++suffix) {
-        int n = snprintf(name, sizeof(name), "__wirelog_step_%" PRIxPTR
-                "_%" PRIx64 "_%" PRIx32, (uintptr_t)step,
-                step->operation_identity, suffix);
-        if (n < 0 || (size_t)n >= sizeof(name))
-            return EOVERFLOW;
-        if (session_find_rel(sess, name))
-            continue;
-        step->successor_private_name = malloc((size_t)n + 1);
-        if (!step->successor_private_name)
-            return ENOMEM;
-        memcpy(step->successor_private_name, name, (size_t)n + 1);
-        step->successor_relation = *source_relation;
-        step->successor_relation.name = step->successor_private_name;
-        memcpy(step->successor_ops, source_relation->ops,
-            source_relation->op_count * sizeof(step->successor_ops[0]));
-        step->successor_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
-        step->successor_relation.ops = step->successor_ops;
-        return 0;
+        || (source_relation->op_count != 3 && source_relation->op_count != 4)
+        || !step->observed_input || !step->observed_head) return ENOTSUP;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    for (unsigned action = 0; action < 64; ++action) {
+        int rc;
+        if (step->successor_name_phase == 0) {
+            if (step->successor_name_suffix == 1024) return EEXIST;
+            /* Fixed buffer generation and header bookkeeping are admitted
+             * before the bounded snprintf; no caller-sized string is read. */
+            rc = wl_evaluation_control_charge(control, 128);
+            if (rc) return rc;
+            int n = snprintf(step->successor_name_buffer,
+                    sizeof(step->successor_name_buffer),
+                    "__wirelog_step_%" PRIxPTR "_%" PRIx64 "_%" PRIx32,
+                    (uintptr_t)step, step->operation_identity,
+                    step->successor_name_suffix);
+            if (n < 0 || (size_t)n >= sizeof(step->successor_name_buffer))
+                return EOVERFLOW;
+            step->successor_name_slot = 0;
+            step->successor_name_byte = 0;
+            step->successor_name_phase = 1;
+        } else if (step->successor_name_phase == 1) {
+            rc = wl_evaluation_control_charge(control, 1);
+            if (rc) return rc;
+            if (step->successor_name_slot >= sess->nrels) {
+                step->successor_name_phase = 2;
+                continue;
+            }
+            col_rel_t *r = sess->rels[step->successor_name_slot];
+            if (!r || !r->name) {
+                step->successor_name_slot++;
+                step->successor_name_byte = 0;
+                continue;
+            }
+            uint32_t byte = step->successor_name_byte;
+            char wanted = step->successor_name_buffer[byte];
+            char actual = r->name[byte];
+            if (actual != wanted) {
+                step->successor_name_slot++;
+                step->successor_name_byte = 0;
+            } else if (!wanted) {
+                step->successor_name_suffix++;
+                step->successor_name_phase = 0;
+            } else step->successor_name_byte++;
+        } else {
+            /* Copy fixed plan metadata in admitted <=128-byte pieces. */
+            size_t relation_bytes = sizeof(step->successor_relation);
+            size_t op_bytes = source_relation->op_count
+                * sizeof(step->successor_ops[0]);
+            size_t offset = step->successor_metadata_byte;
+            if (offset < relation_bytes + op_bytes) {
+                size_t local = offset < relation_bytes ? offset
+                    : offset - relation_bytes;
+                size_t remaining = offset < relation_bytes
+                    ? relation_bytes - local : op_bytes - local;
+                size_t chunk = remaining < 128 ? remaining : 128;
+                rc = wl_evaluation_control_charge(control, chunk);
+                if (rc) return rc;
+                unsigned char *dst = offset < relation_bytes
+                    ? (unsigned char *)&step->successor_relation
+                    : (unsigned char *)step->successor_ops;
+                const unsigned char *src = offset < relation_bytes
+                    ? (const unsigned char *)source_relation
+                    : (const unsigned char *)source_relation->ops;
+                memcpy(dst + local, src + local, chunk);
+                step->successor_metadata_byte += chunk;
+                continue;
+            }
+            rc = wl_evaluation_control_charge(control, 32);
+            if (rc) return rc;
+            step->successor_private_name = step->successor_name_buffer;
+            col_rel_t *input = step->observed_input;
+            col_rel_t *head = step->observed_head;
+            step->successor_input_identity = input->relation_identity;
+            step->successor_input_view_generation = input->view_generation;
+            step->successor_input_storage_generation =
+                input->storage_generation;
+            step->successor_head_identity = head->relation_identity;
+            step->successor_head_view_generation = head->view_generation;
+            step->successor_head_storage_generation = head->storage_generation;
+            step->successor_relation.name = step->successor_private_name;
+            step->successor_ops[0].delta_mode = WL_DELTA_FORCE_FULL;
+            step->successor_relation.ops = step->successor_ops;
+            return wl_evaluation_control_charge(control, 0);
+        }
     }
-    return EEXIST;
+    int rc = wl_evaluation_control_charge(control, 0);
+    return rc ? rc : EAGAIN;
 }
 
 static int
@@ -8799,21 +9034,10 @@ col_controlled_step(wl_col_session_t *sess)
         if (rc) return rc;
         uint64_t identity = step->operation_identity;
         bool observed = step->observed;
-        free(step->successor_private_name);
         memset(step, 0, sizeof(*step));
         step->operation_identity = identity;
         step->observed = observed;
         step->successor_attempt = true;
-        const wl_plan_relation_t *source_relation =
-            &sess->plan->strata[0].relations[0];
-        int target_rc = col_controlled_step_successor_target_init(sess, step,
-                source_relation);
-        if (target_rc) {
-            step->refused = true;
-            step->complete = true;
-            step->successor_mutation_seen = true;
-            return target_rc;
-        }
     }
     if (!successor_step
         && (!step || (!step->operation_active && !step->complete))) {
@@ -8867,7 +9091,6 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
         && !step->published && !wl_columnar_eval_delta_observer_evaluated(sess))
         wl_columnar_eval_delta_observer_set_active(sess, false);
     col_controlled_step_grant_release(step, &step->previous_funding);
-    free(step->successor_private_name);
     free(step);
     sess->controlled_step = NULL;
     /* Destroy consumes the terminal outcome from the caller-owned control
@@ -8929,8 +9152,34 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
         return rc;
     const char *source = sess->plan->strata[0].relations[0]
         .ops[0].relation_name;
-    if (strcmp(relation, source) != 0)
+    /* Mutation API argument matching is outside STEP accounting. Its finite
+     * bound comes from the already charged immutable-name proof, and at most
+     * three registry slots are inspected. Never rebuild the registry hash or
+     * rescan plan/EDB metadata here. STEP revalidates under its own allowance. */
+    if (step->observed_preflight_phase != 8
+        || step->observed_input_name_length == SIZE_MAX
+        || step->observed_head_name_length == SIZE_MAX
+        || strncmp(relation, source, step->observed_input_name_length + 1) != 0)
         return ENOTSUP;
+    const char *head_name = sess->plan->strata[0].relations[0].name;
+    bool input_found = false, head_found = false;
+    for (uint32_t i = 0; i < sess->nrels; ++i) {
+        col_rel_t *r = sess->rels ? sess->rels[i] : NULL;
+        if (!r || !r->name) continue;
+        if (r == step->observed_input
+            && r->relation_identity == step->observed_input_identity
+            && strncmp(r->name, source,
+            step->observed_input_name_length + 1) == 0)
+            input_found = true;
+        if (r == step->observed_head
+            && r->relation_identity == step->observed_head_identity
+            && strncmp(r->name, head_name,
+            step->observed_head_name_length + 1) == 0
+            && r->ncols == 1 && r->nrows <= r->capacity
+            && (!r->column_types || r->column_types[0] == WIRELOG_TYPE_INT64))
+            head_found = true;
+    }
+    if (!input_found || !head_found) return ENOTSUP;
     (void)insert;
     return 0;
 }
@@ -8953,8 +9202,9 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         || sess->plan->strata[0].relations[0].op_count == 0
         || !sess->plan->strata[0].relations[0].ops[0].relation_name)
         return;
-    if (strcmp(relation,
-        sess->plan->strata[0].relations[0].ops[0].relation_name) == 0)
+    if (strncmp(relation,
+        sess->plan->strata[0].relations[0].ops[0].relation_name,
+        step->observed_input_name_length + 1) == 0)
         step->successor_mutation_seen = true;
 }
 
