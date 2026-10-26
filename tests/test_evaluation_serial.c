@@ -2990,6 +2990,7 @@ extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
 static bool observed_multi_authenticated;
 static unsigned observed_multi_stop_phase;
 static uint32_t observed_multi_stop_index;
+static bool observed_multi_stop_work, observed_multi_stop_in_child;
 static void
 observed_multi_stop(wl_evaluation_control_t *control, unsigned phase,
     uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
@@ -3015,9 +3016,14 @@ observed_multi_stop(wl_evaluation_control_t *control, unsigned phase,
         observed_multi_authenticated = true;
     }
     if (phase == observed_multi_stop_phase &&
-        index == observed_multi_stop_index){
+        index == observed_multi_stop_index
+        && (!observed_multi_stop_in_child || bindings)){
         wl_columnar_session_test_observed_transaction_checkpoint = NULL;
-        wl_evaluation_control_request_cancel(control);
+        if (observed_multi_stop_work)
+            CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else
+            wl_evaluation_control_request_cancel(control);
     }
 }
 
@@ -3196,8 +3202,8 @@ observed_wide_program(unsigned width, bool floating, const char *head)
     char *source = calloc(1, 65536);
     CHECK(source);
     size_t offset = 0;
-    const char *names[] = {"input", head, "mirror"};
-    for (unsigned d = 0; d < 3; ++d) {
+    const char *names[] = {"input", head, "mirror", "other", "independent"};
+    for (unsigned d = 0; d < 5; ++d) {
         offset += snprintf(source + offset, 65536 - offset, ".decl %s(",
                 names[d]);
         for (unsigned c = 0; c < width; ++c)
@@ -3205,7 +3211,8 @@ observed_wide_program(unsigned width, bool floating, const char *head)
                     c ? "," : "", c, floating ? "float" : "int64");
         offset += snprintf(source + offset, 65536 - offset, ")\n");
     }
-    for (unsigned d = 1; d < 3; ++d) {
+    for (unsigned rule = 0; rule < 3; ++rule) {
+        unsigned d = rule == 2 ? 4 : rule + 1;
         offset += snprintf(source + offset, 65536 - offset, "%s(", names[d]);
         for (unsigned c = 0; c < width; ++c)
             offset += snprintf(source + offset, 65536 - offset, "%sx%u",
@@ -3252,15 +3259,16 @@ test_controlled_observed_wide_public(void)
         CHECK(!actual->count && !expected->count);
         int64_t rows[257];
         for (unsigned cycle = 0; cycle < 4; ++cycle) {
+            const char *input = cycle < 2 ? "input" : "other";
             for (unsigned c = 0; c < width; ++c)
                 rows[c] = wl_columnar_float_to_bits((double)(cycle / 2 + c) +
                         0.5);
             if (!(cycle % 2)) {
-                CHECK(!wl_session_insert(session, "input", rows, 1, width));
-                CHECK(!wl_session_insert(reference, "input", rows, 1, width));
+                CHECK(!wl_session_insert(session, input, rows, 1, width));
+                CHECK(!wl_session_insert(reference, input, rows, 1, width));
             } else {
-                CHECK(!wl_session_remove(session, "input", rows, 1, width));
-                CHECK(!wl_session_remove(reference, "input", rows, 1, width));
+                CHECK(!wl_session_remove(session, input, rows, 1, width));
+                CHECK(!wl_session_remove(reference, input, rows, 1, width));
             }
             actual->count = expected->count = 0;
             int rc = observed_multi_step(session);
@@ -3275,13 +3283,13 @@ test_controlled_observed_wide_public(void)
                 sizeof(expected->events[0]), observed_multi_order);
             CHECK(!memcmp(actual->events, expected->events,
                 actual->count * sizeof(actual->events[0])));
-            const char *heads[] = {head, "mirror"};
-            for (unsigned h = 0; h < 2; ++h) {
+            const char *heads[] = {head, "mirror", "independent"};
+            for (unsigned h = 0; h < 3; ++h) {
                 col_rel_t *a = session_find_rel((wl_col_session_t *)session,
                         heads[h]);
                 col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
                         heads[h]);
-                CHECK(a && b && a->ncols == width && a->nrows == b->nrows);
+                CHECK(a && a->ncols == width && a->nrows == (b ? b->nrows : 0));
                 for (uint32_t r = 0; r < a->nrows; ++r)
                     for (uint32_t c = 0; c < width;
                         ++c) CHECK(a->columns[c][r] == b->columns[c][r]);
@@ -3299,9 +3307,10 @@ test_controlled_observed_transaction_budget(void)
 {
     uint64_t exact = 0;
     const uint64_t teardown_limits[] = {64, 128, 4096, 12000};
-    for (unsigned trial = 0; trial < 7; ++trial) {
-        bool teardown = trial >= 3;
-        uint64_t limit = teardown ? teardown_limits[trial - 3]
+    for (unsigned trial = 0; trial < 9; ++trial) {
+        bool teardown = trial >= 3 && trial < 7;
+        uint64_t limit = trial == 7 ? 4096 : trial == 8 ? UINT64_C(1000000000)
+            : teardown ? teardown_limits[trial - 3]
             : trial == 0 ? 0 : trial == 1 ? exact : exact - 1;
         char *source = observed_wide_program(2, true, "output");
         wirelog_error_t error;
@@ -3323,16 +3332,31 @@ test_controlled_observed_transaction_budget(void)
         wl_session_options_init(&options);
         options.evaluation_control = control;
         options.memory_governor = governor;
-        wl_session_t *session = NULL;
+        wl_session_t *session = NULL, *reference = NULL;
         CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
             &options, &session));
         const int64_t row[] = { INT64_C(0x3ff0000000000000),
                                 INT64_C(0x4000000000000000) };
         CHECK(!wl_session_insert(session, "input", row, 1, 2));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+        CHECK(!wl_session_insert(reference, "input", row, 1, 2));
         observed_multi_capture_t *capture = calloc(1, sizeof(*capture));
-        CHECK(capture);
+        observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+        CHECK(capture && expected);
         wl_session_set_delta_cb(session, observed_multi_capture, capture);
+        wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+        if (trial == 8) {
+            observed_multi_stop_phase = 8;
+            observed_multi_stop_index = 1;
+            observed_multi_stop_work = observed_multi_stop_in_child = true;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                observed_multi_stop;
+        }
         int rc = observed_multi_step(session);
+        if (trial == 8) {
+            CHECK(!wl_columnar_session_test_observed_transaction_checkpoint);
+            observed_multi_stop_work = observed_multi_stop_in_child = false;
+        }
         wl_evaluation_control_report_t report;
         CHECK(!wl_evaluation_control_report(control, &report));
         if (trial == 0) {
@@ -3349,6 +3373,9 @@ test_controlled_observed_transaction_budget(void)
                 CHECK(!wl_evaluation_control_reset(control));
                 CHECK(!wl_evaluation_control_configure(control, 0));
                 CHECK(!observed_multi_step(session) && capture->count == 2);
+                wl_evaluation_control_report_t resumed;
+                CHECK(!wl_evaluation_control_report(control, &resumed));
+                CHECK(resumed.attempt_id > report.attempt_id && !resumed.limit);
             }
         }
         if (teardown) {
@@ -3360,6 +3387,19 @@ test_controlled_observed_transaction_budget(void)
                 WL_EVALUATION_CONTROL_CANCELLED);
             CHECK(!capture->count);
         }
+        if (!teardown) {
+            CHECK(!wl_session_step(reference));
+            CHECK(capture->count == expected->count);
+            qsort(capture->events, capture->count, sizeof(capture->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(capture->events, expected->events,
+                capture->count * sizeof(capture->events[0])));
+            unsigned delivered = capture->count;
+            CHECK(!observed_multi_step(session) && capture->count == delivered);
+        }
+        wl_session_destroy(reference);
         unsigned attempts = 0;
         while (session) {
             rc = wl_session_try_destroy(&session);
@@ -3371,7 +3411,7 @@ test_controlled_observed_transaction_budget(void)
         CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                 governor)));
         wl_columnar_memory_governor_ref_release(governor);
-        free(capture); free(source);
+        free(expected); free(capture); free(source);
     }
 }
 
@@ -3400,9 +3440,12 @@ test_controlled_observed_missing_private_head(void)
     observed_multi_capture_t *capture = calloc(1, sizeof(*capture));
     CHECK(capture);
     wl_session_set_delta_cb(session, observed_multi_capture, capture);
-    const wl_plan_relation_t *first = &plan->strata[0].relations[0];
-    CHECK(!strcmp(first->name,
-        "output") && first->ops[0].op == WL_PLAN_OP_VARIABLE);
+    const wl_plan_relation_t *first = NULL;
+    for (uint32_t si = 0; si < plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri)
+            if (!strcmp(plan->strata[si].relations[ri].name, "output"))
+                first = &plan->strata[si].relations[ri];
+    CHECK(first && first->ops[0].op == WL_PLAN_OP_VARIABLE);
     wl_plan_op_t *op = (wl_plan_op_t *)&first->ops[0];
     const char *input_name = op->relation_name;
     /* A required private head is deliberately not computed yet. Its older

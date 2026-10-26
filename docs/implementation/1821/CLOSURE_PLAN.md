@@ -4,7 +4,8 @@ This plan tracks closure of #1821; it does not declare the issue complete.
 The initial filtered-observer audit used `9773f94d`. The dispatch-family and
 configuration inventory is now audited at `0d91d02a` (2026-10-26) in
 [SERIAL_COVERAGE.md](SERIAL_COVERAGE.md). Historical #2144 checkpoint claims are
-not evidence that a path is reachable on this base.
+not evidence that a path is reachable on this base. G2's implementation audit
+below uses `a76b8ff5`; the inventory's other groups retain their recorded gaps.
 
 Issues: [serial enforcement #1821](https://github.com/semantic-reasoning/wirelog/issues/1821)
 and [parent #1817](https://github.com/semantic-reasoning/wirelog/issues/1817).
@@ -41,7 +42,7 @@ and fresh test results are recorded separately.
 | FILTER/scan, recursive, differential, batch/pipeline, LFTJ paths actually interrupted | Mixed: generated FILTER/LFTJ tests and controlled batch-producer fixtures exist; recursive STEP admits exact one/two-JOIN binary path manifests. `col_controlled_step_static_preflight` and controlled `eval_plan.c` refuse active differential/retraction state | Connect the required serial host routes and prove each real path using deterministic checkpoints; raw correctness tests such as `diff_join` alone are insufficient. |
 | Cancellation within the declared quantum | Implemented checkpoint helpers and phase-specific stop fixtures; the [work table](../../SEMANTICS.md#required-downstream-work-metric-and-checkpoint-placement) specifies maximum quantum 256 | Complete per-route checkpoint and finite-region inventory, including engine-owned preflight, allocation, cleanup, and fallback work. Record host/library exclusions explicitly. |
 | Exact and one-short limits, reproducible work | Implemented recursive source-fixed ABI-aware frame/descriptor formulas and primitive boundary tests | Identify missing independent boundaries per required route. Measured budgets in observer retry tests are empirical allowances, not independent cost oracles. |
-| Reset/retry, canonical output, signed deltas and retained resources | Restricted recursive append and unary observed insert/remove tests exist; source-access and cleanup receipt tests cover ownership primitives | Complete required serial composition/differential recovery and resource-baseline checks. Primitive success does not establish whole-session recovery. |
+| Reset/retry, canonical output, signed deltas and retained resources | Restricted recursive append and general ordinary observed insert/remove tests exist; multihead reference, retry and governor-baseline tests accompany source-access and cleanup receipts | Complete required serial composition/differential recovery and resource-baseline checks. Primitive success does not establish whole-session recovery. |
 | Complete path/checkpoint table | Dispatch-family/configuration inventory is complete in SERIAL_COVERAGE.md; whole-route polling and fallback qualification remain incomplete | Resolve every required row below with named actual-path tests, polling bound, retry ownership, and a justified disposition. Temporary ENOTSUP is not completion for a required supported configuration. |
 | Normal + ASan/UBSan + disabled-control references | Registered `evaluation_*`, `join_batch_resume`, `join_pipeline`, `diff_join`, and LFTJ suites exist | Run final-commit serial qualification and compare disabled-control results. Old passing runs cannot qualify unsupported routes or changed code. |
 
@@ -78,14 +79,16 @@ prove every internal branch combination.
 | S13 configurations | E12, C01–C07 |
 
 **G1: bounded session admission and completed-snapshot engine work** is
-implemented in this PR bundle as two atomic commits. Observed admission and
+merged in PR #2272 as two atomic commits. Observed admission and
 successor-name setup use charged cursors. Completed snapshots stage their
 callback-ready tuples under work and memory admission, then deliver a finite
 prepaid batch after the cutoff. Callback cooperation does not exclude engine
-preparation. **G2: signed observed composition** is next. G2–G7 retain the
-recursive/differential, host batch/LFTJ, scalar/representation, resource/config
-and final qualification obligations and their #1820 dependencies. These are
-six remaining work groups, not a promise of six remaining PRs.
+preparation. **G2: signed observed composition** is implemented in this bundle
+for ordinary nonrecursive compositions of already controlled scalar operators.
+**G3: general recursion/differential execution** is next. G3–G7 retain the host
+batch/LFTJ, new scalar/expression/representation, resource/configuration and
+final qualification obligations. These are five remaining work groups, not a
+promise of five remaining PRs; #1821 remains open.
 
 ## Work packages and exit criteria
 
@@ -93,14 +96,16 @@ six remaining work groups, not a promise of six remaining PRs.
    dispatch family/configuration axis has a matrix disposition and an open-work
    group where needed. Nine new admission cases distinguish refusal from real
    execution. Implementation and unknown-bound obligations remain open in
-   G2–G7; further scope splits must be recorded before implementation.
+   G3–G7; further scope splits must be recorded before implementation.
 2. **Scalar observed composition.** Batch related required scalar/typed,
    multi-column and multihead host gaps, reusing metered operators and signed
    baseline/current preparation. Exit: every required S01–S05/S10 combination
    has actual-path stops, no premature/replayed publication, canonical retry
    and resource evidence. The optional unary FILTER and its retained-baseline
-   stop/retry repair were delivered by PR #2271. Repeated removals still require
-   bounded `$r$input` staging retirement/reuse coordinated with #1820.
+   stop/retry repair were delivered by PR #2271. This G2 bundle connects ordinary
+   multiinput/multihead composition and retires consumed staging. New expression
+   families and representation variants remain G5; cross-policy qualification
+   remains G6. Host admission does not broaden a child operator's supported domain.
 3. **Serial recursion/differential.** Complete required S07/S08 SCC/frontier,
    trace and retraction paths while retaining one allowance and the #1820
    baseline contract. Exit: real differential/retraction and recursive paths
@@ -129,8 +134,8 @@ six remaining work groups, not a promise of six remaining PRs.
   clang-tidy ratchet checks.
 
 `test_controlled_observed_filter_successors` compares each single mutation
-with a disabled-control session and checks signed events and the staging-cap
-refusal. `test_controlled_observed_filter_stops` checkpoints phase 13 in the
+with a disabled-control session. The historical increment checked signed
+events and the then-existing staging-cap refusal; G2 extends it to repeated cycles. `test_controlled_observed_filter_stops` checkpoints phase 13 in the
 rejected scan, verifies baseline identity during reset/retry, and covers
 checked teardown after cancellation or work-limit cancellation acknowledgment.
 The preflight rejection fixture also rejects an unrelated existing observer.
@@ -172,30 +177,78 @@ remain unclaimed.
 
 ## G2 implementation bundle (2026-10-26)
 
-The next bundle groups four atomic units: bounded observer preparation,
-owned reusable mutation staging, coordinated multihead publication, and
-integrated qualification. It targets ordinary nonrecursive compositions of
-already controlled scalar operators, including multiple inputs and heads.
-Scalar row identity remains the raw observer's native-byte identity; FLOAT
-signed zero and NaN payloads do not acquire new equality rules. Intended scalar
-types are INT32, INT64, UINT32, UINT64, FLOAT, STRING and BOOL. Compound,
-timestamped and spill representations and new expression families remain G5;
-recursive and differential execution remains G3. These are planned obligations,
-not implemented coverage claims.
+Four atomic units remain in one PR: bounded observer preparation, owned reusable
+mutation staging, coordinated multihead publication, and integrated qualification.
+Production code is audited at `a76b8ff5`. The bundle closes the ordinary observed
+host-composition obligations in E03/E04/F10; it does not close #1821 or certify
+all child expression/representation and configuration combinations.
 
-A transaction must prepare one coordinated registry image and all old-head
-retirement claims before its publication cutoff. Independent registrations
-cannot reserve slots independently against the same registry. Failed attempts
-retain the original public heads and notification baseline; cleanup after
-publication must not replay events. Callback replacement/clearing retains its
-existing semantics. G2 closes only when repeated mutation cycles, typed/wide
-rows and dependent/independent multiple heads pass together through session
-entry points with deterministic stops, reference results and resource checks.
+The observer copies, normalizes, subtracts pending rows and compares native
+scalar rows through charged cursors. Its scalar schema domain is INT32, INT64,
+UINT32, UINT64, FLOAT, STRING and BOOL. Native-byte identity is unchanged,
+including FLOAT signed-zero and NaN payloads. Child operator validation remains
+authoritative. New expressions, compound/timestamped/spill representations,
+recursion, differential execution and batch/LFTJ hosting remain G3–G6.
 
-G2 ownership refinement: a separate scalar retirement receipt prepares
-reversible writer claims and validates ordinary scalar backing through charged
-cursors. Commit transfers descriptor lifetime to the receipt; column, name and
-schema-child frees precede the existing memory-credit retirement receipts.
-The binary retirement tariff remains unchanged. Multihead publication will
-use one coordinated registry image and stable dynamically sized private
-bindings, without raising the existing recursive overlay's fixed limit.
+The ordinary session transaction uses dynamically sized authenticated bindings,
+without changing the fixed recursive overlay. It captures every candidate head
+privately, ACKs each child cleanup receipt, prepares baseline and signed events,
+and builds one registry image. Missing private heads cannot read stale public
+heads. Original readers and reversible retirement claims protect publication;
+unrelated registry entries are retained. Input/head counts, widths and names have
+no new small shape cap. The existing columnar `MAX_STRATA` bound of 32 applies.
+
+The final poll precedes the prepaid registry installation and callback batch.
+No event escapes a precommit stop. Work exhaustion retains the transaction across
+attempt IDs; cancellation/nonbudget failures drain private ownership before
+closing the attempt. Retrying cancellation recomputes private candidates against
+the unchanged public model. Late callback cancellation remains sticky for the
+next controlled operation. Postcommit cleanup uses retained maintenance ownership
+and cannot replay events. Consumed `$r$` input and observer staging, old heads,
+registry/hash storage and their credits are retired; repeated cycles do not
+accumulate registry holes. Callback replacement/clearing uses the existing
+observer publisher.
+
+Metadata initialization uses 64-byte slices; plan-copy actions admit 256 units.
+Variable-size lookup and validation use charged byte/slot/column cursors, with
+at most 64 transaction actions per host turn. The finite prepaid publication
+suffix is after the cutoff and has no new cancellation claim. Remaining nested
+resource/configuration audits stay explicitly in G6.
+
+Integrated evidence in `evaluation_serial`:
+
+- `test_controlled_observed_multi`: 24 alternating mutations across two inputs,
+  dependent/independent heads and private JOIN, more than four bindings,
+  cancellation between heads and after earlier retirement claims, late callback
+  cancellation, signed/reference parity, stable cycle resources and zero governor
+  balance after session/program destruction.
+- `test_controlled_observed_wide_public`: two inputs and dependent/independent heads with 320-byte names,
+  widths 0/2/257, FLOAT and empty initial inputs, repeated signed mutations and
+  disabled-control row/event comparisons through session entry points.
+- `test_controlled_observed_transaction_budget`: calibrated exact/one-short
+  publication budgets, retained early-metadata and later-child work-limit resume,
+  reference events/no replay, and cancellation acknowledgment plus checked
+  destruction after partial initialization. Calibration is empirical evidence,
+  not an independent total-cost formula.
+- `test_controlled_observed_missing_private_head`: an unresolved private head
+  cannot use its older public descriptor; public rows survive the rejected attempt
+  and retry succeeds. The multihead checkpoint also rejects forged/stale bindings.
+- Existing filtered-successor tests now perform repeated reusable staging cycles;
+  scalar-retirement tests cover wide/nullary, contention and ledger ownership.
+  `evaluation_observer_build` compares mixed scalar and native FLOAT-bit rows,
+  wide pending subtraction and schema-budget boundaries against the raw observer.
+
+Validation is recorded with the final qualification result below. Independent
+review and final design/risk gates apply to each exact atomic candidate. G3 is
+next after this bundle; no additional prerequisite-only PR is being split out.
+
+Local qualification (2026-10-26): the complete native build and 487-test suite
+completed with 472 passed, 15 skipped and zero failures. The first full run
+exposed missing state-map documentation anchors; those were corrected in the
+publication commit, including its negative-test fixtures, before the passing
+rerun. The final qualification tests then passed `evaluation_serial`,
+`state_map_anchors` and `state_map_anchors_selftest` (3/3), plus
+`evaluation_serial` and `evaluation_observer_build` under ASAN/UBSAN (2/2).
+LLVM 22's full clang-tidy ratchet passed for the production candidate. Formatting
+and whitespace checks passed. MSVC validation requires the remote Windows job;
+these Linux results do not claim a local MSVC build.
