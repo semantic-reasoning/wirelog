@@ -1,8 +1,10 @@
 # Closing #1821: serial evaluation enforcement
 
-This plan is part of the filtered-observer implementation, not a declaration
-that #1821 is complete. Source inspection baseline: `9773f94d`. Historical
-#2144 checkpoint claims are not evidence that a path is reachable on this base.
+This plan tracks closure of #1821; it does not declare the issue complete.
+The initial filtered-observer audit used `9773f94d`. The dispatch-family and
+configuration inventory is now audited at `0d91d02a` (2026-10-26) in
+[SERIAL_COVERAGE.md](SERIAL_COVERAGE.md). Historical #2144 checkpoint claims are
+not evidence that a path is reachable on this base.
 
 Issues: [serial enforcement #1821](https://github.com/semantic-reasoning/wirelog/issues/1821)
 and [parent #1817](https://github.com/semantic-reasoning/wirelog/issues/1817).
@@ -16,11 +18,12 @@ issues into #1821. Serial retry/publication tests must still demonstrate the
 #1820 contract; an unavailable recovery prerequisite remains a recorded blocker.
 Closing #1821 does not close #1817 or enable the public feature by itself.
 
-There are **five work packages below, not five promised PRs**. This PR starts
-the coverage contract and advances scalar observed composition. There is no
-evidence-based remaining PR count yet: the dispatch/configuration inventory
-must first resolve the required unsupported edges. Each later PR must close a
-named group from that inventory, not merely add another isolated plan spelling.
+There are **five work packages below, not five promised PRs**. PR #2271 started
+the coverage contract and advanced scalar observed composition. This follow-up
+completes the dispatch-family inventory and groups its open obligations into
+seven implementation/qualification groups. These are not a promised PR count:
+differential recovery and representation work still need design sizing. Each
+later PR must close named matrix rows, not merely add another isolated plan spelling.
 Changes in package scope and any split into additional PRs must be recorded
 here with their reason before the additional implementation begins.
 
@@ -39,7 +42,7 @@ and fresh test results are recorded separately.
 | Cancellation within the declared quantum | Implemented checkpoint helpers and phase-specific stop fixtures; the [work table](../../SEMANTICS.md#required-downstream-work-metric-and-checkpoint-placement) specifies maximum quantum 256 | Complete per-route checkpoint and finite-region inventory, including engine-owned preflight, allocation, cleanup, and fallback work. Record host/library exclusions explicitly. |
 | Exact and one-short limits, reproducible work | Implemented recursive source-fixed ABI-aware frame/descriptor formulas and primitive boundary tests | Identify missing independent boundaries per required route. Measured budgets in observer retry tests are empirical allowances, not independent cost oracles. |
 | Reset/retry, canonical output, signed deltas and retained resources | Restricted recursive append and unary observed insert/remove tests exist; source-access and cleanup receipt tests cover ownership primitives | Complete required serial composition/differential recovery and resource-baseline checks. Primitive success does not establish whole-session recovery. |
-| Complete path/checkpoint table | Qualification gap: prose and local tariffs exist, but no completed issue-wide dispatch/fallback table | Resolve every required row below with named actual-path tests, polling bound, retry ownership, and a justified disposition. Temporary ENOTSUP is not completion for a required supported configuration. |
+| Complete path/checkpoint table | Dispatch-family/configuration inventory is complete in SERIAL_COVERAGE.md; whole-route polling and fallback qualification remain incomplete | Resolve every required row below with named actual-path tests, polling bound, retry ownership, and a justified disposition. Temporary ENOTSUP is not completion for a required supported configuration. |
 | Normal + ASan/UBSan + disabled-control references | Registered `evaluation_*`, `join_batch_resume`, `join_pipeline`, `diff_join`, and LFTJ suites exist | Run final-commit serial qualification and compare disabled-control results. Old passing runs cannot qualify unsupported routes or changed code. |
 
 Source anchors: [session dispatch](../../../wirelog/columnar/session.c),
@@ -48,44 +51,52 @@ Source anchors: [session dispatch](../../../wirelog/columnar/session.c),
 [registered suites](../../../tests/meson.build),
 [serial fixtures](../../../tests/test_evaluation_serial.c).
 
-## Finite inventory to complete
+## Coverage contract completed for the audited dispatch families
 
-This is the initial required inventory, not a claim that every internal edge
-has already been audited. For each row, package 1 must enumerate concrete
-subpaths/configurations, then record checkpoint, maximum unpolled work,
-independent or empirical budget evidence, owner on stop, retry test, and final
-required/excluded disposition. Add discovered edges to the owning row rather
-than silently enlarging the implementation scope.
+[SERIAL_COVERAGE.md](SERIAL_COVERAGE.md) enumerates 13 entry/scheduling edges,
+all 12 plan operator kinds, 10 fallback/representation edges and seven
+configuration axes. Each has required/sibling/callback ownership, current
+reachability, local checkpoint or explicit unknown bound, evidence or a
+missing-evidence obligation, and an implementation group. This completes the
+inventory deliverable; it does not resolve the recorded enforcement gaps or
+prove every internal branch combination.
 
-| ID | Serial route family | Current disposition and evidence entry point |
-|---|---|---|
-| S01 | Source/VARIABLE scans and relation materialization | Implemented primitives; `evaluation_copy`, `evaluation_relation_creation`; qualify each host entry and representation. |
-| S02 | Numeric/typed FILTER, MAP, expression and REDUCE | Implemented restricted numeric paths; `evaluation_numeric_operators`, `evaluation_numeric_plan`, generated FILTER/MAP/REDUCE fixtures; remaining type/expression configurations need disposition. |
-| S03 | Ordinary/keyed JOIN and right predicates | Implemented evidence in `evaluation_join` and generated right-filter fixtures; cover rejected and colliding candidates and error policies. |
-| S04 | SEMIJOIN/ANTIJOIN and membership fallbacks | Restricted private scalar coverage in `eval_plan.c` and serial fixtures; required predicate/fallback combinations need qualification. |
-| S05 | CONSOLIDATE, sort/dedup, CONCAT, UNION | Metered private composition exists; `evaluation_consolidate`, `evaluation_serial`; verify required retained/owned/segmented and typed routes. |
-| S06 | LFTJ, cache/build and selected fallback | Generated LFTJ fixtures prove bounded child/reader/allocation work; enumerate remaining fallback branches and host admission. |
-| S07 | Serial recursive SCC/frontier scheduling | Restricted one/two-JOIN path manifests only; general required SCC/multihead/frontier routes remain unsupported or unqualified. |
-| S08 | Serial differential JOIN, trace and retraction | Active differential/retraction admission is refused; raw `diff_join` tests do not prove controlled interruption. Requires implementation and #1820 recovery coordination. |
-| S09 | Batch producer, pipeline, suspension/replay | Controlled producer primitives exist; session materialized fallback is exact VARIABLE/JOIN/FILTER/MAP/CONSOLIDATE and strict batching is refused. Qualify required shared-attempt producer/sink and fallback configurations. |
-| S10 | Observed evaluation and signed publication | Unary identity route exists; this PR adds one optional FILTER. Required typed/multi-column/multihead composition remains unqualified. Removal staging can consume registry slots and cause the next mutation to hit the existing three-slot refusal; bounded retirement/reuse remains a recovery gap. |
-| S11 | Session preflight, registry and cleanup | Bounded nonobserver preflight and cleanup helpers exist. Audit observed static scans/name lookups and engine-owned allocation/cleanup regions; do not infer boundedness from a restricted operator list. |
-| S12 | SNAPSHOT serial handoff and publication | `col_session_snapshot_controlled` delivers an already completed STEP after a final poll. It does not evaluate fresh/dirty state. Audit engine-owned delivery/precharge separately from cooperative host callbacks; coordinate evaluating lifecycle with #1820. |
-| S13 | Optional serial builds/configurations | Enumerate supported threading, batch, expression/library and fallback configurations; validate actual dispatch, or document why an exclusion is allowed by #1817. Worker execution belongs to #1822. |
+| Original family | Concrete matrix rows |
+|---|---|
+| S01 source/materialization | O01, F07, C05 |
+| S02 scalar expressions/aggregates | O02/O03/O06, C01/C02 |
+| S03 JOIN | O04, F01/F05 |
+| S04 SEMIJOIN/ANTIJOIN | O05/O09, C07 |
+| S05 consolidation/union | O07/O08, F07/F08 |
+| S06 LFTJ | O11, F06 |
+| S07 recursion | E05/E06, O10/O12, F08 |
+| S08 differential/retraction | E07, F04 |
+| S09 batch/pipeline | E08/E09, F01–F03, C04 |
+| S10 observed signed publication | E03/E04, F10 |
+| S11 preflight/resource lifecycle | E01/E02/E03/E11/E13, F09 |
+| S12 snapshot | E10, F10 |
+| S13 configurations | E12, C01–C07 |
+
+The next implementation milestone is **G1: bounded session admission and
+snapshot engine work**. Long pre-attempt observer scans and unpolled engine
+snapshot traversal are named enforcement gaps; callback cooperation does not
+exclude engine-owned work. G2–G7 group the remaining signed composition,
+recursive/differential, host batch/LFTJ, scalar/representation, resource/config,
+and final qualification work, with exit tests and #1820 dependencies.
 
 ## Work packages and exit criteria
 
-1. **Coverage contract (starts in this PR).** Expand S01–S13 into the complete
-   finite dispatch/configuration/fallback matrix, with evidence and explicit
-   exclusions. Exit: no unclassified required edge; a defensible remaining PR
-   grouping/count and recovery dependencies can then be stated. This PR only
-   starts this inventory and does not mark that exit condition satisfied.
+1. **Coverage contract (inventory complete at `0d91d02a`).** Every audited
+   dispatch family/configuration axis has a matrix disposition and an open-work
+   group where needed. Nine new admission cases distinguish refusal from real
+   execution. Implementation and unknown-bound obligations remain open in
+   G1–G7; further scope splits must be recorded before implementation.
 2. **Scalar observed composition.** Batch related required scalar/typed,
    multi-column and multihead host gaps, reusing metered operators and signed
    baseline/current preparation. Exit: every required S01–S05/S10 combination
    has actual-path stops, no premature/replayed publication, canonical retry
    and resource evidence. The optional unary FILTER and its retained-baseline
-   stop/retry repair are this PR's subitems. Repeated removals still require
+   stop/retry repair were delivered by PR #2271. Repeated removals still require
    bounded `$r$input` staging retirement/reuse coordinated with #1820.
 3. **Serial recursion/differential.** Complete required S07/S08 SCC/frontier,
    trace and retraction paths while retaining one allowance and the #1820
@@ -103,7 +114,7 @@ than silently enlarging the implementation scope.
    matrix edges have evidence, with no temporary unsupported required path.
    Then close #1821; parent/product qualification remains separately owned.
 
-## This PR's checklist and evidence
+## Historical evidence: PR #2271 (2026-10-25)
 
 - [x] Source-audit baseline, seven acceptance rows and ownership boundaries.
 - [x] Initial S01–S13 inventory and five packages with explicit exit criteria.
@@ -133,3 +144,25 @@ and `evaluation_snapshot_cutoff`; ASan/UBSan runs of the first four;
 `threading_doc_selftest`; LLVM 22 clang-tidy ratchet and uncrustify checks.
 These qualify this increment only. The complete suite, MSVC, and remaining
 serial matrix configurations are not claimed by this local run.
+
+## Coverage-contract follow-up (2026-10-26)
+
+- Completed the current dispatch-family/configuration-axis ledger with explicit
+  unsupported required routes and unknown engine-work bounds.
+- Added `test_controlled_session_admission_matrix`: nine static/charged host
+  refusals, no frame execution or side effects, then successful execution and
+  snapshot after restoring the supported configuration.
+- Preserved existing positive recursive, observed, batch and snapshot fixtures;
+  private LFTJ tests are explicitly not reported as session reachability.
+- Selected G1 as the next implementation milestone and recorded seven remaining
+  groups with exit tests rather than inventing a fixed remaining PR count.
+
+Local validation: native `evaluation_serial`, `evaluation_observer_build`,
+`session_admission`, `session`, `evaluation_retry` and
+`evaluation_snapshot_cutoff` passed; ASan/UBSan passed the first three.
+Documentation gates `state_map_anchors`, `state_map_anchors_selftest`,
+`threading_doc` and `threading_doc_selftest`, cited fixture/link checks,
+uncrustify and whitespace checks passed. Other matrix tests were inspected,
+not freshly run. This changes documentation and admission tests only; no
+production dispatch or policy changed. Full-suite, MSVC and optional builds
+remain unclaimed.

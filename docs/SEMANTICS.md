@@ -627,6 +627,8 @@ testing the actual optimizer pipeline.
 
 The [#1821 closure plan](implementation/1821/CLOSURE_PLAN.md) tracks serial
 coverage, remaining work packages, and the evidence required for closure.
+Its [serial coverage matrix](implementation/1821/SERIAL_COVERAGE.md) distinguishes
+session reachability, private operator evidence, and remaining enforcement gaps.
 
 `wirelog/evaluation_control.h` is internal and uninstalled. It provides a
 retained control, exclusive logical-session ownership, attempt accounting,
@@ -677,9 +679,11 @@ remain blocked. A null callback is rejected before a control attempt begins.
 Controlled snapshot checks cancellation immediately before the first tuple
 callback. A stop there publishes no tuples. Once publication starts, the full
 callback batch completes without further polls, so cancellation requested from
-a callback remains sticky for the next snapshot. Callback execution and tuple
-publication are the documented non-preemptible boundary outside the 256-unit
-evaluation-work quantum; this path does not evaluate or modify session state.
+a callback remains sticky for the next snapshot. Host callback bodies are a
+cooperative, non-preemptible boundary. The current engine tuple traversal and
+assembly also run without further work polls; bounding or precharging that
+engine-owned work remains an S12 enforcement gap, not a callback exclusion.
+This path does not evaluate or modify session state.
 Uncontrolled sessions retain existing behavior.
 
 When framed host setup or cleanup must be retried, STEP returns `EAGAIN` with
