@@ -2380,6 +2380,132 @@ wl_columnar_memory_downsize_attempt_advance(
     return EINVAL;
 }
 
+static bool
+wl_columnar_memory_reserved_trim_thread_equal(
+    const wl_columnar_memory_reserved_trim_t *attempt)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return attempt->thread_valid
+           && thrd_equal(attempt->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return attempt->thread_valid
+           && attempt->owner_thread == GetCurrentThreadId();
+#else
+    return attempt->thread_valid
+           && pthread_equal(attempt->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+int
+wl_columnar_memory_reserved_trim_begin(
+    wl_columnar_memory_reservation_t *token, uint64_t target_bytes,
+    wl_columnar_memory_reserved_trim_t *attempt)
+{
+    if (!token || !attempt || attempt->identity || attempt->token
+        || attempt->governor || attempt->old_bytes
+        || attempt->target_bytes || attempt->phase || attempt->thread_valid
+        || !reservation_identity_valid(token) || !target_bytes
+        || atomic_load_explicit(&token->owner_bits, memory_order_acquire)
+        != 0
+        || atomic_load_explicit(&token->state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED)
+        return EINVAL;
+    attempt->identity = attempt;
+    attempt->token = token;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
+    attempt->thread_valid = true;
+    attempt->target_bytes = target_bytes;
+    attempt->phase = WL_COLUMNAR_MEMORY_DOWNSIZE_CLAIM;
+    return 0;
+}
+
+int
+wl_columnar_memory_reserved_trim_advance(
+    wl_columnar_memory_reserved_trim_t *attempt)
+{
+    if (!attempt || attempt->identity != attempt
+        || !wl_columnar_memory_reserved_trim_thread_equal(attempt))
+        return EINVAL;
+    /* DONE belongs to the receipt, not the token: the reserved token may
+     * already have been released or reused by its owner. */
+    if (attempt->phase == WL_COLUMNAR_MEMORY_DOWNSIZE_DONE)
+        return 0;
+    if (attempt->phase == WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED)
+        return EINVAL;
+    if (!attempt->token
+        || !reservation_identity_valid(attempt->token)
+        || atomic_load_explicit(&attempt->token->owner_bits,
+        memory_order_acquire) != 0
+        || !attempt->target_bytes)
+        return EINVAL;
+    if (attempt->phase == WL_COLUMNAR_MEMORY_DOWNSIZE_CLAIM) {
+        uint64_t expected = WL_COLUMNAR_MEMORY_RESERVATION_RESERVED;
+        if (!atomic_compare_exchange_strong_explicit(&attempt->token->state,
+            &expected, WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING,
+            memory_order_acq_rel, memory_order_acquire)) {
+            attempt->phase = WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED;
+            return EBUSY;
+        }
+        /* Claim before reading mutable reservation payload, which is protected
+         * by DOWNSIZING from release, transfer and other resize operations. */
+        attempt->governor = attempt->token->governor;
+        attempt->old_bytes = attempt->token->bytes;
+        if (!attempt->governor || !attempt->old_bytes
+            || attempt->target_bytes >= attempt->old_bytes
+            || attempt->token->replacement_bytes
+            || attempt->token->transition_kind
+            != WL_COLUMNAR_MEMORY_TRANSITION_NONE) {
+            atomic_store_explicit(&attempt->token->state,
+                WL_COLUMNAR_MEMORY_RESERVATION_RESERVED,
+                memory_order_release);
+            attempt->phase = WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED;
+            return EINVAL;
+        }
+        attempt->phase = WL_COLUMNAR_MEMORY_DOWNSIZE_CREDIT;
+        return EAGAIN;
+    }
+    if (attempt->phase == WL_COLUMNAR_MEMORY_DOWNSIZE_CREDIT) {
+        uint64_t total, expected;
+        uint64_t refund = attempt->old_bytes - attempt->target_bytes;
+        if (!attempt->governor || !attempt->old_bytes
+            || attempt->target_bytes >= attempt->old_bytes
+            || attempt->token->governor != attempt->governor
+            || attempt->token->bytes != attempt->old_bytes
+            || attempt->token->replacement_bytes
+            || attempt->token->transition_kind
+            != WL_COLUMNAR_MEMORY_TRANSITION_NONE
+            || atomic_load_explicit(&attempt->token->state,
+            memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING)
+            return EINVAL;
+        total = atomic_load_explicit(&attempt->governor->reserved_bytes,
+                memory_order_relaxed);
+        if (total < refund)
+            return EINVAL;
+#if defined(WL_SESSION_TEST_HOOKS) || defined(WL_COLUMNAR_MEMORY_TEST_HOOKS)
+        if (wl_columnar_memory_downsize_test_before_credit_cas)
+            wl_columnar_memory_downsize_test_before_credit_cas(
+                attempt->governor);
+#endif
+        expected = total;
+        if (!atomic_compare_exchange_strong_explicit(
+                &attempt->governor->reserved_bytes, &expected,
+                total - refund, memory_order_acq_rel, memory_order_acquire))
+            return EAGAIN;
+        attempt->token->bytes = attempt->target_bytes;
+        atomic_store_explicit(&attempt->token->state,
+            WL_COLUMNAR_MEMORY_RESERVATION_RESERVED, memory_order_release);
+        attempt->phase = WL_COLUMNAR_MEMORY_DOWNSIZE_DONE;
+        return 0;
+    }
+    return EINVAL;
+}
+
 enum {
     WL_MEMORY_RELEASE_MODE_NONE = 0,
     WL_MEMORY_RELEASE_MODE_RELEASE = 1,

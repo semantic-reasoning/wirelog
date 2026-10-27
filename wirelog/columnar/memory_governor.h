@@ -410,6 +410,35 @@ int wl_columnar_memory_downsize_attempt_begin(
 int wl_columnar_memory_downsize_attempt_advance(
     wl_columnar_memory_downsize_attempt_t *attempt);
 
+/* Shrink never-allocated admission slack on a canonical RESERVED token.
+ * Caller proves target still covers every live allocation/commitment. Positive
+ * target only; rollback owns the wholly unused case. Canonical owner_bits=0.
+ * One strong CAS per advance. CREDIT must be drained before rollback, even
+ * after cancellation. Invalid CREDIT invariants retain the claim and return
+ * EINVAL; discarding such a receipt is a caller protocol violation. */
+typedef struct wl_columnar_memory_reserved_trim {
+    struct wl_columnar_memory_reserved_trim *identity;
+    wl_columnar_memory_reservation_t *token;
+    wl_columnar_memory_governor_t *governor;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    uint64_t old_bytes;
+    uint64_t target_bytes;
+    wl_columnar_memory_downsize_phase_t phase;
+    bool thread_valid;
+} wl_columnar_memory_reserved_trim_t;
+
+int wl_columnar_memory_reserved_trim_begin(
+    wl_columnar_memory_reservation_t *, uint64_t,
+    wl_columnar_memory_reserved_trim_t *);
+int wl_columnar_memory_reserved_trim_advance(
+    wl_columnar_memory_reserved_trim_t *);
+
 /* rc0 makes ready authoritative; shape/claim refusal yields false. Invalid
  * pointers/record/attempt yield EINVAL. Stops preserve original reservations.
  * Preparation admits a conservative228 units once (including finish44), then

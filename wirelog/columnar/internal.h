@@ -2073,6 +2073,35 @@ typedef struct {
     bool active;
 } col_diff_arrangement_pin_t;
 
+/* Stable host-owned differential registry image. Entries own only pointers;
+ * address-bound credits stay in this original record or arrangement objects.
+ * A slot owns its replacement iff owned is true; old registry ownership is
+ * retained until the coordinated session cutoff. */
+typedef struct {
+    const col_rel_t *source;
+    col_relation_snapshot_t snapshot;
+    uint64_t generation;
+    bool owned;
+} wl_columnar_arrangement_diff_slot_t;
+
+typedef struct {
+    col_diff_arr_entry_t *image, *original;
+    wl_columnar_arrangement_diff_slot_t *slots;
+    uint32_t count, capacity, old_count, old_capacity;
+    uint32_t validate, cleanup_index;
+    unsigned cleanup_phase, retire_phase, prepare_phase;
+    uint64_t array_bytes, metadata_bytes, slots_bytes, old_bytes;
+    uint64_t metadata_limit, retire_bytes;
+    wl_columnar_memory_reservation_t image_credit, slots_credit, build_credit;
+    wl_columnar_memory_reservation_t old_credit, retire_credit;
+    wl_columnar_memory_reserved_trim_t trim;
+    col_diff_arrangement_t *building, *retiring;
+    wl_columnar_memory_governor_ref_t *retire_governor;
+    struct wl_mem_ledger *retire_ledger;
+    bool started, ready, committed, drained, building_initialized;
+    bool image_charged, slots_charged, prepared;
+} wl_columnar_arrangement_diff_attempt_t;
+
 /* ======================================================================== */
 /* Frontier Vtable (Issue #261)                                             */
 /* ======================================================================== */
@@ -6765,6 +6794,27 @@ typedef struct wl_columnar_eval_private_bindings {
 
 bool wl_columnar_session_observed_bindings_authorized(
     const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
+int wl_columnar_session_diff_index(
+    wl_col_session_t *, const wl_columnar_eval_private_bindings_t *,
+    const col_rel_t *, const char *, const uint32_t *, uint32_t,
+    col_diff_arrangement_t **, bool *);
+int wl_columnar_arrangement_diff_attempt_index(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
+    const wl_plan_op_t *, uint32_t, const col_rel_t *, const char *,
+    const uint32_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
+    col_diff_arrangement_t **, bool *);
+int wl_columnar_arrangement_diff_attempt_prepare(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t);
+void wl_columnar_arrangement_diff_attempt_commit(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *);
+int wl_columnar_arrangement_diff_attempt_drain(
+    wl_columnar_arrangement_diff_attempt_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_arrangement_test_diff_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t);
+#endif
 int wl_columnar_eval_private_binding_get(
     const wl_columnar_eval_private_bindings_t *, uint32_t,
     const char **, col_rel_t **);

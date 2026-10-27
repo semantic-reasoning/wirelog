@@ -3765,8 +3765,10 @@ test_controlled_observed_multi(void)
             uint64_t reserved =
                 wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                         governor));
-            if (cycle == 3) resource_baseline = reserved;
-            else CHECK(reserved == resource_baseline);
+            /* Persistent indexes warm after both EDBs become nonempty;
+             * the next registry image admits capacity for existing entries. */
+            if (cycle == 11) resource_baseline = reserved;
+            else if (cycle > 11) CHECK(reserved == resource_baseline);
         }
         unsigned delivered = actual->count;
         CHECK(!observed_multi_step(session) && actual->count == delivered);
@@ -3791,6 +3793,270 @@ test_controlled_observed_multi(void)
             governor)));
     wl_columnar_memory_governor_ref_release(governor);
     free(actual); free(expected);
+}
+
+static unsigned persistent_builds, persistent_reuses;
+static uint64_t persistent_indexed, persistent_probes;
+static void
+persistent_arrangement_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)control; (void)progress;
+    if (phase == 13) ++persistent_reuses;
+    if (phase == 14) ++persistent_builds;
+}
+static void
+persistent_join_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t progress)
+{
+    (void)control; (void)progress;
+    if (phase == 47) ++persistent_indexed;
+    if (phase == 48) ++persistent_probes;
+}
+
+static void
+test_controlled_persistent_join(void)
+{
+    const char *source =
+        ".decl left(x:int64)\n.decl right(x:int64,y:int64)\n"
+        ".decl first(x:int64,y:int64)\n.decl mirror(x:int64,y:int64)\n"
+        ".decl second(x:int64,y:int64)\n"
+        "first(x,y) :- left(x), right(x,y).\n"
+        "mirror(x,y) :- left(x), right(x,y).\n"
+        "second(x,y) :- left(y), right(x,y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL;
+    CHECK(!wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_session_options_t options;
+    wl_session_options_init(&options); options.evaluation_control = control;
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+    };
+    wl_columnar_memory_governor_ref_t *governor =
+        wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(governor); options.memory_governor = governor;
+    wl_session_t *session = NULL, *reference = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+    ((wl_col_session_t *)reference)->diff_enabled = false;
+    observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+    observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+    CHECK(actual && expected);
+    wl_session_set_delta_cb(session, observed_multi_capture, actual);
+    wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+    const int64_t left[] = {1, 2}, right[] = {1, 1, 2, 2, 1, 2, 4, 4};
+    CHECK(!wl_session_insert(session, "left", left, 2, 1));
+    CHECK(!wl_session_insert(reference, "left", left, 2, 1));
+    CHECK(!wl_session_insert(session, "right", right, 4, 2));
+    CHECK(!wl_session_insert(reference, "right", right, 4, 2));
+    col_diff_arrangement_t *previous[2] = {NULL, NULL};
+    wl_col_session_t *cs = (wl_col_session_t *)session;
+    for (unsigned cycle = 0; cycle < 4; ++cycle) {
+        const int64_t added_left[] = {4}, added_right[] = {4, 2};
+        if (cycle == 1) {
+            CHECK(!wl_session_insert(session, "left", added_left, 1, 1));
+            CHECK(!wl_session_insert(reference, "left", added_left, 1, 1));
+        } else if (cycle == 2) {
+            CHECK(!wl_session_insert(session, "right", added_right, 1, 2));
+            CHECK(!wl_session_insert(reference, "right", added_right, 1, 2));
+        } else if (cycle == 3) {
+            CHECK(!wl_session_remove(session, "right", added_right, 1, 2));
+            CHECK(!wl_session_remove(reference, "right", added_right, 1, 2));
+        }
+        actual->count = expected->count = 0;
+        persistent_builds = persistent_reuses = 0;
+        persistent_indexed = persistent_probes = 0;
+        wl_columnar_arrangement_test_diff_checkpoint =
+            persistent_arrangement_checkpoint;
+        wl_columnar_join_test_attempt_checkpoint = persistent_join_checkpoint;
+        CHECK(!observed_multi_step(session));
+        wl_columnar_arrangement_test_diff_checkpoint = NULL;
+        wl_columnar_join_test_attempt_checkpoint = NULL;
+        CHECK(!wl_session_step(reference));
+        CHECK(cs->diff_arr_count == 2 && persistent_probes);
+        if (cycle == 1) {
+            CHECK(!persistent_builds && !persistent_indexed &&
+                persistent_reuses == 3);
+            for (unsigned i = 0; i < 2; ++i)
+                CHECK(cs->diff_arr_entries[i].diff_arr == previous[i]);
+        } else {
+            CHECK(persistent_builds == 2 && persistent_reuses == 1);
+            CHECK(persistent_indexed == (cycle == 2 ? 10 : 8));
+            for (unsigned i = 0; i < 2; ++i)
+                CHECK(cs->diff_arr_entries[i].diff_arr != previous[i]);
+        }
+        for (unsigned i = 0; i < 2;
+            ++i) previous[i] = cs->diff_arr_entries[i].diff_arr;
+        CHECK(actual->count == expected->count);
+        qsort(actual->events, actual->count, sizeof(actual->events[0]),
+            observed_multi_order);
+        qsort(expected->events, expected->count, sizeof(expected->events[0]),
+            observed_multi_order);
+        CHECK(!memcmp(actual->events, expected->events,
+            actual->count * sizeof(actual->events[0])));
+    }
+    /* Exercise raw token/metadata consumers after controlled publication. */
+    const col_rel_t *r = session_find_rel(cs, "right");
+    uint32_t keys[] = {0, 1};
+    int status = 0;
+    col_diff_arrangement_t *unrelated = col_session_get_diff_arrangement(cs,
+            "right", r, keys, 2, &status);
+    CHECK(unrelated && !status && cs->diff_arr_count == 3);
+    col_diff_arrangement_pin_t pin = {0};
+    CHECK(!col_session_pin_diff_arrangement(cs, "right", r, keys, 1, &pin));
+    col_diff_arrangement_pin_release(&pin);
+    const int64_t extra[] = {9};
+    CHECK(!wl_session_insert(session, "left", extra, 1, 1));
+    actual->count = 0;
+    CHECK(!observed_multi_step(session));
+    CHECK(cs->diff_arr_count == 3 &&
+        cs->diff_arr_entries[2].diff_arr == unrelated);
+    CHECK(!wl_session_try_destroy(&session));
+    wl_session_destroy(reference); wl_evaluation_control_release(control);
+    wl_plan_free(plan); wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            governor)));
+    wl_columnar_memory_governor_ref_release(governor);
+    free(actual); free(expected);
+}
+
+static unsigned persistent_stop_phase, persistent_stop_hits;
+static bool persistent_stop_work, persistent_stopped;
+static void
+persistent_stop(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase != persistent_stop_phase || persistent_stopped) return;
+    if (++persistent_stop_hits < 2 && phase != 6 && phase != 10 &&
+        phase != 14) return;
+    persistent_stopped = true;
+    if (persistent_stop_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_controlled_persistent_stops(void)
+{
+    const unsigned phases[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                               15, 47, 48};
+    const char *source = ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+        ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+        "a(x,y) :- l(x), r(x,y).\nb(x,y) :- l(x), r(x,y).\n";
+    for (unsigned point = 0; point < sizeof(phases)/sizeof(phases[0]);
+        ++point){
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor); options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &session));
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            ((wl_col_session_t *)reference)->diff_enabled = false;
+            const int64_t left[] = {1, 2}, right[] = {1, 1, 2, 2};
+            CHECK(!wl_session_insert(session, "l", left, 2, 1));
+            CHECK(!wl_session_insert(reference, "l", left, 2, 1));
+            CHECK(!wl_session_insert(session, "r", right, 2, 2));
+            CHECK(!wl_session_insert(reference, "r", right, 2, 2));
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+            observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            wl_col_session_t *cs = (wl_col_session_t *)session;
+            CHECK(cs->diff_arr_count == 1);
+            col_diff_arr_entry_t *registry = cs->diff_arr_entries;
+            col_diff_arrangement_t *arr = registry[0].diff_arr;
+            uint64_t generation = registry[0].generation;
+            col_rel_t *heads[] = {session_find_rel(cs, "a"),
+                                  session_find_rel(cs, "b")};
+            col_relation_snapshot_t snapshots[] = {
+                wl_columnar_relation_snapshot(heads[0]),
+                wl_columnar_relation_snapshot(heads[1])
+            };
+            actual->count = expected->count = 0;
+            const int64_t extra[] = {1, 3};
+            bool reuse = phases[point] == 12 || phases[point] == 13;
+            CHECK(!wl_session_insert(session, reuse ? "l" : "r", extra, 1,
+                reuse ? 1 : 2));
+            CHECK(!wl_session_insert(reference, reuse ? "l" : "r", extra, 1,
+                reuse ? 1 : 2));
+            CHECK(!wl_evaluation_control_configure(control,
+                UINT64_C(1000000000)));
+            generation = registry[0].generation;
+            persistent_stop_phase = phases[point]; persistent_stop_hits = 0;
+            persistent_stop_work = mode != 0; persistent_stopped = false;
+            wl_columnar_arrangement_test_diff_checkpoint = persistent_stop;
+            wl_columnar_join_test_attempt_checkpoint = persistent_stop;
+            int rc = observed_multi_step(session);
+            wl_columnar_arrangement_test_diff_checkpoint = NULL;
+            wl_columnar_join_test_attempt_checkpoint = NULL;
+            if (!persistent_stopped) fprintf(stderr,
+                    "missed persistent phase %u rc %d\n", phases[point], rc);
+            CHECK(persistent_stopped);
+            CHECK(rc ==
+                (mode ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(!actual->count && cs->diff_arr_entries == registry);
+            CHECK(registry[0].diff_arr == arr &&
+                registry[0].generation == generation);
+            for (unsigned i = 0; i < 2; ++i) {
+                CHECK(session_find_rel(cs, i ? "b" : "a") == heads[i]);
+                CHECK(wl_columnar_relation_snapshot_equal(snapshots[i],
+                    wl_columnar_relation_snapshot(heads[i])));
+            }
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            rc = observed_multi_step(session);
+            if (rc) fprintf(stderr, "persistent retry phase %u mode %u rc %d\n",
+                    phases[point], mode, rc);
+            CHECK(!rc && !wl_session_step(reference));
+            CHECK(!cs->diff_txn_count && actual->count == expected->count);
+            qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(actual->events, expected->events,
+                actual->count*sizeof(actual->events[0])));
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+            free(actual); free(expected);
+        }
+    }
 }
 
 static unsigned incremental_step_phase, incremental_step_hits;
@@ -10810,6 +11076,8 @@ main(void)
     test_controlled_recursive_transaction_refusals();
     test_controlled_recursive_transaction_nonlinear_view();
     test_controlled_observed_multi();
+    test_controlled_persistent_join();
+    test_controlled_persistent_stops();
     test_controlled_incremental_consolidate_step();
     test_controlled_observed_wide_public();
     test_controlled_observed_transaction_budget();

@@ -5278,7 +5278,47 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
     if (rc) goto done;
     uint32_t buckets = 1;
     uint32_t *heads = NULL, *next = NULL;
-    if (keyed) {
+    col_diff_arrangement_t *persistent = NULL;
+    bool build_persistent = false;
+    if (keyed && session->diff_enabled && !used_delta && !filtered_right &&
+        private_bindings) {
+        rc = wl_columnar_join_attempt_charge(control, id,
+                WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+        if (rc) goto done;
+        rc = wl_columnar_session_diff_index(session, private_bindings, right,
+                op->right_relation, right_keys, op->key_count,
+                &persistent, &build_persistent);
+        rc = wl_columnar_join_attempt_return(control, id, rc);
+        if (rc) goto done;
+    }
+    if (persistent) {
+        buckets = persistent->nbuckets;
+        heads = persistent->ht_head; next = persistent->ht_next;
+        if (build_persistent) {
+            for (uint32_t row = 0; row < ctx->join_right.nrows; ++row) {
+                rc = wl_columnar_join_attempt_charge(control, id,
+                        WL_COLUMNAR_JOIN_ATTEMPT_WORK);
+                if (rc) goto done;
+                uint32_t hash = 0;
+                rc = wl_columnar_join_attempt_hash(right, row, right_keys,
+                        op->key_count, &hash, control, id);
+                rc = wl_columnar_join_attempt_return(control, id, rc);
+                if (rc) goto done;
+                rc = wl_columnar_join_attempt_charge(control, id,
+                        WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+                if (rc) goto done;
+                uint32_t bucket = hash & (buckets - 1u);
+                next[row] = heads[bucket]; heads[bucket] = row + 1u;
+                rc = wl_columnar_join_attempt_tail(control, id, 47, row);
+                if (rc) goto done;
+            }
+            rc = wl_columnar_join_attempt_charge(control, id,
+                    WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
+            if (rc) goto done;
+            persistent->indexed_rows = persistent->current_nrows = right->nrows;
+            persistent->source_snapshot = wl_columnar_relation_snapshot(right);
+        }
+    } else if (keyed) {
         rc = wl_columnar_join_attempt_charge(control, id,
                 WL_COLUMNAR_JOIN_ATTEMPT_WORK);
         if (rc) goto done;
@@ -5366,15 +5406,30 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
                     WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
             if (rc) goto done;
             first = heads[hash & (buckets - 1u)];
+            if (persistent) {
+                if (first > ctx->join_right.nrows) {
+                    rc = EINVAL; goto done;
+                }
+                first = first ? first - 1u : UINT32_MAX;
+            }
             rc = wl_columnar_join_attempt_tail(control, id, 29, lr);
             if (rc) goto done;
         }
         for (uint32_t selected = 0, rr = first;
             keyed ? rr < ctx->join_right.nrows : selected < selected_rows;
-            rr = keyed ? next[rr] : rr + 1u, ++selected) {
+            rr = keyed ? persistent ? next[rr] ? next[rr] - 1u : UINT32_MAX
+                : next[rr] : rr + 1u, ++selected) {
             rc = wl_columnar_join_attempt_charge(control, id,
                     WL_COLUMNAR_JOIN_ATTEMPT_CELL_WORK);
             if (rc) goto done;
+            if (persistent &&
+                (selected >= ctx->join_right.nrows || next[rr] > rr)) {
+                rc = EINVAL; goto done;
+            }
+            if (persistent) {
+                rc = wl_columnar_join_attempt_tail(control, id, 48, rr);
+                if (rc) goto done;
+            }
             if (!keyed) rr = filtered_right
                 ? (uint32_t)ctx->values[selected] : selected;
             ctx->row = lr;
