@@ -5054,6 +5054,9 @@ static void
 col_controlled_step_record_edge_append(wl_col_session_t *sess, col_rel_t *edge)
 {
     wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
+    /* General transactions authorize EDB mutations through their owned table;
+     * the public mutation-completed callback schedules full recomputation. */
+    if (step && step->general_observed) return;
     if (!step || !step->complete || !step->recursive_route
         || !step->provenance_valid || step->provenance_invalid
         || edge != step->provenance_edge
@@ -6465,8 +6468,13 @@ static bool
 wl_columnar_session_recursive_transaction_shape(const wl_col_session_t *sess)
 {
     const wl_plan_t *plan = sess->plan;
-    if (!sess->delta_cb || !plan || !plan->strata
-        || plan->stratum_count > MAX_STRATA) return false;
+    if (!plan || !plan->strata ||
+        plan->stratum_count > MAX_STRATA) return false;
+    /* Preserve the independently qualified binary fast path and its tariffs. */
+    if (!sess->delta_cb && plan->stratum_count == 1
+        && plan->strata[0].relation_count == 1 && plan->strata[0].relations
+        && wl_columnar_eval_plan_numeric_recursive_path_supported(
+            &plan->strata[0].relations[0])) return false;
     for (uint32_t i = 0; i < plan->stratum_count; ++i) {
         const wl_plan_stratum_t *stratum = &plan->strata[i];
         if (!stratum->is_recursive) continue;
@@ -9623,6 +9631,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         }
         return 0;
     case WL_SESSION_OBSERVED_BASELINE:
+        if (!sess->delta_cb) {
+            tx->index = 0; tx->phase = WL_SESSION_OBSERVED_REGISTRY; return 0;
+        }
         if (!tx->observer_started) {
             rc = tx->missing_count
                 ? wl_columnar_eval_delta_observer_build_start_missing_heads(
@@ -9769,9 +9780,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         sess->snapshot_stable_valid = true;
         sess->uncommitted_strata_done = 0;
         tx->committed = step->published = true;
-        step->observer_cleanup_pending = true;
+        step->observer_cleanup_pending = tx->observer_started;
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RETIRE;
-        wl_columnar_eval_delta_observer_publish(sess);
+        if (tx->observer_started) wl_columnar_eval_delta_observer_publish(sess);
         return 0;
     }
     case WL_SESSION_OBSERVED_RETIRE:
@@ -9829,8 +9840,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (rc) return rc;
         tx->cleanup_index = tx->old_count;
         tx->dispose_index = tx->count;
-        rc = wl_columnar_eval_delta_observer_finish(sess);
-        if (rc) return rc;
+        if (tx->observer_started) {
+            rc = wl_columnar_eval_delta_observer_finish(sess);
+            if (rc) return rc;
+        }
         step->observer_cleanup_pending = false;
         step->complete = true; tx->phase = WL_SESSION_OBSERVED_DONE;
         return 0;
@@ -10660,7 +10673,7 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
 {
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (!step || !step->observed)
+    if (!step || (!step->observed && !step->general_observed))
         return EBUSY;
     if (step->general_observed) {
         const wl_columnar_session_observed_transaction_t *tx =
