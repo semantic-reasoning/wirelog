@@ -86,6 +86,23 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_weighted_bounded(
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out);
+/* Ordinary capped JOIN with direct output projection. Indices address the
+ * flattened left-then-right schema; duplicates/reordering/key omission are
+ * valid. A positive count requires a non-NULL map and all indices in range;
+ * invalid maps return INVALID with *out NULL. Count zero ignores the pointer
+ * and concatenates, as create_bounded(). The producer copies the map into a
+ * separately governed allocation (reservation descriptor + count uint32s).
+ * Output scratch and batch_bytes use the projected width; input readers retain
+ * their full row scratch. No full-width intermediate output is materialized.
+ * Existing ownership, metadata validation, windowing and retry contracts apply.
+ * The caller may change/free the map after construction, not during callbacks. */
+wl_columnar_spill_status_t wl_columnar_payload_join_create_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_continuation_t **out);
 /* Only for a continuation returned by these constructors; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */
 wl_columnar_spill_status_t wl_columnar_payload_join_error(
