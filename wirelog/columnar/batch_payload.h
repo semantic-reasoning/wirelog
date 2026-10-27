@@ -35,6 +35,32 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_capture(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out);
 
+/* Eligibility concerns backing/credit only, not caller ownership authority.
+ * Callers serialize the source lifecycle. Readers and alias borrows are dynamic
+ * contention: they do not change this predicate and take returns BUSY for them. */
+bool wl_columnar_batch_payload_can_take(const struct col_rel *source);
+
+/* Transfer a complete governed numeric heap relation to an immutable spilled
+ * owner. Caller exclusively owns *source (never a registry/cache borrow) and
+ * serializes mutation and lifecycle; callbacks must not reenter any involved
+ * source/store/governor lifecycle. Same-governor store/source required.
+ * Canonical heap backing only, without pool/arena/shared/retraction ownership.
+ * All ordinals, lane bits, types and timestamp/signed metadata are preserved;
+ * original relation identity ends, and no relation-index cache is transferable.
+ *
+ * Success frees resident storage and clears *source before publishing *out.
+ * Every failure leaves *source unchanged and *out NULL, refunding private files
+ * and charges. Existing readers/aliases can refuse terminal retirement after
+ * capture. Cancellation is checked before retirement, never after it commits.
+ * Transition needs old source plus bounded capture scratch and payload metadata;
+ * insufficient transition credit fails explicitly. Small inputs may save none.
+ * Source and output pointer slots must be distinct and remain live throughout. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_take(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, struct col_rel **source,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out);
+
 /* Stream a known number of numeric scalar rows directly into a spilled payload,
  * without a resident relation or rowset. Same-governor store required. Types
  * are copied; source/types/contexts are borrowed only until return. The source

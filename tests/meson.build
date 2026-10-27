@@ -6579,8 +6579,8 @@ test('evaluation_observer_build', test_evaluation_observer_build_exe,
 
 # #1372 owned numeric resident/spilled payloads.
 test_batch_payload_exe = executable(
-  'test_batch_payload', files('test_batch_payload.c', '../wirelog/columnar/batch_payload.c'),
-  c_args: ['-DWL_TEST_BATCH_PAYLOAD=1'],
+  'test_batch_payload', files('test_batch_payload.c', '../wirelog/columnar/batch_payload.c', '../wirelog/columnar/spill.c'),
+  c_args: ['-DWL_TEST_BATCH_PAYLOAD=1', '-DWL_TEST_SPILL=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],

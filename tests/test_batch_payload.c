@@ -1008,6 +1008,204 @@ static void streamed_payload(void)
     wl_columnar_memory_governor_ref_release(other);
 }
 
+static unsigned take_io_fault, take_io_calls, take_alloc_fault;
+bool wl_columnar_spill_test_allocation(void)
+{
+    return take_alloc_fault && --take_alloc_fault == 0;
+}
+int wl_columnar_spill_test_io(bool writing, uint64_t offset, size_t *length)
+{
+    (void)offset;
+    if (!writing || !take_io_fault) return 0;
+    if (*length > 3) *length = 3;
+    if (++take_io_calls > 3)
+        return take_io_fault == 1 ? EIO : ENOSPC;
+    return 0;
+}
+
+typedef struct { unsigned calls, fail; } take_cancel_t;
+static bool
+take_cancel(void *context)
+{
+    take_cancel_t *state = context;
+    return ++state->calls == state->fail;
+}
+
+static col_rel_t *
+take_source(wl_columnar_memory_governor_ref_t *g)
+{
+    col_rel_t *r = source();
+    CHECK(col_rel_attach_memory_governor(r, g) == 0);
+    CHECK(wl_columnar_batch_payload_can_take(r));
+    return r;
+}
+
+static void
+take_payload(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20),
+        *other = governor(1 << 20);
+    wl_columnar_spill_store_t *store, *tiny;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 64,
+        &store) == OK);
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 32, 64, &tiny) == OK);
+    uint64_t baseline = reserved(g);
+    col_rel_t *r = take_source(g);
+    uint64_t resident = reserved(g) - baseline;
+    wl_columnar_batch_payload_t *p = NULL;
+    take_cancel_t cancellation = {0};
+    CHECK(wl_columnar_batch_payload_take(g, store, &r, take_cancel,
+        &cancellation, &p) == OK && !r && p);
+    unsigned cancellation_calls = cancellation.calls;
+    uint64_t bytes, reader_bytes;
+    wl_columnar_spill_floor_t floor;
+    CHECK(wl_columnar_batch_payload_floor(3, 8,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, &bytes, &reader_bytes) == OK);
+    CHECK(wl_columnar_spill_floor(test_tmpdir(), 3, &floor) == OK);
+    CHECK(reserved(g) == baseline + bytes + floor.segment_bytes);
+    CHECK(resident > bytes + floor.segment_bytes);
+    uint32_t ncols, nrows;
+    const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(p,
+            &ncols, &nrows);
+    CHECK(ncols == 3 && nrows == 8 && types[0] == WIRELOG_TYPE_INT64 &&
+        types[1] == WIRELOG_TYPE_FLOAT && types[2] == WIRELOG_TYPE_BOOL);
+    wl_columnar_batch_payload_reader_t *readers[2];
+    CHECK(wl_columnar_batch_payload_acquire(p, &readers[0]) == OK);
+    CHECK(wl_columnar_batch_payload_acquire(p, &readers[1]) == OK);
+    CHECK(wl_columnar_batch_payload_release(p) == WL_COLUMNAR_SPILL_BUSY);
+    job_t jobs[] = {{readers[0]}, {readers[1]}};
+    wl_thread_t threads[2];
+    CHECK(wl_thread_create(&threads[0], read_thread, &jobs[0]) == 0);
+    CHECK(wl_thread_create(&threads[1], read_thread, &jobs[1]) == 0);
+    wl_thread_join(&threads[0]); wl_thread_join(&threads[1]);
+    for (unsigned i = 0; i < 2; i++)
+        wl_columnar_batch_payload_reader_release(readers[i]);
+    uint64_t published = wl_columnar_spill_store_bytes(store);
+    /* Keep an existing payload live throughout private rollback checks. */
+    for (unsigned kind = 0; kind < 16; kind++) {
+        r = take_source(g);
+        col_rel_t *original = r, *alias = NULL;
+        col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(r);
+        wl_columnar_source_access_reader_t lease = {0};
+        wl_columnar_spill_store_t *target = store;
+        wl_columnar_memory_governor_ref_t *owner = g;
+        wl_columnar_spill_status_t expected = WL_COLUMNAR_SPILL_UNSUPPORTED;
+        cancellation = (take_cancel_t){0};
+        if (kind == 0) {
+            wl_columnar_batch_payload_test_fail_allocation(1);
+            expected = WL_COLUMNAR_SPILL_ALLOCATION;
+        }
+        if (kind == 1) {
+            take_alloc_fault = 1; expected = WL_COLUMNAR_SPILL_ALLOCATION;
+        }
+        if (kind == 2) {
+            target = tiny; expected = WL_COLUMNAR_SPILL_QUOTA;
+        }
+        if (kind == 3 || kind == 4) {
+            take_io_fault = kind - 2; take_io_calls = 0;
+            expected = kind ==
+                3 ? WL_COLUMNAR_SPILL_IO : WL_COLUMNAR_SPILL_CAPACITY;
+        }
+        if (kind == 5 || kind == 6) {
+            cancellation.fail = kind == 5 ? 1 : cancellation_calls;
+            expected = WL_COLUMNAR_SPILL_CANCELLED;
+        }
+        if (kind == 7 || kind == 8) {
+            CHECK(wl_columnar_source_access_reader_acquire(kind == 7 ?
+                &r->source_access : &r->descriptor_access, &lease) == 0);
+            CHECK(wl_columnar_batch_payload_can_take(r));
+            expected = WL_COLUMNAR_SPILL_BUSY;
+        }
+        if (kind == 9) {
+            alias = col_rel_new_auto("alias", 3);
+            CHECK(alias && col_rel_attach_memory_governor(alias, g) == 0);
+            CHECK(col_rel_install_shared_view(alias, r) == 0);
+            wl_columnar_batch_payload_t *alias_out = NULL;
+            CHECK(wl_columnar_batch_payload_take(g, store, &alias, NULL, NULL,
+                &alias_out) == WL_COLUMNAR_SPILL_UNSUPPORTED && alias &&
+                !alias_out);
+            CHECK(wl_columnar_batch_payload_can_take(r));
+            CHECK(!wl_columnar_batch_payload_can_take(alias));
+            expected = WL_COLUMNAR_SPILL_BUSY;
+        }
+        if (kind == 10) {
+            owner = other; expected = WL_COLUMNAR_SPILL_INVALID;
+        }
+        /* Shape rejection precedes capture; restore synthetic flags before
+        * inspecting or retiring the genuinely governed heap allocation. */
+        if (kind == 11) r->pool_owned = true;
+        if (kind == 12) r->arena_owned = true;
+        if (kind == 13) r->retract_backup_nrows = 1;
+        if (kind == 14) r->retained_reserved_bytes++;
+        if (kind == 15) r->storage_owner_generation++;
+        uint64_t before = reserved(g);
+        wl_columnar_batch_payload_t *out = (void *)1;
+        CHECK(wl_columnar_batch_payload_take(owner, target, &r, take_cancel,
+            &cancellation, &out) == expected);
+        CHECK(!out && r == original && reserved(g) == before);
+        CHECK(wl_columnar_spill_store_bytes(store) == published &&
+            wl_columnar_spill_store_bytes(tiny) == 0);
+        if (kind == 6) CHECK(cancellation.calls == cancellation_calls);
+        if (kind == 3 || kind == 4) CHECK(take_io_calls > 3);
+        r->pool_owned = r->arena_owned = false;
+        r->retract_backup_nrows = 0;
+        if (kind == 14) r->retained_reserved_bytes--;
+        if (kind == 15) r->storage_owner_generation--;
+        take_io_fault = take_io_calls = take_alloc_fault = 0;
+        if (lease.owner) CHECK(wl_columnar_source_access_reader_release(
+                    &lease) == 0);
+        if (alias) CHECK(col_rel_destroy_checked(alias) == 0);
+        CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+            wl_columnar_relation_snapshot(r)));
+        CHECK(!wl_columnar_source_access_gate_busy(&r->source_access) &&
+            !wl_columnar_source_access_gate_busy(&r->descriptor_access));
+        for (uint32_t row = 0; row < 8; row++) {
+            CHECK(r->columns[0][row] == -(int64_t)row);
+            double value = -(double)row / 2;
+            int64_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            CHECK(r->columns[1][row] == bits && r->columns[2][row] == row % 2);
+            CHECK(r->timestamps[row].iteration == row &&
+                r->timestamps[row].stratum == 7 &&
+                r->timestamps[row].worker == 3 &&
+                r->timestamps[row].multiplicity == (row % 2 ? -2 : 1));
+        }
+        CHECK(col_rel_destroy_checked(r) == 0);
+    }
+    /* The entire transition floor is required while original storage is live. */
+    r = take_source(g);
+    uint64_t before = reserved(g),
+        need = bytes + floor.segment_bytes + floor.writer_bytes;
+    wl_columnar_memory_reservation_t held;
+    wl_columnar_memory_reservation_init(&held);
+    CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(g),
+        (1 << 20) - before - need + 1, &held));
+    wl_columnar_batch_payload_t *out = NULL;
+    CHECK(wl_columnar_batch_payload_take(g, store, &r, NULL, NULL, &out) ==
+        WL_COLUMNAR_SPILL_MEMORY && r && !out);
+    CHECK(wl_columnar_memory_rollback(&held) && reserved(g) == before);
+    CHECK(wl_columnar_spill_store_bytes(store) == published);
+    CHECK(col_rel_destroy_checked(r) == 0);
+    CHECK(wl_columnar_batch_payload_release(p) == OK);
+    CHECK(wl_columnar_relation_new_auto_governed("empty", 1, 0, false, g,
+        &r) == 0);
+    wirelog_column_type_t invalid = WIRELOG_TYPE_STRING;
+    CHECK(col_rel_set_column_types(r, &invalid, 1) == 0);
+    CHECK(wl_columnar_batch_payload_take(g, store, &r, NULL, NULL, &out) ==
+        WL_COLUMNAR_SPILL_UNSUPPORTED && r && !out);
+    invalid = WIRELOG_TYPE_UINT64;
+    CHECK(col_rel_set_column_types(r, &invalid, 1) == 0);
+    CHECK(wl_columnar_batch_payload_take(g, store, &r, NULL, NULL,
+        &out) == OK && !r);
+    types = wl_columnar_batch_payload_schema(out, &ncols, &nrows);
+    CHECK(ncols == 1 && nrows == 0 && types[0] == WIRELOG_TYPE_UINT64);
+    CHECK(wl_columnar_batch_payload_release(out) == OK);
+    CHECK(wl_columnar_spill_store_close(tiny) == OK);
+    CHECK(wl_columnar_spill_store_close(store) == OK && reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+    wl_columnar_memory_governor_ref_release(other);
+}
+
 int main(void)
 {
     uint64_t inline_bytes, inline_reader_bytes;
@@ -1017,6 +1215,7 @@ int main(void)
     CHECK(wl_columnar_batch_payload_floor_with_inline(2, 1, 3,
         WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, &inline_bytes,
         &inline_reader_bytes) == WL_COLUMNAR_SPILL_INVALID);
+    take_payload();
     streamed_payload();
     inline_payloads(); inline_numeric_functors(); inline_failures();
     round_trip(WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT);
