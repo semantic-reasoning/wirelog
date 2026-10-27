@@ -3987,7 +3987,7 @@ plan_bodies_free(wl_plan_body_t *bodies, uint32_t count)
  * Returns 0 on success, -1 on allocation failure with @st->bodies left NULL.
  */
 static int
-plan_stratum_record_bodies(wl_plan_stratum_t *st)
+plan_stratum_record_bodies(wl_plan_stratum_t *st, const wirelog_program_t *prog)
 {
     if (st->relation_count == 0 || !st->relations)
         return 0;
@@ -4018,6 +4018,19 @@ plan_stratum_record_bodies(wl_plan_stratum_t *st)
         }
         bodies[r].ops = ops;
         bodies[r].op_count = rel->op_count;
+        for (uint32_t i = 0; i < prog->relation_count; ++i) {
+            const wl_ir_relation_info_t *info = &prog->relations[i];
+            if (!info->name || strcmp(info->name, rel->name) != 0) continue;
+            bodies[r].declared_width = info->has_decl
+                ? wl_ir_relation_physical_width(info) : 0;
+            bool scalar = info->has_decl && info->column_count && info->columns;
+            for (uint32_t c = 0; scalar && c < info->column_count; ++c)
+                scalar = info->columns[c].type == WIRELOG_TYPE_INT64
+                    && info->columns[c].compound_kind ==
+                    WIRELOG_COMPOUND_KIND_NONE;
+            bodies[r].declared_int64 = scalar;
+            break;
+        }
     }
 
     st->bodies = bodies;
@@ -4840,7 +4853,7 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
          * path does not have to unwind rels[] by hand.  Still ahead of all four
          * rewrites below, which is what the record is for. */
         if (plan_stratum_record_refs(dst) != 0
-            || plan_stratum_record_bodies(dst) != 0) {
+            || plan_stratum_record_bodies(dst, prog) != 0) {
             wl_plan_free(plan);
             return -1;
         }

@@ -614,6 +614,10 @@ typedef struct {
 typedef struct {
     const wl_plan_op_t *ops;
     uint32_t op_count;
+    /* Declaration-derived recursive empty-set schema; absent declarations and
+     * hand-built bodies leave declared_int64 false. No allocation ownership. */
+    uint32_t declared_width;
+    bool declared_int64;
 } wl_plan_body_t;
 
 /**

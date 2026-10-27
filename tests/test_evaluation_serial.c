@@ -3079,6 +3079,107 @@ observed_multi_step(wl_session_t *session)
 }
 
 static void
+test_controlled_recursive_transaction(void)
+{
+    static const char source[] =
+        ".decl links(x:int64,y:int64)\n.decl seeds(x:int64,y:int64)\n"
+        ".decl extra(x:int64,y:int64)\n.decl reach(x:int64,y:int64)\n"
+        ".decl back(x:int64,y:int64)\n.decl result(x:int64,y:int64)\n"
+        "reach(x,y) :- seeds(x,y).\nreach(x,y) :- extra(x,y).\n"
+        "reach(x,z) :- back(x,y), links(y,z), x != z.\n"
+        "back(x,y) :- reach(x,y).\nresult(x,y) :- back(x,y).\n";
+    for (unsigned trial = 0; trial < 4; ++trial) {
+        bool empty = trial == 1;
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options); options.evaluation_control = control;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor); options.memory_governor = governor;
+        wl_session_t *session = NULL, *reference = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+        int64_t links[] = {1, 2, 2, 3, 3, 4, 4, 2, 2, 3};
+        int64_t seed[] = {0, 1};
+        CHECK(!wl_session_insert(session, "links", links, 5, 2));
+        CHECK(!wl_session_insert(reference, "links", links, 5, 2));
+        if (!empty) {
+            CHECK(!wl_session_insert(session, "seeds", seed, 1, 2));
+            CHECK(!wl_session_insert(reference, "seeds", seed, 1, 2));
+        }
+        observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+        observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+        CHECK(actual && expected);
+        wl_session_set_delta_cb(session, observed_multi_capture, actual);
+        wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+        if (trial >= 2) {
+            CHECK(!wl_evaluation_control_configure(control,
+                UINT64_C(1000000000)));
+            observed_multi_stop_phase = trial == 2 ? 19 : 21;
+            observed_multi_stop_index = 0;
+            observed_multi_stop_work = trial == 3;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                observed_multi_stop;
+        }
+        int rc = observed_multi_step(session);
+        if (trial >= 2) {
+            CHECK(!wl_columnar_session_test_observed_transaction_checkpoint);
+            CHECK(rc ==
+                (trial ==
+                2 ? WL_EVALUATION_CONTROL_CANCELLED :
+                WL_EVALUATION_CONTROL_WORK_LIMIT));
+            CHECK(!actual->count &&
+                !session_find_rel((wl_col_session_t *)session, "reach"));
+            observed_multi_stop_work = false;
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            rc = observed_multi_step(session);
+        }
+        if (rc) fprintf(stderr, "recursive transaction rc=%d empty=%u\n", rc,
+                empty);
+        CHECK(!rc && !wl_session_step(reference));
+        CHECK(actual->count == expected->count);
+        CHECK(actual->count == (empty ? 0 : 12));
+        qsort(actual->events, actual->count, sizeof(actual->events[0]),
+            observed_multi_order);
+        qsort(expected->events, expected->count, sizeof(expected->events[0]),
+            observed_multi_order);
+        CHECK(!memcmp(actual->events, expected->events,
+            actual->count * sizeof(actual->events[0])));
+        const char *heads[] = {"reach", "back", "result"};
+        for (unsigned h = 0; h < 3; ++h) {
+            col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                    heads[h]);
+            col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                    heads[h]);
+            CHECK(a && a->ncols == 2 && a->nrows == (b ? b->nrows : 0));
+            for (uint32_t r = 0; r < a->nrows; ++r)
+                for (uint32_t c = 0; c < 2;
+                    ++c) CHECK(a->columns[c][r] == b->columns[c][r]);
+        }
+        wl_session_destroy(session); wl_session_destroy(reference);
+        wl_evaluation_control_release(control); wl_plan_free(plan);
+        wirelog_program_free(program);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor);
+        free(actual); free(expected);
+    }
+}
+
+static void
 test_controlled_observed_multi(void)
 {
     const char *source =
@@ -10037,6 +10138,7 @@ main(void)
     test_controlled_recursive_step_requires_edge_before_attempt();
     test_controlled_recursive_step_rejects_unsupported_shape();
     test_controlled_session_step_resume();
+    test_controlled_recursive_transaction();
     test_controlled_observed_multi();
     test_controlled_observed_wide_public();
     test_controlled_observed_transaction_budget();

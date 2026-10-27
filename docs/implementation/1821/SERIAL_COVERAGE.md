@@ -226,3 +226,12 @@ independent cost-oracle obligations of G7. Callback execution and finite prepaid
 publication tails retain their existing cutoff semantics. No generic child
 expression, optional representation, recursive/differential or batching claim
 is inferred from host admission.
+
+### G3a/G3b implementation boundary
+
+G3a is the next ordinary recursive fixed-point transaction bundle, with
+declaration-derived positive-arity INT64 schema, synchronous full-body rounds
+and transactional publication. G3b retains real differential trace/arrangement
+and incremental retraction execution (E07/F04). Full recomputation is not
+evidence for those paths. K_FUSION/LFTJ, other recursive types and mixed
+fact/rule IDBs remain separate gaps. See CLOSURE_PLAN.md for the recorded split.
