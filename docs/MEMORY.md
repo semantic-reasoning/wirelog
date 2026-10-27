@@ -4577,13 +4577,17 @@ The ordinary evaluator selects this route after operand selection and key
 resolution, before acquiring an arrangement or allocating an ephemeral full
 index. Eligibility requires a serial coordinator (`num_workers <= 1`), one
 INT64 equality key, nonempty scalar numeric inputs without timestamps, and an
-unprojected, unmaterialized JOIN without a right filter. Worker, differential,
+unmaterialized JOIN. Valid flattened projections (including reordered,
+duplicated or omitted keys) are emitted directly into projected-width batches.
+Already-evaluated right filters are supported; their cache or temporary storage
+remains resident and governed. Worker, differential,
 delta-seeded/retraction, controlled and TDD-bound execution is excluded, as are
 STRING, graph and compound layouts. `WIRELOG_JOIN_BATCH_BYTES` retains precedence
 when both features are enabled, including its strict-mode refusal. Unsupported
 shapes follow their existing paths; the option does not promise bounded indexes
-for an arbitrary plan. In particular, the planner often fuses a projection into
-a JOIN, which excludes that operator from this first integration.
+for an arbitrary plan. A non-NULL out-of-range projection retains the resident
+path's zero-lane behavior. A NULL projection map still means concatenation,
+regardless of its count. Empty inputs retain the established empty-result path.
 
 Selected JOINs capture both inputs into session-owned ephemeral spill payloads
 under source-reader authority, then use the capped window index. The batch cap
@@ -4612,10 +4616,12 @@ overflow `EOVERFLOW`, busy `EBUSY`, closed `EPIPE`, unsupported `ENOTSUP`, inval
 `EINVAL`, and cancellation `ECANCELED`. Producer errors are read before teardown;
 sink allocation/admission errors preserve their own classification.
 
-`test_join_spill` uses a parsed nonrecursive rule with an arithmetic MAP tail,
-which naturally leaves an eligible JOIN. Enabled and disabled execution produce
-the same 108 tuples and observer notifications; enabled execution creates no
-resident arrangement. Additional checks cover self-JOIN, owned FLOAT inputs,
+`test_join_spill` uses natural parsed projection and right-predicate rules as
+well as an arithmetic MAP tail. Enabled and disabled execution produce identical
+results and observer notifications; selected execution creates no resident
+arrangement. Pinned stale filter-cache entries force the real owned-filter
+fallback, checking success, second-capture/I/O/output failures and exact refunds.
+Additional checks cover self-JOIN, owned FLOAT inputs,
 multiple windows and no-match PROGRESS, legacy row caps, excluded shapes and
 workers, disk quota/write/read failures, allocation and governor denial,
 source/pin preservation and exact snapshot cleanup. This proves actual evaluator
