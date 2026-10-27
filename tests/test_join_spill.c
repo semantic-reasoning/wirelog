@@ -61,15 +61,11 @@ reserved(fixture_t *f)
 }
 
 static fixture_t
-fixture(bool enabled, uint64_t quota)
+fixture_source(bool enabled, uint64_t quota, const char *source)
 {
     fixture_t f = {0};
     wirelog_error_t error;
-    f.program = wirelog_parse_string(
-        ".decl a(k: int64, v: int64)\n"
-        ".decl b(k: int64, v: int64)\n"
-        ".decl result(k: int64, x: int64, y: int64)\n"
-        "result(k, x, y + 0) :- a(k, x), b(k, y).\n", &error);
+    f.program = wirelog_parse_string(source, &error);
     CHECK(f.program && wl_plan_from_program(f.program, &f.plan) == 0);
     wl_columnar_memory_resolution_t resolution = {
         .budget_bytes = BUDGET, .usable_bytes = BUDGET,
@@ -100,6 +96,16 @@ fixture(bool enabled, uint64_t quota)
         CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
     }
     return f;
+}
+
+static fixture_t
+fixture(bool enabled, uint64_t quota)
+{
+    return fixture_source(enabled, quota,
+               ".decl a(k: int64, v: int64)\n"
+               ".decl b(k: int64, v: int64)\n"
+               ".decl result(k: int64, x: int64, y: int64)\n"
+               "result(k, x, y + 0) :- a(k, x), b(k, y).\n");
 }
 
 static void
@@ -208,6 +214,10 @@ direct(void)
                            .right_relation = kind == 2 ? "a" : "b",
                            .key_count = 1, .left_keys = lk, .right_keys = rk,
                            .delta_mode = WL_DELTA_FORCE_FULL};
+        uint32_t identity[] = {0, 1, 2, 3};
+        if (owned) {
+            op.project_count = 4; op.project_indices = identity;
+        }
         eval_stack_t stack;
         eval_stack_init(&stack);
         CHECK(eval_stack_push(&stack, left, owned) == 0);
@@ -273,7 +283,7 @@ direct(void)
 static void
 excluded(void)
 {
-    for (unsigned kind = 0; kind < 7; kind++) {
+    for (unsigned kind = 0; kind < 8; kind++) {
         fixture_t f = fixture(true, 65536);
         wl_col_session_t *s = COL_SESSION(f.session);
         wl_col_session_t *worker = NULL;
@@ -298,7 +308,7 @@ excluded(void)
         CHECK(left && right);
         const char *lk[] = {left->col_names[0]};
         const char *rk[] = {right->col_names[0]};
-        uint32_t projection[] = {0, 1, 3};
+        uint32_t projection[] = {0, 1, 99};
         wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "b",
                            .key_count = 1, .left_keys = lk, .right_keys = rk,
                            .delta_mode = WL_DELTA_FORCE_FULL};
@@ -313,15 +323,22 @@ excluded(void)
             op.key_count = 0;
         }
         if (kind == 5) left->nrows = 0;
+        if (kind == 7) op.project_count = 3; /* NULL map still concatenates. */
         eval_stack_t stack;
         eval_stack_init(&stack);
         CHECK(eval_stack_push_delta(&stack, left, false, kind == 2) == 0);
         int rc = wl_columnar_join_op(&op, &stack, s);
         CHECK(rc == (kind == 4 ? ENOTSUP : 0));
-        CHECK(s->spill_join_selected_count == 0);
+        CHECK(s->spill_join_selected_count == (kind == 7 ? 1u : 0u));
         if (!rc) {
             eval_entry_t result = eval_stack_pop(&stack);
             CHECK(result.rel->nrows == (kind == 1 ? 324 : kind == 5 ? 0 : 108));
+            if (kind == 0) {
+                CHECK(result.rel->ncols == 3);
+                for (uint32_t i = 0; i < result.rel->nrows; i++)
+                    CHECK(result.rel->columns[2][i] == 0);
+            }
+            if (kind == 7) CHECK(result.rel->ncols == 4);
             CHECK(eval_entry_dispose(&result) == 0);
         }
         CHECK(eval_stack_drain(&stack) == 0);
@@ -355,6 +372,142 @@ progress(void)
     destroy(&f);
 }
 
+static const wl_plan_op_t *planned_join(fixture_t *f)
+{
+    for (uint32_t i = 0; i < f->plan->stratum_count; i++)
+        for (uint32_t j = 0; j < f->plan->strata[i].relation_count; j++) {
+            const wl_plan_relation_t *r = &f->plan->strata[i].relations[j];
+            for (uint32_t k = 0; k < r->op_count; k++)
+                if (r->ops[k].op == WL_PLAN_OP_JOIN) return &r->ops[k];
+        }
+    return NULL;
+}
+
+static void projected_steps(void)
+{
+    for (unsigned filtered = 0; filtered < 3; filtered++) {
+        for (unsigned enabled = 0; enabled < 2; enabled++) {
+            char source[512];
+            CHECK(snprintf(source, sizeof(source),
+                ".decl a(k: int64, v: int64)\n"
+                ".decl b(k: int64, v: int64)\n"
+                ".decl result(k: int64, x: int64, y: int64)\n"
+                "result(k, x, y) :- a(k, x), b(k, y)%s.\n",
+                filtered == 1 ? ", y = 109" : filtered ==
+                2 ? ", y = 999" : "") > 0);
+            fixture_t f = fixture_source(enabled != 0, 65536, source);
+            const wl_plan_op_t *join = planned_join(&f);
+            CHECK(join);
+            if (!filtered) CHECK(join->project_count == 3 &&
+                    join->project_indices);
+            CHECK((join->right_filter_expr.size != 0) == (filtered != 0));
+            unsigned observed = 0;
+            wl_session_set_delta_cb(f.session, observe, &observed);
+            CHECK(wl_session_step(f.session) == 0);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            col_rel_t *out = session_find_rel(s, "result");
+            uint32_t expected = filtered == 2 ? 0 : filtered == 1 ? 6 : 108;
+            CHECK(out && out->nrows == expected && observed == expected);
+            bool seen[18][18] = {{false}};
+            for (uint32_t i = 0; i < out->nrows; i++) {
+                int64_t x = out->columns[1][i], y = out->columns[2][i] - 100;
+                CHECK(x >= 0 && x < 18 && y >= 0 && y < 18 && !seen[x][y]);
+                CHECK(x % 3 == y % 3 && out->columns[0][i] == x % 3);
+                CHECK(!filtered || y == 9);
+                seen[x][y] = true;
+                CHECK(out->column_types[0] == WIRELOG_TYPE_INT64 &&
+                    out->column_types[1] == WIRELOG_TYPE_INT64 &&
+                    out->column_types[2] == WIRELOG_TYPE_INT64);
+            }
+            CHECK(s->spill_join_selected_count == (enabled &&
+                filtered != 2 ? 1u : 0u));
+            if (enabled &&
+                filtered != 2) CHECK(s->arr_count == 0 &&
+                    s->filt_arr_count == 0);
+            CHECK(wl_columnar_spill_store_bytes(s->spill_store) == 0);
+            /* A completed repeated step neither duplicates output nor events. */
+            CHECK(wl_session_step(f.session) == 0);
+            CHECK(session_find_rel(s, "result")->nrows == expected);
+            CHECK(observed == expected);
+            destroy(&f);
+        }
+    }
+}
+
+static void owned_filters(void)
+{
+    for (unsigned fault = 0; fault < 6; fault++) {
+        fixture_t f = fixture_source(true, 65536,
+                ".decl a(k: int64, v: int64)\n"
+                ".decl b(k: int64, v: int64)\n"
+                ".decl result(k: int64, x: int64, y: int64)\n"
+                "result(k, x, y) :- a(k, x), b(k, y), y = 109.\n");
+        for (int64_t i = 18; i < 108; i++) {
+            int64_t row[] = {0, i};
+            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        }
+        wl_col_session_t *s = COL_SESSION(f.session);
+        col_rel_t *left = session_find_rel(s, "a");
+        col_rel_t *right = session_find_rel(s, "b");
+        wl_plan_op_t op = *planned_join(&f);
+        const char *lk[] = {left->col_names[0]}, *rk[] = {right->col_names[0]};
+        uint32_t map[] = {0, 1, 3};
+        op.left_keys = lk; op.right_keys = rk;
+        op.delta_mode = WL_DELTA_FORCE_FULL;
+        op.project_count = 3; op.project_indices = map;
+        col_filt_cache_pin_t pin = {0}; col_rel_t *filtered = NULL;
+        bool unavailable = false;
+        CHECK(wl_columnar_filter_apply_right_filter_cached_pin_checked(s,
+            &op.right_filter_expr, op.right_relation, right, &pin, &filtered,
+            &unavailable) == 0 && filtered && !unavailable && pin.active);
+        CHECK(filtered->nrows == 1);
+        /* The pinned old view cannot be rebuilt. The real cache reports
+         * unavailable and JOIN must own its separate filter result. */
+        wl_columnar_relation_touch_view(right);
+        uint64_t baseline = reserved(&f);
+        if (fault == 1) fail_allocate_after = 3; /* second snapshot */
+        if (fault == 2) write_error = EIO;
+        if (fault == 3 || fault == 5) {
+            pressure_session = s; pressure_kind = fault == 3 ? 2 : 1;
+        }
+        if (fault == 4) s->join_output_limit = 1;
+        wl_columnar_memory_reservation_init(&pressure);
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(eval_stack_push(&stack, left, false) == 0);
+        int rc = wl_columnar_join_op(&op, &stack, s);
+        CHECK(rc == (fault == 1 || fault == 3 ? ENOMEM : fault == 2 ? EIO
+            : fault == 4 ? EOVERFLOW : fault == 5 ? ENOSPC : 0));
+        CHECK(pin.entry->evict_deferred && pin.rel == filtered &&
+            filtered->nrows == 1);
+        CHECK(s->spill_join_selected_count == 1 && s->arr_count == 0 &&
+            s->filt_arr_count == 0);
+        CHECK(wl_session_budget_denied(f.session) == (fault == 5));
+        if (fault == 5) CHECK(wl_columnar_memory_rollback(&pressure));
+        if (fault == 3 ||
+            fault == 5) CHECK(!pressure_session && s->join_output_peak >= 60);
+        if (!rc) {
+            eval_entry_t result = eval_stack_pop(&stack);
+            CHECK(result.rel->ncols == 3 && result.rel->nrows == 96);
+            bool seen[108] = {false};
+            for (uint32_t i = 0; i < result.rel->nrows; i++) {
+                int64_t x = result.rel->columns[1][i];
+                CHECK(result.rel->columns[0][i] == 0 &&
+                    result.rel->columns[2][i] == 109);
+                CHECK(x >= 0 && x < 108 && !seen[x]); seen[x] = true;
+            }
+            CHECK(eval_entry_dispose(&result) == 0);
+        }
+        CHECK(stack.top == 0 &&
+            wl_columnar_spill_store_bytes(s->spill_store) == 0);
+        CHECK(reserved(&f) == baseline && left->nrows == 108 &&
+            right->nrows == 18);
+        CHECK(!wl_columnar_source_access_gate_busy(&right->source_access));
+        fail_allocate_after = 0; write_error = 0;
+        col_filt_cache_pin_release(&pin);
+        destroy(&f);
+    }
+}
+
 int
 main(void)
 {
@@ -370,6 +523,8 @@ main(void)
         if (enabled) CHECK(s->arr_count == 0);
         destroy(&f);
     }
+    projected_steps();
+    owned_filters();
     failures();
     direct();
     excluded();

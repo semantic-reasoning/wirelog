@@ -1284,17 +1284,26 @@ wl_columnar_join_spill_eligible(const wl_col_session_t *sess,
     const wl_plan_op_t *op, const eval_entry_t *left, const col_rel_t *right,
     bool right_delta, const uint32_t *lk, const uint32_t *rk)
 {
-    return sess->spill_join_batch_bytes && sess->spill_join_index_bytes
-           && sess->spill_store && sess->owns_spill_store
-           && !sess->coordinator && sess->num_workers <= 1
-           && !sess->base.evaluation_control && !sess->join_batch_bytes
-           && !sess->diff_operators_active && !sess->tdd_input_run
-           && !sess->delta_seeded && !sess->retraction_seeded
-           && !sess->retraction_right_pass && !left->is_delta && !right_delta
-           && op->key_count == 1 && !op->materialized
-           && !op->project_count && !op->right_filter_expr.size
-           && wl_columnar_join_spill_source(left->rel, lk[0])
-           && wl_columnar_join_spill_source(right, rk[0]);
+    bool eligible = sess->spill_join_batch_bytes && sess->spill_join_index_bytes
+        && sess->spill_store && sess->owns_spill_store
+        && !sess->coordinator && sess->num_workers <= 1
+        && !sess->base.evaluation_control && !sess->join_batch_bytes
+        && !sess->diff_operators_active && !sess->tdd_input_run
+        && !sess->delta_seeded && !sess->retraction_seeded
+        && !sess->retraction_right_pass && !left->is_delta && !right_delta
+        && op->key_count == 1 && !op->materialized
+        && wl_columnar_join_spill_source(left->rel, lk[0])
+        && wl_columnar_join_spill_source(right, rk[0]);
+    if (!eligible) return false;
+    /* Resident malformed projections have defined zero-lane semantics.
+     * Keep that path; a selected spill execution never retries resident. */
+    if (op->project_indices) {
+        uint64_t width = (uint64_t)left->rel->ncols + right->ncols;
+        for (uint32_t c = 0; c < op->project_count; c++)
+            if (op->project_indices[c] >= width)
+                return false;
+    }
+    return true;
 }
 
 static int
@@ -1391,9 +1400,12 @@ wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
             goto done;
     }
     rc = wl_columnar_join_spill_error(sess,
-            wl_columnar_payload_join_create_bounded(sess->memory_governor,
-            inputs[0], inputs[1], lk, rk, sess->spill_join_batch_bytes,
-            sess->spill_join_index_bytes, NULL, NULL, &cont));
+            wl_columnar_payload_join_create_projected_bounded(
+                sess->memory_governor,
+                inputs[0], inputs[1], lk, rk, op->project_indices,
+                op->project_indices ? op->project_count : 0,
+                sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
+                NULL, NULL, &cont));
     if (rc != 0)
         goto done;
     rc = wl_columnar_join_new_output(sess, left, right, "$join",
@@ -1631,8 +1643,15 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                 lk[0], rk[0], &spill_out);
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+        if (right_filtered)
+            col_rel_destroy(right_filtered);
         if (spill_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, spill_rc);
+#ifdef WL_PROFILE
+        if (spill_out->nrows == 0)
+            sess->profile.join_empty_out++;
+        sess->profile.join_compute_ns += now_ns() - _t0_join;
+#endif
         return wl_columnar_join_publish_after_left(stack, &left_e, spill_out,
                    false);
     }
