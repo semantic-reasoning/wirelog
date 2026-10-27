@@ -399,3 +399,13 @@ their own implementation and qualification. G4 pipeline/batch/LFTJ, G5
 representation/fallback coverage, G6 policy/resource composition and G7 final
 acceptance remain unchanged. No fixed remaining PR count or #1821 closure is
 claimed by this ordinary JOIN index bundle.
+
+## G3b increment: acyclic append differential execution
+
+This executable G3b increment adds a controlled observed append successor for positive
+nonrecursive heads reading EDBs directly. One proven changed occurrence reads
+the appended suffix; metered union/consolidation retains the old head. All
+heads and arrangement changes publish at the existing common cutoff. Mixed
+mutations, repeated changed reads and transitive dependencies retain full
+recomputation. Recursive frontier scheduling, weighted traces and incremental
+retractions remain separate obligations; the recursive scheduler remains the next distinct G3b obligation.

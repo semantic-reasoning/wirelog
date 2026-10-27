@@ -3795,6 +3795,20 @@ test_controlled_observed_multi(void)
     free(actual); free(expected);
 }
 
+static unsigned append_dispatches;
+static uint32_t append_selected_rows;
+static void
+append_dispatch_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)control;
+    if (phase != 28) return;
+    CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
+            bindings->session, bindings));
+    append_dispatches++;
+    append_selected_rows += progress;
+}
+
 static unsigned persistent_builds, persistent_reuses;
 static uint64_t persistent_indexed, persistent_probes;
 static void
@@ -3876,19 +3890,33 @@ test_controlled_persistent_join(void)
         wl_columnar_arrangement_test_diff_checkpoint =
             persistent_arrangement_checkpoint;
         wl_columnar_join_test_attempt_checkpoint = persistent_join_checkpoint;
+        append_dispatches = append_selected_rows = 0;
+        wl_columnar_session_test_observed_transaction_checkpoint =
+            append_dispatch_checkpoint;
         CHECK(!observed_multi_step(session));
+        wl_columnar_session_test_observed_transaction_checkpoint = NULL;
         wl_columnar_arrangement_test_diff_checkpoint = NULL;
         wl_columnar_join_test_attempt_checkpoint = NULL;
         CHECK(!wl_session_step(reference));
-        CHECK(cs->diff_arr_count == 2 && persistent_probes);
+        CHECK(cs->diff_arr_count == 2);
+        CHECK(append_dispatches == ((cycle == 1 || cycle == 2) ? 3u : 0u));
+        CHECK(append_selected_rows == append_dispatches);
+        CHECK(cycle == 2 ? !persistent_probes : persistent_probes != 0);
         if (cycle == 1) {
             CHECK(!persistent_builds && !persistent_indexed &&
                 persistent_reuses == 3);
             for (unsigned i = 0; i < 2; ++i)
                 CHECK(cs->diff_arr_entries[i].diff_arr == previous[i]);
+        } else if (cycle == 2) {
+            /* Delta-right probes use a private ephemeral index, leaving the
+             * published full-source arrangements untouched until needed. */
+            CHECK(!persistent_builds && !persistent_reuses &&
+                !persistent_indexed);
+            for (unsigned i = 0; i < 2; ++i)
+                CHECK(cs->diff_arr_entries[i].diff_arr == previous[i]);
         } else {
             CHECK(persistent_builds == 2 && persistent_reuses == 1);
-            CHECK(persistent_indexed == (cycle == 2 ? 10 : 8));
+            CHECK(persistent_indexed == 8);
             for (unsigned i = 0; i < 2; ++i)
                 CHECK(cs->diff_arr_entries[i].diff_arr != previous[i]);
         }
@@ -3925,6 +3953,180 @@ test_controlled_persistent_join(void)
             governor)));
     wl_columnar_memory_governor_ref_release(governor);
     free(actual); free(expected);
+}
+
+static unsigned append_stop_phase, append_stop_head;
+static bool append_stop_work, append_stopped;
+static void
+append_stop_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    append_dispatch_checkpoint(control, phase, progress, bindings);
+    if (append_stopped || phase != append_stop_phase
+        || (phase == 8 && progress != append_stop_head)) return;
+    append_stopped = true;
+    if (append_stop_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_controlled_append_successors(void)
+{
+    const unsigned phases[] = {25, 26, 27, 28, 8, 13, 14, 15};
+    for (unsigned shape = 0; shape < 3; ++shape) {
+        for (unsigned trial = 0; trial < (shape ? 1u : 17u); ++trial) {
+            const char *source = shape == 1
+                ? ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+                ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+                "a(x,y) :- l(x), r(x,y), l(y).\n"
+                "b(x,y) :- l(x), r(x,y).\n"
+                : shape == 2
+                ? ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+                ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+                "a(x,y) :- l(x), r(x,y).\nb(x,y) :- a(x,y).\n"
+                : ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+                ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+                "a(x,y) :- l(x), r(x,y), y > 0.\n"
+                "a(x,y) :- r(x,y), x = 9.\n"
+                "b(x,y) :- l(x), r(x,y).\n";
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor); options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1, &options, &session));
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            ((wl_col_session_t *)reference)->diff_enabled = false;
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+            observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+            const int64_t l[] = {1}, r[] = {1, 1, 2, 2, 3, 3, 9, 9};
+            CHECK(!wl_session_insert(session, "l", l, 1, 1));
+            CHECK(!wl_session_insert(reference, "l", l, 1, 1));
+            CHECK(!wl_session_insert(session, "r", r, 4, 2));
+            CHECK(!wl_session_insert(reference, "r", r, 4, 2));
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            for (unsigned cycle = 0; cycle < (trial ? 1u : 5u); ++cycle) {
+                actual->count = expected->count = 0;
+                col_rel_t *old = session_find_rel((wl_col_session_t *)session,
+                        "a");
+                const int64_t extra[] = {2, 3};
+                if (cycle == 4) {
+                    CHECK(!wl_session_remove(session, "l", extra, 1, 1));
+                    CHECK(!wl_session_remove(reference, "l", extra, 1, 1));
+                } else {
+                    CHECK(!wl_session_insert(session, "l", extra, 1, 1));
+                    CHECK(!wl_session_insert(reference, "l", extra, 1, 1));
+                    if (cycle == 0) {
+                        CHECK(!wl_session_insert(session, "l", extra + 1, 1,
+                            1));
+                        CHECK(!wl_session_insert(reference, "l", extra + 1, 1,
+                            1));
+                    } else if (cycle == 2) {
+                        const int64_t miss = 88;
+                        CHECK(!wl_session_insert(session, "l", &miss, 1, 1));
+                        CHECK(!wl_session_insert(reference, "l", &miss, 1, 1));
+                    } else if (cycle == 3) {
+                        CHECK(!wl_session_insert(session, "r", extra, 1, 2));
+                        CHECK(!wl_session_insert(reference, "r", extra, 1, 2));
+                    }
+                }
+                append_dispatches = append_selected_rows = 0;
+                append_stopped = false; append_stop_phase = UINT_MAX;
+                if (trial) {
+                    append_stop_phase = phases[(trial - 1) / 2];
+                    append_stop_head = 1;
+                    append_stop_work = (trial - 1) % 2 != 0;
+                    CHECK(!wl_evaluation_control_configure(control,
+                        UINT64_C(1000000000)));
+                }
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    append_stop_checkpoint;
+                int rc = observed_multi_step(session);
+                wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+                if (trial) {
+                    CHECK(append_stopped);
+                    if (append_stop_phase == 15) {
+                        CHECK(rc == (append_stop_work
+                            ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+                        CHECK(session_find_rel((wl_col_session_t *)session,
+                            "a") != old);
+                        CHECK(
+                            !((wl_col_session_t *)session)->pending_input_change);
+                    }else {
+                        CHECK(rc ==
+                            (append_stop_work ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                            : WL_EVALUATION_CONTROL_CANCELLED));
+                        CHECK(!actual->count);
+                        CHECK(session_find_rel((wl_col_session_t *)session,
+                            "a") == old);
+                        CHECK(
+                            ((wl_col_session_t *)session)->pending_input_change);
+                    }
+                    CHECK(!wl_evaluation_control_reset(control));
+                    CHECK(!wl_evaluation_control_configure(control, 0));
+                    CHECK(!observed_multi_step(session));
+                } else {
+                    CHECK(!rc);
+                    CHECK(append_dispatches == (!shape && cycle < 3 ? 2u : 0u));
+                    CHECK(append_selected_rows == append_dispatches
+                        * (cycle == 0 || cycle == 2 ? 2u : 1u));
+                }
+                CHECK(!wl_session_step(reference));
+                CHECK(actual->count == expected->count);
+                qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                    observed_multi_order);
+                qsort(expected->events, expected->count,
+                    sizeof(expected->events[0]), observed_multi_order);
+                CHECK(!memcmp(actual->events, expected->events,
+                    actual->count * sizeof(actual->events[0])));
+                unsigned delivered = actual->count;
+                CHECK(!observed_multi_step(session) &&
+                    actual->count == delivered);
+                for (unsigned h = 0; h < 2; ++h) {
+                    col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                            h ? "b" : "a");
+                    col_rel_t *b =
+                        session_find_rel((wl_col_session_t *)reference,
+                            h ? "b" : "a");
+                    CHECK(a && b && a->nrows == b->nrows &&
+                        a->ncols == b->ncols);
+                    for (uint32_t row = 0; row < a->nrows; ++row)
+                        for (uint32_t c = 0; c < a->ncols; ++c)
+                            CHECK(a->columns[c][row] == b->columns[c][row]);
+                }
+            }
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+            free(actual); free(expected);
+        }
+    }
 }
 
 static unsigned persistent_stop_phase, persistent_stop_hits;
@@ -4010,6 +4212,12 @@ test_controlled_persistent_stops(void)
                 reuse ? 1 : 2));
             CHECK(!wl_session_insert(reference, reuse ? "l" : "r", extra, 1,
                 reuse ? 1 : 2));
+            if (!reuse) {
+                /* Exercise full-source rebuild stops independently of the
+                 * append-only delta-right route. Two changed EDBs fall back. */
+                CHECK(!wl_session_insert(session, "l", left, 1, 1));
+                CHECK(!wl_session_insert(reference, "l", left, 1, 1));
+            }
             CHECK(!wl_evaluation_control_configure(control,
                 UINT64_C(1000000000)));
             generation = registry[0].generation;
@@ -4141,6 +4349,10 @@ test_controlled_persistent_refusals(void)
             change_right ? 2 : 1));
         CHECK(!wl_session_insert(reference, change_right ? "r" : "l", extra, 1,
             change_right ? 2 : 1));
+        if (change_right) {
+            CHECK(!wl_session_insert(session, "l", left, 1, 1));
+            CHECK(!wl_session_insert(reference, "l", left, 1, 1));
+        }
         col_diff_arr_entry_t *registry = cs->diff_arr_entries;
         col_diff_arrangement_t *arr = registry[0].diff_arr;
         col_rel_t *head = session_find_rel(cs, "a");
@@ -11243,6 +11455,7 @@ main(void)
     test_controlled_recursive_transaction_nonlinear_view();
     test_controlled_observed_multi();
     test_controlled_persistent_join();
+    test_controlled_append_successors();
     test_controlled_persistent_stops();
     test_controlled_persistent_refusals();
     test_controlled_incremental_consolidate_step();

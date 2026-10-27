@@ -4815,3 +4815,18 @@ Abort drains a claimed trim before releasing credit. Publication transfers
 canonical tokens without allocation or reclamation. Retained retirement frees
 arrays, keys and descriptors before refunding their credits and governor refs.
 Separate array/metadata accounting remains compatible with raw registry growth.
+
+### Controlled append-delta ownership
+
+The observed acyclic append host retains original source/head readers while
+copying the proven input suffix into a governed private relation. Exact child
+bindings borrow that relation until cleanup ACK; no delta-right index enters
+the public full-source arrangement registry. Two additional operator slots per
+head are admitted with the host metadata for prior-head union/consolidation.
+
+Any precommit stop after append eligibility begins drains the private host
+transaction before reset/retry; consumed work is not refunded. The published
+heads and pending input boundary remain unchanged. Private delta storage retires
+through the scalar retirement protocol, including after successful cutoff and
+on checked destruction. Cleanup uses maintenance funding only after evaluation
+has stopped; it never computes missing contributions or replays observer events.

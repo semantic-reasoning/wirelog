@@ -320,3 +320,27 @@ no row is emitted. Array/metadata initialization and retirement are separately
 charged; allocator/free bodies retain the existing cooperative boundary. E07,
 F04 and F04a remain open for actual differential dispatcher/trace/frontier
 integration. This evidence advances only ordinary JOIN's F05a ownership domain.
+
+## G3b acyclic append-delta host increment
+
+The general **observed** controlled STEP host now selects the actual appended
+suffix at an authenticated VARIABLE or JOIN-right occurrence. Direct-EDB
+positive INT64 heads with at most one changed occurrence across their entire
+body qualify after a charged whole-host audit. Other shapes and mutations use
+existing controlled full recomputation. This is an acyclic insertion route;
+raw `diff_operators_active` dispatch, recursive frontier scheduling, weighted
+traces and incremental retraction remain unqualified G3b work.
+
+`test_controlled_persistent_join` witnesses three exact delta selections of one
+row for both left-input and right-input successors. Unchanged full-right native
+indexes reuse their identity; delta-right joins use ephemeral indexes.
+`test_controlled_append_successors` compares generated multihead results and
+signed events with a control-disabled reference for repeated appends, duplicate
+and nonmatching rows, filters, pure projections, unchanged union branches,
+removal, mixed-input mutation, repeated-read and transitive-dependency fallback.
+Eight host checkpoints exercise cancellation and work limits during eligibility,
+delta preparation, plan preparation, exact selection, later-head execution,
+claims, cutoff and committed retirement. Retry preserves parity and event
+uniqueness; checked destruction restores governor credit. Existing primitive
+copy/JOIN/CONCAT/consolidation boundaries remain their independent qualification;
+these session checkpoints are integration evidence, not exact-cost formulas.
