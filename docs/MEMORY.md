@@ -4593,8 +4593,15 @@ Selected JOINs capture both inputs into session-owned ephemeral spill payloads
 under source-reader authority, then use the capped window index. The batch cap
 bounds output lane storage; the index cap includes its reservation descriptor,
 buckets and row links. Rescanning the left snapshot for each right window trades
-I/O and CPU for bounded index memory. Sources remain resident and unchanged, and
-the final result is materialized in a governed relation. Snapshot descriptors,
+I/O and CPU for bounded index memory. Borrowed registry/cache sources remain
+resident and unchanged. Eligible owned numeric heap intermediates instead
+transfer to the payload: output schema is prepared first, then checked source
+retirement refunds their resident storage before producer/index and output-row
+allocation. The caller's owning slot is cleared only on success. Source readers
+or aliases can refuse retirement; failed transfer preserves the source and
+refunds its private payload. Pool/arena/shared backing keeps snapshot behavior,
+and cross-operand aliases are not transferred. The final result is materialized
+in a governed relation. Snapshot descriptors,
 writer/readers, producer/batch state and output storage remain additional memory
 floors. The generic continuation descriptor and OS/allocator costs retain the
 limitations described above. This does not evict registry columns or implement
@@ -4606,7 +4613,11 @@ the limit refuses the JOIN and a batch can overshoot it. The result stays privat
 until the JOIN finishes, so errors destroy that result. Existing outer STEP and
 observer publication contracts still apply; this is not whole-STEP rollback.
 Continuations/readers are destroyed before releasing both snapshot owners on
-all exits, including self-JOIN and failure during the second capture. Synchronous
+all exits, including self-JOIN and failure during the second capture. Successful
+owned transfer is irreversible if a later operand or output fails; ordinary
+operator cleanup consumes these owned intermediates without promising input
+rollback. Busy left ownership remains on the evaluator stack; a refused private
+heap filter is retained by the session's deferred cleanup registry. Synchronous
 execution adds no controlled cancellation or work-metering guarantee.
 
 Selected-route errors propagate without a resident retry. Spill MEMORY returns
