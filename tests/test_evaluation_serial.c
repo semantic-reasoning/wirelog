@@ -3793,6 +3793,175 @@ test_controlled_observed_multi(void)
     free(actual); free(expected);
 }
 
+static unsigned incremental_step_phase, incremental_step_hits;
+static bool incremental_step_work, incremental_step_stopped;
+static unsigned incremental_step_suffix_mask;
+
+static void
+incremental_step_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase == 204 && progress < 8)
+        incremental_step_suffix_mask |= 1u << progress;
+    if (phase != incremental_step_phase) return;
+    ++incremental_step_hits;
+    if (incremental_step_stopped) return;
+    incremental_step_stopped = true;
+    if (incremental_step_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX) ==
+            WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_controlled_incremental_consolidate_step(void)
+{
+    const char *source =
+        ".decl input(x:int64,y:int64)\n"
+        ".decl plain(x:int64,y:int64)\n"
+        ".decl swapped(x:int64,y:int64)\n"
+        "plain(x,y) :- input(x,y).\n"
+        "swapped(y,x) :- input(x,y).\n";
+    const int64_t rows[] = {1, 9, 2, 8, 3, 7, 3, 6, 0, 5, -1, 4, 5, 3, 2, 2, 4,
+                            1};
+    const unsigned phases[] = {208, 204, 209, 207};
+    for (unsigned point = 0; point < 4; ++point)
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(1000000000, &control));
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor); options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &session));
+            CHECK(((wl_col_session_t *)session)->diff_enabled);
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            ((wl_col_session_t *)reference)->diff_enabled = false;
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+            observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+            CHECK(!wl_session_insert(session, "input", rows, 9, 2));
+            CHECK(!wl_session_insert(reference, "input", rows, 9, 2));
+            incremental_step_phase = phases[point];
+            incremental_step_work = mode != 0;
+            incremental_step_stopped = false; incremental_step_hits = 0;
+            incremental_step_suffix_mask = 0;
+            wl_columnar_filter_test_attempt_checkpoint =
+                incremental_step_checkpoint;
+            CHECK(observed_multi_step(session) == (mode
+                ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED));
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            CHECK(incremental_step_stopped && incremental_step_hits);
+            CHECK(!actual->count);
+            CHECK(!session_find_rel((wl_col_session_t *)session, "plain"));
+            CHECK(!session_find_rel((wl_col_session_t *)session, "swapped"));
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            incremental_step_phase = 0; incremental_step_suffix_mask = 0;
+            wl_columnar_filter_test_attempt_checkpoint =
+                incremental_step_checkpoint;
+            CHECK(!observed_multi_step(session));
+            wl_columnar_filter_test_attempt_checkpoint = NULL;
+            CHECK(!wl_session_step(reference));
+            /* Both generated identity and permuted MAPs reach the optimized
+             * child. Cancellation retries start from scratch; work-limit
+             * resume may have already completed part of suffix sorting. */
+            if (!mode) CHECK((incremental_step_suffix_mask & (1u << 1))
+                    && (incremental_step_suffix_mask & (1u << 3)));
+            const char *heads[] = {"plain", "swapped"};
+            for (unsigned h = 0; h < 2; ++h) {
+                col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                        heads[h]);
+                col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                        heads[h]);
+                CHECK(a && b && a->nrows == b->nrows && a->ncols == b->ncols);
+                for (uint32_t row = 0; row < a->nrows; ++row)
+                    for (uint32_t col = 0; col < a->ncols; ++col)
+                        CHECK(a->columns[col][row] == b->columns[col][row]);
+            }
+            CHECK(actual->count == expected->count);
+            qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(actual->events, expected->events,
+                actual->count * sizeof(actual->events[0])));
+            unsigned delivered = actual->count;
+            CHECK(!observed_multi_step(session) && actual->count == delivered);
+            uint64_t baseline = 0;
+            const int64_t extra[] = {7, 0};
+            for (unsigned cycle = 0; cycle < 4; ++cycle) {
+                CHECK(!wl_evaluation_control_reset(control));
+                CHECK(!wl_evaluation_control_configure(control, 1000000000));
+                actual->count = expected->count = 0;
+                if (!(cycle % 2)) {
+                    CHECK(!wl_session_insert(session, "input", extra, 1, 2));
+                    CHECK(!wl_session_insert(reference, "input", extra, 1, 2));
+                } else {
+                    CHECK(!wl_session_remove(session, "input", extra, 1, 2));
+                    CHECK(!wl_session_remove(reference, "input", extra, 1, 2));
+                }
+                col_rel_t *old = session_find_rel((wl_col_session_t *)session,
+                        "plain");
+                incremental_step_phase = phases[point];
+                incremental_step_stopped = false;
+                wl_columnar_filter_test_attempt_checkpoint =
+                    incremental_step_checkpoint;
+                CHECK(observed_multi_step(session) == (mode
+                    ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                    WL_EVALUATION_CONTROL_CANCELLED));
+                wl_columnar_filter_test_attempt_checkpoint = NULL;
+                CHECK(incremental_step_stopped && !actual->count);
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    "plain") == old);
+                CHECK(!wl_evaluation_control_reset(control));
+                CHECK(!wl_evaluation_control_configure(control, 0));
+                CHECK(!observed_multi_step(session));
+                CHECK(!wl_session_step(reference));
+                CHECK(actual->count == expected->count);
+                qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                    observed_multi_order);
+                qsort(expected->events, expected->count,
+                    sizeof(expected->events[0]), observed_multi_order);
+                CHECK(!memcmp(actual->events, expected->events,
+                    actual->count * sizeof(actual->events[0])));
+                uint64_t reserved =
+                    wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor));
+                if (cycle == 1) baseline = reserved;
+                if (cycle == 3) CHECK(reserved == baseline);
+            }
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+            free(actual); free(expected);
+        }
+}
+
 static char *
 observed_wide_program(unsigned width, bool floating, const char *head)
 {
@@ -10641,6 +10810,7 @@ main(void)
     test_controlled_recursive_transaction_refusals();
     test_controlled_recursive_transaction_nonlinear_view();
     test_controlled_observed_multi();
+    test_controlled_incremental_consolidate_step();
     test_controlled_observed_wide_public();
     test_controlled_observed_transaction_budget();
     test_controlled_observed_missing_private_head();

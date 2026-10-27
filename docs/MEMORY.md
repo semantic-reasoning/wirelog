@@ -4669,3 +4669,12 @@ platform qualification. Existing payload, producer and evaluator evidence covers
 parts of these requirements, but cannot replace the cold-lifecycle evidence.
 Close #1372 only when those remaining acceptance gaps have concrete tests.
 #1373 scheduling and #1385 DOOP qualification remain separate; #1372 stays open.
+
+The #1821 controlled prefix-discovery consolidation optimization introduces no
+additional owner or allocation. Its suffix sort and prefix merge reuse the
+existing two row-index arrays, scalar source lease, private output batch and
+cleanup continuation. A partial suffix sort never exposes uninitialized prefix
+slots: the final merge represents the prefix by its original row indices.
+Session qualification covers retained work-limit resume, cancellation retry,
+insert/remove cycles and zero governor reservations after checked destruction
+and release of the evaluation control and plan (including governed intern storage).
