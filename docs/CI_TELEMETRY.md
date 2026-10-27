@@ -767,7 +767,7 @@ lever sized against the wrong one is mis-sized.
   reading and the second the optimistic one, and neither is a promise: both
   assume the terminal job stays terminal.
 
-  Three different chains produce those numbers, as `ci-pr.yml` stands today.
+  Three different chains produce those numbers, as `ci-pr.yml` stood when this baseline was collected (it has since been reordered: the `tsan` and `tsan-native` legs now run after `lint`, `tsan-native` releases `sanitizer-matrix`, and the `tsan` leg releases the build chain).
   Five runs end at `Build / windows-latest / msvc`, which `build-matrix`
   reaches only after `build-arm` and `build-mbedtls`, both of which need
   `build-primary`, which needs `lint`, which needs `rc-changelog-freeze` --
