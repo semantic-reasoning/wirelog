@@ -5211,6 +5211,14 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
         delta->nrows < right->nrows){
         right = delta; used_delta = true;
     }
+    col_rel_t *append_delta = NULL;
+    rc = wl_columnar_session_append_delta_source(session, private_bindings,
+            op, &append_delta);
+    if (rc) goto done;
+    if (append_delta) {
+        right = append_delta; used_delta = true;
+        forced_empty = append_delta->nrows == 0;
+    }
     bool projected = op->project_count && op->project_indices;
     ctx->join_result_is_delta = right && !forced_empty && !projected
         && (left_delta || used_delta);

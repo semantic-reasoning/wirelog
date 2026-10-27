@@ -1749,6 +1749,19 @@ wl_columnar_eval_plan_composed_source_select(
         record->source_selected = delta;
         record->source_is_delta = true;
     }
+    col_rel_t *append_delta = NULL;
+    int rc = wl_columnar_session_append_delta_source(record->session,
+            record->private_bindings, op, &append_delta);
+    if (rc) {
+        record->semantic_result = rc;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+        return;
+    }
+    if (append_delta) {
+        record->source_selected = append_delta;
+        record->source_is_delta = true;
+        record->source_empty = append_delta->nrows == 0;
+    }
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INIT;
 }
 
