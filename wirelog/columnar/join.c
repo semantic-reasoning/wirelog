@@ -40,6 +40,9 @@
 bool wl_columnar_join_test_enable_semijoin_timestamps;
 #endif
 #ifdef WL_TEST_JOIN_CACHE_HOOK
+void (*wl_columnar_join_test_before_spill_take)(col_rel_t *);
+void (*wl_columnar_join_test_after_spill_take)(uint64_t, uint64_t, uint64_t,
+    uint64_t);
 void (*wl_columnar_join_test_before_diff_commit)(
     wl_columnar_arrangement_diff_txn_t *);
 bool wl_columnar_join_test_fail_next_key_scratch_alloc;
@@ -1381,20 +1384,66 @@ wl_columnar_join_spill_drain(wl_col_session_t *sess,
 
 static int
 wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
-    const col_rel_t *left, const col_rel_t *right, uint32_t lk, uint32_t rk,
-    col_rel_t **out)
+    eval_entry_t *left_entry, col_rel_t *right, col_rel_t **right_owned,
+    uint32_t lk, uint32_t rk, col_rel_t **out)
 {
+    col_rel_t *left = left_entry->rel;
     wl_columnar_batch_payload_t *inputs[2] = { NULL, NULL };
     wl_columnar_continuation_t *cont = NULL;
-    const col_rel_t *sources[2] = { left, right };
+    col_rel_t *sources[2] = { left, right };
+    bool shared_source = left == right ||
+        (left->storage_owner && left->storage_owner == right->storage_owner);
+    bool take[2] = {
+        !shared_source && left_entry->owned &&
+        left->memory_governor == sess->memory_governor &&
+        wl_columnar_batch_payload_can_take(left),
+        !shared_source && *right_owned == right &&
+        right->memory_governor == sess->memory_governor &&
+        wl_columnar_batch_payload_can_take(right)
+    };
     int rc = 0;
     *out = NULL;
     sess->spill_join_selected_count++;
+    /* Own schema/types before either source can retire. Zero row capacity
+     * avoids retaining a full initial output grid through the transition. */
+    rc = wl_columnar_join_new_output(sess, left, right, "$join",
+            col_join_output_width(left, right, op), 0, false, true, out);
+    if (rc == 0) rc = col_join_set_output_types(*out, left, right, op);
+    if (rc != 0) goto done;
     for (unsigned i = 0; i < 2; i++) {
-        wl_columnar_spill_status_t status = wl_columnar_batch_payload_capture(
-            sess->memory_governor, sess->spill_store, sources[i],
-            sources[i]->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
-            NULL, NULL, &inputs[i]);
+        wl_columnar_spill_status_t status;
+        if (take[i]) {
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+            uint64_t identity = sources[i]->relation_identity;
+            uint64_t released = sources[i]->descriptor_reserved_bytes +
+                sources[i]->metadata_reserved_bytes +
+                sources[i]->retained_reserved_bytes +
+                sources[i]->dedup_reserved_bytes;
+            uint64_t before = wl_columnar_memory_reserved(
+                wl_columnar_memory_governor_ref_get(sess->memory_governor));
+            if (wl_columnar_join_test_before_spill_take)
+                wl_columnar_join_test_before_spill_take(sources[i]);
+#endif
+            status = wl_columnar_batch_payload_take(sess->memory_governor,
+                    sess->spill_store, i == 0 ? &left_entry->rel : right_owned,
+                    NULL, NULL, &inputs[i]);
+            if (status == WL_COLUMNAR_SPILL_OK) {
+                /* The owning entry keeps segmentation metadata for disposal;
+                 * no source-derived pointer is read after this boundary. */
+                sources[i] = NULL;
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+                if (wl_columnar_join_test_after_spill_take)
+                    wl_columnar_join_test_after_spill_take(identity, released,
+                        before, wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(
+                                sess->memory_governor)));
+#endif
+            }
+        } else {
+            status = wl_columnar_batch_payload_capture(sess->memory_governor,
+                    sess->spill_store, sources[i], sources[i]->nrows,
+                    WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, NULL, NULL, &inputs[i]);
+        }
         rc = wl_columnar_join_spill_error(sess, status);
         if (rc != 0)
             goto done;
@@ -1408,13 +1457,7 @@ wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
                 NULL, NULL, &cont));
     if (rc != 0)
         goto done;
-    rc = wl_columnar_join_new_output(sess, left, right, "$join",
-            col_join_output_width(left, right, op), COL_REL_INIT_CAP,
-            false, true, out);
-    if (rc == 0)
-        rc = col_join_set_output_types(*out, left, right, op);
-    if (rc == 0)
-        rc = wl_columnar_join_spill_drain(sess, cont, *out);
+    rc = wl_columnar_join_spill_drain(sess, cont, *out);
 done:
     /* Drop reader pins before the segment owners, including after DONE. */
     wl_columnar_continuation_destroy(cont);
@@ -1639,12 +1682,24 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (wl_columnar_join_spill_eligible(sess, op, &left_e, right,
         used_right_delta, lk, rk)) {
         col_rel_t *spill_out = NULL;
-        int spill_rc = wl_columnar_join_spill_run(sess, op, left, right,
-                lk[0], rk[0], &spill_out);
+        int spill_rc = wl_columnar_join_spill_run(sess, op, &left_e, right,
+                &right_filtered, lk[0], rk[0], &spill_out);
         wl_columnar_join_key_scratch_free(&key_scratch, &lk);
         wl_columnar_join_key_scratch_free(&key_scratch, &rk);
-        if (right_filtered)
-            col_rel_destroy(right_filtered);
+        if (right_filtered) {
+            int cleanup_rc = col_rel_destroy_checked(right_filtered);
+            if (cleanup_rc != 0) {
+                /* A selected owned filter is a private canonical governed
+                 * heap relation. Retain its only owner if a reader refuses
+                 * retirement; the session's existing retry drains it later. */
+                if (wl_columnar_session_defer_relation(sess,
+                    right_filtered) != 0)
+                    abort();
+                spill_rc = cleanup_rc;
+                col_rel_destroy(spill_out);
+                spill_out = NULL;
+            }
+        }
         if (spill_rc != 0)
             return wl_columnar_join_dispose_left(stack, &left_e, spill_rc);
 #ifdef WL_PROFILE
