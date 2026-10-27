@@ -48,7 +48,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E03 / S10,S11 | Delta callback: legacy unary route or ordinary acyclic transaction → private captured heads → baseline/events → coordinated publication | R, ordinary scalar host implemented; charged byte/slot/schema/metadata cursors, A/Q64; 32 inherited strata maximum, child domains remain authoritative; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_wide_public`, `test_controlled_observed_transaction_budget`; typed/wide/nullary/dependent-head and empty-input execution, stops and reference parity. New expressions/representations and configurations remain G5/G6 |
 | E04 / S10 | Completed observed STEP plus declared-input insert/remove → private full candidates → signed comparison and atomic registry image | R, reusable ordinary route; no three-slot/four-binding cap; charged preparation, reversible old-head/staging claims, prepaid cutoff, retained cleanup; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_filter_successors`; repeated signed cycles, later-claim cancellation, no replay, reference output and stable/zero governor balances. #1820 recovery contract retained |
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
-| E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. Final phase qualification remains G3a; differential and optimized routes remain G3b/G4 |
+| E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
 | E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
@@ -229,9 +229,25 @@ is inferred from host admission.
 
 ### G3a/G3b implementation boundary
 
-G3a is the next ordinary recursive fixed-point transaction bundle, with
+G3a implements the ordinary recursive fixed-point transaction bundle, with
 declaration-derived positive-arity INT64 schema, synchronous full-body rounds
 and transactional publication. G3b retains real differential trace/arrangement
 and incremental retraction execution (E07/F04). Full recomputation is not
 evidence for those paths. K_FUSION/LFTJ, other recursive types and mixed
 fact/rule IDBs remain separate gaps. See CLOSURE_PLAN.md for the recorded split.
+
+
+G3a source audit: `a9ec399d`. The exact binary unobserved fast path (E05)
+retains its old tariff and append-only successor domain. E06 uses declared
+positive-arity INT64 heads, frozen full-body rounds and one-cell canonical
+comparisons; at most 64 host actions run per turn. Child and receipt helpers
+retain their own established poll bounds. Allocation/cleanup exclusions and
+G6 nested audits are not closed by this host integration.
+
+`test_controlled_recursive_transaction_nonlinear_view` uses an explicitly
+unoptimized internal plan view and a separate unchanged raw reference. Default
+K_FUSION remains refused, so this is not optimized dispatch coverage. Actual
+trace/arrangement and differential retraction (E07/F04), mixed fact/rule IDBs,
+recursive negation/aggregates, non-INT64/nullary recursive heads and default
+optimizer integration remain open. The complete G3a evidence and next G3b work
+are recorded in [the closure plan](CLOSURE_PLAN.md#g3a-implementation-and-qualification-2026-10-27).

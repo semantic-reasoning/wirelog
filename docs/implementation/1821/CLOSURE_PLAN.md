@@ -85,7 +85,8 @@ callback-ready tuples under work and memory admission, then deliver a finite
 prepaid batch after the cutoff. Callback cooperation does not exclude engine
 preparation. **G2: signed observed composition** is implemented in this bundle
 for ordinary nonrecursive compositions of already controlled scalar operators.
-**G3: general recursion/differential execution** is next. G3–G7 retain the host
+**G3a: ordinary recursive SCC transactions** follows G2 in this bundle;
+**G3b: differential trace/arrangement and retraction execution** remains next. G3–G7 retain the host
 batch/LFTJ, new scalar/expression/representation, resource/configuration and
 final qualification obligations. These are five remaining work groups, not a
 promise of five remaining PRs; #1821 remains open.
@@ -239,8 +240,8 @@ Integrated evidence in `evaluation_serial`:
   wide pending subtraction and schema-budget boundaries against the raw observer.
 
 Validation is recorded with the final qualification result below. Independent
-review and final design/risk gates apply to each exact atomic candidate. G3 is
-next after this bundle; no additional prerequisite-only PR is being split out.
+review and final design/risk gates apply to each exact atomic candidate. G3a follows this merged G2 bundle (PR #2275); no additional
+prerequisite-only PR was split out.
 
 Local qualification (2026-10-26): the complete native build and 487-test suite
 completed with 472 passed, 15 skipped and zero failures. The first full run
@@ -265,3 +266,76 @@ refuses active controlled attempts, and ordinary recomputation cannot qualify
 those distinct operators. Optimized K_FUSION/LFTJ routes, recursive aggregates,
 negation, other recursive representations and mixed fact/rule IDBs remain open.
 This split follows recovery/ownership boundaries; it does not close G3 or #1821.
+
+## G3a implementation and qualification (2026-10-27)
+
+Production implementation is audited at `a9ec399d` after two atomic commits;
+the third commit qualifies the assembled bundle and records its remaining scope.
+It advances E06 and ordinary recursive set comparison in F08. It does not close
+G3, #1821, actual differential execution, or every required recursive route.
+
+Declared, positive-arity scalar INT64 recursive heads use metadata recorded
+with the preserved lowered bodies. Unknown declarations, nullary/typed/compound
+recursive schemas, arithmetic recursive MAP, aggregates, negation and mixed
+fact/rule IDBs are not admitted by this bridge. VARIABLE, ordinary JOIN,
+projection MAP, supported row-local FILTER, CONCAT and CONSOLIDATE execute
+through the existing controlled children. Rewritten K_FUSION/LFTJ and nonzero
+worker EXCHANGE are refused. A zero-worker terminal EXCHANGE has no payload in
+this selected ordinary body route; its preserved body ends with CONSOLIDATE.
+
+Every recursive stratum starts with governed empty private heads. All its heads
+read the same frozen round, including every seed-producing rule, and complete
+and ACK their children before rebinding the next round. For this positive
+program, synchronous iteration from bottom is ascending. Canonical consolidated
+sets are compared one INT64 cell at a time; no binary-only merge is generalized.
+The host enforces `MAX_ITERATIONS` (4096 full rounds), returning EOVERFLOW before
+publication if it does not converge. No new total-runtime claim is made.
+Completed private predecessor strata feed later strata. The existing exact
+unobserved `edge`/`path` fast path and its tariffs remain unchanged, including
+its existing append-only successor restriction; this increment does not add
+removal successors to that legacy route.
+
+The general route supports observed and unobserved execution, multiple EDBs,
+and reusable insert/remove recomputation. It starts recursive heads from empty
+after mutation, so cycles do not retain unsupported old derivations. All public
+heads survive a precommit stop. A single coordinated registry image publishes
+after the final poll; optional signed differences use the existing observer.
+Old heads, consumed staging, private rounds and managed credits drain without
+replay. Callback replacement/clearing inside publication and late cancellation
+retain their existing contracts. External callback mutation after a completed
+controlled STEP is not newly enabled. Fresh/dirty snapshots remain outside this
+bundle; completed snapshot behavior is exercised.
+
+Qualification fixtures in `evaluation_serial`:
+
+- `test_controlled_recursive_transaction`: mutual recursion, several seed rules,
+  more than four bindings, cycles/duplicates, empty inputs, actual comparison and
+  retirement stops, and raw/reference parity with zero final governor credits.
+- `test_controlled_recursive_transaction_successors`: four callback modes, each
+  with 12 alternating mutations, alternate supporting derivations, loss of a
+  cycle's final seed, unchanged registry size and stable cycle resources;
+  completed snapshots, in-callback clear/replacement and late cancellation.
+- `test_controlled_recursive_transaction_stops`: admission, empty-head setup,
+  a later round's last active child, comparison, partial physical retirement,
+  descriptor-free/credit-retained retirement, later claims and final cutoff.
+  Each point checks work-limit resume, cancellation retry and cancellation
+  acknowledgment before checked destruction; old public descriptors/snapshots,
+  no early/replayed events and final zero credits are asserted.
+- `test_controlled_recursive_transaction_shapes`: unary and ternary heads,
+  two recursive strata with an acyclic consumer, and exact/one-short budgets.
+  Whole-session budgets are empirically calibrated, not independent cost oracles;
+  unchanged primitive suites retain the source-derived boundary checks.
+- `test_controlled_recursive_transaction_nonlinear_view`: an explicitly
+  unoptimized borrowed internal plan view executes nonlinear recursion with
+  later-round stop/resume against an independent unchanged raw plan. The same
+  fixture verifies the default K_FUSION plan is refused. This proves ordinary
+  scheduler semantics, not default optimizer reachability.
+- `test_controlled_recursive_transaction_refusals`: typed/nullary recursion,
+  expanding arithmetic MAP and mixed fact/rule IDBs fail without publication.
+  `test_controlled_recursive_step_general_join_chain` executes the formerly
+  refused renamed three-JOIN body through the general unobserved route.
+
+Next is G3b's actual trace/arrangement/retraction ownership and enforcement.
+K_FUSION/LFTJ integration, other recursive schema/expression families, legacy
+removal admission and remaining configuration/resource qualification stay open.
+G3b and G4–G7 are five remaining work groups, not a fixed remaining PR count.

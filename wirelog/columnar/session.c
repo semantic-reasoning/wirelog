@@ -9116,6 +9116,19 @@ wl_columnar_session_recursive_retire(
         tx->round_owner = owner;
     }
     if (tx->round_owner != owner) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    /* Exercise retained ownership after physical disposal has begun, and
+     * after the descriptor is gone but managed credit retirement remains. */
+    if (wl_columnar_session_test_observed_transaction_checkpoint &&
+        r->committed && tx->round > 0) {
+        if (r->phase == 6 && r->column > 0)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                22, 0, NULL);
+        else if (r->phase == 13)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                23, 0, NULL);
+    }
+#endif
     if (!r->committed) {
         int rc = wl_columnar_relation_scalar_retirement_prepare(r, control, id);
         if (rc) return rc;
@@ -9144,6 +9157,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->phase,
             tx->phase == WL_SESSION_OBSERVED_EVALUATE ? tx->head : tx->index,
             tx->child_active ? &tx->bindings : NULL);
+    if (wl_columnar_session_test_observed_transaction_checkpoint
+        && tx->round_active && tx->phase == WL_SESSION_OBSERVED_EVALUATE
+        && tx->child_active && tx->head + 1 == tx->round_end)
+        wl_columnar_session_test_observed_transaction_checkpoint(control, 24,
+            tx->round, &tx->bindings);
 #endif
     if ((tx->phase < WL_SESSION_OBSERVED_RETIRE
         || tx->phase >= WL_SESSION_RECURSIVE_SEED) &&

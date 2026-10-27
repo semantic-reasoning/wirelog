@@ -4543,3 +4543,23 @@ post-stop credit restoration. Wide multihead results and retry match the raw
 snapshot; internal projection fixtures cover duplicate/missing entries, empty
 strata and the optional-governor branch. These fixtures do not authorize plan
 mutation during a session operation.
+
+
+### Private ordinary recursive rounds (#1821 G3a)
+
+The controlled general session transaction owns separate old-public,
+previous-round and candidate-head descriptors. A complete SCC round reads only
+its frozen previous inputs; child readers and terminal cleanup receipts drain
+before bindings switch to next-round candidates. Original public descriptors
+remain leased until coordinated publication preparation. Governed empty heads
+use declaration-derived scalar INT64 widths, including when inputs are empty.
+
+`wl_columnar_session_recursive_retire` keeps its scalar retirement receipt at a
+stable transaction address. `round_owner` identifies the owning previous-head
+slot through partial physical freeing and the descriptor-free credit-retirement
+tail; no other path dereferences that retired descriptor. Work-limit resume
+continues the receipt. Cancellation/destruction use retained maintenance control
+to drain it, then every remaining private owner. No old public head is destroyed
+before the common publication cutoff. Repeated successor and interruption tests
+check resource baselines and zero reservations after session and program teardown;
+program intern storage is released by program destruction.
