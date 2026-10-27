@@ -167,6 +167,7 @@ typedef struct {
 } wl_columnar_session_observed_original_t;
 
 typedef struct {
+    wl_columnar_arrangement_diff_attempt_t differential;
     wl_columnar_eval_private_bindings_t bindings;
     wl_columnar_eval_cleanup_receipt_key_t receipt_key;
     wl_columnar_eval_private_dynamic_binding_t *entries;
@@ -340,6 +341,49 @@ wl_columnar_session_observed_bindings_authorized(
            && bindings->attempt_id == step->operation_id
            && wl_evaluation_control_active_attempt_id(bindings->control)
            == step->operation_id;
+}
+
+int
+wl_columnar_session_diff_index(wl_col_session_t *sess,
+    const wl_columnar_eval_private_bindings_t *bindings,
+    const col_rel_t *source,
+    const char *name, const uint32_t *keys, uint32_t count,
+    col_diff_arrangement_t **out, bool *build)
+{
+    *out = NULL; *build = false;
+    if (!sess->diff_enabled || !bindings || sess->spill_join_batch_bytes
+        || sess->join_batch_bytes)
+        return 0;
+    if (!wl_columnar_session_observed_bindings_authorized(sess, bindings))
+        return EINVAL;
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (tx->heads[tx->head].recursive || !source || !count
+        || source->storage_owner != source || source->col_shared
+        || source->timestamps ||
+        source->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+        return 0;
+    wl_evaluation_control_t *control = bindings->control;
+    uint64_t id = bindings->attempt_id;
+    bool public_edb = false;
+    for (uint32_t i = 0; i < sess->plan->edb_count; ++i) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        if (source == tx->entries[i].public_relation
+            && source == tx->entries[i].relation) public_edb = true;
+    }
+    if (!public_edb) return 0;
+    for (uint32_t c = 0; c < source->ncols; ++c) {
+        int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+        if (rc) return rc;
+        if (source->column_types &&
+            source->column_types[c] != WIRELOG_TYPE_INT64)
+            return 0;
+    }
+    return wl_columnar_arrangement_diff_attempt_index(&tx->differential,
+               sess, tx->ops, tx->op_count, source, name, keys, count, control,
+               id,
+               out, build);
 }
 
 static int col_controlled_step_successor_target_init(wl_col_session_t *,
@@ -9724,6 +9768,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         tx->index++; return 0;
     case WL_SESSION_OBSERVED_CLAIMS: /* Every claim is reversible until the single publication cutoff. */
         if (tx->index == tx->old_count) {
+            rc = wl_columnar_arrangement_diff_attempt_prepare(&tx->differential,
+                    sess, control, step->operation_id);
+            if (rc) return rc;
             tx->phase = WL_SESSION_OBSERVED_CUTOFF; return 0;
         }
         {
@@ -9752,7 +9799,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         rc = wl_columnar_session_observed_maintenance(tx);
         if (rc) return rc;
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
-                (uint64_t)tx->old_count + tx->count + 16);
+                (uint64_t)tx->old_count + tx->count + 16
+                + (tx->differential.started ? 128 : 0));
         if (rc) return rc;
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
                 0);
@@ -9788,6 +9836,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         sess->rel_hash_nbuckets = sess->rel_hash_chain_cap = 0;
         if (sess->memory_governor && !wl_columnar_memory_reservation_move(
                 &sess->rels_reservation, &tx->image_credit)) abort();
+        wl_columnar_arrangement_diff_attempt_commit(&tx->differential, sess);
         sess->rels = tx->image; tx->image = NULL;
         sess->nrels = tx->image_count; sess->rel_cap = tx->image_cap;
         for (uint32_t i = 0; i < tx->count; ++i) {
@@ -9807,6 +9856,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         return 0;
     }
     case WL_SESSION_OBSERVED_RETIRE:
+        rc = wl_columnar_arrangement_diff_attempt_drain(&tx->differential,
+                sess, tx->maintenance, tx->maintenance_id);
+        if (rc) return rc;
         if (tx->index == tx->old_count) {
             tx->index = 0; tx->phase = WL_SESSION_OBSERVED_FINISH; return 0;
         }
@@ -9927,7 +9979,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
             if (cancel_rc) return EAGAIN;
             tx->rollback = false;
             tx->phase = WL_SESSION_OBSERVED_CLAIMS; tx->index = 0;
-            if (tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT) {
+            if (tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT
+                || tx->differential.started) {
                 step->transaction_discard = true;
                 step->primary_result = tx->rollback_result;
                 return EAGAIN;
@@ -9946,7 +9999,11 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
                 tx->rollback_result = rc;
                 return EAGAIN;
             }
-            if (!tx->committed && rc != WL_EVALUATION_CONTROL_WORK_LIMIT) {
+            /* Synchronous JOIN/image builders may own a partial index.
+             * Retire the entire private image before retrying a stopped
+             * differential attempt; only the published image may survive. */
+            if (!tx->committed && (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+                || tx->differential.started)) {
                 step->transaction_discard = true;
                 step->primary_result = rc;
                 return EAGAIN;
@@ -9970,6 +10027,9 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     }
     if (tx->child_active || sess->cleanup_active) return EBUSY;
     int rc = wl_columnar_session_observed_maintenance(tx);
+    if (rc) return rc;
+    rc = wl_columnar_arrangement_diff_attempt_drain(&tx->differential,
+            sess, tx->maintenance, tx->maintenance_id);
     if (rc) return rc;
     uint32_t originals = tx->phase <
         WL_SESSION_OBSERVED_LEASES ? 0 : tx->old_count;

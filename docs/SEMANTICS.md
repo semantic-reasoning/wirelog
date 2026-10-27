@@ -1780,3 +1780,25 @@ Disabling `diff_enabled` retains full-sort behavior and tariffs. This algorithm
 is not active differential dispatch, persistent prefix reuse, a persistent JOIN
 arrangement, trace publication or incremental retraction scheduling. Those
 #1821 coverage obligations remain open.
+
+### Controlled persistent ordinary JOIN indexes (#1821, G3b)
+
+The general serial STEP host can share persistent native differential hash
+arrangements across ordinary keyed JOIN children. Eligibility requires the
+selected full right input to be a public EDB with contiguous INT64 storage,
+without a right filter, materialization, spill/batch policy or recursive head.
+Other supported inputs retain the existing controlled JOIN path. This uses
+native one-based chains but does not enable the raw differential dispatcher,
+signed frontier scheduling, or incremental retraction propagation.
+
+An unchanged source snapshot reuses its index; changed snapshots build a private
+replacement. Distinct key vectors use distinct entries and repeated requests
+share one index. All requested indexes and result heads publish at the same
+host cutoff. Existing raw pins or pending/deferred registry transactions refuse
+this image replacement; unrelated unpinned entries survive unchanged.
+
+A pre-cutoff work limit after index preparation begins aborts and drains the
+private host transaction. Reset/retry recomputes it under a fresh attempt;
+consumed work is not refunded. Cancellation and errors likewise leave public
+heads and indexes unchanged. After cutoff, retirement and callback delivery
+complete without replay or rollback.

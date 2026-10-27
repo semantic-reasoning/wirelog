@@ -91,6 +91,19 @@ downsize_advance_on_thread(void *opaque)
     return NULL;
 }
 
+struct trim_thread_arg {
+    wl_columnar_memory_reserved_trim_t *attempt;
+    int result;
+};
+
+static void *
+trim_advance_on_thread(void *opaque)
+{
+    struct trim_thread_arg *arg = opaque;
+    arg->result = wl_columnar_memory_reserved_trim_advance(arg->attempt);
+    return NULL;
+}
+
 static int
 test_explicit_values(void)
 {
@@ -1381,6 +1394,114 @@ test_committed_downsize_attempt(void)
         || !wl_columnar_memory_release(&invalid_token)
         || wl_columnar_memory_reserved(&governor) != 0) {
         FAIL("invalid target failed to restore the committed token");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
+static int
+test_reserved_trim(void)
+{
+    wl_columnar_memory_resolution_t resolution;
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token, invalid_token, moved;
+    wl_columnar_memory_reserved_trim_t attempt = { 0 }, copy, loser = { 0 };
+    wl_columnar_memory_reserved_trim_t invalid = { 0 };
+    struct trim_thread_arg thread_arg = { &attempt, 0 };
+    wl_thread_t thread;
+
+    TEST("bounded unallocated reservation trim resumes after CAS contention");
+    make_resolution(&resolution, 1000, 900);
+    wl_columnar_memory_governor_init(&governor, &resolution);
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_reservation_init(&moved);
+    growth_refund_peer_created = false;
+    wl_columnar_memory_reservation_init(&growth_refund_peer);
+    if (!wl_columnar_memory_reserve(&governor, 100, &token)
+        || wl_columnar_memory_reserved_trim_begin(&token, 0,
+        &attempt) != EINVAL
+        || wl_columnar_memory_reserved(&governor) != 100
+        || wl_columnar_memory_reserved_trim_begin(NULL, 40,
+        &attempt) != EINVAL
+        || wl_columnar_memory_reserved_trim_begin(&token, 40,
+        &attempt) != 0
+        || wl_columnar_memory_reserved_trim_begin(&token, 40,
+        &loser) != 0) {
+        FAIL("trim receipt setup or zero/owner validation failed");
+        return 1;
+    }
+    copy = attempt;
+    if (wl_columnar_memory_reserved_trim_advance(&copy) != EINVAL
+        || wl_thread_create(&thread, trim_advance_on_thread,
+        &thread_arg) != 0
+        || wl_thread_join(&thread) != 0 || thread_arg.result != EINVAL
+        || wl_columnar_memory_reserved_trim_advance(&attempt) != EAGAIN
+        || attempt.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_CREDIT
+        || wl_columnar_memory_reserved_trim_advance(&loser) != EBUSY
+        || loser.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING
+        || wl_columnar_memory_reservation_move(&moved, &token)
+        || wl_columnar_memory_commit(&token, &token)
+        || wl_columnar_memory_rollback(&token)
+        || wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reservation_downsize(&token, 50)) {
+        FAIL("trim claim did not exclude ordinary token operations");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 30, memory_order_release);
+    if (wl_columnar_memory_reserved_trim_advance(&attempt) != EINVAL
+        || token.bytes != 100
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING) {
+        FAIL("aggregate underflow did not retain old token authority");
+        return 1;
+    }
+    atomic_store_explicit(&governor.reserved_bytes, 100, memory_order_release);
+    wl_columnar_memory_downsize_test_before_credit_cas
+        = downsize_add_peer_reservation;
+    int rc = wl_columnar_memory_reserved_trim_advance(&attempt);
+    wl_columnar_memory_downsize_test_before_credit_cas = NULL;
+    if (rc != EAGAIN || !growth_refund_peer_created
+        || wl_columnar_memory_reserved(&governor) != 110
+        || token.bytes != 100
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_DOWNSIZING) {
+        FAIL("aggregate CAS contention changed reserved bytes");
+        return 1;
+    }
+    if (wl_columnar_memory_reserved_trim_advance(&attempt) != 0
+        || attempt.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_DONE
+        || token.bytes != 40
+        || atomic_load_explicit(&token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || wl_columnar_memory_reserved(&governor) != 50
+        || wl_columnar_memory_reserved_trim_advance(&attempt) != 0
+        || wl_columnar_memory_reserved(&governor) != 50
+        || !wl_columnar_memory_release(&growth_refund_peer)
+        || !wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reserved(&governor) != 0
+        || !wl_columnar_memory_reserve(&governor, 7, &token)
+        || wl_columnar_memory_reserved_trim_advance(&attempt) != 0
+        || token.bytes != 7 || wl_columnar_memory_reserved(&governor) != 7
+        || !wl_columnar_memory_release(&token)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("trim receipt did not reduce reserved credit exactly once");
+        return 1;
+    }
+    wl_columnar_memory_reservation_init(&invalid_token);
+    if (!wl_columnar_memory_reserve(&governor, 20, &invalid_token)
+        || wl_columnar_memory_reserved_trim_begin(&invalid_token,
+        20, &invalid) != 0
+        || wl_columnar_memory_reserved_trim_advance(&invalid) != EINVAL
+        || invalid.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED
+        || invalid_token.bytes != 20
+        || atomic_load_explicit(&invalid_token.state, memory_order_acquire)
+        != WL_COLUMNAR_MEMORY_RESERVATION_RESERVED
+        || !wl_columnar_memory_release(&invalid_token)
+        || wl_columnar_memory_reserved(&governor) != 0) {
+        FAIL("invalid target failed to restore the reserved token");
         return 1;
     }
     PASS();
@@ -3658,6 +3779,7 @@ main(void)
     test_growth_reservation();
     test_growth_refund_attempt();
     test_committed_downsize_attempt();
+    test_reserved_trim();
     test_growth_races();
     wl_columnar_memory_governor_test_work_checkpoint = controlled_work_point;
     wl_columnar_memory_governor_test_checkpoint = controlled_point;

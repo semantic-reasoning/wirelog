@@ -367,3 +367,18 @@ work-limit resume, repeated insert/remove successors, raw signed-event parity,
 no premature publication and governor restoration. Operator tests additionally
 cover stale metadata and independent per-pair discovery costs. This advances
 O08; it leaves E07/F04/F04a and the remaining G3b obligations above open.
+
+
+## Next G3b bundle: persistent arrangement-backed JOIN (2026-10-27)
+
+After merged PR #2278, this bundle adds a stable private differential registry
+image, native one-based persistent JOIN probes, and coordinated session
+publication. Ownership, bridge and host integration form one executable atomic
+unit; integrated qualification and ledger updates form the second. They ship
+in one PR, never as a standalone ownership prerequisite.
+
+The initial domain is full-right public EDB, contiguous INT64, keyed ordinary
+serial JOIN with supported projection. Unchanged sources reuse native indexes;
+changed generations rebuild privately. Private-head, recursive, selected-delta,
+filtered/materialized/batched/spill alternatives retain their controlled
+fallback/disposition. No signed differential/frontier/retraction claim follows.

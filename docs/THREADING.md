@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **428**).
+match the script's count (currently **438**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 428 sites.
+symbol-anchored inventory below covers 438 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1751,7 +1751,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 428 call sites.
+The complete current atomic-source inventory contains 438 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2223,3 +2223,24 @@ can refuse retirement without losing the source.
 | --- | --- | --- | --- | --- |
 | `batch_payload.c:wl_columnar_batch_payload_token_owned` | `token->state` | `atomic_load_explicit` | acquire | Observe stable committed ownership under the caller's serialized source lifecycle; reject in-flight token transitions |
 | `batch_payload.c:wl_columnar_batch_payload_token_owned#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate that the committed credit belongs to the source relation; does not replace checked retirement gates |
+
+### Controlled differential registry reservation trim
+
+The RESERVED-only trim returns admitted metadata slack that was never allocated.
+The owner thread claims DOWNSIZING before reading mutable accounting, retains
+that claim across a single-CAS retry, and publishes RESERVED after crediting once.
+Abort drains an outstanding claim before releasing the image token. This does
+not change the COMMITTED-token physical-retirement contract.
+
+| Site | Object | Operation | Order | Purpose |
+|---|---|---|---|---|
+| `memory_governor.c:wl_columnar_memory_reserved_trim_begin` | token owner | `atomic_load_explicit` | acquire | Match the ownerless reserved token before creating a downsize receipt |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_begin#2` | token state | `atomic_load_explicit` | acquire | Require RESERVED without reading mutable token payload |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance` | token owner | `atomic_load_explicit` | acquire | Revalidate owner authority before claiming the reserved token |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#2` | token state | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Claim DOWNSIZING before reading or changing mutable token payload |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#3` | token state | `atomic_store_explicit` | release | Restore RESERVED after rejecting an invalid target without changing credit |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#4` | token state | `atomic_load_explicit` | acquire | Verify DOWNSIZING ownership before credit reduction |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#5` | governor reserved bytes | `atomic_load_explicit` | relaxed | Read current aggregate before subtracting the unallocated reservation slack |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce reserved credit with one retryable aggregate CAS |
+| `memory_governor.c:wl_columnar_memory_reserved_trim_advance#7` | token state | `atomic_store_explicit` | release | Publish the trimmed token after aggregate credit succeeds |
+| `arrangement.c:wl_columnar_arrangement_diff_attempt_prepare` | registry token state | `atomic_load_explicit` | acquire | Validate the old registry accounting before the host publication cutoff |

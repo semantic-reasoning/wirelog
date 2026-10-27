@@ -4744,3 +4744,22 @@ slots: the final merge represents the prefix by its original row indices.
 Session qualification covers retained work-limit resume, cancellation retry,
 insert/remove cycles and zero governor reservations after checked destruction
 and release of the evaluation control and plan (including governed intern storage).
+
+### Controlled ordinary JOIN registry image (#1821, G3b)
+
+The general STEP transaction owns a separate registry image and ownership slots.
+Metadata is copied; existing native arrangements are borrowed without copying
+reservation tokens. New or invalidated indexes are separately admitted and
+owned by the image. A session registry claim excludes raw get/pin/grow/free
+until the image drains. Any old pin, pending transaction, deferred invalidation
+or aliased arrangement prevents replacement. Source snapshots and entry
+generations are revalidated before the common head/registry publication cutoff.
+
+Registry admission includes an upper bound for all copied JOIN metadata. Before
+publication, a RESERVED-only trim refunds never-allocated slack through a
+retained one-CAS receipt, then commits exact array-plus-metadata credit. It does
+not reuse the COMMITTED downsize contract for physically retired storage.
+Abort drains a claimed trim before releasing credit. Publication transfers
+canonical tokens without allocation or reclamation. Retained retirement frees
+arrays, keys and descriptors before refunding their credits and governor refs.
+Separate array/metadata accounting remains compatible with raw registry growth.

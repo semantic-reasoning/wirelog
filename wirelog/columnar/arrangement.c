@@ -3515,3 +3515,627 @@ col_diff_arr_entries_clone(const col_diff_arr_entry_t *src, uint32_t count,
     *out_cap = count;
     return 0;
 }
+
+/* Controlled session image: raw differential APIs retain their own protocol. */
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_arrangement_test_diff_checkpoint)(wl_evaluation_control_t *,
+    unsigned, uint64_t);
+#endif
+
+static int
+wl_columnar_arrangement_diff_pay(wl_evaluation_control_t *control, uint64_t id,
+    unsigned phase, uint64_t progress)
+{
+    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_arrangement_test_diff_checkpoint)
+        wl_columnar_arrangement_test_diff_checkpoint(control, phase, progress);
+#else
+    (void)phase; (void)progress;
+#endif
+    return wl_evaluation_control_charge_attempt(control, id, 0);
+}
+
+static int
+wl_columnar_arrangement_diff_reserve(wl_col_session_t *sess,
+    wl_columnar_memory_reservation_t *credit, uint64_t bytes,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_memory_reservation_init(credit);
+    if (!sess->memory_governor) return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_attempt_controlled(
+        wl_columnar_memory_governor_ref_get(sess->memory_governor), bytes,
+        credit, &status, control, id);
+    if (rc) return rc;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK ||
+        status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+        sess->memory_budget_denied = true; return ENOSPC;
+    }
+    return status == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : EINVAL;
+}
+
+static int
+wl_columnar_arrangement_diff_credit_commit(wl_col_session_t *sess,
+    wl_columnar_memory_reservation_t *credit, const void *owner,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!sess->memory_governor) return 0;
+    bool committed = false;
+    int rc = wl_columnar_memory_governor_commit_attempt_controlled(credit,
+            owner, &committed, control, id);
+    return rc ? rc : committed ? 0 : EINVAL;
+}
+
+static int
+wl_columnar_arrangement_diff_name_bytes(const char *name, uint64_t *bytes,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!name) return EINVAL;
+    for (size_t i = 0; ; ++i) {
+        int rc = wl_columnar_arrangement_diff_pay(control, id, 1, i);
+        if (rc) return rc;
+        if (*bytes == UINT64_MAX || i == SIZE_MAX) return EOVERFLOW;
+        ++*bytes;
+        if (!name[i]) return 0;
+    }
+}
+
+static int
+wl_columnar_arrangement_diff_metadata(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    uint32_t slot, const char *name, const uint32_t *keys, uint32_t count,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    uint64_t length = 0, key_bytes = 0, total = 0;
+    int rc = wl_columnar_arrangement_diff_name_bytes(name, &length, control,
+            id);
+    if (rc) return rc;
+    if (!wl_columnar_memory_size_mul(count, sizeof(uint32_t), &key_bytes)
+        || !wl_columnar_memory_size_add(length, key_bytes, &total)
+        || total > tx->metadata_limit - tx->metadata_bytes
+        || !length || length > SIZE_MAX ||
+        key_bytes > SIZE_MAX) return EOVERFLOW;
+    col_diff_arr_entry_t *entry = &tx->image[slot];
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, slot);
+    if (rc) return rc;
+    entry->rel_name = malloc((size_t)length);
+    if (!entry->rel_name) return ENOMEM;
+    tx->metadata_bytes += length;
+    wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT, length);
+    for (size_t i = 0; i < length; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 3, i);
+        if (rc) return rc;
+        entry->rel_name[i] = i + 1 == length ? 0 : name[i];
+    }
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, slot);
+    if (rc) return rc;
+    entry->key_cols = malloc((size_t)key_bytes);
+    if (!entry->key_cols) return ENOMEM;
+    tx->metadata_bytes += key_bytes;
+    wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        key_bytes);
+    entry->key_count = count;
+    for (uint32_t i = 0; i < count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 4, i);
+        if (rc) return rc;
+        entry->key_cols[i] = keys[i];
+    }
+    return 0;
+}
+
+static int
+wl_columnar_arrangement_diff_image(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    const wl_plan_op_t *ops, uint32_t op_count,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_arrangement_diff_pay(control, id, 0, 0);
+    if (rc) return rc;
+    if (sess->diff_txn_count) return ENOTSUP;
+    if (sess->diff_arr_count > sess->diff_arr_cap
+        || (sess->diff_arr_count && !sess->diff_arr_entries)) return EINVAL;
+    if (op_count > UINT32_MAX - sess->diff_arr_count) return EOVERFLOW;
+    tx->started = true;
+    sess->diff_txn_count = 1; /* excludes raw get/pin/grow/free until drain */
+    tx->original = sess->diff_arr_entries;
+    tx->old_count = sess->diff_arr_count; tx->old_capacity = sess->diff_arr_cap;
+    tx->capacity = tx->old_count + op_count;
+    if (!wl_columnar_memory_size_add(sess->diff_arr_registry_reserved_bytes,
+        sess->diff_arr_registry_metadata_reserved_bytes, &tx->old_bytes))
+        return EOVERFLOW;
+    wl_columnar_memory_reservation_init(&tx->old_credit);
+    wl_columnar_memory_reservation_init(&tx->retire_credit);
+    if (!tx->capacity || !wl_columnar_memory_size_mul(tx->capacity,
+        sizeof(*tx->image), &tx->array_bytes)
+        || !wl_columnar_memory_size_mul(tx->capacity, sizeof(*tx->slots),
+        &tx->slots_bytes)
+        || tx->array_bytes > SIZE_MAX || tx->slots_bytes > SIZE_MAX)
+        return EOVERFLOW;
+    for (uint32_t i = 0; i < tx->old_count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 0, i);
+        if (rc) return rc;
+        const col_diff_arr_entry_t *entry = &tx->original[i];
+        if (entry->pin_count || entry->transaction_pending ||
+            entry->invalidation_deferred) return ENOTSUP;
+        if (!entry->diff_arr || !entry->key_count || !entry->key_cols
+            || !entry->generation || entry->generation == UINT64_MAX)
+            return EINVAL;
+        for (uint32_t j = 0; j < i; ++j) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 0, j);
+            if (rc) return rc;
+            if (tx->original[j].diff_arr == entry->diff_arr) return EINVAL;
+        }
+        rc = wl_columnar_arrangement_diff_name_bytes(entry->rel_name,
+                &tx->metadata_limit, control, id);
+        if (rc) return rc;
+        if (!wl_columnar_memory_size_add(tx->metadata_limit,
+            (uint64_t)entry->key_count * sizeof(uint32_t),
+            &tx->metadata_limit)) return EOVERFLOW;
+    }
+    /* All copied JOIN spellings are an admitted upper bound, including
+     * ineligible or repeated requests. Unallocated slack is retired in prepare. */
+    for (uint32_t i = 0; i < op_count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 0, i);
+        if (rc) return rc;
+        if (ops[i].op != WL_PLAN_OP_JOIN || !ops[i].key_count
+            || !ops[i].right_relation) continue;
+        rc = wl_columnar_arrangement_diff_name_bytes(ops[i].right_relation,
+                &tx->metadata_limit, control, id);
+        if (rc) return rc;
+        if (!wl_columnar_memory_size_add(tx->metadata_limit,
+            (uint64_t)ops[i].key_count * sizeof(uint32_t),
+            &tx->metadata_limit)) return EOVERFLOW;
+    }
+    uint64_t total = 0;
+    if (!wl_columnar_memory_size_add(tx->array_bytes, tx->metadata_limit,
+        &total)) return EOVERFLOW;
+    rc = wl_columnar_arrangement_diff_reserve(sess, &tx->image_credit, total,
+            control, id);
+    if (rc) return rc;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, tx->array_bytes);
+    if (rc) return rc;
+    tx->image = malloc((size_t)tx->array_bytes);
+    if (!tx->image) return ENOMEM;
+    tx->image_charged = true;
+    wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        tx->array_bytes);
+    for (size_t i = 0; i < tx->array_bytes; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 5, i);
+        if (rc) return rc;
+        ((unsigned char *)tx->image)[i] = 0;
+    }
+    rc = wl_columnar_arrangement_diff_reserve(sess, &tx->slots_credit,
+            tx->slots_bytes, control, id);
+    if (rc) return rc;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, tx->slots_bytes);
+    if (rc) return rc;
+    const size_t allocated_slots = (size_t)tx->slots_bytes;
+    tx->slots = malloc(allocated_slots);
+    if (!tx->slots) return ENOMEM;
+    tx->slots_charged = true;
+    wl_mem_ledger_alloc(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+        tx->slots_bytes);
+    rc = wl_columnar_arrangement_diff_credit_commit(sess, &tx->slots_credit,
+            tx, control, id);
+    if (rc) return rc;
+    for (size_t i = 0; i < tx->slots_bytes; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 5, i);
+        if (rc) return rc;
+        ((unsigned char *)tx->slots)[i] = 0;
+    }
+    for (uint32_t i = 0; i < tx->old_count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 6, i);
+        if (rc) return rc;
+        if (i >= allocated_slots / sizeof(*tx->slots)) return EINVAL;
+        tx->count = i + 1;
+        tx->image[i].diff_arr = tx->original[i].diff_arr;
+        tx->image[i].generation = tx->original[i].generation;
+        tx->slots[i].generation = tx->original[i].generation;
+        rc = wl_columnar_arrangement_diff_metadata(tx, sess, i,
+                tx->original[i].rel_name, tx->original[i].key_cols,
+                tx->original[i].key_count, control, id);
+        if (rc) return rc;
+    }
+    tx->ready = true;
+    return 0;
+}
+
+static int
+wl_columnar_arrangement_diff_build(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    uint32_t slot, const uint32_t *keys, uint32_t key_count, uint32_t rows,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    uint32_t buckets = 1;
+    while (buckets < (uint64_t)rows * 2) {
+        int rc = wl_columnar_arrangement_diff_pay(control, id, 7, buckets);
+        if (rc) return rc;
+        if (buckets > UINT32_MAX / 2) return EOVERFLOW;
+        buckets *= 2;
+    }
+    uint64_t key_bytes = (uint64_t)key_count * sizeof(uint32_t);
+    uint64_t head_bytes = (uint64_t)buckets * sizeof(uint32_t);
+    uint64_t next_bytes = (uint64_t)rows * sizeof(uint32_t), total = 0;
+    if (key_bytes > SIZE_MAX || head_bytes > SIZE_MAX || next_bytes > SIZE_MAX
+        || !wl_columnar_memory_size_add(sizeof(col_diff_arrangement_t),
+        key_bytes + head_bytes + next_bytes, &total)) return EOVERFLOW;
+    int rc = wl_columnar_arrangement_diff_reserve(sess, &tx->build_credit,
+            total, control, id);
+    if (rc) return rc;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, total);
+    if (rc) return rc;
+    tx->building = malloc(sizeof(*tx->building));
+    if (!tx->building) return ENOMEM;
+    tx->building_initialized = false;
+    for (size_t i = 0; i < sizeof(*tx->building); ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 8, i);
+        if (rc) return rc;
+        ((unsigned char *)tx->building)[i] = 0;
+    }
+    col_diff_arrangement_t *arr = tx->building;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 8, sizeof(*arr));
+    if (rc) return rc;
+    wl_columnar_memory_reservation_init(&arr->reservation);
+    tx->building_initialized = true;
+    arr->memory_governor = sess->memory_governor;
+    wl_columnar_memory_governor_ref_retain(arr->memory_governor);
+    if (sess->memory_governor && !wl_columnar_memory_reservation_move(
+            &arr->reservation, &tx->build_credit)) return EINVAL;
+    rc = wl_columnar_arrangement_diff_credit_commit(sess, &arr->reservation,
+            arr, control, id);
+    if (rc) return rc;
+    arr->reserved_bytes = total;
+    arr->key_count = key_count; arr->nbuckets = buckets; arr->ht_cap = rows;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, key_bytes);
+    if (rc) return rc;
+    arr->key_cols = malloc((size_t)key_bytes);
+    if (!arr->key_cols) return ENOMEM;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, head_bytes);
+    if (rc) return rc;
+    arr->ht_head = malloc((size_t)head_bytes);
+    if (!arr->ht_head) return ENOMEM;
+    rc = wl_columnar_arrangement_diff_pay(control, id, 2, next_bytes);
+    if (rc) return rc;
+    arr->ht_next = malloc((size_t)next_bytes);
+    if (!arr->ht_next) return ENOMEM;
+    for (uint32_t i = 0; i < key_count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 4, i);
+        if (rc) return rc;
+        arr->key_cols[i] = keys[i];
+    }
+    for (uint32_t i = 0; i < buckets; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 9, i);
+        if (rc) return rc;
+        arr->ht_head[i] = 0;
+    }
+    for (uint32_t i = 0; i < rows; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 9, i);
+        if (rc) return rc;
+        arr->ht_next[i] = 0;
+    }
+    rc = wl_columnar_arrangement_diff_pay(control, id, 10, slot);
+    if (rc) return rc;
+    col_diff_arrangement_attach_ledger(arr, &sess->mem_ledger);
+    tx->image[slot].diff_arr = arr; tx->slots[slot].owned = true;
+    tx->image[slot].generation = tx->slots[slot].generation + 1;
+    tx->building = NULL; tx->building_initialized = false;
+    return 0;
+}
+
+int
+wl_columnar_arrangement_diff_attempt_index(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    const wl_plan_op_t *ops, uint32_t op_count, const col_rel_t *source,
+    const char *name, const uint32_t *keys, uint32_t count,
+    wl_evaluation_control_t *control, uint64_t id,
+    col_diff_arrangement_t **out, bool *build)
+{
+    *out = NULL; *build = false;
+    int rc;
+    if (!tx->started) {
+        rc = wl_columnar_arrangement_diff_image(tx, sess, ops, op_count,
+                control, id);
+        if (rc) return rc;
+    }
+    if (!tx->ready || tx->prepared || tx->committed) return EINVAL;
+    uint32_t slot = tx->count;
+    for (uint32_t i = 0; i < tx->count; ++i) {
+        rc = wl_columnar_arrangement_diff_pay(control, id, 11, i);
+        if (rc) return rc;
+        if (tx->image[i].key_count != count) continue;
+        bool equal = true;
+        for (size_t c = 0; ; ++c) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 11, c);
+            if (rc) return rc;
+            if (name[c] != tx->image[i].rel_name[c]) {
+                equal = false; break;
+            }
+            if (!name[c]) break;
+        }
+        if (!equal) continue;
+        for (uint32_t c = 0; c < count; ++c) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 11, c);
+            if (rc) return rc;
+            if (keys[c] != tx->image[i].key_cols[c]) {
+                equal = false; break;
+            }
+        }
+        if (equal) {
+            slot = i; break;
+        }
+    }
+    col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(source);
+    if (slot == tx->count) {
+        if (slot == tx->capacity) return EOVERFLOW;
+        ++tx->count;
+        rc = wl_columnar_arrangement_diff_metadata(tx, sess, slot, name,
+                keys, count, control, id);
+        if (rc) return rc;
+    }
+    col_diff_arrangement_t *arr = tx->image[slot].diff_arr;
+    bool valid = arr && arr->worker_id == 0 && arr->key_count == count
+        && arr->key_cols && arr->ht_head && arr->ht_next && arr->nbuckets
+        && !(arr->nbuckets & (arr->nbuckets - 1))
+        && arr->ht_cap >= source->nrows && arr->indexed_rows == source->nrows
+        && arr->current_nrows == source->nrows
+        && wl_columnar_relation_snapshot_equal(arr->source_snapshot, snapshot);
+    if (tx->slots[slot].source && (tx->slots[slot].source != source ||
+        !wl_columnar_relation_snapshot_equal(tx->slots[slot].snapshot,
+        snapshot)))
+        return EINVAL;
+    if (valid && !tx->slots[slot].source) {
+        for (uint32_t k = 0; k < count; ++k) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 12, k);
+            if (rc) return rc;
+            if (arr->key_cols[k] != keys[k]) valid = false;
+        }
+        for (uint32_t b = 0; b < arr->nbuckets; ++b) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 12, b);
+            if (rc) return rc;
+            if (arr->ht_head[b] > source->nrows) valid = false;
+        }
+        for (uint32_t r = 0; r < source->nrows; ++r) {
+            rc = wl_columnar_arrangement_diff_pay(control, id, 12, r);
+            if (rc) return rc;
+            /* Native builders index in ascending order: links strictly
+             * decrease, excluding cycles as well as out-of-range rows. */
+            if (arr->ht_next[r] > r) valid = false;
+        }
+    }
+    if (!valid) {
+        if (tx->slots[slot].owned) return EINVAL;
+        rc = wl_columnar_arrangement_diff_build(tx, sess, slot, keys, count,
+                source->nrows, control, id);
+        if (rc) return rc;
+        arr = tx->image[slot].diff_arr; *build = true;
+    }
+    rc = wl_columnar_arrangement_diff_pay(control, id, valid ? 13 : 14, slot);
+    if (rc) return rc;
+    tx->slots[slot].source = source; tx->slots[slot].snapshot = snapshot;
+    *out = arr;
+    return 0;
+}
+
+int
+wl_columnar_arrangement_diff_attempt_prepare(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!tx->started || tx->prepared) return 0;
+    int rc = wl_columnar_arrangement_diff_pay(control, id, 15, tx->validate);
+    if (rc) return rc;
+    if (!tx->ready || sess->diff_txn_count != 1
+        || sess->diff_arr_entries != tx->original
+        || sess->diff_arr_count != tx->old_count
+        || sess->diff_arr_cap != tx->old_capacity) return EINVAL;
+    if (tx->validate < tx->old_count) {
+        uint32_t i = tx->validate;
+        const col_diff_arr_entry_t *entry = &tx->original[i];
+        if (entry->generation != tx->slots[i].generation || entry->pin_count
+            || entry->transaction_pending || entry->invalidation_deferred)
+            return EINVAL;
+        ++tx->validate; return EAGAIN;
+    }
+    if (tx->validate - tx->old_count < tx->count) {
+        uint32_t i = tx->validate - tx->old_count;
+        const col_rel_t *source = tx->slots[i].source;
+        if (source && (!wl_columnar_relation_snapshot_equal(
+                tx->slots[i].snapshot, wl_columnar_relation_snapshot(source))
+            || !tx->image[i].diff_arr
+            || !wl_columnar_relation_snapshot_equal(tx->slots[i].snapshot,
+            tx->image[i].diff_arr->source_snapshot)
+            || tx->image[i].diff_arr->indexed_rows != source->nrows))
+            return EINVAL;
+        ++tx->validate; return EAGAIN;
+    }
+    uint64_t total = tx->array_bytes + tx->metadata_bytes;
+    if (sess->memory_governor) {
+        if (tx->prepare_phase == 0) {
+            if (tx->image_credit.bytes > total) {
+                rc = wl_columnar_memory_reserved_trim_begin(&tx->image_credit,
+                        total, &tx->trim);
+                if (rc) return rc;
+            }
+            tx->prepare_phase = 1; return EAGAIN;
+        }
+        if (tx->prepare_phase == 1) {
+            if (tx->trim.identity) {
+                rc = wl_columnar_memory_reserved_trim_advance(&tx->trim);
+                if (rc) return rc;
+            }
+            tx->prepare_phase = 2; return EAGAIN;
+        }
+        if (tx->prepare_phase == 2) {
+            rc = wl_columnar_arrangement_diff_credit_commit(sess,
+                    &tx->image_credit, sess, control, id);
+            if (rc) return rc;
+            tx->prepare_phase = 3; return EAGAIN;
+        }
+        if (tx->old_bytes &&
+            (sess->diff_arr_registry_reservation.identity !=
+            &sess->diff_arr_registry_reservation ||
+            sess->diff_arr_registry_reservation.bytes != tx->old_bytes ||
+            atomic_load_explicit(&sess->diff_arr_registry_reservation.state,
+            memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED))
+            return EINVAL;
+    }
+    tx->prepared = true;
+    return 0;
+}
+
+void
+wl_columnar_arrangement_diff_attempt_commit(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess)
+{
+    if (!tx->started) return;
+    if (!tx->prepared || tx->committed) abort();
+    /* The host's prepaid cutoff owns these fixed moves and pointer stores.
+     * No callbacks, allocation, credit refunds or reclamation occur here. */
+    if (sess->memory_governor) {
+        if (tx->old_bytes && !wl_columnar_memory_reservation_move(
+                &tx->old_credit, &sess->diff_arr_registry_reservation)) abort();
+        if (!wl_columnar_memory_reservation_move(
+                &sess->diff_arr_registry_reservation,
+                &tx->image_credit)) abort();
+    }
+    sess->diff_arr_entries = tx->image;
+    sess->diff_arr_count = tx->count; sess->diff_arr_cap = tx->capacity;
+    sess->diff_arr_registry_reserved_bytes = tx->array_bytes;
+    sess->diff_arr_registry_metadata_reserved_bytes = tx->metadata_bytes;
+    tx->committed = true;
+}
+
+static int
+wl_columnar_arrangement_diff_finish_credit(
+    wl_columnar_memory_reservation_t *credit)
+{
+    if (!credit->identity || !credit->governor || !credit->bytes) return 0;
+    bool done = false;
+    int rc = wl_columnar_memory_reservation_finish_step(credit, false, &done);
+    return rc ? rc : done ? 0 : EAGAIN;
+}
+
+static int
+wl_columnar_arrangement_diff_retire(wl_columnar_arrangement_diff_attempt_t *tx)
+{
+    col_diff_arrangement_t *arr = tx->retiring;
+    if (tx->retire_phase < 5 && !arr) return EINVAL;
+    switch (tx->retire_phase) {
+    case 0:
+        tx->retire_governor = arr->memory_governor;
+        tx->retire_ledger = arr->ledger;
+        tx->retire_bytes = col_diff_arrangement_bytes(arr);
+        if (arr->reservation.identity && arr->reservation.bytes
+            && !wl_columnar_memory_reservation_move(&tx->retire_credit,
+            &arr->reservation)) return EBUSY;
+        tx->retire_phase = 1; return EAGAIN;
+    case 1: free(arr->ht_head); arr->ht_head = NULL;
+        tx->retire_phase = 2; return EAGAIN;
+    case 2: free(arr->ht_next); arr->ht_next = NULL;
+        tx->retire_phase = 3; return EAGAIN;
+    case 3: free(arr->key_cols); arr->key_cols = NULL;
+        tx->retire_phase = 4; return EAGAIN;
+    case 4: free(arr); tx->retiring = NULL;
+        if (tx->retire_ledger) wl_mem_ledger_free(tx->retire_ledger,
+                WL_MEM_SUBSYS_ARRANGEMENT, tx->retire_bytes);
+        tx->retire_phase = 5; return EAGAIN;
+    case 5: {
+        int rc = wl_columnar_arrangement_diff_finish_credit(&tx->retire_credit);
+        if (rc) return rc;
+        tx->retire_phase = 6; return EAGAIN;
+    }
+    case 6:
+        wl_columnar_memory_governor_ref_release(tx->retire_governor);
+        tx->retire_governor = NULL; tx->retire_ledger = NULL;
+        tx->retire_phase = 0; return 0;
+    default: return EINVAL;
+    }
+}
+
+int
+wl_columnar_arrangement_diff_attempt_drain(
+    wl_columnar_arrangement_diff_attempt_t *tx, wl_col_session_t *sess,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!tx->started || tx->drained) return 0;
+    int rc = wl_columnar_arrangement_diff_pay(control, id,
+            tx->committed ? 17 : 16, tx->cleanup_index);
+    if (rc) return rc;
+    /* A claimed trim is mandatory cleanup, including cancellation between
+     * claim and credit. Its terminal receipt survives later token release. */
+    if (tx->trim.identity &&
+        tx->trim.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_DONE
+        && tx->trim.phase != WL_COLUMNAR_MEMORY_DOWNSIZE_FAILED) {
+        rc = wl_columnar_memory_reserved_trim_advance(&tx->trim);
+        return rc ? rc : EAGAIN;
+    }
+    if (tx->building) {
+        if (!tx->building_initialized) {
+            free(tx->building); tx->building = NULL; return EAGAIN;
+        }
+        if (!tx->retiring && !tx->retire_phase) tx->retiring = tx->building;
+        rc = wl_columnar_arrangement_diff_retire(tx);
+        if (rc) return rc;
+        tx->building = NULL; tx->building_initialized = false;
+        return EAGAIN;
+    }
+    rc = wl_columnar_arrangement_diff_finish_credit(&tx->build_credit);
+    if (rc) return rc;
+    uint32_t count = tx->committed ? tx->old_count : tx->count;
+    col_diff_arr_entry_t *entries = tx->committed ? tx->original : tx->image;
+    if (tx->cleanup_index < count) {
+        uint32_t i = tx->cleanup_index;
+        col_diff_arr_entry_t *entry = &entries[i];
+        if (tx->cleanup_phase == 0) {
+            bool owned = tx->committed
+                ? entry->diff_arr != tx->image[i].diff_arr : tx->slots[i].owned;
+            if (owned && entry->diff_arr) {
+                tx->retiring = entry->diff_arr; tx->cleanup_phase = 1;
+            } else tx->cleanup_phase = 2;
+            return EAGAIN;
+        }
+        if (tx->cleanup_phase == 1) {
+            rc = wl_columnar_arrangement_diff_retire(tx);
+            if (rc) return rc;
+            entry->diff_arr = NULL; tx->cleanup_phase = 2;
+            return EAGAIN;
+        }
+        if (tx->cleanup_phase == 2) {
+            free(entry->rel_name); entry->rel_name = NULL;
+            tx->cleanup_phase = 3; return EAGAIN;
+        }
+        free(entry->key_cols); entry->key_cols = NULL;
+        tx->cleanup_phase = 0; ++tx->cleanup_index;
+        return EAGAIN;
+    }
+    if (tx->cleanup_phase == 0) {
+        if (tx->committed) {
+            free(tx->original); tx->original = NULL;
+            wl_mem_ledger_free(&sess->mem_ledger, WL_MEM_SUBSYS_ARRANGEMENT,
+                tx->old_bytes);
+        } else {
+            free(tx->image); tx->image = NULL;
+            if (tx->image_charged) wl_mem_ledger_free(&sess->mem_ledger,
+                    WL_MEM_SUBSYS_ARRANGEMENT,
+                    tx->array_bytes + tx->metadata_bytes);
+        }
+        tx->cleanup_phase = 1; return EAGAIN;
+    }
+    if (tx->cleanup_phase == 1) {
+        rc = wl_columnar_arrangement_diff_finish_credit(tx->committed
+                ? &tx->old_credit : &tx->image_credit);
+        if (rc) return rc;
+        free(tx->slots); tx->slots = NULL;
+        if (tx->slots_charged) wl_mem_ledger_free(&sess->mem_ledger,
+                WL_MEM_SUBSYS_ARRANGEMENT, tx->slots_bytes);
+        tx->cleanup_phase = 2; return EAGAIN;
+    }
+    rc = wl_columnar_arrangement_diff_finish_credit(&tx->slots_credit);
+    if (rc) return rc;
+    if (sess->diff_txn_count != 1) return EINVAL;
+    sess->diff_txn_count = 0; tx->drained = true;
+    return 0;
+}
