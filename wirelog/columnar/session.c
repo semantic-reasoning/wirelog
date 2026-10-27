@@ -453,6 +453,22 @@ session_find_rel(wl_col_session_t *sess, const char *name)
     return NULL;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Serial qualification policy only. Detach the same source but retain its
+ * allocation until this session is destroyed; never change admission results.
+ * Policy reset cannot release or overwrite the independent retained owner. */
+bool wl_columnar_session_test_retain_cold_source;
+static wl_col_session_t *wl_columnar_session_test_cold_owner;
+static col_rel_t *wl_columnar_session_test_cold_source;
+bool
+wl_columnar_session_test_has_retained_cold_source(const wl_col_session_t *s)
+{
+    /* NULL queries whether any detached test owner remains. */
+    return s ? wl_columnar_session_test_cold_owner == s
+             : wl_columnar_session_test_cold_owner != NULL;
+}
+#endif
+
 /* Cold bindings never enter the raw relation registry. Only an audited,
  * immutable plan may access them, through the bounded right-JOIN reader. */
 static bool
@@ -486,7 +502,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0)
                     return false;
-                if (!op->right_relation || strcmp(op->right_relation, name))
+                if (!op->right_relation || strcmp(op->right_relation,
+                    name) != 0)
                     continue;
                 if (op->op != WL_PLAN_OP_JOIN || op->key_count != 1 ||
                     op->right_filter_expr.size ||
@@ -549,6 +566,11 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     if (!session || session->backend != wl_backend_columnar() || !name)
         return WL_COLUMNAR_SPILL_INVALID;
     wl_col_session_t *s = COL_SESSION(session);
+#ifdef WL_SESSION_TEST_HOOKS
+    bool retain = wl_columnar_session_test_retain_cold_source;
+    if (retain && wl_columnar_session_test_cold_owner)
+        return WL_COLUMNAR_SPILL_BUSY;
+#endif
     if (s->base.input_load_failed || s->cold_relation || s->cold_seal_closed ||
         s->has_evaluated ||
         s->plain_step_completion_pending || s->uncommitted_strata_done ||
@@ -564,7 +586,7 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     /* Linear lookup avoids allocating a hash merely to refuse this operation. */
     uint32_t slot = 0;
     while (slot < s->nrels && (!s->rels[slot] ||
-        strcmp(s->rels[slot]->name, name))) slot++;
+        strcmp(s->rels[slot]->name, name) != 0)) slot++;
     if (slot == s->nrels) return WL_COLUMNAR_SPILL_INVALID;
     col_rel_t *r = s->rels[slot];
     if (r->memory_governor != s->memory_governor ||
@@ -628,7 +650,17 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(context))
         rc = WL_COLUMNAR_SPILL_CANCELLED;
     if (rc == WL_COLUMNAR_SPILL_OK) {
-        int retired = col_rel_destroy_checked(r);
+        int retired;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (retain) {
+            wl_columnar_relation_retirement_token_t token;
+            wl_columnar_relation_retirement_init(&token);
+            retired = wl_columnar_relation_retirement_prepare(r, &token);
+            if (!retired && wl_columnar_relation_retirement_cancel(&token))
+                abort();
+        } else
+#endif
+        retired = col_rel_destroy_checked(r);
         if (retired) rc = retired == EBUSY ? WL_COLUMNAR_SPILL_BUSY :
                 WL_COLUMNAR_SPILL_INVALID;
     }
@@ -639,6 +671,12 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     }
     /* Irreversible commit: no callbacks, allocations or fallible work. Cache
      * registries were empty and source leases absent at preflight. */
+#ifdef WL_SESSION_TEST_HOOKS
+    if (retain) {
+        wl_columnar_session_test_cold_owner = s;
+        wl_columnar_session_test_cold_source = r;
+    }
+#endif
     s->rels[slot] = NULL;
     session_rel_free_hash(s);
     if (inserted_name) s->last_inserted_relation = c->name;
@@ -4486,6 +4524,14 @@ col_session_destroy(wl_session_t *session)
         = wl_columnar_session_retry_retained_eval_entries(sess);
 #ifdef WL_SESSION_TEST_HOOKS
     wl_session_testhook_after_worker_lease_release(&sess->base);
+#endif
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_cold_owner == sess) {
+        if (col_rel_destroy_checked(
+                wl_columnar_session_test_cold_source)) abort();
+        wl_columnar_session_test_cold_source = NULL;
+        wl_columnar_session_test_cold_owner = NULL;
+    }
 #endif
     int relation_alias_rc = session_destroy_relation_array_pass(sess->rels,
             sess->nrels, true);

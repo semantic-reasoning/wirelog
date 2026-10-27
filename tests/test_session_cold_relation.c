@@ -526,9 +526,235 @@ static void generation_boundary(void)
     }
 }
 
+extern bool wl_columnar_session_test_retain_cold_source;
+extern bool wl_columnar_session_test_has_retained_cold_source(
+    const wl_col_session_t *);
+extern void (*wl_columnar_join_test_spill_producer_result)(
+    wl_columnar_spill_status_t);
+static uint64_t budget_peak;
+static unsigned producer_calls;
+static wl_columnar_spill_status_t producer_status;
+static void budget_admitted(wl_columnar_memory_governor_t *g, uint64_t total)
+{
+    (void)g; if (total > budget_peak) budget_peak = total;
+}
+static void producer_result(wl_columnar_spill_status_t status)
+{
+    producer_calls++; producer_status = status;
+}
+static fixture_t budget_fixture(uint64_t allowance)
+{
+    fixture_t f = fixture(query, allowance, 8*1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    s->spill_join_batch_bytes = 1024;
+    s->spill_join_index_bytes = 512*1024;
+    for (int64_t i = 0; i < 128; i++) {
+        int64_t row[] = {0, i};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+    }
+    for (int64_t i = 0; i < 32768; i++) {
+        int64_t row[] = {i < 64 ? 0 : i+1000, 100+i};
+        CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+    }
+    return f;
+}
+typedef struct { unsigned count; unsigned char seen[1024]; } budget_events_t;
+static void budget_observe(const char *name, const int64_t *row, uint32_t cols,
+    void *ctx)
+{
+    budget_events_t *e = ctx;
+    CHECK(!strcmp(name, "result") && cols == 3 && row[0] == 0 &&
+        row[1] >= 0 && row[1] < 128 && row[2] >= 100 && row[2] < 164);
+    unsigned ordinal = (unsigned)(row[1]*64 + row[2]-100);
+    unsigned char mask = (unsigned char)(1u << (ordinal%8));
+    CHECK(!(e->seen[ordinal/8] & mask));
+    e->seen[ordinal/8] |= mask; e->count++;
+}
+static void fixed_budget(void)
+{
+    CHECK(!wl_columnar_session_test_has_retained_cold_source(NULL));
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    wl_columnar_join_test_spill_producer_result = producer_result;
+    budget_peak = producer_calls = 0;
+    fixture_t calibration = budget_fixture(8*1024*1024);
+    CHECK(wl_columnar_session_seal_join_input(calibration.session, "b", NULL,
+        NULL) == OK);
+    budget_events_t events = {0};
+    CHECK(wl_session_snapshot(calibration.session, budget_observe,
+        &events) == 0 && events.count == 8192);
+    uint64_t allowance = budget_peak;
+    destroy(&calibration);
+    for (unsigned retain = 0; retain < 2; retain++) {
+        budget_peak = producer_calls = 0;
+        producer_status = WL_COLUMNAR_SPILL_INVALID;
+        fixture_t f = budget_fixture(allowance);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        col_rel_t *r = session_find_rel(s, "b");
+        uint64_t identity = r->relation_identity, before = reserved(&f);
+        uint64_t resident = r->descriptor_reserved_bytes +
+            r->metadata_reserved_bytes +
+            r->retained_reserved_bytes + r->dedup_reserved_bytes;
+        wl_columnar_session_test_retain_cold_source = retain != 0;
+        CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+            NULL) == OK);
+        wl_columnar_session_test_retain_cold_source = false;
+        uint64_t after = reserved(&f);
+        CHECK(!session_find_rel(s, "b") && s->cold_relation &&
+            s->cold_relation->source_snapshot.relation_identity == identity);
+        CHECK(wl_columnar_session_test_has_retained_cold_source(s) ==
+            (retain != 0));
+        CHECK(retain ? after > before : after < before);
+        CHECK(resident >= UINT64_C(32768)*2*8);
+        uint64_t disk = wl_columnar_spill_store_bytes(s->spill_store);
+        events = (budget_events_t){0};
+        int rc = wl_session_snapshot(f.session, budget_observe, &events);
+        CHECK(budget_peak <= allowance && s->spill_join_selected_count == 1 &&
+            producer_calls == 1);
+        if (!retain) {
+            CHECK(rc == 0 && events.count == 8192 && producer_status == OK);
+            unsigned writes = write_calls;
+            events = (budget_events_t){0};
+            CHECK(wl_session_snapshot(f.session, budget_observe,
+                &events) == 0 && events.count == 8192);
+            CHECK(write_calls == writes);
+        } else {
+            CHECK(rc == ENOSPC && wl_session_budget_denied(f.session) &&
+                !events.count);
+            CHECK(producer_status == WL_COLUMNAR_SPILL_MEMORY ||
+                (producer_status == OK && s->join_output_peak < 8192));
+        }
+        CHECK(s->arr_count == 0 &&
+            wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        destroy(&f);
+        CHECK(!wl_columnar_session_test_has_retained_cold_source(NULL));
+    }
+    wl_columnar_join_test_spill_producer_result = NULL;
+    wl_columnar_memory_governor_test_admitted = NULL;
+}
+static void retention_lifetime(void)
+{
+    fixture_t f = populated(); wl_col_session_t *s = COL_SESSION(f.session);
+    wl_columnar_session_test_retain_cold_source = true;
+    col_rel_t *r = session_find_rel(s, "b");
+    wl_columnar_source_access_reader_t pin = {0};
+    CHECK(col_rel_source_reader_acquire(r, &pin) == 0);
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == WL_COLUMNAR_SPILL_BUSY);
+    CHECK(!s->cold_relation &&
+        !wl_columnar_session_test_has_retained_cold_source(s));
+    CHECK(col_rel_source_reader_release(&pin) == 0);
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == OK);
+    fixture_t other = populated();
+    CHECK(wl_columnar_session_seal_join_input(other.session, "b", NULL,
+        NULL) == WL_COLUMNAR_SPILL_BUSY);
+    destroy(&other);
+    CHECK(wl_columnar_session_test_has_retained_cold_source(s));
+    wl_columnar_session_test_retain_cold_source = false;
+    destroy(&f);
+    CHECK(!wl_columnar_session_test_has_retained_cold_source(NULL));
+    f = populated();
+    wl_columnar_session_test_retain_cold_source = true;
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == OK);
+    wl_columnar_session_test_retain_cold_source = false;
+    destroy(&f);
+}
+
+/* Each thread owns its cursor; no session operation runs alongside these pins. */
+static void *cold_reader(void *context)
+{
+    wl_columnar_batch_payload_reader_t *reader = context;
+    for (unsigned i = 0; i < 1024; i++) {
+        unsigned row = (i*37)%128;
+        const uint64_t *lanes;
+        wl_columnar_spill_metadata_t metadata;
+        CHECK(wl_columnar_batch_payload_read(reader, row, NULL, NULL, &lanes,
+            &metadata) == OK);
+        CHECK(lanes[0] == row && lanes[1] == row+100 &&
+            metadata.multiplicity == 1);
+    }
+    return NULL;
+}
+static void concurrent_cold_readers(void)
+{
+    fixture_t f = populated();
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == OK);
+    wl_columnar_batch_payload_t *payload =
+        COL_SESSION(f.session)->cold_relation->payload;
+    wl_columnar_batch_payload_reader_t *readers[2];
+    wl_thread_t threads[2];
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(wl_columnar_batch_payload_acquire(payload, &readers[i]) == OK);
+        CHECK(wl_thread_create(&threads[i], cold_reader, readers[i]) == 0);
+    }
+    CHECK(wl_columnar_batch_payload_release(payload) == WL_COLUMNAR_SPILL_BUSY);
+    for (unsigned i = 0; i < 2; i++) {
+        wl_thread_join(&threads[i]);
+        wl_columnar_batch_payload_reader_release(readers[i]);
+    }
+    events_t events = {0};
+    CHECK(wl_session_snapshot(f.session, observe,
+        &events) == 0 && events.count == 4);
+    destroy(&f);
+}
+static fixture_t floor_fixture(uint64_t allowance, int64_t rows)
+{
+    fixture_t f = fixture(query, allowance, 1024*1024);
+    for (int64_t i = 0; i < rows; i++) {
+        int64_t row[] = {0, i};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+    }
+    return f;
+}
+static void count_event(const char *name, const int64_t *row, uint32_t cols,
+    void *context)
+{
+    (void)name; (void)row; (void)cols; (*(unsigned *)context)++;
+}
+static void fixed_floors(void)
+{
+    /* Fresh immutable allowance admits preparation but not simultaneous capture. */
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    budget_peak = 0;
+    fixture_t calibration = floor_fixture(4*1024*1024, 1);
+    uint64_t preparation_peak = budget_peak;
+    CHECK(wl_columnar_session_seal_join_input(calibration.session, "b", NULL,
+        NULL) == OK);
+    CHECK(budget_peak > preparation_peak);
+    destroy(&calibration);
+    fixture_t f = floor_fixture(preparation_peak, 1);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    col_rel_t *source = session_find_rel(s, "b");
+    uint64_t before = reserved(&f);
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == WL_COLUMNAR_SPILL_MEMORY);
+    CHECK(session_find_rel(s,
+        "b") == source && !s->cold_relation && !f.session->input_sealed);
+    CHECK(reserved(&f) == before &&
+        wl_columnar_spill_store_bytes(s->spill_store) == 0);
+    destroy(&f);
+    wl_columnar_memory_governor_test_admitted = NULL;
+    /* Distinct floor: sealing succeeds, but the 16,384-row final result cannot fit. */
+    f = floor_fixture(256*1024, 128); s = COL_SESSION(f.session);
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == OK);
+    uint64_t disk = wl_columnar_spill_store_bytes(s->spill_store);
+    unsigned events = 0;
+    CHECK(wl_session_snapshot(f.session, count_event, &events) == ENOSPC);
+    CHECK(wl_session_budget_denied(f.session) && events == 0 &&
+        s->cold_relation);
+    CHECK(wl_columnar_spill_store_bytes(s->spill_store) == disk && disk > 0);
+    destroy(&f);
+}
+
 int main(void)
 {
     lifecycle(); rollback(); read_failure(); exclusions(); empty_and_multiple();
     typed_projection(); quota_and_alias(); loaders(); generation_boundary();
+    fixed_budget(); retention_lifetime(); fixed_floors();
+    concurrent_cold_readers();
     return 0;
 }

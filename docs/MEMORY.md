@@ -4719,21 +4719,73 @@ producer/output errors are covered by `test_batch_payload` and `test_join_spill`
 This completes the owned intermediate subset; it does not make registry or
 persistent trace storage cold, nor add differential cold execution.
 
+### Persistent sealed numeric JOIN input (#1372)
+
+The internal `wl_columnar_session_seal_join_input` operation can now convert one
+right-only numeric EDB into a session-owned immutable cold binding before the
+first STEP or SNAPSHOT attempt. It captures privately, checks exclusive resident
+retirement, refunds the original allocation, removes the raw registry entry,
+and publishes the binding without a fallible gap. Failed capture, cancellation,
+quota or retirement leaves the original registry source intact and refunds the
+private work. The binding owns its schema names and payload; it preserves the
+source identity, view and row ordinals while advancing the storage generation.
+Generation overflow is refused before capture. Existing resident arrangements
+cannot survive this transition.
+
+The supported plan is serial, nonrecursive, and contains only audited
+VARIABLE/JOIN/MAP/CONSOLIDATE operations. The cold name must occur only as a JOIN
+right input, never a VARIABLE or relation head. Eligible JOINs use one INT64 key,
+scalar numeric rows, no timestamps and no right filter. Multiple eligible JOINs
+may consume the same binding. Spill batch/index caps must be positive. Opaque
+rewrites, workers, controlled execution, delta callbacks and competing JOIN
+batch modes are refused. The plan must remain immutable for the session lifetime,
+and session operations remain externally serialized. This is an internal
+opt-in, not a new installed API or automatic eviction policy.
+
+Successful sealing makes all fact and compound mutation unsupported. Generic
+fact/file loaders reject before staging or opening adapters, without poisoning
+an otherwise usable sealed session; genuine partial-load errors still poison.
+Supported STEP/SNAPSHOT execution resolves the binding before the missing-right
+case and routes it through the capped payload producer without rebuilding a
+resident arrangement. Schema/projection ownership is admitted before private
+left transfer. Readers hold separate cursors and release pins before binding
+cleanup. Repeated queries reuse the same owned spill segments; session teardown
+releases those segments and their governed metadata. Final output remains
+resident, so successful input retirement does not promise arbitrary result size.
+
+`test_session_cold_relation` supplies the lifecycle and causal budget evidence.
+A separate calibration run chooses an allowance for two fresh sessions with the
+same parsed plan, facts and caps: 128 left rows, 32,768 right rows, and 8,192 exact
+results. Both publish the same cold binding and remove the resident registry
+entry. A serial test-only control retains the original physical source in a
+detached owner until teardown. Only the real source refund differs: normal
+retirement completes with exact callbacks; retention reaches the same bounded
+producer and naturally fails a later admission with budget evidence and no
+callbacks. No injected denial or extra pressure allocation drives the comparison.
+The allowance covers preparation, capture and execution; host staging,
+allocator/OS costs and documented unmanaged allocations remain excluded.
+
+Separate fixed-allowance tests distinguish refusal at the simultaneous
+source/capture floor from failure after successful sealing when resident output
+cannot fit. The first preserves the original source; the second retains the
+valid cold binding and publishes no callbacks. Tests also cover independent
+concurrent readers, multiple consumers, repeated STEP/SNAPSHOT, empty inputs,
+FLOAT/UINT64 projection lanes, reader/alias BUSY, quota, partial I/O, allocation
+failure, cancellation, generation boundaries and complete credit refund.
+
 ### Remaining #1372 implementation groups
 
-The next integration group must establish actual immutable cold relation/trace
-publication and resident-buffer reclamation together with its supported readers:
-stable row identity/generation, direct-column and arrangement consumer audit,
-mixed resident/cold exact access, and pin/cleanup ownership. Unsupported mutable
-or materializing consumers must remain resident by explicit eligibility or fail
-explicitly. SIDE/nested-reference ownership needs a concrete provenance decision.
+The sealed right-only numeric EDB subset now has actual persistent cold storage,
+resident reclamation and evaluator consumers. General cold VARIABLE/direct-column
+access, mutable relations, persistent trace/differential storage and their
+arrangement consumers remain separate integration work. They require stable
+identity/generation and pin/cleanup ownership across updates, signed differences
+and retractions. Unsupported consumers remain explicitly ineligible for sealing.
+SIDE/nested-reference ownership also needs a concrete provenance decision.
 
-Group supported host configuration and final acceptance with that lifecycle
-where practical: fixed-budget execution and floor refusal, exact types and signed
-differences/retractions, multiple readers, cancellation/I/O/quota cleanup and
-platform qualification. Existing payload, producer and evaluator evidence covers
-parts of these requirements, but cannot replace the cold-lifecycle evidence.
-Close #1372 only when those remaining acceptance gaps have concrete tests.
+Supported public host configuration and platform qualification remain open.
+Existing payload and sealed-session evidence cannot replace those acceptance
+requirements. Close #1372 only when the remaining gaps have concrete tests.
 #1373 scheduling and #1385 DOOP qualification remain separate; #1372 stays open.
 
 The #1821 controlled prefix-discovery consolidation optimization introduces no

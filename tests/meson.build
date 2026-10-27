@@ -6601,7 +6601,7 @@ test('payload_join', test_payload_join_exe, suite: ['unit', 'tsan'], timeout: 12
 # Persistent, sealed right-only EDB ownership and actual bounded JOIN access.
 test_session_cold_relation_exe = executable(
   'test_session_cold_relation', files('test_session_cold_relation.c', '../wirelog/columnar/spill.c'),
-  c_args: ['-DWL_TEST_SPILL=1'],
+  c_args: ['-DWL_TEST_SPILL=1', '-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],
