@@ -4973,6 +4973,14 @@ arr_free_contents(col_arrangement_t *arr);
 void
 col_arr_attach_ledger(col_arrangement_t *arr, wl_mem_ledger_t *ledger);
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Set/reset only with no concurrent arrangement users. Observer must not
+ * allocate or reenter the governor; false reserve is not itself proof of
+ * budget denial, so tests must also compare request with remaining budget. */
+extern void (*wl_columnar_arrangement_test_reserve_denied)(
+    wl_columnar_memory_governor_t *, uint64_t, uint64_t);
+#endif
+
 void
 col_arr_attach_memory_governor(col_arrangement_t *arr,
     wl_columnar_memory_governor_ref_t *memory_governor);

@@ -4624,8 +4624,48 @@ fallback, checking success, second-capture/I/O/output failures and exact refunds
 Additional checks cover self-JOIN, owned FLOAT inputs,
 multiple windows and no-match PROGRESS, legacy row caps, excluded shapes and
 workers, disk quota/write/read failures, allocation and governor denial,
-source/pin preservation and exact snapshot cleanup. This proves actual evaluator
-routing, not a fixed-budget whole-program completion claim. The separate 64 KiB
-streamed-payload JOIN proof remains unchanged. Public configuration, broader
-consumer/trace integration and the remaining #1372 acceptance audit are still
-outstanding; #1372 remains open and #1385 is not qualified by this unit.
+source/pin preservation and exact snapshot cleanup.
+
+The fixed-budget session acceptance test calibrates the successful peak in a
+separate fresh session, then creates enabled and disabled sessions with identical
+facts and one identical enforcing allowance set before creation. There is no
+budget increase, ledger reset or shared warm cache. A 4,096-row right source and
+three sparse matches require an 8,192-bucket resident index plus row links. A
+test-only observer at arrangement admission identifies the refused request and
+proves it exceeds remaining credit; the resident path retains its existing
+`ENOMEM` classification. Spill STEP completes with the exact three rows and
+observer events, no full arrangement and no residual snapshot files. The same
+comparison runs with a parsed equality filter retaining all right rows, so its
+resident cache and temporary preparation costs are included. Admission peaks
+include session creation, source preparation and observer publication.
+
+A separate fresh-session calibration locates an allowance below the spill floor
+that still prepares the inputs and selects the route. Repeating that allowance
+returns `ENOSPC` with budget-denial evidence, no result notifications, no
+resident retry and released source gates/snapshots. Session destruction returns
+all credit; this does not assert whole-STEP rollback of retained evaluator
+metadata. Subsequent insertion and removal in a sufficiently funded session
+verify exact visible rows and signed notifications through the existing
+incremental/retraction machinery. Those steps are not a bounded-execution claim.
+
+This demonstrates an execution/index working set exceeding a fixed allowance,
+with resident inputs, filter and output that fit. It does not demonstrate cold
+registry/trace reclamation or whole-program arbitrary-budget completion. The
+separate 64 KiB streamed-payload proof remains unchanged.
+
+### Remaining #1372 implementation groups
+
+The next integration group must establish actual immutable cold relation/trace
+publication and resident-buffer reclamation together with its supported readers:
+stable row identity/generation, direct-column and arrangement consumer audit,
+mixed resident/cold exact access, and pin/cleanup ownership. Unsupported mutable
+or materializing consumers must remain resident by explicit eligibility or fail
+explicitly. SIDE/nested-reference ownership needs a concrete provenance decision.
+
+Group supported host configuration and final acceptance with that lifecycle
+where practical: fixed-budget execution and floor refusal, exact types and signed
+differences/retractions, multiple readers, cancellation/I/O/quota cleanup and
+platform qualification. Existing payload, producer and evaluator evidence covers
+parts of these requirements, but cannot replace the cold-lifecycle evidence.
+Close #1372 only when those remaining acceptance gaps have concrete tests.
+#1373 scheduling and #1385 DOOP qualification remain separate; #1372 stays open.
