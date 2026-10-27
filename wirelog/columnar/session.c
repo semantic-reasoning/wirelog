@@ -4065,6 +4065,8 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
             goto oom;
         }
         sess->owns_spill_store = true;
+        sess->spill_join_batch_bytes = options->spill_join_batch_bytes;
+        sess->spill_join_index_bytes = options->spill_join_index_bytes;
     }
 
     /* Issue #317: Initialize per-worker frontier progress tracker.
@@ -4476,6 +4478,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     memset(out_worker->cleanup_receipts, 0,
         sizeof(out_worker->cleanup_receipts));
     out_worker->owns_spill_store = false; /* Borrow, including failure cleanup. */
+    out_worker->spill_join_selected_count = 0;
     out_worker->delta_observer_build = NULL;
     /* Independent authority exists before any failure cleanup. The worker
      * attribution budget is initialized below after its policy is resolved. */

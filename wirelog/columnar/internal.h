@@ -2646,6 +2646,11 @@ typedef struct wl_col_session_t {
      * require external serialization even when sharing this pointer. */
     wl_columnar_spill_store_t *spill_store;
     bool owns_spill_store;
+    /* Internal opt-in; coordinator serial ordinary JOIN only. Sources and
+     * final output stay resident. Count selections, including failed ones. */
+    uint64_t spill_join_batch_bytes;
+    uint64_t spill_join_index_bytes;
+    uint64_t spill_join_selected_count;
     /* Issue #1380: memory instrumentation state that is not part of the
      * ledger proper.
      *   mem_channel_ring_bytes: bytes charged to CHANNEL for the MPSC ring
