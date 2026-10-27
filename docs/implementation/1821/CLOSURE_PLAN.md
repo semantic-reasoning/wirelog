@@ -339,3 +339,23 @@ Next is G3b's actual trace/arrangement/retraction ownership and enforcement.
 K_FUSION/LFTJ integration, other recursive schema/expression families, legacy
 removal admission and remaining configuration/resource qualification stay open.
 G3b and G4–G7 are five remaining work groups, not a fixed remaining PR count.
+
+## G3b subdivision recorded before implementation (2026-10-27)
+
+The next bundle delivers controlled incremental CONSOLIDATE through ordinary
+session STEP, using validated prefix discovery. It supersedes the proposed
+combined differential JOIN/CONSOLIDATE bundle: persistent multi-arrangement
+publication needs a separate host ownership protocol, while consolidation can
+reuse its existing leased source, private output and resumable cleanup.
+
+This bundle discovers a strictly increasing prefix from actual leased values,
+sorts only the suffix and merges the two runs. It does not propagate or trust
+sorted-prefix metadata across MAP. The disabled optimization retains full sort.
+Existing nonfinite FLOAT rejection precedes discovery, so the comparator domain
+is finite numeric scalars; equal signed zeros retain stable source order.
+
+Atomic units: (1) executing bounded algorithm and operator qualification;
+(2) ordinary STEP reachability, stop/retry qualification and coverage ledger.
+Persistent differential JOIN/registry transactions, active differential dispatch
+(F04), persistent prefix reuse, and recursive frontier/retraction scheduling
+remain open. These are work obligations, not a promised remaining PR count.

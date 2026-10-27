@@ -1752,3 +1752,31 @@ stop before transfer retains every partial allocation and gate until charged
 maintenance cleanup completes. This is a restricted internal preparation
 primitive; it does not activate unsupported evaluator routes or satisfy all of
 issue #1821.
+
+### Controlled consolidation prefix discovery (#1821)
+
+When `diff_enabled` is set, the ordinary controlled CONSOLIDATE child discovers
+its strictly increasing prefix under the existing scalar source lease. It reads
+actual values rather than trusting `sorted_nrows`; this also handles order-changing
+MAP projections. Nonfinite FLOAT values are rejected before discovery. Finite
+FLOAT comparison, including equal signed zeros, uses the same stable ordering
+as the full-sort path. The first equal or descending pair ends discovery.
+
+Only suffix indices enter merge sort. A separate stable merge uses implicit
+prefix row indices, so alternating suffix scratch arrays never expose uninitialized
+prefix slots. Existing deduplication and private output publication follow.
+No source metadata is modified and no new memory owner is introduced.
+
+Each discovery pair pays 128 for traversal, 128 for comparator entry, 128 per
+inspected column, and 128 for its decision. Merge pays 128 for each traversal,
+comparison fees when both runs remain, and 128 for index emission. Existing
+checkpoint tails preserve the 256-work quantum and framed continuation; sorting,
+output construction and cleanup retain their existing fees and owners. The
+one-column discovery boundary test derives 512 per pair after an empirical
+setup anchor. Whole-operation exact/one-short tests use empirical allowances.
+The optimization does not promise lower total work for every input.
+
+Disabling `diff_enabled` retains full-sort behavior and tariffs. This algorithm
+is not active differential dispatch, persistent prefix reuse, a persistent JOIN
+arrangement, trace publication or incremental retraction scheduling. Those
+#1821 coverage obligations remain open.

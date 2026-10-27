@@ -2808,10 +2808,35 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
         rc = wl_columnar_filter_attempt_tail(control, attempt_id, 203, row);
         if (rc) goto done;
     }
-    for (uint64_t span = 1; span < rows; span *= 2) {
+    /* Discover from leased values, not cache metadata: MAP may have changed
+     * ordering. Nonfinite FLOATs were rejected above. Strict ordering makes
+     * the prefix unique; stable suffix sort/merge preserves first-row ties.
+     * These locals survive framed suspension with the original source lease. */
+    uint32_t prefix = 0;
+    if (sess->diff_enabled && rows) {
+        prefix = 1;
+        while (prefix < rows) {
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
+            if (rc) goto done;
+            int order = 0;
+            rc = wl_columnar_filter_consolidate_compare(ctx, prefix - 1,
+                    prefix, &order, control, attempt_id);
+            rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+            if (rc) goto done;
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
+            if (rc) goto done;
+            bool increasing = order < 0;
+            rc = wl_columnar_filter_attempt_tail(control, attempt_id, 208,
+                    prefix);
+            if (rc) goto done;
+            if (!increasing) break;
+            ++prefix;
+        }
+    }
+    for (uint64_t span = 1; span < rows - prefix; span *= 2) {
         rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
         if (rc) goto done;
-        for (uint64_t base = 0; base < rows; base += span * 2) {
+        for (uint64_t base = prefix; base < rows; base += span * 2) {
             rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
             if (rc) goto done;
             uint64_t middle = base + span < rows ? base + span : rows;
@@ -2846,6 +2871,30 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
         uint32_t *swap = indices; indices = temporary; temporary = swap;
         rc = wl_columnar_filter_attempt_tail(control, attempt_id, 206, span);
         if (rc) goto done;
+    }
+    if (prefix && prefix < rows) {
+        /* Prefix indices are implicit: buffer swaps initialize only suffix
+         * slots. Merge into the other array before the existing dedup pass. */
+        uint32_t left = 0, right = prefix;
+        for (uint32_t out = 0; out < rows; ++out) {
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
+            if (rc) goto done;
+            int order = 0;
+            if (left < prefix && right < rows) {
+                rc = wl_columnar_filter_consolidate_compare(ctx, left,
+                        indices[right], &order, control, attempt_id);
+                rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
+                if (rc) goto done;
+            }
+            rc = wl_columnar_filter_attempt_charge(control, attempt_id, 128);
+            if (rc) goto done;
+            temporary[out] = left < prefix && (right == rows || order <= 0)
+                ? left++ : indices[right++];
+            rc = wl_columnar_filter_attempt_tail(control, attempt_id, 209,
+                    out);
+            if (rc) goto done;
+        }
+        indices = temporary;
     }
     uint32_t previous = 0;
     for (uint32_t position = 0; position < rows; ++position) {
