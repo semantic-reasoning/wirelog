@@ -369,7 +369,7 @@ cover stale metadata and independent per-pair discovery costs. This advances
 O08; it leaves E07/F04/F04a and the remaining G3b obligations above open.
 
 
-## Next G3b bundle: persistent arrangement-backed JOIN (2026-10-27)
+## G3b persistent arrangement-backed JOIN bundle (2026-10-27)
 
 After merged PR #2278, this bundle adds a stable private differential registry
 image, native one-based persistent JOIN probes, and coordinated session
@@ -382,3 +382,20 @@ serial JOIN with supported projection. Unchanged sources reuse native indexes;
 changed generations rebuild privately. Private-head, recursive, selected-delta,
 filtered/materialized/batched/spill alternatives retain their controlled
 fallback/disposition. No signed differential/frontier/retraction claim follows.
+
+
+Qualification includes generated shared/distinct-key heads, reuse without row
+indexing, rebuild after insert/remove, unrelated-index preservation and raw
+registry/pin compatibility. The 18-point cancellation/work-limit matrix proves
+old heads and indexes survive every precommit stop. Refusal/invalid-chain,
+ENOSPC, claimed-trim, committed-credit and postcutoff cleanup fixtures complete
+the bundle. Admission-denial qualification also fixes diagnostic RELEASED token
+payload being mistaken for owned cleanup credit; final teardown restores aggregate reservation credit.
+
+The next G3b bundle must integrate the actual differential dispatcher and its
+signed trace/frontier transitions, using this ownership boundary. Persistent
+prefix metadata and recursive incremental retraction propagation still need
+their own implementation and qualification. G4 pipeline/batch/LFTJ, G5
+representation/fallback coverage, G6 policy/resource composition and G7 final
+acceptance remain unchanged. No fixed remaining PR count or #1821 closure is
+claimed by this ordinary JOIN index bundle.

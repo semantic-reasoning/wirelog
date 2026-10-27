@@ -115,7 +115,7 @@ references, not interruption evidence.
 | F02c | Eligible keyed JOIN lacks persistent arrangement, or producer creation cannot fit one row | Raw NO_ARRANGEMENT selects ephemeral hash; ROW_TOO_LARGE selects one-shot output, strict refuses. Controlled producer B exists only for admitted prepared inputs; host fallback ownership missing, G4 |
 | F02d | MATERIALIZED, LFTJ, INSERT_ROUTE exclusions in batch eligibility/reporting | Differential/materialized selection belongs to F04/F05; raw LFTJ strict refusal/non-strict one-shot is F06; insertion route does not activate the batch knob. These are not controlled escape hatches; G3/G4/G5 |
 | F04a | Differential arrangement/trace persistent transaction versus ephemeral hash fallback | Raw fallback must leave no transaction state; controlled entry refuses active differential mode and active-attempt registry growth. Integrated stop owner absent; G3, #1820 |
-| F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | Controlled ordinary JOIN uses its owned charged child/scratch, not proof of all raw cache paths. Persistent pins, ephemeral buffers and filtered source identity need separate parity/stop evidence; F or missing raw-route owner, G5/G6 |
+| F05a | Ordinary keyed persistent arrangement/probe bundle versus ephemeral hash; cached right filter versus operation-owned filtered relation | General serial STEP owns a private native index registry for full-right public EDB INT64 JOIN, with bounded creation/reuse/probes and a common head/index cutoff. Existing pins/pending/deferred entries refuse replacement. Filtered/private-head/batch representations retain their previous controlled disposition; this does not qualify raw cache alternatives, G5/G6 |
 | F06a | `ops.c:col_op_lftj` sorted-arrangement probe/cache versus owned per-source materialization; raw binary output callback | Controlled private LFTJ uses its per-attempt copy/sort/traversal L owner. Raw whole-output append and cache alternatives have no session control proof; G4 |
 | F07a | Scalar-source compound kind NONE versus INLINE/SIDE, declared schema/type validity, timestamps and row weights | Admission predicates differ by child; no cross-operator representation support inferred. Managed copies/readers can be bounded while a surrounding child refuses the representation; G5 |
 | F07b | Retained/borrowed/owned, contiguous/segmented/spill-backed storage and empty/nullary/wide rows | Source reader/descriptor and copy helpers must preserve representation and governor state; capacity/overflow errors remain errors. Enumerated qualification combinations, not an invitation to raw fallback; G5/G6 |
@@ -278,7 +278,45 @@ Repeated cycles restore the governor baseline; checked destruction followed by
 control and plan release drain the final retained credits.
 
 This is O08 algorithm evidence, not F04 dispatch closure. Active differential
-JOIN/CONSOLIDATE dispatch still refuses controlled execution. Persistent JOIN
-arrangements and their host-atomic publication, persistent sorted-prefix reuse,
-recursive delta/frontier transitions, and actual retraction scheduling remain
-open under G3b. No trace persistence is inferred from `diff.c` comments.
+JOIN/CONSOLIDATE dispatch still refuses controlled execution. The subsequent ordinary JOIN bundle below supplies persistent index ownership
+and host-atomic publication for its stated domain. Persistent sorted-prefix
+reuse, recursive delta/frontier transitions, and actual retraction scheduling
+remain open under G3b. No trace persistence is inferred from `diff.c` comments.
+
+
+### G3b second bundle: persistent ordinary JOIN index ownership
+
+`test_controlled_persistent_join` executes a generated three-head STEP plan.
+Two heads share one right-key index and another uses a different key vector.
+Native indexing/probe witnesses prove the route ran. A left-only successor
+reuses both indexes without indexing any row; right insertion/removal rebuilds
+privately, with signed observer parity against disabled-control/full-recompute
+execution. A raw-created unrelated index survives the next controlled image,
+and raw registry growth/pin consumers work after controlled publication.
+
+`test_controlled_persistent_stops` injects cancellation and work exhaustion at
+18 checkpoints spanning registry discovery/allocation/copy, index allocation,
+key and chain initialization, request lookup/reuse, indexing/probing and host
+prepare. Public heads, registry identity and entry generation remain unchanged;
+reset/retry reaches reference parity and final destruction restores governor
+credit. Work-limit recovery after image preparation is abort-and-retry, not
+retained cursor continuation.
+
+`test_controlled_persistent_refusals` qualifies held pins, pending transactions,
+deferred invalidation, malformed native chains, admission denial for registry,
+ownership slots and index storage, interrupted claimed RESERVED trims and
+committed image credit before cutoff, and cancellation during postcommit
+retirement. Checked destruction refuses a live partial index until cancellation
+cleanup drains it. Refusals preserve public state;
+invalid cached chains rebuild privately; committed completion delivers events
+once. Admission denial remains ENOSPC; peer pressure is released before further
+host cleanup. Denied reservations retain diagnostic payload but own no credit;
+the wrapper restores their fresh token before generic cleanup. The focused governor fixture independently checks trim contention,
+competing operations, wrong-thread/copied receipts and exactly-once credit.
+
+Registry actions are admitted in 128-unit increments. Native row hashing and
+candidate probes use the existing controlled JOIN key/cell charges even when
+no row is emitted. Array/metadata initialization and retirement are separately
+charged; allocator/free bodies retain the existing cooperative boundary. E07,
+F04 and F04a remain open for actual differential dispatcher/trace/frontier
+integration. This evidence advances only ordinary JOIN's F05a ownership domain.

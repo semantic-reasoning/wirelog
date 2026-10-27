@@ -3551,6 +3551,9 @@ wl_columnar_arrangement_diff_reserve(wl_col_session_t *sess,
     if (rc) return rc;
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK ||
         status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return 0;
+    /* Denied admission leaves RELEASED diagnostic payload (bytes/governor),
+    * not owned credit. Restore this fresh token before generic draining. */
+    wl_columnar_memory_reservation_init(credit);
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
         sess->memory_budget_denied = true; return ENOSPC;
     }

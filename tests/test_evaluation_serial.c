@@ -4059,6 +4059,172 @@ test_controlled_persistent_stops(void)
     }
 }
 
+static wl_columnar_memory_governor_t *persistent_fault_governor;
+static wl_columnar_memory_reservation_t persistent_pressure;
+static wl_evaluation_control_t *persistent_public_control;
+static unsigned persistent_fault_mode, persistent_fault_hits;
+static bool persistent_fault_fired;
+static void
+persistent_fault(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (persistent_fault_fired) return;
+    if ((persistent_fault_mode == 2 && phase == 7)
+        || (persistent_fault_mode == 8 && phase == 0)
+        || (persistent_fault_mode == 9 && phase == 2)) {
+        uint64_t remaining = persistent_fault_governor->budget_bytes
+            - wl_columnar_memory_reserved(persistent_fault_governor);
+        CHECK(wl_columnar_memory_reserve_checked(persistent_fault_governor,
+            remaining,
+            &persistent_pressure) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        persistent_fault_fired = true;
+    } else if ((persistent_fault_mode == 5 || persistent_fault_mode == 6)
+        && phase == 15 &&
+        ++persistent_fault_hits == (persistent_fault_mode == 5 ? 5u : 7u)){
+        persistent_fault_fired = true;
+        CHECK(wl_evaluation_control_charge(control,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    } else if (persistent_fault_mode == 10 && phase == 8 && progress == 1) {
+        persistent_fault_fired = true;
+        wl_evaluation_control_request_cancel(control);
+    } else if (persistent_fault_mode == 7 && phase == 17) {
+        persistent_fault_fired = true;
+        wl_evaluation_control_request_cancel(persistent_public_control);
+    }
+}
+
+static void
+test_controlled_persistent_refusals(void)
+{
+    const char *source = ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+        ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+        "a(x,y) :- l(x), r(x,y).\nb(x,y) :- l(x), r(x,y).\n";
+    for (unsigned mode = 0; mode < 11; ++mode) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL;
+        CHECK(!wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options); options.evaluation_control = control;
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor); options.memory_governor = governor;
+        wl_session_t *session = NULL, *reference = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+        ((wl_col_session_t *)reference)->diff_enabled = false;
+        const int64_t left[] = {1, 2}, right[] = {1, 1, 2, 2}, extra[] = {1, 3};
+        CHECK(!wl_session_insert(session, "l", left, 2, 1));
+        CHECK(!wl_session_insert(reference, "l", left, 2, 1));
+        CHECK(!wl_session_insert(session, "r", right, 2, 2));
+        CHECK(!wl_session_insert(reference, "r", right, 2, 2));
+        observed_multi_capture_t *actual = calloc(1, sizeof(*actual)),
+            *expected = calloc(1, sizeof(*expected));
+        CHECK(actual && expected);
+        wl_session_set_delta_cb(session, observed_multi_capture, actual);
+        wl_session_set_delta_cb(reference, observed_multi_capture, expected);
+        CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+        wl_col_session_t *cs = (wl_col_session_t *)session;
+        bool denial = mode == 2 || mode == 8 || mode == 9;
+        bool change_right = denial || mode >= 5;
+        CHECK(!wl_session_insert(session, change_right ? "r" : "l", extra, 1,
+            change_right ? 2 : 1));
+        CHECK(!wl_session_insert(reference, change_right ? "r" : "l", extra, 1,
+            change_right ? 2 : 1));
+        col_diff_arr_entry_t *registry = cs->diff_arr_entries;
+        col_diff_arrangement_t *arr = registry[0].diff_arr;
+        col_rel_t *head = session_find_rel(cs, "a");
+        col_diff_arrangement_pin_t pin = {0}; uint32_t key = 0;
+        if (mode == 0) CHECK(!col_session_pin_diff_arrangement(cs, "r",
+                session_find_rel(cs, "r"), &key, 1, &pin));
+        if (mode == 1) arr->ht_next[0] = arr->current_nrows + 1;
+        if (mode == 3) registry[0].transaction_pending = true;
+        if (mode == 4) registry[0].invalidation_deferred = true;
+        actual->count = expected->count = 0;
+        persistent_fault_mode = mode; persistent_fault_hits = 0;
+        persistent_fault_fired = false;
+        persistent_fault_governor =
+            wl_columnar_memory_governor_ref_get(governor);
+        persistent_public_control = control;
+        wl_columnar_memory_reservation_init(&persistent_pressure);
+        CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000000)));
+        wl_columnar_arrangement_test_diff_checkpoint = persistent_fault;
+        int rc = EAGAIN;
+        if (denial || mode == 10) {
+            unsigned turns = 0;
+            while (rc == EAGAIN && !persistent_fault_fired) {
+                rc = wl_session_step(session);
+                CHECK(++turns < 100000);
+            }
+            /* Admission fails synchronously after the selected checkpoint.
+             * Release peer pressure before advancing retained cleanup. */
+            CHECK(persistent_fault_fired);
+            if (denial) CHECK(wl_columnar_memory_rollback(
+                        &persistent_pressure));
+        }
+        if (mode == 10) {
+            CHECK(!actual->count && cs->diff_arr_entries == registry);
+            CHECK(wl_session_try_destroy(&session) == EBUSY && session);
+            wl_columnar_arrangement_test_diff_checkpoint = NULL;
+            CHECK(observed_multi_step(session) ==
+                WL_EVALUATION_CONTROL_CANCELLED);
+            CHECK(!actual->count && !cs->diff_txn_count);
+            CHECK(!wl_session_try_destroy(&session));
+            goto persistent_refusal_done;
+        }
+        if (rc == EAGAIN) rc = observed_multi_step(session);
+        wl_columnar_arrangement_test_diff_checkpoint = NULL;
+        int wanted = mode == 0 || mode == 3 || mode == 4 ? ENOTSUP
+            : denial ? ENOSPC : mode == 5 ||
+            mode == 6 ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0;
+        if (rc != wanted) fprintf(stderr,
+                "persistent fault mode %u expected %d got %d\n", mode, wanted,
+                rc);
+        CHECK(rc == wanted);
+        if (denial || mode >= 5) CHECK(persistent_fault_fired);
+        if (wanted) {
+            CHECK(!actual->count && cs->diff_arr_entries == registry &&
+                registry[0].diff_arr == arr);
+            CHECK(session_find_rel(cs, "a") == head && !cs->diff_txn_count);
+        }
+        if (mode == 0) col_diff_arrangement_pin_release(&pin);
+        if (mode == 3) registry[0].transaction_pending = false;
+        if (mode == 4) registry[0].invalidation_deferred = false;
+        CHECK(!wl_evaluation_control_reset(control));
+        CHECK(!wl_evaluation_control_configure(control, 0));
+        if (wanted) CHECK(!observed_multi_step(session));
+        CHECK(!wl_session_step(reference));
+        CHECK(actual->count == expected->count);
+        qsort(actual->events, actual->count, sizeof(actual->events[0]),
+            observed_multi_order);
+        qsort(expected->events, expected->count, sizeof(expected->events[0]),
+            observed_multi_order);
+        CHECK(!memcmp(actual->events, expected->events,
+            actual->count*sizeof(actual->events[0])));
+        if (mode == 1) CHECK(cs->diff_arr_entries[0].diff_arr != arr);
+        unsigned delivered = actual->count;
+        CHECK(!observed_multi_step(session) && actual->count == delivered);
+        CHECK(!wl_session_try_destroy(&session));
+persistent_refusal_done:
+        wl_session_destroy(reference); wl_evaluation_control_release(control);
+        wl_plan_free(plan); wirelog_program_free(program);
+        CHECK(!wl_columnar_memory_reserved(persistent_fault_governor));
+        wl_columnar_memory_governor_ref_release(governor);
+        persistent_fault_governor = NULL; persistent_public_control = NULL;
+        free(actual); free(expected);
+    }
+}
+
 static unsigned incremental_step_phase, incremental_step_hits;
 static bool incremental_step_work, incremental_step_stopped;
 static unsigned incremental_step_suffix_mask;
@@ -11078,6 +11244,7 @@ main(void)
     test_controlled_observed_multi();
     test_controlled_persistent_join();
     test_controlled_persistent_stops();
+    test_controlled_persistent_refusals();
     test_controlled_incremental_consolidate_step();
     test_controlled_observed_wide_public();
     test_controlled_observed_transaction_budget();
