@@ -2307,6 +2307,20 @@ typedef struct {
 } wl_columnar_eval_cleanup_receipt_t;
 
 struct wl_columnar_retained_eval_entry;
+
+/* Authoritative immutable right-only EDB. Never a resident registry relation.
+ * All metadata shares reservation; payload owns types and rows. Borrowed fields
+ * and readers may not escape a serialized session operation. */
+typedef struct wl_columnar_session_cold_relation {
+    wl_columnar_memory_reservation_t reservation;
+    struct wl_columnar_batch_payload *payload;
+    col_relation_snapshot_t source_snapshot;
+    uint64_t cold_storage_generation;
+    uint32_t ncols, nrows;
+    char *name;
+    char **col_names;
+} wl_columnar_session_cold_relation_t;
+
 struct wl_columnar_kfusion_cohort;
 typedef struct wl_columnar_eval_tdd_run wl_columnar_eval_tdd_run_t;
 typedef struct wl_columnar_controlled_step wl_columnar_controlled_step_t;
@@ -2651,6 +2665,8 @@ typedef struct wl_col_session_t {
     uint64_t spill_join_batch_bytes;
     uint64_t spill_join_index_bytes;
     uint64_t spill_join_selected_count;
+    wl_columnar_session_cold_relation_t *cold_relation;
+    bool cold_seal_closed; /* First evaluation attempt permanently closes seal. */
     /* Issue #1380: memory instrumentation state that is not part of the
      * ledger proper.
      *   mem_channel_ring_bytes: bytes charged to CHANNEL for the MPSC ring
@@ -4886,6 +4902,24 @@ int
 session_add_rel(wl_col_session_t *sess, col_rel_t *r);
 int
 session_remove_rel(wl_col_session_t *sess, const char *name);
+/* Explicit internal pre-evaluation opt-in, under external session lifecycle
+ * serialization. Caller keeps the plan immutable through session destruction.
+ * One canonical numeric EDB used only by supported ordinary right JOINs may be
+ * sealed. Success removes its resident registry owner and makes ALL fact and
+ * compound mutation unsupported, including zero-row requests. Failed sealing
+ * preserves the source/registry and refunds private work. No public host API.
+ * No readers may escape synchronous operations; callbacks must not reenter
+ * source/session/store/governor lifecycle. STEP/SNAPSHOT recheck mode guards.
+ * Original logical identity/view/ordinals survive in source_snapshot; storage
+ * generation advances once. Old resident caches are not reusable. */
+wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
+    wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
+    void *context);
+int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
+/* Shared schema lookup semantics, including the resident col<N> fallback. */
+int wl_columnar_relation_schema_column_index(uint32_t ncols,
+    const char *const *names, const char *name);
+
 #ifdef WL_SESSION_TEST_HOOKS
 int wl_columnar_session_test_register_retraction(wl_col_session_t *sess,
     col_rel_t *relation, bool publish);

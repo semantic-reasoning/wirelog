@@ -61,6 +61,10 @@ struct wl_session {
      * destroyed; otherwise a later snapshot could evaluate truncated facts.
      */
     bool input_load_failed;
+    /* Permanent backend input-admission policy, distinct from partial-load
+     * poison. Set only on successful immutable sealing; no unseal operation.
+     * Lifecycle is externally serialized. Generic loaders refuse before I/O. */
+    bool input_sealed;
     /*
      * Heap-owned because columnar worker sessions begin as bitwise copies of
      * the coordinator.  Workers clear both fields and never close or destroy
