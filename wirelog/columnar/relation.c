@@ -12986,22 +12986,30 @@ cleanup:
 /* ---- column name lookup ------------------------------------------------- */
 
 int
-col_rel_col_idx(const col_rel_t *r, const char *name)
+wl_columnar_relation_schema_column_index(uint32_t ncols,
+    const char *const *names, const char *name)
 {
-    if (!r->col_names || !name)
+    if (!names || !name)
         return -1;
-    for (uint32_t i = 0; i < r->ncols; i++) {
-        if (r->col_names[i] && strcmp(r->col_names[i], name) == 0)
+    for (uint32_t i = 0; i < ncols; i++) {
+        if (names[i] && strcmp(names[i], name) == 0)
             return (int)i;
     }
     /* fallback: "col<N>" convention */
     if (name[0] == 'c' && name[1] == 'o' && name[2] == 'l') {
         char *end;
         long v = strtol(name + 3, &end, 10);
-        if (*end == '\0' && v >= 0 && (uint32_t)v < r->ncols)
+        if (*end == '\0' && v >= 0 && (uint32_t)v < ncols)
             return (int)v;
     }
     return -1;
+}
+
+int
+col_rel_col_idx(const col_rel_t *r, const char *name)
+{
+    return wl_columnar_relation_schema_column_index(r->ncols,
+               (const char *const *)r->col_names, name);
 }
 
 /* ---- convenience constructors ------------------------------------------- */

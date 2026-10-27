@@ -132,6 +132,8 @@ wl_session_load_facts(wl_session_t *sess, const struct wirelog_program *prog)
         return -1;
     if (sess->input_load_failed)
         return -1;
+    if (sess->input_sealed)
+        return ENOTSUP;
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         const wl_ir_relation_info_t *rel = &prog->relations[i];
@@ -163,6 +165,8 @@ wl_session_load_input_files(wl_session_t *sess,
         return -1;
     if (sess->input_load_failed)
         return -1;
+    if (sess->input_sealed)
+        return ENOTSUP;
 
     for (uint32_t i = 0; i < prog->relation_count; i++) {
         const wl_ir_relation_info_t *rel = &prog->relations[i];

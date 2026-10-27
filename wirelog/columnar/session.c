@@ -10,6 +10,8 @@
 
 #include "columnar/compound_side.h"
 #include "columnar/internal.h"
+#include "columnar/batch_payload.h"
+#include "columnar/columnar_nanoarrow.h"
 #include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
 
@@ -493,6 +495,200 @@ session_find_rel(wl_col_session_t *sess, const char *name)
             return sess->rels[i];
     }
     return NULL;
+}
+
+/* Cold bindings never enter the raw relation registry. Only an audited,
+ * immutable plan may access them, through the bounded right-JOIN reader. */
+static bool
+wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
+    uint32_t ncols, const char *const *names,
+    const wirelog_column_type_t *types)
+{
+    const wl_plan_t *plan = sess->plan;
+    if (!plan || !name || !ncols || !plan->strata) return false;
+    bool edb = false, consumer = false;
+    for (uint32_t i = 0; i < plan->edb_count; i++)
+        if (plan->edb_relations && plan->edb_relations[i] &&
+            strcmp(plan->edb_relations[i], name) == 0) edb = true;
+    if (!edb) return false;
+    for (uint32_t si = 0; si < plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &plan->strata[si];
+        if (sp->is_recursive || !sp->relations) return false;
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const wl_plan_relation_t *rp = &sp->relations[ri];
+            if (!rp->name || strcmp(rp->name, name) == 0 || !rp->ops)
+                return false;
+            for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+                const wl_plan_op_t *op = &rp->ops[oi];
+                /* Reject all opaque rewrites, even if top-level names hide
+                 * their dependencies. No alternate body/worker route is used. */
+                if (op->opaque_data || op->materialized ||
+                    (op->op != WL_PLAN_OP_VARIABLE &&
+                    op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
+                    op->op != WL_PLAN_OP_CONSOLIDATE) ||
+                    (op->delta_mode != WL_DELTA_AUTO &&
+                    op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
+                if (op->relation_name && strcmp(op->relation_name, name) == 0)
+                    return false;
+                if (!op->right_relation || strcmp(op->right_relation, name))
+                    continue;
+                if (op->op != WL_PLAN_OP_JOIN || op->key_count != 1 ||
+                    op->right_filter_expr.size ||
+                    (op->project_count && !op->project_indices)) return false;
+                int key = wl_columnar_relation_schema_column_index(ncols,
+                        names, op->right_keys ? op->right_keys[0] : NULL);
+                /* The resident JOIN also falls back to column zero. */
+                if (key < 0) key = 0;
+                if (types && types[key] != WIRELOG_TYPE_INT64) return false;
+                consumer = true;
+            }
+        }
+    }
+    return consumer;
+}
+
+static bool
+wl_columnar_session_cold_mode(const wl_col_session_t *s)
+{
+    return s->spill_store && s->owns_spill_store &&
+           s->spill_join_batch_bytes && s->spill_join_index_bytes &&
+           !s->coordinator && s->num_workers == 1 &&
+           !s->base.evaluation_control && !s->join_batch_bytes &&
+           !s->delta_cb && !s->diff_operators_active && !s->tdd_input_run &&
+           !s->delta_seeded && !s->retraction_seeded &&
+           !s->retraction_right_pass && !s->delta_observer &&
+           !s->delta_observer_build && !s->delta_observer_prepare &&
+           !s->delta_publish_active;
+}
+
+int
+wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
+{
+    if (!s->cold_relation) return 0;
+    const wl_columnar_session_cold_relation_t *c = s->cold_relation;
+    const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
+        c->payload, NULL, NULL);
+    return wl_columnar_session_cold_mode(s) &&
+           wl_columnar_session_cold_plan(s, c->name, c->ncols,
+               (const char *const *)c->col_names, types) ? 0 : ENOTSUP;
+}
+
+static void
+wl_columnar_session_cold_free(wl_columnar_session_cold_relation_t *c)
+{
+    if (!c) return;
+    if (c->payload && wl_columnar_batch_payload_release(c->payload) !=
+        WL_COLUMNAR_SPILL_OK) abort(); /* No synchronous reader may escape. */
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_init(&token);
+    if (!wl_columnar_memory_reservation_move(&token, &c->reservation)) abort();
+    free(c);
+    if (!wl_columnar_memory_release(&token)) abort();
+}
+
+wl_columnar_spill_status_t
+wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
+    wl_columnar_spill_cancel_fn cancel, void *context)
+{
+    if (!session || session->backend != wl_backend_columnar() || !name)
+        return WL_COLUMNAR_SPILL_INVALID;
+    wl_col_session_t *s = COL_SESSION(session);
+    if (s->base.input_load_failed || s->cold_relation || s->cold_seal_closed ||
+        s->has_evaluated ||
+        s->plain_step_completion_pending || s->uncommitted_strata_done ||
+        s->cleanup_active || s->cleanup_pending || s->source_leases ||
+        s->deferred_relations || s->retained_eval_entries ||
+        s->tdd_workers || s->tdd_owner_lifetime || s->controlled_step ||
+        s->arr_count || s->darr_count || s->diff_arr_count ||
+        s->diff_txn_count ||
+        s->sarr_count || s->filt_arr_count || s->filt_cache_count ||
+        s->mat_cache.count || s->last_removed_relation)
+        return WL_COLUMNAR_SPILL_BUSY;
+    if (!wl_columnar_session_cold_mode(s)) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    /* Linear lookup avoids allocating a hash merely to refuse this operation. */
+    uint32_t slot = 0;
+    while (slot < s->nrels && (!s->rels[slot] ||
+        strcmp(s->rels[slot]->name, name))) slot++;
+    if (slot == s->nrels) return WL_COLUMNAR_SPILL_INVALID;
+    col_rel_t *r = s->rels[slot];
+    if (r->memory_governor != s->memory_governor ||
+        !wl_columnar_batch_payload_can_take(r) || r->timestamps ||
+        !wl_columnar_session_cold_plan(s, name, r->ncols,
+        (const char *const *)r->col_names, r->column_types))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return WL_COLUMNAR_SPILL_OVERFLOW;
+    uint64_t bytes = sizeof(wl_columnar_session_cold_relation_t) +
+        (r->col_names ? (uint64_t)r->ncols * sizeof(char *) : 0);
+    if (!wl_columnar_memory_size_add(bytes, strlen(r->name) + 1, &bytes))
+        return WL_COLUMNAR_SPILL_OVERFLOW;
+    for (uint32_t i = 0; r->col_names && i < r->ncols; i++)
+        if (r->col_names[i] && !wl_columnar_memory_size_add(bytes,
+            strlen(r->col_names[i]) + 1,
+            &bytes)) return WL_COLUMNAR_SPILL_OVERFLOW;
+    if (bytes > SIZE_MAX) return WL_COLUMNAR_SPILL_OVERFLOW;
+    wl_columnar_memory_reservation_t pending;
+    wl_columnar_memory_reservation_init(&pending);
+    wl_columnar_memory_admission_status_t admission =
+        wl_columnar_memory_reserve_checked(wl_columnar_memory_governor_ref_get(
+                s->memory_governor), bytes, &pending);
+    if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED) {
+            s->memory_budget_denied = true;
+            return WL_COLUMNAR_SPILL_MEMORY;
+        }
+        return WL_COLUMNAR_SPILL_OVERFLOW;
+    }
+    wl_columnar_session_cold_relation_t *c = calloc(1, (size_t)bytes);
+    if (!c) {
+        if (!wl_columnar_memory_rollback(&pending)) abort();
+        return WL_COLUMNAR_SPILL_ALLOCATION;
+    }
+    wl_columnar_memory_reservation_init(&c->reservation);
+    if (!wl_columnar_memory_reservation_move(&c->reservation, &pending) ||
+        !wl_columnar_memory_commit(&c->reservation, c)) abort();
+    char *cursor = (char *)(c + 1);
+    if (r->col_names) {
+        c->col_names = (char **)cursor;
+        cursor += (size_t)r->ncols * sizeof(char *);
+    }
+    c->name = cursor;
+    memcpy(cursor, r->name, strlen(r->name) + 1);
+    cursor += strlen(r->name) + 1;
+    for (uint32_t i = 0; r->col_names && i < r->ncols; i++) {
+        if (!r->col_names[i]) continue;
+        c->col_names[i] = cursor;
+        memcpy(cursor, r->col_names[i], strlen(r->col_names[i]) + 1);
+        cursor += strlen(r->col_names[i]) + 1;
+    }
+    c->ncols = r->ncols; c->nrows = r->nrows;
+    c->source_snapshot = wl_columnar_relation_snapshot(r);
+    c->cold_storage_generation = r->storage_generation + 1;
+    bool inserted_name = s->last_inserted_relation &&
+        strcmp(s->last_inserted_relation, r->name) == 0;
+    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_capture(
+        s->memory_governor, s->spill_store, r, r->nrows,
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, cancel, context, &c->payload);
+    if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(context))
+        rc = WL_COLUMNAR_SPILL_CANCELLED;
+    if (rc == WL_COLUMNAR_SPILL_OK) {
+        int retired = col_rel_destroy_checked(r);
+        if (retired) rc = retired == EBUSY ? WL_COLUMNAR_SPILL_BUSY :
+                WL_COLUMNAR_SPILL_INVALID;
+    }
+    if (rc != WL_COLUMNAR_SPILL_OK) {
+        wl_columnar_session_cold_free(c);
+        if (rc == WL_COLUMNAR_SPILL_MEMORY) s->memory_budget_denied = true;
+        return rc;
+    }
+    /* Irreversible commit: no callbacks, allocations or fallible work. Cache
+     * registries were empty and source leases absent at preflight. */
+    s->rels[slot] = NULL;
+    session_rel_free_hash(s);
+    if (inserted_name) s->last_inserted_relation = c->name;
+    s->cold_relation = c;
+    s->base.input_sealed = true;
+    return WL_COLUMNAR_SPILL_OK;
 }
 
 static uint32_t
@@ -4427,6 +4623,8 @@ col_session_destroy(wl_session_t *session)
             : 0ULL);
     wl_arena_compound_arena_retire(sess->compound_arena);
     sess->compound_arena = NULL;
+    wl_columnar_session_cold_free(sess->cold_relation);
+    sess->cold_relation = NULL;
     if (sess->owns_spill_store)
         wl_columnar_spill_store_retire(sess->spill_store);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);
@@ -4470,6 +4668,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     if (!coordinator || !out_worker || coordinator == out_worker
         || (!partitions && num_partitions > 0))
         return EINVAL;
+    if (coordinator->base.input_sealed) return ENOTSUP;
     /* Worker storage is reusable only after a complete destroy. A refused
      * teardown leaves ownership in place and permanently closes this worker. */
     if (out_worker->teardown_started || out_worker->tdd_input_run
@@ -5139,6 +5338,7 @@ col_session_insert(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (session->input_sealed) return ENOTSUP;
     if (num_rows == 0)
         return 0;
     if (COL_SESSION(session)->delta_observer
@@ -5249,6 +5449,7 @@ col_session_make_compound(wl_session_t *session, const char *functor,
         *handle_out = WIRELOG_COMPOUND_HANDLE_NULL;
     if (!session || !functor || !args || arity == 0 || !handle_out)
         return EINVAL;
+    if (session->input_sealed) return ENOTSUP;
     if (arity > UINT32_MAX - 1u)
         return EOVERFLOW;
     if (arity > UINT32_MAX / (uint32_t)sizeof(int64_t))
@@ -5347,6 +5548,7 @@ col_session_insert_incremental(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (session->input_sealed) return ENOTSUP;
     if (num_rows == 0)
         return 0;
     if (COL_SESSION(session)->delta_observer
@@ -5413,6 +5615,7 @@ col_session_remove(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (session->input_sealed) return ENOTSUP;
     if (num_rows == 0)
         return 0;
     if (COL_SESSION(session)->delta_observer
@@ -5605,6 +5808,7 @@ col_session_remove_incremental(wl_session_t *session, const char *relation,
 {
     if (!session || !relation || !data)
         return EINVAL;
+    if (session->input_sealed) return ENOTSUP;
     if (num_rows == 0)
         return 0;
     if (COL_SESSION(session)->delta_observer
@@ -10716,6 +10920,10 @@ static int
 col_session_step(wl_session_t *session)
 {
     if (!session) return EINVAL;
+    wl_col_session_t *sess = COL_SESSION(session);
+    sess->cold_seal_closed = true;
+    int cold_rc = wl_columnar_session_cold_execution_check(sess);
+    if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
         return col_controlled_step(COL_SESSION(session));
     return col_session_step_impl(session);
@@ -11849,6 +12057,10 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
     void *user_data)
 {
     if (!session) return EINVAL;
+    wl_col_session_t *sess = COL_SESSION(session);
+    sess->cold_seal_closed = true;
+    int cold_rc = wl_columnar_session_cold_execution_check(sess);
+    if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
         return col_session_snapshot_controlled(session, callback, user_data);
     return col_session_snapshot_impl(session, callback, user_data);

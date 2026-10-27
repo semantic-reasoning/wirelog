@@ -667,6 +667,7 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
     if (rc == 0 && *out) {
         /* Ensure the backend pointer is correctly bound */
         (*out)->backend = backend;
+        (*out)->input_sealed = false;
         (*out)->operation_admission = admission;
         (*out)->owns_operation_admission = true;
         (*out)->evaluation_control = control;
