@@ -135,7 +135,9 @@ static wl_columnar_continuation_status_t begin(void *v,
 static wl_columnar_continuation_status_t reserve_sink(void *v, uint64_t bytes,
     uint32_t rows)
 {
-    sink_t *s = v; return s->inner.reserve(s->inner.context, bytes, rows);
+    sink_t *s = v;
+    return s->failure == 4 ? WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED
+        : s->inner.reserve(s->inner.context, bytes, rows);
 }
 static wl_columnar_continuation_status_t append(void *v,
     const wl_columnar_continuation_batch_t *b)
@@ -1222,8 +1224,144 @@ static void window_publication(void)
     }
 }
 
+static col_rel_t *projection_source(uint32_t rows, uint64_t offset)
+{
+    col_rel_t *r = col_rel_new_auto("projected_source", 3); CHECK(r);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                     WIRELOG_TYPE_UINT64, WIRELOG_TYPE_FLOAT};
+    CHECK(col_rel_set_column_types(r, types, 3) == 0);
+    for (uint32_t i = 0; i < rows; i++) {
+        int64_t lanes[] = {key(i, rows), 0, 0};
+        uint64_t value = UINT64_MAX - offset - i;
+        double real = i ? (double)i + 0.25 : -0.0;
+        memcpy(&lanes[1], &value, 8); memcpy(&lanes[2], &real, 8);
+        CHECK(col_rel_append_row(r, lanes) == 0);
+        /* Preserve raw -0 in this immutable fixture; append canonicalizes it. */
+        memcpy(&r->columns[2][i], &real, 8);
+    }
+    return r;
+}
+
+static void projected(void)
+{
+    for (unsigned mode = 0; mode < 5; mode++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 64,
+            &store) == OK);
+        col_rel_t *l = projection_source(9, 0), *r = projection_source(11, 100);
+        wl_columnar_batch_payload_t *lp = capture(g, store, l, mode % 2);
+        wl_columnar_batch_payload_t *rp = capture(g, store, r, 1);
+        col_rel_destroy(l); col_rel_destroy(r);
+        uint64_t baseline = reserved(g);
+        uint32_t invalid[] = {6};
+        wl_columnar_continuation_t *join = (void *)1;
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, invalid, 1, 40, index_cap(3), NULL, NULL, &join) ==
+            WL_COLUMNAR_SPILL_INVALID && !join);
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, NULL, 1, 40, index_cap(3), NULL, NULL, &join) ==
+            WL_COLUMNAR_SPILL_INVALID && !join);
+        /* Count zero ignores the map and retains full-width semantics. */
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, invalid, 0, 40, index_cap(3), NULL, NULL, &join) ==
+            WL_COLUMNAR_SPILL_MEMORY && !join);
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, invalid, 0, 48, index_cap(3), NULL, NULL, &join) == OK);
+        wl_columnar_continuation_destroy(join);
+        uint32_t *map = malloc(5 * sizeof(*map)); CHECK(map);
+        const uint32_t expected_map[] = {5, 1, 2, 4, 5};
+        memcpy(map, expected_map, sizeof(expected_map));
+        for (unsigned fault = 1; fault <= 3; fault++) {
+            allocation_fail = fault;
+            CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+                0, 0, map, 5, 40, index_cap(3), NULL, NULL, &join) ==
+                WL_COLUMNAR_SPILL_ALLOCATION && !join);
+            CHECK(reserved(g) == baseline);
+        }
+        /* Governed map, readers, index and output all unwind on denial. */
+        wl_columnar_memory_reservation_t held;
+        wl_columnar_memory_reservation_init(&held);
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(g),
+            (1 << 20) - baseline, &held));
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, map, 5, 40, index_cap(3), NULL, NULL, &join) ==
+            WL_COLUMNAR_SPILL_MEMORY && !join);
+        CHECK(wl_columnar_memory_rollback(&held));
+        CHECK(reserved(g) == baseline);
+        CHECK(wl_columnar_payload_join_create_projected_bounded(g, lp, rp,
+            0, 0, map, 5, 40, index_cap(mode ? 3 : 1), NULL, NULL,
+            &join) == OK);
+        memset(map, 0xff, sizeof(expected_map)); free(map);
+        CHECK(wl_columnar_batch_payload_release(lp) == WL_COLUMNAR_SPILL_BUSY);
+        sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+        s.failure = mode;
+        bool seen[9][11] = {{false}}; unsigned total = 0, calls = 0;
+        for (;;) {
+            CHECK(++calls < 10000);
+            wl_columnar_continuation_status_t status =
+                wl_columnar_continuation_publish(join, &sink);
+            if (status == WL_COLUMNAR_CONTINUATION_PROGRESS) continue;
+            if (status == WL_COLUMNAR_CONTINUATION_SINK_FAILURE ||
+                status == WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE ||
+                status == WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED) {
+                CHECK(mode == 1 || mode == 2 || mode == 4);
+                s.failure = 0; continue;
+            }
+            CHECK(status == WL_COLUMNAR_CONTINUATION_OK ||
+                status == WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS ||
+                status == WL_COLUMNAR_CONTINUATION_DONE);
+            s.failure = 0;
+            wl_columnar_batch_payload_t *out =
+                wl_columnar_join_batch_payload_sink_take(&s.owned);
+            if (out) {
+                uint32_t cols, rows;
+                const wirelog_column_type_t *types =
+                    wl_columnar_batch_payload_schema(out, &cols, &rows);
+                CHECK(cols == 5 && rows == 1 && types[0] == WIRELOG_TYPE_FLOAT
+                    && types[1] == WIRELOG_TYPE_UINT64 && types[2] ==
+                    WIRELOG_TYPE_FLOAT && types[3] == WIRELOG_TYPE_UINT64
+                    && types[4] == WIRELOG_TYPE_FLOAT);
+                wl_columnar_batch_payload_reader_t *reader;
+                CHECK(wl_columnar_batch_payload_acquire(out, &reader) == OK);
+                const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL,
+                    &lanes, &meta) == OK);
+                uint64_t i = UINT64_MAX - lanes[1],
+                    j = UINT64_MAX - 100 - lanes[3];
+                CHECK(i < 9 && j < 11 && !seen[i][j] && key((uint32_t)i, 9) ==
+                    key((uint32_t)j, 11));
+                double lv = i ? (double)i + 0.25 : -0.0;
+                double rv = j ? (double)j + 0.25 : -0.0;
+                CHECK(memcmp(&lanes[0], &rv, 8) == 0 &&
+                    memcmp(&lanes[2], &lv, 8) == 0 && lanes[0] == lanes[4]);
+                CHECK(meta.multiplicity == 1 && !meta.iteration && !meta.stratum
+                    && !meta.worker);
+                seen[i][j] = true; total++;
+                wl_columnar_batch_payload_reader_release(reader);
+                CHECK(wl_columnar_batch_payload_release(out) == OK);
+            }
+            if (status == WL_COLUMNAR_CONTINUATION_DONE) break;
+        }
+        unsigned expected = 0;
+        for (uint32_t i = 0; i < 9; i++)
+            for (uint32_t j = 0; j < 11; j++)
+                if (key(i, 9) == key(j, 11)) {
+                    CHECK(seen[i][j]); expected++;
+                }
+        CHECK(total == expected);
+        wl_columnar_continuation_destroy(join);
+        CHECK(reserved(g) == baseline);
+        CHECK(wl_columnar_batch_payload_release(lp) == OK);
+        CHECK(wl_columnar_batch_payload_release(rp) == OK);
+        CHECK(wl_columnar_spill_store_close(store) == OK);
+        CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void)
 {
+    projected();
     combinations(); failures(); budget(false); budget(true); misses();
     concurrent_self_join(false); concurrent_self_join(true);
     unsupported_and_empty();
