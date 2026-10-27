@@ -12,8 +12,11 @@ All notable changes to wirelog are documented in this file.
   projected rules and precomputed right filters are supported, with projected
   batch storage and governed projection ownership. Paired actual-session tests
   show exact completion under a fixed allowance that refuses the resident
-  index, including resident filter storage. Inputs, filters and final output
-  remain resident; unsupported shapes keep their existing paths.
+  index, including resident filter storage. Eligible owned numeric intermediates
+  now transfer to immutable payloads and refund their resident storage before
+  the next JOIN's index/output allocation. A same-index fixed-budget comparison
+  proves completion depends on that refund. Borrowed inputs, pool-backed filters
+  and final output remain resident; unsupported shapes keep their existing paths.
 
 - **`subprojects_ignored` gate** (#1814):
   `scripts/ci/check-subprojects-ignored.sh`, registered as `meson test

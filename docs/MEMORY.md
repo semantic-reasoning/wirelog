@@ -4664,6 +4664,61 @@ with resident inputs, filter and output that fit. It does not demonstrate cold
 registry/trace reclamation or whole-program arbitrary-budget completion. The
 separate 64 KiB streamed-payload proof remains unchanged.
 
+### Reclaiming owned JOIN intermediates
+
+`wl_columnar_batch_payload_take` consumes a complete, exclusively owned,
+canonical governed heap relation into the existing immutable spilled payload.
+It checks backing and committed reservation ownership; pool/arena/shared backing,
+retraction backups and deferred owners are ineligible. Numeric capture preserves
+all physical lane bits, row ordinals, types and timestamp/signed-difference
+metadata. STRING/compound/graph capture is not added to this transfer API.
+The original relation identity ends on retirement; payload ordinals belong to
+the new owner, and old relation-index caches cannot transfer with it.
+
+The source lifecycle must be externally serialized. The backing predicate does
+not grant ownership authority over a borrowed registry/cache relation. Readers
+and alias borrows are transient contention, not a reason to silently retain the
+source: checked retirement returns BUSY, drops the unpublished payload and
+preserves the source. Every failed transfer leaves the source pointer unchanged,
+with private disk and memory credit refunded. Cancellation is checked immediately
+before retirement; successful retirement clears the owning slot and publishes
+payload ownership without a later cancellable/error step. Concurrent readers of
+the new payload use its existing pin/read/release contract after source removal.
+
+The ordinary evaluator uses this transition for eligible owned intermediates
+and private heap filters, preparing owned output schema at zero row capacity
+before either operand retires. Two JOINs sharing a descriptor or storage owner
+retain snapshot behavior. Pool-backed private filters also retain that behavior;
+the independent heap allocation used when the session pool cannot be admitted
+is transferable. Failed left cleanup preserves the evaluator entry and its
+segmentation metadata; private heap-filter refusal uses deferred session cleanup.
+A successful transfer followed by a later error consumes the intermediate and
+cleans its payload/output rather than recreating the original relation.
+
+The parsed multi-JOIN acceptance fixture produces 8,192 intermediate rows, then
+joins them against a 32,768-row resident input to produce 64 exact results and
+notifications. It calibrates in a separate fresh session, then compares two new
+sessions with identical facts, fixed enforcing allowance and bounded index/batch
+settings. A test-only retention policy keeps the intermediate until normal
+end-of-JOIN cleanup; it changes no admission outcome or query/index setting.
+The real transfer run records the retired identity and reservation refund before
+producer construction and completes. The retained run fails with MEMORY at the
+second producer constructor, publishing no results. Thus this evidence depends
+on reclaiming resident input storage, beyond the separate index-saving proof.
+The test derives its allowance from observed admission peaks rather than a
+platform-specific byte total. Source preparation and observer publication are
+included; host staging, OS/allocator and previously documented ungoverned costs
+remain outside the managed-memory claim.
+
+A lower fixed allowance admits source preparation but refuses execution with
+budget evidence and no notifications or owned spill files. The low-level
+transition-floor test separately proves failure preserves the original source
+and refunds private work. Failure, late cancellation, partial I/O, quota,
+reader/alias BUSY, typed/signed metadata, concurrent pins and post-transfer
+producer/output errors are covered by `test_batch_payload` and `test_join_spill`.
+This completes the owned intermediate subset; it does not make registry or
+persistent trace storage cold, nor add differential cold execution.
+
 ### Remaining #1372 implementation groups
 
 The next integration group must establish actual immutable cold relation/trace

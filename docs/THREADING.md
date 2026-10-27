@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **426**).
+match the script's count (currently **428**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 426 sites.
+symbol-anchored inventory below covers 428 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1751,7 +1751,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 426 call sites.
+The complete current atomic-source inventory contains 428 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2209,3 +2209,17 @@ work; this slice does not claim a hard cleanup quantum or complete issue #1821.
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#2` | `gate->state` | `atomic_compare_exchange_strong_explicit` | acquire/relaxed | Acquire one gate in the ordered set with a single non-spurious transition |
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#3` | `gate->state` | `atomic_load_explicit` | acquire | Read one reader gate before its bounded release transition |
 | `source_access.h:wl_columnar_source_access_gate_set_attempt_advance#4` | `gate->state` | `atomic_compare_exchange_strong_explicit` | release/relaxed | Release one gate in reverse order with a single non-spurious transition |
+
+### Owned payload transfer token observations (#1372)
+
+The payload ownership-shape predicate observes committed reservation state and
+owner identity while the caller serializes the source's mutation and ownership
+lifecycle. These acquire loads do not claim a token or pin a relation. Capture
+uses its existing source-reader lease, and terminal retirement still requires
+checked descriptor/storage writer admission; active readers or alias borrows
+can refuse retirement without losing the source.
+
+| Site | Atomic field | Operation | Order | Purpose |
+| --- | --- | --- | --- | --- |
+| `batch_payload.c:wl_columnar_batch_payload_token_owned` | `token->state` | `atomic_load_explicit` | acquire | Observe stable committed ownership under the caller's serialized source lifecycle; reject in-flight token transitions |
+| `batch_payload.c:wl_columnar_batch_payload_token_owned#2` | `token->owner_bits` | `atomic_load_explicit` | acquire | Validate that the committed credit belongs to the source relation; does not replace checked retirement gates |
