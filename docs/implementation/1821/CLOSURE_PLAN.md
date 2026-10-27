@@ -252,3 +252,16 @@ rerun. The final qualification tests then passed `evaluation_serial`,
 LLVM 22's full clang-tidy ratchet passed for the production candidate. Formatting
 and whitespace checks passed. MSVC validation requires the remote Windows job;
 these Linux results do not claim a local MSVC build.
+
+## G3 bundle split (2026-10-27, before implementation)
+
+G3a implements ordinary monotone recursive fixed-point transactions with frozen
+round inputs, positive-arity declared INT64 heads, multiple heads/strata and
+private recomputation after input mutation. Three atomic units cover executable
+admission/scheduling, successor/publication integration, and qualification.
+G3b retains actual differential JOIN/CONSOLIDATE, trace/arrangement transactions
+and incremental retraction propagation: arrangement registry growth currently
+refuses active controlled attempts, and ordinary recomputation cannot qualify
+those distinct operators. Optimized K_FUSION/LFTJ routes, recursive aggregates,
+negation, other recursive representations and mixed fact/rule IDBs remain open.
+This split follows recovery/ownership boundaries; it does not close G3 or #1821.

@@ -145,11 +145,17 @@ typedef enum {
     WL_SESSION_OBSERVED_RETIRE = 15,
     WL_SESSION_OBSERVED_FINISH = 16,
     WL_SESSION_OBSERVED_DONE = 17,
+    WL_SESSION_RECURSIVE_SEED = 18,
+    WL_SESSION_RECURSIVE_COMPARE = 19,
+    WL_SESSION_RECURSIVE_REBIND = 20,
+    WL_SESSION_RECURSIVE_RETIRE = 21,
 } wl_columnar_session_observed_phase_t;
 
 typedef struct {
     wl_plan_relation_t plan;
-    col_rel_t *candidate;
+    col_rel_t *candidate, *previous;
+    uint32_t stratum, width;
+    bool recursive;
 } wl_columnar_session_observed_head_t;
 
 typedef struct {
@@ -193,6 +199,12 @@ typedef struct {
     uint32_t cleanup_index, dispose_index, missing_count;
     wl_columnar_relation_scalar_retirement_t disposal;
     int child_result;
+    uint32_t round_begin, round_end, round, round_index, column, cleanup_round,
+        audit_op;
+    uint64_t row;
+    col_rel_t **round_owner;
+    bool round_active, round_changed;
+    wl_columnar_relation_scalar_retirement_t round_retirement;
 } wl_columnar_session_observed_transaction_t;
 
 struct wl_columnar_controlled_step {
@@ -6449,6 +6461,25 @@ col_controlled_step_batch_shape(const wl_col_session_t *sess)
 static bool wl_columnar_session_observed_general_shape(
     const wl_col_session_t *);
 
+static bool
+wl_columnar_session_recursive_transaction_shape(const wl_col_session_t *sess)
+{
+    const wl_plan_t *plan = sess->plan;
+    if (!sess->delta_cb || !plan || !plan->strata
+        || plan->stratum_count > MAX_STRATA) return false;
+    for (uint32_t i = 0; i < plan->stratum_count; ++i) {
+        const wl_plan_stratum_t *stratum = &plan->strata[i];
+        if (!stratum->is_recursive) continue;
+        /* Preserve the existing before-attempt refusal of the single-head
+         * typed route; general metadata is validated by charged admission. */
+        if (plan->stratum_count == 1 && stratum->relation_count == 1
+            && (!stratum->bodies || !stratum->bodies[0].declared_int64))
+            return false;
+        return true;
+    }
+    return false;
+}
+
 static int
 col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
 {
@@ -6481,6 +6512,8 @@ col_controlled_step_static_preflight(wl_col_session_t *sess, bool successor)
         || wl_columnar_eval_delta_rollback_active(sess)
         || (wl_columnar_eval_delta_observer_active(sess) && !retained_baseline))
         return ENOTSUP;
+
+    if (wl_columnar_session_recursive_transaction_shape(sess)) return 0;
 
     /* The first controlled recursive route is intentionally exact: one
      * recursive path relation, the parser's terminal zero-worker EXCHANGE,
@@ -9043,6 +9076,52 @@ wl_columnar_session_observed_child(wl_col_session_t *sess,
     return EAGAIN;
 }
 
+/* The SCC bridge accepts only positive, row-local operations. Projection
+ * expressions are checked one column per charged PLAN action below. */
+static bool
+wl_columnar_session_recursive_positive_op(const wl_plan_op_t *op)
+{
+    if (op->opaque_data || op->materialized) return false;
+    switch (op->op) {
+    case WL_PLAN_OP_VARIABLE:
+    case WL_PLAN_OP_JOIN:
+    case WL_PLAN_OP_CONCAT:
+    case WL_PLAN_OP_CONSOLIDATE:
+    case WL_PLAN_OP_FILTER: return true;
+    case WL_PLAN_OP_MAP:
+        return op->project_count && op->project_indices
+               && (!op->map_expr_count || (op->map_exprs
+               && op->map_expr_count == op->project_count));
+    default: return false;
+    }
+}
+
+static int
+wl_columnar_session_recursive_retire(
+    wl_columnar_session_observed_transaction_t *tx, col_rel_t **owner,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_relation_scalar_retirement_t *r = &tx->round_retirement;
+    if (!r->storage.identity) {
+        int rc = wl_columnar_relation_scalar_retirement_begin(r, *owner);
+        if (rc) return rc;
+        tx->round_owner = owner;
+    }
+    if (tx->round_owner != owner) return EINVAL;
+    if (!r->committed) {
+        int rc = wl_columnar_relation_scalar_retirement_prepare(r, control, id);
+        if (rc) return rc;
+        rc = wl_columnar_relation_scalar_retirement_commit(r);
+        if (rc) return rc;
+    }
+    int rc = wl_columnar_relation_scalar_retirement_step(r, control, id);
+    if (rc) return rc;
+    *owner = NULL;
+    tx->round_owner = NULL;
+    memset(r, 0, sizeof(*r));
+    return 0;
+}
+
 static int
 wl_columnar_session_observed_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -9058,7 +9137,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->phase == WL_SESSION_OBSERVED_EVALUATE ? tx->head : tx->index,
             tx->child_active ? &tx->bindings : NULL);
 #endif
-    if (tx->phase < WL_SESSION_OBSERVED_RETIRE &&
+    if ((tx->phase < WL_SESSION_OBSERVED_RETIRE
+        || tx->phase >= WL_SESSION_RECURSIVE_SEED) &&
         !(tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active)){
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
                 tx->phase == WL_SESSION_OBSERVED_PLAN ? 256 : tx->phase ==
@@ -9081,7 +9161,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->phase = WL_SESSION_OBSERVED_ALLOCATE;
             return 0;
         }
-        if (!plan->strata || plan->strata[tx->si].is_recursive) return ENOTSUP;
+        if (!plan->strata) return ENOTSUP;
+        const wl_plan_stratum_t *count_stratum = &plan->strata[tx->si];
+        if (count_stratum->is_recursive && (!count_stratum->is_monotone
+            || count_stratum->has_aggregate ||
+            !count_stratum->bodies)) return ENOTSUP;
         if (plan->strata[tx->si].relation_count &&
             !plan->strata[tx->si].relations)
             return EINVAL;
@@ -9090,13 +9174,18 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         } else {
             const wl_plan_relation_t *r =
                 &plan->strata[tx->si].relations[tx->ri++];
-            if (!r->name || !r->ops || !r->op_count
-                || r->ops[r->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE)
+            const wl_plan_body_t *body = count_stratum->is_recursive
+                ? &count_stratum->bodies[tx->ri - 1] : NULL;
+            const wl_plan_op_t *ops = body ? body->ops : r->ops;
+            uint32_t count = body ? body->op_count : r->op_count;
+            if (!r->name || !ops || !count
+                || ops[count - 1].op != WL_PLAN_OP_CONSOLIDATE
+                || (body && (!body->declared_int64 || !body->declared_width)))
                 return ENOTSUP;
             if (tx->head_count == UINT32_MAX ||
-                r->op_count > UINT32_MAX - tx->op_count)
+                count > UINT32_MAX - tx->op_count)
                 return EOVERFLOW;
-            tx->head_count++; tx->op_count += r->op_count;
+            tx->head_count++; tx->op_count += count;
             return 0;
         }
     case WL_SESSION_OBSERVED_ALLOCATE: {
@@ -9197,19 +9286,63 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 &plan->strata[tx->si].relations[tx->ri];
             wl_columnar_session_observed_head_t *head =
                 &tx->heads[tx->filled_heads];
+            const wl_plan_stratum_t *stratum = &plan->strata[tx->si];
+            const wl_plan_body_t *body = stratum->is_recursive
+                ? &stratum->bodies[tx->ri] : NULL;
+            const wl_plan_op_t *source_ops = body ? body->ops : source->ops;
+            uint32_t source_count = body ? body->op_count : source->op_count;
             if (!tx->op) {
+                head->stratum = tx->si;
+                head->recursive = stratum->is_recursive;
+                head->width = body ? body->declared_width : 0;
                 head->plan = *source;
+                head->plan.op_count = source_count;
                 head->plan.ops = tx->ops + tx->filled_ops;
                 tx->entries[plan->edb_count +
                     tx->filled_heads].name = source->name;
             }
+            /* Audit every rewritten slot separately from the preserved body. */
+            if (body && tx->audit_op < source->op_count) {
+                const wl_plan_op_t *original = &source->ops[tx->audit_op++];
+                if (original->op == WL_PLAN_OP_K_FUSION ||
+                    original->op == WL_PLAN_OP_LFTJ)
+                    return ENOTSUP;
+                if (original->op == WL_PLAN_OP_EXCHANGE) {
+                    const wl_plan_op_exchange_t *exchange =
+                        original->opaque_data;
+                    if (!exchange || exchange->num_workers) return ENOTSUP;
+                }
+                return 0;
+            }
             if (!col_controlled_step_controlled_op(
-                    &source->ops[tx->op])) return ENOTSUP;
-            tx->ops[tx->filled_ops + tx->op] = source->ops[tx->op];
+                    &source_ops[tx->op])) return ENOTSUP;
+            if (body && !wl_columnar_session_recursive_positive_op(
+                    &source_ops[tx->op])) return ENOTSUP;
+            const wl_plan_op_t *recursive_op = &source_ops[tx->op];
+            if (body && recursive_op->op == WL_PLAN_OP_MAP
+                && tx->column < recursive_op->map_expr_count) {
+                const wl_plan_expr_buffer_t *expr =
+                    &recursive_op->map_exprs[tx->column];
+                char expected[32];
+                int length = snprintf(expected, sizeof(expected), "col%u",
+                        recursive_op->project_indices[tx->column]);
+                uint16_t actual = 0;
+                if (!expr->data || expr->size < 3 ||
+                    expr->data[0] != WL_PLAN_EXPR_VAR)
+                    return ENOTSUP;
+                memcpy(&actual, expr->data + 1, sizeof(actual));
+                if (length < 0 || (uint32_t)length != actual ||
+                    expr->size != (uint32_t)actual + 3
+                    || memcmp(expr->data + 3, expected,
+                    actual) != 0) return ENOTSUP;
+                tx->column++; return 0;
+            }
+            tx->column = 0;
+            tx->ops[tx->filled_ops + tx->op] = source_ops[tx->op];
             tx->ops[tx->filled_ops + tx->op].delta_mode = WL_DELTA_FORCE_FULL;
-            if (++tx->op == source->op_count) {
-                tx->filled_ops += source->op_count; tx->filled_heads++;
-                tx->op = 0; tx->ri++;
+            if (++tx->op == source_count) {
+                tx->filled_ops += source_count; tx->filled_heads++;
+                tx->op = tx->audit_op = 0; tx->ri++;
             }
             return 0;
         }
@@ -9349,12 +9482,29 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (tx->head == tx->head_count) {
             tx->phase = WL_SESSION_OBSERVED_BASELINE; return 0;
         }
+        if (tx->heads[tx->head].recursive && !tx->round_active) {
+            tx->round_begin = tx->head; tx->round_end = tx->head;
+            tx->round_index = tx->head; tx->round = 0;
+            tx->round_active = true;
+            tx->phase = WL_SESSION_RECURSIVE_SEED;
+            return 0;
+        }
         rc = wl_columnar_session_observed_child(sess, step);
         if (rc) return rc;
         if (tx->child_active) return EAGAIN;
         if (!tx->heads[tx->head].candidate) return EINVAL;
         {
             col_rel_t *candidate = tx->heads[tx->head].candidate;
+            if (tx->round_active) {
+                if (candidate->ncols !=
+                    tx->heads[tx->head].width) return ENOTSUP;
+                if (++tx->head == tx->round_end) {
+                    tx->round_index = tx->round_begin;
+                    tx->row = tx->column = 0; tx->round_changed = false;
+                    tx->phase = WL_SESSION_RECURSIVE_COMPARE;
+                }
+                return 0;
+            }
             uint32_t slot = plan->edb_count + tx->head;
             tx->entries[slot].relation = candidate;
             tx->entries[slot].snapshot =
@@ -9367,6 +9517,111 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->head++;
             return 0;
         }
+    case WL_SESSION_RECURSIVE_SEED: {
+        /* Start from bottom, never an old public closure. On later rounds
+         * ownership moves from candidate to the immutable round input. */
+        uint32_t i = tx->round_index;
+        if (i == tx->head_count || tx->heads[i].stratum
+            != tx->heads[tx->round_begin].stratum) {
+            tx->round_end = i;
+            tx->head = tx->round_begin;
+            tx->phase = WL_SESSION_OBSERVED_EVALUATE;
+            return 0;
+        }
+        wl_columnar_session_observed_head_t *head = &tx->heads[i];
+        if (tx->round) {
+            head->previous = head->candidate; head->candidate = NULL;
+        } else {
+            rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
+                head->plan.name, head->width, 1, sess->memory_governor,
+                &head->previous, control, step->operation_id);
+            if (rc) return rc;
+        }
+        uint32_t slot = plan->edb_count + i;
+        tx->entries[slot].relation = head->previous;
+        tx->entries[slot].snapshot =
+            wl_columnar_relation_snapshot(head->previous);
+        tx->round_index++;
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_COMPARE: {
+        if (tx->round_index == tx->round_end) {
+            tx->round_index = tx->round_begin;
+            tx->phase = WL_SESSION_RECURSIVE_REBIND;
+            return 0;
+        }
+        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        col_rel_t *a = head->previous, *b = head->candidate;
+        if (!a || !b || a->ncols != head->width || b->ncols != head->width)
+            return EINVAL;
+        if (tx->column < head->width && tx->row == 0) {
+            if ((b->column_types &&
+                b->column_types[tx->column] != WIRELOG_TYPE_INT64)
+                || b->timestamps ||
+                b->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+                return ENOTSUP;
+        }
+        /* Even unequal cardinalities visit the output schema first. */
+        if (tx->row == 0 && tx->column < head->width) {
+            tx->column++; return 0;
+        }
+        if (!tx->row) {
+            tx->row = 1; tx->column = 0; return 0;
+        }
+        if (a->nrows != b->nrows) tx->round_changed = true;
+        else if (tx->row - 1 < b->nrows) {
+            if (a->columns[tx->column][tx->row - 1]
+                != b->columns[tx->column][tx->row -
+                1]) tx->round_changed = true;
+            if (++tx->column == head->width) {
+                tx->column = 0; tx->row++;
+            }
+            return 0;
+        }
+        tx->round_index++; tx->row = tx->column = 0;
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_REBIND: {
+        if (tx->round_index == tx->round_end) {
+            tx->round_index = tx->round_begin;
+            tx->phase = WL_SESSION_RECURSIVE_RETIRE;
+            return 0;
+        }
+        uint32_t i = tx->round_index++, slot = plan->edb_count + i;
+        col_rel_t *r = tx->heads[i].candidate;
+        tx->entries[slot].relation = r;
+        tx->entries[slot].snapshot = wl_columnar_relation_snapshot(r);
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_RETIRE:
+        if (tx->round_index < tx->round_end) {
+            rc = wl_columnar_session_recursive_retire(tx,
+                    &tx->heads[tx->round_index].previous, control,
+                    step->operation_id);
+            if (rc) return rc;
+            if (!tx->round_changed) {
+                uint32_t slot = plan->edb_count + tx->round_index;
+                if (!tx->entries[slot].public_relation)
+                    tx->overrides[tx->missing_count++] =
+                        (wl_columnar_eval_delta_binding_t){tx->entries[slot].
+                                                           name,
+                                                           NULL,
+                                                           tx->heads[tx->
+                                                               round_index].
+                                                           width};
+            }
+            tx->round_index++; return 0;
+        }
+        if (tx->round_changed) {
+            if (++tx->round >= MAX_ITERATIONS) return EOVERFLOW;
+            tx->round_index = tx->round_begin;
+            tx->phase = WL_SESSION_RECURSIVE_SEED;
+        } else {
+            tx->round_active = false;
+            tx->head = tx->round_end;
+            tx->phase = WL_SESSION_OBSERVED_EVALUATE;
+        }
+        return 0;
     case WL_SESSION_OBSERVED_BASELINE:
         if (!tx->observer_started) {
             rc = tx->missing_count
@@ -9721,9 +9976,27 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         if (rc) return rc;
         tx->observer_started = false;
     }
+    if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
+        if (tx->round_owner) {
+            rc = wl_columnar_session_recursive_retire(tx, tx->round_owner,
+                    tx->maintenance, tx->maintenance_id);
+            if (rc) return rc;
+        }
+        while (tx->cleanup_round < tx->head_count) {
+            col_rel_t **owner = &tx->heads[tx->cleanup_round].previous;
+            if (*owner) {
+                rc = wl_columnar_session_recursive_retire(tx, owner,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            tx->cleanup_round++;
+            return EAGAIN;
+        }
+    }
     uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
     if (entries > tx->count) entries = tx->count;
     if (tx->dispose_index < entries) {
+        if (!tx->entries || !tx->heads) return EINVAL;
         uint32_t i = tx->dispose_index;
         col_rel_t *r = i < sess->plan->edb_count
             ? tx->entries[i].relation != tx->entries[i].public_relation
@@ -10178,6 +10451,7 @@ static bool
 wl_columnar_session_observed_general_shape(const wl_col_session_t *sess)
 {
     const wl_plan_t *plan = sess->plan;
+    if (wl_columnar_session_recursive_transaction_shape(sess)) return true;
     if (!sess->delta_cb) return false;
     if (!plan || !plan->strata) return true;
     if (plan->edb_count == 1 && plan->edb_column_type_counts
@@ -10282,6 +10556,8 @@ col_controlled_step(wl_col_session_t *sess)
         sess->controlled_step->observed = sess->delta_cb != NULL;
         sess->controlled_step->general_observed =
             wl_columnar_session_observed_general_shape(sess);
+        if (sess->controlled_step->general_observed)
+            sess->controlled_step->recursive_route = false;
     }
     return col_controlled_step_drive(sess, sess->controlled_step, false);
 }
