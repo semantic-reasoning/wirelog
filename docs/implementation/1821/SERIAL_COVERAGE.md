@@ -251,3 +251,34 @@ trace/arrangement and differential retraction (E07/F04), mixed fact/rule IDBs,
 recursive negation/aggregates, non-INT64/nullary recursive heads and default
 optimizer integration remain open. The complete G3a evidence and next G3b work
 are recorded in [the closure plan](CLOSURE_PLAN.md#g3a-implementation-and-qualification-2026-10-27).
+
+### G3b first bundle: controlled prefix-discovery consolidation
+
+Audited on `567a5570` plus this bundle. O08 now has an ordinary controlled
+incremental algorithm selected by the session's existing `diff_enabled` option:
+`wl_columnar_filter_consolidate_attempt_start_owned` discovers a strictly
+increasing prefix under its scalar source lease, sorts only the suffix and
+stably merges the runs before deduplication. Discovery uses actual values, not
+`sorted_nrows` provenance. Disabling the option preserves the previous full sort.
+
+`evaluation_consolidate` tests `incremental_prefixes` and
+`incremental_prefix_boundary` qualify wide/nullary/finite FLOAT inputs, equal
+boundaries, descending suffixes, invalid cache metadata, signed zeros, nonfinite
+rejection, cancellation at discovery/sort/merge/output, retry and exact/one-short
+allowances. The discovery oracle uses source fees (512 per one-column pair)
+after an empirical setup anchor; whole-call budgets are empirical.
+
+`test_controlled_incremental_consolidate_step` in `evaluation_serial` executes
+unmodified generated identity and column-permuting MAP plans through ordinary
+STEP, verifies actual suffix checkpoints, stops at all four algorithm phases,
+and exercises both cancellation/retry and retained work-limit reset/resume.
+Insert/remove successors preserve old public heads and callbacks until success;
+canonical rows and signed events match a disabled-control/full-sort session.
+Repeated cycles restore the governor baseline; checked destruction followed by
+control and plan release drain the final retained credits.
+
+This is O08 algorithm evidence, not F04 dispatch closure. Active differential
+JOIN/CONSOLIDATE dispatch still refuses controlled execution. Persistent JOIN
+arrangements and their host-atomic publication, persistent sorted-prefix reuse,
+recursive delta/frontier transitions, and actual retraction scheduling remain
+open under G3b. No trace persistence is inferred from `diff.c` comments.

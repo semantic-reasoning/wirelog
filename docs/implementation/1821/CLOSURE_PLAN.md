@@ -359,3 +359,11 @@ Atomic units: (1) executing bounded algorithm and operator qualification;
 Persistent differential JOIN/registry transactions, active differential dispatch
 (F04), persistent prefix reuse, and recursive frontier/retraction scheduling
 remain open. These are work obligations, not a promised remaining PR count.
+
+The first consolidation bundle's session qualification is
+`test_controlled_incremental_consolidate_step`: generated identity/permuted MAP
+plans, discovery/suffix-sort/merge/output checkpoints, cancellation and retained
+work-limit resume, repeated insert/remove successors, raw signed-event parity,
+no premature publication and governor restoration. Operator tests additionally
+cover stale metadata and independent per-pair discovery costs. This advances
+O08; it leaves E07/F04/F04a and the remaining G3b obligations above open.
