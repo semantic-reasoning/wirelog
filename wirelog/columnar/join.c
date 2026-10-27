@@ -22,6 +22,7 @@
 #include "columnar/internal.h"
 #include "columnar/diff_join_batch.h"
 #include "columnar/join_batch.h"
+#include "columnar/payload_join.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
 
@@ -1252,6 +1253,171 @@ wl_columnar_join_select_right(const wl_plan_op_t *op,
     return selection;
 }
 
+/* Eligibility is deliberately narrower than the payload API. An ordinary
+* synchronous coordinator may snapshot scalar sources, but must not consume
+* differential metadata, borrowed worker stores or controlled work. Existing
+* relation batching/pipelines take precedence when both knobs are set. */
+static bool
+wl_columnar_join_spill_source(const col_rel_t *rel, uint32_t key)
+{
+    if (!rel->nrows || key >= rel->ncols || rel->has_graph_column
+        || rel->timestamps || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+        || rel->compound_count || rel->compound_arity_map
+        || rel->compound_arity_len || rel->inline_physical_offset)
+        return false;
+    if (!rel->column_types)
+        return true;
+    if (rel->column_types[key] != WIRELOG_TYPE_INT64)
+        return false;
+    for (uint32_t c = 0; c < rel->ncols; c++) {
+        wirelog_column_type_t type = rel->column_types[c];
+        if (type != WIRELOG_TYPE_INT32 && type != WIRELOG_TYPE_INT64
+            && type != WIRELOG_TYPE_UINT32 && type != WIRELOG_TYPE_UINT64
+            && type != WIRELOG_TYPE_FLOAT && type != WIRELOG_TYPE_BOOL)
+            return false;
+    }
+    return true;
+}
+
+static bool
+wl_columnar_join_spill_eligible(const wl_col_session_t *sess,
+    const wl_plan_op_t *op, const eval_entry_t *left, const col_rel_t *right,
+    bool right_delta, const uint32_t *lk, const uint32_t *rk)
+{
+    return sess->spill_join_batch_bytes && sess->spill_join_index_bytes
+           && sess->spill_store && sess->owns_spill_store
+           && !sess->coordinator && sess->num_workers <= 1
+           && !sess->base.evaluation_control && !sess->join_batch_bytes
+           && !sess->diff_operators_active && !sess->tdd_input_run
+           && !sess->delta_seeded && !sess->retraction_seeded
+           && !sess->retraction_right_pass && !left->is_delta && !right_delta
+           && op->key_count == 1 && !op->materialized
+           && !op->project_count && !op->right_filter_expr.size
+           && wl_columnar_join_spill_source(left->rel, lk[0])
+           && wl_columnar_join_spill_source(right, rk[0]);
+}
+
+static int
+wl_columnar_join_spill_error(wl_col_session_t *sess,
+    wl_columnar_spill_status_t status)
+{
+    switch (status) {
+    case WL_COLUMNAR_SPILL_OK: return 0;
+    case WL_COLUMNAR_SPILL_MEMORY:
+        sess->memory_budget_denied = true;
+        return ENOSPC;
+    case WL_COLUMNAR_SPILL_ALLOCATION: return ENOMEM;
+    case WL_COLUMNAR_SPILL_QUOTA:
+    case WL_COLUMNAR_SPILL_CAPACITY: return ENOSPC;
+    case WL_COLUMNAR_SPILL_IO: return EIO;
+    case WL_COLUMNAR_SPILL_CANCELLED: return ECANCELED;
+    case WL_COLUMNAR_SPILL_BUSY: return EBUSY;
+    case WL_COLUMNAR_SPILL_OVERFLOW: return EOVERFLOW;
+    case WL_COLUMNAR_SPILL_CLOSED: return EPIPE;
+    case WL_COLUMNAR_SPILL_UNSUPPORTED: return ENOTSUP;
+    case WL_COLUMNAR_SPILL_INVALID: return EINVAL;
+    }
+    return EINVAL;
+}
+
+/* Unlike the relation producer drain, payload PROGRESS publishes nothing and
+ * sticky I/O errors belong to the producer, not the sink. The output stays
+ * private until the complete JOIN succeeds. */
+static int
+wl_columnar_join_spill_drain(wl_col_session_t *sess,
+    wl_columnar_continuation_t *cont, col_rel_t *out)
+{
+    col_join_batch_relation_sink_t ctx;
+    wl_columnar_continuation_sink_t sink;
+    int rc = col_join_batch_relation_sink_init(&ctx, &sink, sess, out);
+    if (rc != 0)
+        return wl_columnar_join_output_error(sess, out, rc);
+    for (;;) {
+        uint32_t before = out->nrows;
+        wl_columnar_continuation_status_t status =
+            wl_columnar_continuation_publish(cont, &sink);
+        if (status == WL_COLUMNAR_CONTINUATION_PROGRESS)
+            continue;
+        if (status == WL_COLUMNAR_CONTINUATION_OK) {
+            if (wl_columnar_join_output_limit_reached(sess, out,
+                out->nrows - before))
+                return EOVERFLOW;
+            continue;
+        }
+        if (status == WL_COLUMNAR_CONTINUATION_DONE)
+            return 0;
+        wl_columnar_spill_status_t producer =
+            wl_columnar_payload_join_error(cont);
+        if (producer != WL_COLUMNAR_SPILL_OK)
+            return wl_columnar_join_spill_error(sess, producer);
+        switch (status) {
+        case WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED:
+            rc = ENOSPC;
+            break;
+        case WL_COLUMNAR_CONTINUATION_SINK_FAILURE:
+            rc = ctx.error ? ctx.error : ENOMEM;
+            break;
+        case WL_COLUMNAR_CONTINUATION_ALLOCATION_FAILURE:
+        case WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE:
+            rc = ENOMEM;
+            break;
+        case WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS: rc = EIO; break;
+        case WL_COLUMNAR_CONTINUATION_STALE: rc = EAGAIN; break;
+        case WL_COLUMNAR_CONTINUATION_UNSUPPORTED: rc = ENOTSUP; break;
+        default: rc = EINVAL; break;
+        }
+        return wl_columnar_join_output_error(sess, out, rc);
+    }
+}
+
+static int
+wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
+    const col_rel_t *left, const col_rel_t *right, uint32_t lk, uint32_t rk,
+    col_rel_t **out)
+{
+    wl_columnar_batch_payload_t *inputs[2] = { NULL, NULL };
+    wl_columnar_continuation_t *cont = NULL;
+    const col_rel_t *sources[2] = { left, right };
+    int rc = 0;
+    *out = NULL;
+    sess->spill_join_selected_count++;
+    for (unsigned i = 0; i < 2; i++) {
+        wl_columnar_spill_status_t status = wl_columnar_batch_payload_capture(
+            sess->memory_governor, sess->spill_store, sources[i],
+            sources[i]->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+            NULL, NULL, &inputs[i]);
+        rc = wl_columnar_join_spill_error(sess, status);
+        if (rc != 0)
+            goto done;
+    }
+    rc = wl_columnar_join_spill_error(sess,
+            wl_columnar_payload_join_create_bounded(sess->memory_governor,
+            inputs[0], inputs[1], lk, rk, sess->spill_join_batch_bytes,
+            sess->spill_join_index_bytes, NULL, NULL, &cont));
+    if (rc != 0)
+        goto done;
+    rc = wl_columnar_join_new_output(sess, left, right, "$join",
+            col_join_output_width(left, right, op), COL_REL_INIT_CAP,
+            false, true, out);
+    if (rc == 0)
+        rc = col_join_set_output_types(*out, left, right, op);
+    if (rc == 0)
+        rc = wl_columnar_join_spill_drain(sess, cont, *out);
+done:
+    /* Drop reader pins before the segment owners, including after DONE. */
+    wl_columnar_continuation_destroy(cont);
+    for (unsigned i = 0; i < 2; i++) {
+        if (inputs[i] && wl_columnar_batch_payload_release(inputs[i])
+            != WL_COLUMNAR_SPILL_OK)
+            abort(); /* Private readers are gone; no external owner exists. */
+    }
+    if (rc != 0) {
+        col_rel_destroy(*out);
+        *out = NULL;
+    }
+    return rc;
+}
+
 int
 wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -1456,6 +1622,19 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
         if (right_filtered)
             col_rel_destroy(right_filtered);
         return wl_columnar_join_dispose_left(stack, &left_e, EINVAL);
+    }
+
+    if (wl_columnar_join_spill_eligible(sess, op, &left_e, right,
+        used_right_delta, lk, rk)) {
+        col_rel_t *spill_out = NULL;
+        int spill_rc = wl_columnar_join_spill_run(sess, op, left, right,
+                lk[0], rk[0], &spill_out);
+        wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+        wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+        if (spill_rc != 0)
+            return wl_columnar_join_dispose_left(stack, &left_e, spill_rc);
+        return wl_columnar_join_publish_after_left(stack, &left_e, spill_out,
+                   false);
     }
 
     uint32_t ocols = col_join_output_width(left, right, op);

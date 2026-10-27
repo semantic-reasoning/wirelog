@@ -4563,3 +4563,63 @@ to drain it, then every remaining private owner. No old public head is destroyed
 before the common publication cutoff. Repeated successor and interruption tests
 check resource baselines and zero reservations after session and program teardown;
 program intern storage is released by program destruction.
+
+## Opt-in ordinary evaluator spill JOIN (#1372)
+
+Internal `wl_session_options_t` version 5 adds `spill_join_batch_bytes` and
+`spill_join_index_bytes`. Both zero keeps existing behavior. Both positive
+requires the existing spill directory/quota/row-width configuration; combining
+this route with evaluation control is rejected with `EINVAL` before attachment.
+Version 2, 3 and 4 option prefixes retain disabled routing, including when their
+buffers contain unknown trailing bytes. This is not an installed public API.
+
+The ordinary evaluator selects this route after operand selection and key
+resolution, before acquiring an arrangement or allocating an ephemeral full
+index. Eligibility requires a serial coordinator (`num_workers <= 1`), one
+INT64 equality key, nonempty scalar numeric inputs without timestamps, and an
+unprojected, unmaterialized JOIN without a right filter. Worker, differential,
+delta-seeded/retraction, controlled and TDD-bound execution is excluded, as are
+STRING, graph and compound layouts. `WIRELOG_JOIN_BATCH_BYTES` retains precedence
+when both features are enabled, including its strict-mode refusal. Unsupported
+shapes follow their existing paths; the option does not promise bounded indexes
+for an arbitrary plan. In particular, the planner often fuses a projection into
+a JOIN, which excludes that operator from this first integration.
+
+Selected JOINs capture both inputs into session-owned ephemeral spill payloads
+under source-reader authority, then use the capped window index. The batch cap
+bounds output lane storage; the index cap includes its reservation descriptor,
+buckets and row links. Rescanning the left snapshot for each right window trades
+I/O and CPU for bounded index memory. Sources remain resident and unchanged, and
+the final result is materialized in a governed relation. Snapshot descriptors,
+writer/readers, producer/batch state and output storage remain additional memory
+floors. The generic continuation descriptor and OS/allocator costs retain the
+limitations described above. This does not evict registry columns or implement
+mutable/trace transitions or #1373 scheduling.
+
+PROGRESS advances private scan state without publishing or charging output rows.
+Only committed batches count against the ordinary JOIN row limit; equality with
+the limit refuses the JOIN and a batch can overshoot it. The result stays private
+until the JOIN finishes, so errors destroy that result. Existing outer STEP and
+observer publication contracts still apply; this is not whole-STEP rollback.
+Continuations/readers are destroyed before releasing both snapshot owners on
+all exits, including self-JOIN and failure during the second capture. Synchronous
+execution adds no controlled cancellation or work-metering guarantee.
+
+Selected-route errors propagate without a resident retry. Spill MEMORY returns
+`ENOSPC` with memory-budget-denial evidence; QUOTA/CAPACITY also return `ENOSPC`
+but do not set that evidence. ALLOCATION returns `ENOMEM`, I/O returns `EIO`,
+overflow `EOVERFLOW`, busy `EBUSY`, closed `EPIPE`, unsupported `ENOTSUP`, invalid
+`EINVAL`, and cancellation `ECANCELED`. Producer errors are read before teardown;
+sink allocation/admission errors preserve their own classification.
+
+`test_join_spill` uses a parsed nonrecursive rule with an arithmetic MAP tail,
+which naturally leaves an eligible JOIN. Enabled and disabled execution produce
+the same 108 tuples and observer notifications; enabled execution creates no
+resident arrangement. Additional checks cover self-JOIN, owned FLOAT inputs,
+multiple windows and no-match PROGRESS, legacy row caps, excluded shapes and
+workers, disk quota/write/read failures, allocation and governor denial,
+source/pin preservation and exact snapshot cleanup. This proves actual evaluator
+routing, not a fixed-budget whole-program completion claim. The separate 64 KiB
+streamed-payload JOIN proof remains unchanged. Public configuration, broader
+consumer/trace integration and the remaining #1372 acceptance audit are still
+outstanding; #1372 remains open and #1385 is not qualified by this unit.

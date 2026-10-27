@@ -444,6 +444,8 @@ wl_session_options_init(wl_session_options_t *options)
     options->spill_directory = NULL;
     options->spill_quota_bytes = 0;
     options->spill_max_row_bytes = 0;
+    options->spill_join_batch_bytes = 0;
+    options->spill_join_index_bytes = 0;
 }
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -532,6 +534,14 @@ wl_session_options_normalize(const wl_session_options_t *options,
         wl_columnar_memory_governor_ref_t *memory_governor;
         wl_evaluation_control_t *evaluation_control;
     } wl_session_options_v3_t;
+    typedef struct {
+        uint32_t size, version;
+        void *windows_job_handle;
+        wl_columnar_memory_governor_ref_t *memory_governor;
+        wl_evaluation_control_t *evaluation_control;
+        const char *spill_directory;
+        uint64_t spill_quota_bytes, spill_max_row_bytes;
+    } wl_session_options_v4_t;
     uint32_t size;
     uint32_t version;
     wl_session_options_init(normalized);
@@ -554,6 +564,17 @@ wl_session_options_normalize(const wl_session_options_t *options,
         normalized->windows_job_handle = legacy.windows_job_handle;
         normalized->memory_governor = legacy.memory_governor;
         normalized->evaluation_control = legacy.evaluation_control;
+        return 1;
+    }
+    if (version == 4 && size >= sizeof(wl_session_options_v4_t)) {
+        wl_session_options_v4_t legacy;
+        memcpy(&legacy, options, sizeof(legacy));
+        normalized->windows_job_handle = legacy.windows_job_handle;
+        normalized->memory_governor = legacy.memory_governor;
+        normalized->evaluation_control = legacy.evaluation_control;
+        normalized->spill_directory = legacy.spill_directory;
+        normalized->spill_quota_bytes = legacy.spill_quota_bytes;
+        normalized->spill_max_row_bytes = legacy.spill_max_row_bytes;
         return 1;
     }
     if (version != WL_SESSION_OPTIONS_VERSION || size < sizeof(*normalized))
@@ -617,6 +638,12 @@ wl_session_create_with_snapshot_options(const wl_compute_backend_t *backend,
         return EINVAL;
     }
     control = normalized.evaluation_control;
+    if ((normalized.spill_join_batch_bytes != 0)
+        != (normalized.spill_join_index_bytes != 0))
+        return EINVAL;
+    if (normalized.spill_join_batch_bytes
+        && (!normalized.spill_directory || control))
+        return EINVAL;
     if ((control || normalized.spill_directory)
         && !backend->session_create_with_options)
         return ENOTSUP;
