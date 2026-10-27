@@ -931,6 +931,194 @@ parsed_chain(void)
     }
 }
 
+extern bool wl_columnar_join_test_retain_spilled_sources;
+extern void (*wl_columnar_join_test_spill_producer_result)(
+    wl_columnar_spill_status_t);
+static unsigned reclaim_producers, reclaim_transfers;
+static uint64_t reclaim_identity, reclaim_released, reclaim_before,
+    reclaim_after;
+static wl_columnar_spill_status_t reclaim_producer_status;
+static void
+reclaim_producer(wl_columnar_spill_status_t status)
+{
+    reclaim_producers++;
+    reclaim_producer_status = status;
+}
+static void
+reclaim_source(col_rel_t *source)
+{
+    CHECK(source->nrows == 8192 && source->ncols >= 3);
+    reclaim_identity = source->relation_identity;
+}
+static void
+reclaim_retired(uint64_t identity, uint64_t released, uint64_t before,
+    uint64_t after)
+{
+    CHECK(identity == reclaim_identity &&
+        released >= 8192 * 3 * sizeof(int64_t));
+    CHECK(after < before && before - after < released);
+    reclaim_transfers++; reclaim_released = released;
+    reclaim_before = before; reclaim_after = after;
+}
+static void
+reclaim_reset(void)
+{
+    reclaim_producers = reclaim_transfers = 0;
+    reclaim_identity = reclaim_released = reclaim_before = reclaim_after = 0;
+    reclaim_producer_status = WL_COLUMNAR_SPILL_OK;
+    budget_peak = 0;
+}
+
+static fixture_t
+reclaim_fixture(uint64_t allowance)
+{
+    fixture_t f = {0};
+    wirelog_error_t error;
+    f.program = wirelog_parse_string(
+        ".decl a(k: int64, v: int64)\n.decl b(k: int64, v: int64)\n"
+        ".decl c(k: int64, v: int64)\n"
+        ".decl result(k: int64, x: int64, y: int64, z: int64)\n"
+        "result(k,x,y,z) :- a(k,x), b(k,y), c(y,z).\n", &error);
+    CHECK(f.program && wl_plan_from_program(f.program, &f.plan) == 0);
+    unsigned joins = 0;
+    for (uint32_t i = 0; i < f.plan->stratum_count; i++)
+        for (uint32_t j = 0; j < f.plan->strata[i].relation_count; j++)
+            for (uint32_t k = 0; k < f.plan->strata[i].relations[j].op_count;
+                k++)
+                joins += f.plan->strata[i].relations[j].ops[k].op ==
+                    WL_PLAN_OP_JOIN;
+    CHECK(joins == 2);
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = allowance, .usable_bytes = allowance,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV, .status = WL_COLUMNAR_MEMORY_OK
+    };
+    f.governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f.governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.memory_governor = f.governor;
+    options.spill_directory = test_tmpdir();
+    options.spill_quota_bytes = 8 * 1024 * 1024;
+    options.spill_max_row_bytes = 64;
+    options.spill_join_batch_bytes = 1024;
+    options.spill_join_index_bytes = 512 * 1024;
+    CHECK(wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+        &options, &f.session) == 0);
+    CHECK(wl_session_load_facts(f.session, f.program) == 0);
+    for (int64_t i = 0; i < 128; i++) {
+        int64_t row[] = {i % 2, i};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        row[1] += 100;
+        CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+    }
+    /* Host staging is outside the managed-memory claim and freed before STEP. */
+    int64_t *rows = malloc(32768 * 2 * sizeof(*rows));
+    CHECK(rows);
+    for (int64_t i = 0; i < 32768; i++) {
+        rows[2 * i] = i ? i + 10000 : 100;
+        rows[2 * i + 1] = i + 500;
+    }
+    CHECK(wl_session_insert(f.session, "c", rows, 32768, 2) == 0);
+    free(rows);
+    return f;
+}
+
+typedef struct { bool seen[128]; unsigned count; } reclaim_events_t;
+static void
+reclaim_observe(const char *name, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *context)
+{
+    reclaim_events_t *events = context;
+    CHECK(strcmp(name, "result") == 0 && ncols == 4 && diff == 1);
+    CHECK(row[0] == 0 && row[1] >= 0 && row[1] < 128 && row[1] % 2 == 0 &&
+        row[2] == 100 && row[3] == 500 && !events->seen[row[1]]);
+    events->seen[row[1]] = true; events->count++;
+}
+static void
+reclaim_contents(fixture_t *f)
+{
+    col_rel_t *out = session_find_rel(COL_SESSION(f->session), "result");
+    CHECK(out && out->nrows == 64 && out->ncols == 4);
+    reclaim_events_t events = {0};
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        int64_t row[] = {out->columns[0][i], out->columns[1][i],
+                         out->columns[2][i], out->columns[3][i]};
+        reclaim_observe("result", row, 4, 1, &events);
+    }
+    CHECK(events.count == 64);
+}
+
+static void
+fixed_budget_reclamation(void)
+{
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    wl_columnar_join_test_before_spill_take = reclaim_source;
+    wl_columnar_join_test_after_spill_take = reclaim_retired;
+    wl_columnar_join_test_spill_producer_result = reclaim_producer;
+    reclaim_reset();
+    fixture_t calibration = reclaim_fixture(8 * 1024 * 1024);
+    uint64_t preparation = budget_peak;
+    reclaim_events_t events = {0};
+    wl_session_set_delta_cb(calibration.session, reclaim_observe, &events);
+    CHECK(wl_session_step(calibration.session) == 0 && events.count == 64);
+    CHECK(reclaim_transfers == 1 && reclaim_producers == 2);
+    reclaim_contents(&calibration);
+    uint64_t allowance = budget_peak, released = reclaim_released;
+    destroy(&calibration);
+    CHECK(allowance > preparation && released);
+    /* Identical query, index/window caps and allowance. The only difference
+     * is whether the intermediate remains resident through the second JOIN. */
+    for (unsigned retain = 0; retain < 2; retain++) {
+        reclaim_reset();
+        wl_columnar_join_test_retain_spilled_sources = retain != 0;
+        fixture_t f = reclaim_fixture(allowance);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        events = (reclaim_events_t){0};
+        wl_session_set_delta_cb(f.session, reclaim_observe, &events);
+        int rc = wl_session_step(f.session);
+        CHECK(budget_peak <= allowance && s->spill_join_selected_count == 2);
+        CHECK(s->arr_count == 0 && reclaim_producers == 2);
+        if (!retain) {
+            CHECK(rc == 0 && events.count == 64 && reclaim_transfers == 1);
+            CHECK(reclaim_released == released &&
+                reclaim_after < reclaim_before);
+            CHECK(reclaim_producer_status == WL_COLUMNAR_SPILL_OK);
+            reclaim_contents(&f);
+        } else {
+            CHECK(rc == ENOSPC && wl_session_budget_denied(f.session));
+            CHECK(reclaim_producer_status == WL_COLUMNAR_SPILL_MEMORY);
+            CHECK(events.count == 0 && reclaim_transfers == 0);
+        }
+        CHECK(session_find_rel(s, "a")->nrows == 128 &&
+            session_find_rel(s, "b")->nrows == 128 &&
+            session_find_rel(s, "c")->nrows == 32768);
+        CHECK(wl_columnar_spill_store_bytes(s->spill_store) == 0);
+        destroy(&f);
+    }
+    wl_columnar_join_test_retain_spilled_sources = false;
+    /* Input preparation still fits, but the intermediate/transition/output
+     * floor cannot be supplied. Failed STEP must not publish a partial result. */
+    CHECK(allowance > released / 2 && allowance - released / 2 > preparation);
+    uint64_t floor = allowance - released / 2;
+    reclaim_reset();
+    fixture_t f = reclaim_fixture(floor);
+    events = (reclaim_events_t){0};
+    wl_session_set_delta_cb(f.session, reclaim_observe, &events);
+    CHECK(wl_session_step(f.session) == ENOSPC &&
+        wl_session_budget_denied(f.session));
+    CHECK(COL_SESSION(f.session)->spill_join_selected_count > 0 &&
+        events.count == 0);
+    CHECK(budget_peak <= floor &&
+        wl_columnar_spill_store_bytes(COL_SESSION(f.session)->spill_store) ==
+        0);
+    destroy(&f);
+    wl_columnar_memory_governor_test_admitted = NULL;
+    wl_columnar_join_test_before_spill_take = NULL;
+    wl_columnar_join_test_after_spill_take = NULL;
+    wl_columnar_join_test_spill_producer_result = NULL;
+}
+
 int
 main(void)
 {
@@ -946,6 +1134,7 @@ main(void)
         if (enabled) CHECK(s->arr_count == 0);
         destroy(&f);
     }
+    fixed_budget_reclamation();
     owned_left_transfer();
     parsed_chain();
     fixed_budget();

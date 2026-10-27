@@ -40,6 +40,9 @@
 bool wl_columnar_join_test_enable_semijoin_timestamps;
 #endif
 #ifdef WL_TEST_JOIN_CACHE_HOOK
+/* Comparison policy only: retain sources through normal end-of-JOIN cleanup. */
+bool wl_columnar_join_test_retain_spilled_sources;
+void (*wl_columnar_join_test_spill_producer_result)(wl_columnar_spill_status_t);
 void (*wl_columnar_join_test_before_spill_take)(col_rel_t *);
 void (*wl_columnar_join_test_after_spill_take)(uint64_t, uint64_t, uint64_t,
     uint64_t);
@@ -1401,6 +1404,10 @@ wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         right->memory_governor == sess->memory_governor &&
         wl_columnar_batch_payload_can_take(right)
     };
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    if (wl_columnar_join_test_retain_spilled_sources)
+        take[0] = take[1] = false;
+#endif
     int rc = 0;
     *out = NULL;
     sess->spill_join_selected_count++;
@@ -1448,13 +1455,17 @@ wl_columnar_join_spill_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         if (rc != 0)
             goto done;
     }
-    rc = wl_columnar_join_spill_error(sess,
-            wl_columnar_payload_join_create_projected_bounded(
-                sess->memory_governor,
-                inputs[0], inputs[1], lk, rk, op->project_indices,
-                op->project_indices ? op->project_count : 0,
-                sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
-                NULL, NULL, &cont));
+    wl_columnar_spill_status_t producer_status =
+        wl_columnar_payload_join_create_projected_bounded(sess->memory_governor,
+            inputs[0], inputs[1], lk, rk, op->project_indices,
+            op->project_indices ? op->project_count : 0,
+            sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
+            NULL, NULL, &cont);
+#ifdef WL_TEST_JOIN_CACHE_HOOK
+    if (wl_columnar_join_test_spill_producer_result)
+        wl_columnar_join_test_spill_producer_result(producer_status);
+#endif
+    rc = wl_columnar_join_spill_error(sess, producer_status);
     if (rc != 0)
         goto done;
     rc = wl_columnar_join_spill_drain(sess, cont, *out);
