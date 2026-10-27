@@ -904,6 +904,162 @@ edge_parities(void)
     }
 }
 
+static uint64_t prefix_visits, suffix_visits, merge_visits, prefix_anchor;
+static uint32_t first_suffix;
+static void
+incremental_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase == 208) ++prefix_visits;
+    if (phase == 204) {
+        if (!suffix_visits) first_suffix = (uint32_t)progress;
+        ++suffix_visits;
+    }
+    if (phase == 209) ++merge_visits;
+    checkpoint(control, phase, progress);
+}
+
+static void
+incremental_prefix_boundary(void)
+{
+    /* After the empirical setup anchor, each one-column discovery comparison
+     * costs 128 traversal + 128 compare entry + 128 cell + 128 decision.
+     * The target budget is derived from those source fees, not total runtime. */
+    col_rel_t *input = source_new(1, 9, 2, false);
+    for (unsigned trial = 0; trial < 4; ++trial) {
+        uint64_t limit = trial >=
+            2 ? prefix_anchor + 2 * 512 - (trial == 3) : 0;
+        host_t *host = host_new(input, false, limit, 0);
+        host->session->diff_enabled = true;
+        prefix_visits = 0; hook_hit = false; restart_hook = false;
+        target_phase = 208;
+        target_progress = trial == 0 ? 1 : trial == 1 ? 3 : UINT64_MAX;
+        wl_columnar_filter_test_attempt_checkpoint = incremental_checkpoint;
+        host_run(host);
+        wl_columnar_filter_test_attempt_checkpoint = NULL;
+        CHECK(host->status.semantic_result == (trial >= 2
+            ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(prefix_visits == (trial == 0 ? 1 : trial == 3 ? 2 : 3));
+        uint64_t consumed = host_finish(host).consumed;
+        if (!trial) prefix_anchor = consumed;
+        if (trial == 1) CHECK(consumed == prefix_anchor + 2 * 512);
+    }
+    col_rel_destroy(input);
+    input = source_new(1, 2, 0, true);
+    input->columns[0][1] = wl_columnar_float_to_bits(NAN);
+    host_t *host = host_new(input, false, 0, 0);
+    host->session->diff_enabled = true;
+    prefix_visits = 0; hook_hit = true;
+    wl_columnar_filter_test_attempt_checkpoint = incremental_checkpoint;
+    host_run(host);
+    wl_columnar_filter_test_attempt_checkpoint = NULL;
+    CHECK(host->status.semantic_result == EINVAL && !prefix_visits);
+    (void)host_finish(host); col_rel_destroy(input);
+}
+
+static void
+incremental_prefixes(void)
+{
+    /* Includes equal boundaries, inversions, suffix-before-prefix, wide keys,
+     * empty/nullary inputs, signed zeros and fully ordered inputs. */
+    static const int64_t values[][9] = {
+        {1, 2, 3, 4, 5, 6, 7, 8, 9},
+        {1, 2, 3, 3, 0, -1, 5, 2, 4},
+        {9, 8, 7, 6, 5, 4, 3, 2, 1},
+        {2, 2, 2, 2, 2, 2, 2, 2, 2},
+        {-3, -2, -1, 0, 0, 2, 1, 0, -2},
+    };
+    for (unsigned shape = 0; shape < 5; ++shape)
+        for (unsigned width_case = 0; width_case < 4; ++width_case)
+            for (unsigned empty = 0; empty < 2; ++empty) {
+                uint32_t width = width_case == 0 ? 0
+                    : width_case == 1 ? 1 : 17;
+                bool typed = width_case == 3;
+                uint32_t rows = empty ? 0 : 9;
+                col_rel_t *input = source_new(width, rows, 0, typed);
+                col_rel_t *twin = source_new(width, rows, 0, typed);
+                for (uint32_t row = 0; row < rows; ++row)
+                    if (width) {
+                        int64_t value = values[shape][row];
+                        if (typed) value = wl_columnar_float_to_bits(
+                                value ? (double)value : row % 2 ? -0.0 : 0.0);
+                        input->columns[width - 1][row] = value;
+                        twin->columns[width - 1][row] = value;
+                    }
+                /* Cache metadata is deliberately unusable: ordering must be
+                 * discovered from the leased values without changing it. */
+                input->sorted_nrows = rows + 11;
+                uint64_t generation = input->storage_generation;
+                host_t *host = host_new(input, false, 0, 0);
+                host->session->diff_enabled = true;
+                prefix_visits = suffix_visits = merge_visits = 0;
+                hook_hit = true;
+                wl_columnar_filter_test_attempt_checkpoint =
+                    incremental_checkpoint;
+                host_run(host);
+                wl_columnar_filter_test_attempt_checkpoint = NULL;
+                CHECK(!host->status.semantic_result);
+                eval_stack_t raw = {0};
+                CHECK(!eval_stack_push(&raw, twin, true));
+                wl_col_session_t *reference = calloc(1, sizeof(*reference));
+                CHECK(reference);
+                wl_mem_ledger_init(&reference->mem_ledger, 0);
+                CHECK(!col_op_consolidate(&raw, reference));
+                relations_equal(wl_columnar_eval_stack_cleanup_stack(
+                        host->frame)->items[0].rel, raw.items[0].rel);
+                CHECK(input->sorted_nrows == rows + 11
+                    && input->storage_generation == generation);
+                if (!empty && width && shape == 0)
+                    CHECK(prefix_visits == 8 && !suffix_visits &&
+                        !merge_visits);
+                if (!empty && width && shape == 1)
+                    CHECK(prefix_visits == 3 && suffix_visits
+                        && first_suffix == 3 && merge_visits == rows);
+                (void)host_finish(host);
+                col_rel_destroy(input); CHECK(!eval_stack_drain(&raw));
+                free(reference);
+            }
+
+    static const unsigned phases[] = {208, 204, 209, 207};
+    for (unsigned stop = 0; stop < 4; ++stop) {
+        col_rel_t *input = source_new(1, 9, 0, false);
+        for (uint32_t row = 0; row < 9; ++row)
+            input->columns[0][row] = values[1][row];
+        uint64_t generation = input->storage_generation;
+        host_t *host = host_new(input, false, 0, 0);
+        host->session->diff_enabled = true;
+        target_phase = phases[stop];
+        target_progress = target_phase == 208 ? 1 : target_phase == 204 ? 3 : 0;
+        hook_hit = restart_hook = false;
+        wl_columnar_filter_test_attempt_checkpoint = incremental_checkpoint;
+        host_run(host);
+        wl_columnar_filter_test_attempt_checkpoint = NULL;
+        CHECK(hook_hit &&
+            host->status.semantic_result == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(!host->status.committed &&
+            input->storage_generation == generation);
+        CHECK(wl_columnar_eval_stack_cleanup_stack(host->frame)->items[0].rel ==
+            input);
+        (void)host_finish(host);
+        /* Retry the unchanged source after all private owners are drained. */
+        host = host_new(input, false, 0, 0);
+        host->session->diff_enabled = true;
+        host_run(host); CHECK(!host->status.semantic_result);
+        uint64_t exact = host_finish(host).consumed;
+        for (unsigned shorter = 0; shorter < 2; ++shorter) {
+            host = host_new(input, false, exact - shorter, 0);
+            host->session->diff_enabled = true;
+            host_run(host);
+            CHECK(host->status.semantic_result == (shorter
+                ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+            CHECK(host->status.committed == !shorter);
+            (void)host_finish(host);
+        }
+        col_rel_destroy(input);
+    }
+}
+
 int
 main(void)
 {
@@ -915,6 +1071,7 @@ main(void)
                 for (unsigned typed = 0; typed < 2; ++typed)
                     CHECK(parity(widths[w], rows[r], pattern, typed)
                         == parity(widths[w], rows[r], pattern, typed));
+    incremental_prefixes(); incremental_prefix_boundary();
     negative_cases(); interruptions(); budgets_and_allocation();
     allocation_ordinals(); retained_input(); governed_cases();
     generated_union();

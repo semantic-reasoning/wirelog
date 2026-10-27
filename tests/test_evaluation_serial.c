@@ -2152,6 +2152,9 @@ controlled_recursive_session(const int64_t *edges, uint32_t edge_count,
     wl_session_t *session = NULL;
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
         &options, &session));
+    /* These source-fixed tariffs certify the legacy full-sort route. The
+     * prefix-discovery route has separate boundary and STEP qualification. */
+    ((wl_col_session_t *)session)->diff_enabled = false;
     CHECK(!wl_session_insert(session, "edge", edges, edge_count, 2));
     *plan_out = plan;
     *program_out = program;
@@ -2182,6 +2185,9 @@ controlled_recursive_two_join_session(const int64_t *edges,
     wl_session_t *session = NULL;
     CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
         &options, &session));
+    /* These source-fixed tariffs certify the legacy full-sort route. The
+     * prefix-discovery route has separate boundary and STEP qualification. */
+    ((wl_col_session_t *)session)->diff_enabled = false;
     CHECK(!wl_session_insert(session, "edge", edges, edge_count, 2));
     *plan_out = plan;
     *program_out = program;
