@@ -5,12 +5,12 @@ name: CI PR
 # Execution flow:
 #   rc-changelog-freeze
 #   └─ lint
-#      ├─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
-#      │  ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681) ──┐
-#      │  └─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix
-#      └─ sanitizer-matrix
-#         ├─ tsan
-#         └─ tsan-native
+#      ├─ tsan-native (ubuntu-latest gcc, advisory compile smoke)
+#      │  └─ sanitizer-matrix (multi-OS ASan/UBSan)
+#      └─ tsan (ubuntu-latest gcc+clang, gating TSan)
+#         └─ build-primary (ubuntu-latest gcc, SBOM/size/path-a gates)
+#            ├─ build-arm (ubuntu-24.04-arm gcc, ABI #681) ──┐
+#            └─ build-mbedtls (ubuntu-latest gcc, crypto) ──┼─ build-matrix
 #
 # CodeQL runs in its own workflow (GitHub default-setup); not invoked from here.
 
@@ -134,11 +134,12 @@ jobs:
   # ==========================================================================
   # Phase 2a: Build Primary (ubuntu-latest + gcc)
   # Fast-path job that gates critical checks: SBOM, binary size, Path A example.
-  # This completes first and unblocks downstream validation.
+  # Gated on the tsan leg; the first build to run and unblocks build-arm,
+  # build-mbedtls, and build-matrix.
   # ==========================================================================
   build-primary:
     name: Build / ubuntu-latest / gcc
-    needs: [lint, build-scope]
+    needs: [tsan, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
     strategy:
@@ -567,13 +568,14 @@ jobs:
         run: scripts/ci/test-mbedtls-prefix.sh
 
   # ==========================================================================
-  # Phase: Sanitizer Matrix (starts after lint, parallel with build-primary)
-  # ASan + UBSan validation; runs in parallel with build-matrix.
+  # Phase: Sanitizer Matrix (starts after tsan-native)
+  # ASan + UBSan validation; runs after the tsan-native advisory leg and
+  # parallel with the build chain that follows the tsan leg.
   # Linux: GCC + Clang + ARM64 GCC; macOS: Clang
   # ==========================================================================
   sanitizer-matrix:
     name: Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}
-    needs: [lint, build-scope]
+    needs: [tsan-native, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -658,15 +660,15 @@ jobs:
 
   # ==========================================================================
   # Phase 3b: TSan
-  # Runs after sanitizer-matrix to keep sanitizer coverage ahead of all
-  # TSan-instrumented jobs when PR runner capacity is constrained.
+  # Runs right after lint, in parallel with tsan-native; the build chain is
+  # gated on it so the gating TSan leg lands before the plain builds.
   # TSan forces POSIX pthreads via -Dthreads=posix.
   # TSan only intercepts pthread calls; C11 <threads.h> functions
   # (thrd_create, mtx_lock) are uninstrumented and cause false SEGV.
   # ==========================================================================
   tsan:
     name: TSan / ubuntu-latest / ${{ matrix.compiler }}
-    needs: [sanitizer-matrix, build-scope]
+    needs: [lint, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
     strategy:
@@ -718,8 +720,8 @@ jobs:
 
   # ==========================================================================
   # Phase 3b (advisory): TSan compile smoke with -Dthreads=native
-  # Runs after sanitizer-matrix for the same runner-pressure ordering as the
-  # gating TSan leg while preserving its advisory compile-smoke semantics.
+  # Runs right after lint, in parallel with the gating tsan leg, preserving
+  # its advisory compile-smoke semantics while sanitizer-matrix follows it.
   #
   # WHY THIS LEG EXISTS:
   #   The normal TSan job above forces -Dthreads=posix because libtsan's
@@ -745,7 +747,7 @@ jobs:
   # ==========================================================================
   tsan-native:
     name: TSan-native / ubuntu-latest / gcc
-    needs: [sanitizer-matrix, build-scope]
+    needs: [lint, build-scope]
     if: ${{ needs.build-scope.outputs.build-required == 'true' }}
     runs-on: ubuntu-latest
 

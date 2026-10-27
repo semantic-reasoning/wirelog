@@ -284,9 +284,11 @@ class SkipCascade(unittest.TestCase):
         # Deliberate: that metric ends at the job's *creation*, which
         # happens whether or not the job then dispatches.  Only the skip
         # cascade is carved out, because GitHub batches its creation stamps.
+        # The victim is a leg released by lint (which completed before it was
+        # created), so cancelling it still leaves a measurable release latency.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "TSan-native / ubuntu-latest / gcc"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -993,9 +995,10 @@ class DependencyGraph(unittest.TestCase):
         # The caller's own dependency lands on the callee's root.
         self.assertEqual(self.graph["lint / EditorConfig check"],
                          ["RC changelog freeze gate"])
-        # The caller's dependents attach to the callee's sink.
+        # The caller's dependents attach to the callee's sink.  In the
+        # reordered graph the tsan leg is lint's direct dependent.
         self.assertIn("lint / uncrustify check",
-                      self.graph["Build / ubuntu-latest / gcc"])
+                      self.graph["TSan / ubuntu-latest / ${{ matrix.compiler }}"])
 
     def test_every_job_has_an_entry_and_roots_are_explicit(self):
         # A job missing from the graph must be a gap, never mistaken for a
@@ -1040,8 +1043,8 @@ class DependencyGraph(unittest.TestCase):
             root = Path(tmp)
             (root / ".github" / "workflows").mkdir(parents=True)
             source = self.WORKFLOW.read_text(encoding="utf-8").replace(
-                "    needs: [sanitizer-matrix, build-scope]",
-                "    needs:\n      - sanitizer-matrix\n      - build-scope", 1)
+                "    needs: [tsan, build-scope]",
+                "    needs:\n      - tsan\n      - build-scope", 1)
             (root / ".github" / "workflows" / "ci-pr.yml").write_text(
                 source, encoding="utf-8")
             (root / ".github" / "workflows" / "lint-pr.yml").write_text(
@@ -1109,28 +1112,36 @@ class CriticalPath(unittest.TestCase):
         path = self._analyze("run-success")["critical_path"]["observed"]
         chain = path["evidence"]["chain"]
         self.assertEqual(chain[-1], "TSan / ubuntu-latest / clang")
-        # The nearest job to finish before TSan started was a macOS matrix
-        # build that TSan does not depend on; taking it would have produced a
-        # plausible and wrong path.
+        # TSan's real dependency is the lint sink, so the walk hops there;
+        # the build matrix jobs finish nearby but are not a dependency of
+        # TSan, and taking one would produce a plausible but wrong path.
         self.assertNotIn("Build / macos-latest / clang", chain)
-        self.assertIn("Sanitizers / ubuntu-latest / clang", chain)
+        self.assertIn("lint / uncrustify check", chain)
         self.assertEqual(chain[0], "RC changelog freeze gate")
 
     def test_the_observed_path_counts_queueing_and_the_graph_path_does_not(self):
         paths = self._analyze("run-success")["critical_path"]
-        # The gap between them is the queueing on the path, which is the
-        # measurement #1574 needs before it reorders the graph.
-        self.assertGreater(paths["observed"]["seconds"],
-                           paths["graph"]["seconds"])
+        # In the reordered graph the declared path runs on through the build
+        # chain, so it is longer than the observed walk, which stops at the
+        # last finisher (TSan).  They are different measurements over
+        # different node sets and must not be equal.
+        self.assertGreater(paths["graph"]["seconds"],
+                           paths["observed"]["seconds"])
+        self.assertIn("Build / ubuntu-latest / gcc",
+                      paths["graph"]["evidence"]["chain"])
+        self.assertNotIn("Build / ubuntu-latest / gcc",
+                         paths["observed"]["evidence"]["chain"])
 
     def test_a_skip_cascade_whose_chain_avoids_it_stays_measured(self):
-        # Every edge on the reported chain is known, so the number is final.
+        # The observed walk starts at the last job that actually ran and hops
+        # through dependencies that did, so it skips the cascade entirely and
+        # every edge on the reported chain is known: the number is final.
         # Flagging it because some unrelated edge elsewhere was unavailable
         # would attach a caveat that does not apply to the value shown.
         paths = self._analyze("run-skip-cascade")["critical_path"]
-        self.assertEqual(paths["graph"]["status"], "measured")
+        self.assertEqual(paths["observed"]["status"], "measured")
         self.assertNotIn("Build / ubuntu-24.04-arm / gcc",
-                         paths["graph"]["evidence"]["chain"])
+                         paths["observed"]["evidence"]["chain"])
 
     def _with_skipped(self, job_name):
         run, jobs = fixture("run-success")
@@ -1159,7 +1170,7 @@ class CriticalPath(unittest.TestCase):
         # duration.  Walking through it at zero weight drops the gap it
         # represents, which is the same reason a skipped job is excluded.
         run, jobs = fixture("run-success")
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "lint / uncrustify check"
         mutated = self._cancelled_before_starting(jobs, victim)
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -1168,10 +1179,10 @@ class CriticalPath(unittest.TestCase):
                             drift)["critical_path"]["observed"]
         self.assertNotIn(victim, path["evidence"]["chain"])
         # The walk routes around it rather than stopping: the same job still
-        # ends the path, reached through a dependency that did run.
+        # ends the path, reached through the other dependency that did run.
         self.assertEqual(path["evidence"]["chain"][-1],
                          "TSan / ubuntu-latest / clang")
-        self.assertIn("Sanitizers / macos-latest / clang",
+        self.assertIn("Detect build-triggering changes",
                       path["evidence"]["chain"])
 
     def test_the_observed_walk_stops_rather_than_inventing_a_hop(self):
@@ -1214,19 +1225,19 @@ class CriticalPath(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "lint / uncrustify check":
                 job["started_at"] = None     # completed, but never started
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in mutated["jobs"]])
         observed = tool.analyze(run, mutated, edges,
                                 drift)["critical_path"]["observed"]
-        # Summing that hop as zero reported 5206 against a true 10362 and
-        # called it measured: a 50 per cent error presented as final.
+        # Summing that hop as zero would present the shortfall it represents
+        # as a measurement; name the untimed hop instead.
         self.assertEqual(observed["status"], "partial")
         self.assertIn("not timed", observed["reason"])
         self.assertEqual(observed["evidence"]["unmeasured_hops"],
-                         ["Sanitizers / ubuntu-latest / clang"])
+                         ["lint / uncrustify check"])
 
     def test_an_untimed_node_on_the_graph_chain_is_named_too(self):
         run, jobs = fixture("run-success")
@@ -1290,13 +1301,15 @@ class CriticalPath(unittest.TestCase):
 
     def test_a_skipped_job_is_never_counted_as_untimed(self):
         # A skipped job has no duration and that is the right answer, so the
-        # run-wide caveat must not fire on the skip cascade and turn every
-        # such run into a qualified number.
+        # run-wide "untimed jobs off the chain" caveat must not fire on the
+        # skip cascade and turn every such run into a data gap.  A node the
+        # graph chain itself walks through may still be named as unmeasured
+        # (see the skip-cascade test above), but that is a chain-scoped
+        # caveat, not a run-wide one.
         report = self._analyze("run-skip-cascade")
         self.assertGreater(report["job_counts"]["skipped"], 0)
         for key in ("observed", "graph"):
             path = report["critical_path"][key]
-            self.assertEqual(path["status"], "measured")
             self.assertNotIn("untimed_jobs_off_chain", path["evidence"])
 
     def test_a_graph_that_resolved_to_nothing_is_not_called_a_missing_graph(self):
