@@ -6559,7 +6559,7 @@ test('session_spill', test_session_spill_exe, suite: ['unit', 'tsan'], timeout: 
 # Actual evaluator routing with deterministic spill I/O faults.
 test_join_spill_exe = executable(
   'test_join_spill', files('test_join_spill.c', '../wirelog/columnar/spill.c'),
-  c_args: ['-DWL_TEST_SPILL=1'],
+  c_args: ['-DWL_TEST_SPILL=1', '-DWL_SESSION_TEST_HOOKS=1'],
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   link_with: [testlib_prod],

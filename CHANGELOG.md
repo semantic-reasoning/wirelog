@@ -8,8 +8,12 @@ All notable changes to wirelog are documented in this file.
 
 - **Opt-in spilled evaluator JOIN** (#1372): internal session options can
   route eligible serial numeric JOINs through ephemeral disk snapshots and
-  a capped window index before resident arrangement construction. Inputs and
-  final output remain resident; unsupported shapes keep their existing paths.
+  a capped window index before resident arrangement construction. Natural
+  projected rules and precomputed right filters are supported, with projected
+  batch storage and governed projection ownership. Paired actual-session tests
+  show exact completion under a fixed allowance that refuses the resident
+  index, including resident filter storage. Inputs, filters and final output
+  remain resident; unsupported shapes keep their existing paths.
 
 - **`subprojects_ignored` gate** (#1814):
   `scripts/ci/check-subprojects-ignored.sh`, registered as `meson test

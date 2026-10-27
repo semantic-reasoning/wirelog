@@ -222,6 +222,12 @@ arr_ledger_bytes(const col_arrangement_t *arr)
     return (uint64_t)bytes;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Serial test observation only; never changes admission or failure handling. */
+void (*wl_columnar_arrangement_test_reserve_denied)(
+    wl_columnar_memory_governor_t *, uint64_t, uint64_t);
+#endif
+
 static bool
 arr_reserve_bytes(col_arrangement_t *arr, uint64_t bytes,
     wl_columnar_memory_reservation_t *pending)
@@ -234,8 +240,13 @@ arr_reserve_bytes(col_arrangement_t *arr, uint64_t bytes,
     if (!governor)
         return true;
     wl_columnar_memory_reservation_init(pending);
-    if (!wl_columnar_memory_reserve(governor, bytes, pending)
-        || !wl_columnar_memory_commit(pending, arr)) {
+    bool admitted = wl_columnar_memory_reserve(governor, bytes, pending);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!admitted && wl_columnar_arrangement_test_reserve_denied)
+        wl_columnar_arrangement_test_reserve_denied(governor, bytes,
+            wl_columnar_memory_reserved(governor));
+#endif
+    if (!admitted || !wl_columnar_memory_commit(pending, arr)) {
         (void)wl_columnar_memory_release(pending);
         return false;
     }

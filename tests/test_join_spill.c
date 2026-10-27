@@ -508,6 +508,233 @@ static void owned_filters(void)
     }
 }
 
+/* Calibrate on a separate fresh session; proof sessions never change budget. */
+static uint64_t budget_peak, denied_request, denied_reserved;
+static wl_columnar_memory_governor_t *denied_governor;
+static void
+budget_admitted(wl_columnar_memory_governor_t *g, uint64_t total)
+{
+    (void)g;
+    if (total > budget_peak) budget_peak = total;
+}
+static void
+budget_denied(wl_columnar_memory_governor_t *g, uint64_t bytes, uint64_t total)
+{
+    denied_governor = g;
+    denied_request = bytes;
+    denied_reserved = total;
+}
+
+static fixture_t
+budget_fixture(bool enabled, bool filtered, uint64_t allowance)
+{
+    fixture_t f = {0};
+    wirelog_error_t error;
+    f.program = wirelog_parse_string(filtered ?
+            ".decl a(k: int64, v: int64)\n.decl b(k: int64, v: int64)\n"
+            ".decl result(k: int64, x: int64, y: int64)\n"
+            "result(k,x,y) :- a(k,x), b(k,y), y = 100.\n" :
+            ".decl a(k: int64, v: int64)\n.decl b(k: int64, v: int64)\n"
+            ".decl result(k: int64, x: int64, y: int64)\n"
+            "result(k,x,y) :- a(k,x), b(k,y).\n", &error);
+    CHECK(f.program && wl_plan_from_program(f.program, &f.plan) == 0);
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = allowance, .usable_bytes = allowance,
+        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+        .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+        .status = WL_COLUMNAR_MEMORY_OK
+    };
+    f.governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f.governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.memory_governor = f.governor;
+    options.spill_directory = test_tmpdir();
+    options.spill_quota_bytes = 1024 * 1024;
+    options.spill_max_row_bytes = 64;
+    if (enabled) {
+        options.spill_join_batch_bytes = 96;
+        options.spill_join_index_bytes =
+            sizeof(wl_columnar_memory_reservation_t) + 16;
+    }
+    CHECK(wl_session_create_with_options(wl_backend_columnar(), f.plan, 1,
+        &options, &f.session) == 0);
+    CHECK(wl_session_load_facts(f.session, f.program) == 0);
+    int64_t *rows = malloc(4096 * 2 * sizeof(*rows));
+    CHECK(rows);
+    for (int64_t i = 0; i < 4096; i++) {
+        rows[2 * i] = i;
+        rows[2 * i + 1] = 100;
+        if (i == 0 || i == 2048 || i == 4095) {
+            int64_t row[] = {i, i + 10};
+            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        }
+    }
+    CHECK(wl_session_insert(f.session, "b", rows, 4096, 2) == 0);
+    free(rows);
+    wl_plan_op_t *op = planned_join(&f);
+    CHECK(op && (filtered ? op->right_filter_expr.size != 0 :
+        op->project_count == 3));
+    return f;
+}
+
+static void
+budget_observe(const char *name, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *context)
+{
+    unsigned *seen = context;
+    CHECK(strcmp(name, "result") == 0 && ncols == 3 && diff == 1);
+    unsigned bit = row[0] == 0 ? 1 : row[0] == 2048 ? 2 :
+        row[0] == 4095 ? 4 : 0;
+    CHECK(bit && !(*seen & bit));
+    CHECK(row[1] == row[0] + 10 && row[2] == 100);
+    *seen |= bit;
+}
+
+static void
+budget_contents(fixture_t *f)
+{
+    wl_col_session_t *s = COL_SESSION(f->session);
+    col_rel_t *out = session_find_rel(s, "result");
+    unsigned seen = 0;
+    CHECK(out && out->nrows == 3 && out->ncols == 3);
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        int64_t row[] = {out->columns[0][i], out->columns[1][i],
+                         out->columns[2][i]};
+        budget_observe("result", row, 3, 1, &seen);
+    }
+    CHECK(seen == 7);
+}
+
+static void
+fixed_budget(void)
+{
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    wl_columnar_arrangement_test_reserve_denied = budget_denied;
+    for (unsigned filtered = 0; filtered < 2; filtered++) {
+        budget_peak = 0;
+        fixture_t calibration = budget_fixture(true, filtered, 4 * 1024 * 1024);
+        uint64_t preparation_peak = budget_peak;
+        unsigned calibration_seen = 0;
+        wl_session_set_delta_cb(calibration.session, budget_observe,
+            &calibration_seen);
+        CHECK(wl_session_step(calibration.session) == 0);
+        budget_contents(&calibration);
+        uint64_t allowance = budget_peak;
+        destroy(&calibration);
+        CHECK(allowance > preparation_peak);
+        for (unsigned enabled = 0; enabled < 2; enabled++) {
+            budget_peak = denied_request = denied_reserved = 0;
+            denied_governor = NULL;
+            fixture_t f = budget_fixture(enabled, filtered, allowance);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            unsigned observed = 0;
+            wl_session_set_delta_cb(f.session, budget_observe, &observed);
+            int rc = wl_session_step(f.session);
+            CHECK(budget_peak <= allowance);
+            if (enabled) {
+                CHECK(rc == 0 && observed == 7);
+                CHECK(s->spill_join_selected_count == 1 && s->arr_count == 0);
+                CHECK(denied_request == 0);
+                budget_contents(&f);
+            } else {
+                CHECK(rc != 0 && observed == 0);
+                CHECK(s->spill_join_selected_count == 0);
+                CHECK(denied_governor ==
+                    wl_columnar_memory_governor_ref_get(f.governor));
+                /* 4096 rows require 8192 buckets and 4096 row links. */
+                CHECK(denied_request == 8192 * sizeof(uint64_t) +
+                    4096 * sizeof(uint32_t));
+                CHECK(denied_reserved <= allowance &&
+                    denied_request > allowance - denied_reserved);
+            }
+            CHECK(session_find_rel(s, "a")->nrows == 3);
+            CHECK(session_find_rel(s, "b")->nrows == 4096);
+            CHECK(wl_columnar_spill_store_bytes(s->spill_store) == 0);
+            destroy(&f);
+        }
+        if (!filtered) {
+            uint64_t floor = 0;
+            for (uint64_t fraction = 1; fraction < 32 && !floor; fraction++) {
+                uint64_t candidate = preparation_peak +
+                    (allowance - preparation_peak) * fraction / 32;
+                fixture_t probe = budget_fixture(true, false, candidate);
+                unsigned seen = 0;
+                wl_session_set_delta_cb(probe.session, budget_observe, &seen);
+                int rc = wl_session_step(probe.session);
+                if (rc == ENOSPC && wl_session_budget_denied(probe.session) &&
+                    COL_SESSION(probe.session)->spill_join_selected_count == 1)
+                    floor = candidate;
+                destroy(&probe);
+            }
+            CHECK(floor > preparation_peak && floor < allowance);
+            budget_peak = 0;
+            fixture_t f = budget_fixture(true, false, floor);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            unsigned observed = 0;
+            wl_session_set_delta_cb(f.session, budget_observe, &observed);
+            int rc = wl_session_step(f.session);
+            CHECK(rc == ENOSPC && wl_session_budget_denied(f.session));
+            CHECK(s->spill_join_selected_count == 1 && s->arr_count == 0);
+            CHECK(observed == 0 && budget_peak <= floor);
+            CHECK(wl_columnar_spill_store_bytes(s->spill_store) == 0);
+            CHECK(!wl_columnar_source_access_gate_busy(&session_find_rel(s,
+                "a")->source_access) &&
+                !wl_columnar_source_access_gate_busy(&session_find_rel(s,
+                "b")->source_access));
+            destroy(&f);
+        }
+    }
+    wl_columnar_memory_governor_test_admitted = NULL;
+    wl_columnar_arrangement_test_reserve_denied = NULL;
+}
+
+typedef struct { int64_t key; int32_t diff; unsigned count; } later_event_t;
+static void
+later_observe(const char *name, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *context)
+{
+    later_event_t *event = context;
+    CHECK(strcmp(name, "result") == 0 && ncols == 3);
+    CHECK(row[0] == event->key && row[1] == row[0] + 10 &&
+        row[2] == 100 && diff == event->diff);
+    CHECK(++event->count == 1);
+}
+
+static void
+later_steps(void)
+{
+    /* These established delta/retraction paths may build resident indexes. */
+    fixture_t f = budget_fixture(true, false, 4 * 1024 * 1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    CHECK(wl_session_step(f.session) == 0);
+    CHECK(s->spill_join_selected_count == 1);
+    budget_contents(&f);
+    later_event_t event = {.key = 1, .diff = 1};
+    wl_session_set_delta_cb(f.session, later_observe, &event);
+    int64_t inserted[] = {1, 11}, removed[] = {0, 10};
+    CHECK(wl_session_insert(f.session, "a", inserted, 1, 2) == 0);
+    CHECK(wl_session_step(f.session) == 0 && event.count == 1);
+    CHECK(session_find_rel(s, "result")->nrows == 4);
+    event.key = 0; event.diff = -1; event.count = 0;
+    CHECK(wl_session_remove(f.session, "a", removed, 1, 2) == 0);
+    CHECK(wl_session_step(f.session) == 0 && event.count == 1);
+    col_rel_t *out = session_find_rel(s, "result");
+    CHECK(out->nrows == 3);
+    unsigned seen = 0;
+    for (uint32_t i = 0; i < out->nrows; i++) {
+        int64_t key = out->columns[0][i];
+        unsigned bit = key == 1 ? 1 : key == 2048 ? 2 : key == 4095 ? 4 : 0;
+        CHECK(bit && !(seen & bit));
+        CHECK(out->columns[1][i] == key + 10 &&
+            out->columns[2][i] == 100);
+        seen |= bit;
+    }
+    CHECK(seen == 7);
+    CHECK(wl_columnar_spill_store_bytes(s->spill_store) == 0);
+    destroy(&f);
+}
+
 int
 main(void)
 {
@@ -523,6 +750,8 @@ main(void)
         if (enabled) CHECK(s->arr_count == 0);
         destroy(&f);
     }
+    fixed_budget();
+    later_steps();
     projected_steps();
     owned_filters();
     failures();
