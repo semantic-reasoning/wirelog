@@ -816,6 +816,21 @@ both input protections. Retrying after either terminal stop starts a fresh
 merge from the unchanged input relations under a new control attempt. The
 primitive does not yet connect to recursive evaluator dispatch or enable
 controlled recursive STEP.
+The ordinary recursive SCC transaction is a separate integration: it evaluates
+complete preserved positive bodies from empty private INT64 heads, freezes all
+head inputs for each round, and compares canonical CONSOLIDATE results one cell
+per charged action. It does not invoke the candidate-merge primitive above.
+Every child cleanup receipt is ACKed before rebinding. Later strata see only
+completed private predecessors, and all public heads remain unchanged until
+one prepaid registry installation. Input removals recompute from empty state;
+signed callbacks describe the difference, not execution of differential
+operators. Work exhaustion retains the private round; cancellation drains it
+before retry. Obsolete round storage remains owned by a stable retirement
+receipt even after its descriptor is freed. The exact legacy binary route
+retains its independent admission and cost contract. See the
+[G3a qualification ledger](implementation/1821/CLOSURE_PLAN.md#g3a-implementation-and-qualification-2026-10-27)
+for admitted types/operators, iteration ceiling and remaining paths.
+
 Generated LFTJ operators in the supported serial controlled composition now
 use an internal resumable attempt. It charges source-name bytes and candidate
 lookups during discovery, copies at most 256 scalar cells per action, and uses
