@@ -195,6 +195,89 @@ wl_columnar_batch_payload_capture(wl_columnar_memory_governor_ref_t *g,
                rows, storage, NULL, cancel, cancel_context, out);
 }
 
+static bool
+wl_columnar_batch_payload_token_owned(const col_rel_t *r,
+    const wl_columnar_memory_reservation_t *token, uint64_t bytes)
+{
+    uint64_t state = atomic_load_explicit(&token->state, memory_order_acquire);
+    if (!bytes)
+        return state == WL_COLUMNAR_MEMORY_RESERVATION_EMPTY ||
+               state == WL_COLUMNAR_MEMORY_RESERVATION_RELEASED;
+    return token->identity == token && token->bytes == bytes &&
+           token->governor ==
+           wl_columnar_memory_governor_ref_get(r->memory_governor) &&
+           state == WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED &&
+           token->replacement_bytes == 0 &&
+           atomic_load_explicit(&token->owner_bits, memory_order_acquire) ==
+           (uintptr_t)r;
+}
+
+bool
+wl_columnar_batch_payload_can_take(const col_rel_t *r)
+{
+    uint64_t bytes;
+    return r && r->memory_governor && !r->pool_owned && !r->arena_owned &&
+           !r->col_shared && r->storage_owner == r &&
+           r->storage_owner_identity == r->relation_identity &&
+           r->storage_owner_generation == r->storage_generation &&
+           wl_columnar_relation_snapshot_valid(wl_columnar_relation_snapshot(
+                   r)) &&
+           !r->deferred_relation_session && !r->deferred_relation_next &&
+           !r->retract_backup_columns && !r->retract_backup_timestamps &&
+           !r->retract_backup_nrows && !r->retract_backup_base_nrows &&
+           !r->retract_backup_capacity &&
+           !r->retract_backup_timestamp_capacity &&
+           !r->retract_backup_sorted_nrows && !r->retract_backup_run_count &&
+           r->descriptor_reserved_bytes != 0 &&
+           col_rel_retained_live_bytes(r, &bytes) &&
+           bytes == r->retained_reserved_bytes &&
+           wl_columnar_batch_payload_token_owned(r, &r->retained_reservation,
+               r->retained_reserved_bytes) &&
+           wl_columnar_batch_payload_token_owned(r, &r->descriptor_reservation,
+               r->descriptor_reserved_bytes) &&
+           wl_columnar_batch_payload_token_owned(r, &r->metadata_reservation,
+               r->metadata_reserved_bytes) &&
+           wl_columnar_batch_payload_token_owned(r, &r->dedup_reservation,
+               r->dedup_reserved_bytes) &&
+           !r->pool_name_reserved_bytes &&
+           wl_columnar_batch_payload_token_owned(r, &r->pool_name_reservation,
+               0);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_take(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, col_rel_t **source,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out)
+{
+    if (!out) return WL_COLUMNAR_SPILL_INVALID;
+    *out = NULL;
+    if (!g || !source || !*source || (*source)->memory_governor != g ||
+        !wl_columnar_spill_store_uses_governor(store, g))
+        return WL_COLUMNAR_SPILL_INVALID;
+    if (!wl_columnar_batch_payload_can_take(*source))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    wl_columnar_batch_payload_t *p = NULL;
+    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_capture(g, store,
+            *source, (*source)->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+            cancel, cancel_context, &p);
+    if (rc != WL_COLUMNAR_SPILL_OK) return rc;
+    if (cancel && cancel(cancel_context)) {
+        rc = WL_COLUMNAR_SPILL_CANCELLED;
+    } else {
+        int retired = col_rel_destroy_checked(*source);
+        if (retired == 0) {
+            *source = NULL;
+            *out = p;
+            return WL_COLUMNAR_SPILL_OK;
+        }
+        rc = retired ==
+            EBUSY ? WL_COLUMNAR_SPILL_BUSY : WL_COLUMNAR_SPILL_INVALID;
+    }
+    if (wl_columnar_batch_payload_release(p) != WL_COLUMNAR_SPILL_OK) abort();
+    return rc;
+}
+
 static wl_columnar_spill_status_t
 wl_columnar_batch_payload_capture_impl(
     wl_columnar_memory_governor_ref_t *g,
