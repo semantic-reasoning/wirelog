@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Persistent sealed JOIN inputs** (#1372): an internal pre-evaluation operation
+  can retire one right-only numeric EDB into session-owned spill segments and
+  reuse it across eligible serial JOINs and repeated STEP/SNAPSHOT calls.
+  Sealed sessions reject mutation and unsupported consumers explicitly.
+  Paired fixed-budget tests prove completion depends on the actual resident
+  source refund, with separate capture/output floor and cleanup coverage.
+  Public configuration, mutable/trace storage and broader readers remain open.
+
 - **Opt-in spilled evaluator JOIN** (#1372): internal session options can
   route eligible serial numeric JOINs through ephemeral disk snapshots and
   a capped window index before resident arrangement construction. Natural
