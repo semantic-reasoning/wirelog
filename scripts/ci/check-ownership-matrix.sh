@@ -141,39 +141,24 @@ awk -F '\t' '
 # and would have caught it without a human reading join.c.  A definition alone
 # does not satisfy it; the symbol must appear somewhere other than its own
 # definition site.
-# Cost note: this is the one per-anchor shell loop left in this file, two
-# full-tree greps per anchor, so it is the growth term.  At 37 anchors the gate
-# runs ~2 s against a 120 s timeout.  The awk pass above exists because a
-# per-row loop timed the sibling threading gate out at 30.09 s on the Windows
-# runner (#1462), where process creation is far more expensive; if this table
-# roughly triples, collapse these greps into one alternation pass before that
-# margin matters.
-uncalled=""
-while IFS= read -r anchor; do
-    symbol=${anchor#*:}
-    # `|| true` on both: grep exits 1 when it matches nothing, and under
-    # `set -euo pipefail` that would abort the gate with no diagnostic at all.
-    uses=$({ grep -rhoE "\b$symbol\b" "$repo_root/wirelog" --include='*.c' --include='*.h' || true; } | wc -l)
-    # `.h` occurrences are netted out entirely, so the test is "more than one
-    # occurrence in .c files": definition plus at least one other mention.
-    # It is a heuristic and fails open, not closed.  A definition paired with a
-    # forward declaration in a .c, with a mention in its own doc comment, with
-    # a same-named static in another file, or with only an #ifdef-gated test
-    # wrapper as its caller all pass: the count is global rather than scoped
-    # to the anchor's file, and nothing here evaluates the preprocessor.
-    # wl_columnar_eval_retire_prior_deltas has such a wrapper, reachable only
-    # under WL_TEST_BDX_SEED.  Its row is sound because a production call
-    # exists as well, but the wrapper alone would have satisfied this check.
-    # No line number is cited for it on purpose: the bounds check below scans
-    # only docs/MEMORY.md, so a line citation in this comment would rot
-    # unchecked.
-    # There is no false-fail shape here: a genuinely called symbol always has
-    # a definition plus a call, and the only construct that could hide a call
-    # from grep is token pasting, which `grep -rn '##'` finds nowhere under
-    # wirelog/.
-    decls=$({ grep -rhoE "\b$symbol\b" "$repo_root/wirelog" --include='*.h' || true; } | wc -l)
-    [ "$((uses - decls))" -gt 1 ] || uncalled="$uncalled $anchor"
-done <"$anchors"
+# Count C identifier occurrences in one production-source scan. The previous
+# per-anchor loop counted .c/.h matches and subtracted .h matches; scanning .c
+# directly preserves that heuristic while avoiding repeated tree scans and
+# process creation on Windows. Patterns are deduplicated complete identifiers,
+# so -w keeps prefix-related symbols distinct and -o retains repeated matches
+# on one line. Comments and C forward declarations still count as before;
+# this is a textual reachability heuristic, not preprocessor-aware call analysis.
+symbols="$tmp_dir/symbols"
+awk -F ':' '{ print $2 }' "$anchors" | sort -u >"$symbols"
+uses="$tmp_dir/uses"
+grep -rhoFw -f "$symbols" "$repo_root/wirelog" --include='*.c' >"$uses" || true
+uncalled=$(awk '
+    FILENAME == ARGV[1] { count[$0]++; next }
+    {
+        split($0, cite, ":")
+        if (count[cite[2]] <= 1) printf " %s", $0
+    }
+' "$uses" "$anchors")
 [ -z "$uncalled" ] || {
     echo "check-ownership-matrix: FAIL: cited symbols have no caller under wirelog/, so the row documents a path production does not take:$uncalled" >&2
     exit 1
