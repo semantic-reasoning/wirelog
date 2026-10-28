@@ -80,6 +80,7 @@ wirelog_result_get_relation
 wirelog_result_relation_cardinality
 wirelog_result_write_csv
 wirelog_session_create
+wirelog_session_create_with_options
 wirelog_session_create_with_snapshot
 wirelog_session_destroy
 wirelog_session_insert
@@ -88,6 +89,7 @@ wirelog_session_make_compound
 wirelog_session_make_compound_typed
 wirelog_session_remove
 wirelog_session_remove_typed
+wirelog_session_seal_join_input
 wirelog_session_set_delta_cb
 wirelog_session_set_typed_delta_cb
 wirelog_session_snapshot
