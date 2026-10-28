@@ -438,7 +438,8 @@ resolve_backend(wirelog_backend_kind_t kind)
 static wirelog_error_t
 wirelog_session_create_impl(wirelog_program_t *program,
     wirelog_backend_kind_t backend, uint32_t num_workers,
-    wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out)
+    wirelog_extension_snapshot_t *snapshot,
+    const wl_session_options_t *options, wirelog_session_t **out)
 {
     if (!out)
         return WIRELOG_ERR_EXEC;
@@ -459,8 +460,8 @@ wirelog_session_create_impl(wirelog_program_t *program,
     }
 
     wl_session_t *inner = NULL;
-    rc = wl_session_create_with_snapshot(be, plan,
-            num_workers > 0 ? num_workers : 1, snapshot, &inner);
+    rc = wl_session_create_with_snapshot_options(be, plan,
+            num_workers > 0 ? num_workers : 1, snapshot, options, &inner);
     if (rc != 0 || !inner) {
         wl_plan_free(plan);
         /* EOVERFLOW here is governor budget exhaustion, not representation
@@ -506,7 +507,7 @@ wirelog_session_create(wirelog_program_t *program,
     wirelog_session_t **out)
 {
     return wirelog_session_create_impl(program, backend, num_workers, NULL,
-               out);
+               NULL, out);
 }
 
 wirelog_error_t
@@ -515,7 +516,67 @@ wirelog_session_create_with_snapshot(wirelog_program_t *program,
     wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out)
 {
     return wirelog_session_create_impl(program, backend, num_workers,
-               snapshot, out);
+               snapshot, NULL, out);
+}
+
+wirelog_error_t
+wirelog_session_create_with_options(wirelog_program_t *program,
+    wirelog_backend_kind_t backend, uint32_t num_workers,
+    const wirelog_session_options_v1_t *options, wirelog_session_t **out)
+{
+    if (!out) return WIRELOG_ERR_EXEC;
+    *out = NULL;
+    if (!options)
+        return wirelog_session_create_impl(program, backend, num_workers,
+                   NULL, NULL, out);
+
+    /* A short descriptor need only provide its size word. Read no later field
+     * until the complete v1 prefix is known to be present. */
+    uint32_t size;
+    memcpy(&size, options, sizeof(size));
+    if (size < sizeof(wirelog_session_options_v1_t)) return WIRELOG_ERR_EXEC;
+    wirelog_session_options_v1_t supplied;
+    memcpy(&supplied, options, sizeof(supplied));
+    if (supplied.abi_version != 1) return WIRELOG_ERR_EXEC;
+    if (supplied.spill_directory) {
+        if (!supplied.spill_directory[0] || !supplied.spill_quota_bytes ||
+            supplied.spill_max_row_bytes < 32) return WIRELOG_ERR_EXEC;
+    } else if (supplied.spill_quota_bytes || supplied.spill_max_row_bytes) {
+        return WIRELOG_ERR_EXEC;
+    }
+    if ((supplied.spill_join_batch_bytes != 0) !=
+        (supplied.spill_join_index_bytes != 0) ||
+        (supplied.spill_join_batch_bytes && !supplied.spill_directory))
+        return WIRELOG_ERR_EXEC;
+
+    wl_session_options_t normalized;
+    wl_session_options_init(&normalized);
+    normalized.spill_directory = supplied.spill_directory;
+    normalized.spill_quota_bytes = supplied.spill_quota_bytes;
+    normalized.spill_max_row_bytes = supplied.spill_max_row_bytes;
+    normalized.spill_join_batch_bytes = supplied.spill_join_batch_bytes;
+    normalized.spill_join_index_bytes = supplied.spill_join_index_bytes;
+    return wirelog_session_create_impl(program, backend, num_workers,
+               supplied.snapshot, &normalized, out);
+}
+
+wirelog_error_t
+wirelog_session_seal_join_input(wirelog_session_t *session,
+    const char *relation)
+{
+    if (!session || !relation) return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
+    wl_columnar_spill_status_t status = wl_columnar_session_seal_join_input(
+        session->inner, relation, NULL, NULL);
+    switch (status) {
+    case WL_COLUMNAR_SPILL_OK: return WIRELOG_OK;
+    case WL_COLUMNAR_SPILL_MEMORY: return WIRELOG_ERR_MEMORY_BUDGET;
+    case WL_COLUMNAR_SPILL_ALLOCATION: return WIRELOG_ERR_MEMORY;
+    case WL_COLUMNAR_SPILL_QUOTA:
+    case WL_COLUMNAR_SPILL_CAPACITY:
+    case WL_COLUMNAR_SPILL_IO: return WIRELOG_ERR_IO;
+    default: return WIRELOG_ERR_EXEC;
+    }
 }
 
 void

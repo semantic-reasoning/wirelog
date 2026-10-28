@@ -5726,6 +5726,16 @@ test_wirelog_advanced_exe = executable(
 
 test('wirelog_advanced', test_wirelog_advanced_exe)
 
+# Installed-header host contract exercised against the production library.
+test_wirelog_advanced_spill_exe = executable(
+  'test_wirelog_advanced_spill', files('test_wirelog_advanced_spill.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  link_with: wirelog_lib,
+)
+test('wirelog_advanced_spill', test_wirelog_advanced_spill_exe,
+  suite: ['unit', 'tsan'], timeout: 120)
+
+
 # Issue #841: umbrella public API symbols are real linkable/runtime
 # entry points, not only header declarations.
 test_wirelog_public_api_exe = executable(

@@ -914,7 +914,7 @@ test_create_invalid_backend(void)
 /* The additive snapshot API must retain independently of the caller, so a
  * caller may release its reference and unregister the addon immediately. */
 static int
-test_create_with_snapshot_lifetime(void)
+test_create_with_snapshot_lifetime(bool use_options)
 {
     wirelog_extension_registry_t *registry = NULL;
     wirelog_extension_snapshot_t *snapshot = NULL;
@@ -943,9 +943,14 @@ test_create_with_snapshot_lifetime(void)
         goto cleanup;
     }
     snapshot = wirelog_extension_snapshot_acquire(registry);
+    wirelog_session_options_v1_t options = {0};
+    options.struct_size = sizeof(options); options.abi_version = 1;
+    options.snapshot = snapshot;
     if (!snapshot
-        || wirelog_session_create_with_snapshot(prog,
-        WIRELOG_BACKEND_DEFAULT, 2, snapshot, &session) != WIRELOG_OK
+        || (use_options ? wirelog_session_create_with_options(prog,
+        WIRELOG_BACKEND_DEFAULT, 2, &options, &session) :
+        wirelog_session_create_with_snapshot(prog,
+        WIRELOG_BACKEND_DEFAULT, 2, snapshot, &session)) != WIRELOG_OK
         || !session) {
         fprintf(stderr, "T-snapshot-public: creation failed\n");
         rc = 1;
@@ -1001,6 +1006,15 @@ test_create_with_snapshot_invalid_args(void)
     if (wirelog_session_create_with_snapshot(prog, WIRELOG_BACKEND_DEFAULT,
         1, snapshot, NULL) != WIRELOG_ERR_EXEC)
         rc = 1;
+    wirelog_session_options_v1_t options = {0};
+    options.struct_size = sizeof(options); options.abi_version = 1;
+    options.snapshot = snapshot;
+    if (wirelog_session_create_with_options(NULL, WIRELOG_BACKEND_DEFAULT,
+        1, &options, &session) != WIRELOG_ERR_EXEC || session != NULL)rc = 1;
+    if (wirelog_session_create_with_options(prog, (wirelog_backend_kind_t)999,
+        1, &options, &session) != WIRELOG_ERR_EXEC || session != NULL)rc = 1;
+    if (wirelog_session_create_with_options(prog, WIRELOG_BACKEND_DEFAULT,
+        1, &options, NULL) != WIRELOG_ERR_EXEC)rc = 1;
     wirelog_extension_snapshot_release(snapshot);
     wirelog_program_free(prog);
     if (registry && wirelog_extension_registry_destroy(registry) != 0)
@@ -3278,14 +3292,47 @@ done:
     return failed;
 }
 
+/* NULL public options preserve the internal default-options hook; an
+ * explicit disabled descriptor intentionally opts out of that test default. */
+static int
+test_options_null_defaults(void)
+{
+    wirelog_program_t *p = parse_or_die(PROG_SRC, "options-null-defaults");
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor(0);
+    if (!p || !ref) {
+        wirelog_program_free(p); wl_columnar_memory_governor_ref_release(ref);
+        return 1;
+    }
+    wl_session_options_t internal; wl_session_options_init(&internal);
+    internal.memory_governor = ref;
+    wl_session_testhook_set_default_options(&internal);
+    wirelog_session_t *s = NULL;
+    wirelog_error_t error = wirelog_session_create_with_options(p,
+            WIRELOG_BACKEND_DEFAULT, 1, NULL, &s);
+    int failed = error != WIRELOG_ERR_MEMORY_BUDGET || s != NULL;
+    wirelog_session_destroy(s); s = NULL;
+    wirelog_session_options_v1_t disabled = {0};
+    disabled.struct_size = sizeof(disabled); disabled.abi_version = 1;
+    error = wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
+            &disabled, &s);
+    failed |= error != WIRELOG_OK || s == NULL;
+    wl_session_testhook_set_default_options(NULL);
+    wirelog_session_destroy(s); wirelog_program_free(p);
+    failed |= reserved_on(ref) != 0;
+    wl_columnar_memory_governor_ref_release(ref);
+    return failed;
+}
+
 int
 main(void)
 {
     int failures = 0;
+    failures += test_options_null_defaults();
     failures += test_create_destroy_basic();
     failures += test_create_columnar();
     failures += test_create_invalid_backend();
-    failures += test_create_with_snapshot_lifetime();
+    failures += test_create_with_snapshot_lifetime(false);
+    failures += test_create_with_snapshot_lifetime(true);
     failures += test_create_with_snapshot_invalid_args();
     failures += test_public_snapshot_extension_execution();
     failures += test_public_map_extension_execution();

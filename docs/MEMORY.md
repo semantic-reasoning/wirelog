@@ -4059,7 +4059,8 @@ teardown, and multiple readers/segments surviving coordinator destruction with
 complete final refunds. `session_options` covers bounded v2/v3 prefix reads,
 invalid configurations and unsupported legacy backend rejection.
 
-Remaining #1372 work: public opt-in API; intern/compound lifetime
+At this foundation stage, remaining work included the public opt-in API (now
+available for the numeric subset below); intern/compound lifetime
 pins; queue scheduling/integration for #1373; direct-column and
 arrangement/index consumer audits; supported relation/trace transitions; actual
 mixed resident/cold indexed execution under pressure. Retained index chains,
@@ -4113,7 +4114,8 @@ signed metadata, partial cancellation, quota and allocation/admission failure,
 reader pins, concurrent reads during retirement, and session teardown. This is
 mixed batch storage evidence, not full mixed relation/index evaluation or a
 working-set pressure completion claim. Compound-reference pins, automatic policy,
-public configuration and bounded relation/index consumers remain outstanding.
+broader relation/index consumers remain outstanding. Public configuration for
+the later numeric evaluator subset is described below.
 
 ### Reclaiming owned resident batches (#1372, partial)
 
@@ -4147,8 +4149,9 @@ test stack, allocator overhead and OS file cache are outside this managed
 measurement. This proves bounded batch reclamation, not whole-process RSS or
 cold relation/index execution. A separate boundary test denies a transition
 one byte below its calculated floor and succeeds exactly at the floor.
-Automatic scheduling, compound-reference lifetimes, public spill configuration
-and the remaining #1372/#1385 acceptance criteria are still outstanding.
+Automatic scheduling, compound-reference lifetimes and remaining #1372/#1385
+acceptance criteria are still outstanding. Public configuration for the later
+numeric evaluator subset is described below.
 
 
 ### Reference-safe STRING batches (#1372, partial)
@@ -4200,7 +4203,7 @@ allocator overhead and OS resources are additional resident costs. Pin counters
 are embedded, and the payload/segment floor includes its new intern pointer;
 no separately allocated pin metadata is omitted. This does not serialize string
 bytes into a portable or cross-process spill format. Compound lifetimes, cold
-relation/index execution, public spill configuration and scheduling remain
+relation/index execution beyond the later numeric subset and scheduling remain
 outstanding; #1372 and #1385 are not complete.
 
 
@@ -4223,8 +4226,8 @@ lease frees arena storage, refunds reservations, and releases the governor.
 
 Compound payload capture/spill still rejects compound layouts. Retaining arena
 bytes does not retain nested intern references or establish logical layout and
-provenance. Those contracts, cold indexed readers, public spill configuration,
-and scheduler integration remain follow-up work; #1372 is not complete.
+provenance. Those contracts, broader cold indexed readers and scheduler
+integration remain follow-up work; #1372 is not complete.
 
 
 ### Flat INLINE compound spill with explicit provenance (#1372)
@@ -4276,8 +4279,8 @@ layout API, and publishes it through the transactional sink in resident, spilled
 demoted forms, then destroys the session and program before reading the results.
 This proves that relation-backed sink path, not automatic INLINE JOIN scheduling.
 SIDE contents live in side relations and are not preserved by merely holding
-arena handles. SIDE/nested capture, cold indexed execution, public spill options
-and scheduler integration remain outstanding; #1372 stays open.
+arena handles. SIDE/nested capture, broader cold indexed execution and scheduler
+integration remain outstanding; #1372 stays open.
 
 ### Explicit indexed JOIN over immutable payloads (#1372)
 
@@ -4386,8 +4389,8 @@ publication, duplicate tuple cancellation, first/last and arithmetic boundary
 values, nonmatching extreme weights, a partial-batch overflow after an earlier
 commit, concurrent self-JOIN consumers, I/O failure, cancellation and complete
 reservation refunds. General logical-time support, automatic evaluator cold
-relation routing, public spill configuration and
-#1373 scheduling remain separate work. This advances signed-difference indexed
+relation routing and #1373 scheduling remain separate work. Public configuration
+for the later numeric evaluator subset is described below. This advances signed-difference indexed
 execution but does not complete #1372 or qualify #1385.
 
 ### Capped right-window payload JOIN (#1372)
@@ -4510,7 +4513,7 @@ object, the generic continuation's fixed descriptor, allocator overhead and OS
 resources remain explicit additional costs. Arbitrary callbacks can retain their
 own unbounded state and must account for it separately. Existing relation-capture
 paths still require their complete source relation; automatic evaluator/registry
-cold routing, mutable/trace transitions, public spill configuration, broader
+cold routing, mutable/trace transitions, broader
 compound support and #1373 scheduling remain separate work. #1372 stays open and
 this does not qualify #1385.
 
@@ -4773,6 +4776,114 @@ concurrent readers, multiple consumers, repeated STEP/SNAPSHOT, empty inputs,
 FLOAT/UINT64 projection lanes, reader/alias BUSY, quota, partial I/O, allocation
 failure, cancellation, generation boundaries and complete credit refund.
 
+### Public advanced spill configuration and sealing (#1372)
+
+`wirelog_session_create_with_options` exposes explicit spill configuration through
+installed `wirelog/wirelog-advanced.h`. Initialize `wirelog_session_options_v1_t`
+with zeros, its `struct_size`, and `abi_version = 1`. Unknown versions and short
+prefixes are rejected; larger descriptors have only their v1 prefix read. NULL
+options retain legacy creation behavior. Existing create/create_with_snapshot
+APIs are unchanged. A non-NULL descriptor normalizes into private options without
+exposing a governor, control handle or internal struct layout.
+
+The descriptor's optional scalar-addon `snapshot` uses the existing retained
+snapshot contract. The program remains borrowed until session destruction;
+descriptor and directory storage are needed only during construction. The
+session copies its directory, seeds inline facts before returning, and unwinds
+its temporary owners on failure without consuming the caller's snapshot owner.
+
+A configured directory must already exist and remain under host control. Supply
+a positive file quota and `spill_max_row_bytes >= 32`; a wider schema can require
+more than that validation minimum. Set both JOIN caps positive to enable eligible
+serial spill execution, or both zero for a store without JOIN routing. NULL
+directory with all limits zero disables spilling. Directory creation, implicit
+activation and durable/reopenable spill files are not provided.
+
+The existing `WIRELOG_MEMORY_BUDGET` setting accepts decimal bytes with a minimum
+of 268435456 (256 MiB). A smaller or malformed setting is invalid configuration,
+not proof of memory exhaustion. Batch/index caps bound individual scratch units,
+not the entire session. The full source must initially fit and coexist with
+capture scratch; final IDB output stays resident. Public-only tests use a valid
+fixed 256 MiB allowance and refuse a 4096-by-4096 JOIN's resident output with
+`WIRELOG_ERR_MEMORY_BUDGET` and no callbacks. The earlier identical-budget
+retained-source control remains the causal reclamation proof; this public test
+qualifies the actual host boundary and output floor.
+
+After loading all inputs, call `wirelog_session_seal_join_input` for one eligible
+right-only numeric EDB. It uses the exact immutable plan/mode restrictions above;
+opaque optimized plans, general VARIABLE reads of that input, recursive, worker,
+delta and controlled paths remain ineligible. The public call is synchronous and
+has no cancellation callback. Success freezes all fact/compound mutation for the
+session and cannot be undone. Refusal preserves the source; retry is possible
+only while the lifecycle remains eligible. The first evaluation attempt closes
+the seal window permanently. Use repeated STEP or repeated SNAPSHOT according to
+the existing advanced API contract; do not mix evaluation modes to infer tuple
+multiplicity. Externally serialize every operation on the session. Snapshot
+callbacks borrow their tuples only for the callback duration.
+
+Seal results distinguish managed-memory admission (`WIRELOG_ERR_MEMORY_BUDGET`),
+allocator failure (`WIRELOG_ERR_MEMORY`), disk I/O/capacity/quota
+(`WIRELOG_ERR_IO`), and unsupported/invalid/busy/generation states
+(`WIRELOG_ERR_EXEC`). Errors do not inherit a prior operation's budget flag.
+Constructor storage-open errors retain its existing `WIRELOG_ERR_EXEC` mapping.
+The installed typed path preserves finite nonzero FLOAT values and its existing
+signed-zero canonicalization; nonfinite input is rejected. Public schema syntax
+does not currently expose BOOL/UINT64 declarations; internal payload tests cover
+those types without implying public schema support.
+
+This complete example uses inline facts and an existing private spill directory:
+
+```c
+#include <wirelog/wirelog-advanced.h>
+#include <stdio.h>
+
+static void show(const char *name, const int64_t *row, uint32_t ncols, void *ctx)
+{
+    (void)ctx;
+    if (ncols == 3)
+        printf("%s(%lld,%lld,%lld)\n", name, (long long)row[0],
+            (long long)row[1], (long long)row[2]);
+}
+int main(int argc, char **argv)
+{
+    if (argc != 2) return 2;
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n"
+        ".decl result(k:int64,x:int64,y:int64)\na(1,11).\nb(1,101).\n"
+        "result(k,x,y + 0) :- a(k,x),b(k,y).\n", &error);
+    if (!program) return 1;
+    wirelog_session_options_v1_t options = {0};
+    options.struct_size = sizeof(options);
+    options.abi_version = 1;
+    options.spill_directory = argv[1];
+    options.spill_quota_bytes = 1048576;
+    options.spill_max_row_bytes = 64;
+    options.spill_join_batch_bytes = 4096;
+    options.spill_join_index_bytes = 4096;
+    wirelog_session_t *session = NULL;
+    error = wirelog_session_create_with_options(program,
+        WIRELOG_BACKEND_COLUMNAR, 1, &options, &session);
+    if (error == WIRELOG_OK)
+        error = wirelog_session_seal_join_input(session, "b");
+    if (error == WIRELOG_OK)
+        error = wirelog_session_snapshot(session, show, NULL);
+    wirelog_session_destroy(session);
+    wirelog_program_free(program);
+    return error == WIRELOG_OK ? 0 : 1;
+}
+```
+
+After installing the library, compile the saved example with
+`cc example.c $(pkg-config --cflags --libs wirelog) -o example` and pass an
+existing directory as its sole argument. Expected output is `result(1,11,101)`.
+Session destruction closes its files; POSIX unlinks them immediately at creation,
+while Windows uses delete-on-close. Tests use an isolated directory and scoped
+live-descriptor evidence on Linux; directory emptiness alone does not prove that
+an anonymous POSIX descriptor closed. The production-library public test is
+registered on all supported hosts. Native platform qualification depends on the
+actual corresponding CI run, not a Linux macro compile.
+
 ### Remaining #1372 implementation groups
 
 The sealed right-only numeric EDB subset now has actual persistent cold storage,
@@ -4783,7 +4894,9 @@ identity/generation and pin/cleanup ownership across updates, signed differences
 and retractions. Unsupported consumers remain explicitly ineligible for sealing.
 SIDE/nested-reference ownership also needs a concrete provenance decision.
 
-Supported public host configuration and platform qualification remain open.
+Public advanced configuration and explicit sealing are now available for the
+numeric subset above. Broader consumer support and native platform qualification
+remain evidence-dependent.
 Existing payload and sealed-session evidence cannot replace those acceptance
 requirements. Close #1372 only when the remaining gaps have concrete tests.
 #1373 scheduling and #1385 DOOP qualification remain separate; #1372 stays open.

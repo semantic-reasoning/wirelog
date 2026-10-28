@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Public advanced spill configuration** (#1372): versioned
+  `wirelog_session_create_with_options` configures session-owned spill storage
+  and bounded numeric JOIN scratch, with optional scalar snapshots.
+  `wirelog_session_seal_join_input` exposes persistent right-only numeric input
+  reclamation before evaluation. Existing constructors retain their defaults;
+  public integration tests cover lifecycle, exact results, output budget refusal
+  and cleanup. General mutable/trace cold storage remains follow-up work.
+
 - **Persistent sealed JOIN inputs** (#1372): an internal pre-evaluation operation
   can retire one right-only numeric EDB into session-owned spill segments and
   reuse it across eligible serial JOINs and repeated STEP/SNAPSHOT calls.

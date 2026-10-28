@@ -242,6 +242,26 @@ advanced API exposes backend selection through the
 `wirelog_backend_kind_t` enum (`DEFAULT`, `COLUMNAR`); new backends
 will appear as additive enum values in future minor releases.
 
+#### Advanced explicit spill configuration (#1372)
+
+`wirelog_session_create_with_options` accepts a versioned v1 descriptor with an
+optional retained scalar snapshot and explicit spill directory/quota/scratch
+caps. NULL preserves legacy defaults; existing creators are unchanged. Inline
+facts still load before return. Options and directory storage are borrowed only
+for construction; the program stays borrowed for the session lifetime.
+
+`wirelog_session_seal_join_input` exposes the internal pre-evaluation right-only
+numeric EDB transition. It retains the conservative serial immutable-plan
+eligibility checks and makes all fact/compound mutation unsupported after
+success. Refusal preserves the source but cannot reopen the seal window after
+an evaluation attempt. Cold lookup never substitutes empty input for an
+unsupported consumer. Every session operation remains externally serialized.
+Memory admission, allocation and disk capacity/quota failures retain distinct
+public error classifications. This advanced-only opt-in has no easy-facade
+counterpart; existing cross-facade defaults remain unchanged. Full lifecycle,
+limits, platform cleanup and a complete host example are in
+[MEMORY.md](MEMORY.md#public-advanced-spill-configuration-and-sealing-1372).
+
 #### Parity audit (v0.41 / #785)
 
 The cross-facade contract is mechanically pinned by a per-test

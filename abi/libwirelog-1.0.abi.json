@@ -82,6 +82,7 @@
     <elf-symbol name='wirelog_result_relation_cardinality' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_result_write_csv' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_create' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_session_create_with_options' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_create_with_snapshot' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_destroy' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_insert' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
@@ -90,6 +91,7 @@
     <elf-symbol name='wirelog_session_make_compound_typed' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_remove' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_remove_typed' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_session_seal_join_input' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_set_delta_cb' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_set_typed_delta_cb' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_snapshot' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>

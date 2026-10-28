@@ -154,6 +154,82 @@ wirelog_session_create_with_snapshot(wirelog_program_t *program,
     wirelog_extension_snapshot_t *snapshot, wirelog_session_t **out);
 
 /**
+ * wirelog_session_options_v1_t:
+ *
+ * Versioned advanced-session configuration. Zero-initialize, set struct_size
+ * to sizeof(wirelog_session_options_v1_t), and abi_version to 1. Version 1
+ * accepts at least this prefix; larger trailing storage is ignored. A NULL
+ * descriptor to create_with_options preserves legacy defaults.
+ *
+ * snapshot has the create_with_snapshot ownership contract. The descriptor
+ * and spill_directory are borrowed only during creation; the store copies
+ * the directory. The program remains borrowed for the session lifetime.
+ *
+ * NULL directory and zero spill limits disable spilling. Otherwise the
+ * directory must already exist, quota must be positive, and max_row_bytes
+ * must be at least 32 (wider schemas require more). Both join caps must be
+ * zero (store only) or positive (enable eligible serial numeric JOINs).
+ * Positive caps require a configured directory. No directories are created.
+ *
+ * Caps bound individual batches/index windows, not total memory. The existing
+ * WIRELOG_MEMORY_BUDGET policy still governs managed memory. Inputs initially
+ * fit in memory and capture needs additional scratch; final output remains
+ * resident. Spill files are ephemeral and session-owned, not reopenable data.
+ */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    wirelog_extension_snapshot_t *snapshot;
+    const char *spill_directory;
+    uint64_t spill_quota_bytes;
+    uint64_t spill_max_row_bytes;
+    uint64_t spill_join_batch_bytes;
+    uint64_t spill_join_index_bytes;
+} wirelog_session_options_v1_t;
+
+/**
+ * Create a session with explicit host configuration and optional scalar-addon
+ * snapshot. Inline facts are seeded before return, as with create(). Legacy
+ * constructors are unchanged. A non-NULL out is cleared before validation.
+ *
+ * Returns the create() errors: invalid descriptors/configuration and storage
+ * open failures are WIRELOG_ERR_EXEC, allocator failure is WIRELOG_ERR_MEMORY,
+ * and managed-memory denial is WIRELOG_ERR_MEMORY_BUDGET. Every failed call
+ * releases its temporary owners and leaves the caller's snapshot reference
+ * intact. NULL options uses legacy defaults, including no explicit spill opt-in.
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_create_with_options(wirelog_program_t *program,
+    wirelog_backend_kind_t backend, uint32_t num_workers,
+    const wirelog_session_options_v1_t *options, wirelog_session_t **out);
+
+/**
+ * Seal one right-only numeric EDB as persistent immutable spill input before
+ * the first STEP/SNAPSHOT attempt. Load all inputs first. Requires configured
+ * spill JOIN caps and a serial nonrecursive plan using only audited
+ * VARIABLE/JOIN/MAP/CONSOLIDATE operations: the selected name may occur only as
+ * a JOIN right input, with one INT64 key, no right filter, timestamps, references,
+ * opaque/materialized rewrites, worker/control/delta modes or delta callback.
+ * Optimized plans may therefore be ineligible. Only one input may be sealed.
+ *
+ * Success reclaims the resident source and makes all fact/compound mutation
+ * unsupported for the entire session. The binding is reused by supported
+ * STEP/SNAPSHOT calls until destruction; sealing cannot be undone. A refusal
+ * preserves the original source and allows retry only while the session is
+ * still eligible; an evaluation attempt permanently closes the seal window.
+ * Calls are synchronous and must be externally serialized with all session
+ * operations. No callback or cancellation hook is invoked by this public API.
+ *
+ * Returns WIRELOG_OK, WIRELOG_ERR_MEMORY_BUDGET for governed admission refusal,
+ * WIRELOG_ERR_MEMORY for allocation failure, WIRELOG_ERR_IO for disk I/O,
+ * capacity or quota errors, and WIRELOG_ERR_EXEC for other invalid/unsupported,
+ * busy or exhausted-generation states. Error classification is per operation.
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_seal_join_input(wirelog_session_t *session,
+    const char *relation);
+
+/**
  * wirelog_session_destroy:
  * @session: Session to free (NULL-safe).
  *
