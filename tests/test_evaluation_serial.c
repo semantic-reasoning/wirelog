@@ -19,6 +19,16 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define unsetenv wl_test_unsetenv_
+#endif
+
 extern void (*wl_columnar_session_test_observed_preflight_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
@@ -11223,6 +11233,14 @@ test_scalar_retirement_receipt(void)
 int
 main(void)
 {
+    /* Issue #2262: session.c reads WIRELOG_JOIN_BATCH_BYTES and _STRICT when
+     * a session is created, and controlled STEP refuses strict mode and the
+     * batch-configured shapes other than the one in SEMANTICS.md (#1821).
+     * The tests here that exercise the knob set the session fields directly,
+     * so clear the inherited environment before any session or child
+     * process exists. */
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     test_recursive_reachability_plan_manifest();
     test_recursive_two_join_plan_manifest();
     test_controlled_recursive_two_join_step();
