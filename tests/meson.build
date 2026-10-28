@@ -6534,6 +6534,10 @@ test_evaluation_serial_exe = executable(
 )
 test('evaluation_serial', test_evaluation_serial_exe,
      suite: ['unit', 'tsan'], timeout: 120)
+# #2262: the fixtures must not inherit the bounded join knob.
+test('evaluation_serial_join_batch_env', test_evaluation_serial_exe,
+     env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+     suite: ['unit'], timeout: 120)
 
 # #1372 primitive spill I/O faults stay out of the production library.
 test_spill_segments_exe = executable(
