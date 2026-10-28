@@ -65,7 +65,9 @@ fi
 
 existing=$(gh release view "$tag" --json assets --jq '.assets[].name')
 
-published() { printf '%s\n' "$existing" | grep -qxF "$1"; }
+# Consume the entire list: grep -q can close the pipe after an early match,
+# making printf fail with SIGPIPE and pipefail report an existing asset absent.
+published() { printf '%s\n' "$existing" | grep -xF -- "$1" >/dev/null; }
 
 present=0
 for suffix in .sig .pem .cosign.bundle; do

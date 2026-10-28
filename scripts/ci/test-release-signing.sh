@@ -627,6 +627,45 @@ wirelog-9.9.9.tar.gz.cosign.bundle' present
 publish_complete() { run_publish_diagnosed 'complete signing set skip' 3; }
 assert 'a complete signing set is skipped, other assets still upload' publish_complete
 
+# A real release can carry many unrelated assets. Keep the matching signing
+# names at the beginning, beyond which grep must drain more than a pipe buffer.
+# Early-exit grep under pipefail can otherwise turn a successful match into
+# producer SIGPIPE (141), falsely authorizing an upload of an existing asset.
+large_unrelated=$(for ((i = 0; i < 20000; i++)); do
+    printf 'unrelated-asset-%06d\n' "$i"
+done)
+setup_publish "wirelog-9.9.9.tar.gz.sig
+wirelog-9.9.9.tar.gz.pem
+wirelog-9.9.9.tar.gz.cosign.bundle
+$large_unrelated" present
+publish_large_complete() {
+    run_publish_diagnosed 'large complete signing set skip' 3 &&
+        ! grep -Eq '^release upload .*\.tar\.gz\.(sig|pem|cosign\.bundle)$' "$gh_calls"
+}
+assert 'a large complete signing set never re-uploads signing assets' publish_large_complete
+
+setup_publish "wirelog-9.9.9.tar.gz
+wirelog-9.9.9.tar.gz.sha256
+wirelog-9.9.9.tar.gz.blake3
+wirelog-9.9.9.tar.gz.sig
+wirelog-9.9.9.tar.gz.pem
+wirelog-9.9.9.tar.gz.cosign.bundle
+$large_unrelated" present
+publish_large_all() { run_publish_diagnosed 'large existing release skip' 0; }
+assert 'all existing assets in a large release are skipped' publish_large_all
+
+setup_publish "wirelog-9.9.9.tar.gz.sig.extra
+$large_unrelated" present
+publish_large_absent() { run_publish_diagnosed 'large absent asset listing' 6; }
+assert 'large unrelated listings do not match asset prefixes' publish_large_absent
+
+setup_publish "wirelog-9.9.9.tar.gz.sig
+$large_unrelated" present
+publish_large_partial() {
+    ! run_publish >/dev/null 2>&1 && [[ "$(uploads)" == 0 ]]
+}
+assert 'a partial signing set in a large listing is refused before upload' publish_large_partial
+
 publisher_failure_is_diagnosed() {
     setup_publish '' present
     local output
