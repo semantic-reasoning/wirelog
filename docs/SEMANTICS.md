@@ -1828,9 +1828,11 @@ complete without replay or rollback.
 The general observed STEP host can evaluate a proven append to one EDB using
 only its appended interval. Eligibility is decided for the whole host before
 execution: all heads are positive, nonrecursive INT64 compositions reading EDBs
-directly, with at most one occurrence of the changed input in each entire head
-body. Pure projections, filters and unions are supported. Unchanged branches
-may recompute duplicates. Repeated changed reads, transitive IDB dependencies,
+directly, with at most one changed-input read along each evaluated branch.
+A charged stack-degree proof adds JOIN inputs and takes the maximum over UNION
+alternatives, so separate linear branches may each read the appended suffix.
+Pure projections, filters and unions are supported. Unchanged branches
+may recompute duplicates. Nonlinear repeated changed reads, transitive IDB dependencies,
 nonmonotone operations, mixed input changes and removals retain controlled full
 recomputation.
 

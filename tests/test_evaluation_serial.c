@@ -4424,14 +4424,27 @@ test_controlled_observed_multi(void)
 
 static unsigned append_dispatches;
 static uint32_t append_selected_rows;
+static unsigned append_selected_op, append_left_reads, append_right_reads;
 static void
 append_dispatch_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
 {
     (void)control;
+    if (phase == 44) append_selected_op = progress;
     if (phase != 28) return;
     CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
             bindings->session, bindings));
+    const wl_plan_op_t *selected = &bindings->plan->ops[append_selected_op];
+    if (selected->op == WL_PLAN_OP_VARIABLE) {
+        CHECK(!strcmp(selected->relation_name,
+            bindings->session->last_inserted_relation));
+        append_left_reads++;
+    } else {
+        CHECK(selected->op == WL_PLAN_OP_JOIN);
+        CHECK(!strcmp(selected->right_relation,
+            bindings->session->last_inserted_relation));
+        append_right_reads++;
+    }
     append_dispatches++;
     append_selected_rows += progress;
 }
@@ -4602,9 +4615,16 @@ static void
 test_controlled_append_successors(void)
 {
     const unsigned phases[] = {25, 26, 27, 28, 8, 13, 14, 15};
-    for (unsigned shape = 0; shape < 3; ++shape) {
+    for (unsigned shape = 0; shape < 4; ++shape) {
         for (unsigned trial = 0; trial < (shape ? 1u : 17u); ++trial) {
-            const char *source = shape == 1
+            const char *source = shape == 3
+                ? ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
+                ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
+                "a(x,y) :- l(x), r(x,y), y > 0.\n"
+                "a(x,y) :- r(x,y), l(y), x < 9.\n"
+                "a(x,y) :- r(x,y), x = 9.\n"
+                "b(x,y) :- l(x), r(x,y).\n"
+                : shape == 1
                 ? ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
                 ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
                 "a(x,y) :- l(x), r(x,y), l(y).\n"
@@ -4680,6 +4700,7 @@ test_controlled_append_successors(void)
                     }
                 }
                 append_dispatches = append_selected_rows = 0;
+                append_left_reads = append_right_reads = 0;
                 append_stopped = false; append_stop_phase = UINT_MAX;
                 if (trial) {
                     append_stop_phase = phases[(trial - 1) / 2];
@@ -4716,7 +4737,11 @@ test_controlled_append_successors(void)
                     CHECK(!observed_multi_step(session));
                 } else {
                     CHECK(!rc);
-                    CHECK(append_dispatches == (!shape && cycle < 3 ? 2u : 0u));
+                    CHECK(append_dispatches == (cycle < 3
+                        ? !shape ? 2u : shape == 3 ? 3u : 0u : 0u));
+                    if (shape == 3 && cycle < 3)
+                        CHECK(append_left_reads == 2 &&
+                            append_right_reads == 1);
                     CHECK(append_selected_rows == append_dispatches
                         * (cycle == 0 || cycle == 2 ? 2u : 1u));
                 }

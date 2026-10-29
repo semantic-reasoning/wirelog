@@ -458,3 +458,15 @@ not close G3b or #1821. Nonlinear/default K execution, weighted traces, persiste
 raw epoch/rule frontiers and cross-attempt incremental retractions remain open,
 alongside persistent prefix metadata and the recorded G4–G7 obligations. Repeated
 seed work is allowed; no universal raw performance improvement is claimed.
+
+## Positive linear frontier PR bundle
+
+The recursive UNION increment is grouped with acyclic append UNION execution
+and integrated source-map authority/recovery qualification in one PR, preserving
+a separate atomic commit for each unit. The append host now uses a charged
+per-branch degree proof and mode-specific occurrence markers for direct-EDB
+linear alternatives. Nonlinear repeated reads, transitive dependencies, mixed
+mutations and removals keep whole-host full recomputation. Existing common
+publication, suffix ownership and explicit differential opt-out remain intact.
+The subsequent qualification unit supplies the combined lifecycle evidence;
+this bundle does not close the remaining G3b obligations above.
