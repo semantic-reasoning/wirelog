@@ -492,6 +492,11 @@ static void unsupported_filters(void)
 
 int main(void)
 {
+    /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
+     * refuses wirelog_session_seal_join_input, so clear the inherited knob
+     * and its _STRICT companion before the first session exists. */
+    environment("WIRELOG_JOIN_BATCH_BYTES", NULL);
+    environment("WIRELOG_JOIN_BATCH_STRICT", NULL);
     char *budget = copy_environment("WIRELOG_MEMORY_BUDGET");
     environment("WIRELOG_MEMORY_BUDGET", "268435456");
 #ifdef _WIN32

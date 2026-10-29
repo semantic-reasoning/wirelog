@@ -11,6 +11,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define unsetenv wl_test_unsetenv_
+#endif
+
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, \
                                       __LINE__, #x); abort(); } } while (0)
 #define BUDGET (UINT64_C(256) * 1024 * 1024)
@@ -1122,6 +1132,13 @@ fixed_budget_reclamation(void)
 int
 main(void)
 {
+    /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
+     * _STRICT, and a nonzero batch size refuses spill JOIN selection and
+     * sealed cold input. The knob cases here set the session fields
+     * directly, so clear the inherited environment before the first
+     * session exists. */
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     for (unsigned enabled = 0; enabled < 2; enabled++) {
         fixture_t f = fixture(enabled != 0, 65536);
         wl_col_session_t *s = COL_SESSION(f.session);
