@@ -1508,7 +1508,9 @@ static void reference_joins(bool inlined)
                         types[3] == WIRELOG_TYPE_STRING &&
                         types[4] == WIRELOG_TYPE_STRING);
                     CHECK(wl_columnar_batch_payload_uses_intern(out, intern));
-                    CHECK(!wl_columnar_batch_payload_inline_schema(out, NULL));
+                    uint32_t logical_count = UINT32_MAX;
+                    CHECK(!wl_columnar_batch_payload_inline_schema(out,
+                        &logical_count) && logical_count == 0);
                     wl_columnar_batch_payload_reader_t *reader;
                     CHECK(wl_columnar_batch_payload_acquire(out,
                         &reader) == OK);
