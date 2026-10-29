@@ -6,6 +6,14 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Flat INLINE cold field consumers** (#1372): bounded projection/JOIN paths
+  consume declared scalar children, including STRING keys and payloads, through
+  either cold input, self JOINs and resident intermediate chains. Source layout
+  and original-use provenance are checked before retirement; copied semantic
+  metadata and intern pins preserve functors even for numeric-only INLINE.
+  Public typed/failure/memory tests retain explicit resident metadata/output
+  floors. Whole compounds, SIDE and nested handles remain unsupported.
+
 - **Declared INLINE source layout** (#1372): plans own logical declarations,
   and ordinary sessions initialize governed flat INLINE metadata before facts
   or raw inserts, including empty numeric inputs. Original unsupported body

@@ -910,6 +910,108 @@ static void reference_public_joins(void)
     }
 }
 
+static void inline_public_projections(void)
+{
+    for (unsigned filtered = 0; filtered < 2; filtered++)
+        for (unsigned empty = 0; empty < 2; empty++)
+            for (unsigned order = 0; order < 3; order++) {
+                char text[1024];
+                snprintf(text, sizeof(text),
+                    ".decl a(p:pair(int64,symbol) inline,q:box(symbol) inline)\n.decl b(p:pair(symbol,int64) inline)\n"
+                    ".decl result(s:symbol,k:int64,t:symbol)\n.decl other(s:symbol,k:int64)\n"
+                    "a(0,\"\",\"unused\").\na(1,\"alpha\",\"unused\").\na(2,\"한글\",\"unused\").\n"
+                    "b(\"\",0).\nb(\"alpha\",1).\nb(\"한글\",2).\n"
+                    "result(s,k,s) :- a(pair(k,s),box(u))%s.\nother(s,k) :- b(pair(s,k)).\n",
+                    filtered ? ", k >= 1" : "");
+                wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+                wirelog_session_options_v1_t o = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &o, &s) == WIRELOG_OK);
+                int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+                CHECK(wirelog_program_get_facts(p, "a", &facts, &rows,
+                    &cols) == 0 && rows == 3 && cols == 3);
+                reference_public_events_t expected = {0};
+                for (unsigned i = 0; i < rows; i++) {
+                    CHECK(facts[i*cols] >= 0 && facts[i*cols] < 3);
+                    expected.ids[facts[i*cols]] = facts[i*cols+1];
+                    if (empty) CHECK(wirelog_session_remove(s, "a",
+                            facts+i*cols, 1, cols) == WIRELOG_OK);
+                }
+                if (!empty) CHECK(wirelog_session_insert(s, "a", facts, 1,
+                        cols) == WIRELOG_OK);                                                /* Duplicate row. */
+                free(facts); facts = NULL;
+                CHECK(wirelog_program_get_facts(p, "b", &facts, &rows,
+                    &cols) == 0 && rows == 3 && cols == 2);
+                if (empty) CHECK(wirelog_session_remove(s, "b", facts, rows,
+                        cols) == WIRELOG_OK);
+                free(facts);
+                if (order) {
+                    CHECK(wirelog_session_seal_input(s,
+                        order == 1 ? "a" : "b") == WIRELOG_OK);
+                    CHECK(wirelog_session_seal_join_input(s,
+                        order == 1 ? "b" : "a") == WIRELOG_OK);
+                }
+                if (order == 2) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    reference_public_events_t e = expected;
+                    CHECK(wirelog_session_snapshot_typed(s,
+                        reference_public_observe, &e) == WIRELOG_OK);
+                    CHECK(e.bits[0] == (empty ? 0u : filtered ? 6u : 7u) &&
+                        e.bits[1] == (empty ? 0u : 7u));
+                }
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(live_files() == 0);
+            }
+}
+
+static void inline_public_joins(void)
+{
+    const char *text =
+        ".decl a(p:pair(symbol,int64) inline)\n.decl b(p:triple(symbol,symbol,int64) inline)\n"
+        ".decl c(p:pair(symbol,int64) inline)\n"
+        ".decl result(k:symbol,x:int64,next:symbol,z:int64)\n"
+        ".decl self(k:symbol,x:int64,p:symbol,y:int64)\n"
+        ".decl scan(k:symbol,x:int64)\n"
+        ".decl second(k:symbol,x:int64,next:symbol,y:int64)\n"
+        "a(\"\",0).\na(\"alpha\",1).\na(\"한글\",2).\n"
+        "b(\"\",\"alpha\",10).\nb(\"alpha\",\"한글\",11).\nb(\"한글\",\"\",12).\n"
+        "c(\"alpha\",100).\nc(\"한글\",101).\nc(\"\",102).\n"
+        "result(k,x,n,z+0) :- a(pair(k,x)),b(triple(k,n,y)),c(pair(n,z)).\n"
+        "self(k,x,k,y+0) :- a(pair(k,x)),a(pair(k,y)).\n"
+        "scan(k,x) :- a(pair(k,x)).\n"
+        "second(k,x,n,y+0) :- a(pair(k,x)),b(triple(k,n,y)).\n";
+    for (unsigned direction = 0; direction < 5; direction++) {
+        wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t o = configured();
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT,
+            1, &o, &s) == WIRELOG_OK);
+        int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+        CHECK(wirelog_program_get_facts(p, "a", &facts, &rows,
+            &cols) == 0 && rows == 3 && cols == 2);
+        reference_chain_events_t expected = {0};
+        for (unsigned i = 0; i < rows;
+            i++) expected.ids[facts[i*2+1]] = (uint64_t)facts[i*2];
+        free(facts);
+        const char *names[] = {"a", "b", "c"};
+        if (direction == 1) CHECK(wirelog_session_seal_input(s,
+                "a") == WIRELOG_OK);
+        if (direction == 2) CHECK(wirelog_session_seal_input(s,
+                "c") == WIRELOG_OK);
+        if (direction >= 3) for (unsigned i = 0; i < 3; i++)
+                CHECK(wirelog_session_seal_input(s,
+                    names[direction == 3 ? i : 2-i]) == WIRELOG_OK);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            reference_chain_events_t e = expected;
+            CHECK(wirelog_session_snapshot_typed(s, reference_chain_observe,
+                &e) == WIRELOG_OK);
+            for (unsigned i = 0; i < 4; i++) CHECK(e.seen[i] == 7);
+            CHECK(wirelog_session_step(s) == WIRELOG_OK);
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(live_files() == 0);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -928,6 +1030,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();
     join_directions(); join_chains();

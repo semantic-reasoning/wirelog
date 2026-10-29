@@ -168,7 +168,7 @@ wirelog_session_create_with_snapshot(wirelog_program_t *program,
  * NULL directory and zero spill limits disable spilling. Otherwise the
  * directory must already exist, quota must be positive, and max_row_bytes
  * must be at least 32 (wider schemas require more). Both join caps must be
- * zero (store only) or positive (enable eligible serial numeric JOINs).
+ * zero (store only) or positive (enable eligible serial bounded JOINs).
  * Positive caps require a configured directory. No directories are created.
  *
  * Caps bound individual batches/index windows, not total memory. The existing
@@ -228,11 +228,17 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * A cold left input is consumed by an initial VARIABLE/JOIN pair; both sides
  * may be sealed, including a self-JOIN. Subsequent JOINs consume an admitted
  * resident intermediate. No FILTER/MAP before that first cold JOIN, multi-key,
- * cross/theta JOIN, other key types, right filter, timestamps, compound values,
+ * cross/theta JOIN, other key types, right filter, timestamps, whole compound
+ * values, SIDE/nested layouts,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * JOINs and standalone direct/filtered projections accept STRING lanes from
  * the originating program intern table, including non-key payload columns.
  * Both JOIN keys must have the same type; reference IDs are never remapped.
+ * Declared flat INLINE sources may supply scalar child lanes through these
+ * projection/JOIN shapes. The initialized layout and original body-use
+ * provenance must agree with the plan; nested/whole-value/wrong-functor or
+ * wrong-arity uses make the source ineligible. Outputs are scalar fields,
+ * not reconstructed compounds. Even numeric INLINE retains its functor table.
  * The program must outlive the session. Intern storage remains resident, and
  * sealing validates IDs even in unprojected STRING lanes.
  * Optimized plans may therefore be ineligible. The session must also not have

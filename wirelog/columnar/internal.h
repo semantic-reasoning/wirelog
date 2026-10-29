@@ -4937,8 +4937,9 @@ int
 session_remove_rel(wl_col_session_t *sess, const char *name);
 /* Explicit internal pre-evaluation opt-in, under external session lifecycle
  * serialization. Caller keeps the plan immutable through session destruction.
- * Canonical numeric EDBs used only by supported right JOINs or complete
- * direct/filtered projections may be sealed individually. Success removes its resident registry owner and makes ALL fact and
+ * Supported scalar or declared flat INLINE EDBs used only by audited JOINs
+ * or complete direct/filtered projections may be sealed individually. Success
+ * removes its resident registry owner and makes ALL fact and
  * compound mutation unsupported, including zero-row requests. Failed sealing
  * preserves the source/registry and refunds private work.
  * No readers may escape synchronous operations; callbacks must not reenter
@@ -4954,6 +4955,11 @@ wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
 wl_columnar_session_cold_relation_t *wl_columnar_session_cold_find(
     const wl_col_session_t *session, const char *name);
 int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
+/* Read-only source/declaration provenance; returns NULL schema for scalars. */
+bool wl_columnar_session_cold_source_schema(const wl_col_session_t *session,
+    const char *name, const col_rel_t *resident,
+    const struct wl_columnar_batch_payload *payload,
+    const wl_plan_edb_schema_t **schema);
 /* Valid only after the complete cold projection body has been audited. */
 typedef struct {
     const wl_plan_op_t *map;

@@ -4726,10 +4726,10 @@ producer/output errors are covered by `test_batch_payload` and `test_join_spill`
 This completes the owned intermediate subset; it does not make registry or
 persistent trace storage cold, nor add differential cold execution.
 
-### Persistent sealed numeric JOIN input (#1372)
+### Persistent sealed projection and JOIN inputs (#1372)
 
 The internal `wl_columnar_session_seal_input` operation converts one eligible
-numeric EDB into a session-owned immutable cold binding before the
+scalar or declared flat INLINE EDB into a session-owned immutable cold binding before the
 first STEP or SNAPSHOT attempt. It captures privately, checks exclusive resident
 retirement, refunds the original allocation, removes the raw registry entry,
 and publishes the binding without a fallible gap. Failed capture, cancellation,
@@ -4747,9 +4747,9 @@ earlier bindings and their disk extents, and preserve the failed resident source
 Duplicate sealing is refused. Destruction releases every node and payload before
 the session store. Raw lookup of any known cold name remains an explicit error.
 
-Complete direct/narrowly filtered projection rules over another loaded numeric
+Complete direct/narrowly filtered projection rules over another eligible loaded
 EDB can coexist whether that source is resident or already sealed. Auditing uses
-that source's complete numeric schema and metadata, not the selected candidate's
+that source's complete physical schema and declaration provenance, not the selected candidate's
 width/types. This does not admit arbitrary resident filters or filters on IDBs,
 and another source's valid projection cannot authorize an unused candidate.
 
@@ -4757,13 +4757,14 @@ The supported plan is serial, nonrecursive, and contains only audited
 VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
 described below. The cold name must have an eligible consumer: a JOIN input
 or the exact direct/filtered projection body below; it cannot be a relation head
-or an arbitrary VARIABLE consumer. Eligible JOINs use one INT64 key,
-scalar numeric rows, no timestamps and no right filter. Multiple eligible JOINs
+or an arbitrary VARIABLE consumer. Eligible JOINs use one matching INT64 or
+STRING key, supported scalar lanes (including declared flat INLINE fields),
+no timestamps and no right filter. Multiple eligible JOINs
 may consume the same binding. A cold left source requires an initial
 VARIABLE/JOIN pair. Both inputs can be sealed, and a self-JOIN acquires two
 independent reader pins over one persistent owner. A subsequent JOIN consumes
 an admitted resident intermediate. FILTER/MAP before the first cold JOIN,
-multi-key/cross/theta JOINs and non-INT64 keys are refused. Available source
+multi-key/cross/theta JOINs and other key types are refused. Available source
 schemas and projection bounds are checked before retirement and again at
 execution; an unloaded resident counterpart is checked when its schema exists.
 Spill batch/index caps must be positive. Opaque
@@ -4851,7 +4852,7 @@ retained-source control remains the causal reclamation proof; this public test
 qualifies the actual host boundary and output floor.
 
 After loading all inputs, call `wirelog_session_seal_input` for one eligible
-numeric input. `wirelog_session_seal_join_input` remains a compatibility spelling
+scalar or declared flat INLINE input. `wirelog_session_seal_join_input` remains a compatibility spelling
 with identical eligibility, errors and lifetime. A projection-only program can
 seal its source without a JOIN. It uses the exact immutable plan/mode restrictions above;
 opaque optimized plans, VARIABLE reads outside the direct-projection subset, recursive, worker,
@@ -4929,7 +4930,7 @@ actual corresponding CI run, not a Linux macro compile.
 
 ### Bounded direct projections of sealed JOIN inputs (#1372)
 
-A sealed numeric JOIN input can also supply an exact three-operator
+An eligible sealed JOIN input can also supply an exact three-operator
 `VARIABLE(cold) → MAP(columns) → CONSOLIDATE` rule. For example, alongside
 `result(k,x,y + 0) :- a(k,x), b(k,y).`, a declared `keys(k)` head can use
 `keys(k) :- b(k,v).`. Such a projection may also be the source's only consumer:
@@ -5014,7 +5015,8 @@ controls cover one and both input owners without hiding resident output costs.
 
 ### Remaining #1372 implementation groups
 
-The sealed scalar numeric/STRING JOIN and projection subsets now have actual persistent cold storage,
+The sealed scalar numeric/STRING and declared flat INLINE field JOIN/projection
+subsets now have actual persistent cold storage,
 resident reclamation and evaluator consumers. General cold VARIABLE/direct-column access beyond the exact direct-projection
 subset, mutable relations, persistent trace/differential storage and their
 arrangement consumers remain separate integration work. They require stable
@@ -5130,5 +5132,33 @@ Original nested/whole-compound body uses are recorded separately before lowering
 loses that information. This summary restricts future cold eligibility, not
 ordinary source initialization or existing resident evaluation. The declaration
 record alone does not prove that a consumer supports a flat field view. SIDE
-and mixed SIDE layouts retain their existing initialization behavior. This
-preparation does not yet enable INLINE cold consumers.
+and mixed SIDE layouts retain their existing initialization behavior. Flat INLINE field consumers use this provenance as described below.
+
+### Flat INLINE cold field consumers (#1372, partial)
+
+The same bounded projection and JOIN paths now accept real declaration-derived
+flat INLINE sources. Preflight compares logical kind/arity/offset/functor and
+all physical lane types with the initialized source. The source must have an
+owned plan declaration and no original unsupported body use. Nested/whole-value,
+wrong-functor/arity and SIDE consumers remain ineligible even when lowering
+would otherwise resemble a scalar projection. Missing declarations, invalid
+functors, mismatched layouts and invalid STRING IDs refuse before retirement.
+Runtime rechecks every binding against its originating declaration capability.
+
+Capture copies semantic declarations into the payload and pins the originating
+intern table, including numeric-only INLINE sources whose functor is the only
+reference. Reordered/extracted output lanes keep their scalar types and do not
+inherit the source arity map. STRING child keys use the same intern-identity
+rule as scalar STRING JOINs. Both input directions, both-cold/self JOINs,
+resident intermediate chains and independent scans share this contract.
+
+Tests use parsed STRING-child declarations and automatically initialized source
+metadata, with empty/Unicode values, physical raw inserts, multiple logical
+INLINE groups and actual typed public output. Malformed layout/provenance and
+allocation/write/read/cancellation failures preserve source/prior bindings and
+refund private work. Numeric-only INLINE explicitly retains functor capability.
+Fixed-intern/schema two-cardinality checks retain bounded JOIN scratch; paired
+retained-source controls prove projection and one/two-owner JOIN reclamation.
+Intern/declaration storage, resident output and intermediate floors remain.
+The program must still outlive public sessions; no public lifetime shortcut,
+whole compound reconstruction, SIDE or nested-handle ownership is introduced.

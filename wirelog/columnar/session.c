@@ -615,6 +615,83 @@ wl_columnar_session_cold_find(const wl_col_session_t *s, const char *name)
     return NULL;
 }
 
+/* Read-only declaration/source audit shared by seal preflight and consumers.
+ * Numeric scalar legacy plans need no declaration record. INLINE requires both
+ * original-use provenance and the real initialized layout, never guessed IDs. */
+bool
+wl_columnar_session_cold_source_schema(const wl_col_session_t *s,
+    const char *name, const col_rel_t *r,
+    const wl_columnar_batch_payload_t *payload,
+    const wl_plan_edb_schema_t **out)
+{
+    *out = NULL;
+    const wl_plan_edb_schema_t *schema = NULL;
+    if (s->plan && s->plan->edb_schemas && name)
+        for (uint32_t i = 0; i < s->plan->edb_count; i++)
+            if (s->plan->edb_relations && s->plan->edb_relations[i] &&
+                !strcmp(s->plan->edb_relations[i], name)) {
+                schema = &s->plan->edb_schemas[i]; break;
+            }
+    uint32_t logical = 0;
+    const wirelog_column_t *stored = payload ?
+        wl_columnar_batch_payload_inline_schema(payload, &logical) : NULL;
+    bool actual_inline = stored ||
+        (r && (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE ||
+        r->compound_count || r->compound_arity_map || r->compound_arity_len ||
+        r->inline_physical_offset));
+    if (r && (r->has_graph_column || r->timestamps)) return false;
+    if (!schema || !schema->columns ||
+        !schema->column_count) return !actual_inline;
+    if (schema->has_unsupported_inline_cold_use || !s->intern ||
+        !s->plan || s->intern != s->plan->intern ||
+        (!r && !payload)) return false;
+    uint32_t width = r ? r->ncols : 0;
+    const wirelog_column_type_t *types = r ? r->column_types :
+        wl_columnar_batch_payload_schema(payload, &width, NULL);
+    if (wl_columnar_spill_validate_inline_schema(types, width, schema->columns,
+        schema->column_count) != WL_COLUMNAR_SPILL_OK) return false;
+    if (payload && (!stored || logical != schema->column_count ||
+        !wl_columnar_batch_payload_uses_intern(payload,
+        s->intern))) return false;
+    if (r && (r->compound_kind != WIRELOG_COMPOUND_KIND_INLINE ||
+        !r->compound_arity_map ||
+        r->compound_arity_len != schema->column_count)) return false;
+    uint32_t compounds = 0, first = 0;
+    for (uint32_t i = 0; i < schema->column_count; i++) {
+        const wirelog_column_t *c = &schema->columns[i];
+        bool inlined = c->compound_kind == WIRELOG_COMPOUND_KIND_INLINE;
+        uint32_t lanes = inlined ? c->compound_arity : 1;
+        if (inlined) {
+            if (!wl_intern_reverse(s->intern,
+                c->compound_functor_id)) return false;
+            if (!compounds++) first = c->compound_inline_col_offset;
+        }
+        if (r && r->compound_arity_map[i] != lanes) return false;
+        if (stored &&
+            (stored[i].type != c->type ||
+            stored[i].compound_kind != c->compound_kind ||
+            stored[i].compound_functor_id != c->compound_functor_id ||
+            stored[i].compound_arity != c->compound_arity ||
+            stored[i].compound_inline_col_offset !=
+            c->compound_inline_col_offset)) return false;
+    }
+    if (r &&
+        (r->compound_count != compounds ||
+        r->inline_physical_offset != first)) return false;
+    /* Packed declared child types are authoritative even for unprojected lanes. */
+    for (uint32_t i = 0; i < s->plan->edb_count; i++) {
+        if (&s->plan->edb_schemas[i] != schema) continue;
+        if (!s->plan->edb_column_type_counts || !s->plan->edb_column_types ||
+            s->plan->edb_column_type_counts[i] != width ||
+            !s->plan->edb_column_types[i]) return false;
+        for (uint32_t c = 0; c < width; c++)
+            if (types[c] != s->plan->edb_column_types[i][c]) return false;
+        break;
+    }
+    *out = schema;
+    return true;
+}
+
 /* Eligibility of another rule is independent of the sealing order. Resolve
  * its own complete scalar schema, never the candidate's schema. Discovery is
  * read-only: a failed preflight must not allocate a resident registry hash. */
@@ -636,6 +713,9 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
     uint32_t width = 0;
     const wirelog_column_type_t *types = NULL;
     if (c) {
+        const wl_plan_edb_schema_t *schema;
+        if (!wl_columnar_session_cold_source_schema(s, name, NULL, c->payload,
+            &schema)) return false;
         width = c->ncols;
         types = wl_columnar_batch_payload_schema(c->payload, NULL, NULL);
     } else {
@@ -644,10 +724,9 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
             if (s->rels[i] && !strcmp(s->rels[i]->name, name)) {
                 r = s->rels[i]; break;
             }
-        if (!r || !r->ncols || r->timestamps || r->has_graph_column ||
-            r->compound_kind != WIRELOG_COMPOUND_KIND_NONE ||
-            r->compound_count || r->compound_arity_map ||
-            r->compound_arity_len || r->inline_physical_offset) return false;
+        const wl_plan_edb_schema_t *schema;
+        if (!r || !r->ncols || !wl_columnar_session_cold_source_schema(s, name,
+            r, NULL, &schema)) return false;
         width = r->ncols; types = r->column_types;
         for (uint32_t i = 0; types && i < width; i++)
             if (types[i] != WIRELOG_TYPE_INT32 &&
@@ -756,6 +835,9 @@ wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
         c = c->next) {
         const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
             c->payload, NULL, NULL);
+        const wl_plan_edb_schema_t *schema;
+        if (!wl_columnar_session_cold_source_schema(s, c->name, NULL,
+            c->payload, &schema)) return ENOTSUP;
         for (uint32_t i = 0; i < c->ncols; i++)
             if (types[i] == WIRELOG_TYPE_STRING &&
                 !wl_columnar_batch_payload_uses_intern(c->payload,
@@ -813,6 +895,9 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
         strcmp(s->rels[slot]->name, name) != 0)) slot++;
     if (slot == s->nrels) return WL_COLUMNAR_SPILL_INVALID;
     col_rel_t *r = s->rels[slot];
+    const wl_plan_edb_schema_t *schema;
+    if (!wl_columnar_session_cold_source_schema(s, name, r, NULL, &schema))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
     if (r->memory_governor != s->memory_governor ||
         !wl_columnar_batch_payload_can_take(r) || r->timestamps ||
         !wl_columnar_session_cold_plan(s, name, r->ncols,
@@ -868,7 +953,11 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     c->cold_storage_generation = r->storage_generation + 1;
     bool inserted_name = s->last_inserted_relation &&
         strcmp(s->last_inserted_relation, r->name) == 0;
-    wl_columnar_spill_status_t rc =
+    wl_columnar_spill_status_t rc = schema ?
+        wl_columnar_batch_payload_capture_with_inline(s->memory_governor,
+            s->spill_store, r, r->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+            schema->columns, schema->column_count, s->intern, cancel, context,
+            &c->payload) :
         wl_columnar_batch_payload_capture_with_intern(
         s->memory_governor, s->spill_store, r, r->nrows,
         WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, s->intern, cancel, context,

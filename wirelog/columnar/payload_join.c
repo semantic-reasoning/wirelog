@@ -295,8 +295,14 @@ wl_columnar_payload_join_schema(wl_columnar_batch_payload_t *payload,
         wl_columnar_batch_payload_schema(payload, cols, rows);
     uint32_t logical;
     if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
-    if (wl_columnar_batch_payload_inline_schema(payload, &logical) ||
-        (types[key] != WIRELOG_TYPE_INT64 &&
+    const wirelog_column_t *columns =
+        wl_columnar_batch_payload_inline_schema(payload, &logical);
+    if (columns && (!intern || !wl_columnar_batch_payload_uses_intern(payload,
+        intern) ||
+        wl_columnar_spill_validate_inline_schema(types, *cols, columns,
+        logical) != WL_COLUMNAR_SPILL_OK))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    if ((types[key] != WIRELOG_TYPE_INT64 &&
         !(intern &&
         types[key] ==
         WIRELOG_TYPE_STRING))) return WL_COLUMNAR_SPILL_UNSUPPORTED;
