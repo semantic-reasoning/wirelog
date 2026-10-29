@@ -13,6 +13,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+static int
+wl_test_unsetenv_(const char *name)
+{
+    return _putenv_s(name, "");
+}
+
+#define unsetenv wl_test_unsetenv_
+#endif
+
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", \
                                       __FILE__, __LINE__, #x); abort(); \
                       } } while (0)
@@ -1209,6 +1219,13 @@ static void filtered_shape(void)
 
 int main(void)
 {
+    /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
+     * _STRICT, and a nonzero batch size refuses spill JOIN selection and
+     * sealed cold input. The knob cases here set the session fields
+     * directly, so clear the inherited environment before the first
+     * session exists. */
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
+    CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     projection_shape(); filtered_predicates(); filtered_shape();
     for (unsigned filtered = 0; filtered < 2; filtered++) {
         projection_consumers(filtered != 0); projection_failures(filtered != 0);

@@ -5745,6 +5745,10 @@ test_wirelog_advanced_spill_exe = executable(
 )
 test('wirelog_advanced_spill', test_wirelog_advanced_spill_exe,
   suite: ['unit', 'tsan'], timeout: 120)
+# #2287: the spill fixtures must not inherit the bounded join knob.
+test('wirelog_advanced_spill_join_batch_env', test_wirelog_advanced_spill_exe,
+  env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+  suite: ['unit'], timeout: 120)
 
 
 # Issue #841: umbrella public API symbols are real linkable/runtime
@@ -6590,6 +6594,10 @@ test_join_spill_exe = executable(
   link_with: [testlib_prod],
 )
 test('join_spill', test_join_spill_exe, suite: ['unit', 'tsan'], timeout: 120)
+# #2287: the spill fixtures must not inherit the bounded join knob.
+test('join_spill_join_batch_env', test_join_spill_exe,
+  env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+  suite: ['unit'], timeout: 120)
 
 # Production resumable observer baseline and transferable reader transitions.
 test_evaluation_observer_build_exe = executable(
@@ -6632,3 +6640,7 @@ test_session_cold_relation_exe = executable(
   link_with: [testlib_prod],
 )
 test('session_cold_relation', test_session_cold_relation_exe, suite: ['unit', 'tsan'], timeout: 120)
+# #2287: the spill fixtures must not inherit the bounded join knob.
+test('session_cold_relation_join_batch_env', test_session_cold_relation_exe,
+  env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+  suite: ['unit'], timeout: 120)
