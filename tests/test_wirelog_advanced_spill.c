@@ -1,4 +1,7 @@
 /* Public-only #1372 host integration against the production shared library. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #endif
