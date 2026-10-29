@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 
 #include "columnar/internal.h"
+#include "columnar/batch_payload.h"
 #include "columnar/join_batch.h"
 #include "columnar/join_pipeline.h"
 #include "wirelog/util/log.h"
@@ -371,10 +372,70 @@ ordinary_join:
     return 0;
 }
 
+/* A cold source may bypass resident VARIABLE only for this complete body.
+ * Canonical column bytecode is accepted, never arbitrary expressions. */
+bool
+wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types)
+{
+    if (!rp || !name || !rp->ops || rp->op_count != 3) return false;
+    const wl_plan_op_t *v = &rp->ops[0], *m = &rp->ops[1];
+    if (v->op != WL_PLAN_OP_VARIABLE || !v->relation_name ||
+        strcmp(v->relation_name, name) || m->op != WL_PLAN_OP_MAP ||
+        rp->ops[2].op != WL_PLAN_OP_CONSOLIDATE ||
+        !m->project_count || !m->project_indices) return false;
+    for (uint32_t i = 0; i < 3; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->opaque_data || op->materialized || op->right_relation ||
+            (i && op->relation_name) || op->right_filter_expr.size ||
+            (op->delta_mode != WL_DELTA_AUTO &&
+            op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
+    }
+    if ((m->map_exprs == NULL) != (m->map_expr_count == 0) ||
+        (m->map_expr_count && m->map_expr_count != m->project_count))
+        return false;
+    for (uint32_t i = 0; i < m->project_count; i++) {
+        if (m->project_indices[i] >= ncols) return false;
+        if (!m->map_expr_count) continue;
+        const wl_plan_expr_buffer_t *e = &m->map_exprs[i];
+        if (!e->size && !e->data) continue;
+        if (!e->data || e->size < 7 ||
+            (e->data[0] != WL_PLAN_EXPR_VAR &&
+            e->data[0] != WL_PLAN_EXPR_VAR_FLOAT)) return false;
+        uint16_t len;
+        memcpy(&len, e->data + 1, sizeof(len));
+        if ((uint32_t)len + 3 != e->size ||
+            memcmp(e->data + 3, "col", 3)) return false;
+        uint32_t col = 0;
+        for (uint32_t j = 6; j < e->size; j++) {
+            unsigned digit = (unsigned)e->data[j] - '0';
+            if (digit > 9 || col > (UINT32_MAX - digit) / 10) return false;
+            col = col * 10 + digit;
+        }
+        if (col != m->project_indices[i] ||
+            ((e->data[0] == WL_PLAN_EXPR_VAR_FLOAT) !=
+            (types && types[col] == WIRELOG_TYPE_FLOAT))) return false;
+    }
+    return true;
+}
+
 int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    if (sess->cold_relation && rplan->ops) {
+        const char *name = sess->cold_relation->name;
+        for (uint32_t i = 0; i < rplan->op_count; i++) {
+            if (!rplan->ops[i].relation_name ||
+                strcmp(rplan->ops[i].relation_name, name)) continue;
+            if (wl_columnar_session_cold_execution_check(sess) ||
+                !wl_columnar_eval_plan_cold_projection(rplan, name,
+                sess->cold_relation->ncols, wl_columnar_batch_payload_schema(
+                    sess->cold_relation->payload, NULL, NULL))) return ENOTSUP;
+            int rc = wl_columnar_ops_cold_projection(rplan, stack, sess);
+            return rc ? rc : col_op_consolidate(stack, sess);
+        }
+    }
     if (!sess->tdd_input_run)
         return wl_columnar_eval_plan_body(rplan, stack, sess);
     wl_columnar_eval_tdd_run_t *run = sess->tdd_input_run;

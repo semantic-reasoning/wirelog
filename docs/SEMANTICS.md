@@ -250,8 +250,13 @@ caps. NULL preserves legacy defaults; existing creators are unchanged. Inline
 facts still load before return. Options and directory storage are borrowed only
 for construction; the program stays borrowed for the session lifetime.
 
-`wirelog_session_seal_join_input` exposes the internal pre-evaluation right-only
-numeric EDB transition. It retains the conservative serial immutable-plan
+`wirelog_session_seal_join_input` exposes the internal pre-evaluation
+numeric JOIN-input transition. A sealed JOIN input may additionally feed an exact
+`VARIABLE → MAP → CONSOLIDATE` direct column-projection rule. Column indices
+may repeat or reorder; arbitrary expressions, filters and cold left JOINs remain
+unsupported, and at least one eligible right JOIN consumer is required. Reads
+use independent bounded pins; projected output and consolidation remain resident.
+It retains the conservative serial immutable-plan
 eligibility checks and makes all fact/compound mutation unsupported after
 success. Refusal preserves the source but cannot reopen the seal window after
 an evaluation attempt. Cold lookup never substitutes empty input for an

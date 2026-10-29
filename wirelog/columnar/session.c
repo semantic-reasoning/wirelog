@@ -586,7 +586,7 @@ wl_columnar_session_test_has_retained_cold_source(const wl_col_session_t *s)
 #endif
 
 /* Cold bindings never enter the raw relation registry. Only an audited,
- * immutable plan may access them, through the bounded right-JOIN reader. */
+ * immutable plan may access them through bounded JOIN/projection readers. */
 static bool
 wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
     uint32_t ncols, const char *const *names,
@@ -616,7 +616,9 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     op->op != WL_PLAN_OP_CONSOLIDATE) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
-                if (op->relation_name && strcmp(op->relation_name, name) == 0)
+                if (op->relation_name && strcmp(op->relation_name, name) == 0 &&
+                    !wl_columnar_eval_plan_cold_projection(rp, name, ncols,
+                    types))
                     return false;
                 if (!op->right_relation || strcmp(op->right_relation,
                     name) != 0)

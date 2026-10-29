@@ -402,6 +402,49 @@ static void output_floor(void)
     CHECK(live_files() == 0);
 }
 
+typedef struct { unsigned keys, joined, seen; uint64_t key_bits[2];
+} mixed_events_t;
+static void mixed_observe(const char *name, const int64_t *row, uint32_t cols,
+    void *ctx)
+{
+    mixed_events_t *e = ctx;
+    if (!strcmp(name, "keys")) {
+        CHECK(cols == 1 && row[0] >= 0 && row[0] < 128);
+        unsigned key = (unsigned)row[0];
+        uint64_t mask = UINT64_C(1) << (key % 64);
+        CHECK(!(e->key_bits[key / 64] & mask)); e->key_bits[key / 64] |= mask;
+        e->keys++;
+    } else {
+        events_t one = {0}; observe(name, row, cols, &one);
+        CHECK(!(e->seen & one.seen)); e->seen |= one.seen; e->joined++;
+    }
+}
+static void mixed_projection(void)
+{
+    const char *text =
+        ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n"
+        ".decl result(k:int64,x:int64,y:int64)\n.decl keys(k:int64)\n"
+        "result(k,x,y + 0) :- a(k,x),b(k,y).\nkeys(k) :- b(k,v).\n";
+    for (unsigned sealed = 0; sealed < 2; sealed++) {
+        wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t o = configured();
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
+            &o, &s) == WIRELOG_OK);
+        populate(s, false);
+        if (sealed) {
+            CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_OK);
+            check_mutation(s);
+        }
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            mixed_events_t e = {0};
+            CHECK(wirelog_session_snapshot(s, mixed_observe, &e) == WIRELOG_OK);
+            CHECK(e.keys == 128 && e.joined == 4 && e.seen == 15);
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(live_files() == 0);
+    }
+}
+
 int main(void)
 {
     char *budget = copy_environment("WIRELOG_MEMORY_BUDGET");
@@ -416,7 +459,7 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
-    output_floor();
+    output_floor(); mixed_projection();
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);
 #else

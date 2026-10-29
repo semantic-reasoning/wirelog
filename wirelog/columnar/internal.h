@@ -2337,7 +2337,7 @@ typedef struct {
 
 struct wl_columnar_retained_eval_entry;
 
-/* Authoritative immutable right-only EDB. Never a resident registry relation.
+/* Authoritative immutable JOIN input. Never a resident registry relation.
  * All metadata shares reservation; payload owns types and rows. Borrowed fields
  * and readers may not escape a serialized session operation. */
 typedef struct wl_columnar_session_cold_relation {
@@ -4946,6 +4946,11 @@ wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
     wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
     void *context);
 int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
+bool wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *plan,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types);
+int wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *session);
+
 /* Shared schema lookup semantics, including the resident col<N> fallback. */
 int wl_columnar_relation_schema_column_index(uint32_t ncols,
     const char *const *names, const char *name);

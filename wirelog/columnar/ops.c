@@ -34,6 +34,7 @@
 
 #include "columnar/internal.h"
 #include "columnar/join_batch.h"
+#include "columnar/batch_payload.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
 
@@ -117,6 +118,8 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     if (!op->relation_name)
         return ENOENT;
+    if (sess->cold_relation &&
+        !strcmp(sess->cold_relation->name, op->relation_name)) return ENOTSUP;
     col_rel_t *full_rel = session_find_rel(sess, op->relation_name);
     if (!full_rel)
         return ENOENT;
@@ -346,6 +349,99 @@ col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
         wl_columnar_expr_compiled_free(programs[c]);
     free((void *)programs);
     wl_ops_scratch_release(&scratch);
+    return rc;
+}
+
+/* Read scratch is one pinned payload row plus one projected row/schema. The
+ * complete projected output remains resident and independently admitted. */
+int
+wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *sess)
+{
+    if (!sess || !stack || !sess->cold_relation ||
+        wl_columnar_session_cold_execution_check(sess) ||
+        !wl_columnar_eval_plan_cold_projection(plan, sess->cold_relation->name,
+        sess->cold_relation->ncols, wl_columnar_batch_payload_schema(
+            sess->cold_relation->payload, NULL, NULL))) return ENOTSUP;
+    const wl_plan_op_t *op = &plan->ops[1];
+    wl_columnar_session_cold_relation_t *cold = sess->cold_relation;
+    uint32_t width = op->project_count;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(width,
+        sizeof(int64_t) + sizeof(wirelog_column_type_t), &bytes) ||
+        bytes > SIZE_MAX) return EOVERFLOW;
+    wl_ops_scratch_t scratch;
+    int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, bytes,
+            sess);
+    if (rc) return rc;
+    int64_t *row = malloc((size_t)width * sizeof(*row));
+    wirelog_column_type_t *types = malloc((size_t)width * sizeof(*types));
+    col_rel_t *out = NULL;
+    wl_columnar_batch_payload_reader_t *reader = NULL;
+    col_rel_append_batch_t batch = {0};
+    bool appending = false;
+    if (!row || !types) {
+        rc = ENOMEM; goto done;
+    }
+    const wirelog_column_type_t *schema =
+        wl_columnar_batch_payload_schema(cold->payload, NULL, NULL);
+    for (uint32_t i = 0; i < width;
+        i++) types[i] = schema[op->project_indices[i]];
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_map_fail_output_alloc) {
+        rc = ENOMEM; goto done;
+    }
+#endif
+    rc = wl_columnar_relation_new_auto_governed("$map", width, cold->nrows,
+            false, sess->memory_governor, &out);
+    if (rc) goto done;
+    rc = col_rel_set_column_types(out, types, width);
+    if (rc) goto done;
+    wl_columnar_spill_status_t status =
+        wl_columnar_batch_payload_acquire(cold->payload, &reader);
+    if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+    rc = col_rel_append_batch_begin(&batch, out);
+    if (rc) goto done;
+    appending = true;
+    for (uint32_t ordinal = 0; ordinal < cold->nrows; ordinal++) {
+        const uint64_t *lanes = NULL;
+        wl_columnar_spill_metadata_t metadata;
+        status = wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL,
+                &lanes, &metadata);
+        if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+        for (uint32_t i = 0; i < width; i++)
+            memcpy(&row[i], &lanes[op->project_indices[i]], sizeof(row[i]));
+        rc = col_rel_append_batch_row(&batch, row);
+        if (rc) goto done;
+    }
+    rc = col_rel_append_batch_end(&batch, true);
+    appending = false;
+    goto done;
+spill_error:
+    switch (status) {
+    case WL_COLUMNAR_SPILL_MEMORY: rc = ENOSPC; break;
+    case WL_COLUMNAR_SPILL_ALLOCATION: rc = ENOMEM; break;
+    case WL_COLUMNAR_SPILL_IO:
+    case WL_COLUMNAR_SPILL_QUOTA:
+    case WL_COLUMNAR_SPILL_CAPACITY: rc = EIO; break;
+    case WL_COLUMNAR_SPILL_OVERFLOW: rc = EOVERFLOW; break;
+    case WL_COLUMNAR_SPILL_BUSY: rc = EBUSY; break;
+    default: rc = ENOTSUP; break;
+    }
+done:
+    if (appending) {
+        int ended = col_rel_append_batch_end(&batch, false);
+        if (ended) rc = ended;
+    }
+    wl_columnar_batch_payload_reader_release(reader);
+    free(types); free(row);
+    wl_ops_scratch_release(&scratch);
+    if (rc == ENOSPC) sess->memory_budget_denied = true;
+    if (!rc) rc = eval_stack_push(stack, out, true);
+    if (rc && out) {
+        eval_entry_t entry = {.rel = out, .owned = true};
+        return wl_columnar_ops_dispose_entry(stack, &entry, rc);
+    }
     return rc;
 }
 
