@@ -4934,14 +4934,17 @@ int
 session_remove_rel(wl_col_session_t *sess, const char *name);
 /* Explicit internal pre-evaluation opt-in, under external session lifecycle
  * serialization. Caller keeps the plan immutable through session destruction.
- * One canonical numeric EDB used only by supported ordinary right JOINs may be
- * sealed. Success removes its resident registry owner and makes ALL fact and
+ * One canonical numeric EDB used only by supported right JOINs or complete
+ * direct/filtered projections may be sealed. Success removes its resident registry owner and makes ALL fact and
  * compound mutation unsupported, including zero-row requests. Failed sealing
- * preserves the source/registry and refunds private work. No public host API.
+ * preserves the source/registry and refunds private work.
  * No readers may escape synchronous operations; callbacks must not reenter
  * source/session/store/governor lifecycle. STEP/SNAPSHOT recheck mode guards.
  * Original logical identity/view/ordinals survive in source_snapshot; storage
  * generation advances once. Old resident caches are not reusable. */
+wl_columnar_spill_status_t wl_columnar_session_seal_input(
+    wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
+    void *context);
 wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
     wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
     void *context);

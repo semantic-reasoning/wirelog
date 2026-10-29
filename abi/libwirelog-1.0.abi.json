@@ -91,6 +91,7 @@
     <elf-symbol name='wirelog_session_make_compound_typed' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_remove' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_remove_typed' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='wirelog_session_seal_input' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_seal_join_input' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_set_delta_cb' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='wirelog_session_set_typed_delta_cb' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>

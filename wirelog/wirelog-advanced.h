@@ -182,8 +182,9 @@ wirelog_session_create_with_snapshot(wirelog_program_t *program,
  * turns it on). Any other value, including an empty one, "0", "0x10", "5x",
  * "abc" or one out of range, leaves it off. When it is on, that session
  * selects no spill JOIN even with positive join caps, and
- * wirelog_session_seal_join_input() returns WIRELOG_ERR_EXEC. Changing the
- * environment after creation does not affect an existing session.
+ * wirelog_session_seal_input() and its compatibility spelling return
+ * WIRELOG_ERR_EXEC. Changing the environment after creation does not affect
+ * an existing session.
  */
 typedef struct {
     uint32_t struct_size;
@@ -213,18 +214,18 @@ wirelog_session_create_with_options(wirelog_program_t *program,
     const wirelog_session_options_v1_t *options, wirelog_session_t **out);
 
 /**
- * Seal one numeric JOIN input as persistent immutable spill input before
+ * Seal one numeric input as persistent immutable spill input before
  * the first STEP/SNAPSHOT attempt. Load all inputs first. Requires configured
  * spill JOIN caps and a serial nonrecursive plan using only audited
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
- * The selected name must have a JOIN
- * right consumer with one INT64 key. It may also feed a complete
+ * The selected name must have an eligible consumer: a JOIN right input with
+ * one INT64 key or a complete
  * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with one
  * FILTER before MAP comparing an INT64 column with an integer literal
  * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
  * remain resident; output capacity is admitted for the source row count even
- * when no row passes. Scan-only sealing and general cold pipelines
- * are unsupported. No right filter, timestamps, references,
+ * when no row passes. Projection-only programs need no JOIN consumer.
+ * General cold pipelines remain unsupported. No right filter, timestamps, references,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
@@ -245,6 +246,12 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * capacity or quota errors, and WIRELOG_ERR_EXEC for other invalid/unsupported,
  * busy or exhausted-generation states. Error classification is per operation.
  */
+WIRELOG_API wirelog_error_t
+wirelog_session_seal_input(wirelog_session_t *session,
+    const char *relation);
+
+/** Compatibility spelling of wirelog_session_seal_input, with identical
+ * eligibility, errors and lifetime. A JOIN consumer is not required. */
 WIRELOG_API wirelog_error_t
 wirelog_session_seal_join_input(wirelog_session_t *session,
     const char *relation);

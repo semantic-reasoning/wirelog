@@ -1217,6 +1217,51 @@ static void filtered_shape(void)
     destroy(&f);
 }
 
+static void standalone_reads(void)
+{
+    for (unsigned filtered = 0; filtered < 2; filtered++) {
+        char text[256];
+        snprintf(text, sizeof(text),
+            ".decl b(k:int64,v:int64)\n.decl keys(k:int64)\n"
+            "keys(k) :- b(k,v)%s.\n", filtered ? ", v >= 164" : "");
+        fixture_t f = fixture(text, 1024*1024, 8*1024*1024);
+        for (unsigned i = 0; i < 8192; i++) {
+            int64_t r[] = {(int64_t)i, 100+(int64_t)i};
+            CHECK(wl_session_insert(f.session, "b", r, 1, 2) == 0);
+        }
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(s->cold_relation && !session_find_rel(s, "b"));
+        const wl_plan_relation_t *rp = projection_plan(&f);
+        wl_plan_relation_t wide = *rp;
+        wl_plan_op_t ops[4]; memcpy(ops, rp->ops, rp->op_count*sizeof(*ops));
+        wide.ops = ops;
+        wl_plan_op_t *map = &ops[rp->op_count-2];
+        uint32_t indices[64] = {0};
+        map->project_indices = indices; map->project_count = 64;
+        map->map_exprs = NULL; map->map_expr_count = 0;
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(wl_columnar_ops_cold_projection(&wide, &stack, s) == ENOSPC);
+        CHECK(!stack.top && reserved(&f) == before);
+        projection_events_t events = {.rows = 8192,
+                                      .first = filtered ? 64u : 0u};
+        read_fault = 5;
+        CHECK(wl_session_snapshot(f.session, projection_observe,
+            &events) == EIO);
+        CHECK(!events.keys && !events.joined && s->cold_relation);
+        CHECK(wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+            NULL) == WL_COLUMNAR_SPILL_BUSY);
+        CHECK(wl_session_snapshot(f.session, projection_observe, &events) == 0);
+        CHECK(events.keys == 8192-events.first && !events.joined);
+        CHECK(events.sum == UINT64_C(8192)*8191/2 -
+            (uint64_t)events.first*(events.first ? events.first-1 : 0)/2);
+        destroy(&f);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -1226,6 +1271,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    standalone_reads();
     projection_shape(); filtered_predicates(); filtered_shape();
     for (unsigned filtered = 0; filtered < 2; filtered++) {
         projection_consumers(filtered != 0); projection_failures(filtered != 0);
