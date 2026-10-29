@@ -465,14 +465,15 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
     if (sess->cold_relation && rplan->ops) {
-        const char *name = sess->cold_relation->name;
         for (uint32_t i = 0; i < rplan->op_count; i++) {
-            if (!rplan->ops[i].relation_name ||
-                strcmp(rplan->ops[i].relation_name, name)) continue;
+            wl_columnar_session_cold_relation_t *cold =
+                wl_columnar_session_cold_find(
+                sess, rplan->ops[i].relation_name);
+            if (!cold) continue;
             if (wl_columnar_session_cold_execution_check(sess) ||
-                !wl_columnar_eval_plan_cold_projection(rplan, name,
-                sess->cold_relation->ncols, wl_columnar_batch_payload_schema(
-                    sess->cold_relation->payload, NULL, NULL))) return ENOTSUP;
+                !wl_columnar_eval_plan_cold_projection(rplan, cold->name,
+                cold->ncols, wl_columnar_batch_payload_schema(
+                    cold->payload, NULL, NULL))) return ENOTSUP;
             int rc = wl_columnar_ops_cold_projection(rplan, stack, sess);
             return rc ? rc : col_op_consolidate(stack, sess);
         }

@@ -118,8 +118,7 @@ col_op_variable(const wl_plan_op_t *op, eval_stack_t *stack,
     }
     if (!op->relation_name)
         return ENOENT;
-    if (sess->cold_relation &&
-        !strcmp(sess->cold_relation->name, op->relation_name)) return ENOTSUP;
+    if (wl_columnar_session_cold_find(sess, op->relation_name)) return ENOTSUP;
     col_rel_t *full_rel = session_find_rel(sess, op->relation_name);
     if (!full_rel)
         return ENOENT;
@@ -359,15 +358,17 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     eval_stack_t *stack, wl_col_session_t *sess)
 {
     wl_columnar_eval_plan_cold_projection_t decoded;
-    if (!sess || !stack || !sess->cold_relation ||
+    wl_columnar_session_cold_relation_t *cold = plan && plan->ops &&
+        plan->op_count
+        ? wl_columnar_session_cold_find(sess,
+            plan->ops[0].relation_name) : NULL;
+    if (!sess || !stack || !cold ||
         wl_columnar_session_cold_execution_check(sess) ||
         !wl_columnar_eval_plan_cold_projection_decode(plan,
-        sess->cold_relation->name,
-        sess->cold_relation->ncols, wl_columnar_batch_payload_schema(
-            sess->cold_relation->payload, NULL, NULL),
+        cold->name, cold->ncols, wl_columnar_batch_payload_schema(
+            cold->payload, NULL, NULL),
         &decoded)) return ENOTSUP;
     const wl_plan_op_t *op = decoded.map;
-    wl_columnar_session_cold_relation_t *cold = sess->cold_relation;
     uint32_t width = op->project_count;
     uint64_t bytes;
     if (!wl_columnar_memory_size_mul(width,

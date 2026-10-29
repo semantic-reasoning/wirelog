@@ -4735,6 +4735,20 @@ source identity, view and row ordinals while advancing the storage generation.
 Generation overflow is refused before capture. Existing resident arrangements
 cannot survive this transition.
 
+Several already-loaded inputs can be sealed independently in either order,
+using one stable governed node per input. All facts must be loaded before the
+first seal freezes mutation; additional sealing is allowed until evaluation.
+Each capture commits only its own binding. Failed later captures preserve all
+earlier bindings and their disk extents, and preserve the failed resident source.
+Duplicate sealing is refused. Destruction releases every node and payload before
+the session store. Raw lookup of any known cold name remains an explicit error.
+
+Complete direct/narrowly filtered projection rules over another loaded numeric
+EDB can coexist whether that source is resident or already sealed. Auditing uses
+that source's complete numeric schema and metadata, not the selected candidate's
+width/types. This does not admit arbitrary resident filters or filters on IDBs,
+and another source's valid projection cannot authorize an unused candidate.
+
 The supported plan is serial, nonrecursive, and contains only audited
 VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
 described below. The cold name must have an eligible consumer: a JOIN right

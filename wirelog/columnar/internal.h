@@ -2341,6 +2341,9 @@ struct wl_columnar_retained_eval_entry;
  * All metadata shares reservation; payload owns types and rows. Borrowed fields
  * and readers may not escape a serialized session operation. */
 typedef struct wl_columnar_session_cold_relation {
+    struct wl_columnar_session_cold_relation *next;
+    /* NULL in production; keep layout identical across test-hook builds. */
+    col_rel_t *retained_source;
     wl_columnar_memory_reservation_t reservation;
     struct wl_columnar_batch_payload *payload;
     col_relation_snapshot_t source_snapshot;
@@ -2695,7 +2698,7 @@ typedef struct wl_col_session_t {
     uint64_t spill_join_batch_bytes;
     uint64_t spill_join_index_bytes;
     uint64_t spill_join_selected_count;
-    wl_columnar_session_cold_relation_t *cold_relation;
+    wl_columnar_session_cold_relation_t *cold_relation; /* Owned binding list. */
     bool cold_seal_closed; /* First evaluation attempt permanently closes seal. */
     /* Issue #1380: memory instrumentation state that is not part of the
      * ledger proper.
@@ -4934,8 +4937,8 @@ int
 session_remove_rel(wl_col_session_t *sess, const char *name);
 /* Explicit internal pre-evaluation opt-in, under external session lifecycle
  * serialization. Caller keeps the plan immutable through session destruction.
- * One canonical numeric EDB used only by supported right JOINs or complete
- * direct/filtered projections may be sealed. Success removes its resident registry owner and makes ALL fact and
+ * Canonical numeric EDBs used only by supported right JOINs or complete
+ * direct/filtered projections may be sealed individually. Success removes its resident registry owner and makes ALL fact and
  * compound mutation unsupported, including zero-row requests. Failed sealing
  * preserves the source/registry and refunds private work.
  * No readers may escape synchronous operations; callbacks must not reenter
@@ -4948,6 +4951,8 @@ wl_columnar_spill_status_t wl_columnar_session_seal_input(
 wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
     wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
     void *context);
+wl_columnar_session_cold_relation_t *wl_columnar_session_cold_find(
+    const wl_col_session_t *session, const char *name);
 int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
 /* Valid only after the complete cold projection body has been audited. */
 typedef struct {

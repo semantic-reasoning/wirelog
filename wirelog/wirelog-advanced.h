@@ -229,10 +229,14 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
- * wirelog_session_options_v1_t). Only one input may be sealed.
+ * wirelog_session_options_v1_t). Multiple loaded inputs may be
+ * sealed individually, in any order, before the first evaluation attempt.
  *
  * Success reclaims the resident source and makes all fact/compound mutation
- * unsupported for the entire session. The binding is reused by supported
+ * unsupported for the entire session. Further sealing of other already-loaded
+ * eligible inputs is allowed until evaluation. Each seal is transactional:
+ * failure preserves earlier bindings and the failed input's resident source.
+ * Re-sealing an already sealed name is an error. The binding is reused by supported
  * STEP/SNAPSHOT calls until destruction; sealing cannot be undone. A refusal
  * preserves the original source and allows retry only while the session is
  * still eligible, and a refusal because WIRELOG_JOIN_BATCH_BYTES was on lasts

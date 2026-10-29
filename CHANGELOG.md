@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Multiple sealed inputs** (#1372): independently seal already-loaded numeric
+  sources in either order, retaining earlier bindings on a later failure.
+  Per-source lookup, destruction and narrow projection schema auditing preserve
+  exact results across resident/sealed mixtures and multiple JOIN consumers.
+
 - **Standalone sealed-input reads** (#1372): `wirelog_session_seal_input`
   permits supported direct/filtered projections without a JOIN consumer.
   The existing `wirelog_session_seal_join_input` spelling remains compatible;
