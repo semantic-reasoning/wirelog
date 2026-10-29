@@ -727,6 +727,15 @@ typedef struct {
  * zero-arity declaration such as `.decl p()`. */
 #define WL_PLAN_WIDTH_UNDECLARED UINT32_MAX
 
+/* Optional declaration provenance for each EDB. Columns are owned name-less
+ * copies; physical child types remain in edb_column_types. Missing metadata
+ * never grants compound cold eligibility to a hand-built legacy plan. */
+typedef struct {
+    const wirelog_column_t *columns;
+    uint32_t column_count;
+    bool has_unsupported_inline_cold_use;
+} wl_plan_edb_schema_t;
+
 typedef struct {
     const wl_plan_stratum_t *strata;
     uint32_t stratum_count;
@@ -747,6 +756,7 @@ typedef struct {
      * plans' int64 default. */
     const wirelog_column_type_t *const *edb_column_types;
     const uint32_t *edb_column_type_counts;
+    const wl_plan_edb_schema_t *edb_schemas;
     struct wl_intern *intern; /* borrowed from program; lifetime >= plan */
 } wl_plan_t;
 

@@ -5116,3 +5116,19 @@ resumes a pending scalar retirement before switching owners, and enumerates
 prior/current/next owners exactly once. Public heads remain unchanged before
 cutoff; private row frontiers retire before successful publication. Maintenance
 funding only retires ownership and never constructs missing results.
+
+### Declaration-derived INLINE source layout (#1372)
+
+Parsed execution plans own name-less logical compound declarations alongside
+packed physical lane types. Ordinary sessions initialize flat INLINE source
+metadata before loading facts or accepting host rows, including empty numeric
+inputs. Logical layout scratch and retained relation metadata are governed;
+failed initialization releases partial source allocations. Field projections
+produce scalar outputs even when their width equals the source physical width.
+
+Original nested/whole-compound body uses are recorded separately before lowering
+loses that information. This summary restricts future cold eligibility, not
+ordinary source initialization or existing resident evaluation. The declaration
+record alone does not prove that a consumer supports a flat field view. SIDE
+and mixed SIDE layouts retain their existing initialization behavior. This
+preparation does not yet enable INLINE cold consumers.

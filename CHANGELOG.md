@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Declared INLINE source layout** (#1372): plans own logical declarations,
+  and ordinary sessions initialize governed flat INLINE metadata before facts
+  or raw inserts, including empty numeric inputs. Original unsupported body
+  patterns retain separate provenance for subsequent cold eligibility checks.
+
 - **STRING cold JOIN consumers** (#1372): matching STRING or INT64 keys,
   STRING payloads, both cold directions, self JOIN and resident intermediate
   chains preserve originating intern identity and independently pinned output.

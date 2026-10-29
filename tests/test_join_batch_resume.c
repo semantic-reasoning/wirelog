@@ -7057,16 +7057,10 @@ test_owned_inline_relation(void)
         && source_rel->column_types
         && source_rel->column_types[1] == WIRELOG_TYPE_STRING);
     PAYLOAD_CHECK(seen && seen->nrows == 2);
-    /* The internal session does not install logical compound metadata. Bind
-    * the originating parsed declaration through the existing layout API. */
-    col_rel_logical_col_t layout[3];
-    for (uint32_t i = 0; i < 3; i++) {
-        layout[i].kind = schema->columns[i].compound_kind;
-        layout[i].arity = schema->columns[i].compound_arity;
-        layout[i].depth = layout[i].kind ==
-            WIRELOG_COMPOUND_KIND_INLINE ? 1 : 0;
-    }
-    PAYLOAD_CHECK(col_rel_apply_compound_schema(source_rel, layout, 3) == 0);
+    PAYLOAD_CHECK(source_rel->compound_kind == WIRELOG_COMPOUND_KIND_INLINE &&
+        source_rel->compound_count == 1 &&
+        source_rel->compound_arity_len == 3 &&
+        source_rel->compound_arity_map[1] == 2);
     wl_columnar_memory_governor_ref_t *g = cs->memory_governor;
     wl_columnar_memory_governor_ref_retain(g);
     wl_columnar_spill_store_t *store;

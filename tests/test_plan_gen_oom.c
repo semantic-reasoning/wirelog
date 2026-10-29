@@ -49,11 +49,14 @@ main(void)
         ".decl b(x: int64, value: int64)\n"
         ".decl c(x: int64, value: int64)\n"
         ".decl guard(q: int64)\n"
+        ".decl inline_a(id:int64,p:pair(symbol,int64) inline)\n"
+        ".decl inline_b(p:box/1 inline,x:int64,q:pair/2 inline)\n"
         ".decl out(x: int64, av: int64, bv: int64, cv: int64)\n"
         "out(x, av, bv, cv) :- a(x, av), b(x, bv), c(x, cv), guard(7).\n";
     bool saw_success = false;
     bool saw_injected_failure = false;
     bool saw_lftj = false;
+    bool saw_inline = false;
 
     for (long attempt = 0; attempt < 512; attempt++) {
         wirelog_error_t error;
@@ -93,6 +96,15 @@ main(void)
                     }
                 }
             }
+            unsigned declarations = 0;
+            for (uint32_t i = 0; i < plan->edb_count; i++)
+                declarations += plan->edb_schemas &&
+                    plan->edb_schemas[i].columns != NULL;
+            if (declarations != 2) {
+                fprintf(stderr, "successful plan lost compound declarations\n");
+                wl_plan_free(plan); wirelog_program_free(program); return 1;
+            }
+            saw_inline = true;
             saw_success = true;
             wl_plan_free(plan);
         } else if (plan) {
@@ -106,5 +118,6 @@ main(void)
         wirelog_program_free(program);
     }
 
-    return saw_success && saw_injected_failure && saw_lftj ? 0 : 1;
+    return saw_success && saw_injected_failure && saw_lftj &&
+           saw_inline ? 0 : 1;
 }
