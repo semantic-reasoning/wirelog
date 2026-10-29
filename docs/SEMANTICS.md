@@ -259,9 +259,9 @@ INT64 column with one integer literal (`=`, `!=`, `<`, `>`, `<=`, `>=`), with th
 column on the left. Other predicates and arbitrary cold expressions remain
 unsupported. An initial `VARIABLE → JOIN` may instead consume a cold left
 source, including two sealed sources or the same binding on both sides.
-Each JOIN uses one INT64 equality key. Chained JOINs continue from an admitted
+Each JOIN uses one matching INT64 or STRING equality key. Chained JOINs continue from an admitted
 resident intermediate; FILTER/MAP before the first cold JOIN, multi-key/cross/
-theta JOINs, non-INT64 keys and right filters remain unsupported. An eligible direct/filtered projection alone is sufficient; a
+theta JOINs, other key types and right filters remain unsupported. An eligible direct/filtered projection alone is sufficient; a
 JOIN consumer is not required. Reads
 use independent bounded pins; projected output and consolidation remain resident.
 Output capacity is admitted for the full source row count even if no row passes.
@@ -307,8 +307,10 @@ not assume symmetric coverage.
 Standalone direct/filtered cold projections also accept STRING lanes from the
 originating program's intern table, preserving STRING output types and IDs.
 Every STRING lane is validated at capture, including unprojected lanes. Empty
-strings and non-ASCII strings retain their ordinary intern identity. Reference
-JOINs and compound sources remain unsupported. Pins retain backing storage; the
+strings and non-ASCII strings retain their ordinary intern identity. JOINs
+also preserve STRING payload lanes and compare STRING keys only after both
+inputs prove the same originating intern table. Coincident IDs from another
+table are refused; compound sources remain unsupported. Pins retain backing storage; the
 public program must still outlive its sessions, and intern storage is a resident
 memory floor. A copied raw ID alone does not extend that lifetime.
 

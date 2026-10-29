@@ -692,7 +692,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     rp);
             bool selected_projection = projection &&
                 !strcmp(rp->ops[0].relation_name, name);
-            bool selected_join = !references && rp->op_count &&
+            bool selected_join = rp->op_count &&
                 rp->ops[0].relation_name &&
                 !strcmp(rp->ops[0].relation_name, name) &&
                 wl_columnar_join_cold_prefix(sess, rp);
@@ -714,7 +714,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 if (!op->right_relation || strcmp(op->right_relation,
                     name) != 0)
                     continue;
-                if (references || op->op != WL_PLAN_OP_JOIN ||
+                if (op->op != WL_PLAN_OP_JOIN ||
                     op->key_count != 1 ||
                     op->right_filter_expr.size ||
                     (op->project_count && !op->project_indices)) return false;
@@ -722,7 +722,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                         names, op->right_keys ? op->right_keys[0] : NULL);
                 /* The resident JOIN also falls back to column zero. */
                 if (key < 0) key = 0;
-                if (types && types[key] != WIRELOG_TYPE_INT64) return false;
+                if (types && types[key] != WIRELOG_TYPE_INT64 &&
+                    types[key] != WIRELOG_TYPE_STRING) return false;
                 if (oi == 1 && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
                     !wl_columnar_join_cold_prefix(sess, rp)) return false;
                 consumer = true;

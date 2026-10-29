@@ -103,6 +103,22 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_projected_bounded(
     uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out);
+/* Reference-aware ordinary projected JOIN. Keys must both be INT64 or both
+ * STRING; every STRING-bearing input must retain the supplied originating
+ * intern table, even for non-key lanes. NULL intern is numeric-only. Legacy
+ * constructors remain numeric-only; INLINE/weighted/timed inputs are excluded.
+ * Output STRING IDs borrow the producer readers' retained capability while a
+ * batch is pending. A sink keeping independent payloads must capture with its
+ * own intern pin before acknowledgement (and before original-owner retirement).
+ * Raw copied IDs alone do not extend that lifetime. Existing caps/retry apply. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
 /* Only for a continuation returned by these constructors; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */
 wl_columnar_spill_status_t wl_columnar_payload_join_error(

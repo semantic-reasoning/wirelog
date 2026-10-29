@@ -289,17 +289,21 @@ wl_columnar_payload_join_produce(void *context,
 
 static wl_columnar_spill_status_t
 wl_columnar_payload_join_schema(wl_columnar_batch_payload_t *payload,
-    uint32_t key, uint32_t *cols, uint32_t *rows)
+    uint32_t key, uint32_t *cols, uint32_t *rows, const wl_intern_t *intern)
 {
     const wirelog_column_type_t *types =
         wl_columnar_batch_payload_schema(payload, cols, rows);
     uint32_t logical;
     if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
     if (wl_columnar_batch_payload_inline_schema(payload, &logical) ||
-        types[key] != WIRELOG_TYPE_INT64) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+        (types[key] != WIRELOG_TYPE_INT64 &&
+        !(intern &&
+        types[key] ==
+        WIRELOG_TYPE_STRING))) return WL_COLUMNAR_SPILL_UNSUPPORTED;
     for (uint32_t c = 0; c < *cols; c++)
-        if (types[c] ==
-            WIRELOG_TYPE_STRING) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+        if (types[c] == WIRELOG_TYPE_STRING &&
+            !wl_columnar_batch_payload_uses_intern(payload, intern))
+            return WL_COLUMNAR_SPILL_UNSUPPORTED;
     return WL_COLUMNAR_SPILL_OK;
 }
 
@@ -309,7 +313,8 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out, bool weighted, bool bounded,
-    uint64_t index_bytes, const uint32_t *projection, uint32_t project_count)
+    uint64_t index_bytes, const uint32_t *projection, uint32_t project_count,
+    const wl_intern_t *intern)
 {
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
@@ -318,10 +323,14 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
         g)) return WL_COLUMNAR_SPILL_INVALID;
     uint32_t lc, lr, rc, rr;
     wl_columnar_spill_status_t status = wl_columnar_payload_join_schema(left,
-            left_key, &lc, &lr);
+            left_key, &lc, &lr, intern);
     if (status != WL_COLUMNAR_SPILL_OK) return status;
-    status = wl_columnar_payload_join_schema(right, right_key, &rc, &rr);
+    status = wl_columnar_payload_join_schema(right, right_key, &rc, &rr,
+            intern);
     if (status != WL_COLUMNAR_SPILL_OK) return status;
+    if (wl_columnar_batch_payload_schema(left, NULL, NULL)[left_key] !=
+        wl_columnar_batch_payload_schema(right, NULL, NULL)[right_key])
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
     if (lc > UINT32_MAX - rc) return WL_COLUMNAR_SPILL_OVERFLOW;
     uint32_t input_cols = lc + rc;
     if (project_count && !projection) return WL_COLUMNAR_SPILL_INVALID;
@@ -463,7 +472,7 @@ wl_columnar_payload_join_create(wl_columnar_memory_governor_ref_t *g,
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
-               false, 0, NULL, 0);
+               false, 0, NULL, 0, NULL);
 }
 
 wl_columnar_spill_status_t
@@ -475,7 +484,7 @@ wl_columnar_payload_join_create_weighted(wl_columnar_memory_governor_ref_t *g,
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, true,
-               false, 0, NULL, 0);
+               false, 0, NULL, 0, NULL);
 }
 
 wl_columnar_spill_status_t
@@ -487,7 +496,7 @@ wl_columnar_payload_join_create_bounded(wl_columnar_memory_governor_ref_t *g,
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
-               true, index_bytes, NULL, 0);
+               true, index_bytes, NULL, 0, NULL);
 }
 
 wl_columnar_spill_status_t
@@ -500,7 +509,7 @@ wl_columnar_payload_join_create_weighted_bounded(
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, true,
-               true, index_bytes, NULL, 0);
+               true, index_bytes, NULL, 0, NULL);
 }
 
 wl_columnar_spill_status_t
@@ -514,5 +523,19 @@ wl_columnar_payload_join_create_projected_bounded(
 {
     return wl_columnar_payload_join_create_impl(g, left, right, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
-               true, index_bytes, projection, project_count);
+               true, index_bytes, projection, project_count, NULL);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, false,
+               true, index_bytes, projection, project_count, intern);
 }

@@ -219,7 +219,7 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * spill JOIN caps and a serial nonrecursive plan using only audited
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
  * The selected name must have an eligible consumer: a JOIN input with
- * one INT64 equality key or a complete
+ * one matching INT64 or STRING equality key or a complete
  * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with one
  * FILTER before MAP comparing an INT64 column with an integer literal
  * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
@@ -228,10 +228,11 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * A cold left input is consumed by an initial VARIABLE/JOIN pair; both sides
  * may be sealed, including a self-JOIN. Subsequent JOINs consume an admitted
  * resident intermediate. No FILTER/MAP before that first cold JOIN, multi-key,
- * cross/theta JOIN, non-INT64 key, right filter, timestamps, compound values,
+ * cross/theta JOIN, other key types, right filter, timestamps, compound values,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
- * Standalone direct/filtered projections also accept STRING lanes from the
- * originating program intern table; reference-bearing JOINs remain unsupported.
+ * JOINs and standalone direct/filtered projections accept STRING lanes from
+ * the originating program intern table, including non-key payload columns.
+ * Both JOIN keys must have the same type; reference IDs are never remapped.
  * The program must outlive the session. Intern storage remains resident, and
  * sealing validates IDs even in unprojected STRING lanes.
  * Optimized plans may therefore be ineligible. The session must also not have

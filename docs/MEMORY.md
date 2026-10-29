@@ -4984,7 +4984,7 @@ credit. The persistent binding stays session-owned and valid for permitted
 retries. This does not promise rollback of other heads already committed by an
 earlier STEP relation, or add asynchronous cancellation/control support.
 
-### STRING cold projection consumers (#1372, partial)
+### STRING cold projection and JOIN consumers (#1372, partial)
 
 Standalone direct and narrowly filtered projections accept actual STRING lanes,
 including reordered and repeated outputs and multiple sealed inputs. Source
@@ -4992,10 +4992,15 @@ initialization preserves declared STRING types even for raw host inserts and
 empty relations. Capture validates every STRING ID, including unused lanes,
 and pins the originating session/program intern table. Runtime checks compare
 table identity through the retained payload or spill-segment owner; a different
-table with coincident IDs is not equivalent. Existing numeric JOIN routes remain
-numeric-only in this increment; reference-bearing JOINs are refused.
+table with coincident IDs is not equivalent, even under the same governor.
+The reference-aware JOIN route accepts matching INT64 or STRING keys and
+STRING payload columns in either input. Legacy numeric-only payload producer
+constructors retain their restrictions. Self-JOIN and chained consumers use
+independent reader pins; a stored output payload acquires its own intern pin
+before batch acknowledgement. An owned reference intermediate is captured
+before checked retirement, preserving the same resident intermediate floor.
 
-Projection preserves STRING types and IDs without rehydrating full input rows.
+Projection and JOIN preserve STRING types and IDs without rehydrating full input rows.
 The program must outlive public sessions; output IDs borrow that lifetime.
 Payload readers retain source storage while live, including after owner
 retirement. Independently retained output requires its own intern capability.
@@ -5003,11 +5008,13 @@ Intern strings/table storage remain resident and charged. Tests pair reclaimed
 and retained STRING sources under one allowance and separately exhaust real
 admission with increasing distinct strings; spilling rows cannot remove this
 floor. Private output/read/allocation failures preserve the sealed binding and
-release attempt resources before retry.
+release attempt resources before retry. Fixed-intern two-cardinality tests
+keep JOIN scratch unchanged under fixed index/batch caps; retained-source
+controls cover one and both input owners without hiding resident output costs.
 
 ### Remaining #1372 implementation groups
 
-The sealed numeric JOIN and scalar STRING projection subsets now have actual persistent cold storage,
+The sealed scalar numeric/STRING JOIN and projection subsets now have actual persistent cold storage,
 resident reclamation and evaluator consumers. General cold VARIABLE/direct-column access beyond the exact direct-projection
 subset, mutable relations, persistent trace/differential storage and their
 arrangement consumers remain separate integration work. They require stable

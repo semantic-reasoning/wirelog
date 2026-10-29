@@ -6,10 +6,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **STRING cold JOIN consumers** (#1372): matching STRING or INT64 keys,
+  STRING payloads, both cold directions, self JOIN and resident intermediate
+  chains preserve originating intern identity and independently pinned output.
+  Fixed-intern scratch and retained-source controls keep memory floors explicit.
+
 - **STRING cold projections** (#1372): standalone direct/filtered projections
   consume sealed STRING lanes with actual types, originating-intern checks and
   pinned storage. Multiple bindings, failure/retry and fixed-budget tests retain
-  explicit resident intern/output floors; reference JOINs remain follow-up work.
+  explicit resident intern/output floors.
 
 - **Sealed JOIN inputs in either position** (#1372): bounded readers now consume
   cold left, both-cold and self-JOIN inputs. Audited chains continue through
