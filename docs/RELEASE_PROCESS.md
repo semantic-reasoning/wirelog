@@ -417,22 +417,22 @@ the cutover commit sets `project_version` to `1.0.0-rc1`.
 - Tag protection on `v1.x.*`.
 - Required status checks:
   - Stable policy plan: `default`, `abi`, `asan`, `tsan`, `perf`,
-    plus `mbedtls-enabled / ubuntu-latest / gcc`.
+    plus `mbedtls-enabled / ubuntu-26.04 / gcc`.
   - `perf` must be represented by a dedicated always-emitting release
     perf context that runs with `WIRELOG_PERF_REQUIRE=1`; do not rely on
     path-filtered contexts for branch protection.
   - Currently known concrete PR contexts to require at cutover (unless
     replaced by a later policy-consolidation change): `lint / EditorConfig check`,
     `lint / uncrustify check`,
-    `Build / ubuntu-latest / gcc`, `Build / ubuntu-24.04-arm / gcc`,
+    `Build / ubuntu-26.04 / gcc`, `Build / ubuntu-26.04-arm / gcc`,
     `RC changelog freeze gate`, `CLA signoff gate`,
-    `mbedtls-enabled / ubuntu-latest / gcc`,
-    `Build / ubuntu-latest / clang`, `Build / macos-latest / clang`,
+    `mbedtls-enabled / ubuntu-26.04 / gcc`,
+    `Build / ubuntu-26.04 / clang`, `Build / macos-latest / clang`,
     `Build / windows-latest / msvc`,
-    `Sanitizers / ubuntu-latest / gcc`,
-    `Sanitizers / ubuntu-latest / clang`,
+    `Sanitizers / ubuntu-26.04 / gcc`,
+    `Sanitizers / ubuntu-26.04 / clang`,
     `Sanitizers / macos-latest / clang`,
-    `TSan / ubuntu-latest / gcc`.
+    `TSan / ubuntu-26.04 / gcc`.
 
 #### Synthetic PR verification plan (Phase B)
 
@@ -488,7 +488,7 @@ separate policy change.
 ### mbedTLS-enabled validation policy
 
 The stable check name for optional crypto validation is
-`mbedtls-enabled / ubuntu-latest / gcc`.  The check is validation
+`mbedtls-enabled / ubuntu-26.04 / gcc`.  The check is validation
 coverage only: it proves that `-DmbedTLS=enabled` still configures,
 builds, and runs the crypto tests against a system PSA Crypto provider.
 It does **not** change the default release artifact posture, which

@@ -226,7 +226,7 @@ unset coverage_padding coverage_large coverage_near
 # still safe -- and prefer adding a behavioural case over widening again.
 # -A6, not -A2: check-abi-manifest.sh's arm64 arch-skip prints five diagnostic
 # lines between its SKIP echo and its exit, and that branch is the one live on
-# the ubuntu-24.04-arm required check. Two other branches sit at exactly the
+# the ubuntu-26.04-arm required check. Two other branches sit at exactly the
 # old two-line limit, so the window had no margin and any added `echo` would
 # have silently dropped a branch out of coverage.
 #

@@ -139,7 +139,7 @@ class SkipCascade(unittest.TestCase):
         """A run-success job restamped the way a job that never ran is."""
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = name or "Sanitizers / ubuntu-latest / clang"
+        victim = name or "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = conclusion
@@ -157,7 +157,7 @@ class SkipCascade(unittest.TestCase):
             run, jobs = fixture("run-success")
             mutated = copy.deepcopy(jobs)
             for job in mutated["jobs"]:
-                if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                     job["conclusion"] = "startup_failure"
                     job["started_at"] = job["created_at"]
                     job["completed_at"] = job["created_at"]
@@ -268,7 +268,7 @@ class SkipCascade(unittest.TestCase):
         # never-run job's completion stamp is bookkeeping.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -288,7 +288,7 @@ class SkipCascade(unittest.TestCase):
         # created), so cancelling it still leaves a measurable release latency.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "TSan-native / ubuntu-latest / gcc"
+        victim = "TSan-native / ubuntu-26.04 / gcc"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -317,7 +317,7 @@ class SkipCascade(unittest.TestCase):
         for conclusion in ("neutral", "action_required"):
             with self.subTest(conclusion=conclusion):
                 mutated = copy.deepcopy(jobs)
-                victim = "Sanitizers / ubuntu-latest / clang"
+                victim = "Sanitizers / ubuntu-26.04 / clang"
                 for job in mutated["jobs"]:
                     if job["name"] == victim:
                         job["conclusion"] = conclusion
@@ -337,7 +337,7 @@ class SkipCascade(unittest.TestCase):
         # was written must not default to "ran" and publish a zero.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "a_conclusion_from_the_future"
@@ -359,7 +359,7 @@ class SkipCascade(unittest.TestCase):
         for conclusion in tool.CONCLUSIONS_THAT_RAN:
             with self.subTest(conclusion=conclusion):
                 mutated = copy.deepcopy(jobs)
-                victim = "Sanitizers / ubuntu-latest / clang"
+                victim = "Sanitizers / ubuntu-26.04 / clang"
                 for job in mutated["jobs"]:
                     if job["name"] == victim:
                         job["conclusion"] = conclusion
@@ -393,8 +393,8 @@ class SkipCascade(unittest.TestCase):
         # phrase follows whatever order the API returned the jobs in.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victims = ["Sanitizers / ubuntu-latest / clang",
-                   "Sanitizers / ubuntu-latest / gcc",
+        victims = ["Sanitizers / ubuntu-26.04 / clang",
+                   "Sanitizers / ubuntu-26.04 / gcc",
                    "Sanitizers / macos-latest / clang"]
         for name, conclusion in zip(victims, ("startup_failure", "stale",
                                               "cancelled")):
@@ -424,7 +424,7 @@ class SkipCascade(unittest.TestCase):
         # with nothing saying so.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "TSan / ubuntu-latest / clang"      # the last to finish
+        victim = "TSan / ubuntu-26.04 / clang"      # the last to finish
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "stale"
@@ -439,7 +439,7 @@ class SkipCascade(unittest.TestCase):
         # of six blanks below it.  One test decides all three.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -476,7 +476,7 @@ class SkipCascade(unittest.TestCase):
     def test_first_failure_latency_is_measured(self):
         metric = self.report["metrics"]["first_failure_latency"]
         self.assertEqual(metric["status"], "measured")
-        self.assertEqual(metric["evidence"]["job"], "Build / ubuntu-latest / gcc")
+        self.assertEqual(metric["evidence"]["job"], "Build / ubuntu-26.04 / gcc")
         self.assertEqual(metric["seconds"], 1499)
         # The step matters: a size gate failing at minute 25 is #1573's case,
         # and the job name alone does not distinguish it from a test failure.
@@ -490,7 +490,7 @@ class SkipCascade(unittest.TestCase):
 
     def test_a_skipped_job_reports_no_release_latency(self):
         by_name = {j["name"]: j for j in self.report["jobs"]}
-        metric = by_name["Build / ubuntu-24.04-arm / gcc"]["metrics"][
+        metric = by_name["Build / ubuntu-26.04-arm / gcc"]["metrics"][
             "scheduler_release_latency"]
         self.assertEqual(metric["status"], "unavailable")
         self.assertIn("skipped", metric["reason"])
@@ -529,21 +529,21 @@ class ReleaseLatency(unittest.TestCase):
 
     def test_a_skipped_dependency_makes_the_latency_unavailable(self):
         run, jobs = fixture("run-skip-cascade")
-        needs = {"Build / ubuntu-latest / gcc": [
-            "mbedtls-enabled / ubuntu-latest / gcc"]}
+        needs = {"Build / ubuntu-26.04 / gcc": [
+            "mbedtls-enabled / ubuntu-26.04 / gcc"]}
         report = tool.analyze(run, jobs, needs)
         by_name = {j["name"]: j for j in report["jobs"]}
-        metric = by_name["Build / ubuntu-latest / gcc"]["metrics"][
+        metric = by_name["Build / ubuntu-26.04 / gcc"]["metrics"][
             "scheduler_release_latency"]
         self.assertEqual(metric["status"], "unavailable")
         self.assertIn("batched", metric["reason"])
 
     def test_a_dependency_absent_from_the_run_is_named(self):
         run, jobs = fixture("run-skip-cascade")
-        needs = {"Build / ubuntu-latest / gcc": ["a job that never ran"]}
+        needs = {"Build / ubuntu-26.04 / gcc": ["a job that never ran"]}
         report = tool.analyze(run, jobs, needs)
         by_name = {j["name"]: j for j in report["jobs"]}
-        metric = by_name["Build / ubuntu-latest / gcc"]["metrics"][
+        metric = by_name["Build / ubuntu-26.04 / gcc"]["metrics"][
             "scheduler_release_latency"]
         self.assertEqual(metric["status"], "unavailable")
         self.assertIn("a job that never ran", metric["reason"])
@@ -590,10 +590,10 @@ class InFlightAndMissingData(unittest.TestCase):
     def test_queued_run_invents_nothing(self):
         report = tool.analyze(*fixture("run-queued"))
         by_name = {j["name"]: j for j in report["jobs"]}
-        queued = by_name["TSan / ubuntu-latest / gcc"]
+        queued = by_name["TSan / ubuntu-26.04 / gcc"]
         self.assertEqual(queued["metrics"]["queue_delay"]["status"], "unavailable")
         self.assertEqual(queued["metrics"]["job_wall"]["status"], "unavailable")
-        running = by_name["Build / ubuntu-latest / gcc"]
+        running = by_name["Build / ubuntu-26.04 / gcc"]
         self.assertEqual(running["metrics"]["queue_delay"]["seconds"], 12)
         self.assertEqual(running["metrics"]["job_wall"]["status"], "unavailable")
         self.assertEqual(report["metrics"]["run_wall_clock"]["status"], "partial")
@@ -606,7 +606,7 @@ class InFlightAndMissingData(unittest.TestCase):
             with self.subTest(phase=phase):
                 self.assertEqual(metric["status"], "unavailable")
         self.assertEqual(no_steps["clock_offset_estimate"]["status"], "unavailable")
-        never_started = by_name["Build / ubuntu-latest / gcc"]
+        never_started = by_name["Build / ubuntu-26.04 / gcc"]
         self.assertEqual(never_started["metrics"]["queue_delay"]["status"],
                          "unavailable")
         self.assertEqual(report["t0_source"], "created_at")
@@ -665,7 +665,7 @@ class PhaseAttribution(unittest.TestCase):
         mutated = copy.deepcopy(jobs)
         renamed = 0
         for job in mutated["jobs"]:
-            if job["name"] != "Build / ubuntu-latest / gcc":
+            if job["name"] != "Build / ubuntu-26.04 / gcc":
                 continue
             for step in job["steps"]:
                 if step["name"] == "Test":
@@ -674,7 +674,7 @@ class PhaseAttribution(unittest.TestCase):
         self.assertEqual(renamed, 1, "fixture must contain the step to rename")
         report = tool.analyze(run, mutated)
         job = next(j for j in report["jobs"]
-                   if j["name"] == "Build / ubuntu-latest / gcc")
+                   if j["name"] == "Build / ubuntu-26.04 / gcc")
         self.assertEqual(job["phases"]["tests"]["status"], "unavailable")
         self.assertIn("Verify build outputs", report["unmapped_steps"])
 
@@ -736,13 +736,13 @@ class UnusableSteps(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         job = next(j for j in mutated["jobs"]
-                   if j["name"] == "Build / ubuntu-latest / gcc")
+                   if j["name"] == "Build / ubuntu-26.04 / gcc")
         for step in job["steps"]:
             if step["name"] == "Test":
                 step["started_at"], step["completed_at"] = started, completed
         report = tool.analyze(run, mutated)
         return next(j for j in report["jobs"]
-                    if j["name"] == "Build / ubuntu-latest / gcc")
+                    if j["name"] == "Build / ubuntu-26.04 / gcc")
 
     def test_a_backwards_step_is_named_not_silently_dropped(self):
         job = self._with_broken_test_step("2026-09-10T19:50:00Z",
@@ -761,7 +761,7 @@ class UnusableSteps(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         job = next(j for j in mutated["jobs"]
-                   if j["name"] == "Build / ubuntu-latest / gcc")
+                   if j["name"] == "Build / ubuntu-26.04 / gcc")
         for step in job["steps"]:
             if step["name"] == "Test":
                 step["completed_at"] = step["started_at"]
@@ -827,7 +827,7 @@ class SkippedSteps(unittest.TestCase):
     def test_a_skipped_step_does_not_feed_the_phase_it_matched(self):
         report = tool.analyze(*fixture("run-success"))
         job = next(j for j in report["jobs"]
-                   if j["name"] == "Sanitizers / ubuntu-latest / gcc")
+                   if j["name"] == "Sanitizers / ubuntu-26.04 / gcc")
         phase = job["phases"]["deps_install"]
         # The macOS install is skipped on a Linux runner; only the Linux one
         # actually installed anything.
@@ -888,12 +888,12 @@ class FailureConclusions(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         job = next(j for j in mutated["jobs"]
-                   if j["name"] == "Build / ubuntu-latest / gcc")
+                   if j["name"] == "Build / ubuntu-26.04 / gcc")
         job["conclusion"] = "timed_out"
         report = tool.analyze(run, mutated)
         metric = report["metrics"]["first_failure_latency"]
         self.assertEqual(metric["status"], "measured")
-        self.assertEqual(metric["evidence"]["job"], "Build / ubuntu-latest / gcc")
+        self.assertEqual(metric["evidence"]["job"], "Build / ubuntu-26.04 / gcc")
 
     def test_a_cancelled_job_is_not_a_failure_but_is_acknowledged(self):
         run, jobs = fixture("run-success")
@@ -912,7 +912,7 @@ class FailureConclusions(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         job = next(j for j in mutated["jobs"]
-                   if j["name"] == "Build / ubuntu-latest / gcc")
+                   if j["name"] == "Build / ubuntu-26.04 / gcc")
         job["conclusion"] = "timed_out"
         for step in job["steps"]:
             step["conclusion"] = "cancelled"
@@ -953,7 +953,7 @@ class GraphAbsence(unittest.TestCase):
         by_name = {j["name"]: j for j in report["jobs"]}
         # Absence from a partial graph is an extractor gap, not rootness; the
         # two were conflated and 17 of 18 jobs claimed to be roots.
-        absent = by_name["Sanitizers / ubuntu-latest / gcc"]["metrics"][
+        absent = by_name["Sanitizers / ubuntu-26.04 / gcc"]["metrics"][
             "scheduler_release_latency"]
         self.assertIn("absent from the supplied dependency graph",
                       absent["reason"])
@@ -998,7 +998,7 @@ class DependencyGraph(unittest.TestCase):
         # The caller's dependents attach to the callee's sink.  In the
         # reordered graph the tsan leg is lint's direct dependent.
         self.assertIn("lint / uncrustify check",
-                      self.graph["TSan / ubuntu-latest / ${{ matrix.compiler }}"])
+                      self.graph["TSan / ubuntu-26.04 / ${{ matrix.compiler }}"])
 
     def test_every_job_has_an_entry_and_roots_are_explicit(self):
         # A job missing from the graph must be a gap, never mistaken for a
@@ -1033,7 +1033,7 @@ class DependencyGraph(unittest.TestCase):
     def test_matrix_placeholders_match_expanded_names(self):
         pattern = tool.name_pattern("Build / ${{ matrix.os }} / ${{ m }}")
         self.assertTrue(pattern.match("Build / windows-latest / msvc"))
-        self.assertFalse(pattern.match("Sanitizers / ubuntu-latest / gcc"))
+        self.assertFalse(pattern.match("Sanitizers / ubuntu-26.04 / gcc"))
 
     def test_an_unreadable_needs_form_is_refused_not_read_as_a_root(self):
         # Block lists and wrapped flow lists are legal YAML this parser does
@@ -1058,12 +1058,12 @@ class DependencyGraph(unittest.TestCase):
         # Otherwise correctness depends on which job happens to be declared
         # first, and #1574 reorders jobs.
         graph = {"Build / ${{ matrix.os }} / ${{ matrix.compiler }}": ["Wide"],
-                 "Build / ubuntu-latest / gcc": ["Narrow"],
+                 "Build / ubuntu-26.04 / gcc": ["Narrow"],
                  "Wide": [], "Narrow": []}
-        jobs = ["Build / ubuntu-latest / gcc", "Build / macos-latest / clang",
+        jobs = ["Build / ubuntu-26.04 / gcc", "Build / macos-latest / clang",
                 "Wide", "Narrow"]
         edges, drift = tool.match_graph_to_jobs(graph, jobs)
-        self.assertEqual(edges["Build / ubuntu-latest / gcc"], ["Narrow"])
+        self.assertEqual(edges["Build / ubuntu-26.04 / gcc"], ["Narrow"])
         self.assertEqual(edges["Build / macos-latest / clang"], ["Wide"])
         self.assertEqual(drift["nodes_without_job"], [])
 
@@ -1083,13 +1083,13 @@ class DependencyGraph(unittest.TestCase):
         graph = {"Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}": [],
                  "Sanitizers / tsan / ${{ matrix.compiler }}":
                      ["Sanitizers / ${{ matrix.os }} / ${{ matrix.compiler }}"]}
-        jobs = ["Sanitizers / ubuntu-latest / gcc", "Sanitizers / tsan / gcc"]
+        jobs = ["Sanitizers / ubuntu-26.04 / gcc", "Sanitizers / tsan / gcc"]
         edges, _ = tool.match_graph_to_jobs(graph, jobs)
         for job, deps in edges.items():
             with self.subTest(job=job):
                 self.assertNotIn(job, deps, "a job cannot depend on itself")
         self.assertEqual(edges["Sanitizers / tsan / gcc"],
-                         ["Sanitizers / ubuntu-latest / gcc"])
+                         ["Sanitizers / ubuntu-26.04 / gcc"])
 
     def test_drift_is_reported_when_the_run_and_the_graph_disagree(self):
         edges, drift = tool.match_graph_to_jobs(
@@ -1111,7 +1111,7 @@ class CriticalPath(unittest.TestCase):
     def test_the_walk_follows_dependencies_not_the_nearest_finisher(self):
         path = self._analyze("run-success")["critical_path"]["observed"]
         chain = path["evidence"]["chain"]
-        self.assertEqual(chain[-1], "TSan / ubuntu-latest / clang")
+        self.assertEqual(chain[-1], "TSan / ubuntu-26.04 / clang")
         # TSan's real dependency is the lint sink, so the walk hops there;
         # the build matrix jobs finish nearby but are not a dependency of
         # TSan, and taking one would produce a plausible but wrong path.
@@ -1127,9 +1127,9 @@ class CriticalPath(unittest.TestCase):
         # different node sets and must not be equal.
         self.assertGreater(paths["graph"]["seconds"],
                            paths["observed"]["seconds"])
-        self.assertIn("Build / ubuntu-latest / gcc",
+        self.assertIn("Build / ubuntu-26.04 / gcc",
                       paths["graph"]["evidence"]["chain"])
-        self.assertNotIn("Build / ubuntu-latest / gcc",
+        self.assertNotIn("Build / ubuntu-26.04 / gcc",
                          paths["observed"]["evidence"]["chain"])
 
     def test_a_skip_cascade_whose_chain_avoids_it_stays_measured(self):
@@ -1140,7 +1140,7 @@ class CriticalPath(unittest.TestCase):
         # would attach a caveat that does not apply to the value shown.
         paths = self._analyze("run-skip-cascade")["critical_path"]
         self.assertEqual(paths["observed"]["status"], "measured")
-        self.assertNotIn("Build / ubuntu-24.04-arm / gcc",
+        self.assertNotIn("Build / ubuntu-26.04-arm / gcc",
                          paths["observed"]["evidence"]["chain"])
 
     def _with_skipped(self, job_name):
@@ -1181,7 +1181,7 @@ class CriticalPath(unittest.TestCase):
         # The walk routes around it rather than stopping: the same job still
         # ends the path, reached through the other dependency that did run.
         self.assertEqual(path["evidence"]["chain"][-1],
-                         "TSan / ubuntu-latest / clang")
+                         "TSan / ubuntu-26.04 / clang")
         self.assertIn("Detect build-triggering changes",
                       path["evidence"]["chain"])
 
@@ -1198,7 +1198,7 @@ class CriticalPath(unittest.TestCase):
     def test_a_job_outside_the_graph_stops_the_walk_as_partial(self):
         run, jobs = fixture("run-success")
         graph = tool.extract_graph(self.WORKFLOW)
-        del graph["TSan / ubuntu-latest / ${{ matrix.compiler }}"]
+        del graph["TSan / ubuntu-26.04 / ${{ matrix.compiler }}"]
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in jobs["jobs"]])
         report = tool.analyze(run, jobs, edges, drift)
@@ -1264,7 +1264,7 @@ class CriticalPath(unittest.TestCase):
             # A leaf the longest path legitimately routes around.  Weighted at
             # zero during selection, it is precisely the node that ends up off
             # the winning chain, so a caveat scoped to the chain never fires.
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["started_at"] = None
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -1275,8 +1275,8 @@ class CriticalPath(unittest.TestCase):
         self.assertEqual(path["status"], "partial")
         self.assertIn("routed around", path["reason"])
         self.assertEqual(path["evidence"]["untimed_jobs_off_chain"],
-                         ["Sanitizers / ubuntu-latest / clang"])
-        self.assertNotIn("Sanitizers / ubuntu-latest / clang",
+                         ["Sanitizers / ubuntu-26.04 / clang"])
+        self.assertNotIn("Sanitizers / ubuntu-26.04 / clang",
                          path["evidence"]["chain"])
 
     def test_an_untimed_last_finisher_is_not_walked_past_in_silence(self):
@@ -1286,7 +1286,7 @@ class CriticalPath(unittest.TestCase):
             # The observed walk starts at the last job to finish that was
             # timed, so untiming the actual last finisher moves the start
             # down one branch and the job never appears on the result.
-            if job["name"] == "TSan / ubuntu-latest / clang":
+            if job["name"] == "TSan / ubuntu-26.04 / clang":
                 job["started_at"] = None
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -1295,8 +1295,8 @@ class CriticalPath(unittest.TestCase):
                             drift)["critical_path"]["observed"]
         self.assertEqual(path["status"], "partial")
         self.assertEqual(path["evidence"]["untimed_jobs_off_chain"],
-                         ["TSan / ubuntu-latest / clang"])
-        self.assertNotIn("TSan / ubuntu-latest / clang",
+                         ["TSan / ubuntu-26.04 / clang"])
+        self.assertNotIn("TSan / ubuntu-26.04 / clang",
                          path["evidence"]["chain"])
 
     def test_a_skipped_job_is_never_counted_as_untimed(self):
@@ -1416,7 +1416,7 @@ class CriticalPath(unittest.TestCase):
         unreadable = copy.deepcopy(run)
         unreadable["status"] = "something-new"
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["started_at"] = None
@@ -1517,7 +1517,7 @@ class CriticalPath(unittest.TestCase):
         # then reports is true: the step evidence establishes it ran.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1536,7 +1536,7 @@ class CriticalPath(unittest.TestCase):
         # those as unusable would discard the commonest shape there is.
         _, jobs = fixture("run-success")
         template = next(job["steps"][0] for job in jobs["jobs"]
-                        if job["name"] == "Sanitizers / ubuntu-latest / clang")
+                        if job["name"] == "Sanitizers / ubuntu-26.04 / clang")
         instant = dict(template, completed_at=template["started_at"])
         self.assertEqual(tool.first_step_start({"steps": [instant]}),
                          template["started_at"])
@@ -1548,7 +1548,7 @@ class CriticalPath(unittest.TestCase):
         # on a runner, and lists it as missing data besides.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1579,7 +1579,7 @@ class CriticalPath(unittest.TestCase):
                            "a_conclusion_from_the_future"):
             with self.subTest(conclusion=conclusion):
                 mutated = copy.deepcopy(jobs)
-                victim = "Sanitizers / ubuntu-latest / clang"
+                victim = "Sanitizers / ubuntu-26.04 / clang"
                 for job in mutated["jobs"]:
                     if job["name"] == victim:
                         job["conclusion"] = conclusion
@@ -1615,7 +1615,7 @@ class CriticalPath(unittest.TestCase):
         # was created.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1635,7 +1635,7 @@ class CriticalPath(unittest.TestCase):
         # instantly -- the misreading this whole rule exists to prevent.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1653,7 +1653,7 @@ class CriticalPath(unittest.TestCase):
         # stamps would discard the only evidence there is.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1671,7 +1671,7 @@ class CriticalPath(unittest.TestCase):
         # No start stamp to cite, so nothing says when the job began.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1688,7 +1688,7 @@ class CriticalPath(unittest.TestCase):
         # report disowns two sections later.
         _, jobs = fixture("run-success")
         template = next(job["steps"][0] for job in jobs["jobs"]
-                        if job["name"] == "Sanitizers / ubuntu-latest / clang")
+                        if job["name"] == "Sanitizers / ubuntu-26.04 / clang")
         self.assertIsNone(tool.first_step_start(
             {"steps": [dict(template, conclusion="skipped")]}))
         self.assertIsNone(tool.first_step_start(
@@ -1700,7 +1700,7 @@ class CriticalPath(unittest.TestCase):
     def test_the_earliest_step_is_the_one_reported(self):
         _, jobs = fixture("run-success")
         steps = next(job["steps"] for job in jobs["jobs"]
-                     if job["name"] == "Sanitizers / ubuntu-latest / clang")
+                     if job["name"] == "Sanitizers / ubuntu-26.04 / clang")
         self.assertGreater(len(steps), 1)
         timed = [step["started_at"] for step in steps
                  if step.get("started_at") and step.get("completed_at")
@@ -1773,7 +1773,7 @@ class CriticalPath(unittest.TestCase):
         # so, or a total gets published as final with that job missing.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1791,7 +1791,7 @@ class CriticalPath(unittest.TestCase):
         # and the caption does not cover them.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1808,7 +1808,7 @@ class CriticalPath(unittest.TestCase):
         # degraded cells from the block.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1827,7 +1827,7 @@ class CriticalPath(unittest.TestCase):
         # so phase seconds are printed for a job the caption would excuse.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -1903,7 +1903,7 @@ class CriticalPath(unittest.TestCase):
         live = copy.deepcopy(run)
         live["status"] = "in_progress"
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["started_at"] = None
@@ -1927,7 +1927,7 @@ class CriticalPath(unittest.TestCase):
         # is refuted by the same row that carries it.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["started_at"] = None
@@ -1966,7 +1966,7 @@ class CriticalPath(unittest.TestCase):
         run["status"] = run_status
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["status"] = "waiting"
                 job["conclusion"] = None
                 job["started_at"] = None
@@ -1984,7 +1984,7 @@ class CriticalPath(unittest.TestCase):
         # one-sided assertion let one of them drift back once already.
         for key in ("observed", "graph"):
             evidence = paths[key]["evidence"]
-            self.assertIn("Sanitizers / ubuntu-latest / clang",
+            self.assertIn("Sanitizers / ubuntu-26.04 / clang",
                           evidence["unfinished_jobs_off_chain"], key)
             self.assertNotIn("untimed_jobs_off_chain", evidence, key)
 
@@ -1995,7 +1995,7 @@ class CriticalPath(unittest.TestCase):
         paths = self._held_for_approval("completed")
         for key in ("observed", "graph"):
             evidence = paths[key]["evidence"]
-            self.assertIn("Sanitizers / ubuntu-latest / clang",
+            self.assertIn("Sanitizers / ubuntu-26.04 / clang",
                           evidence["untimed_jobs_off_chain"], key)
             self.assertNotIn("unfinished_jobs_off_chain", evidence, key)
 
@@ -2035,7 +2035,7 @@ class CriticalPath(unittest.TestCase):
         # nobody can wait for.
         paths = self._held_for_approval("something-new")
         for key in ("observed", "graph"):
-            self.assertIn("Sanitizers / ubuntu-latest / clang",
+            self.assertIn("Sanitizers / ubuntu-26.04 / clang",
                           paths[key]["evidence"]["untimed_jobs_off_chain"],
                           key)
 
@@ -2064,14 +2064,14 @@ class CriticalPath(unittest.TestCase):
                 run["status"] = "in_progress"
                 mutated = copy.deepcopy(jobs)
                 for job in mutated["jobs"]:
-                    if job["name"] == "Sanitizers / ubuntu-latest / clang":
+                    if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                         job["status"] = status
                         job["conclusion"] = None
                         job["started_at"] = None
                         job["completed_at"] = None
                 running, untimed = tool.untimed_executed_jobs(
                     tool.analyze(run, mutated)["jobs"], run_status="in_progress")
-                self.assertIn("Sanitizers / ubuntu-latest / clang", running)
+                self.assertIn("Sanitizers / ubuntu-26.04 / clang", running)
                 self.assertEqual(untimed, [])
 
     def test_a_job_that_completed_without_a_start_is_not_called_unfinished(self):
@@ -2098,7 +2098,7 @@ class CriticalPath(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["conclusion"] = "failure"
                 job["started_at"] = None
                 # No step evidence, so only the conclusion check can keep
@@ -2108,7 +2108,7 @@ class CriticalPath(unittest.TestCase):
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in mutated["jobs"]])
         path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
-        self.assertIn("Sanitizers / ubuntu-latest / clang",
+        self.assertIn("Sanitizers / ubuntu-26.04 / clang",
                       path["evidence"]["untimed_jobs_off_chain"])
 
     @staticmethod
@@ -2131,7 +2131,7 @@ class CriticalPath(unittest.TestCase):
         # will never acquire one.  Both alarms would be false.
         run, jobs = fixture("run-success")
         mutated = self._cancelled_before_starting(
-            jobs, "Sanitizers / ubuntu-latest / clang")
+            jobs, "Sanitizers / ubuntu-26.04 / clang")
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in mutated["jobs"]])
@@ -2148,21 +2148,21 @@ class CriticalPath(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["status"] = "something-new"
                 job["started_at"] = None
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
             graph, [j["name"] for j in mutated["jobs"]])
         path = tool.analyze(run, mutated, edges, drift)["critical_path"]["graph"]
-        self.assertIn("Sanitizers / ubuntu-latest / clang",
+        self.assertIn("Sanitizers / ubuntu-26.04 / clang",
                       path["evidence"]["untimed_jobs_off_chain"])
 
     def test_a_finished_job_with_no_duration_is_still_missing_data(self):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["started_at"] = None    # completed, never started
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -2178,7 +2178,7 @@ class CriticalPath(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "TSan / ubuntu-latest / clang":
+            if job["name"] == "TSan / ubuntu-26.04 / clang":
                 job["started_at"] = None
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -2318,7 +2318,7 @@ class Populations(unittest.TestCase):
         disguised = [j for j in jobs["jobs"]
                      if j.get("runner_name") == "semantic-reasoning-i401-6-2"]
         self.assertTrue(disguised, "fixture must keep the disguised runner")
-        self.assertIn("ubuntu-latest", disguised[0]["labels"])
+        self.assertIn("ubuntu-26.04", disguised[0]["labels"])
         self.assertEqual(tool.population_of(disguised[0]), "self-hosted")
 
     def test_windows_runner_is_self_hosted(self):
@@ -2447,7 +2447,7 @@ class Rendering(unittest.TestCase):
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
         for job in mutated["jobs"]:
-            if job["name"] == "Sanitizers / ubuntu-latest / clang":
+            if job["name"] == "Sanitizers / ubuntu-26.04 / clang":
                 job["started_at"] = None
         graph = tool.extract_graph(self.WORKFLOW)
         edges, drift = tool.match_graph_to_jobs(
@@ -2614,7 +2614,7 @@ class Rendering(unittest.TestCase):
         # one short.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["conclusion"] = "cancelled"
@@ -2635,7 +2635,7 @@ class Rendering(unittest.TestCase):
         # the ones that are not absent by design.
         run, jobs = fixture("run-success")
         mutated = copy.deepcopy(jobs)
-        victim = "Sanitizers / ubuntu-latest / clang"
+        victim = "Sanitizers / ubuntu-26.04 / clang"
         for job in mutated["jobs"]:
             if job["name"] == victim:
                 job["status"] = "completed"

@@ -13,7 +13,7 @@ import unittest
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci-pr.yml"
 EXPECTED_TIMEOUTS = {
-    "ubuntu-latest": 60,
+    "ubuntu-26.04": 60,
     "macos-latest": 60,
     "windows-latest": 120,
 }

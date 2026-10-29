@@ -6,7 +6,7 @@
       "created_at": "2026-09-11T06:49:48Z",
       "id": 103174726297,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Detect build-triggering changes",
       "runner_group_name": "GitHub Actions",
@@ -62,7 +62,7 @@
       "created_at": "2026-09-11T06:49:48Z",
       "id": 103174726522,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Docs / policy validation",
       "runner_group_name": "default",
@@ -118,7 +118,7 @@
       "created_at": "2026-09-11T06:49:48Z",
       "id": 103174726533,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "RC changelog freeze gate",
       "runner_group_name": "default",
@@ -174,7 +174,7 @@
       "created_at": "2026-09-11T06:50:17Z",
       "id": 103174840940,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / EditorConfig check",
       "runner_group_name": "default",
@@ -246,7 +246,7 @@
       "created_at": "2026-09-11T06:50:36Z",
       "id": 103174910112,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / uncrustify check",
       "runner_group_name": "GitHub Actions",
@@ -326,9 +326,9 @@
       "created_at": "2026-09-11T06:50:52Z",
       "id": 103174971848,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Sanitizers / ubuntu-latest / clang",
+      "name": "Sanitizers / ubuntu-26.04 / clang",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000055705",
       "started_at": "2026-09-11T06:50:54Z",
@@ -438,9 +438,9 @@
       "created_at": "2026-09-11T06:50:52Z",
       "id": 103174971875,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Build / ubuntu-latest / gcc",
+      "name": "Build / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000055706",
       "started_at": "2026-09-11T06:50:55Z",
@@ -582,9 +582,9 @@
       "created_at": "2026-09-11T06:50:52Z",
       "id": 103174971879,
       "labels": [
-        "ubuntu-24.04-arm"
+        "ubuntu-26.04-arm"
       ],
-      "name": "Sanitizers / ubuntu-24.04-arm / gcc",
+      "name": "Sanitizers / ubuntu-26.04-arm / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000055708",
       "started_at": "2026-09-11T06:50:57Z",
@@ -694,9 +694,9 @@
       "created_at": "2026-09-11T06:50:52Z",
       "id": 103174971902,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Sanitizers / ubuntu-latest / gcc",
+      "name": "Sanitizers / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000055707",
       "started_at": "2026-09-11T06:50:55Z",
@@ -918,9 +918,9 @@
       "created_at": "2026-09-11T07:14:47Z",
       "id": 103180567746,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "mbedtls-enabled / ubuntu-latest / gcc",
+      "name": "mbedtls-enabled / ubuntu-26.04 / gcc",
       "runner_group_name": null,
       "runner_name": null,
       "started_at": "2026-09-11T07:14:47Z",
@@ -933,9 +933,9 @@
       "created_at": "2026-09-11T07:14:47Z",
       "id": 103180567967,
       "labels": [
-        "ubuntu-24.04-arm"
+        "ubuntu-26.04-arm"
       ],
-      "name": "Build / ubuntu-24.04-arm / gcc",
+      "name": "Build / ubuntu-26.04-arm / gcc",
       "runner_group_name": null,
       "runner_name": null,
       "started_at": "2026-09-11T07:14:47Z",
@@ -961,9 +961,9 @@
       "created_at": "2026-09-11T07:34:52Z",
       "id": 103185485539,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan / ubuntu-latest / ${{ matrix.compiler }}",
+      "name": "TSan / ubuntu-26.04 / ${{ matrix.compiler }}",
       "runner_group_name": null,
       "runner_name": null,
       "started_at": "2026-09-11T07:34:52Z",
@@ -976,9 +976,9 @@
       "created_at": "2026-09-11T07:34:52Z",
       "id": 103185485852,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan-native / ubuntu-latest / gcc",
+      "name": "TSan-native / ubuntu-26.04 / gcc",
       "runner_group_name": null,
       "runner_name": null,
       "started_at": "2026-09-11T07:34:52Z",

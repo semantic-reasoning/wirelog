@@ -111,7 +111,10 @@ def read_policy_identity(repo: Path) -> dict[str, str]:
     options = (repo / "meson_options.txt").read_text(encoding="utf-8")
     setup = (repo / ".github/actions/setup-meson/action.yml").read_text(encoding="utf-8")
     required = (
-        ("runs-on: ubuntu-latest", workflow),
+        # Pins the PR-CI profile token in ci-pr.yml.  Deliberately NOT the
+        # attribution measurement environment, which this file pins to
+        # ubuntu-24.04 (see require_os_ubuntu_2404 below).
+        ("runs-on: ubuntu-26.04", workflow),
         ("meson setup builddir -Dtests=true -DmbedTLS=disabled", workflow),
         ("meson compile -C builddir wirelog", workflow),
         ("buildtype=release", meson),

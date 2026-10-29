@@ -42,7 +42,7 @@ SKIPs, with a named reason, unless all of the following hold:
     command line.
 
 The architecture guard is not redundant with the OS one: `build-arm`
-(`.github/workflows/ci-pr.yml`, ubuntu-24.04-arm) is Linux, uninstrumented
+(`.github/workflows/ci-pr.yml`, ubuntu-26.04-arm) is Linux, uninstrumented
 and not MSVC, and runs an unfiltered `meson test`.  It is protected today
 only by clang-tidy 22 being absent from that image, which is an accident of
 the runner rather than a guarantee.  `clang-analyzer-*` results are
