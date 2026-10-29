@@ -1750,7 +1750,7 @@ wl_columnar_eval_plan_composed_source_select(
         record->source_is_delta = true;
     }
     col_rel_t *append_delta = NULL;
-    int rc = wl_columnar_session_append_delta_source(record->session,
+    int rc = wl_columnar_session_delta_source(record->session,
             record->private_bindings, op, &append_delta);
     if (rc) {
         record->semantic_result = rc;

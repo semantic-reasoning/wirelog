@@ -344,3 +344,37 @@ claims, cutoff and committed retirement. Retry preserves parity and event
 uniqueness; checked destruction restores governor credit. Existing primitive
 copy/JOIN/CONCAT/consolidation boundaries remain their independent qualification;
 these session checkpoints are integration evidence, not exact-cost formulas.
+
+## G3b controlled recursive row-frontier increment
+
+`test_controlled_recursive_frontiers` exercises generated single/mutual SCC
+plans with recursive VARIABLE/left and JOIN-right occurrences, cycles, duplicate
+seeds, filters, projections, acyclic consumers, observed/unobserved hosts and
+17-column rows. Exact source hooks verify authenticated frontier dispatch,
+later source row counts smaller than accumulated sets, and real zero-row inputs
+while another head still changes. Initial/append/remove results and signed
+events match a control-disabled reference. Repeated-occurrence fallback uses an
+explicit borrowed view of compiler-preserved unrewritten bodies; it does not
+qualify the default K_FUSION rewrite.
+
+`test_controlled_recursive_frontier_stops` coordinates cancellation/work limits
+at thirteen host/primitive points, including an admitted frontier constructor,
+inside controlled row append, later-round source selection, physical/credit
+retirement, a downstream consumer and the common cutoff. Public heads/snapshots
+and pending inputs survive every precommit stop; reset/retry restores reference
+parity, and checked destruction restores aggregate governor credit. Existing
+recursive tests retain empirical exact/one-short session-budget coverage.
+These integrated checkpoints are not new primitive exact-cost formulas.
+
+Each comparison/gather action has a four-unit admission and handles at most one
+INT64 cell plus bounded cursor bookkeeping. Constructors and row append reuse
+qualified bounded metadata/row helpers; allocator/free bodies and callbacks
+retain their existing cooperative exclusions. All children ACK before set
+difference, all differences finish before rebinding, and all frontier ownership
+transitions finish before the next round. Any precommit limit after frontier
+preparation uses whole-host abort/retry, including later strata.
+
+This advances E06's general positive INT64 linear SCC domain with attempt-local
+row-frontier execution. E07/F04/F04a raw differential dispatch, weighted traces,
+persistent epoch/rule-frontier publication, cross-attempt incremental retraction
+and optimized/nonlinear variants remain open. No global diff flag is relaxed.

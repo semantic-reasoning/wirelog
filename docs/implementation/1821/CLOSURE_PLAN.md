@@ -409,3 +409,30 @@ heads and arrangement changes publish at the existing common cutoff. Mixed
 mutations, repeated changed reads and transitive dependencies retain full
 recomputation. Recursive frontier scheduling, weighted traces and incremental
 retractions remain separate obligations; the recursive scheduler remains the next distinct G3b obligation.
+
+## G3b increment: controlled linear SCC row frontiers
+
+The general host now executes actual previous-round row-frontier reads for
+positive declared INT64 SCCs with at most one same-SCC source occurrence across
+each entire preserved head body. Exact occurrence authorization, existing
+controlled union/consolidation, bounded sorted-set difference and retained
+private owner retirement form one executable atomic unit in one PR bundle.
+Multiple mutual heads, seeds, filters, projections and preceding/downstream
+strata remain composable. Repeated same-SCC reads retain full rounds where
+admitted; default optimized-path refusals are unchanged.
+
+All input successors restart from bottom, then execute genuine frontier rounds.
+This closes the selected attempt-local linear SCC scheduler domain; it does not
+close cross-attempt incremental append/retraction, nonlinear/default optimized
+variants, weighted traces or persistent raw epoch/rule-frontier publication.
+Those remain G3b work alongside persistent prefix metadata. G4 through G7 remain
+as recorded; #1821 is not closed by this increment.
+
+Generated route tests witness smaller-than-accumulation and empty frontiers,
+left/right recursive JOIN inputs, single/mutual recursion, 17-column rows,
+observed/unobserved parity and insert/remove restarts. A borrowed unrewritten
+compiler-body view qualifies repeated-occurrence fallback without claiming the
+refused K_FUSION route. Thirteen cancellation/work-limit checkpoints cover
+admission, plan/constructor preparation, difference/gather/append, later-round
+selection, retirement, downstream evaluation and cutoff, with retry/event and
+governor restoration checks.

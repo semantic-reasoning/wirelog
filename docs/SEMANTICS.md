@@ -1821,3 +1821,29 @@ changed head becomes the metered consolidated union of its old head and new
 contributions. Heads, arrangements and committed input boundaries advance at
 one cutoff. The implementation does not activate raw synchronous differential
 operators or claim recursive frontier, weighted trace or retraction support.
+
+### Controlled recursive row frontiers
+
+The general controlled STEP host evaluates qualified positive, nonaggregate,
+positive-arity INT64 SCCs with attempt-local row frontiers. A charged audit of
+all preserved head bodies requires at most one same-SCC VARIABLE or JOIN-right
+read per entire head body. Other sources remain full immutable inputs. A
+referenced head's frontier is selected by the authenticated exact operator
+occurrence, including empty frontiers; the executing head does not substitute
+its own frontier. Round zero borrows the referenced head's empty bottom.
+
+Every qualified child computes a terminal controlled consolidation of its body
+contribution and prior accumulated head. After all SCC children complete and
+ACK cleanup, a charged lexicographic difference of new and old accumulated sets
+produces each next frontier. Ordering follows actual controlled CONSOLIDATE
+output provenance, rather than sorted-prefix metadata. All differences finish
+before rebinding; every old frontier retires before another child starts.
+Convergence requires every next frontier to be empty.
+
+Initial evaluation and all insert/remove successors restart from empty bottom,
+then use frontier rounds within the attempt. This handles changed external
+inputs joining old closure tuples without retaining a cross-attempt delta.
+Repeated same-SCC reads use the existing full frozen-round route where admitted.
+Default K_FUSION/LFTJ and representation refusals remain in force. Public heads
+and observer events retain the existing common cutoff. Raw epoch/rule-frontier
+arrays, weighted traces and incremental retraction are separate contracts.

@@ -3200,6 +3200,371 @@ test_controlled_recursive_transaction(void)
     }
 }
 
+static unsigned frontier_round, frontier_full, frontier_reads, frontier_smaller,
+    frontier_empty, frontier_parent_phase, frontier_stop_phase,
+    frontier_work_hits;
+static bool frontier_stopped, frontier_stop_work, frontier_internal_stop;
+
+static void
+frontier_request_stop(wl_evaluation_control_t *control)
+{
+    frontier_stopped = true;
+    if (frontier_stop_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    frontier_parent_phase = phase;
+    if (phase == 37) frontier_round = progress;
+    if (phase == 38) frontier_full = progress;
+    if (phase == 36) {
+        CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
+                bindings->session, bindings));
+        wl_columnar_eval_private_bindings_t copy = *bindings;
+        col_rel_t *refused = (col_rel_t *)(uintptr_t)1;
+        CHECK(wl_columnar_session_delta_source(bindings->session, &copy,
+            &bindings->plan->ops[0], &refused) == EINVAL && !refused);
+        frontier_reads++;
+        if (frontier_round && progress < frontier_full) frontier_smaller++;
+        if (frontier_round && !progress && frontier_full) frontier_empty++;
+    }
+    if (frontier_stopped || phase != frontier_stop_phase ||
+        frontier_internal_stop)
+        return;
+    if ((phase == 36 || phase == 21) && frontier_round < 2) return;
+    if (phase == 8 && progress != 2) return; /* downstream consumer */
+    frontier_request_stop(control);
+}
+
+static void
+frontier_constructor_checkpoint(wl_evaluation_control_t *control, unsigned part)
+{
+    (void)part;
+    if (!frontier_stopped && frontier_internal_stop && frontier_stop_phase == 32
+        && frontier_parent_phase == 32) frontier_request_stop(control);
+}
+
+static void
+frontier_row_checkpoint(wl_evaluation_control_t *control, uint64_t work)
+{
+    (void)work;
+    if (!frontier_stopped && frontier_internal_stop && frontier_stop_phase == 35
+        && frontier_parent_phase == 35 && ++frontier_work_hits == 3)
+        frontier_request_stop(control);
+}
+
+static char *
+frontier_source(unsigned shape)
+{
+    if (shape == 4) {
+        char *text = calloc(1, 8192); CHECK(text);
+        size_t used = 0; char tuple[256] = {0}; size_t n = 0;
+        for (unsigned c = 0; c < 17; ++c)
+            n += (size_t)snprintf(tuple + n, sizeof(tuple) - n, "%sx%u",
+                    c ? "," : "", c);
+        const char *names[] = {"seeds", "extra", "reach", "back", "result"};
+        for (unsigned i = 0; i < 5; ++i) {
+            used += (size_t)snprintf(text + used, 8192 - used, ".decl %s(",
+                    names[i]);
+            for (unsigned c = 0; c < 17; ++c)
+                used += (size_t)snprintf(text + used, 8192 - used,
+                        "%sx%u:int64", c ? "," : "", c);
+            used += (size_t)snprintf(text + used, 8192 - used, ")\n");
+        }
+        snprintf(text + used, 8192 - used,
+            "reach(%s) :- seeds(%s).\nreach(%s) :- extra(%s).\n"
+            "reach(%s) :- back(%s).\nback(%s) :- reach(%s).\n"
+            "result(%s) :- back(%s).\n", tuple, tuple, tuple, tuple,
+            tuple, tuple, tuple, tuple, tuple, tuple);
+        return text;
+    }
+    const char *rule = shape == 1
+        ? "reach(x,z) :- links(x,y), back(y,z), x != z.\n"
+        : shape == 2 ? "reach(x,z) :- reach(x,y), links(y,z), x != z.\n"
+        : "reach(x,z) :- back(x,y), links(y,z), x != z.\n";
+    char *text = calloc(1, 4096); CHECK(text);
+    snprintf(text, 4096,
+        ".decl links(x:int64,y:int64)\n.decl seeds(x:int64,y:int64)\n"
+        ".decl extra(x:int64,y:int64)\n.decl reach(x:int64,y:int64)\n"
+        "%s.decl result(x:int64,y:int64)\n"
+        "reach(x,y) :- seeds(x,y).\nreach(x,y) :- extra(x,y).\n%s%s%s",
+        shape == 2 ? "" : ".decl back(x:int64,y:int64)\n", rule,
+        shape == 3 ? "reach(x,z) :- links(x,y), back(y,z), x != z.\n" : "",
+        shape == 2 ? "result(x,y) :- reach(x,y).\n"
+            : "back(x,y) :- reach(x,y).\nresult(x,y) :- back(x,y).\n");
+    return text;
+}
+
+static void
+frontier_check_parity(wl_session_t *session, wl_session_t *reference,
+    observed_multi_capture_t *actual, observed_multi_capture_t *expected,
+    bool single)
+{
+    CHECK(actual->count == expected->count);
+    qsort(actual->events, actual->count, sizeof(actual->events[0]),
+        observed_multi_order);
+    qsort(expected->events, expected->count, sizeof(expected->events[0]),
+        observed_multi_order);
+    CHECK(!memcmp(actual->events, expected->events,
+        actual->count * sizeof(actual->events[0])));
+    const char *names[] = {"reach", "back", "result"};
+    for (unsigned i = 0; i < 3; ++i) {
+        if (single && i == 1) continue;
+        const col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                names[i]);
+        const col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                names[i]);
+        CHECK(a && b && a->ncols == b->ncols && a->nrows == b->nrows);
+        for (uint32_t r = 0; r < a->nrows; ++r)
+            for (uint32_t c = 0; c < a->ncols; ++c)
+                CHECK(a->columns[c][r] == b->columns[c][r]);
+    }
+}
+
+static void
+test_controlled_recursive_frontiers(void)
+{
+    for (unsigned shape = 0; shape < 5; ++shape) {
+        for (unsigned observed = 0; observed < 2; ++observed) {
+            char *source = frontier_source(shape);
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            free(source); CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_plan_t *owned_plan = plan, unrewritten;
+            wl_plan_stratum_t *strata = NULL;
+            /* The default nonlinear rewrite is still an explicit refusal.
+             * Exercise the existing unrewritten full-round fallback using a
+             * borrowed view of compiler-recorded bodies, without changing
+             * ownership or claiming the optimized K_FUSION route. */
+            if (shape == 3) {
+                unrewritten = *plan;
+                strata = malloc(plan->stratum_count * sizeof(*strata));
+                CHECK(strata);
+                memcpy(strata, plan->strata,
+                    plan->stratum_count * sizeof(*strata));
+                for (uint32_t si = 0; si < plan->stratum_count; ++si) {
+                    if (!strata[si].is_recursive) continue;
+                    wl_plan_relation_t *rels =
+                        malloc(strata[si].relation_count * sizeof(*rels));
+                    CHECK(rels);
+                    memcpy(rels, strata[si].relations,
+                        strata[si].relation_count * sizeof(*rels));
+                    strata[si].relations = rels;
+                    for (uint32_t r = 0; r < strata[si].relation_count; ++r) {
+                        rels[r].ops = strata[si].bodies[r].ops;
+                        rels[r].op_count = strata[si].bodies[r].op_count;
+                    }
+                }
+                unrewritten.strata = strata; plan = &unrewritten;
+            }
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.evaluation_control = control;
+            options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1, &options, &session));
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            ((wl_col_session_t *)reference)->diff_enabled = false;
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual)),
+                *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            if (observed) {
+                wl_session_set_delta_cb(session, observed_multi_capture,
+                    actual);
+                wl_session_set_delta_cb(reference, observed_multi_capture,
+                    expected);
+            }
+            int64_t seeds[34] = {1, 2, 2, 3}, extra[17] = {-1, 2};
+            uint32_t width = shape == 4 ? 17 : 2;
+            if (shape == 4) for (unsigned c = 0; c < 17; ++c) {
+                    seeds[c] = (int64_t)c; seeds[c + 17] = 100 + (int64_t)c;
+                    extra[c] = 100 + (int64_t)c;
+                }
+            const int64_t links[] = {1, 2, 2, 3, 3, 1, 3, 4, 2, 3};
+            if (shape != 4) {
+                CHECK(!wl_session_insert(session, "links", links, 5, 2));
+                CHECK(!wl_session_insert(reference, "links", links, 5, 2));
+            }
+            CHECK(!wl_session_insert(session, "seeds", seeds, 2, width));
+            CHECK(!wl_session_insert(reference, "seeds", seeds, 2, width));
+            CHECK(!wl_session_insert(session, "extra", extra, 1, width));
+            CHECK(!wl_session_insert(reference, "extra", extra, 1, width));
+            for (unsigned cycle = 0; cycle < 3; ++cycle) {
+                int64_t added[17] = {4, 5};
+                if (shape == 1) added[1] = 1;
+                if (shape == 4) for (unsigned c = 0; c < 17;
+                        ++c) added[c] = 200 + (int64_t)c;
+                const char *input = shape == 4 ? "seeds" : "links";
+                if (cycle == 1) {
+                    CHECK(!wl_session_insert(session, input, added, 1, width));
+                    CHECK(!wl_session_insert(reference, input, added, 1,
+                        width));
+                } else if (cycle == 2) {
+                    CHECK(!wl_session_remove(session, input, added, 1, width));
+                    CHECK(!wl_session_remove(reference, input, added, 1,
+                        width));
+                }
+                actual->count = expected->count = 0;
+                frontier_round = frontier_full = frontier_reads =
+                    frontier_smaller = frontier_empty = 0;
+                frontier_stop_phase = UINT_MAX;
+                frontier_stopped = frontier_internal_stop = false;
+                wl_columnar_session_test_observed_transaction_checkpoint =
+                    frontier_checkpoint;
+                int rc = observed_multi_step(session);
+                wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+                if (rc) fprintf(stderr,
+                        "frontier shape=%u observed=%u cycle=%u rc=%d\n", shape,
+                        observed, cycle, rc);
+                CHECK(!rc && !wl_session_step(reference));
+                CHECK(shape == 3 ? !frontier_reads : frontier_reads != 0);
+                if (shape != 3) {
+                    CHECK(frontier_smaller);
+                    if (shape != 2) CHECK(frontier_empty);
+                }
+                frontier_check_parity(session, reference, actual, expected,
+                    shape == 2);
+                unsigned delivered = actual->count;
+                CHECK(!observed_multi_step(session) &&
+                    actual->count == delivered);
+            }
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control);
+            if (strata) {
+                for (uint32_t si = 0; si < owned_plan->stratum_count; ++si)
+                    if (strata[si].is_recursive) free(
+                            (void *)strata[si].relations);
+                free(strata);
+            }
+            wl_plan_free(owned_plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor); free(actual);
+            free(expected);
+        }
+    }
+}
+
+static void
+test_controlled_recursive_frontier_stops(void)
+{
+    const unsigned phases[] = {29, 30, 31, 32, 33, 34, 35, 36, 21, 22, 23, 8,
+                               14};
+    for (unsigned point = 0; point < sizeof(phases)/sizeof(phases[0]);
+        ++point){
+        for (unsigned outcome = 0; outcome < 2; ++outcome) {
+            wirelog_error_t error;
+            wirelog_program_t *program =
+                wirelog_parse_string(recursive_transaction_source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.evaluation_control = control;
+            options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1, &options, &session));
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            const int64_t edges[] = {1, 2, 2, 3, 3, 4}, seed[] = {0, 1},
+                added[] = {4, 5};
+            CHECK(!wl_session_insert(session, "links", edges, 3, 2));
+            CHECK(!wl_session_insert(reference, "links", edges, 3, 2));
+            CHECK(!wl_session_insert(session, "seeds", seed, 1, 2));
+            CHECK(!wl_session_insert(reference, "seeds", seed, 1, 2));
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual)),
+                *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            const char *names[] = {"reach", "back", "result"};
+            col_rel_t *old[3]; col_relation_snapshot_t snapshots[3];
+            for (unsigned h = 0; h < 3; ++h) {
+                old[h] = session_find_rel((wl_col_session_t *)session,
+                        names[h]);
+                snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+            }
+            CHECK(!wl_session_insert(session, "links", added, 1, 2));
+            CHECK(!wl_session_insert(reference, "links", added, 1, 2));
+            actual->count = expected->count = 0;
+            CHECK(!wl_evaluation_control_configure(control,
+                UINT64_C(1000000000)));
+            frontier_stop_phase = phases[point];
+            frontier_stop_work = outcome != 0;
+            frontier_stopped = false; frontier_round = frontier_work_hits = 0;
+            frontier_internal_stop = phases[point] == 32 || phases[point] == 35;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                frontier_checkpoint;
+            wl_columnar_relation_test_constructor_committed =
+                frontier_constructor_checkpoint;
+            wl_columnar_relation_test_work_checkpoint = frontier_row_checkpoint;
+            int rc = observed_multi_step(session);
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+            wl_columnar_relation_test_constructor_committed = NULL;
+            wl_columnar_relation_test_work_checkpoint = NULL;
+            if (!frontier_stopped) fprintf(stderr,
+                    "missed frontier stop phase=%u outcome=%u rc=%d\n",
+                    phases[point], outcome, rc);
+            CHECK(frontier_stopped);
+            CHECK(rc ==
+                (outcome ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(!actual->count &&
+                ((wl_col_session_t *)session)->pending_input_change);
+            for (unsigned h = 0; h < 3; ++h) {
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    names[h]) == old[h]);
+                CHECK(wl_columnar_relation_snapshot_equal(snapshots[h],
+                    wl_columnar_relation_snapshot(old[h])));
+            }
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            frontier_check_parity(session, reference, actual, expected, false);
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control); wl_plan_free(plan);
+            wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor); free(actual);
+            free(expected);
+        }
+    }
+}
+
 static void
 recursive_snapshot_count(const char *name, const int64_t *row, uint32_t width,
     void *data)
@@ -11466,6 +11831,8 @@ main(void)
     test_controlled_recursive_step_general_join_chain();
     test_controlled_session_step_resume();
     test_controlled_recursive_transaction();
+    test_controlled_recursive_frontiers();
+    test_controlled_recursive_frontier_stops();
     test_controlled_recursive_transaction_successors();
     test_controlled_recursive_transaction_stops();
     test_controlled_recursive_transaction_shapes();

@@ -6829,9 +6829,10 @@ typedef struct wl_columnar_eval_private_bindings {
 
 bool wl_columnar_session_observed_bindings_authorized(
     const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
-/* Exact host-owned occurrence override. NULL means ordinary full evaluation;
- * a live delta is immutable through child ACK and never a public index key. */
-int wl_columnar_session_append_delta_source(wl_col_session_t *,
+/* Exact host-owned occurrence override for acyclic appends or qualified SCC
+ * row frontiers. NULL means full evaluation; an empty delta remains a nonNULL
+ * immutable source through child ACK and never a public full-source index key. */
+int wl_columnar_session_delta_source(wl_col_session_t *,
     const wl_columnar_eval_private_bindings_t *, const wl_plan_op_t *,
     col_rel_t **);
 int wl_columnar_session_diff_index(

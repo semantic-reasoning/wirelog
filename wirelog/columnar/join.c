@@ -5212,7 +5212,7 @@ wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
         right = delta; used_delta = true;
     }
     col_rel_t *append_delta = NULL;
-    rc = wl_columnar_session_append_delta_source(session, private_bindings,
+    rc = wl_columnar_session_delta_source(session, private_bindings,
             op, &append_delta);
     if (rc) goto done;
     if (append_delta) {

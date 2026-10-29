@@ -154,11 +154,20 @@ typedef enum {
     WL_SESSION_APPEND_AUDIT = 25,
     WL_SESSION_APPEND_COPY = 26,
     WL_SESSION_APPEND_PLAN = 27,
+    WL_SESSION_RECURSIVE_RANGE = 29,
+    WL_SESSION_RECURSIVE_AUDIT = 30,
+    WL_SESSION_RECURSIVE_PLAN = 31,
+    WL_SESSION_RECURSIVE_FRONTIER = 32,
+    WL_SESSION_RECURSIVE_DIFFERENCE = 33,
+    WL_SESSION_RECURSIVE_GATHER = 34,
+    WL_SESSION_RECURSIVE_EMIT = 35,
 } wl_columnar_session_observed_phase_t;
 
 typedef struct {
     wl_plan_relation_t plan;
-    col_rel_t *candidate, *previous;
+    col_rel_t *candidate, *previous, *frontier, *next_frontier;
+    col_relation_snapshot_t frontier_snapshot;
+    uint32_t delta_source;
     uint32_t stratum, width;
     bool recursive;
     const wl_plan_op_t *delta_op;
@@ -216,6 +225,8 @@ typedef struct {
     col_rel_t *append_delta;
     col_relation_snapshot_t append_snapshot;
     bool append_active;
+    bool round_frontiers, frontier_started;
+    uint32_t old_row, new_row;
 } wl_columnar_session_observed_transaction_t;
 
 struct wl_columnar_controlled_step {
@@ -447,7 +458,7 @@ void (*wl_columnar_session_test_successor_registry_charge)(
 #endif
 
 int
-wl_columnar_session_append_delta_source(wl_col_session_t *sess,
+wl_columnar_session_delta_source(wl_col_session_t *sess,
     const wl_columnar_eval_private_bindings_t *bindings,
     const wl_plan_op_t *op, col_rel_t **out)
 {
@@ -457,16 +468,41 @@ wl_columnar_session_append_delta_source(wl_col_session_t *sess,
         return EINVAL;
     wl_columnar_session_observed_transaction_t *tx =
         sess->controlled_step->transaction;
-    if (!tx->append_active || op != tx->heads[tx->head].delta_op) return 0;
-    if (!tx->append_delta || !wl_columnar_relation_snapshot_equal(
-            tx->append_snapshot,
-            wl_columnar_relation_snapshot(tx->append_delta))) return EINVAL;
-    *out = tx->append_delta;
+    const wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
+    if (op != head->delta_op) return 0;
+    if (tx->round_active && tx->round_frontiers) {
+        if (head->delta_source < tx->round_begin
+            || head->delta_source >= tx->round_end) return EINVAL;
+        const wl_columnar_session_observed_head_t *source =
+            &tx->heads[head->delta_source];
+        col_rel_t *r = tx->round ? source->frontier : source->previous;
+        col_relation_snapshot_t snapshot = tx->round
+            ? source->frontier_snapshot
+            : tx->entries[sess->plan->edb_count + head->delta_source].snapshot;
+        if (!r || !wl_columnar_relation_snapshot_equal(snapshot,
+            wl_columnar_relation_snapshot(r))) return EINVAL;
+        *out = r;
 #ifdef WL_SESSION_TEST_HOOKS
-    if (wl_columnar_session_test_observed_transaction_checkpoint)
-        wl_columnar_session_test_observed_transaction_checkpoint(
-            bindings->control, 28, tx->append_delta->nrows, bindings);
+        if (wl_columnar_session_test_observed_transaction_checkpoint) {
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 37, tx->round, bindings);
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 38, source->previous->nrows, bindings);
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 36, r->nrows, bindings);
+        }
 #endif
+    } else if (tx->append_active) {
+        if (!tx->append_delta || !wl_columnar_relation_snapshot_equal(
+                tx->append_snapshot,
+                wl_columnar_relation_snapshot(tx->append_delta))) return EINVAL;
+        *out = tx->append_delta;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_observed_transaction_checkpoint)
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 28, tx->append_delta->nrows, bindings);
+#endif
+    }
     return 0;
 }
 
@@ -9477,6 +9513,26 @@ wl_columnar_session_recursive_retire(
 }
 
 static int
+wl_columnar_session_frontier_new(wl_col_session_t *sess,
+    wl_columnar_session_observed_head_t *head, uint64_t id)
+{
+    wl_columnar_relation_scalar_source_t source;
+    bool initialized = false;
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    int rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
+        &source, &initialized, control, id);
+    if (!rc) rc = wl_columnar_relation_scalar_source_begin_attempt_controlled(
+            &source, head->candidate, false);
+    if (!rc) rc =
+            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+            (
+            &source, head->plan.name, sess->memory_governor,
+            &head->next_frontier);
+    return initialized ? wl_columnar_relation_scalar_source_end(&source, rc)
+        : rc;
+}
+
+static int
 wl_columnar_session_observed_action(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
@@ -9502,7 +9558,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
                 tx->phase == WL_SESSION_OBSERVED_PLAN ? 256 : tx->phase ==
                 WL_SESSION_OBSERVED_ALLOCATE ||
-                tx->phase == WL_SESSION_OBSERVED_ZERO ? 64 : 1);
+                tx->phase == WL_SESSION_OBSERVED_ZERO ? 64 :
+                tx->phase == WL_SESSION_RECURSIVE_DIFFERENCE ||
+                tx->phase == WL_SESSION_RECURSIVE_GATHER ? 4 : 1);
         if (rc) return rc;
     }
     switch (tx->phase) {
@@ -9977,7 +10035,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->round_begin = tx->head; tx->round_end = tx->head;
             tx->round_index = tx->head; tx->round = 0;
             tx->round_active = true;
-            tx->phase = WL_SESSION_RECURSIVE_SEED;
+            tx->round_frontiers = sess->diff_enabled;
+            tx->phase = WL_SESSION_RECURSIVE_RANGE;
             return 0;
         }
         rc = wl_columnar_session_observed_child(sess, step);
@@ -10008,6 +10067,76 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->head++;
             return 0;
         }
+    case WL_SESSION_RECURSIVE_RANGE:
+        if (tx->round_index < tx->head_count &&
+            tx->heads[tx->round_index].stratum
+            == tx->heads[tx->round_begin].stratum) {
+            tx->round_end = ++tx->round_index; return 0;
+        }
+        tx->index = tx->round_index = tx->round_begin;
+        tx->other = tx->round_begin; tx->op = 0; tx->byte = 0;
+        tx->phase = tx->round_frontiers ? WL_SESSION_RECURSIVE_AUDIT
+            : WL_SESSION_RECURSIVE_SEED;
+        if (!tx->round_frontiers) tx->index = 0;
+        return 0;
+    case WL_SESSION_RECURSIVE_AUDIT: {
+        if (tx->index == tx->round_end) {
+            tx->index = tx->round_begin;
+            tx->frontier_started = true;
+            tx->phase = WL_SESSION_RECURSIVE_PLAN; return 0;
+        }
+        wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
+        const wl_plan_op_t *op = &head->plan.ops[tx->op];
+        const char *name = op->op == WL_PLAN_OP_VARIABLE ? op->relation_name
+            : op->op == WL_PLAN_OP_JOIN ? op->right_relation : NULL;
+        if (name && tx->other < tx->round_end) {
+            char a = name[tx->byte];
+            char b = tx->heads[tx->other].plan.name[tx->byte];
+            if (a != b) {
+                tx->other++; tx->byte = 0; return 0;
+            }
+            if (a) {
+                tx->byte++; return 0;
+            }
+            head->delta_op = op; head->delta_source = tx->other;
+            if (++head->delta_reads > 1) {
+                /* No plan was modified: the entire SCC retains full rounds. */
+                tx->round_frontiers = false; tx->index = 0;
+                tx->phase = WL_SESSION_RECURSIVE_SEED;
+                return 0;
+            }
+        }
+        tx->other = tx->round_begin; tx->byte = 0;
+        if (++tx->op == head->plan.op_count) {
+            tx->op = 0; tx->index++;
+        }
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_PLAN: {
+        if (tx->index == tx->round_end) {
+            tx->index = 0;
+            tx->phase = WL_SESSION_RECURSIVE_SEED; return 0;
+        }
+        wl_columnar_session_observed_head_t *head = &tx->heads[tx->index];
+        wl_plan_op_t *tail = (wl_plan_op_t *)head->plan.ops
+            + head->plan.op_count - 1;
+        if (tx->byte < 3 * sizeof(*tail)) {
+            size_t bytes = 3 * sizeof(*tail) - tx->byte;
+            if (bytes > 128) bytes = 128;
+            rc = wl_evaluation_control_charge_attempt(control,
+                    step->operation_id, bytes);
+            if (rc) return rc;
+            memset((unsigned char *)tail + tx->byte, 0, bytes);
+            tx->byte += bytes; return 0;
+        }
+        tail[0].op = WL_PLAN_OP_VARIABLE;
+        tail[0].relation_name = head->plan.name;
+        tail[0].delta_mode = WL_DELTA_FORCE_FULL;
+        tail[1].op = WL_PLAN_OP_CONCAT;
+        tail[2].op = WL_PLAN_OP_CONSOLIDATE;
+        head->plan.op_count += 2;
+        tx->index++; tx->byte = 0; return 0;
+    }
     case WL_SESSION_RECURSIVE_SEED: {
         /* Start from bottom, never an old public closure. On later rounds
          * ownership moves from candidate to the immutable round input. */
@@ -10059,6 +10188,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (!tx->row) {
             tx->row = 1; tx->column = 0; return 0;
         }
+        if (tx->round_frontiers) {
+            tx->column = tx->old_row = tx->new_row = 0;
+            tx->phase = WL_SESSION_RECURSIVE_FRONTIER; return 0;
+        }
         if (a->nrows != b->nrows) tx->round_changed = true;
         else if (tx->row - 1 < b->nrows) {
             if (a->columns[tx->column][tx->row - 1]
@@ -10071,6 +10204,52 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         }
         tx->round_index++; tx->row = tx->column = 0;
         return 0;
+    }
+    case WL_SESSION_RECURSIVE_FRONTIER:
+        rc = wl_columnar_session_frontier_new(sess,
+                &tx->heads[tx->round_index], step->operation_id);
+        if (rc) return rc;
+        tx->phase = WL_SESSION_RECURSIVE_DIFFERENCE; return 0;
+    case WL_SESSION_RECURSIVE_DIFFERENCE: {
+        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        const col_rel_t *a = head->previous, *b = head->candidate;
+        /* Ordering comes from actual terminal controlled CONSOLIDATE outputs
+         * (or empty bottom), never caller-supplied sorted-prefix hints. */
+        if (tx->new_row == b->nrows) {
+            if (head->next_frontier->nrows) tx->round_changed = true;
+            tx->round_index++; tx->row = tx->column = 0;
+            tx->phase = WL_SESSION_RECURSIVE_COMPARE; return 0;
+        }
+        if (tx->old_row == a->nrows) {
+            tx->column = 0; tx->phase = WL_SESSION_RECURSIVE_GATHER;
+            return 0;
+        }
+        int64_t av = a->columns[tx->column][tx->old_row];
+        int64_t bv = b->columns[tx->column][tx->new_row];
+        if (av < bv) {
+            tx->old_row++; tx->column = 0;
+        }else if (av > bv) {
+            tx->column = 0; tx->phase = WL_SESSION_RECURSIVE_GATHER;
+        } else if (++tx->column == head->width) {
+            tx->old_row++; tx->new_row++; tx->column = 0;
+        }
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_GATHER: {
+        wl_columnar_session_observed_head_t *head = &tx->heads[tx->round_index];
+        head->next_frontier->row_scratch[tx->column] =
+            head->candidate->columns[tx->column][tx->new_row];
+        if (++tx->column == head->width)
+            tx->phase = WL_SESSION_RECURSIVE_EMIT;
+        return 0;
+    }
+    case WL_SESSION_RECURSIVE_EMIT: {
+        col_rel_t *r = tx->heads[tx->round_index].next_frontier;
+        rc = wl_columnar_relation_append_row_controlled(r, r->row_scratch,
+                control);
+        if (rc) return rc;
+        tx->new_row++; tx->column = 0;
+        tx->phase = WL_SESSION_RECURSIVE_DIFFERENCE; return 0;
     }
     case WL_SESSION_RECURSIVE_REBIND: {
         if (tx->round_index == tx->round_end) {
@@ -10086,10 +10265,32 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
     }
     case WL_SESSION_RECURSIVE_RETIRE:
         if (tx->round_index < tx->round_end) {
-            rc = wl_columnar_session_recursive_retire(tx,
-                    &tx->heads[tx->round_index].previous, control,
-                    step->operation_id);
-            if (rc) return rc;
+            if (tx->heads[tx->round_index].previous) {
+                rc = wl_columnar_session_recursive_retire(tx,
+                        &tx->heads[tx->round_index].previous, control,
+                        step->operation_id);
+                if (rc) return rc;
+            }
+            wl_columnar_session_observed_head_t *head =
+                &tx->heads[tx->round_index];
+            if (head->frontier) {
+                rc = wl_columnar_session_recursive_retire(tx, &head->frontier,
+                        control, step->operation_id);
+                if (rc) return rc;
+            }
+            if (head->next_frontier) {
+                if (tx->round_changed) {
+                    head->frontier = head->next_frontier;
+                    head->next_frontier = NULL;
+                    head->frontier_snapshot =
+                        wl_columnar_relation_snapshot(head->frontier);
+                } else {
+                    rc = wl_columnar_session_recursive_retire(tx,
+                            &head->next_frontier,
+                            control, step->operation_id);
+                    if (rc) return rc;
+                }
+            }
             if (!tx->round_changed) {
                 uint32_t slot = plan->edb_count + tx->round_index;
                 if (!tx->entries[slot].public_relation)
@@ -10404,7 +10605,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
             tx->rollback = false;
             tx->phase = WL_SESSION_OBSERVED_CLAIMS; tx->index = 0;
             if (tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT
-                || tx->differential.started || tx->append_active) {
+                || tx->differential.started || tx->append_active ||
+                tx->frontier_started) {
                 step->transaction_discard = true;
                 step->primary_result = tx->rollback_result;
                 return EAGAIN;
@@ -10427,7 +10629,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
              * Retire the entire private image before retrying a stopped
              * differential attempt; only the published image may survive. */
             if (!tx->committed && (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
-                || tx->differential.started || tx->append_active)) {
+                || tx->differential.started || tx->append_active ||
+                tx->frontier_started)) {
                 step->transaction_discard = true;
                 step->primary_result = rc;
                 return EAGAIN;
@@ -10504,6 +10707,19 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
             col_rel_t **owner = &tx->heads[tx->cleanup_round].previous;
             if (*owner) {
                 rc = wl_columnar_session_recursive_retire(tx, owner,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            wl_columnar_session_observed_head_t *head =
+                &tx->heads[tx->cleanup_round];
+            if (head->frontier) {
+                rc = wl_columnar_session_recursive_retire(tx, &head->frontier,
+                        tx->maintenance, tx->maintenance_id);
+                if (rc) return rc;
+            }
+            if (head->next_frontier) {
+                rc = wl_columnar_session_recursive_retire(tx,
+                        &head->next_frontier,
                         tx->maintenance, tx->maintenance_id);
                 if (rc) return rc;
             }
