@@ -880,9 +880,19 @@ if not is_windows
   # the #1487 walltime gate fails a shell test that exceeds 50% of its Meson
   # timeout, so 180 keeps that alarm at 90 s where 300 would move it to
   # 150 s.
+  #
+  # Issue #1651: it builds libwirelog from scratch in an isolated build dir,
+  # so -- like candidate_consumer_contract (#1615) -- it must not run in
+  # parallel with the rest of the suite: a nested parallel ninja inside the
+  # ncpu-wide test scheduler contends for CPU and starves neighbours (the
+  # #1615 mechanism).  is_parallel: false serialises it.  The timeout stays
+  # 180 (see the walltime argument above); serialised the gate is faster --
+  # measured ~14 s on a dev box and ~40 s on the worst CI leg, both well
+  # under the 90 s budget.
   test('log_abi_compile_erasure',
        find_program(meson.project_source_root() / 'scripts/ci/check-log-erasure.sh'),
        suite: 'abi',
+       is_parallel: false,
        timeout: 180)
 
   # Issue #1799: the gate's selftest.  60 rather than the gate's 180 because
