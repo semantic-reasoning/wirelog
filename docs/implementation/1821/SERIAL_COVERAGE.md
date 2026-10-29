@@ -378,3 +378,26 @@ This advances E06's general positive INT64 linear SCC domain with attempt-local
 row-frontier execution. E07/F04/F04a raw differential dispatch, weighted traces,
 persistent epoch/rule-frontier publication, cross-attempt incremental retraction
 and optimized/nonlinear variants remain open. No global diff flag is relaxed.
+
+## G3b default generated linear UNION qualification
+
+`test_controlled_recursive_union_heads` uses unmodified generated plans with
+separate recursive branches referencing distinct heads and JOIN keys. Observed
+and unobserved initial, append and remove attempts match raw serial and two-worker
+fallback results, including exact head sets and signed event delivery. Source
+checkpoints witness each branch, referenced-head selection, smaller and real
+empty frontiers. `test_recursive_union_workers` separately requires a generated
+EXCHANGE plan and nonzero TDD execution statistics before comparing exact sets.
+
+The frontier stop matrix now covers seventeen checkpoints, adding map allocation,
+partial 64-byte initialization, later audit entries and later-branch selection.
+Authentication tests reject copied bindings and copied, misaligned and out-of-range
+operator addresses; reserved old-head union slots remain unmapped. These are
+integration checkpoints, not new primitive exact-cost formulas.
+
+`test_linear_union_degree` rejects malformed/opaque/unsupported stack expressions
+and `(recursive UNION seed) JOIN recursive`. `test_default_linear_union_plan`
+requires natural linear alternatives without K_FUSION; the existing nonlinear
+fixture still requires K expansion. Nonlinear borrowed-body fallback remains an
+explicitly separate case. Persistent traces/frontiers and incremental retraction
+remain unqualified and open.

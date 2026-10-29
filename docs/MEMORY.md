@@ -5010,6 +5010,17 @@ Later empty frontiers are real owned relations, never a request to fall back to
 full input. Child generation/plan/attempt authorization and frozen snapshots
 protect the exact occurrence through cleanup ACK.
 
+The transaction reserves a parallel uint32 source map for every private operator
+slot, including the old-head union tail. Allocation is governed and initialization
+advances in at most 64-byte charged regions. Zero means full input; a checked
+one-based head index selects the referenced SCC frontier. Tail slots remain zero.
+Bindings and child generation are authenticated before integer range/alignment
+checks identify an exact current-head operator slot. The complete charged degree
+audit precedes frontier plan changes; a nonlinear body ignores partial map entries.
+Allocation, zeroing and audit preparation may retain progress on work limits;
+the sticky whole-host abort policy begins at frontier plan preparation. The map
+retires with transaction metadata and owns no relations.
+
 A qualified scalar-source lease constructs each schema-preserving next frontier
 and drains lexically before the constructor action returns. The transaction
 retains any published constructor output. A two-pointer private set difference

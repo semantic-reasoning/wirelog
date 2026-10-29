@@ -24,6 +24,8 @@
 #include <string.h>
 
 char *wl_test_make_delta_name(const char *name);
+bool wl_plan_test_delta_alternatives_linear(const wl_plan_op_t *, uint32_t,
+    const uint32_t *, uint32_t);
 
 static const char *k_semijoin_chain_src;
 static wirelog_ir_node_t *find_composite_left_joinlike(
@@ -782,6 +784,76 @@ test_join_project_fusion_keeps_computed_map(void)
 
     wl_plan_free(plan);
     wirelog_program_free(prog);
+    PASS();
+}
+
+static void
+test_linear_union_degree(void)
+{
+    TEST(
+        "UNION alternatives preserve linear degree, but a later recursive JOIN adds degree");
+    wl_plan_op_t ops[8] = {0};
+    uint32_t positions[] = {0, 3};
+    ops[0].op = WL_PLAN_OP_VARIABLE;
+    ops[1].op = WL_PLAN_OP_VARIABLE;
+    ops[2].op = WL_PLAN_OP_CONCAT;
+    ops[3].op = WL_PLAN_OP_JOIN;
+    ops[4].op = WL_PLAN_OP_CONSOLIDATE;
+    ASSERT(!wl_plan_test_delta_alternatives_linear(ops, 5, positions, 2),
+        "(recursive UNION seed) JOIN recursive remains nonlinear");
+    ops[3].op = WL_PLAN_OP_VARIABLE;
+    ops[4].op = WL_PLAN_OP_FILTER;
+    ops[5].op = WL_PLAN_OP_MAP;
+    ops[6].op = WL_PLAN_OP_CONCAT;
+    ops[7].op = WL_PLAN_OP_CONSOLIDATE;
+    ASSERT(wl_plan_test_delta_alternatives_linear(ops, 8, positions, 2),
+        "separate recursive alternatives with row-local operations are linear");
+    ops[4].opaque_data = &positions;
+    ASSERT(!wl_plan_test_delta_alternatives_linear(ops, 8, positions, 2),
+        "opaque operations retain established rewriting");
+    ops[4].opaque_data = NULL; ops[4].op = WL_PLAN_OP_REDUCE;
+    ASSERT(!wl_plan_test_delta_alternatives_linear(ops, 8, positions, 2),
+        "aggregates retain established rewriting");
+    ops[0].op = WL_PLAN_OP_CONCAT;
+    ASSERT(!wl_plan_test_delta_alternatives_linear(ops, 8, positions, 2),
+        "stack underflow does not qualify");
+    ops[0].op = ops[1].op = WL_PLAN_OP_VARIABLE;
+    ASSERT(!wl_plan_test_delta_alternatives_linear(ops, 2, positions, 1),
+        "multiple final stack values do not qualify");
+    PASS();
+}
+
+static void
+test_default_linear_union_plan(void)
+{
+    TEST("default compiler keeps linear recursive UNION alternatives ordinary");
+    const char *src = ".decl seed(x:int64,y:int64)\n"
+        ".decl edge(x:int64,y:int64)\n.decl reverse(x:int64,y:int64)\n"
+        ".decl reach(x:int64,y:int64)\n.decl back(x:int64,y:int64)\n"
+        ".decl mirror(x:int64,y:int64)\nreach(x,y) :- seed(x,y).\n"
+        "reach(x,z) :- back(x,y), edge(y,z).\n"
+        "reach(x,z) :- reverse(x,y), mirror(y,z).\n"
+        "back(y,x) :- reach(x,y).\nmirror(x,y) :- reach(x,y), x > 5.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(src, &error);
+    ASSERT(program, "linear UNION program parses");
+    wl_plan_t *plan = NULL;
+    ASSERT(!wl_plan_from_program(program, &plan), "linear UNION plan builds");
+    bool found = false; unsigned joins = 0;
+    for (uint32_t s = 0; s < plan->stratum_count; ++s)
+        for (uint32_t r = 0; r < plan->strata[s].relation_count; ++r) {
+            const wl_plan_relation_t *rel = &plan->strata[s].relations[r];
+            for (uint32_t i = 0; i < rel->op_count; ++i) {
+                ASSERT(rel->ops[i].op != WL_PLAN_OP_K_FUSION,
+                    "linear alternatives do not acquire K_FUSION");
+                if (!strcmp(rel->name, "reach")) {
+                    found = true;
+                    joins += rel->ops[i].op == WL_PLAN_OP_JOIN;
+                }
+            }
+        }
+    ASSERT(found && joins == 2, "both recursive JOIN branches remain visible");
+    wl_plan_free(plan); wirelog_program_free(program);
     PASS();
 }
 
@@ -1570,6 +1642,8 @@ main(void)
     test_tc_end_to_end();
     test_join_project_fusion_plan_shape();
     test_join_project_fusion_keeps_computed_map();
+    test_linear_union_degree();
+    test_default_linear_union_plan();
     test_k_fusion_sequences_fuse_join_project();
     test_semijoin_does_not_shift_column_indices();
     test_semijoin_chain_end_to_end();

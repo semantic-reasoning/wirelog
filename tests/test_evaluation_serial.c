@@ -3204,6 +3204,9 @@ static unsigned frontier_round, frontier_full, frontier_reads, frontier_smaller,
     frontier_empty, frontier_parent_phase, frontier_stop_phase,
     frontier_work_hits;
 static bool frontier_stopped, frontier_stop_work, frontier_internal_stop;
+static unsigned frontier_selected_op, frontier_first_branch,
+    frontier_late_reads,
+    frontier_back_reads, frontier_mirror_reads, frontier_audit_hits;
 
 static void
 frontier_request_stop(wl_evaluation_control_t *control)
@@ -3220,7 +3223,21 @@ frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
 {
     frontier_parent_phase = phase;
-    if (phase == 37) frontier_round = progress;
+    bool later_branch = false;
+    if (phase == 37) {
+        if (frontier_round != progress) frontier_first_branch = UINT_MAX;
+        frontier_round = progress;
+    }
+    if (phase == 39) {
+        frontier_selected_op = progress;
+        if (!strcmp(bindings->plan->name, "reach")) {
+            if (frontier_first_branch ==
+                UINT_MAX) frontier_first_branch = progress;
+            else if (frontier_first_branch != progress) {
+                later_branch = true; frontier_late_reads++;
+            }
+        }
+    }
     if (phase == 38) frontier_full = progress;
     if (phase == 36) {
         CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
@@ -3229,6 +3246,27 @@ frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
         col_rel_t *refused = (col_rel_t *)(uintptr_t)1;
         CHECK(wl_columnar_session_delta_source(bindings->session, &copy,
             &bindings->plan->ops[0], &refused) == EINVAL && !refused);
+        const wl_plan_op_t *bad = (const wl_plan_op_t *)
+            ((const unsigned char *)bindings->plan->ops + 1);
+        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+            bad, &refused) == EINVAL && !refused);
+        wl_plan_op_t foreign = bindings->plan->ops[0];
+        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+            &foreign, &refused) == EINVAL && !refused);
+        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+            bindings->plan->ops + bindings->plan->op_count,
+            &refused) == EINVAL && !refused);
+        CHECK(!wl_columnar_session_delta_source(bindings->session, bindings,
+            &bindings->plan->ops[bindings->plan->op_count - 3],
+            &refused) && !refused);
+        const wl_plan_op_t *selected =
+            &bindings->plan->ops[frontier_selected_op];
+        const char *source_name = selected->op == WL_PLAN_OP_VARIABLE
+            ? selected->relation_name : selected->right_relation;
+        if (!strcmp(bindings->plan->name, "reach")) {
+            if (!strcmp(source_name, "back")) frontier_back_reads++;
+            if (!strcmp(source_name, "mirror")) frontier_mirror_reads++;
+        }
         frontier_reads++;
         if (frontier_round && progress < frontier_full) frontier_smaller++;
         if (frontier_round && !progress && frontier_full) frontier_empty++;
@@ -3237,6 +3275,8 @@ frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
         frontier_internal_stop)
         return;
     if ((phase == 36 || phase == 21) && frontier_round < 2) return;
+    if (phase == 39 && (!later_branch || frontier_round < 2)) return;
+    if (phase == 40 && ++frontier_audit_hits < 2) return;
     if (phase == 8 && progress != 2) return; /* downstream consumer */
     frontier_request_stop(control);
 }
@@ -3286,6 +3326,7 @@ frontier_source(unsigned shape)
     const char *rule = shape == 1
         ? "reach(x,z) :- links(x,y), back(y,z), x != z.\n"
         : shape == 2 ? "reach(x,z) :- reach(x,y), links(y,z), x != z.\n"
+        : shape == 5 ? "reach(x,z) :- back(x,y), reach(y,z), x != z.\n"
         : "reach(x,z) :- back(x,y), links(y,z), x != z.\n";
     char *text = calloc(1, 4096); CHECK(text);
     snprintf(text, 4096,
@@ -3329,7 +3370,7 @@ frontier_check_parity(wl_session_t *session, wl_session_t *reference,
 static void
 test_controlled_recursive_frontiers(void)
 {
-    for (unsigned shape = 0; shape < 5; ++shape) {
+    for (unsigned shape = 0; shape < 6; ++shape) {
         for (unsigned observed = 0; observed < 2; ++observed) {
             char *source = frontier_source(shape);
             wirelog_error_t error;
@@ -3343,7 +3384,7 @@ test_controlled_recursive_frontiers(void)
              * Exercise the existing unrewritten full-round fallback using a
              * borrowed view of compiler-recorded bodies, without changing
              * ownership or claiming the optimized K_FUSION route. */
-            if (shape == 3) {
+            if (shape == 5) {
                 unrewritten = *plan;
                 strata = malloc(plan->stratum_count * sizeof(*strata));
                 CHECK(strata);
@@ -3435,8 +3476,8 @@ test_controlled_recursive_frontiers(void)
                         "frontier shape=%u observed=%u cycle=%u rc=%d\n", shape,
                         observed, cycle, rc);
                 CHECK(!rc && !wl_session_step(reference));
-                CHECK(shape == 3 ? !frontier_reads : frontier_reads != 0);
-                if (shape != 3) {
+                CHECK(shape == 5 ? !frontier_reads : frontier_reads != 0);
+                if (shape != 5) {
                     CHECK(frontier_smaller);
                     if (shape != 2) CHECK(frontier_empty);
                 }
@@ -3467,14 +3508,15 @@ test_controlled_recursive_frontiers(void)
 static void
 test_controlled_recursive_frontier_stops(void)
 {
-    const unsigned phases[] = {29, 30, 31, 32, 33, 34, 35, 36, 21, 22, 23, 8,
-                               14};
+    const unsigned phases[] = {42, 41, 40, 29, 30, 31, 32, 33, 34, 35, 36, 39,
+                               21, 22, 23, 8, 14};
     for (unsigned point = 0; point < sizeof(phases)/sizeof(phases[0]);
         ++point){
         for (unsigned outcome = 0; outcome < 2; ++outcome) {
             wirelog_error_t error;
-            wirelog_program_t *program =
-                wirelog_parse_string(recursive_transaction_source, &error);
+            char *source = frontier_source(3);
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            free(source);
             CHECK(program);
             wl_plan_t *plan = NULL;
             CHECK(!wl_plan_from_program(program, &plan));
@@ -3524,6 +3566,7 @@ test_controlled_recursive_frontier_stops(void)
             frontier_stop_phase = phases[point];
             frontier_stop_work = outcome != 0;
             frontier_stopped = false; frontier_round = frontier_work_hits = 0;
+            frontier_first_branch = UINT_MAX; frontier_audit_hits = 0;
             frontier_internal_stop = phases[point] == 32 || phases[point] == 35;
             wl_columnar_session_test_observed_transaction_checkpoint =
                 frontier_checkpoint;
@@ -3571,6 +3614,215 @@ recursive_snapshot_count(const char *name, const int64_t *row, uint32_t width,
 {
     CHECK(name && row && width);
     ++*(unsigned *)data;
+}
+
+static int
+union_pair_order(const void *left, const void *right)
+{
+    const int64_t *a = left, *b = right;
+    if (a[0] != b[0]) return a[0] < b[0] ? -1 : 1;
+    return (a[1] > b[1]) - (a[1] < b[1]);
+}
+
+static void
+union_compare_heads(wl_session_t *left, wl_session_t *right)
+{
+    const char *names[] = {"reach", "back", "mirror", "result"};
+    for (unsigned h = 0; h < 4; ++h) {
+        const col_rel_t *a = session_find_rel((wl_col_session_t *)left,
+                names[h]);
+        const col_rel_t *b = session_find_rel((wl_col_session_t *)right,
+                names[h]);
+        CHECK(a && b && a->ncols == 2 && b->ncols == 2 &&
+            a->nrows == b->nrows && a->nrows <= 128);
+        int64_t av[128][2], bv[128][2];
+        for (uint32_t r = 0; r < a->nrows; ++r)
+            for (uint32_t c = 0; c < 2; ++c) {
+                av[r][c] = a->columns[c][r]; bv[r][c] = b->columns[c][r];
+            }
+        qsort(av, a->nrows, sizeof(av[0]), union_pair_order);
+        qsort(bv, b->nrows, sizeof(bv[0]), union_pair_order);
+        CHECK(!memcmp(av, bv, a->nrows * sizeof(av[0])));
+    }
+}
+
+static void
+test_controlled_recursive_union_heads(void)
+{
+    const char *source = ".decl seed(x:int64,y:int64)\n"
+        ".decl edge(x:int64,y:int64)\n.decl reverse(x:int64,y:int64)\n"
+        ".decl reach(x:int64,y:int64)\n.decl back(x:int64,y:int64)\n"
+        ".decl mirror(x:int64,y:int64)\n.decl result(x:int64,y:int64)\n"
+        "reach(x,y) :- seed(x,y).\n"
+        "reach(x,z) :- back(x,y), edge(y,z).\n"
+        "reach(x,z) :- reverse(x,y), mirror(y,z).\n"
+        "back(y,x) :- reach(x,y).\nmirror(x,y) :- reach(x,y), x > 5.\n"
+        "result(x,y) :- reach(x,y).\n";
+    for (unsigned observed = 0; observed < 2; ++observed) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        CHECK(program);
+        wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
+        for (uint32_t si = 0; si < plan->stratum_count; ++si)
+            for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri) {
+                const wl_plan_relation_t *r = &plan->strata[si].relations[ri];
+                for (uint32_t op = 0; op < r->op_count; ++op)
+                    CHECK(r->ops[op].op != WL_PLAN_OP_K_FUSION);
+            }
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        };
+        wl_columnar_memory_governor_ref_t *governor =
+            wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(governor);
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.evaluation_control = control;
+        options.memory_governor = governor;
+        wl_session_t *session = NULL, *reference = NULL, *parallel = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &reference));
+        CHECK(!wl_session_create(wl_backend_columnar(), plan, 2, &parallel));
+        CHECK(((wl_col_session_t *)parallel)->num_workers == 2);
+        observed_multi_capture_t *actual = calloc(1, sizeof(*actual)),
+            *expected = calloc(1, sizeof(*expected));
+        CHECK(actual && expected);
+        if (observed) {
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+        }
+        wl_session_t *sessions[] = {session, reference, parallel};
+        const int64_t seed[] = {1, 2, 10, 20}, edges[] = {1, 3, 2, 4, 10, 30},
+            reverse[] = {99, 10, 77, 3};
+        for (unsigned i = 0; i < 3; ++i) {
+            CHECK(!wl_session_insert(sessions[i], "seed", seed, 2, 2));
+            CHECK(!wl_session_insert(sessions[i], "edge", edges, 3, 2));
+            CHECK(!wl_session_insert(sessions[i], "reverse", reverse, 2, 2));
+        }
+        const uint32_t counts[] = {6, 7, 8, 7, 6};
+        for (unsigned cycle = 0; cycle < 5; ++cycle) {
+            const int64_t edge[] = {3, 5}, reversed[] = {88, 20};
+            for (unsigned i = 0; i < 3; ++i) {
+                if (cycle == 1) CHECK(!wl_session_insert(sessions[i], "edge",
+                        edge, 1, 2));
+                if (cycle == 2) CHECK(!wl_session_insert(sessions[i], "reverse",
+                        reversed, 1, 2));
+                if (cycle == 3) CHECK(!wl_session_remove(sessions[i], "edge",
+                        edge, 1, 2));
+                if (cycle == 4) CHECK(!wl_session_remove(sessions[i], "reverse",
+                        reversed, 1, 2));
+            }
+            actual->count = expected->count = 0;
+            frontier_round = frontier_full = frontier_reads = frontier_smaller =
+                frontier_empty = 0;
+            frontier_back_reads = frontier_mirror_reads = frontier_late_reads =
+                0;
+            frontier_first_branch = UINT_MAX; frontier_stop_phase = UINT_MAX;
+            frontier_stopped = frontier_internal_stop = false;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                frontier_checkpoint;
+            CHECK(!observed_multi_step(session));
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+            CHECK(!wl_session_step(reference));
+            if (!cycle) {
+                unsigned tuples = 0;
+                CHECK(!wl_session_snapshot(parallel, recursive_snapshot_count,
+                    &tuples) && tuples);
+                const wl_col_session_t *ps = (const wl_col_session_t *)parallel;
+                CHECK(ps->tdd_last_fallback_reason ==
+                    WL_COLUMNAR_INTERNAL_TDD_FALLBACK_NO_EXCHANGE);
+            } else CHECK(!wl_session_step(parallel));
+            CHECK(frontier_back_reads && frontier_mirror_reads &&
+                frontier_late_reads);
+            CHECK(frontier_smaller && frontier_empty);
+            const col_rel_t *r = session_find_rel((wl_col_session_t *)session,
+                    "reach");
+            CHECK(r && r->nrows == counts[cycle]);
+            bool left = false, right = false;
+            for (uint32_t row = 0; row < r->nrows; ++row) {
+                left |= r->columns[0][row] == 20 && r->columns[1][row] == 30;
+                right |= r->columns[0][row] == 99 && r->columns[1][row] == 20;
+            }
+            CHECK(left && right);
+            union_compare_heads(session, reference);
+            union_compare_heads(session, parallel);
+            CHECK(actual->count == expected->count);
+            qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(actual->events, expected->events,
+                actual->count * sizeof(actual->events[0])));
+            unsigned delivered = actual->count;
+            CHECK(!observed_multi_step(session) && actual->count == delivered);
+        }
+        CHECK(!wl_session_try_destroy(&session)); wl_session_destroy(reference);
+        wl_session_destroy(parallel);
+        wl_evaluation_control_release(control); wl_plan_free(plan);
+        wirelog_program_free(program);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                governor)));
+        wl_columnar_memory_governor_ref_release(governor); free(actual);
+        free(expected);
+    }
+}
+
+static void
+test_recursive_union_workers(void)
+{
+    const char *source = ".decl seed(x:int64,y:int64)\n"
+        ".decl edge(x:int64,y:int64)\n.decl other(x:int64,y:int64)\n"
+        ".decl reach(x:int64,y:int64)\n.decl back(x:int64,y:int64)\n"
+        ".decl mirror(x:int64,y:int64)\n.decl result(x:int64,y:int64)\n"
+        "reach(x,y) :- seed(x,y).\n"
+        "reach(x,z) :- reach(x,y), edge(y,z).\n"
+        "reach(x,z) :- reach(x,y), other(y,z).\n"
+        "back(x,y) :- reach(x,y).\nmirror(x,y) :- reach(x,y).\n"
+        "result(x,y) :- reach(x,y).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    CHECK(program);
+    wl_plan_t *plan = NULL; CHECK(!wl_plan_from_program(program, &plan));
+    unsigned exchanges = 0;
+    for (uint32_t si = 0; si < plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < plan->strata[si].relation_count; ++ri) {
+            const wl_plan_relation_t *r = &plan->strata[si].relations[ri];
+            for (uint32_t op = 0; op < r->op_count; ++op) {
+                CHECK(r->ops[op].op != WL_PLAN_OP_K_FUSION);
+                exchanges += r->ops[op].op == WL_PLAN_OP_EXCHANGE;
+            }
+        }
+    CHECK(exchanges);
+    wl_session_t *serial = NULL, *parallel = NULL;
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &serial));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 2, &parallel));
+    const int64_t seed[] = {1, 2}, other[] = {3, 4, 5, 6};
+    int64_t (*edge)[2] = malloc(8192 * sizeof(*edge));
+    CHECK(edge);
+    for (unsigned r = 0; r < 8192; ++r) {
+        edge[r][0] = 100 + r; edge[r][1] = 20000 + r;
+    }
+    edge[0][0] = 2; edge[0][1] = 3;
+    edge[1][0] = 4; edge[1][1] = 5;
+    wl_session_t *sessions[] = {serial, parallel};
+    for (unsigned i = 0; i < 2; ++i) {
+        CHECK(!wl_session_insert(sessions[i], "seed", seed, 1, 2));
+        CHECK(!wl_session_insert(sessions[i], "edge", &edge[0][0], 8192, 2));
+        CHECK(!wl_session_insert(sessions[i], "other", other, 2, 2));
+    }
+    CHECK(!wl_session_step(serial));
+    unsigned tuples = 0;
+    CHECK(!wl_session_snapshot(parallel, recursive_snapshot_count, &tuples));
+    CHECK(tuples && ((wl_col_session_t *)parallel)->tdd_executed_strata);
+    union_compare_heads(serial, parallel);
+    CHECK(session_find_rel((wl_col_session_t *)parallel, "reach")->nrows == 5);
+    wl_session_destroy(serial); wl_session_destroy(parallel); free(edge);
+    wl_plan_free(plan); wirelog_program_free(program);
 }
 
 typedef struct {
@@ -11833,6 +12085,8 @@ main(void)
     test_controlled_recursive_transaction();
     test_controlled_recursive_frontiers();
     test_controlled_recursive_frontier_stops();
+    test_controlled_recursive_union_heads();
+    test_recursive_union_workers();
     test_controlled_recursive_transaction_successors();
     test_controlled_recursive_transaction_stops();
     test_controlled_recursive_transaction_shapes();

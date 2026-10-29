@@ -1855,7 +1855,10 @@ operators or claim recursive frontier, weighted trace or retraction support.
 The general controlled STEP host evaluates qualified positive, nonaggregate,
 positive-arity INT64 SCCs with attempt-local row frontiers. A charged audit of
 all preserved head bodies requires at most one same-SCC VARIABLE or JOIN-right
-read per entire head body. Other sources remain full immutable inputs. A
+read per evaluated branch: VARIABLE pushes degree zero/one, JOIN adds its right
+source degree, and CONCAT takes the maximum of its alternatives. Multiple linear
+UNION branches are admitted; a UNION followed by another recursive JOIN remains
+nonlinear. Other sources remain full immutable inputs. A
 referenced head's frontier is selected by the authenticated exact operator
 occurrence, including empty frontiers; the executing head does not substitute
 its own frontier. Round zero borrows the referenced head's empty bottom.
@@ -1871,7 +1874,11 @@ Convergence requires every next frontier to be empty.
 Initial evaluation and all insert/remove successors restart from empty bottom,
 then use frontier rounds within the attempt. This handles changed external
 inputs joining old closure tuples without retaining a cross-attempt delta.
-Repeated same-SCC reads use the existing full frozen-round route where admitted.
-Default K_FUSION/LFTJ and representation refusals remain in force. Public heads
+Genuinely nonlinear bodies use the existing full frozen-round route where
+admitted. The compiler preserves ordinary operators for proven monotone,
+nonaggregate linear UNION alternatives, avoiding unnecessary K expansion;
+nonlinear K expansion remains unchanged. Default K_FUSION/LFTJ and representation
+refusals remain in force. Seed branches can execute again in subsequent rounds;
+this does not promise a universal raw performance improvement. Public heads
 and observer events retain the existing common cutoff. Raw epoch/rule-frontier
 arrays, weighted traces and incremental retraction are separate contracts.

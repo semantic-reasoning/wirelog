@@ -167,7 +167,7 @@ typedef struct {
     wl_plan_relation_t plan;
     col_rel_t *candidate, *previous, *frontier, *next_frontier;
     col_relation_snapshot_t frontier_snapshot;
-    uint32_t delta_source;
+    uint32_t op_base;
     uint32_t stratum, width;
     bool recursive;
     const wl_plan_op_t *delta_op;
@@ -191,6 +191,7 @@ typedef struct {
     wl_columnar_session_observed_head_t *heads;
     wl_columnar_session_observed_original_t *originals;
     wl_plan_op_t *ops;
+    uint32_t *frontier_sources;
     col_rel_t **image;
     col_rel_t **old_registry;
     wl_columnar_memory_reservation_t metadata_credit, image_credit;
@@ -226,7 +227,8 @@ typedef struct {
     col_relation_snapshot_t append_snapshot;
     bool append_active;
     bool round_frontiers, frontier_started;
-    uint32_t old_row, new_row;
+    uint32_t old_row, new_row, degree_depth;
+    uint8_t degrees[COL_STACK_MAX];
 } wl_columnar_session_observed_transaction_t;
 
 struct wl_columnar_controlled_step {
@@ -469,16 +471,26 @@ wl_columnar_session_delta_source(wl_col_session_t *sess,
     wl_columnar_session_observed_transaction_t *tx =
         sess->controlled_step->transaction;
     const wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
-    if (op != head->delta_op) return 0;
     if (tx->round_active && tx->round_frontiers) {
-        if (head->delta_source < tx->round_begin
-            || head->delta_source >= tx->round_end) return EINVAL;
+        uintptr_t address = (uintptr_t)op, first = (uintptr_t)head->plan.ops;
+        if (address < first || address - first >=
+            (uint64_t)head->plan.op_count * sizeof(*op)
+            || (address - first) % sizeof(*op)) return EINVAL;
+        uint32_t local = (uint32_t)((address - first) / sizeof(*op));
+        if (head->op_base >= tx->op_count ||
+            local >= tx->op_count - head->op_base
+            || !tx->frontier_sources) return EINVAL;
+        uint32_t encoded = tx->frontier_sources[head->op_base + local];
+        if (!encoded) return 0;
+        uint32_t source_head = encoded - 1;
+        if (source_head < tx->round_begin || source_head >= tx->round_end)
+            return EINVAL;
         const wl_columnar_session_observed_head_t *source =
-            &tx->heads[head->delta_source];
+            &tx->heads[source_head];
         col_rel_t *r = tx->round ? source->frontier : source->previous;
         col_relation_snapshot_t snapshot = tx->round
             ? source->frontier_snapshot
-            : tx->entries[sess->plan->edb_count + head->delta_source].snapshot;
+            : tx->entries[sess->plan->edb_count + source_head].snapshot;
         if (!r || !wl_columnar_relation_snapshot_equal(snapshot,
             wl_columnar_relation_snapshot(r))) return EINVAL;
         *out = r;
@@ -487,12 +499,14 @@ wl_columnar_session_delta_source(wl_col_session_t *sess,
             wl_columnar_session_test_observed_transaction_checkpoint(
                 bindings->control, 37, tx->round, bindings);
             wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 39, local, bindings);
+            wl_columnar_session_test_observed_transaction_checkpoint(
                 bindings->control, 38, source->previous->nrows, bindings);
             wl_columnar_session_test_observed_transaction_checkpoint(
                 bindings->control, 36, r->nrows, bindings);
         }
 #endif
-    } else if (tx->append_active) {
+    } else if (tx->append_active && op == head->delta_op) {
         if (!tx->append_delta || !wl_columnar_relation_snapshot_equal(
                 tx->append_snapshot,
                 wl_columnar_relation_snapshot(tx->append_delta))) return EINVAL;
@@ -9615,7 +9629,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             + (uint64_t)tx->head_count *
             (sizeof(*tx->heads) + sizeof(*tx->overrides))
             + (uint64_t)tx->old_count * sizeof(*tx->originals)
-            + (uint64_t)tx->op_count * sizeof(*tx->ops);
+            + (uint64_t)tx->op_count *
+            (sizeof(*tx->ops) + sizeof(*tx->frontier_sources));
         uint64_t image_bytes = (uint64_t)tx->image_cap * sizeof(*tx->image);
         if (bytes > SIZE_MAX || image_bytes > SIZE_MAX) return EOVERFLOW;
         switch (tx->allocation) {
@@ -9661,6 +9676,17 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->image = (col_rel_t **)malloc((size_t)image_bytes);
             if (!tx->image) return ENOMEM;
             break;
+        case 8:
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_observed_transaction_checkpoint)
+                wl_columnar_session_test_observed_transaction_checkpoint(
+                    control,
+                    42, tx->allocation, NULL);
+#endif
+            tx->frontier_sources = malloc((size_t)tx->op_count *
+                    sizeof(*tx->frontier_sources));
+            if (!tx->frontier_sources) return ENOMEM;
+            break;
         default: tx->phase = WL_SESSION_OBSERVED_ZERO; return 0;
         }
         tx->allocation++;
@@ -9680,8 +9706,16 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             bytes = (size_t)tx->old_count * sizeof(*tx->originals); break;
         case 4: data = (unsigned char *)tx->ops;
             bytes = (size_t)tx->op_count * sizeof(*tx->ops); break;
+        case 5: data = (unsigned char *)tx->frontier_sources;
+            bytes = (size_t)tx->op_count * sizeof(*tx->frontier_sources); break;
         default: tx->phase = WL_SESSION_OBSERVED_PLAN; return 0;
         }
+#ifdef WL_SESSION_TEST_HOOKS
+        if (tx->init_array == 5 && tx->init_byte && tx->init_byte < bytes
+            && wl_columnar_session_test_observed_transaction_checkpoint)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                41, (uint32_t)tx->init_byte, NULL);
+#endif
         size_t chunk = bytes - tx->init_byte;
         if (chunk > 64) chunk = 64;
         if (chunk) memset(data + tx->init_byte, 0, chunk);
@@ -9722,6 +9756,7 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 head->plan = *source;
                 head->plan.op_count = source_count;
                 head->plan.ops = tx->ops + tx->filled_ops;
+                head->op_base = tx->filled_ops;
                 tx->entries[plan->edb_count +
                     tx->filled_heads].name = source->name;
             }
@@ -10078,7 +10113,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->round_end = ++tx->round_index; return 0;
         }
         tx->index = tx->round_index = tx->round_begin;
-        tx->other = tx->round_begin; tx->op = 0; tx->byte = 0;
+        tx->other = tx->round_begin; tx->op = tx->degree_depth = 0;
+        tx->byte = 0;
         tx->phase = tx->round_frontiers ? WL_SESSION_RECURSIVE_AUDIT
             : WL_SESSION_RECURSIVE_SEED;
         if (!tx->round_frontiers) tx->index = 0;
@@ -10102,17 +10138,40 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             if (a) {
                 tx->byte++; return 0;
             }
-            head->delta_op = op; head->delta_source = tx->other;
-            if (++head->delta_reads > 1) {
-                /* No plan was modified: the entire SCC retains full rounds. */
-                tx->round_frontiers = false; tx->index = 0;
-                tx->phase = WL_SESSION_RECURSIVE_SEED;
-                return 0;
+            if (tx->other == UINT32_MAX) return EOVERFLOW;
+            tx->frontier_sources[head->op_base + tx->op] = tx->other + 1;
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_session_test_observed_transaction_checkpoint)
+                wl_columnar_session_test_observed_transaction_checkpoint(
+                    control,
+                    40, tx->op, NULL);
+#endif
+        }
+        bool recursive = tx->frontier_sources[head->op_base + tx->op] != 0;
+        if (op->op == WL_PLAN_OP_VARIABLE) {
+            if (tx->degree_depth == COL_STACK_MAX) return ENOBUFS;
+            tx->degrees[tx->degree_depth++] = recursive ? 1 : 0;
+        } else if (op->op == WL_PLAN_OP_CONCAT) {
+            if (tx->degree_depth < 2) return EINVAL;
+            uint8_t right = tx->degrees[--tx->degree_depth];
+            if (right > tx->degrees[tx->degree_depth - 1])
+                tx->degrees[tx->degree_depth - 1] = right;
+        } else {
+            if (!tx->degree_depth) return EINVAL;
+            if (op->op == WL_PLAN_OP_JOIN && recursive) {
+                if (tx->degrees[tx->degree_depth - 1]) {
+                    /* Whole-SCC fallback; partial maps are inactive and no
+                     * child plan has been changed. */
+                    tx->round_frontiers = false; tx->index = 0;
+                    tx->phase = WL_SESSION_RECURSIVE_SEED; return 0;
+                }
+                tx->degrees[tx->degree_depth - 1] = 1;
             }
         }
         tx->other = tx->round_begin; tx->byte = 0;
         if (++tx->op == head->plan.op_count) {
-            tx->op = 0; tx->index++;
+            if (tx->degree_depth != 1) return EINVAL;
+            tx->op = tx->degree_depth = 0; tx->index++;
         }
         return 0;
     }
@@ -10789,6 +10848,7 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     free(tx->originals); tx->originals = NULL;
     free(tx->overrides); tx->overrides = NULL;
     free(tx->ops); tx->ops = NULL;
+    free(tx->frontier_sources); tx->frontier_sources = NULL;
     if (tx->metadata_admitted && sess->memory_governor) {
         bool done = false;
         rc = wl_columnar_memory_reservation_finish_step(&tx->metadata_credit,
