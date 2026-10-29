@@ -470,3 +470,13 @@ mutations and removals keep whole-host full recomputation. Existing common
 publication, suffix ownership and explicit differential opt-out remain intact.
 The subsequent qualification unit supplies the combined lifecycle evidence;
 this bundle does not close the remaining G3b obligations above.
+
+The integrated qualification commit covers shared-map authority, twelve append
+UNION stop points, explicit differential opt-out, callback lifecycle and no-op
+mutations. Separate metadata-denial and map-allocation failures preserve typed
+errors, public snapshots and pending inputs; retry and destruction restore
+reference parity and governor credit. Recursive fixtures retain real empty
+frontier and observed/unobserved evidence. Initially unobserved acyclic append
+and all previously recorded persistent/weighted/nonlinear obligations remain
+outside this bundle. PR submission occurs after combined validation of all
+three atomic units, including the source formatting stabilized before review.

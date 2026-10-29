@@ -449,6 +449,7 @@ unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t);
 size_t wl_columnar_session_test_observer_precharged_events;
+bool wl_columnar_session_test_fail_frontier_map_allocation;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
 void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
 void (*wl_columnar_session_test_observed_transaction_checkpoint)(
@@ -9684,6 +9685,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                 wl_columnar_session_test_observed_transaction_checkpoint(
                     control,
                     42, tx->allocation, NULL);
+            if (wl_columnar_session_test_fail_frontier_map_allocation) {
+                wl_columnar_session_test_fail_frontier_map_allocation = false;
+                return ENOMEM;
+            }
 #endif
             tx->frontier_sources = malloc((size_t)tx->op_count *
                     sizeof(*tx->frontier_sources));
@@ -10016,11 +10021,11 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     head->delta_reads++;
 #ifdef WL_SESSION_TEST_HOOKS
                     if (wl_columnar_session_test_observed_transaction_checkpoint)
-
-
+                    {
                         wl_columnar_session_test_observed_transaction_checkpoint
                         (
                             control, 43, tx->op, NULL);
+                    }
 #endif
                 }
             }

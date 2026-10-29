@@ -4939,7 +4939,10 @@ append occurrences with a mode-specific marker. Exact current-child range and
 alignment checks precede decoding; recursive head encodings are never interpreted
 as append markers. A whole-host charged degree proof precedes plan changes, and
 partial maps remain inactive on nonlinear fallback. Old-head union slots stay
-zero and therefore retain their full-source reads. Two additional operator slots per
+zero and therefore retain their full-source reads. Combined metadata admission
+failure remains ENOSPC; map malloc failure remains ENOMEM. Both drain admitted
+ownership without publishing heads or advancing the pending input boundary.
+Two additional operator slots per
 head are admitted with the host metadata for prior-head union/consolidation.
 
 Any precommit stop after append eligibility begins drains the private host

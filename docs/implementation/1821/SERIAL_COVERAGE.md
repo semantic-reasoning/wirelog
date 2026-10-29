@@ -401,3 +401,34 @@ requires natural linear alternatives without K_FUSION; the existing nonlinear
 fixture still requires K expansion. Nonlinear borrowed-body fallback remains an
 explicitly separate case. Persistent traces/frontiers and incremental retraction
 remain unqualified and open.
+
+## Positive linear frontier bundle: authority and recovery
+
+The recursive UNION and acyclic append UNION execution units share the governed
+operator-source map, while retaining mode-specific decoding. Their integrated
+qualification is a separate atomic commit in the same PR.
+
+`frontier_map_authority` runs at actual recursive and append selections. It
+rejects copied stale records, live generation/attempt mismatches, copied,
+misaligned, one-past and foreign-head operator slots. Live fields are restored
+before evaluation continues. The added old-head VARIABLE is verified to remain
+an unmapped full-source read. No freed transaction storage is dereferenced.
+
+`test_controlled_append_successors` exercises twelve UNION checkpoints with
+both cancellation and work limits: map allocation, partial zeroing, later source
+audit, eligibility, suffix copy, plan preparation, later JOIN-right branch,
+selection, later head, claims, cutoff and retirement. Existing publication,
+pending-input, retry/event and governor checks apply. Additional generated cases
+verify differential opt-out, callback clear/re-enable after completed operations,
+nonmatching/duplicate contributions and zero-row mutation no-ops. These are
+integrated host checks, not primitive exact-work formulas. They do not qualify
+initially unobserved acyclic append or an empty selected append suffix; real
+empty selected frontiers remain covered by the recursive fixtures.
+
+`test_controlled_frontier_map_failures` independently exercises acyclic and
+recursive hosts. It distinguishes combined-metadata governor denial (`ENOSPC`)
+from test-injected map malloc failure (`ENOMEM`). The no-JOIN fixture excludes
+index reclamation from hiding denial. Competing credit is released before
+cleanup; failures preserve public snapshots, pending input and zero events.
+Reset/retry matches raw head sets and signed events, repeated STEP does not
+replay delivery, and checked destruction restores aggregate governor credit.
