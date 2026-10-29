@@ -2299,6 +2299,209 @@ static void reference_projection_memory(void)
     destroy(&f);
 }
 
+typedef struct {
+    wl_col_session_t *session;
+    unsigned count;
+    bool seen[144];
+    bool numeric;
+} reference_join_events_t;
+static void reference_join_observe(const char *name, const int64_t *row,
+    uint32_t width, void *context)
+{
+    reference_join_events_t *e = context;
+    CHECK(!strcmp(name, "result") && width == 5);
+    CHECK(row[1] >= 0 && row[1] < 12 && row[3] >= 0 && row[3] < 12);
+    unsigned x = (unsigned)row[1], y = (unsigned)row[3];
+    CHECK(x % 3 == y % 3);
+    unsigned pair = x*12+y;
+    CHECK(!e->seen[pair]); e->seen[pair] = true; e->count++;
+    if (e->numeric) CHECK(row[0] == (int64_t)(x%3));
+    else CHECK(!strcmp(wl_intern_reverse(e->session->intern, row[0]),
+            reference_values[x%3]));
+    CHECK(!strcmp(wl_intern_reverse(e->session->intern, row[2]),
+        reference_values[(x+1)%3]));
+    CHECK(!strcmp(wl_intern_reverse(e->session->intern, row[4]),
+        reference_values[(y+2)%3]));
+}
+static void reference_join_directions(void)
+{
+    for (unsigned numeric = 0; numeric < 2; numeric++)
+        for (unsigned shape = 0; shape < 5; shape++)
+            for (unsigned direction = 0; direction < 5; direction++) {
+                char text[512];
+                snprintf(text, sizeof(text),
+                    ".decl a(k:%s,x:int64,p:symbol)\n"
+                    ".decl b(k:%s,y:int64,q:symbol)\n"
+                    ".decl result(k:%s,x:int64,p:symbol,y:int64,q:symbol)\n"
+                    "result(k,x,p,y+0,q) :- a(k,x,p),b(k,y,q).\n",
+                    numeric ? "int64" : "symbol", numeric ? "int64" : "symbol",
+                    numeric ? "int64" : "symbol");
+                fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+                wl_col_session_t *s = COL_SESSION(f.session);
+                int64_t ids[3];
+                for (unsigned i = 0; i < 3; i++)
+                    ids[i] = wl_intern_put(s->intern, reference_values[i]);
+                int64_t absent = numeric ? 99 : wl_intern_put(s->intern,
+                        "absent");
+                wl_plan_relation_t *rp = join_body(&f, "result");
+                CHECK(rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
+                    !strcmp(rp->ops[0].relation_name, "a") &&
+                    rp->ops[1].op == WL_PLAN_OP_JOIN);
+                for (unsigned i = 0; i < 12; i++) {
+                    int64_t a[] = {numeric ? (int64_t)(i%3) : ids[i%3], i,
+                                   ids[(i+1)%3]};
+                    int64_t b[] = {shape == 1 ? absent : a[0], i, ids[(i+2)%3]};
+                    if (shape != 2 && shape != 4)
+                        CHECK(wl_session_insert(f.session, "a", a, 1, 3) == 0);
+                    if (shape != 3 && shape != 4)
+                        CHECK(wl_session_insert(f.session, "b", b, 1, 3) == 0);
+                }
+                seal_direction(&f, direction);
+                uint64_t disk = wl_columnar_spill_store_bytes(s->spill_store);
+                if (direction && !shape) {
+                    unsigned count = 0; read_fault = 7;
+                    CHECK(wl_session_snapshot(f.session, count_only,
+                        &count) == EIO && !count);
+                    read_fault = 0;
+                    CHECK(wl_columnar_spill_store_bytes(s->spill_store) ==
+                        disk);
+                }
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    reference_join_events_t e = {.session = s,
+                                                 .numeric = numeric != 0};
+                    CHECK(wl_session_snapshot(f.session, reference_join_observe,
+                        &e) == 0);
+                    CHECK(e.count == (shape ? 0 : 48));
+                    CHECK(wl_columnar_spill_store_bytes(s->spill_store) ==
+                        disk);
+                    if (!shape) {
+                        col_rel_t *out = session_find_rel(s, "result");
+                        CHECK(out && out->column_types &&
+                            out->column_types[2] == WIRELOG_TYPE_STRING &&
+                            out->column_types[4] == WIRELOG_TYPE_STRING);
+                    }
+                    CHECK(wl_session_step(f.session) == 0);
+                }
+                destroy(&f);
+            }
+}
+
+static const char *reference_join_budget_query =
+    ".decl a(k:int64,v:int64,s:symbol)\n.decl b(k:int64,v:int64,t:symbol)\n"
+    ".decl result(k:int64,x:int64,y:int64,s:symbol)\n"
+    "result(k,x,y+0,s) :- a(k,x,s),b(k,y,t).\n";
+static fixture_t reference_join_budget_fixture(uint64_t allowance, bool both)
+{
+    fixture_t f = fixture(reference_join_budget_query, allowance, 8*1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    CHECK(wl_intern_put(s->intern, "shared") == 0);
+    s->spill_join_batch_bytes = 1024; s->spill_join_index_bytes = 64*1024;
+    for (int64_t i = 0; i < 4096; i++) {
+        int64_t a[] = {i < 128 ? 0 : 10000+i, i, 0};
+        CHECK(wl_session_insert(f.session, "a", a, 1, 3) == 0);
+    }
+    for (int64_t i = 0; i < (both ? 4096 : 128); i++) {
+        int64_t b[] = {i < 128 ? 0 : 20000+i, 100+i, 0};
+        CHECK(wl_session_insert(f.session, "b", b, 1, 3) == 0);
+    }
+    return f;
+}
+typedef struct { unsigned count; uint64_t seen[256];
+} reference_reclaimed_events_t;
+static void reference_reclaimed_observe(const char *name, const int64_t *row,
+    uint32_t width, void *context)
+{
+    reference_reclaimed_events_t *e = context;
+    CHECK(!strcmp(name,
+        "result") && width == 4 && row[3] == 0 && row[0] == 0 && row[1] >= 0 &&
+        row[1] < 128 &&
+        row[2] >= 100 && row[2] < 228);
+    unsigned pos = (unsigned)(row[1]*128 + row[2]-100);
+    uint64_t bit = UINT64_C(1) << (pos%64);
+    CHECK(!(e->seen[pos/64]&bit)); e->seen[pos/64] |= bit; e->count++;
+}
+static void reference_join_reclamation(void)
+{
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    for (unsigned both = 0; both < 2; both++) {
+        budget_peak = 0;
+        fixture_t calibration = reference_join_budget_fixture(8*1024*1024,
+                both != 0);
+        seal_direction(&calibration, both ? 3 : 1);
+        uint64_t preparation = budget_peak;
+        reference_reclaimed_events_t e = {0};
+        CHECK(wl_session_snapshot(calibration.session,
+            reference_reclaimed_observe,
+            &e) == 0 && e.count == 16384);
+        uint64_t allowance = budget_peak;
+        CHECK(allowance > preparation);
+        destroy(&calibration);
+        for (unsigned retain = 0; retain < 2; retain++) {
+            budget_peak = 0;
+            fixture_t f = reference_join_budget_fixture(allowance, both != 0);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            uint64_t before = reserved(&f);
+            wl_columnar_session_test_retain_cold_source = retain != 0;
+            seal_direction(&f, both ? 3 : 1);
+            wl_columnar_session_test_retain_cold_source = false;
+            CHECK(retain ? reserved(&f) > before : reserved(&f) < before);
+            unsigned owners = 0;
+            for (wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
+                c = c->next) {
+                CHECK((c->retained_source != NULL) == (retain != 0)); owners++;
+            }
+            CHECK(owners == (both ? 2u : 1u));
+            uint64_t disk = wl_columnar_spill_store_bytes(s->spill_store);
+            e = (reference_reclaimed_events_t){0};
+            int rc = wl_session_snapshot(f.session, reference_reclaimed_observe,
+                    &e);
+            CHECK(budget_peak <= allowance);
+            if (retain) CHECK(rc == ENOSPC &&
+                    wl_session_budget_denied(f.session) && e.count == 0);
+            else CHECK(rc == 0 && e.count == 16384);
+            CHECK(wl_columnar_spill_store_bytes(s->spill_store) == disk);
+            destroy(&f);
+            CHECK(!wl_columnar_session_test_has_retained_cold_source(NULL));
+        }
+    }
+    wl_columnar_memory_governor_test_admitted = NULL;
+}
+static void reference_join_bounded_scratch(void)
+{
+    uint64_t peaks[2] = {0};
+    for (unsigned large = 0; large < 2; large++) {
+        fixture_t f = fixture(reference_join_budget_query, 4*1024*1024,
+                1024*1024);
+        CHECK(wl_intern_put(COL_SESSION(f.session)->intern, "shared") == 0);
+        for (int64_t i = 0; i < (large ? 512 : 64); i++) {
+            int64_t a[] = {i, 10+i, 0}, b[] = {10000+i, 100+i, 0};
+            CHECK(wl_session_insert(f.session, "a", a, 1, 3) == 0);
+            CHECK(wl_session_insert(f.session, "b", b, 1, 3) == 0);
+        }
+        seal_direction(&f, 3);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        budget_peak = before; constructor_peak = 0;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        wl_columnar_join_test_spill_producer_result = constructor_result;
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(wl_columnar_join_cold_left(s, join_body(&f, "result"),
+            &stack) == 0);
+        peaks[large] = constructor_peak-before;
+        CHECK(constructor_peak > before && budget_peak == constructor_peak);
+        eval_entry_t e;
+        CHECK(eval_stack_pop_relation(&stack, &e) == 0 && e.rel->nrows == 0);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        CHECK(wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        wl_columnar_memory_governor_test_admitted = NULL;
+        wl_columnar_join_test_spill_producer_result = NULL;
+        destroy(&f);
+    }
+    CHECK(peaks[0] == peaks[1]);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -2308,6 +2511,8 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    reference_join_reclamation(); reference_join_bounded_scratch();
+    reference_join_directions();
     reference_projection_memory();
     reference_projections(); reference_projection_failures();
     reference_projection_bytecode();

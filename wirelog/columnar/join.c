@@ -1498,6 +1498,7 @@ typedef struct {
     uint32_t width;
     const char *const *names;
     const wirelog_column_type_t *types;
+    const wl_intern_t *intern;
 } wl_columnar_join_source_t;
 
 static wl_columnar_join_source_t
@@ -1505,6 +1506,7 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
     col_rel_t *resident)
 {
     wl_columnar_join_source_t src = {0};
+    src.intern = s->plan && s->intern == s->plan->intern ? s->intern : NULL;
     src.cold = wl_columnar_session_cold_find(s, name);
     if (src.cold) {
         src.width = src.cold->ncols;
@@ -1538,11 +1540,34 @@ wl_columnar_join_source_key(const wl_columnar_join_source_t *src,
 }
 
 static bool
+wl_columnar_join_source_references(const wl_columnar_join_source_t *src)
+{
+    for (uint32_t c = 0; src->types && c < src->width; c++)
+        if (src->types[c] == WIRELOG_TYPE_STRING) return true;
+    return false;
+}
+
+static bool
 wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
     uint32_t key)
 {
-    return src->cold ? key < src->width && src->types[key] == WIRELOG_TYPE_INT64
-        : src->resident && wl_columnar_join_spill_schema(src->resident, key);
+    if (key >= src->width || (!src->cold && !src->resident)) return false;
+    const col_rel_t *r = src->resident;
+    if (r && (r->timestamps || r->has_graph_column ||
+        r->compound_kind != WIRELOG_COMPOUND_KIND_NONE || r->compound_count ||
+        r->compound_arity_map || r->compound_arity_len ||
+        r->inline_physical_offset)) return false;
+    wirelog_column_type_t type =
+        src->types ? src->types[key] : WIRELOG_TYPE_INT64;
+    if (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_STRING) return false;
+    for (uint32_t c = 0; src->types && c < src->width; c++) {
+        type = src->types[c];
+        if (type < WIRELOG_TYPE_INT32 || type > WIRELOG_TYPE_BOOL) return false;
+        if (type == WIRELOG_TYPE_STRING && (!src->intern || (src->cold &&
+            !wl_columnar_batch_payload_uses_intern(src->cold->payload,
+            src->intern)))) return false;
+    }
+    return true;
 }
 
 static bool
@@ -1570,6 +1595,11 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     /* Missing right retains ordinary empty-result/projection typing semantics. */
     if (!right->cold && !right->resident) return true;
     if (!wl_columnar_join_source_valid(right, rk)) return false;
+    wirelog_column_type_t lt =
+        left->types ? left->types[lk] : WIRELOG_TYPE_INT64;
+    wirelog_column_type_t rt =
+        right->types ? right->types[rk] : WIRELOG_TYPE_INT64;
+    if (lt != rt) return false;
     uint64_t joined = (uint64_t)left->width + right->width;
     if (joined > UINT32_MAX) return false;
     for (uint32_t i = 0; i < op->project_count; i++)
@@ -1694,25 +1724,37 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
             continue;
         }
         wl_columnar_spill_status_t status;
-        if (i == 0 && left->owned &&
-            wl_columnar_batch_payload_can_take(left->rel))
+        bool transfer = i == 0 && left->owned &&
+            wl_columnar_batch_payload_can_take(left->rel);
+        if (transfer && !wl_columnar_join_source_references(&sources[i]))
             status = wl_columnar_batch_payload_take(sess->memory_governor,
                     sess->spill_store, &left->rel, NULL, NULL, &inputs[i]);
-        else
-            status = wl_columnar_batch_payload_capture(sess->memory_governor,
-                    sess->spill_store, sources[i].resident,
-                    sources[i].resident->nrows,
-                    WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, NULL, NULL, &inputs[i]);
+        else {
+            status =
+                wl_columnar_batch_payload_capture_with_intern(
+                sess->memory_governor,
+                sess->spill_store, sources[i].resident,
+                sources[i].resident->nrows,
+                WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, sess->intern, NULL, NULL,
+                &inputs[i]);
+            if (status == WL_COLUMNAR_SPILL_OK && transfer) {
+                int retired = col_rel_destroy_checked(left->rel);
+                if (!retired) left->rel = NULL;
+                else status = retired ==
+                        EBUSY ? WL_COLUMNAR_SPILL_BUSY :
+                        WL_COLUMNAR_SPILL_INVALID;
+            }
+        }
         owned[i] = inputs[i] != NULL;
         rc = wl_columnar_join_spill_error(sess, status);
         if (rc) goto done;
     }
     wl_columnar_spill_status_t status =
-        wl_columnar_payload_join_create_projected_bounded(
+        wl_columnar_payload_join_create_reference_projected_bounded(
         sess->memory_governor, inputs[0], inputs[1], lk, rk,
         op->project_indices, op->project_count,
         sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
-        NULL, NULL, &cont);
+        sess->intern, NULL, NULL, &cont);
 #ifdef WL_TEST_JOIN_CACHE_HOOK
     if (wl_columnar_join_test_spill_producer_result)
         wl_columnar_join_test_spill_producer_result(status);

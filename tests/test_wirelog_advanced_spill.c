@@ -837,6 +837,79 @@ static void reference_public_projections(void)
             }
 }
 
+typedef struct { uint64_t ids[3]; unsigned seen[4]; } reference_chain_events_t;
+static void reference_chain_observe(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    reference_chain_events_t *e = context;
+    unsigned which = !strcmp(name, "result") ? 0 : !strcmp(name, "self") ? 1 :
+        !strcmp(name, "scan") ? 2 : 3;
+    CHECK(which != 3 || !strcmp(name, "second"));
+    unsigned width = which == 2 ? 2 : 4;
+    CHECK(diff == 1 && row->logical_ncols == width &&
+        row->physical_nlanes == width);
+    unsigned i = (unsigned)row->lanes[1]; CHECK(i < 3);
+    CHECK(row->types[0] == WIRELOG_TYPE_STRING &&
+        row->types[1] == WIRELOG_TYPE_INT64);
+    CHECK(row->physical_types[0] == WIRELOG_TYPE_STRING &&
+        row->lanes[0] == e->ids[i]);
+    if (which != 2) {
+        CHECK(row->types[2] == WIRELOG_TYPE_STRING &&
+            row->types[3] == WIRELOG_TYPE_INT64);
+        CHECK(row->physical_types[2] == WIRELOG_TYPE_STRING);
+        CHECK(row->lanes[2] == e->ids[which == 1 ? i : (i+1)%3]);
+        CHECK(row->lanes[3] == i + (which == 0 ? 100u : which == 1 ? 0u : 10u));
+    }
+    CHECK(!(e->seen[which] & (1u<<i))); e->seen[which] |= 1u<<i;
+}
+static void reference_public_joins(void)
+{
+    const char *text =
+        ".decl a(k:symbol,x:int64)\n.decl b(k:symbol,next:symbol,y:int64)\n"
+        ".decl c(next:symbol,z:int64)\n"
+        ".decl result(k:symbol,x:int64,next:symbol,z:int64)\n"
+        ".decl self(k:symbol,x:int64,p:symbol,y:int64)\n"
+        ".decl scan(k:symbol,x:int64)\n"
+        ".decl second(k:symbol,x:int64,next:symbol,y:int64)\n"
+        "a(\"\",0).\na(\"alpha\",1).\na(\"한글\",2).\n"
+        "b(\"\",\"alpha\",10).\nb(\"alpha\",\"한글\",11).\nb(\"한글\",\"\",12).\n"
+        "c(\"alpha\",100).\nc(\"한글\",101).\nc(\"\",102).\n"
+        "result(k,x,n,z+0) :- a(k,x),b(k,n,y),c(n,z).\n"
+        "self(k,x,k,y+0) :- a(k,x),a(k,y).\n"
+        "scan(k,x) :- a(k,x).\n"
+        "second(k,x,n,y+0) :- a(k,x),b(k,n,y).\n";
+    for (unsigned direction = 0; direction < 5; direction++) {
+        wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t o = configured();
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT,
+            1, &o, &s) == WIRELOG_OK);
+        int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+        CHECK(wirelog_program_get_facts(p, "a", &facts, &rows,
+            &cols) == 0 && rows == 3 && cols == 2);
+        reference_chain_events_t expected = {0};
+        for (unsigned i = 0; i < rows;
+            i++) expected.ids[facts[i*2+1]] = (uint64_t)facts[i*2];
+        free(facts);
+        const char *names[] = {"a", "b", "c"};
+        if (direction == 1) CHECK(wirelog_session_seal_input(s,
+                "a") == WIRELOG_OK);
+        if (direction == 2) CHECK(wirelog_session_seal_input(s,
+                "c") == WIRELOG_OK);
+        if (direction >= 3) for (unsigned i = 0; i < 3; i++)
+                CHECK(wirelog_session_seal_input(s,
+                    names[direction == 3 ? i : 2-i]) == WIRELOG_OK);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            reference_chain_events_t e = expected;
+            CHECK(wirelog_session_snapshot_typed(s, reference_chain_observe,
+                &e) == WIRELOG_OK);
+            for (unsigned i = 0; i < 4; i++) CHECK(e.seen[i] == 7);
+            CHECK(wirelog_session_step(s) == WIRELOG_OK);
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(live_files() == 0);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -855,6 +928,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    reference_public_joins();
     reference_public_projections();
     join_directions(); join_chains();
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
