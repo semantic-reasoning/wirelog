@@ -4830,3 +4830,29 @@ heads and pending input boundary remain unchanged. Private delta storage retires
 through the scalar retirement protocol, including after successful cutoff and
 on checked destruction. Cleanup uses maintenance funding only after evaluation
 has stopped; it never computes missing contributions or replays observer events.
+
+### Controlled recursive frontier ownership
+
+Each qualified head owns its prior accumulated relation, candidate, current row
+frontier and next row frontier separately. Round zero has no owned frontier;
+its exact source override borrows the source head's empty prior relation.
+Later empty frontiers are real owned relations, never a request to fall back to
+full input. Child generation/plan/attempt authorization and frozen snapshots
+protect the exact occurrence through cleanup ACK.
+
+A qualified scalar-source lease constructs each schema-preserving next frontier
+and drains lexically before the constructor action returns. The transaction
+retains any published constructor output. A two-pointer private set difference
+charges comparison and cursor/gather actions in four-unit regions, gathers one
+INT64 cell per action into the new frontier's row scratch, then uses the
+qualified controlled append with its documented scratch alias contract.
+Existing constructor/append admissions cover width-dependent work and retain
+their allocator and cleanup cooperative boundaries and error distinctions.
+
+Once frontier plan preparation starts, any later precommit work limit aborts
+and drains the whole private host transaction, even in a downstream stratum.
+Reset/retry starts a new attempt without refunding consumed work. Cleanup
+resumes a pending scalar retirement before switching owners, and enumerates
+prior/current/next owners exactly once. Public heads remain unchanged before
+cutoff; private row frontiers retire before successful publication. Maintenance
+funding only retires ownership and never constructs missing results.
