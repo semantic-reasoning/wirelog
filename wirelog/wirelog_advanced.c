@@ -561,12 +561,12 @@ wirelog_session_create_with_options(wirelog_program_t *program,
 }
 
 wirelog_error_t
-wirelog_session_seal_join_input(wirelog_session_t *session,
+wirelog_session_seal_input(wirelog_session_t *session,
     const char *relation)
 {
     if (!session || !relation) return WIRELOG_ERR_EXEC;
     wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
-    wl_columnar_spill_status_t status = wl_columnar_session_seal_join_input(
+    wl_columnar_spill_status_t status = wl_columnar_session_seal_input(
         session->inner, relation, NULL, NULL);
     switch (status) {
     case WL_COLUMNAR_SPILL_OK: return WIRELOG_OK;
@@ -577,6 +577,13 @@ wirelog_session_seal_join_input(wirelog_session_t *session,
     case WL_COLUMNAR_SPILL_IO: return WIRELOG_ERR_IO;
     default: return WIRELOG_ERR_EXEC;
     }
+}
+
+wirelog_error_t
+wirelog_session_seal_join_input(wirelog_session_t *session,
+    const char *relation)
+{
+    return wirelog_session_seal_input(session, relation);
 }
 
 void

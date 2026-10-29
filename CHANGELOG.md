@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Standalone sealed-input reads** (#1372): `wirelog_session_seal_input`
+  permits supported direct/filtered projections without a JOIN consumer.
+  The existing `wirelog_session_seal_join_input` spelling remains compatible;
+  mutation freeze, evaluation closure and resident output floors are unchanged.
+
 - **Filtered sealed-input projections** (#1372): bounded column projections can
   apply one signed integer column/literal comparison while preserving resident
   output floors, exact results, failure recovery and fixed-budget reclamation.

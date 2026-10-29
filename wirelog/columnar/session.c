@@ -629,6 +629,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 return false;
             bool projection = wl_columnar_eval_plan_cold_projection(rp,
                     name, ncols, types);
+            if (projection) consumer = true;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
                 /* Reject all opaque rewrites, even if top-level names hide
@@ -824,6 +825,13 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     s->cold_relation = c;
     s->base.input_sealed = true;
     return WL_COLUMNAR_SPILL_OK;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_session_seal_input(wl_session_t *session, const char *name,
+    wl_columnar_spill_cancel_fn cancel, void *context)
+{
+    return wl_columnar_session_seal_join_input(session, name, cancel, context);
 }
 
 static uint32_t

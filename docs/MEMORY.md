@@ -4724,8 +4724,8 @@ persistent trace storage cold, nor add differential cold execution.
 
 ### Persistent sealed numeric JOIN input (#1372)
 
-The internal `wl_columnar_session_seal_join_input` operation can now convert one
-right-only numeric EDB into a session-owned immutable cold binding before the
+The internal `wl_columnar_session_seal_input` operation converts one eligible
+numeric EDB into a session-owned immutable cold binding before the
 first STEP or SNAPSHOT attempt. It captures privately, checks exclusive resident
 retirement, refunds the original allocation, removes the raw registry entry,
 and publishes the binding without a fallible gap. Failed capture, cancellation,
@@ -4737,15 +4737,15 @@ cannot survive this transition.
 
 The supported plan is serial, nonrecursive, and contains only audited
 VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
-described below. The cold name must have a JOIN right consumer and may also feed
-the exact direct/filtered projection body below; it cannot be a relation head
+described below. The cold name must have an eligible consumer: a JOIN right
+input or the exact direct/filtered projection body below; it cannot be a relation head
 or an arbitrary VARIABLE consumer. Eligible JOINs use one INT64 key,
 scalar numeric rows, no timestamps and no right filter. Multiple eligible JOINs
 may consume the same binding. Spill batch/index caps must be positive. Opaque
 rewrites, workers, controlled execution, delta callbacks and competing JOIN
 batch modes are refused. The plan must remain immutable for the session lifetime,
-and session operations remain externally serialized. This is an internal
-opt-in, not a new installed API or automatic eviction policy.
+and session operations remain externally serialized. The advanced public opt-in
+is described below; this is not an automatic eviction policy.
 
 Successful sealing makes all fact and compound mutation unsupported. Generic
 fact/file loaders reject before staging or opening adapters, without poisoning
@@ -4811,8 +4811,10 @@ fixed 256 MiB allowance and refuse a 4096-by-4096 JOIN's resident output with
 retained-source control remains the causal reclamation proof; this public test
 qualifies the actual host boundary and output floor.
 
-After loading all inputs, call `wirelog_session_seal_join_input` for one eligible
-numeric JOIN input. It uses the exact immutable plan/mode restrictions above;
+After loading all inputs, call `wirelog_session_seal_input` for one eligible
+numeric input. `wirelog_session_seal_join_input` remains a compatibility spelling
+with identical eligibility, errors and lifetime. A projection-only program can
+seal its source without a JOIN. It uses the exact immutable plan/mode restrictions above;
 opaque optimized plans, VARIABLE reads outside the direct-projection subset, recursive, worker,
 delta and controlled paths remain ineligible. The public call is synchronous and
 has no cancellation callback. Success freezes all fact/compound mutation for the
@@ -4891,8 +4893,10 @@ actual corresponding CI run, not a Linux macro compile.
 A sealed numeric JOIN input can also supply an exact three-operator
 `VARIABLE(cold) → MAP(columns) → CONSOLIDATE` rule. For example, alongside
 `result(k,x,y + 0) :- a(k,x), b(k,y).`, a declared `keys(k)` head can use
-`keys(k) :- b(k,v).`. At least one eligible right JOIN consumer must remain;
-scan-only programs still cannot use `wirelog_session_seal_join_input`.
+`keys(k) :- b(k,v).`. Such a projection may also be the source's only consumer:
+`wirelog_session_seal_input` supports direct and narrowly filtered standalone
+reads. The compatibility `wirelog_session_seal_join_input` spelling does too.
+A known but unused source or a source with unsupported consumers is refused.
 
 Seal preflight and ordinary dispatch share the same full-body predicate. It
 accepts valid reordered/repeated column indices and canonical column-reference

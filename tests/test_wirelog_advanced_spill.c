@@ -248,7 +248,7 @@ static void descriptors(void)
 static void refusals(void)
 {
     const char *scan =
-        ".decl b(k:int64,v:int64)\n.decl result(k:int64,v:int64)\nresult(k,v) :- b(k,v).\n";
+        ".decl b(k:int64,v:int64)\n.decl result(k:int64,v:int64)\nresult(k,v + 1) :- b(k,v).\n";
     for (unsigned kind = 0; kind < 8; kind++) {
         wirelog_program_t *p = parse(kind == 5 ? scan : query);
         wirelog_session_options_v1_t o = configured();
@@ -552,6 +552,52 @@ static void unsupported_filters(void)
     }
 }
 
+static void standalone_reads(void)
+{
+    CHECK(wirelog_session_seal_input(NULL, "b") == WIRELOG_ERR_EXEC);
+    for (unsigned filtered = 0; filtered < 2; filtered++)
+        for (unsigned empty = 0; empty < 2; empty++)
+            for (unsigned mode = 0; mode < 3; mode++) {
+                char text[256];
+                snprintf(text, sizeof(text),
+                    ".decl b(k:int64,v:int64)\n.decl keys(k:int64)\n"
+                    "keys(k) :- b(k,v)%s.\n", filtered ? ", v >= 164" : "");
+                wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+                wirelog_session_options_v1_t o = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT,
+                    1, &o, &s) == WIRELOG_OK);
+                for (unsigned i = 0; i < (empty ? 1u : 128u); i++) {
+                    int64_t row[] = {(int64_t)i, 100+(int64_t)i};
+                    CHECK(wirelog_session_insert(s, "b", row, 1,
+                        2) == WIRELOG_OK);
+                    if (empty) CHECK(wirelog_session_remove(s, "b", row, 1,
+                            2) == WIRELOG_OK);
+                }
+                if (mode) {
+                    CHECK((mode == 1 ? wirelog_session_seal_input(s, "b") :
+                        wirelog_session_seal_join_input(s, "b")) == WIRELOG_OK);
+                    check_mutation(s);
+                    CHECK(wirelog_session_seal_input(s,
+                        "b") == WIRELOG_ERR_EXEC);
+                }
+                if (mode == 2) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    mixed_events_t e = {0};
+                    CHECK(wirelog_session_snapshot(s, mixed_observe,
+                        &e) == WIRELOG_OK);
+                    unsigned count = empty ? 0u : filtered ? 64u : 128u;
+                    CHECK(e.keys == count && !e.joined);
+                    CHECK(e.key_bits[0] == (count == 128 ? UINT64_MAX : 0));
+                    CHECK(e.key_bits[1] == (count ? UINT64_MAX : 0));
+                }
+                /* Every evaluation attempt closes the sealing window. */
+                CHECK(wirelog_session_seal_input(s, "b") == WIRELOG_ERR_EXEC);
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(live_files() == 0);
+            }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -571,7 +617,8 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
-    output_floor(); mixed_projection(); unsupported_filters();
+    standalone_reads(); output_floor(); mixed_projection();
+    unsupported_filters();
     join_batch_knob();
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);

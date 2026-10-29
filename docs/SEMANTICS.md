@@ -250,13 +250,15 @@ caps. NULL preserves legacy defaults; existing creators are unchanged. Inline
 facts still load before return. Options and directory storage are borrowed only
 for construction; the program stays borrowed for the session lifetime.
 
-`wirelog_session_seal_join_input` exposes the internal pre-evaluation
-numeric JOIN-input transition. A sealed JOIN input may additionally feed an exact
+`wirelog_session_seal_input` exposes the internal pre-evaluation numeric-input
+transition; `wirelog_session_seal_join_input` is a compatibility spelling with
+identical behavior. A sealed JOIN input may additionally feed an exact
 `VARIABLE → MAP → CONSOLIDATE` direct column-projection rule. Column indices
 may repeat or reorder. One FILTER between VARIABLE and MAP may compare one
 INT64 column with one integer literal (`=`, `!=`, `<`, `>`, `<=`, `>=`), with the
 column on the left. Other predicates, arbitrary expressions and cold left JOINs remain
-unsupported, and at least one eligible right JOIN consumer is required. Reads
+unsupported. An eligible direct/filtered projection alone is sufficient; a
+JOIN consumer is not required. Reads
 use independent bounded pins; projected output and consolidation remain resident.
 Output capacity is admitted for the full source row count even if no row passes.
 It retains the conservative serial immutable-plan
