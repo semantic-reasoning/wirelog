@@ -1262,6 +1262,349 @@ static void standalone_reads(void)
     }
 }
 
+static const char *multiple_query =
+    ".decl a(k:int64,v:int64)\n.decl b(k:int64,x:int64,v:int64)\n"
+    ".decl c(k:int64,v:int64)\n.decl unused(k:int64)\n"
+    ".decl pa(k:int64)\n.decl pb(k:int64)\n.decl pc(k:int64)\n"
+    "pa(k) :- a(k,v), v >= 132.\npb(k) :- b(k,x,v), v >= 216.\n"
+    "pc(k) :- c(k,v).\n";
+static fixture_t multiple_fixture(uint64_t quota)
+{
+    fixture_t f = fixture(multiple_query, 4*1024*1024, quota);
+    int64_t unused = 0;
+    CHECK(wl_session_insert(f.session, "unused", &unused, 1, 1) == 0);
+    for (int64_t i = 0; i < 64; i++) {
+        int64_t a[] = {i, 100+i}, b[] = {i, -i, 200+i}, c[] = {i, 300+i};
+        CHECK(wl_session_insert(f.session, "a", a, 1, 2) == 0);
+        CHECK(wl_session_insert(f.session, "b", b, 1, 3) == 0);
+        CHECK(wl_session_insert(f.session, "c", c, 1, 2) == 0);
+    }
+    return f;
+}
+typedef struct { uint64_t bits[3]; } multiple_events_t;
+static void multiple_observe(const char *name, const int64_t *row,
+    uint32_t width,
+    void *context)
+{
+    multiple_events_t *e = context;
+    unsigned index = !strcmp(name, "pa") ? 0u : !strcmp(name, "pb") ? 1u : 2u;
+    CHECK(index != 2 || !strcmp(name, "pc"));
+    CHECK(width == 1 && row[0] >= 0 && row[0] < 64);
+    uint64_t bit = UINT64_C(1) << (unsigned)row[0];
+    CHECK(!(e->bits[index] & bit)); e->bits[index] |= bit;
+}
+static void multiple_result(fixture_t *f)
+{
+    multiple_events_t e = {0};
+    CHECK(wl_session_snapshot(f->session, multiple_observe, &e) == 0);
+    CHECK(e.bits[0] == (UINT64_MAX << 32) &&
+        e.bits[1] == (UINT64_MAX << 16) && e.bits[2] == UINT64_MAX);
+}
+static void multiple_bindings(void)
+{
+    const char *orders[][3] = {{"a", "b", "c"}, {"c", "b", "a"},
+                               {"b", "a", "c"}};
+    for (unsigned order = 0; order < 3; order++)
+        for (unsigned count = 0; count < 4; count++) {
+            fixture_t f = multiple_fixture(1024*1024);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            for (unsigned i = 0; i < count; i++) {
+                CHECK(wl_columnar_session_seal_input(f.session,
+                    orders[order][i], NULL, NULL) == OK);
+                CHECK(wl_columnar_session_cold_find(s, orders[order][i]));
+                CHECK(!session_find_rel(s, orders[order][i]));
+                CHECK(wl_columnar_session_seal_input(f.session,
+                    orders[order][i], NULL, NULL) == WL_COLUMNAR_SPILL_BUSY);
+            }
+            CHECK(wl_columnar_session_seal_input(f.session, "unused", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            if (wl_columnar_session_cold_find(s, "c"))
+                CHECK(s->last_inserted_relation ==
+                    wl_columnar_session_cold_find(s, "c")->name);
+            for (unsigned i = 0; i < count; i++) {
+                wl_plan_op_t op = {.op = WL_PLAN_OP_VARIABLE,
+                                   .relation_name = orders[order][i]};
+                eval_stack_t stack; eval_stack_init(&stack);
+                CHECK(col_op_variable(&op, &stack, s) == ENOTSUP && !stack.top);
+            }
+            if (count == 3) {
+                multiple_events_t e = {0}; read_fault = 5;
+                CHECK(wl_session_snapshot(f.session, multiple_observe,
+                    &e) == EIO);
+                CHECK(!e.bits[0] && !e.bits[1] && !e.bits[2]);
+            } else CHECK(wl_session_step(f.session) == 0);
+            multiple_result(&f); multiple_result(&f);
+            CHECK(wl_columnar_session_seal_input(f.session, "c", NULL,
+                NULL) == WL_COLUMNAR_SPILL_BUSY);
+            destroy(&f);
+        }
+    for (unsigned retain = 0; retain < 2; retain++) {
+        fixture_t f = multiple_fixture(1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        uint64_t before = reserved(&f);
+        wl_columnar_session_test_retain_cold_source = retain != 0;
+        for (unsigned i = 0; i < 3; i++)
+            CHECK(wl_columnar_session_seal_input(f.session, orders[0][i], NULL,
+                NULL) == OK);
+        wl_columnar_session_test_retain_cold_source = false;
+        CHECK(retain ? reserved(&f) > before : reserved(&f) < before);
+        unsigned nodes = 0;
+        for (wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
+            c = c->next){
+            CHECK((c->retained_source != NULL) == (retain != 0)); nodes++;
+        }
+        CHECK(nodes == 3 &&
+            wl_columnar_session_test_has_retained_cold_source(s) ==
+            (retain != 0));
+        multiple_result(&f); destroy(&f);
+        CHECK(!wl_columnar_session_test_has_retained_cold_source(NULL));
+    }
+}
+static void multiple_seal_failures(void)
+{
+    for (unsigned later = 0; later < 2; later++)
+        for (unsigned kind = 0; kind < 5; kind++) {
+            fixture_t f = multiple_fixture(1024*1024);
+            wl_col_session_t *s = COL_SESSION(f.session);
+            CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+                NULL) == OK);
+            wl_columnar_session_cold_relation_t *first =
+                wl_columnar_session_cold_find(s, "a");
+            if (later) CHECK(wl_columnar_session_seal_input(f.session, "b",
+                    NULL, NULL) == OK);
+            const char *failed = later ? "c" : "b";
+            wl_columnar_session_cold_relation_t *second =
+                wl_columnar_session_cold_find(s, "b");
+            col_rel_t *source = session_find_rel(s, failed);
+            uint64_t before = reserved(&f),
+                disk = wl_columnar_spill_store_bytes(s->spill_store);
+            cancellation_t cancellation = {.stop = 3};
+            wl_columnar_source_access_reader_t lease = {0};
+            wl_columnar_spill_status_t expected = WL_COLUMNAR_SPILL_IO;
+            if (kind == 0) write_fault = 1;
+            if (kind == 1) {
+                allocation_fault = 1; expected = WL_COLUMNAR_SPILL_ALLOCATION;
+            }
+            if (kind == 2) expected = WL_COLUMNAR_SPILL_CANCELLED;
+            if (kind == 3) {
+                CHECK(col_rel_source_reader_acquire(source, &lease) == 0);
+                expected = WL_COLUMNAR_SPILL_BUSY;
+            }
+            wl_plan_expr_buffer_t saved = {0}; wl_plan_op_t *filter = NULL;
+            if (kind == 4) {
+                for (uint32_t i = 0; i < f.plan->stratum_count; i++)
+                    for (uint32_t j = 0; j < f.plan->strata[i].relation_count;
+                        j++) {
+                        const wl_plan_relation_t *rp =
+                            &f.plan->strata[i].relations[j];
+                        if (!strcmp(rp->name,
+                            "pa")) filter = (wl_plan_op_t *)&rp->ops[1];
+                    }
+                CHECK(filter && filter->op == WL_PLAN_OP_FILTER);
+                saved = filter->filter_expr; filter->filter_expr.data = NULL;
+                expected = WL_COLUMNAR_SPILL_UNSUPPORTED;
+            }
+            CHECK(wl_columnar_session_seal_input(f.session, failed,
+                kind == 2 ? cancel : NULL,
+                &cancellation) == expected);
+            if (kind == 3) CHECK(col_rel_source_reader_release(&lease) == 0);
+            if (filter) filter->filter_expr = saved;
+            CHECK(wl_columnar_session_cold_find(s,
+                "a") == first && !first->next);
+            CHECK(session_find_rel(s,
+                failed) == source && !wl_columnar_session_cold_find(s, failed));
+            CHECK(reserved(&f) == before &&
+                wl_columnar_spill_store_bytes(s->spill_store) == disk);
+            CHECK(wl_columnar_session_cold_find(s, "b") == second);
+            CHECK(wl_columnar_session_seal_input(f.session, failed, NULL,
+                NULL) == OK);
+            if (!later) CHECK(wl_columnar_session_seal_input(f.session, "c",
+                    NULL, NULL) == OK);
+            multiple_result(&f); destroy(&f);
+        }
+    /* Combined persistent quota refuses a later capture, preserving a usable mixed state. */
+    for (unsigned third = 0; third < 2; third++) {
+        fixture_t f = multiple_fixture(third ? 8000 : 4096);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        if (third) CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == OK);
+        const char *name = third ? "c" : "b";
+        col_rel_t *source = session_find_rel(s, name);
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        CHECK(wl_columnar_session_seal_input(f.session, name, NULL,
+            NULL) == WL_COLUMNAR_SPILL_QUOTA);
+        CHECK(reserved(&f) == before &&
+            wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        CHECK(session_find_rel(s, name) == source);
+        multiple_result(&f);
+        CHECK(wl_columnar_session_seal_input(f.session, name, NULL,
+            NULL) == WL_COLUMNAR_SPILL_BUSY);
+        destroy(&f);
+    }
+}
+
+static void multiple_memory_floor(void)
+{
+    for (unsigned later = 0; later < 2; later++) {
+        fixture_t f = multiple_fixture(1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        if (later) CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == OK);
+        const char *name = later ? "c" : "b";
+        col_rel_t *source = session_find_rel(s, name);
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        uint64_t bytes = 4*1024*1024 - before - 64;
+        wl_columnar_memory_reservation_t token;
+        wl_columnar_memory_reservation_init(&token);
+        CHECK(wl_columnar_memory_reserve_checked(
+                wl_columnar_memory_governor_ref_get(f.governor),
+                bytes, &token) <= WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY);
+        void *pressure = malloc((size_t)bytes); CHECK(pressure);
+        memset(pressure, 0, (size_t)bytes);
+        CHECK(wl_columnar_memory_commit(&token, pressure));
+        CHECK(wl_columnar_session_seal_input(f.session, name, NULL,
+            NULL) == WL_COLUMNAR_SPILL_MEMORY);
+        CHECK(reserved(&f) == before+bytes && session_find_rel(s,
+            name) == source);
+        CHECK(wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        free(pressure); CHECK(wl_columnar_memory_release(&token));
+        CHECK(reserved(&f) == before);
+        CHECK(wl_columnar_session_seal_input(f.session, name, NULL,
+            NULL) == OK);
+        multiple_result(&f); destroy(&f);
+    }
+}
+
+static void multiple_idb_filter_refusal(void)
+{
+    const char *text = ".decl a(k:int64,v:int64)\n.decl z(k:int64,v:int64)\n"
+        ".decl keys(k:int64)\nz(k,v) :- a(k,v).\nkeys(k) :- z(k,v), v > 0.\n";
+    fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+    int64_t row[] = {1, 2};
+    CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+    uint64_t before = reserved(&f);
+    CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+        NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(reserved(&f) == before && session_find_rel(COL_SESSION(f.session),
+        "a"));
+    destroy(&f);
+}
+
+static void multiple_schema_audit(void)
+{
+    for (unsigned bad = 0; bad < 6; bad++) {
+        fixture_t f = multiple_fixture(1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        col_rel_t *b = session_find_rel(s, "b");
+        wirelog_column_type_t *original = b->column_types;
+        wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64,
+                                         WIRELOG_TYPE_INT64};
+        unsigned slot = 0; while (slot < s->nrels && s->rels[slot] != b) slot++;
+        CHECK(slot < s->nrels);
+        uint64_t before = reserved(&f);
+        for (unsigned phase = 0; phase < 2; phase++) {
+            b->column_types = types;
+            if (bad == 0) types[2] = WIRELOG_TYPE_FLOAT;
+            if (bad == 1) types[1] = WIRELOG_TYPE_STRING; /* Nonprojected lane. */
+            if (bad == 2) b->has_graph_column = true;
+            if (bad == 3) b->compound_count = 1;
+            if (bad == 4) b->ncols = 2; /* Predicate col2 must use B's width. */
+            if (bad == 5) s->rels[slot] = NULL;
+            CHECK(wl_columnar_session_seal_input(f.session, phase ? "c" : "a",
+                NULL, NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            b->column_types = original; b->has_graph_column = false;
+            b->compound_count = 0; b->ncols = 3; s->rels[slot] = b;
+            CHECK(reserved(&f) == before && !wl_columnar_session_cold_find(s,
+                "c"));
+            if (!phase) {
+                CHECK(!s->cold_relation);
+                CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+                    NULL) == OK);
+                before = reserved(&f);
+            } else CHECK(wl_columnar_session_cold_find(s, "a"));
+        }
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        CHECK(wl_columnar_session_seal_input(f.session, "c", NULL, NULL) == OK);
+        multiple_result(&f); destroy(&f);
+    }
+}
+typedef struct { unsigned seen[2]; } multiple_join_events_t;
+static void multiple_join_observe(const char *name, const int64_t *row,
+    uint32_t n,
+    void *context)
+{
+    multiple_join_events_t *e = context;
+    unsigned which = !strcmp(name, "r") ? 0u : 1u;
+    CHECK(!which || !strcmp(name, "s"));
+    CHECK(n == 3 && row[0] >= 0 && row[0] < 4 && row[1] == 10+row[0]);
+    CHECK(row[2] == (which ? 200 : 100)+row[0]);
+    unsigned bit = 1u << (unsigned)row[0];
+    CHECK(!(e->seen[which] & bit)); e->seen[which] |= bit;
+}
+static void multiple_right_joins(void)
+{
+    const char *text =
+        ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n.decl c(k:int64,v:int64)\n"
+        ".decl r(k:int64,x:int64,y:int64)\n.decl s(k:int64,x:int64,y:int64)\n"
+        "r(k,x,y + 0) :- a(k,x),b(k,y).\ns(k,x,y + 0) :- a(k,x),c(k,y).\n";
+    for (unsigned reverse = 0; reverse < 2; reverse++) {
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        for (int64_t i = 0; i < 64; i++) {
+            int64_t a[] = {i, 10+i}, b[] = {i, 100+i}, c[] = {i, 200+i};
+            if (i < 4) CHECK(wl_session_insert(f.session, "a", a, 1, 2) == 0);
+            CHECK(wl_session_insert(f.session, "b", b, 1, 2) == 0);
+            CHECK(wl_session_insert(f.session, "c", c, 1, 2) == 0);
+        }
+        CHECK(wl_columnar_session_seal_input(f.session, reverse ? "c" : "b",
+            NULL, NULL) == OK);
+        CHECK(wl_columnar_session_seal_input(f.session, reverse ? "b" : "c",
+            NULL, NULL) == OK);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            multiple_join_events_t e = {0};
+            CHECK(wl_session_snapshot(f.session, multiple_join_observe,
+                &e) == 0);
+            CHECK(e.seen[0] == 15 && e.seen[1] == 15);
+            if (!repeat) CHECK(COL_SESSION(
+                        f.session)->spill_join_selected_count == 2);
+        }
+        destroy(&f);
+    }
+}
+
+static void multiple_runtime_guard(void)
+{
+    fixture_t f = multiple_fixture(1024*1024);
+    const char *names[] = {"c", "a", "b"};
+    for (unsigned i = 0; i < 3; i++)
+        CHECK(wl_columnar_session_seal_input(f.session, names[i], NULL,
+            NULL) == OK);
+    const wl_plan_relation_t *pb = NULL; wl_plan_op_t *map = NULL;
+    for (uint32_t i = 0; i < f.plan->stratum_count; i++)
+        for (uint32_t j = 0; j < f.plan->strata[i].relation_count; j++) {
+            const wl_plan_relation_t *rp = &f.plan->strata[i].relations[j];
+            if (!strcmp(rp->name, "pb")) pb = rp;
+            if (!strcmp(rp->name, "pc")) map = (wl_plan_op_t *)&rp->ops[1];
+        }
+    CHECK(pb && map && map->op == WL_PLAN_OP_MAP);
+    const uint32_t *original = map->project_indices;
+    uint32_t invalid = 99; map->project_indices = &invalid;
+    eval_stack_t stack; eval_stack_init(&stack); uint64_t before = reserved(&f);
+    /* B is newest and valid; older C must still be checked before B reads. */
+    CHECK(wl_columnar_ops_cold_projection(pb, &stack,
+        COL_SESSION(f.session)) == ENOTSUP);
+    CHECK(!stack.top && reserved(&f) == before);
+    map->project_indices = original;
+    CHECK(wl_columnar_ops_cold_projection(pb, &stack,
+        COL_SESSION(f.session)) == 0);
+    eval_entry_t e = eval_stack_pop(&stack); CHECK(e.rel->nrows == 48);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0 && reserved(&f) == before);
+    multiple_result(&f); destroy(&f);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -1271,6 +1614,10 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    multiple_runtime_guard(); multiple_memory_floor();
+    multiple_idb_filter_refusal();
+    multiple_schema_audit(); multiple_right_joins();
+    multiple_bindings(); multiple_seal_failures();
     standalone_reads();
     projection_shape(); filtered_predicates(); filtered_shape();
     for (unsigned filtered = 0; filtered < 2; filtered++) {

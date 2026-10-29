@@ -263,7 +263,10 @@ use independent bounded pins; projected output and consolidation remain resident
 Output capacity is admitted for the full source row count even if no row passes.
 It retains the conservative serial immutable-plan
 eligibility checks and makes all fact/compound mutation unsupported after
-success. Refusal preserves the source but cannot reopen the seal window after
+success. Additional already-loaded eligible inputs may be sealed independently
+before evaluation; failure preserves prior bindings and the failed resident
+source. Complete narrow projections over other resident numeric EDBs coexist
+using their own schema checks. Refusal cannot reopen the seal window after
 an evaluation attempt. Cold lookup never substitutes empty input for an
 unsupported consumer. Every session operation remains externally serialized.
 Memory admission, allocation and disk capacity/quota failures retain distinct

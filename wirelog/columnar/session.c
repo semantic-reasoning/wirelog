@@ -596,7 +596,6 @@ session_find_rel(wl_col_session_t *sess, const char *name)
  * Policy reset cannot release or overwrite the independent retained owner. */
 bool wl_columnar_session_test_retain_cold_source;
 static wl_col_session_t *wl_columnar_session_test_cold_owner;
-static col_rel_t *wl_columnar_session_test_cold_source;
 bool
 wl_columnar_session_test_has_retained_cold_source(const wl_col_session_t *s)
 {
@@ -605,6 +604,61 @@ wl_columnar_session_test_has_retained_cold_source(const wl_col_session_t *s)
              : wl_columnar_session_test_cold_owner != NULL;
 }
 #endif
+
+wl_columnar_session_cold_relation_t *
+wl_columnar_session_cold_find(const wl_col_session_t *s, const char *name)
+{
+    if (!s || !name) return NULL;
+    for (wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
+        c = c->next)
+        if (!strcmp(c->name, name)) return c;
+    return NULL;
+}
+
+/* Eligibility of another rule is independent of the sealing order. Resolve
+ * its own complete scalar schema, never the candidate's schema. Discovery is
+ * read-only: a failed preflight must not allocate a resident registry hash. */
+static bool
+wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp)
+{
+    if (!rp || !rp->ops || !rp->op_count ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name)
+        return false;
+    const char *name = rp->ops[0].relation_name;
+    bool edb = false;
+    for (uint32_t i = 0; i < s->plan->edb_count; i++)
+        if (s->plan->edb_relations && s->plan->edb_relations[i] &&
+            !strcmp(s->plan->edb_relations[i], name)) edb = true;
+    if (!edb) return false;
+    wl_columnar_session_cold_relation_t *c = wl_columnar_session_cold_find(s,
+            name);
+    uint32_t width = 0;
+    const wirelog_column_type_t *types = NULL;
+    if (c) {
+        width = c->ncols;
+        types = wl_columnar_batch_payload_schema(c->payload, NULL, NULL);
+    } else {
+        const col_rel_t *r = NULL;
+        for (uint32_t i = 0; i < s->nrels; i++)
+            if (s->rels[i] && !strcmp(s->rels[i]->name, name)) {
+                r = s->rels[i]; break;
+            }
+        if (!r || !r->ncols || r->timestamps || r->has_graph_column ||
+            r->compound_kind != WIRELOG_COMPOUND_KIND_NONE ||
+            r->compound_count || r->compound_arity_map ||
+            r->compound_arity_len || r->inline_physical_offset) return false;
+        width = r->ncols; types = r->column_types;
+        for (uint32_t i = 0; types && i < width; i++)
+            if (types[i] != WIRELOG_TYPE_INT32 &&
+                types[i] != WIRELOG_TYPE_INT64 &&
+                types[i] != WIRELOG_TYPE_UINT32 &&
+                types[i] != WIRELOG_TYPE_UINT64 &&
+                types[i] != WIRELOG_TYPE_FLOAT && types[i] != WIRELOG_TYPE_BOOL)
+                return false;
+    }
+    return wl_columnar_eval_plan_cold_projection(rp, name, width, types);
+}
 
 /* Cold bindings never enter the raw relation registry. Only an audited,
  * immutable plan may access them through bounded JOIN/projection readers. */
@@ -627,9 +681,11 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
             const wl_plan_relation_t *rp = &sp->relations[ri];
             if (!rp->name || strcmp(rp->name, name) == 0 || !rp->ops)
                 return false;
-            bool projection = wl_columnar_eval_plan_cold_projection(rp,
-                    name, ncols, types);
-            if (projection) consumer = true;
+            bool projection = wl_columnar_session_cold_projection_rule(sess,
+                    rp);
+            bool selected_projection = projection &&
+                !strcmp(rp->ops[0].relation_name, name);
+            if (selected_projection) consumer = true;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
                 /* Reject all opaque rewrites, even if top-level names hide
@@ -642,7 +698,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0 &&
-                    !projection)
+                    !selected_projection)
                     return false;
                 if (!op->right_relation || strcmp(op->right_relation,
                     name) != 0)
@@ -680,12 +736,15 @@ int
 wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
 {
     if (!s->cold_relation) return 0;
-    const wl_columnar_session_cold_relation_t *c = s->cold_relation;
-    const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
-        c->payload, NULL, NULL);
-    return wl_columnar_session_cold_mode(s) &&
-           wl_columnar_session_cold_plan(s, c->name, c->ncols,
-               (const char *const *)c->col_names, types) ? 0 : ENOTSUP;
+    if (!wl_columnar_session_cold_mode(s)) return ENOTSUP;
+    for (const wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
+        c = c->next) {
+        const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
+            c->payload, NULL, NULL);
+        if (!wl_columnar_session_cold_plan(s, c->name, c->ncols,
+            (const char *const *)c->col_names, types)) return ENOTSUP;
+    }
+    return 0;
 }
 
 static void
@@ -710,10 +769,12 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     wl_col_session_t *s = COL_SESSION(session);
 #ifdef WL_SESSION_TEST_HOOKS
     bool retain = wl_columnar_session_test_retain_cold_source;
-    if (retain && wl_columnar_session_test_cold_owner)
+    if (retain && wl_columnar_session_test_cold_owner &&
+        wl_columnar_session_test_cold_owner != s)
         return WL_COLUMNAR_SPILL_BUSY;
 #endif
-    if (s->base.input_load_failed || s->cold_relation || s->cold_seal_closed ||
+    if (s->base.input_load_failed || wl_columnar_session_cold_find(s, name) ||
+        s->cold_seal_closed ||
         s->has_evaluated ||
         s->plain_step_completion_pending || s->uncommitted_strata_done ||
         s->cleanup_active || s->cleanup_pending || s->source_leases ||
@@ -724,7 +785,9 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
         s->sarr_count || s->filt_arr_count || s->filt_cache_count ||
         s->mat_cache.count || s->last_removed_relation)
         return WL_COLUMNAR_SPILL_BUSY;
-    if (!wl_columnar_session_cold_mode(s)) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    if (!wl_columnar_session_cold_mode(s) ||
+        wl_columnar_session_cold_execution_check(s))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
     /* Linear lookup avoids allocating a hash merely to refuse this operation. */
     uint32_t slot = 0;
     while (slot < s->nrels && (!s->rels[slot] ||
@@ -816,12 +879,13 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
 #ifdef WL_SESSION_TEST_HOOKS
     if (retain) {
         wl_columnar_session_test_cold_owner = s;
-        wl_columnar_session_test_cold_source = r;
+        c->retained_source = r;
     }
 #endif
     s->rels[slot] = NULL;
     session_rel_free_hash(s);
     if (inserted_name) s->last_inserted_relation = c->name;
+    c->next = s->cold_relation;
     s->cold_relation = c;
     s->base.input_sealed = true;
     return WL_COLUMNAR_SPILL_OK;
@@ -4676,9 +4740,13 @@ col_session_destroy(wl_session_t *session)
 #endif
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_session_test_cold_owner == sess) {
-        if (col_rel_destroy_checked(
-                wl_columnar_session_test_cold_source)) abort();
-        wl_columnar_session_test_cold_source = NULL;
+        for (wl_columnar_session_cold_relation_t *c = sess->cold_relation; c;
+            c = c->next) {
+            if (c->retained_source &&
+                col_rel_destroy_checked(c->retained_source))
+                abort();
+            c->retained_source = NULL;
+        }
         wl_columnar_session_test_cold_owner = NULL;
     }
 #endif
@@ -4774,8 +4842,11 @@ col_session_destroy(wl_session_t *session)
             : 0ULL);
     wl_arena_compound_arena_retire(sess->compound_arena);
     sess->compound_arena = NULL;
-    wl_columnar_session_cold_free(sess->cold_relation);
-    sess->cold_relation = NULL;
+    while (sess->cold_relation) {
+        wl_columnar_session_cold_relation_t *c = sess->cold_relation;
+        sess->cold_relation = c->next;
+        wl_columnar_session_cold_free(c);
+    }
     if (sess->owns_spill_store)
         wl_columnar_spill_store_retire(sess->spill_store);
     wl_columnar_memory_governor_ref_release(sess->memory_governor);

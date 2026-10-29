@@ -1500,7 +1500,8 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     uint64_t started = now_ns();
     sess->profile.join_calls++;
 #endif
-    const wl_columnar_session_cold_relation_t *cold = sess->cold_relation;
+    const wl_columnar_session_cold_relation_t *cold =
+        wl_columnar_session_cold_find(sess, op->right_relation);
     int rc = wl_columnar_session_cold_execution_check(sess);
     if (rc || op->key_count != 1 || op->materialized ||
         op->right_filter_expr.size || left->is_delta ||
@@ -1619,8 +1620,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     int pop_rc = eval_stack_pop_relation(stack, &left_e);
     if (pop_rc != 0)
         return pop_rc;
-    if (sess->cold_relation && op->right_relation &&
-        strcmp(sess->cold_relation->name, op->right_relation) == 0)
+    if (wl_columnar_session_cold_find(sess, op->right_relation))
         return wl_columnar_join_cold_run(sess, op, stack, &left_e);
 
     /* right_filtered: non-NULL only when right was pool-allocated by
