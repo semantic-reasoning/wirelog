@@ -2581,7 +2581,8 @@ reserved_on(wl_columnar_memory_governor_ref_t *ref)
 
 static int measure_create_floor(wirelog_program_t *prog,
     uint64_t *intern_bytes, uint64_t *compound_bytes,
-    uint64_t *descriptor_bytes, uint64_t *diff_registry_bytes);
+    uint64_t *descriptor_bytes, uint64_t *diff_registry_bytes,
+    uint64_t *schema_scratch);
 
 static int
 test_inline_fact_budget_denial_maps(void)
@@ -2599,7 +2600,7 @@ test_inline_fact_budget_denial_maps(void)
     int rc = 1;
 
     if (!prog || measure_create_floor(prog, &intern_bytes, &compound_bytes,
-        &descriptor_bytes, &diff_registry_bytes) != 0)
+        &descriptor_bytes, &diff_registry_bytes, NULL) != 0)
         goto out;
     if (!wl_columnar_memory_size_add(intern_bytes, compound_bytes, &floor)
         || !wl_columnar_memory_size_add(floor, SESSION_REGISTRY_BYTES,
@@ -2685,7 +2686,7 @@ test_count_controlled_diff_join_candidates(const wl_plan_op_t *ops,
 static int
 measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
     uint64_t *compound_bytes, uint64_t *descriptor_bytes,
-    uint64_t *diff_registry_bytes)
+    uint64_t *diff_registry_bytes, uint64_t *schema_scratch)
 {
     wl_columnar_memory_governor_ref_t *probe
         = enforcing_governor(UINT64_MAX / 4u);
@@ -2702,6 +2703,7 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
         goto out;
     *descriptor_bytes = 0;
     *diff_registry_bytes = 0;
+    if (schema_scratch) *schema_scratch = 0;
     for (uint32_t i = 0; i < warm->edb_count; i++) {
         size_t name_len = strlen(warm->edb_relations[i]);
         uint64_t name_bytes, relation_bytes;
@@ -2713,6 +2715,29 @@ measure_create_floor(wirelog_program_t *prog, uint64_t *intern_bytes,
             || !wl_columnar_memory_size_add(*descriptor_bytes,
             relation_bytes, descriptor_bytes))
             goto out;
+        bool typed = false;
+        uint32_t width = warm->edb_column_type_counts[i];
+        for (uint32_t c = 0; c < width; c++)
+            typed |= warm->edb_column_types[i][c] == WIRELOG_TYPE_STRING ||
+                warm->edb_column_types[i][c] == WIRELOG_TYPE_FLOAT;
+        if (typed) {
+            col_rel_t *relation = NULL;
+            if (wl_columnar_relation_alloc_governed(&relation,
+                warm->edb_relations[i], probe) != 0) goto out;
+            uint64_t descriptor = reserved_on(probe);
+            int status = col_rel_set_schema(relation, width, NULL);
+            uint64_t transient = reserved_on(probe) - descriptor;
+            if (!status) status = col_rel_set_column_types(relation,
+                        warm->edb_column_types[i], width);
+            uint64_t metadata = reserved_on(probe) - descriptor;
+            col_rel_destroy(relation);
+            if (status || reserved_on(probe) != 0 ||
+                !wl_columnar_memory_size_add(*descriptor_bytes, metadata,
+                descriptor_bytes)) goto out;
+            /* Type publication holds the old empty schema until replacement. */
+            if (schema_scratch && transient > *schema_scratch)
+                *schema_scratch = transient;
+        }
     }
     uint64_t candidates = 0;
     for (uint32_t s = 0; s < warm->stratum_count; s++) {
@@ -2784,7 +2809,7 @@ test_bulk_insert_error_mapping(void)
     int rc = 1;
 
     if (!prog || measure_create_floor(prog, &intern_bytes,
-        &compound_bytes, &descriptor_bytes, &diff_registry_bytes) != 0) {
+        &compound_bytes, &descriptor_bytes, &diff_registry_bytes, NULL) != 0) {
         fprintf(stderr, "T-1938: could not measure session floor\n");
         goto out;
     }
@@ -2948,7 +2973,7 @@ test_denied_eval_interning_maps_to_memory(void)
         if (!prog)
             return 1;
         if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
-            &descriptor_bytes, &diff_registry_bytes) != 0) {
+            &descriptor_bytes, &diff_registry_bytes, NULL) != 0) {
             fprintf(stderr, "T-1521: could not measure the create floor\n");
             wirelog_program_free(prog);
             return 1;
@@ -3019,12 +3044,13 @@ test_injected_governor_denial_maps_to_memory(void)
     uint64_t compound_bytes = 0;
     uint64_t descriptor_bytes = 0;
     uint64_t diff_registry_bytes = 0;
+    uint64_t schema_scratch = 0;
     int rc = 1;
 
     if (!prog)
         return 1;
     if (measure_create_floor(prog, &intern_bytes, &compound_bytes,
-        &descriptor_bytes, &diff_registry_bytes) != 0) {
+        &descriptor_bytes, &diff_registry_bytes, &schema_scratch) != 0) {
         fprintf(stderr, "T-1473: could not measure the create-time floor\n");
         goto out;
     }
@@ -3058,11 +3084,11 @@ test_injected_governor_denial_maps_to_memory(void)
     }
     wl_columnar_memory_governor_ref_release(ref);
 
-    /* Exact floor: creation succeeds, destroy leaves the program-owned
-     * intern reservation, and freeing the program releases it. */
+    /* Retained floor plus measured schema replacement scratch: creation
+     * succeeds, destroy leaves only the program-owned intern reservation. */
     ref = enforcing_governor(intern_bytes + compound_bytes
             + SESSION_REGISTRY_BYTES + diff_registry_bytes
-            + descriptor_bytes);
+            + descriptor_bytes + schema_scratch);
     if (!ref)
         goto out;
     options.memory_governor = ref;
@@ -3070,11 +3096,16 @@ test_injected_governor_denial_maps_to_memory(void)
     error = wirelog_session_create(prog, WIRELOG_BACKEND_COLUMNAR, 1,
             &session);
     wl_session_testhook_set_default_options(NULL);
+    uint64_t retained_floor = intern_bytes + compound_bytes
+        + SESSION_REGISTRY_BYTES + diff_registry_bytes + descriptor_bytes;
+    /* Replacement slack may also admit the optional registry hash. The
+     * mandatory retained schema must be present, and no reservation may
+     * exceed the measured creation allowance. Destruction below proves all
+     * schema/hash scratch is refunded. */
     if (error != WIRELOG_OK || !session
-        || reserved_on(ref) != intern_bytes + compound_bytes
-        + SESSION_REGISTRY_BYTES + diff_registry_bytes
-        + descriptor_bytes) {
-        fprintf(stderr, "T-1473: exact-fit create err=%d reserved=%llu\n",
+        || reserved_on(ref) < retained_floor
+        || reserved_on(ref) > retained_floor + schema_scratch) {
+        fprintf(stderr, "T-1473: measured-floor create err=%d reserved=%llu\n",
             error, (unsigned long long)reserved_on(ref));
         goto out;
     }
@@ -3323,6 +3354,63 @@ test_options_null_defaults(void)
     return failed;
 }
 
+typedef struct {
+    const wl_intern_t *intern;
+    const char *expected;
+    unsigned count;
+    bool invalid;
+} builtin_rows_t;
+static void builtin_row(const char *name, const int64_t *row, uint32_t cols,
+    void *context)
+{
+    builtin_rows_t *out = context;
+    if (strcmp(name, "out"))return;
+    out->count++;
+    const char *k = cols > 0 ? wl_intern_reverse(out->intern, row[0]) : NULL;
+    const char *v = cols > 1 ? wl_intern_reverse(out->intern, row[1]) : NULL;
+    const char *x = cols > 2 ? wl_intern_reverse(out->intern, row[2]) : NULL;
+    if (cols != 3 || !k || strcmp(k, "k") || !v || strcmp(v,
+        out->expected) || !x || strcmp(x, "x")) out->invalid = true;
+}
+static int test_builtin_string_pipeline_types(void)
+{
+    const struct { const char *expression, *expected; } cases[] = {
+        {"to_upper(s)", "ALPHA"}, {"to_lower(s)", "alpha"},
+        {"cat(s,\"!\")", "alpha!"},
+        {"substr(to_upper(s),0,strlen(s))", "ALPHA"},
+        {"str_replace(s,\"ph\",to_upper(\"ph\"))", "alPHa"},
+        {"trim(cat(\" \",cat(s,\" \")))", "alpha"},
+        {"to_string(strlen(s)+1)", "6"},
+        {"to_string(to_number(\"40\")+2)", "42"},
+        {"to_string(contains(s,\"ph\"))", "1"}
+    };
+    for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+            ".decl a(k:symbol,s:symbol)\n.decl b(k:symbol,t:symbol)\n"
+            ".decl d(k:symbol,x:symbol)\n.decl out(k:symbol,t:symbol,x:symbol)\n"
+            "a(\"k\",\"alpha\").\nd(\"k\",\"x\").\nb(k,%s):-a(k,s).\n"
+            "out(k,t,x):-a(k,s),b(k,t),d(k,x).\n", cases[i].expression);
+        wirelog_program_t *p = parse_or_die(source, "STRING-builtin-pipeline");
+        if (!p) return 1;
+        wirelog_session_t *session = NULL;
+        wirelog_error_t error = wirelog_session_create(p,
+                WIRELOG_BACKEND_DEFAULT, 1, &session);
+        builtin_rows_t rows =
+        {.intern = (const wl_intern_t *)wirelog_program_get_intern(p),
+         .expected = cases[i].expected};
+        if (!error) error = wirelog_session_snapshot(session, builtin_row,
+                    &rows);
+        wirelog_session_destroy(session); wirelog_program_free(p);
+        if (error || rows.invalid || rows.count != 1) {
+            fprintf(stderr, "STRING builtin %s: error=%d rows=%u invalid=%d\n",
+                cases[i].expression, error, rows.count, rows.invalid);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int
 main(void)
 {
@@ -3344,6 +3432,7 @@ main(void)
     failures += test_insert_remove_roundtrip();
     failures += test_null_safety();
     failures += test_open_parse_error();
+    failures += test_builtin_string_pipeline_types();
     failures += test_num_workers_default_is_one();
     failures += test_num_workers_explicit_four();
     failures += test_inline_compound_body_binding();

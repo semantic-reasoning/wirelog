@@ -250,7 +250,7 @@ caps. NULL preserves legacy defaults; existing creators are unchanged. Inline
 facts still load before return. Options and directory storage are borrowed only
 for construction; the program stays borrowed for the session lifetime.
 
-`wirelog_session_seal_input` exposes the internal pre-evaluation numeric-input
+`wirelog_session_seal_input` exposes the internal pre-evaluation eligible-input
 transition; `wirelog_session_seal_join_input` is a compatibility spelling with
 identical behavior. A sealed JOIN input may additionally feed an exact
 `VARIABLE → MAP → CONSOLIDATE` direct column-projection rule. Column indices
@@ -269,7 +269,7 @@ It retains the conservative serial immutable-plan
 eligibility checks and makes all fact/compound mutation unsupported after
 success. Additional already-loaded eligible inputs may be sealed independently
 before evaluation; failure preserves prior bindings and the failed resident
-source. Complete narrow projections over other resident numeric EDBs coexist
+source. Complete narrow projections over other resident scalar EDBs coexist
 using their own schema checks. Refusal cannot reopen the seal window after
 an evaluation attempt. Cold lookup never substitutes empty input for an
 unsupported consumer. Every session operation remains externally serialized.
@@ -303,6 +303,14 @@ tests (`test_create_columnar`, `test_create_invalid_backend`,
 easy facade -- the easy surface hides backend selection by
 design.  The asymmetry is recorded here so future maintainers do
 not assume symmetric coverage.
+
+Standalone direct/filtered cold projections also accept STRING lanes from the
+originating program's intern table, preserving STRING output types and IDs.
+Every STRING lane is validated at capture, including unprojected lanes. Empty
+strings and non-ASCII strings retain their ordinary intern identity. Reference
+JOINs and compound sources remain unsupported. Pins retain backing storage; the
+public program must still outlive its sessions, and intern storage is a resident
+memory floor. A copied raw ID alone does not extend that lifetime.
 
 ### References
 
@@ -1229,7 +1237,15 @@ BOOL, and integer arithmetic produces INT64. The cached producer follows the
 existing permissive expression stack rules: ignored full-stack pushes and
 aggregate no-ops do not replace the actual result producer.
 
-Raw interpreter-only expression families retain the legacy whole-output
+Well-formed compositions of existing fixed-result scalar builtins also have
+static result types, including string literals, conversions, string functions,
+comparisons and numeric digest/UUID functions. UUID5_RFC produces STRING;
+numeric UUID functions produce INT64. Classification checks the complete buffer,
+operand depth and final producer without evaluation, interning, crypto or
+callbacks. It preserves direct STRING lanes beside interpreted builtin results
+through ordinary JOIN/SEMIJOIN, including empty MAP inputs. Classification does
+not validate runtime values or guarantee successful evaluation.
+Opaque extension expressions retain the legacy whole-output
 untyped schema when any lane is unresolved. This includes mixed numeric/addon
 results; they do not acquire a fabricated partial schema. Numeric schema
 resolution invokes no callbacks. Existing extension invocation/admission rules

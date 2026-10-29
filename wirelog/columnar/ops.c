@@ -241,7 +241,7 @@ wl_columnar_ops_reject_null_session(eval_stack_t *stack)
     return eval_stack_pop_relation(stack, &discarded);
 }
 
-/* Complete schema only: an interpreter-only lane retains the legacy whole
+/* Complete schema only: an unclassified lane retains the legacy whole
  * untyped output. Resolve without running any expression/callback, then install
  * on the still-empty private output using normal governed metadata ownership.
  * The temporary native vector is covered by the caller's scratch admission. */
@@ -260,6 +260,10 @@ wl_columnar_ops_map_set_types(const wl_plan_op_t *op, const col_rel_t *input,
             op->map_exprs[c].data && op->map_exprs[c].size) {
             known = c < program_count && programs &&
                 wl_columnar_expr_compiled_result_type(programs[c],
+                    input->column_types, input->ncols, &types[c]);
+            if (!known)
+                known = wl_columnar_expr_interpreted_result_type(
+                    op->map_exprs[c].data, op->map_exprs[c].size,
                     input->column_types, input->ncols, &types[c]);
         } else {
             uint32_t column = op->project_indices ? op->project_indices[c] : c;

@@ -532,6 +532,13 @@ string_payloads(void)
         uint32_t cols, rows;
         CHECK(wl_columnar_batch_payload_schema(p, &cols,
             &rows)[0] == WIRELOG_TYPE_STRING && cols == 3 && rows == 8);
+        CHECK(wl_columnar_batch_payload_uses_intern(p, intern));
+        CHECK(!wl_columnar_batch_payload_uses_intern(p, NULL));
+        wl_intern_t *foreign = wl_intern_create(); CHECK(foreign);
+        CHECK(wl_intern_attach_memory_governor(foreign, g) == 0);
+        CHECK(wl_intern_put(foreign, "different-at-id-zero") == 0);
+        CHECK(!wl_columnar_batch_payload_uses_intern(p, foreign));
+        wl_intern_free(foreign);
         CHECK(wl_intern_detach_memory_governor(intern, g) == EBUSY);
         for (unsigned i = 0; i < 1024; i++) {
             char value[32]; snprintf(value, sizeof(value), "growth-%u", i);
@@ -556,6 +563,7 @@ string_payloads(void)
             &jobs[1]) == 0);
         if (mode == 1) wl_intern_free(intern); /* Retire while pinned readers run. */
         wl_columnar_spill_store_retire(store);
+        CHECK(wl_columnar_batch_payload_uses_intern(p, intern));
         CHECK(wl_columnar_batch_payload_release(p) == WL_COLUMNAR_SPILL_BUSY);
         wl_thread_join(&threads[0]); wl_thread_join(&threads[1]);
         const char *bad = "sentinel";

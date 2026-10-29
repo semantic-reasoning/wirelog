@@ -574,6 +574,15 @@ wl_columnar_batch_payload_read(wl_columnar_batch_payload_reader_t *r,
     return WL_COLUMNAR_SPILL_OK;
 }
 
+bool
+wl_columnar_batch_payload_uses_intern(const wl_columnar_batch_payload_t *p,
+    const wl_intern_t *intern)
+{
+    return p && intern && (p->segment ?
+           wl_columnar_spill_segment_uses_intern(p->segment, intern) :
+           p->intern == intern);
+}
+
 const wirelog_column_type_t *
 wl_columnar_batch_payload_schema(const wl_columnar_batch_payload_t *p,
     uint32_t *ncols, uint32_t *nrows)

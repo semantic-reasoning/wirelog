@@ -85,6 +85,11 @@ wl_columnar_spill_status_t wl_columnar_spill_store_close(
  * callback context or compound arena; STRING/INLINE segments additionally pin intern. */
 void wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store);
 /* Live-store identity check for adapters sharing admission with the store. */
+/* Identity only, over a live segment owner/reader capability. Does not acquire
+ * a new pin or claim that the original intern owner is still open. */
+bool wl_columnar_spill_segment_uses_intern(
+    const wl_columnar_spill_segment_t *segment, const wl_intern_t *intern);
+
 bool wl_columnar_spill_store_uses_governor(
     const wl_columnar_spill_store_t *store,
     const wl_columnar_memory_governor_ref_t *governor);

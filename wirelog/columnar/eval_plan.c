@@ -433,7 +433,8 @@ wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
         if (!e->size && !e->data) continue;
         if (!e->data || e->size < 7 ||
             (e->data[0] != WL_PLAN_EXPR_VAR &&
-            e->data[0] != WL_PLAN_EXPR_VAR_FLOAT)) return false;
+            e->data[0] != WL_PLAN_EXPR_VAR_FLOAT &&
+            e->data[0] != WL_PLAN_EXPR_VAR_STRING)) return false;
         uint16_t len;
         memcpy(&len, e->data + 1, sizeof(len));
         if ((uint32_t)len + 3 != e->size ||
@@ -446,7 +447,9 @@ wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
         }
         if (col != m->project_indices[i] ||
             ((e->data[0] == WL_PLAN_EXPR_VAR_FLOAT) !=
-            (types && types[col] == WIRELOG_TYPE_FLOAT))) return false;
+            (types && types[col] == WIRELOG_TYPE_FLOAT)) ||
+            (e->data[0] == WL_PLAN_EXPR_VAR_STRING &&
+            (!types || types[col] != WIRELOG_TYPE_STRING))) return false;
     }
     if (out) *out = decoded;
     return true;

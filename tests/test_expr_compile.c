@@ -19,6 +19,8 @@
  */
 
 #include "../wirelog/backend.h"
+#include "../wirelog/columnar/internal.h"
+#include "../wirelog/intern.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -548,12 +550,291 @@ test_float_arithmetic_precedence(void)
     PASS();
 }
 
+static uint32_t string_operand(uint8_t *out, uint8_t tag, const char *text)
+{
+    uint16_t size = (uint16_t)strlen(text);
+    out[0] = tag; memcpy(out + 1, &size, 2); memcpy(out + 3, text, size);
+    return 3u + size;
+}
+static void test_string_result_classification(void)
+{
+    TEST("pure complete STRING/CAT classification and malformed refusal");
+    wirelog_column_type_t source[] = {WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT64};
+    wirelog_column_type_t result = WIRELOG_TYPE_BOOL;
+    uint8_t expression[2048];
+    uint32_t size = string_operand(expression, WL_PLAN_EXPR_VAR, "col0");
+    size += string_operand(expression+size, WL_PLAN_EXPR_CONST_STR, "(");
+    expression[size++] = WL_PLAN_EXPR_STR_FN_CAT;
+    size += string_operand(expression+size, WL_PLAN_EXPR_CONST_STR, "");
+    expression[size++] = WL_PLAN_EXPR_STR_FN_CAT;
+    if (!wl_columnar_expr_interpreted_result_type(expression, size, source, 2,
+        &result) || result != WIRELOG_TYPE_STRING){
+        FAIL("nested CAT type missing"); return;
+    }
+    for (unsigned variant = 0; variant < 13; variant++) {
+        uint8_t bad[2048]; memcpy(bad, expression, size); uint32_t count = size;
+        if (variant == 0) bad[count++] = WL_PLAN_EXPR_EXTENSION_CALL;
+        if (variant == 1) bad[count++] = WL_PLAN_EXPR_CONST_STR;
+        if (variant == 2) count = 2; /* Truncated length. */
+        if (variant == 3) count = 6; /* Truncated column name. */
+        if (variant == 4) {
+            bad[0] = WL_PLAN_EXPR_VAR_STRING; bad[6] = '1';
+        }                                                                     /* Actual INT64 lane. */
+        if (variant == 5) bad[6] = '2'; /* Out of range. */
+        if (variant == 6) bad[0] = WL_PLAN_EXPR_VAR_FLOAT;
+        if (variant == 7) {
+            bad[0] = WL_PLAN_EXPR_STR_FN_CAT; count = 1;
+        }
+        if (variant == 8) count += string_operand(bad+count,
+                    WL_PLAN_EXPR_CONST_STR, "extra");
+        if (variant == 9) bad[count-1] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+        if (variant == 10) count = string_operand(bad, WL_PLAN_EXPR_VAR,
+                    "col4294967296");
+        if (variant == 11) count = string_operand(bad, WL_PLAN_EXPR_VAR,
+                    "col00000000000000001");
+        if (variant == 12) bad[3] = 'x';
+        result = WIRELOG_TYPE_BOOL;
+        if (wl_columnar_expr_interpreted_result_type(bad, count, source, 2,
+            &result) || result != WIRELOG_TYPE_BOOL){
+            FAIL("malformed/unknown expression classified"); return;
+        }
+    }
+    expression[0] = WL_PLAN_EXPR_VAR_STRING;
+    if (!wl_columnar_expr_interpreted_result_type(expression, size, source, 2,
+        &result) ||
+        wl_columnar_expr_interpreted_result_type(expression, size, NULL, 2,
+        &result)){
+        FAIL("explicit STRING reference provenance"); return;
+    }
+    for (unsigned extra = 0; extra < 2; extra++) {
+        size = 0;
+        for (unsigned i = 0; i < COL_FILTER_STACK + extra; i++)
+            size += string_operand(expression+size, WL_PLAN_EXPR_CONST_STR, "");
+        for (unsigned i = 1; i < COL_FILTER_STACK + extra;
+            i++) expression[size++] = WL_PLAN_EXPR_STR_FN_CAT;
+        if (wl_columnar_expr_interpreted_result_type(expression, size, source,
+            2, &result) != (extra == 0)){
+            FAIL("operand stack bound"); return;
+        }
+    }
+    PASS();
+}
+
+static void test_builtin_result_contracts(void)
+{
+    TEST("all fixed builtin result types, arities and opaque refusal");
+    const struct { uint8_t tag; unsigned arity; wirelog_column_type_t type;
+    } cases[] = {
+        {WL_PLAN_EXPR_ARITH_ADD, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SUB, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_MUL, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_DIV, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_MOD, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_BAND, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_BOR, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_BXOR, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHL, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHR, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HMAC_SHA256, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_UUID5, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_UUID5_SS, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_UUID5_SI, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_UUID5_IS, 2, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_BNOT, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HASH, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_CRC32_ETH, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_CRC32_CAST, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_MD5, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA1, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA256, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA512, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_HASH_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_CRC32_ETH_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_CRC32_CAST_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_MD5_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA1_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA256_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_SHA512_S, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_STR_FN_STRLEN, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_STR_FN_STR_ORD, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_STR_FN_TO_NUMBER, 1, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_UUID4, 0, WIRELOG_TYPE_INT64},
+        {WL_PLAN_EXPR_ARITH_FLOAT_ADD, 2, WIRELOG_TYPE_FLOAT},
+        {WL_PLAN_EXPR_ARITH_FLOAT_SUB, 2, WIRELOG_TYPE_FLOAT},
+        {WL_PLAN_EXPR_ARITH_FLOAT_MUL, 2, WIRELOG_TYPE_FLOAT},
+        {WL_PLAN_EXPR_ARITH_FLOAT_DIV, 2, WIRELOG_TYPE_FLOAT},
+        {WL_PLAN_EXPR_CMP_EQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_NEQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_LT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_GT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_LTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_GTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_EQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_NEQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_LT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_GT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_LTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_FLOAT_GTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_EQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_NEQ, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_LT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_GT, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_LTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_CMP_STR_GTE, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_STR_FN_CONTAINS, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_STR_FN_STR_PREFIX, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_STR_FN_STR_SUFFIX, 2, WIRELOG_TYPE_BOOL},
+        {WL_PLAN_EXPR_STR_FN_TO_UPPER, 1, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_TO_LOWER, 1, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_TRIM, 1, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_TO_STRING, 1, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_CAT, 2, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_UUID5_RFC, 2, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_SUBSTR, 3, WIRELOG_TYPE_STRING},
+        {WL_PLAN_EXPR_STR_FN_STR_REPLACE, 3, WIRELOG_TYPE_STRING},
+    };
+    uint8_t expression[1024]; wirelog_column_type_t result;
+    for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        uint32_t size = 0;
+        for (unsigned j = 0; j < cases[i].arity; j++) {
+            expression[size++] = WL_PLAN_EXPR_CONST_INT;
+            memset(expression+size, 0, 8); size += 8;
+        }
+        expression[size++] = cases[i].tag;
+        result = WIRELOG_TYPE_UINT64;
+        if (!wl_columnar_expr_interpreted_result_type(expression, size, NULL, 0,
+            &result) || result != cases[i].type){
+            FAIL("builtin result contract"); return;
+        }
+        if (cases[i].arity &&
+            wl_columnar_expr_interpreted_result_type(expression+9, size-9, NULL,
+            0, &result)){
+            FAIL("operator underflow"); return;
+        }
+        /* Every STRING producer must keep a direct key in a zero-row MAP.
+         * Even crypto tags are classified without invoking execution. */
+        if (cases[i].type == WIRELOG_TYPE_STRING) {
+            col_rel_t *input = col_rel_new_auto("in", 1),
+                *output = col_rel_new_auto("out", 2);
+            wl_col_session_t session = {0}; session.intern = wl_intern_create();
+            wirelog_column_type_t string_type = WIRELOG_TYPE_STRING;
+            uint8_t key[32];
+            uint32_t key_size = string_operand(key, WL_PLAN_EXPR_VAR, "col0");
+            wl_plan_expr_buffer_t exprs[] = {{.data = key, .size = key_size},
+                                             {.data = expression,
+                                              .size = size}};
+            uint32_t indices[] = {0, 0};
+            wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                                .project_indices = indices, .map_expr_count = 2,
+                                .map_exprs = exprs};
+            bool ok = input && output && session.intern &&
+                col_rel_set_column_types(input, &string_type, 1) == 0 &&
+                col_op_map_output_types(&map, input, &session, NULL,
+                    output) == 0 && output->column_types &&
+                output->column_types[0] == WIRELOG_TYPE_STRING &&
+                output->column_types[1] == WIRELOG_TYPE_STRING &&
+                wl_intern_count(session.intern) == 0 && !output->nrows;
+            col_rel_destroy(input); col_rel_destroy(output);
+            wl_intern_free(session.intern);
+            if (!ok) {
+                FAIL("empty mixed MAP type or classifier side effect"); return;
+            }
+        }
+    }
+    const uint8_t opaque[] = {WL_PLAN_EXPR_EXTENSION_CALL,
+                              WL_PLAN_EXPR_EXTENSION_CALL_ABI,
+                              WL_PLAN_EXPR_AGG_COUNT, WL_PLAN_EXPR_AGG_SUM,
+                              WL_PLAN_EXPR_AGG_MIN, WL_PLAN_EXPR_AGG_MAX,
+                              WL_PLAN_EXPR_AGG_AVG, 0xff};
+    for (unsigned i = 0; i < sizeof(opaque); i++) {
+        uint32_t size = string_operand(expression, WL_PLAN_EXPR_CONST_STR,
+                "uninterned");
+        expression[size++] = opaque[i];
+        expression[size++] = WL_PLAN_EXPR_STR_FN_TO_UPPER;
+        result = WIRELOG_TYPE_UINT64;
+        if (wl_columnar_expr_interpreted_result_type(expression, size, NULL, 0,
+            &result) || result != WIRELOG_TYPE_UINT64){
+            FAIL("opaque prefix rescued by known suffix"); return;
+        }
+    }
+    /* Nullary UUID4 must respect the stack bound as a push. */
+    memset(expression, WL_PLAN_EXPR_ARITH_UUID4, COL_FILTER_STACK+1);
+    uint32_t size = COL_FILTER_STACK+1;
+    for (unsigned i = 1; i < COL_FILTER_STACK+1;
+        i++) expression[size++] = WL_PLAN_EXPR_ARITH_ADD;
+    if (wl_columnar_expr_interpreted_result_type(expression, size, NULL, 0,
+        &result)){
+        FAIL("nullary stack overflow"); return;
+    }
+    const uint8_t values[] = {WL_PLAN_EXPR_CONST_INT, WL_PLAN_EXPR_CONST_FLOAT,
+                              WL_PLAN_EXPR_BOOL};
+    const wirelog_column_type_t expected[] = {WIRELOG_TYPE_INT64,
+                                              WIRELOG_TYPE_FLOAT,
+                                              WIRELOG_TYPE_BOOL};
+    for (unsigned i = 0; i < 3; i++) {
+        expression[0] = values[i]; memset(expression+1, 0, 8);
+        size = i == 2 ? 2 : 9;
+        if (!wl_columnar_expr_interpreted_result_type(expression, size, NULL, 0,
+            &result) || result != expected[i]) {
+            FAIL("constant type"); return;
+        }
+        for (uint32_t n = 0; n < size;
+            n++) if (wl_columnar_expr_interpreted_result_type(expression, n,
+                NULL, 0, &result)) {
+                FAIL("truncated constant"); return;
+            }
+    }
+    PASS();
+}
+
+static void test_empty_string_map_schema(void)
+{
+    TEST(
+        "empty MAP keeps direct STRING beside interpreted CAT; unknown stays untyped");
+    col_rel_t *input = col_rel_new_auto("input", 1);
+    col_rel_t *output = col_rel_new_auto("output", 2);
+    wl_col_session_t session = {0};
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_STRING};
+    uint8_t direct[32], cat[64];
+    uint32_t a = string_operand(direct, WL_PLAN_EXPR_VAR, "col0");
+    memcpy(cat, direct, a); uint32_t b = a;
+    b += string_operand(cat+b, WL_PLAN_EXPR_CONST_STR, "suffix");
+    cat[b++] = WL_PLAN_EXPR_STR_FN_CAT;
+    wl_plan_expr_buffer_t expressions[] = {{.data = direct, .size = a},
+                                           {.data = cat, .size = b}};
+    uint32_t indices[] = {0, 0};
+    wl_plan_op_t map = {.op = WL_PLAN_OP_MAP, .project_count = 2,
+                        .project_indices = indices, .map_expr_count = 2,
+                        .map_exprs = expressions};
+    bool ok = input && output && col_rel_set_column_types(input, types,
+            1) == 0 &&
+        col_op_map_output_types(&map, input, &session, NULL, output) == 0 &&
+        output->column_types &&
+        output->column_types[0] == WIRELOG_TYPE_STRING &&
+        output->column_types[1] == WIRELOG_TYPE_STRING && !output->nrows;
+    col_rel_destroy(output); output = col_rel_new_auto("unknown", 2);
+    cat[b-1] = WL_PLAN_EXPR_EXTENSION_CALL;
+    ok = ok && output && col_op_map_output_types(&map, input, &session, NULL,
+            output) == 0 && !output->column_types;
+    col_rel_destroy(output); col_rel_destroy(input);
+    if (!ok) {
+        FAIL("empty type publication or unknown fallback"); return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
     printf("=== wirelog Pre-compiled Expression Evaluator Tests (Issue #298)"
         " ===\n\n");
 
+    test_string_result_classification();
+    test_empty_string_map_schema();
+    test_builtin_result_contracts();
     printf("--- FILTER: arithmetic comparison ---\n");
     test_filter_crdt_arithmetic();
     test_filter_arithmetic_vs_constant();

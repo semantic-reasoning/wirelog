@@ -161,6 +161,12 @@ const wirelog_column_type_t *wl_columnar_batch_payload_schema(
     const wl_columnar_batch_payload_t *payload, uint32_t *ncols,
     uint32_t *nrows);
 
+/* Identity of the retained provenance, including spilled segment ownership.
+ * Caller holds a live payload owner/reader. This neither acquires an intern
+ * pin nor tests whether its original owner is open. Numeric payloads return false. */
+bool wl_columnar_batch_payload_uses_intern(
+    const wl_columnar_batch_payload_t *payload, const wl_intern_t *intern);
+
 /* Exact admission owner identity; no ownership transfer. */
 bool wl_columnar_batch_payload_uses_governor(
     const wl_columnar_batch_payload_t *payload,

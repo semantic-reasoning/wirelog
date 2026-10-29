@@ -763,6 +763,80 @@ static void join_chains(void)
     }
 }
 
+typedef struct { int64_t ids[3]; unsigned bits[2]; } reference_public_events_t;
+static void reference_public_observe(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    reference_public_events_t *e = context;
+    unsigned idx = !strcmp(name, "result") ? 0u : 1u;
+    CHECK(idx == 0 || !strcmp(name, "other"));
+    unsigned width = idx ? 2 : 3;
+    CHECK(diff == 1 && row && row->logical_ncols == width &&
+        row->physical_nlanes == width);
+    CHECK(row->types[0] == WIRELOG_TYPE_STRING &&
+        row->physical_types[0] == WIRELOG_TYPE_STRING &&
+        row->types[1] == WIRELOG_TYPE_INT64);
+    unsigned key = (unsigned)row->lanes[1];
+    CHECK(key < 3 && row->lanes[0] == (uint64_t)e->ids[key]);
+    if (!idx) CHECK(row->types[2] == WIRELOG_TYPE_STRING &&
+            row->physical_types[2] == WIRELOG_TYPE_STRING &&
+            row->lanes[2] == row->lanes[0]);
+    CHECK(!(e->bits[idx]&(1u<<key))); e->bits[idx] |= 1u<<key;
+}
+static void reference_public_projections(void)
+{
+    for (unsigned filtered = 0; filtered < 2; filtered++)
+        for (unsigned empty = 0; empty < 2; empty++)
+            for (unsigned order = 0; order < 3; order++) {
+                char text[1024];
+                snprintf(text, sizeof(text),
+                    ".decl a(k:int64,s:symbol,u:symbol)\n.decl b(s:symbol,k:int64)\n"
+                    ".decl result(s:symbol,k:int64,t:symbol)\n.decl other(s:symbol,k:int64)\n"
+                    "a(0,\"\",\"unused\").\na(1,\"alpha\",\"unused\").\na(2,\"한글\",\"unused\").\n"
+                    "b(\"\",0).\nb(\"alpha\",1).\nb(\"한글\",2).\n"
+                    "result(s,k,s) :- a(k,s,u)%s.\nother(s,k) :- b(s,k).\n",
+                    filtered ? ", k >= 1" : "");
+                wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+                wirelog_session_options_v1_t o = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &o, &s) == WIRELOG_OK);
+                int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+                CHECK(wirelog_program_get_facts(p, "a", &facts, &rows,
+                    &cols) == 0 && rows == 3 && cols == 3);
+                reference_public_events_t expected = {0};
+                for (unsigned i = 0; i < rows; i++) {
+                    CHECK(facts[i*cols] >= 0 && facts[i*cols] < 3);
+                    expected.ids[facts[i*cols]] = facts[i*cols+1];
+                    if (empty) CHECK(wirelog_session_remove(s, "a",
+                            facts+i*cols, 1, cols) == WIRELOG_OK);
+                }
+                if (!empty) CHECK(wirelog_session_insert(s, "a", facts, 1,
+                        cols) == WIRELOG_OK);                                                /* Duplicate row. */
+                free(facts); facts = NULL;
+                CHECK(wirelog_program_get_facts(p, "b", &facts, &rows,
+                    &cols) == 0 && rows == 3 && cols == 2);
+                if (empty) CHECK(wirelog_session_remove(s, "b", facts, rows,
+                        cols) == WIRELOG_OK);
+                free(facts);
+                if (order) {
+                    CHECK(wirelog_session_seal_input(s,
+                        order == 1 ? "a" : "b") == WIRELOG_OK);
+                    CHECK(wirelog_session_seal_join_input(s,
+                        order == 1 ? "b" : "a") == WIRELOG_OK);
+                }
+                if (order == 2) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    reference_public_events_t e = expected;
+                    CHECK(wirelog_session_snapshot_typed(s,
+                        reference_public_observe, &e) == WIRELOG_OK);
+                    CHECK(e.bits[0] == (empty ? 0u : filtered ? 6u : 7u) &&
+                        e.bits[1] == (empty ? 0u : 7u));
+                }
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(live_files() == 0);
+            }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -781,6 +855,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    reference_public_projections();
     join_directions(); join_chains();
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
     sealed_sets(); standalone_reads(); output_floor(); mixed_projection();

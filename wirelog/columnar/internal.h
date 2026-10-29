@@ -5310,6 +5310,12 @@ bool wl_columnar_expr_compiled_result_type(
     const wl_columnar_expr_compiled_t *c,
     const wirelog_column_type_t *source_types, uint32_t ncols,
     wirelog_column_type_t *type);
+/* Pure static result query for complete canonical fixed-result scalar builtin
+ * expressions. No execution, operand/ID validation, intern mutation or callbacks.
+ * Unknown/extension/aggregate/malformed input leaves type untouched. */
+bool wl_columnar_expr_interpreted_result_type(const uint8_t *buf, uint32_t size,
+    const wirelog_column_type_t *source_types, uint32_t ncols,
+    wirelog_column_type_t *type);
 int
 wl_columnar_expr_eval_compiled(const wl_columnar_expr_compiled_t *c,
     const int64_t *row, uint32_t ncols, int64_t *out_val);

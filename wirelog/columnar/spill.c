@@ -282,6 +282,14 @@ wl_columnar_spill_store_retire(wl_columnar_spill_store_t *store)
 }
 
 bool
+wl_columnar_spill_segment_uses_intern(
+    const wl_columnar_spill_segment_t *segment,
+    const wl_intern_t *intern)
+{
+    return segment && intern && segment->intern == intern;
+}
+
+bool
 wl_columnar_spill_store_uses_governor(const wl_columnar_spill_store_t *store,
     const wl_columnar_memory_governor_ref_t *governor)
 {
