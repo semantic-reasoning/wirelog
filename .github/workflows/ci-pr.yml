@@ -638,8 +638,15 @@ jobs:
 
       - name: Test with sanitizers
         # The required, pinned-Syft SBOM gate runs in build-primary. A host
-        # Syft here can make its redundant scan time out under sanitizer load.
-        run: meson test -C builddir-san --exclude sbom_snapshot --print-errorlogs
+        # Syft here can make its redundant scan time out under sanitizer load,
+        # so sbom_snapshot is excluded here; every other test still runs,
+        # including the other sbom-suite contract checks.
+        # Distro meson (1.10.x on ubuntu-26.04) has no `meson test --exclude`,
+        # and `--no-suite sbom` would drop those contract checks too, so the
+        # exclusion is built from the configured test list at run time.
+        run: |
+          rest="$(meson introspect --tests builddir-san | jq -r '.[].name' | grep -Fxv sbom_snapshot | tr '\n' ' ')"
+          meson test -C builddir-san $rest --print-errorlogs
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
