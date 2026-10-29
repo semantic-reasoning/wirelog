@@ -401,6 +401,68 @@ static void output_floor(void)
     wirelog_session_destroy(s); wirelog_program_free(p);
     CHECK(live_files() == 0);
 }
+static wirelog_session_t *knob_session(wirelog_program_t *p,
+    const char *knob)
+{
+    wirelog_session_t *s = NULL;
+    wirelog_session_options_v1_t o = configured();
+    environment("WIRELOG_JOIN_BATCH_BYTES", knob);
+    CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
+        &o, &s) == WIRELOG_OK);
+    populate(s, false);
+    return s;
+}
+static void knob_snapshot(wirelog_session_t *s)
+{
+    events_t e = {0};
+    CHECK(wirelog_session_snapshot(s, observe, &e) == WIRELOG_OK);
+    CHECK(e.count == 4 && e.seen == 15 && e.second == 0);
+}
+/* Issue #2287: WIRELOG_JOIN_BATCH_BYTES is read when the session is created.
+ * A value that turns it on refuses the seal before capture and leaves the
+ * source mutable; the other values below leave sealing available. On
+ * Windows, environment() deletes the variable for "", so that case repeats
+ * the unset one there. */
+static void join_batch_knob(void)
+{
+    static const char *const off[] = {
+        "0", "", "abc", "5x", "0x10", "18446744073709551616"
+    };
+    static const char *const on[] = {"4096", " 5", "-1"};
+    wirelog_program_t *p = parse(query);
+    for (unsigned i = 0; i < sizeof(off)/sizeof(off[0]); i++) {
+        wirelog_session_t *s = knob_session(p, off[i]);
+        CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_OK);
+#if defined(_WIN32) || defined(__linux__)
+        CHECK(live_files() > 0);
+#endif
+        knob_snapshot(s);
+        wirelog_session_destroy(s);
+        CHECK(live_files() == 0);
+    }
+    for (unsigned i = 0; i < sizeof(on)/sizeof(on[0]); i++) {
+        wirelog_session_t *s = knob_session(p, on[i]);
+        CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_ERR_EXEC);
+        CHECK(live_files() == 0);
+        /* Clearing the environment does not change a created session. */
+        environment("WIRELOG_JOIN_BATCH_BYTES", NULL);
+        CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_ERR_EXEC);
+        int64_t row[] = {200, 300};
+        CHECK(wirelog_session_insert(s, "b", row, 1, 2) == WIRELOG_OK);
+        CHECK(wirelog_session_remove(s, "b", row, 1, 2) == WIRELOG_OK);
+        knob_snapshot(s);
+        wirelog_session_destroy(s);
+        CHECK(live_files() == 0);
+    }
+    /* Setting the environment after creation does not refuse the seal. */
+    wirelog_session_t *s = knob_session(p, NULL);
+    environment("WIRELOG_JOIN_BATCH_BYTES", "4096");
+    CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_OK);
+    environment("WIRELOG_JOIN_BATCH_BYTES", NULL);
+    knob_snapshot(s);
+    wirelog_session_destroy(s); wirelog_program_free(p);
+    CHECK(live_files() == 0);
+}
 
 typedef struct { unsigned keys, joined, seen; uint64_t key_bits[2];
 } mixed_events_t;
@@ -510,6 +572,7 @@ int main(void)
 #endif
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
     output_floor(); mixed_projection(); unsupported_filters();
+    join_batch_knob();
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);
 #else

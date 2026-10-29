@@ -175,6 +175,15 @@ wirelog_session_create_with_snapshot(wirelog_program_t *program,
  * WIRELOG_MEMORY_BUDGET policy still governs managed memory. Inputs initially
  * fit in memory and capture needs additional scratch; final output remains
  * resident. Spill files are ephemeral and session-owned, not reopenable data.
+ *
+ * Environment: WIRELOG_JOIN_BATCH_BYTES is read when the session is created.
+ * It is on when its whole value parses as a nonzero base-10 integer the way
+ * strtoull() reads it, so leading whitespace and a sign are accepted ("-1"
+ * turns it on). Any other value, including an empty one, "0", "0x10", "5x",
+ * "abc" or one out of range, leaves it off. When it is on, that session
+ * selects no spill JOIN even with positive join caps, and
+ * wirelog_session_seal_join_input() returns WIRELOG_ERR_EXEC. Changing the
+ * environment after creation does not affect an existing session.
  */
 typedef struct {
     uint32_t struct_size;
@@ -217,13 +226,17 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * when no row passes. Scan-only sealing and general cold pipelines
  * are unsupported. No right filter, timestamps, references,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
- * Optimized plans may therefore be ineligible. Only one input may be sealed.
+ * Optimized plans may therefore be ineligible. The session must also not have
+ * been created with WIRELOG_JOIN_BATCH_BYTES on (see
+ * wirelog_session_options_v1_t). Only one input may be sealed.
  *
  * Success reclaims the resident source and makes all fact/compound mutation
  * unsupported for the entire session. The binding is reused by supported
  * STEP/SNAPSHOT calls until destruction; sealing cannot be undone. A refusal
  * preserves the original source and allows retry only while the session is
- * still eligible; an evaluation attempt permanently closes the seal window.
+ * still eligible, and a refusal because WIRELOG_JOIN_BATCH_BYTES was on lasts
+ * for the session's lifetime; an evaluation attempt permanently closes the
+ * seal window.
  * Calls are synchronous and must be externally serialized with all session
  * operations. No callback or cancellation hook is invoked by this public API.
  *
