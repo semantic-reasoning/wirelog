@@ -1397,9 +1397,8 @@ static void reference_joins(void)
 {
     const uint32_t map[] = {5, 1, 4, 2, 5};
     const char *values[] = {"", "alpha", "한글"};
-    for (unsigned string_key = 0; string_key < 2;
-        string_key++) for (unsigned mode = 0;
-            mode < 5; mode++) {
+    for (unsigned string_key = 0; string_key < 2; string_key++) {
+        for (unsigned mode = 0; mode < 5; mode++) {
             wl_columnar_memory_governor_ref_t *g = governor(1<<20);
             wl_intern_t *intern = wl_intern_create();
             CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
@@ -1529,6 +1528,7 @@ static void reference_joins(void)
             CHECK(wl_columnar_batch_payload_release(retained) == OK);
             CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
         }
+    }
 }
 
 int main(void)
