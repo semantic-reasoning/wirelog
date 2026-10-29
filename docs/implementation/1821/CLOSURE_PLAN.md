@@ -436,3 +436,25 @@ refused K_FUSION route. Thirteen cancellation/work-limit checkpoints cover
 admission, plan/constructor preparation, difference/gather/append, later-round
 selection, retirement, downstream evaluation and cutoff, with retry/event and
 governor restoration checks.
+
+## G3b increment: default generated linear UNION frontiers
+
+This bundle widens the preceding whole-head occurrence limit to a conservative
+per-branch degree proof. The compiler preserves ordinary operators for monotone,
+nonaggregate linear UNION alternatives; the controlled host authenticates every
+recursive occurrence against a governed per-operator source-head map. Distinct
+mutual heads, recursive inputs on either JOIN side, empty frontiers and seed
+branches remain composable at the existing all-child barrier and public cutoff.
+
+Natural generated plans qualify initial/append/remove parity and signed events.
+A separate generated EXCHANGE plan witnesses actual two-worker execution; mutual
+heads without EXCHANGE retain and qualify their existing fallback. Compiler tests
+retain nonlinear K expansion and reject a recursive UNION followed by another
+recursive JOIN. Stops additionally cover map allocation, partial initialization,
+audit and later-branch selection, with retry/public-state/credit restoration.
+
+This supersedes the preceding whole-head single-occurrence restriction, but does
+not close G3b or #1821. Nonlinear/default K execution, weighted traces, persistent
+raw epoch/rule frontiers and cross-attempt incremental retractions remain open,
+alongside persistent prefix metadata and the recorded G4–G7 obligations. Repeated
+seed work is allowed; no universal raw performance improvement is claimed.

@@ -3035,6 +3035,63 @@ fail:
 }
 #endif /* ENABLE_K_FUSION */
 
+/* UNION alternatives with maximum recursive degree one need no K expansion.
+ * Analyze the complete stack expression: CONCAT takes max, while a later
+ * recursive JOIN still adds one. A byte per operator avoids size-product
+ * overflow; allocation, shape or representation failure keeps the old rewrite. */
+static bool
+wl_plan_delta_alternatives_linear(const wl_plan_op_t *ops, uint32_t count,
+    const uint32_t *positions, uint32_t k)
+{
+    uint8_t *degrees = calloc(count, sizeof(*degrees));
+    if (!degrees) return false;
+    uint32_t depth = 0, next = 0;
+    bool linear = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        const wl_plan_op_t *op = &ops[i];
+        bool recursive = next < k && positions[next] == i;
+        if (recursive) next++;
+        if (op->opaque_data || op->materialized) {
+            linear = false; break;
+        }
+        if (op->op == WL_PLAN_OP_VARIABLE) {
+            degrees[depth++] = recursive ? 1 : 0;
+        } else if (op->op == WL_PLAN_OP_CONCAT) {
+            if (depth < 2) {
+                linear = false; break;
+            }
+            uint8_t right = degrees[--depth];
+            if (right > degrees[depth - 1]) degrees[depth - 1] = right;
+        } else if (op->op == WL_PLAN_OP_JOIN) {
+            if (!depth || (recursive && degrees[depth - 1])) {
+                linear = false; break;
+            }
+            if (recursive) degrees[depth - 1] = 1;
+        } else if (op->op == WL_PLAN_OP_MAP || op->op == WL_PLAN_OP_FILTER
+            || op->op == WL_PLAN_OP_CONSOLIDATE) {
+            if (!depth) {
+                linear = false; break;
+            }
+        } else {
+            linear = false; break;
+        }
+    }
+    linear = linear && depth == 1 && next == k;
+    free(degrees);
+    return linear;
+}
+
+#ifdef WIRELOG_TEST_DELTA_LINEARITY
+bool wl_plan_test_delta_alternatives_linear(const wl_plan_op_t *, uint32_t,
+    const uint32_t *, uint32_t);
+bool
+wl_plan_test_delta_alternatives_linear(const wl_plan_op_t *ops, uint32_t count,
+    const uint32_t *positions, uint32_t k)
+{
+    return wl_plan_delta_alternatives_linear(ops, count, positions, k);
+}
+#endif
+
 /**
  * Apply multi-way delta expansion to all recursive strata in the plan.
  * For each relation in a recursive stratum with K >= 2 IDB body atoms,
@@ -3068,6 +3125,12 @@ rewrite_multiway_delta(wl_plan_t *plan)
             uint32_t k = count_delta_positions(
                 rel->ops, rel->op_count, idb_names, st->relation_count, dpos);
 
+            if (k >= 2 && st->is_monotone && !st->has_aggregate
+                && wl_plan_delta_alternatives_linear(rel->ops, rel->op_count,
+                dpos, k)) {
+                free(dpos);
+                continue;
+            }
             if (k >= 2) {
                 uint32_t new_count = 0;
                 wl_plan_op_t *new_ops;

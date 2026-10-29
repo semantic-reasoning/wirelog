@@ -2189,6 +2189,7 @@ test_plan_gen_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWIRELOG_TEST_DELTA_NAME',
+           '-DWIRELOG_TEST_DELTA_LINEARITY',
            '-DWIRELOG_TEST_EXTENSION_SERIALIZATION'],
 )
 

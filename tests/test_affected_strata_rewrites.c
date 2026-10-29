@@ -12,9 +12,9 @@
  * 0 leaves no stratum to run and retracted tuples are retained.
  *
  * Every case here builds a REAL plan through wl_plan_from_program() and
- * asserts its own premise -- that the blinding operator it targets is
- * actually present -- before asserting the mask, so the case cannot pass
- * vacuously if a future rewrite changes shape.
+ * asserts its own plan-shape premise before asserting the mask. Nonlinear
+ * cases require their blinding operator; the linear UNION control requires
+ * ordinary branches, so neither route passes vacuously after rewrite changes.
  *
  * Coverage note: because every plan here comes from wl_plan_from_program(),
  * every stratum carries a recorded wl_plan_stratum_t.rule_refs, so this file
@@ -86,10 +86,9 @@ static const char *const SRC_FUSED_TC =
     "Path(x,y) :- Edge(x,y).\n"
     "Path(x,y) :- Path(x,z), Path(z,y).\n";
 
-/* Three rules for P, each with at most ONE IDB body atom, still fuse:
- * count_delta_positions() counts delta positions across the whole relation
- * plan (the union of every rule for the head), not per rule. */
-static const char *const SRC_CROSS_RULE_FUSION =
+/* Three rules for P, each with at most ONE IDB body atom, remain ordinary
+ * linear UNION alternatives. Affected-stratum detection must still see E. */
+static const char *const SRC_LINEAR_UNION =
     ".decl E(x: int64, y: int64)\n"
     ".decl P(x: int64, y: int64)\n"
     ".decl Q(x: int64, y: int64)\n"
@@ -304,15 +303,15 @@ test_fused_rule_marks_stratum(void)
 }
 
 /* ======================================================================== */
-/* TC2: cross-rule fusion (each rule has at most one IDB atom)                */
+/* TC2: linear UNION (each rule has at most one IDB atom)                     */
 /* ======================================================================== */
 
 static void
-test_cross_rule_fusion_marks_stratum(void)
+test_linear_union_marks_stratum(void)
 {
-    TEST("K-fusion: three rules with <=1 IDB atom each still fuse");
+    TEST("linear UNION: ordinary branches still mark the affected stratum");
 
-    wl_plan_t *plan = build_plan(SRC_CROSS_RULE_FUSION, false);
+    wl_plan_t *plan = build_plan(SRC_LINEAR_UNION, false);
     if (!plan) {
         FAIL("build_plan failed");
         return;
@@ -325,9 +324,20 @@ test_cross_rule_fusion_marks_stratum(void)
         return;
     }
 
-    if (relation_leading_op(plan, "P") != WL_PLAN_OP_K_FUSION) {
+    unsigned joins = 0;
+    bool fused = false;
+    const wl_plan_stratum_t *stratum = &plan->strata[si];
+    for (uint32_t r = 0; r < stratum->relation_count; ++r) {
+        const wl_plan_relation_t *relation = &stratum->relations[r];
+        if (strcmp(relation->name, "P")) continue;
+        for (uint32_t op = 0; op < relation->op_count; ++op) {
+            joins += relation->ops[op].op == WL_PLAN_OP_JOIN;
+            fused |= relation->ops[op].op == WL_PLAN_OP_K_FUSION;
+        }
+    }
+    if (fused || joins != 2) {
         wl_plan_free(plan);
-        FAIL("premise: P was not rewritten to K_FUSION");
+        FAIL("premise: P must preserve both ordinary linear UNION branches");
         return;
     }
 
@@ -1054,7 +1064,7 @@ main(void)
     printf("=== Affected-strata detection across plan rewrites (#1019) ===\n");
 
     test_fused_rule_marks_stratum();
-    test_cross_rule_fusion_marks_stratum();
+    test_linear_union_marks_stratum();
     test_lftj_star_join_marks_stratum();
     test_unfused_control();
     test_independent_stratum_stays_clear();
