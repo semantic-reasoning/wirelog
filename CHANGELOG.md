@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Filtered sealed-input projections** (#1372): bounded column projections can
+  apply one signed integer column/literal comparison while preserving resident
+  output floors, exact results, failure recovery and fixed-budget reclamation.
+
 - **Sealed-input direct projections** (#1372): an eligible sealed numeric JOIN
   input can also feed a direct column-projection rule through bounded pinned
   reads, without reconstructing the full source. Mixed JOIN/projection tests

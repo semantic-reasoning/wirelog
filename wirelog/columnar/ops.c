@@ -358,12 +358,15 @@ int
 wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     eval_stack_t *stack, wl_col_session_t *sess)
 {
+    wl_columnar_eval_plan_cold_projection_t decoded;
     if (!sess || !stack || !sess->cold_relation ||
         wl_columnar_session_cold_execution_check(sess) ||
-        !wl_columnar_eval_plan_cold_projection(plan, sess->cold_relation->name,
+        !wl_columnar_eval_plan_cold_projection_decode(plan,
+        sess->cold_relation->name,
         sess->cold_relation->ncols, wl_columnar_batch_payload_schema(
-            sess->cold_relation->payload, NULL, NULL))) return ENOTSUP;
-    const wl_plan_op_t *op = &plan->ops[1];
+            sess->cold_relation->payload, NULL, NULL),
+        &decoded)) return ENOTSUP;
+    const wl_plan_op_t *op = decoded.map;
     wl_columnar_session_cold_relation_t *cold = sess->cold_relation;
     uint32_t width = op->project_count;
     uint64_t bytes;
@@ -409,6 +412,22 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
         status = wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL,
                 &lanes, &metadata);
         if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+        if (decoded.comparison) {
+            int64_t value;
+            memcpy(&value, &lanes[decoded.predicate_column], sizeof(value));
+            int64_t literal = decoded.predicate_literal;
+            bool keep = false;
+            switch (decoded.comparison) {
+            case WL_PLAN_EXPR_CMP_EQ: keep = value == literal; break;
+            case WL_PLAN_EXPR_CMP_NEQ: keep = value != literal; break;
+            case WL_PLAN_EXPR_CMP_LT: keep = value < literal; break;
+            case WL_PLAN_EXPR_CMP_GT: keep = value > literal; break;
+            case WL_PLAN_EXPR_CMP_LTE: keep = value <= literal; break;
+            case WL_PLAN_EXPR_CMP_GTE: keep = value >= literal; break;
+            default: rc = ENOTSUP; goto done;
+            }
+            if (!keep) continue;
+        }
         for (uint32_t i = 0; i < width; i++)
             memcpy(&row[i], &lanes[op->project_indices[i]], sizeof(row[i]));
         rc = col_rel_append_batch_row(&batch, row);
