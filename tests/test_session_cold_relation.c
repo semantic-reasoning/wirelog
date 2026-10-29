@@ -1522,7 +1522,7 @@ static void multiple_schema_audit(void)
         for (unsigned phase = 0; phase < 2; phase++) {
             b->column_types = types;
             if (bad == 0) types[2] = WIRELOG_TYPE_FLOAT;
-            if (bad == 1) types[1] = WIRELOG_TYPE_STRING; /* Nonprojected lane. */
+            if (bad == 1) types[1] = (wirelog_column_type_t)99; /* Unsupported nonprojected lane. */
             if (bad == 2) b->has_graph_column = true;
             if (bad == 3) b->compound_count = 1;
             if (bad == 4) b->ncols = 2; /* Predicate col2 must use B's width. */
@@ -2084,6 +2084,221 @@ static void cold_intermediate_floor(void)
     }
 }
 
+static const char *reference_projection_query =
+    ".decl a(k:int64,s:symbol,u:symbol)\n.decl b(s:symbol,k:int64)\n"
+    ".decl result(s:symbol,k:int64,t:symbol)\n.decl other(s:symbol,k:int64)\n"
+    "result(s,k,s) :- a(k,s,u), k >= 3.\nother(s,k) :- b(s,k).\n";
+static const char *reference_values[] = {"", "alpha", "한글"};
+static fixture_t reference_projection_fixture(uint64_t allowance, unsigned rows)
+{
+    fixture_t f = fixture(reference_projection_query, allowance, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    int64_t ids[3];
+    for (unsigned i = 0; i < 3; i++) {
+        ids[i] = wl_intern_put(s->intern, reference_values[i]);
+        CHECK(ids[i] >= 0);
+    }
+    for (unsigned i = 0; i < (rows ? rows : 1); i++) {
+        int64_t a[] = {(int64_t)i, ids[i%3], ids[(i+1)%3]},
+            b[] = {ids[i%3], (int64_t)i};
+        CHECK(wl_session_insert(f.session, "a", a, 1, 3) == 0);
+        CHECK(wl_session_insert(f.session, "b", b, 1, 2) == 0);
+        if (!rows) {
+            CHECK(wl_session_remove(f.session, "a", a, 1, 3) == 0);
+            CHECK(wl_session_remove(f.session, "b", b, 1, 2) == 0);
+        }
+    }
+    return f;
+}
+typedef struct { wl_intern_t *intern; unsigned bits[2]; } reference_events_t;
+static void reference_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    reference_events_t *e = context;
+    unsigned idx = !strcmp(name, "result") ? 0u : 1u;
+    CHECK(idx == 0 || !strcmp(name, "other"));
+    CHECK(cols == (idx ? 2u : 3u) && row[1] >= (idx ? 0 : 3) && row[1] < 9);
+    CHECK(!strcmp(wl_intern_reverse(e->intern, row[0]),
+        reference_values[(unsigned)row[1]%3]));
+    if (!idx) CHECK(row[2] == row[0]);
+    unsigned bit = 1u << (unsigned)row[1]; CHECK(!(e->bits[idx]&bit));
+    e->bits[idx] |= bit;
+}
+static void reference_projections(void)
+{
+    for (unsigned empty = 0; empty < 2; empty++)
+        for (unsigned order = 0; order < 2; order++)
+            for (unsigned count = 0; count <= 2; count++) {
+                fixture_t f = reference_projection_fixture(4*1024*1024,
+                        empty ? 0 : 9);
+                wl_col_session_t *s = COL_SESSION(f.session);
+                const char *names[] = {"a", "b"};
+                for (unsigned i = 0; i < count;
+                    i++) CHECK(wl_columnar_session_seal_input(f.session,
+                        names[order ? 1-i : i], NULL, NULL) == OK);
+                if (order) CHECK(wl_session_step(f.session) == 0);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    reference_events_t e = {.intern = s->intern};
+                    CHECK(wl_session_snapshot(f.session, reference_observe,
+                        &e) == 0);
+                    CHECK(e.bits[0] == (empty ? 0u : 504u) &&
+                        e.bits[1] == (empty ? 0u : 511u));
+                }
+                col_rel_t *r = session_find_rel(s, "result");
+                if (!empty) CHECK(r && r->column_types &&
+                        r->column_types[0] == WIRELOG_TYPE_STRING &&
+                        r->column_types[2] == WIRELOG_TYPE_STRING);
+                destroy(&f);
+            }
+}
+static void reference_projection_failures(void)
+{
+    for (unsigned fault = 0; fault < 6; fault++) {
+        fixture_t f = reference_projection_fixture(4*1024*1024, 9);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        col_rel_t *source = session_find_rel(s, "a");
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        int64_t saved = source->columns[2][8];
+        wl_intern_t *intern = s->intern, *foreign = NULL;
+        if (fault == 0) source->columns[2][8] = INT64_MAX; /* Unprojected invalid ID. */
+        if (fault == 1) s->intern = NULL;
+        if (fault == 2) {
+            foreign = wl_intern_create(); CHECK(foreign); s->intern = foreign;
+        }
+        if (fault == 3) allocation_fault = 1;
+        if (fault == 4) write_fault = 1;
+        cancellation_t cancellation = {.stop = 3};
+        wl_columnar_spill_status_t rc =
+            wl_columnar_session_seal_input(f.session, "a",
+                fault == 5 ? cancel : NULL, &cancellation);
+        CHECK(rc != OK && session_find_rel(s,
+            "a") == source && !wl_columnar_session_cold_find(s, "a"));
+        CHECK(reserved(&f) == before &&
+            wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        s->intern = intern; if (foreign) wl_intern_free(foreign);
+        source->columns[2][8] = saved; allocation_fault = write_fault = 0;
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        const wl_plan_relation_t *rp = join_body(&f, "result");
+        eval_stack_t stack; eval_stack_init(&stack); before = reserved(&f);
+        wl_columnar_ops_test_map_fail_output_alloc = true;
+        CHECK(wl_columnar_ops_cold_projection(rp, &stack, s) == ENOMEM);
+        wl_columnar_ops_test_map_fail_output_alloc = false;
+        CHECK(!stack.top && reserved(&f) == before);
+        s->intern = NULL;
+        CHECK(wl_columnar_ops_cold_projection(rp, &stack,
+            s) == ENOTSUP && !stack.top);
+        s->intern = intern;
+        read_fault = 9; unsigned events = 0;
+        CHECK(wl_session_snapshot(f.session, count_only,
+            &events) == EIO && events == 0);
+        read_fault = 0; reference_events_t e = {.intern = intern};
+        CHECK(wl_session_snapshot(f.session, reference_observe,
+            &e) == 0 && e.bits[0] == 504 && e.bits[1] == 511);
+        destroy(&f);
+    }
+}
+static void reference_projection_bytecode(void)
+{
+    fixture_t f = reference_projection_fixture(4*1024*1024, 9);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    wl_plan_relation_t *rp = join_body(&f, "result");
+    wl_plan_op_t *map = (wl_plan_op_t *)&rp->ops[rp->op_count-2];
+    CHECK(map->map_expr_count && map->map_exprs[0].data[0] == WL_PLAN_EXPR_VAR);
+    uint8_t *data = (uint8_t *)map->map_exprs[0].data;
+    data[0] = WL_PLAN_EXPR_VAR_FLOAT;
+    uint64_t before = reserved(&f);
+    CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+        NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(reserved(&f) == before && session_find_rel(s, "a"));
+    data[0] = WL_PLAN_EXPR_VAR;
+    uint8_t *numeric = (uint8_t *)map->map_exprs[1].data;
+    numeric[0] = WL_PLAN_EXPR_VAR_STRING;
+    CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+        NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(reserved(&f) == before && session_find_rel(s, "a"));
+    numeric[0] = WL_PLAN_EXPR_VAR;
+    data[0] = WL_PLAN_EXPR_VAR_STRING;
+    CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+    destroy(&f);
+}
+
+static void reference_wide_projection(fixture_t *f, wl_plan_relation_t *wide,
+    wl_plan_op_t ops[4], uint32_t indices[32])
+{
+    *wide = *join_body(f, "result"); CHECK(wide->op_count == 4);
+    memcpy(ops, wide->ops, 4*sizeof(*ops)); wide->ops = ops;
+    for (unsigned i = 0; i < 32; i++) indices[i] = 1;
+    ops[2].project_indices = indices; ops[2].project_count = 32;
+    ops[2].map_expr_count = 0; ops[2].map_exprs = NULL;
+}
+static void reference_projection_memory(void)
+{
+    wl_columnar_memory_governor_test_admitted = budget_admitted;
+    budget_peak = 0;
+    fixture_t calibration = reference_projection_fixture(4*1024*1024, 1024);
+    CHECK(wl_columnar_session_seal_input(calibration.session, "a", NULL,
+        NULL) == OK);
+    wl_plan_relation_t wide; wl_plan_op_t ops[4]; uint32_t indices[32];
+    reference_wide_projection(&calibration, &wide, ops, indices);
+    eval_stack_t stack; eval_stack_init(&stack);
+    CHECK(wl_columnar_ops_cold_projection(&wide, &stack,
+        COL_SESSION(calibration.session)) == 0);
+    uint64_t allowance = budget_peak;
+    eval_entry_t entry = eval_stack_pop(&stack);
+    CHECK(entry.rel->nrows == 1021 &&
+        entry.rel->column_types[0] == WIRELOG_TYPE_STRING);
+    CHECK(eval_stack_dispose_entry(&stack, &entry) == 0); destroy(&calibration);
+    for (unsigned retain = 0; retain < 2; retain++) {
+        budget_peak = 0;
+        fixture_t f = reference_projection_fixture(allowance, 1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        wl_columnar_session_test_retain_cold_source = retain != 0;
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        wl_columnar_session_test_retain_cold_source = false;
+        reference_wide_projection(&f, &wide, ops, indices);
+        uint64_t before = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        int rc = wl_columnar_ops_cold_projection(&wide, &stack, s);
+        CHECK(budget_peak <= allowance);
+        if (retain) CHECK(rc == ENOSPC && !stack.top &&
+                wl_session_budget_denied(f.session));
+        else {
+            CHECK(rc == 0); entry = eval_stack_pop(&stack);
+            CHECK(entry.rel->nrows == 1021 &&
+                entry.rel->column_types[0] == WIRELOG_TYPE_STRING);
+            CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+        }
+        CHECK(reserved(&f) == before &&
+            wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        destroy(&f);
+    }
+    wl_columnar_memory_governor_test_admitted = NULL;
+    /* Intern storage remains resident. Real distinct strings eventually exhaust
+     * a fixed allowance even though the row source has already been sealed. */
+    fixture_t f = reference_projection_fixture(256*1024, 9);
+    CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    uint64_t before = reserved(&f),
+        disk = wl_columnar_spill_store_bytes(s->spill_store);
+    bool denied = false;
+    for (unsigned i = 0; i < 16384; i++) {
+        char value[256]; memset(value, 'x', sizeof(value));
+        int length = snprintf(value, 32, "distinct-%u-", i); CHECK(length > 0);
+        value[length] = 'x'; value[sizeof(value)-1] = '\0';
+        int64_t id = -1;
+        int rc = wl_intern_put_checked(s->intern, value, &id);
+        if (rc == WL_INTERN_ERR_MEMORY_BUDGET) {
+            denied = true; break;
+        }
+        CHECK(rc == 0 && id >= 0);
+    }
+    CHECK(denied && reserved(&f) > before &&
+        wl_columnar_spill_store_bytes(s->spill_store) == disk);
+    destroy(&f);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -2093,6 +2308,9 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    reference_projection_memory();
+    reference_projections(); reference_projection_failures();
+    reference_projection_bytecode();
     cold_intermediate_floor();
     directional_constructor_floor();
     directional_reclamation(); directional_bounded_scratch();

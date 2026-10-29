@@ -3081,6 +3081,154 @@ wl_columnar_expr_compile(const uint8_t *buf, uint32_t size,
                NULL);
 }
 
+/* Static result contracts only: bounded depth and a complete single-result
+ * buffer identify the final producer without evaluation or operand storage. */
+bool
+wl_columnar_expr_interpreted_result_type(const uint8_t *buf, uint32_t size,
+    const wirelog_column_type_t *types, uint32_t ncols,
+    wirelog_column_type_t *type)
+{
+    if (!buf || !size || !type) return false;
+    uint32_t pos = 0, depth = 0;
+    wirelog_column_type_t result = WIRELOG_TYPE_INT64;
+    while (pos < size) {
+        uint8_t tag = buf[pos++];
+        uint32_t arity = 0;
+        switch ((wl_plan_expr_tag_t)tag) {
+        case WL_PLAN_EXPR_VAR:
+        case WL_PLAN_EXPR_VAR_FLOAT:
+        case WL_PLAN_EXPR_VAR_STRING:
+        case WL_PLAN_EXPR_CONST_STR: {
+            if (size - pos < sizeof(uint16_t)) return false;
+            uint16_t length;
+            memcpy(&length, buf + pos, sizeof(length));
+            pos += sizeof(length);
+            if (length > size - pos) return false;
+            result = WIRELOG_TYPE_STRING;
+            if (tag != WL_PLAN_EXPR_CONST_STR) {
+                if (length < 4 || length > 12 || memcmp(buf + pos, "col", 3))
+                    return false;
+                uint32_t col = 0;
+                for (uint32_t j = 3; j < length; j++) {
+                    unsigned digit = (unsigned)buf[pos + j] - '0';
+                    if (digit > 9 || col > (UINT32_MAX - digit) / 10)
+                        return false;
+                    col = col * 10 + digit;
+                }
+                if (col >= ncols) return false;
+                result = types ? types[col] : WIRELOG_TYPE_INT64;
+                if (result < WIRELOG_TYPE_INT32 || result > WIRELOG_TYPE_BOOL ||
+                    (tag == WL_PLAN_EXPR_VAR_STRING &&
+                    result != WIRELOG_TYPE_STRING) ||
+                    (tag == WL_PLAN_EXPR_VAR_FLOAT &&
+                    result != WIRELOG_TYPE_FLOAT))
+                    return false;
+            }
+            pos += length;
+            break;
+        }
+        case WL_PLAN_EXPR_CONST_INT:
+        case WL_PLAN_EXPR_CONST_FLOAT:
+            if (size - pos < 8) return false;
+            pos += 8;
+            result = tag ==
+                WL_PLAN_EXPR_CONST_FLOAT ? WIRELOG_TYPE_FLOAT :
+                WIRELOG_TYPE_INT64;
+            break;
+        case WL_PLAN_EXPR_BOOL:
+            if (pos == size) return false;
+            ++pos; result = WIRELOG_TYPE_BOOL;
+            break;
+        case WL_PLAN_EXPR_ARITH_ADD:
+        case WL_PLAN_EXPR_ARITH_SUB:
+        case WL_PLAN_EXPR_ARITH_MUL:
+        case WL_PLAN_EXPR_ARITH_DIV:
+        case WL_PLAN_EXPR_ARITH_MOD:
+        case WL_PLAN_EXPR_ARITH_BAND:
+        case WL_PLAN_EXPR_ARITH_BOR:
+        case WL_PLAN_EXPR_ARITH_BXOR:
+        case WL_PLAN_EXPR_ARITH_SHL:
+        case WL_PLAN_EXPR_ARITH_SHR:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256:
+        case WL_PLAN_EXPR_ARITH_UUID5:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SS:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_SI:
+        case WL_PLAN_EXPR_ARITH_HMAC_SHA256_IS:
+        case WL_PLAN_EXPR_ARITH_UUID5_SS:
+        case WL_PLAN_EXPR_ARITH_UUID5_SI:
+        case WL_PLAN_EXPR_ARITH_UUID5_IS:
+            arity = 2; result = WIRELOG_TYPE_INT64; break;
+        case WL_PLAN_EXPR_ARITH_BNOT:
+        case WL_PLAN_EXPR_ARITH_HASH:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST:
+        case WL_PLAN_EXPR_ARITH_MD5:
+        case WL_PLAN_EXPR_ARITH_SHA1:
+        case WL_PLAN_EXPR_ARITH_SHA256:
+        case WL_PLAN_EXPR_ARITH_SHA512:
+        case WL_PLAN_EXPR_ARITH_HASH_S:
+        case WL_PLAN_EXPR_ARITH_CRC32_ETH_S:
+        case WL_PLAN_EXPR_ARITH_CRC32_CAST_S:
+        case WL_PLAN_EXPR_ARITH_MD5_S:
+        case WL_PLAN_EXPR_ARITH_SHA1_S:
+        case WL_PLAN_EXPR_ARITH_SHA256_S:
+        case WL_PLAN_EXPR_ARITH_SHA512_S:
+        case WL_PLAN_EXPR_STR_FN_STRLEN:
+        case WL_PLAN_EXPR_STR_FN_STR_ORD:
+        case WL_PLAN_EXPR_STR_FN_TO_NUMBER:
+            arity = 1; result = WIRELOG_TYPE_INT64; break;
+        case WL_PLAN_EXPR_ARITH_UUID4:
+            arity = 0; result = WIRELOG_TYPE_INT64; break;
+        case WL_PLAN_EXPR_ARITH_FLOAT_ADD:
+        case WL_PLAN_EXPR_ARITH_FLOAT_SUB:
+        case WL_PLAN_EXPR_ARITH_FLOAT_MUL:
+        case WL_PLAN_EXPR_ARITH_FLOAT_DIV:
+            arity = 2; result = WIRELOG_TYPE_FLOAT; break;
+        case WL_PLAN_EXPR_CMP_EQ:
+        case WL_PLAN_EXPR_CMP_NEQ:
+        case WL_PLAN_EXPR_CMP_LT:
+        case WL_PLAN_EXPR_CMP_GT:
+        case WL_PLAN_EXPR_CMP_LTE:
+        case WL_PLAN_EXPR_CMP_GTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_EQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_NEQ:
+        case WL_PLAN_EXPR_CMP_FLOAT_LT:
+        case WL_PLAN_EXPR_CMP_FLOAT_GT:
+        case WL_PLAN_EXPR_CMP_FLOAT_LTE:
+        case WL_PLAN_EXPR_CMP_FLOAT_GTE:
+        case WL_PLAN_EXPR_CMP_STR_EQ:
+        case WL_PLAN_EXPR_CMP_STR_NEQ:
+        case WL_PLAN_EXPR_CMP_STR_LT:
+        case WL_PLAN_EXPR_CMP_STR_GT:
+        case WL_PLAN_EXPR_CMP_STR_LTE:
+        case WL_PLAN_EXPR_CMP_STR_GTE:
+        case WL_PLAN_EXPR_STR_FN_CONTAINS:
+        case WL_PLAN_EXPR_STR_FN_STR_PREFIX:
+        case WL_PLAN_EXPR_STR_FN_STR_SUFFIX:
+            arity = 2; result = WIRELOG_TYPE_BOOL; break;
+        case WL_PLAN_EXPR_STR_FN_TO_UPPER:
+        case WL_PLAN_EXPR_STR_FN_TO_LOWER:
+        case WL_PLAN_EXPR_STR_FN_TRIM:
+        case WL_PLAN_EXPR_STR_FN_TO_STRING:
+            arity = 1; result = WIRELOG_TYPE_STRING; break;
+        case WL_PLAN_EXPR_STR_FN_CAT:
+        case WL_PLAN_EXPR_STR_FN_UUID5_RFC:
+            arity = 2; result = WIRELOG_TYPE_STRING; break;
+        case WL_PLAN_EXPR_STR_FN_SUBSTR:
+        case WL_PLAN_EXPR_STR_FN_STR_REPLACE:
+            arity = 3; result = WIRELOG_TYPE_STRING; break;
+        default: return false; /* No opaque, extension or aggregate contract. */
+        }
+        if (depth < arity) return false;
+        depth -= arity;
+        if (depth == COL_FILTER_STACK) return false;
+        ++depth;
+    }
+    if (depth != 1) return false;
+    *type = result;
+    return true;
+}
+
 bool
 wl_columnar_expr_compiled_result_type(const wl_columnar_expr_compiled_t *c,
     const wirelog_column_type_t *source_types, uint32_t ncols,

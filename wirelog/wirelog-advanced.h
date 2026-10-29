@@ -214,7 +214,7 @@ wirelog_session_create_with_options(wirelog_program_t *program,
     const wirelog_session_options_v1_t *options, wirelog_session_t **out);
 
 /**
- * Seal one numeric input as persistent immutable spill input before
+ * Seal one eligible input as persistent immutable spill input before
  * the first STEP/SNAPSHOT attempt. Load all inputs first. Requires configured
  * spill JOIN caps and a serial nonrecursive plan using only audited
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
@@ -228,8 +228,12 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * A cold left input is consumed by an initial VARIABLE/JOIN pair; both sides
  * may be sealed, including a self-JOIN. Subsequent JOINs consume an admitted
  * resident intermediate. No FILTER/MAP before that first cold JOIN, multi-key,
- * cross/theta JOIN, non-INT64 key, right filter, timestamps, references,
+ * cross/theta JOIN, non-INT64 key, right filter, timestamps, compound values,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
+ * Standalone direct/filtered projections also accept STRING lanes from the
+ * originating program intern table; reference-bearing JOINs remain unsupported.
+ * The program must outlive the session. Intern storage remains resident, and
+ * sealing validates IDs even in unprojected STRING lanes.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
  * wirelog_session_options_v1_t). Multiple loaded inputs may be

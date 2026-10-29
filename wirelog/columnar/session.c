@@ -654,8 +654,10 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
                 types[i] != WIRELOG_TYPE_INT64 &&
                 types[i] != WIRELOG_TYPE_UINT32 &&
                 types[i] != WIRELOG_TYPE_UINT64 &&
-                types[i] != WIRELOG_TYPE_FLOAT && types[i] != WIRELOG_TYPE_BOOL)
-                return false;
+                types[i] != WIRELOG_TYPE_FLOAT &&
+                types[i] != WIRELOG_TYPE_BOOL &&
+                !(types[i] == WIRELOG_TYPE_STRING && s->intern &&
+                s->intern == s->plan->intern)) return false;
     }
     return wl_columnar_eval_plan_cold_projection(rp, name, width, types);
 }
@@ -669,6 +671,11 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
 {
     const wl_plan_t *plan = sess->plan;
     if (!plan || !name || !ncols || !plan->strata) return false;
+    bool references = false;
+    for (uint32_t i = 0; types && i < ncols; i++)
+        references |= types[i] == WIRELOG_TYPE_STRING;
+    if (references &&
+        (!sess->intern || sess->intern != plan->intern)) return false;
     bool edb = false, consumer = false;
     for (uint32_t i = 0; i < plan->edb_count; i++)
         if (plan->edb_relations && plan->edb_relations[i] &&
@@ -685,7 +692,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     rp);
             bool selected_projection = projection &&
                 !strcmp(rp->ops[0].relation_name, name);
-            bool selected_join = rp->op_count && rp->ops[0].relation_name &&
+            bool selected_join = !references && rp->op_count &&
+                rp->ops[0].relation_name &&
                 !strcmp(rp->ops[0].relation_name, name) &&
                 wl_columnar_join_cold_prefix(sess, rp);
             if (selected_projection || selected_join) consumer = true;
@@ -706,7 +714,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 if (!op->right_relation || strcmp(op->right_relation,
                     name) != 0)
                     continue;
-                if (op->op != WL_PLAN_OP_JOIN || op->key_count != 1 ||
+                if (references || op->op != WL_PLAN_OP_JOIN ||
+                    op->key_count != 1 ||
                     op->right_filter_expr.size ||
                     (op->project_count && !op->project_indices)) return false;
                 int key = wl_columnar_relation_schema_column_index(ncols,
@@ -746,6 +755,10 @@ wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
         c = c->next) {
         const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
             c->payload, NULL, NULL);
+        for (uint32_t i = 0; i < c->ncols; i++)
+            if (types[i] == WIRELOG_TYPE_STRING &&
+                !wl_columnar_batch_payload_uses_intern(c->payload,
+                s->intern)) return ENOTSUP;
         if (!wl_columnar_session_cold_plan(s, c->name, c->ncols,
             (const char *const *)c->col_names, types)) return ENOTSUP;
     }
@@ -854,9 +867,11 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     c->cold_storage_generation = r->storage_generation + 1;
     bool inserted_name = s->last_inserted_relation &&
         strcmp(s->last_inserted_relation, r->name) == 0;
-    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_capture(
+    wl_columnar_spill_status_t rc =
+        wl_columnar_batch_payload_capture_with_intern(
         s->memory_governor, s->spill_store, r, r->nrows,
-        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, cancel, context, &c->payload);
+        WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, s->intern, cancel, context,
+        &c->payload);
     if (rc == WL_COLUMNAR_SPILL_OK && cancel && cancel(context))
         rc = WL_COLUMNAR_SPILL_CANCELLED;
     if (rc == WL_COLUMNAR_SPILL_OK) {
@@ -4413,17 +4428,19 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
         /* Preserve declared physical lane types before the first fact is
          * inserted.  In particular, float facts are binary64 bits in the
          * existing 64-bit storage lane and must not be accepted as legacy
-         * integers merely because the relation starts empty. */
-        bool has_float_type = false;
+         * integers merely because the relation starts empty. STRING IDs also
+         * require their declared type before raw insertion or cold capture. */
+        bool has_declared_lane_type = false;
         if (plan->edb_column_types && plan->edb_column_type_counts
             && plan->edb_column_types[i]
             && plan->edb_column_type_counts[i] > 0) {
             uint32_t type_count = plan->edb_column_type_counts[i];
             for (uint32_t c = 0; c < type_count; c++)
-                has_float_type |= plan->edb_column_types[i][c]
-                    == WIRELOG_TYPE_FLOAT;
+                has_declared_lane_type |= plan->edb_column_types[i][c]
+                    == WIRELOG_TYPE_FLOAT || plan->edb_column_types[i][c]
+                    == WIRELOG_TYPE_STRING;
         }
-        if (has_float_type) {
+        if (has_declared_lane_type) {
             uint32_t type_count = plan->edb_column_type_counts[i];
             rc = col_rel_set_schema(r, type_count, NULL);
             if (rc == 0)

@@ -63,6 +63,7 @@
  *       rules are structurally identical, so again this pins the set.
  */
 
+#include "../wirelog/columnar/internal.h"
 #include "../wirelog/backend.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
@@ -114,6 +115,7 @@ static int fail_count;
 typedef struct {
     const char *rel;
     uint32_t count;
+    bool string_schema;
     const wirelog_intern_t *intern;
     /* Interned values of the row, joined with '|', for the first MAX_SEEN
      * rows.  Counting alone is not enough: swapping one rule constant for
@@ -197,6 +199,10 @@ eval_relation(const char *src, const char *relation, collect_t *out)
         && wl_session_snapshot(sess, collect_cb, out) == 0)
         result = 0;
 
+    col_rel_t *observed = session_find_rel(COL_SESSION(sess), relation);
+    out->string_schema = observed && observed->ncols && observed->column_types;
+    for (uint32_t c = 0; out->string_schema && c < observed->ncols; c++)
+        out->string_schema = observed->column_types[c] == WIRELOG_TYPE_STRING;
     wl_session_destroy(sess);
     wl_plan_free(plan);
     wirelog_program_free(prog);
@@ -514,6 +520,7 @@ test_covariant_override_survives_lookup(void)
      * reading the inherited tuple is shadowed and this is 3. */
     ASSERT(c.count == 4, "expected the inherited covariant variant to "
         "survive; params-only descriptors shadow it");
+    ASSERT(c.string_schema, "STRING schema must survive CAT and SEMIJOIN");
     ASSERT(saw(&c, "it|OfLong()|Sub|<Sup: OfLong it()>"),
         "Sub must inherit the covariant OfLong variant from Sup");
     PASS();

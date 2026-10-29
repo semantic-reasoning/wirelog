@@ -944,12 +944,47 @@ test_eval_strlen_multiple_inputs(void)
 /* Main                                                                     */
 /* ======================================================================== */
 
+static void test_mixed_builtin_result_schema(void)
+{
+    TEST(
+        "mixed builtin final producers preserve numeric, BOOL and STRING types");
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(
+        ".decl a(s:symbol)\n.decl r(n:int64,len:int64,yes:int64,text:symbol)\n"
+        "a(\"41\").\nr(to_number(s)+1,strlen(to_upper(s)),contains(s,\"4\"),to_string(strlen(s))):-a(s).\n",
+        &error);
+    wl_plan_t *plan = NULL; wl_session_t *session = NULL;
+    bool ok = program && wl_plan_from_program(program, &plan) == 0 &&
+        wl_session_create(wl_backend_columnar(), plan, 1, &session) == 0 &&
+        wl_session_load_facts(session, program) == 0;
+    struct result_ctx rows = {0};
+    if (ok) ok = wl_session_snapshot(session, capture_cb, &rows) == 0;
+    col_rel_t *r = ok ? session_find_rel(COL_SESSION(session), "r") : NULL;
+    ok = ok && r && r->ncols == 4 && r->nrows == 1 && r->column_types &&
+        r->column_types[0] == WIRELOG_TYPE_INT64 &&
+        r->column_types[1] == WIRELOG_TYPE_INT64 &&
+        r->column_types[2] == WIRELOG_TYPE_BOOL &&
+        r->column_types[3] == WIRELOG_TYPE_STRING &&
+        r->columns[0][0] == 42 && r->columns[1][0] == 2 &&
+        r->columns[2][0] == 1;
+    const char *value = ok ? wl_intern_reverse(COL_SESSION(session)->intern,
+            r->columns[3][0]) : NULL;
+    ok = ok && value && !strcmp(value, "2");
+    if (session) wl_session_destroy(session);
+    wl_plan_free(plan); if (program) wirelog_program_free(program);
+    if (!ok) {
+        FAIL("mixed result values or schema lost"); return;
+    }
+    PASS();
+}
+
 int
 main(void)
 {
     printf(
         "=== String Function Evaluator Integration Tests (Issue #143) ===\n");
 
+    test_mixed_builtin_result_schema();
     printf("\n--- strlen via to_string ---\n");
     test_eval_strlen_via_to_string_2digits();
     test_eval_strlen_via_to_string_3digits();

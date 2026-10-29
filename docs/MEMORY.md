@@ -3604,8 +3604,12 @@ parser used by the integer FILTER shortcut.
 Raw MAP reserves its temporary native type vector in the existing scratch
 admission, keeps full governed row-capacity admission before callbacks, and
 uses the existing metadata setter only on the empty private output. A raw
-interpreter-only expression lane retains the legacy untyped schema for the
-whole output; mixed numeric/addon/string fallback results are not covered by
+unclassified interpreter expression lane retains the legacy untyped schema for
+the whole output. Existing fixed-result scalar builtins use a pure complete-
+buffer/depth/final-producer check with constant scratch; they preserve complete
+result metadata without execution, crypto, interning or callbacks during schema
+resolution. Runtime value validation and evaluation errors remain separate.
+Opaque mixed numeric/addon fallback results are not covered by
 the numeric FLOAT ordering guarantee. The temporary vector is freed before
 row evaluation. Pool/arena output ownership remains available without a
 governor.
@@ -4980,9 +4984,30 @@ credit. The persistent binding stays session-owned and valid for permitted
 retries. This does not promise rollback of other heads already committed by an
 earlier STEP relation, or add asynchronous cancellation/control support.
 
+### STRING cold projection consumers (#1372, partial)
+
+Standalone direct and narrowly filtered projections accept actual STRING lanes,
+including reordered and repeated outputs and multiple sealed inputs. Source
+initialization preserves declared STRING types even for raw host inserts and
+empty relations. Capture validates every STRING ID, including unused lanes,
+and pins the originating session/program intern table. Runtime checks compare
+table identity through the retained payload or spill-segment owner; a different
+table with coincident IDs is not equivalent. Existing numeric JOIN routes remain
+numeric-only in this increment; reference-bearing JOINs are refused.
+
+Projection preserves STRING types and IDs without rehydrating full input rows.
+The program must outlive public sessions; output IDs borrow that lifetime.
+Payload readers retain source storage while live, including after owner
+retirement. Independently retained output requires its own intern capability.
+Intern strings/table storage remain resident and charged. Tests pair reclaimed
+and retained STRING sources under one allowance and separately exhaust real
+admission with increasing distinct strings; spilling rows cannot remove this
+floor. Private output/read/allocation failures preserve the sealed binding and
+release attempt resources before retry.
+
 ### Remaining #1372 implementation groups
 
-The sealed numeric JOIN-input subset now has actual persistent cold storage,
+The sealed numeric JOIN and scalar STRING projection subsets now have actual persistent cold storage,
 resident reclamation and evaluator consumers. General cold VARIABLE/direct-column access beyond the exact direct-projection
 subset, mutable relations, persistent trace/differential storage and their
 arrangement consumers remain separate integration work. They require stable
@@ -4991,7 +5016,7 @@ and retractions. Unsupported consumers remain explicitly ineligible for sealing.
 SIDE/nested-reference ownership also needs a concrete provenance decision.
 
 Public advanced configuration and explicit sealing are now available for the
-numeric subset above. Broader consumer support and native platform qualification
+subsets above. Broader consumer support and native platform qualification
 remain evidence-dependent.
 Existing payload and sealed-session evidence cannot replace those acceptance
 requirements. Close #1372 only when the remaining gaps have concrete tests.
