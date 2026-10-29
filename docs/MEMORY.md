@@ -4810,8 +4810,8 @@ retained-source control remains the causal reclamation proof; this public test
 qualifies the actual host boundary and output floor.
 
 After loading all inputs, call `wirelog_session_seal_join_input` for one eligible
-right-only numeric EDB. It uses the exact immutable plan/mode restrictions above;
-opaque optimized plans, general VARIABLE reads of that input, recursive, worker,
+numeric JOIN input. It uses the exact immutable plan/mode restrictions above;
+opaque optimized plans, VARIABLE reads outside the direct-projection subset, recursive, worker,
 delta and controlled paths remain ineligible. The public call is synchronous and
 has no cancellation callback. Success freezes all fact/compound mutation for the
 session and cannot be undone. Refusal preserves the source; retry is possible
@@ -4884,11 +4884,56 @@ an anonymous POSIX descriptor closed. The production-library public test is
 registered on all supported hosts. Native platform qualification depends on the
 actual corresponding CI run, not a Linux macro compile.
 
+### Bounded direct projections of sealed JOIN inputs (#1372)
+
+A sealed numeric JOIN input can also supply an exact three-operator
+`VARIABLE(cold) → MAP(columns) → CONSOLIDATE` rule. For example, alongside
+`result(k,x,y + 0) :- a(k,x), b(k,y).`, a declared `keys(k)` head can use
+`keys(k) :- b(k,v).`. At least one eligible right JOIN consumer must remain;
+scan-only programs still cannot use `wirelog_session_seal_join_input`.
+
+Seal preflight and ordinary dispatch share the same full-body predicate. It
+accepts valid reordered/repeated column indices and canonical column-reference
+bytecode matching those indices and source types, with checked lengths and
+integer overflow. General expressions, filters, concatenation, cold left JOINs,
+opaque rewrites and other raw-column consumers remain explicitly unsupported.
+A raw VARIABLE request for a known cold name returns ENOTSUP rather than treating
+the removed registry entry as empty. No synthetic relation with missing columns
+is exposed to ordinary operators.
+
+Each projection acquires an independent payload reader and copies selected lanes
+from stable source ordinals before the next read. Temporary schema and row scratch
+are admitted through the session governor. The complete projected output is
+separately admitted before reading; it remains private until all reads finish.
+The reader and row scratch are bounded independently of source row count, but the
+resident projected result, normal consolidation and head publication are not.
+A narrow projection avoids full-source rehydration; this is not arbitrary-budget
+or general out-of-core execution. Numeric lanes/types and duplicate rows follow the ordinary relation contract
+before consolidation, including existing FLOAT signed-zero canonicalization.
+Finite nonzero FLOAT bits and UINT64/BOOL lanes remain exact.
+
+Internal and public tests exercise real parsed mixed-consumer programs, resident
+parity, repeated snapshots, empty input, reordered/repeated indices, FLOAT/UINT64/
+BOOL lanes, malformed projection bytecode, explicit unsupported shapes, read
+failure after a private prefix, allocation refusal and cleanup/retry. A new
+fixed-allowance paired run completes 8,192 projected keys plus the JOIN after
+physical source reclamation, while retaining that source at the same allowance
+causes genuine managed-memory refusal. Separate admission measurements show the
+same temporary reader/row overhead at 128 and 8,192 source rows after excluding
+resident output. A 64-column projected output exceeds a real 1 MiB allowance without
+losing the cold owner; the narrow projection can then succeed at that same limit. Earlier JOIN-only proofs are
+not substituted for this projection evidence.
+
+Failures release the append lease, reader and private result before refunding
+credit. The persistent binding stays session-owned and valid for permitted
+retries. This does not promise rollback of other heads already committed by an
+earlier STEP relation, or add asynchronous cancellation/control support.
+
 ### Remaining #1372 implementation groups
 
-The sealed right-only numeric EDB subset now has actual persistent cold storage,
-resident reclamation and evaluator consumers. General cold VARIABLE/direct-column
-access, mutable relations, persistent trace/differential storage and their
+The sealed numeric JOIN-input subset now has actual persistent cold storage,
+resident reclamation and evaluator consumers. General cold VARIABLE/direct-column access beyond the exact direct-projection
+subset, mutable relations, persistent trace/differential storage and their
 arrangement consumers remain separate integration work. They require stable
 identity/generation and pin/cleanup ownership across updates, signed differences
 and retractions. Unsupported consumers remain explicitly ineligible for sealing.

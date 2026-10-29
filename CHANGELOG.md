@@ -6,6 +6,12 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Sealed-input direct projections** (#1372): an eligible sealed numeric JOIN
+  input can also feed a direct column-projection rule through bounded pinned
+  reads, without reconstructing the full source. Mixed JOIN/projection tests
+  cover exact results, numeric lanes, failures and fixed-budget reclamation;
+  projected results and consolidation still require resident memory.
+
 - **Public advanced spill configuration** (#1372): versioned
   `wirelog_session_create_with_options` configures session-owned spill storage
   and bounded numeric JOIN scratch, with optional scalar snapshots.
