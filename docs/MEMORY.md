@@ -4991,7 +4991,12 @@ Separate array/metadata accounting remains compatible with raw registry growth.
 The observed acyclic append host retains original source/head readers while
 copying the proven input suffix into a governed private relation. Exact child
 bindings borrow that relation until cleanup ACK; no delta-right index enters
-the public full-source arrangement registry. Two additional operator slots per
+the public full-source arrangement registry. The governed source map also records
+append occurrences with a mode-specific marker. Exact current-child range and
+alignment checks precede decoding; recursive head encodings are never interpreted
+as append markers. A whole-host charged degree proof precedes plan changes, and
+partial maps remain inactive on nonlinear fallback. Old-head union slots stay
+zero and therefore retain their full-source reads. Two additional operator slots per
 head are admitted with the host metadata for prior-head union/consolidation.
 
 Any precommit stop after append eligibility begins drains the private host

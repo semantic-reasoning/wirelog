@@ -170,7 +170,6 @@ typedef struct {
     uint32_t op_base;
     uint32_t stratum, width;
     bool recursive;
-    const wl_plan_op_t *delta_op;
     uint32_t delta_reads;
 } wl_columnar_session_observed_head_t;
 
@@ -471,17 +470,20 @@ wl_columnar_session_delta_source(wl_col_session_t *sess,
     wl_columnar_session_observed_transaction_t *tx =
         sess->controlled_step->transaction;
     const wl_columnar_session_observed_head_t *head = &tx->heads[tx->head];
-    if (tx->round_active && tx->round_frontiers) {
+    uint32_t local = 0, encoded = 0;
+    if ((tx->round_active && tx->round_frontiers) || tx->append_active) {
         uintptr_t address = (uintptr_t)op, first = (uintptr_t)head->plan.ops;
         if (address < first || address - first >=
             (uint64_t)head->plan.op_count * sizeof(*op)
             || (address - first) % sizeof(*op)) return EINVAL;
-        uint32_t local = (uint32_t)((address - first) / sizeof(*op));
+        local = (uint32_t)((address - first) / sizeof(*op));
         if (head->op_base >= tx->op_count ||
             local >= tx->op_count - head->op_base
             || !tx->frontier_sources) return EINVAL;
-        uint32_t encoded = tx->frontier_sources[head->op_base + local];
+        encoded = tx->frontier_sources[head->op_base + local];
         if (!encoded) return 0;
+    }
+    if (tx->round_active && tx->round_frontiers) {
         uint32_t source_head = encoded - 1;
         if (source_head < tx->round_begin || source_head >= tx->round_end)
             return EINVAL;
@@ -506,15 +508,19 @@ wl_columnar_session_delta_source(wl_col_session_t *sess,
                 bindings->control, 36, r->nrows, bindings);
         }
 #endif
-    } else if (tx->append_active && op == head->delta_op) {
+    } else if (tx->append_active) {
+        if (encoded != 1) return EINVAL;
         if (!tx->append_delta || !wl_columnar_relation_snapshot_equal(
                 tx->append_snapshot,
                 wl_columnar_relation_snapshot(tx->append_delta))) return EINVAL;
         *out = tx->append_delta;
 #ifdef WL_SESSION_TEST_HOOKS
-        if (wl_columnar_session_test_observed_transaction_checkpoint)
+        if (wl_columnar_session_test_observed_transaction_checkpoint) {
+            wl_columnar_session_test_observed_transaction_checkpoint(
+                bindings->control, 44, local, bindings);
             wl_columnar_session_test_observed_transaction_checkpoint(
                 bindings->control, 28, tx->append_delta->nrows, bindings);
+        }
 #endif
     }
     return 0;
@@ -10010,19 +10016,50 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     }
                 }
                 if (supported && r == step->append_source) {
-                    head->delta_op = op;
-                    if (++head->delta_reads > 1) supported = false;
+                    tx->frontier_sources[head->op_base + tx->op] = 1;
+                    head->delta_reads++;
+#ifdef WL_SESSION_TEST_HOOKS
+                    if (wl_columnar_session_test_observed_transaction_checkpoint)
+
+
+                        wl_columnar_session_test_observed_transaction_checkpoint
+                        (
+                            control, 43, tx->op, NULL);
+#endif
                 }
             }
         }
+        /* Prove linearity along every evaluated path, not across the UNION
+         * alternatives as a whole. Partial maps are inactive after fallback. */
+        if (supported) {
+            bool changed = tx->frontier_sources[head->op_base + tx->op] != 0;
+            if (op->op == WL_PLAN_OP_VARIABLE) {
+                if (tx->degree_depth == COL_STACK_MAX) supported = false;
+                else tx->degrees[tx->degree_depth++] = changed ? 1 : 0;
+            } else if (op->op == WL_PLAN_OP_CONCAT) {
+                if (tx->degree_depth < 2) supported = false;
+                else {
+                    uint8_t right = tx->degrees[--tx->degree_depth];
+                    if (right > tx->degrees[tx->degree_depth - 1])
+                        tx->degrees[tx->degree_depth - 1] = right;
+                }
+            } else if (!tx->degree_depth) supported = false;
+            else if (op->op == WL_PLAN_OP_JOIN && changed) {
+                if (tx->degrees[tx->degree_depth - 1]) supported = false;
+                else tx->degrees[tx->degree_depth - 1] = 1;
+            }
+            if (tx->op + 1 == head->plan.op_count && tx->degree_depth != 1)
+                supported = false;
+        }
         if (!supported) {
+            tx->degree_depth = 0;
             tx->append_active = false;
             tx->index = tx->op = tx->other = tx->column = 0; tx->byte = 0;
             tx->phase = WL_SESSION_OBSERVED_EVALUATE; return 0;
         }
         tx->other = tx->column = 0; tx->byte = 0;
         if (++tx->op == head->plan.op_count) {
-            tx->index++; tx->op = 0;
+            tx->index++; tx->op = tx->degree_depth = 0;
         }
         return 0;
     }
