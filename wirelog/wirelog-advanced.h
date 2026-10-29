@@ -218,14 +218,17 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * the first STEP/SNAPSHOT attempt. Load all inputs first. Requires configured
  * spill JOIN caps and a serial nonrecursive plan using only audited
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
- * The selected name must have an eligible consumer: a JOIN right input with
- * one INT64 key or a complete
+ * The selected name must have an eligible consumer: a JOIN input with
+ * one INT64 equality key or a complete
  * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with one
  * FILTER before MAP comparing an INT64 column with an integer literal
  * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
  * remain resident; output capacity is admitted for the source row count even
  * when no row passes. Projection-only programs need no JOIN consumer.
- * General cold pipelines remain unsupported. No right filter, timestamps, references,
+ * A cold left input is consumed by an initial VARIABLE/JOIN pair; both sides
+ * may be sealed, including a self-JOIN. Subsequent JOINs consume an admitted
+ * resident intermediate. No FILTER/MAP before that first cold JOIN, multi-key,
+ * cross/theta JOIN, non-INT64 key, right filter, timestamps, references,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
