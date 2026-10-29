@@ -24,7 +24,7 @@ jobs:
   # ==========================================================================
   editorconfig-check:
     name: EditorConfig check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
 
@@ -65,7 +65,7 @@ jobs:
   uncrustify-check:
     name: uncrustify check
     needs: [editorconfig-check]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
         with:

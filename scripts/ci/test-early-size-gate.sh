@@ -148,7 +148,7 @@ assert 'main size report is uploaded through always()' grep -A6 -F 'name: Upload
 assert 'main artifacts have unique platform-qualified names' grep -Fq 'name: wirelog-size-monitor-${{ matrix.os }}' "$main_wf"
 assert 'baseline verifier trusts only canonical ubuntu artifact' grep -Fq 'wirelog-size-monitor-ubuntu-latest' "$root/scripts/ci/verify-size-baseline.py"
 assert 'main workflow grants no write permission' sh -c '! grep -Eq "^[[:space:]]+(actions|contents):[[:space:]]+write" "$1"' sh "$main_wf"
-assert 'PR required build job identity remains unchanged' grep -Fq 'name: Build / ubuntu-latest / gcc' "$wf"
+assert 'PR required build job identity remains unchanged' grep -Fq 'name: Build / ubuntu-26.04 / gcc' "$wf"
 
 # The production size gate has format-aware readers only for ELF and Mach-O.
 # Keep enforcing the platform-independent wiring assertions above, but do not

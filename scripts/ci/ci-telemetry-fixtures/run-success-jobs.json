@@ -6,7 +6,7 @@
       "created_at": "2026-09-10T18:27:12Z",
       "id": 102996159107,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Detect build-triggering changes",
       "runner_group_name": "GitHub Actions",
@@ -62,7 +62,7 @@
       "created_at": "2026-09-10T18:27:12Z",
       "id": 102996159417,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "RC changelog freeze gate",
       "runner_group_name": "GitHub Actions",
@@ -118,7 +118,7 @@
       "created_at": "2026-09-10T18:27:12Z",
       "id": 102996159476,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Docs / policy validation",
       "runner_group_name": "GitHub Actions",
@@ -174,7 +174,7 @@
       "created_at": "2026-09-10T18:36:40Z",
       "id": 102999400767,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / EditorConfig check",
       "runner_group_name": "default",
@@ -246,7 +246,7 @@
       "created_at": "2026-09-10T18:50:56Z",
       "id": 103004228926,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / uncrustify check",
       "runner_group_name": "GitHub Actions",
@@ -326,9 +326,9 @@
       "created_at": "2026-09-10T18:59:50Z",
       "id": 103007248983,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Build / ubuntu-latest / gcc",
+      "name": "Build / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054702",
       "started_at": "2026-09-10T19:22:16Z",
@@ -470,9 +470,9 @@
       "created_at": "2026-09-10T18:59:50Z",
       "id": 103007249006,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Sanitizers / ubuntu-latest / gcc",
+      "name": "Sanitizers / ubuntu-26.04 / gcc",
       "runner_group_name": "default",
       "runner_name": "i406-d2",
       "started_at": "2026-09-10T19:19:52Z",
@@ -582,9 +582,9 @@
       "created_at": "2026-09-10T18:59:50Z",
       "id": 103007249042,
       "labels": [
-        "ubuntu-24.04-arm"
+        "ubuntu-26.04-arm"
       ],
-      "name": "Sanitizers / ubuntu-24.04-arm / gcc",
+      "name": "Sanitizers / ubuntu-26.04-arm / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054683",
       "started_at": "2026-09-10T19:14:42Z",
@@ -806,9 +806,9 @@
       "created_at": "2026-09-10T18:59:50Z",
       "id": 103007249070,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Sanitizers / ubuntu-latest / clang",
+      "name": "Sanitizers / ubuntu-26.04 / clang",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054699",
       "started_at": "2026-09-10T19:21:25Z",
@@ -918,9 +918,9 @@
       "created_at": "2026-09-10T19:42:53Z",
       "id": 103021643946,
       "labels": [
-        "ubuntu-24.04-arm"
+        "ubuntu-26.04-arm"
       ],
-      "name": "Build / ubuntu-24.04-arm / gcc",
+      "name": "Build / ubuntu-26.04-arm / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054763",
       "started_at": "2026-09-10T19:45:59Z",
@@ -1014,9 +1014,9 @@
       "created_at": "2026-09-10T19:42:53Z",
       "id": 103021644050,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "mbedtls-enabled / ubuntu-latest / gcc",
+      "name": "mbedtls-enabled / ubuntu-26.04 / gcc",
       "runner_group_name": "default",
       "runner_name": "semantic-reasoning-i401-6-2",
       "started_at": "2026-09-10T19:49:48Z",
@@ -1414,9 +1414,9 @@
       "created_at": "2026-09-10T19:59:58Z",
       "id": 103027282864,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Build / ubuntu-latest / clang",
+      "name": "Build / ubuntu-26.04 / clang",
       "runner_group_name": "default",
       "runner_name": "semantic-reasoning-i401-6",
       "started_at": "2026-09-10T20:31:06Z",
@@ -1558,9 +1558,9 @@
       "created_at": "2026-09-10T20:25:47Z",
       "id": 103035976181,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan / ubuntu-latest / gcc",
+      "name": "TSan / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054867",
       "started_at": "2026-09-10T20:52:56Z",
@@ -1654,9 +1654,9 @@
       "created_at": "2026-09-10T20:25:47Z",
       "id": 103035976299,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan-native / ubuntu-latest / gcc",
+      "name": "TSan-native / ubuntu-26.04 / gcc",
       "runner_group_name": "default",
       "runner_name": "i406-d2",
       "started_at": "2026-09-10T20:58:46Z",
@@ -1750,9 +1750,9 @@
       "created_at": "2026-09-10T20:25:47Z",
       "id": 103035976439,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan / ubuntu-latest / clang",
+      "name": "TSan / ubuntu-26.04 / clang",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1000054868",
       "started_at": "2026-09-10T20:53:12Z",

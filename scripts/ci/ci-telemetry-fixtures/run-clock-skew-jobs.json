@@ -6,7 +6,7 @@
       "created_at": "2026-09-11T08:33:37Z",
       "id": 103200409721,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "RC changelog freeze gate",
       "runner_group_name": "default",
@@ -62,7 +62,7 @@
       "created_at": "2026-09-11T08:33:37Z",
       "id": 103200409951,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Detect build-triggering changes",
       "runner_group_name": "GitHub Actions",
@@ -118,7 +118,7 @@
       "created_at": "2026-09-11T08:33:37Z",
       "id": 103200409955,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Docs / policy validation",
       "runner_group_name": "default",
@@ -174,7 +174,7 @@
       "created_at": "2026-09-11T08:35:15Z",
       "id": 103200838630,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / EditorConfig check",
       "runner_group_name": "GitHub Actions",
@@ -246,7 +246,7 @@
       "created_at": "2026-09-11T08:43:11Z",
       "id": 103202876645,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "lint / uncrustify check",
       "runner_group_name": "default",

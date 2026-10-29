@@ -6,7 +6,7 @@
       "created_at": "2026-09-10T10:00:01Z",
       "id": 301,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
       "name": "Detect build-triggering changes",
       "runner_group_name": "GitHub Actions",
@@ -21,9 +21,9 @@
       "created_at": "2026-09-10T10:00:11Z",
       "id": 302,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "Build / ubuntu-latest / gcc",
+      "name": "Build / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1",
       "started_at": null,
@@ -45,9 +45,9 @@
       "created_at": "2026-09-10T10:02:00Z",
       "id": 303,
       "labels": [
-        "ubuntu-latest"
+        "ubuntu-26.04"
       ],
-      "name": "TSan / ubuntu-latest / gcc",
+      "name": "TSan / ubuntu-26.04 / gcc",
       "runner_group_name": "GitHub Actions",
       "runner_name": "GitHub Actions 1",
       "started_at": "2026-09-10T10:02:05Z",
