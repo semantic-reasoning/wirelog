@@ -4751,11 +4751,18 @@ and another source's valid projection cannot authorize an unused candidate.
 
 The supported plan is serial, nonrecursive, and contains only audited
 VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
-described below. The cold name must have an eligible consumer: a JOIN right
-input or the exact direct/filtered projection body below; it cannot be a relation head
+described below. The cold name must have an eligible consumer: a JOIN input
+or the exact direct/filtered projection body below; it cannot be a relation head
 or an arbitrary VARIABLE consumer. Eligible JOINs use one INT64 key,
 scalar numeric rows, no timestamps and no right filter. Multiple eligible JOINs
-may consume the same binding. Spill batch/index caps must be positive. Opaque
+may consume the same binding. A cold left source requires an initial
+VARIABLE/JOIN pair. Both inputs can be sealed, and a self-JOIN acquires two
+independent reader pins over one persistent owner. A subsequent JOIN consumes
+an admitted resident intermediate. FILTER/MAP before the first cold JOIN,
+multi-key/cross/theta JOINs and non-INT64 keys are refused. Available source
+schemas and projection bounds are checked before retirement and again at
+execution; an unloaded resident counterpart is checked when its schema exists.
+Spill batch/index caps must be positive. Opaque
 rewrites, workers, controlled execution, delta callbacks and competing JOIN
 batch modes are refused. The plan must remain immutable for the session lifetime,
 and session operations remain externally serialized. The advanced public opt-in
@@ -4767,10 +4774,24 @@ an otherwise usable sealed session; genuine partial-load errors still poison.
 Supported STEP/SNAPSHOT execution resolves the binding before the missing-right
 case and routes it through the capped payload producer without rebuilding a
 resident arrangement. Schema/projection ownership is admitted before private
-left transfer. Readers hold separate cursors and release pins before binding
+resident source transfer. Resident counterparts are privately captured; sealed
+inputs are borrowed without rehydration. Failed attempts drop reader pins before
+releasing only temporary payload owners. Missing resident right inputs preserve
+the ordinary empty-result typing contract. Readers hold separate cursors and release pins before binding
 cleanup. Repeated queries reuse the same owned spill segments; session teardown
 releases those segments and their governed metadata. Final output remains
 resident, so successful input retirement does not promise arbitrary result size.
+
+`test_session_cold_relation` also compares all resident/cold input directions,
+both seal orders, duplicate/skew and empty inputs, self-JOIN, repeated consumers,
+and a two-JOIN chain with a direct scan. Fixed-allowance controls separately
+prove left-only and two-owner reclamation against deliberately retained physical
+allocations. A direct both-cold JOIN compares constructor/reader/index scratch
+at two source cardinalities with the same caps and no output rows. A real
+admitted pressure allocation proves constructor refusal and cleanup; a separate
+many-match case proves the resident output floor. A no-match final result with
+a large first JOIN separately proves the resident intermediate floor. These are bounded-input
+claims, not a guarantee that arbitrary output or intermediate sizes fit.
 
 `test_session_cold_relation` supplies the lifecycle and causal budget evidence.
 A separate calibration run chooses an allowance for two fresh sessions with the
@@ -4919,7 +4940,7 @@ integer overflow. An optional single FILTER between VARIABLE and MAP accepts
 one INT64 column compared with one integer literal using `=`, `!=`, `<`, `>`,
 `<=` or `>=` (column on the left). For example, `keys(k) :- b(k,v), v >= 164.`
 filters on a column that need not appear in the output. Other predicates,
-arithmetic, multiple filters, concatenation, cold left JOINs,
+arithmetic, multiple filters, concatenation, FILTER/MAP before a cold JOIN,
 opaque rewrites and other raw-column consumers remain explicitly unsupported.
 A raw VARIABLE request for a known cold name returns ENOTSUP rather than treating
 the removed registry entry as empty. No synthetic relation with missing columns

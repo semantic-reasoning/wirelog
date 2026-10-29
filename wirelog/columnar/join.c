@@ -1490,44 +1490,171 @@ done:
     return rc;
 }
 
-/* Persistent right owner is session-owned; this attempt owns only left/output.
- * No synthetic col_rel with missing columns is passed to resident readers. */
+/* Source metadata is borrowed only until capture/take. Persistent payloads are
+* session-owned; a temporary resident snapshot has a separate attempt owner. */
+typedef struct {
+    const wl_columnar_session_cold_relation_t *cold;
+    col_rel_t *resident;
+    uint32_t width;
+    const char *const *names;
+    const wirelog_column_type_t *types;
+} wl_columnar_join_source_t;
+
+static wl_columnar_join_source_t
+wl_columnar_join_source(const wl_col_session_t *s, const char *name,
+    col_rel_t *resident)
+{
+    wl_columnar_join_source_t src = {0};
+    src.cold = wl_columnar_session_cold_find(s, name);
+    if (src.cold) {
+        src.width = src.cold->ncols;
+        src.names = (const char *const *)src.cold->col_names;
+        src.types = wl_columnar_batch_payload_schema(src.cold->payload, NULL,
+                NULL);
+    } else {
+        /* Read-only lookup also serves seal preflight; never build a hash. */
+        if (!resident && name)
+            for (uint32_t i = 0; i < s->nrels; i++)
+                if (s->rels[i] && !strcmp(s->rels[i]->name, name)) {
+                    resident = s->rels[i]; break;
+                }
+        src.resident = resident;
+        if (resident) {
+            src.width = resident->ncols;
+            src.names = (const char *const *)resident->col_names;
+            src.types = resident->column_types;
+        }
+    }
+    return src;
+}
+
+static uint32_t
+wl_columnar_join_source_key(const wl_columnar_join_source_t *src,
+    const char *name)
+{
+    int key = wl_columnar_relation_schema_column_index(src->width, src->names,
+            name);
+    return key < 0 ? 0 : (uint32_t)key;
+}
+
+static bool
+wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
+    uint32_t key)
+{
+    return src->cold ? key < src->width && src->types[key] == WIRELOG_TYPE_INT64
+        : src->resident && wl_columnar_join_spill_schema(src->resident, key);
+}
+
+static bool
+wl_columnar_join_cold_shape(const wl_plan_op_t *op,
+    const wl_columnar_join_source_t *left,
+    const wl_columnar_join_source_t *right)
+{
+    if (op->op != WL_PLAN_OP_JOIN || op->key_count != 1 || op->opaque_data ||
+        op->materialized || op->right_filter_expr.size || !op->right_relation ||
+        (op->project_count && !op->project_indices) ||
+        (op->delta_mode != WL_DELTA_AUTO &&
+        op->delta_mode != WL_DELTA_FORCE_FULL))
+        return false;
+    uint32_t lk = wl_columnar_join_source_key(left,
+            op->left_keys ? op->left_keys[0] : NULL);
+    uint32_t rk = wl_columnar_join_source_key(right,
+            op->right_keys ? op->right_keys[0] : NULL);
+    /* An unloaded left has no runtime schema yet. Preflight can still audit
+     * the known right; the actual entry is checked again before execution. */
+    if (!left->cold && !left->width &&
+        (!left->resident || !left->resident->nrows))
+        return (!right->cold && !right->resident) ||
+               wl_columnar_join_source_valid(right, rk);
+    if (!wl_columnar_join_source_valid(left, lk)) return false;
+    /* Missing right retains ordinary empty-result/projection typing semantics. */
+    if (!right->cold && !right->resident) return true;
+    if (!wl_columnar_join_source_valid(right, rk)) return false;
+    uint64_t joined = (uint64_t)left->width + right->width;
+    if (joined > UINT32_MAX) return false;
+    for (uint32_t i = 0; i < op->project_count; i++)
+        if (op->project_indices[i] >= joined) return false;
+    return true;
+}
+
+/* The same complete prefix contract is used before retirement and at runtime.
+* Its first JOIN creates an ordinary resident entry for the audited suffix. */
+bool
+wl_columnar_join_cold_prefix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp)
+{
+    if (!rp || !rp->ops || rp->op_count < 3 ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->opaque_data || op->materialized ||
+            (op->delta_mode != WL_DELTA_AUTO &&
+            op->delta_mode != WL_DELTA_FORCE_FULL) ||
+            (i && op->relation_name) || (i && op->op != WL_PLAN_OP_JOIN &&
+            op->op != WL_PLAN_OP_MAP &&
+            op->op != WL_PLAN_OP_CONSOLIDATE)) return false;
+    }
+    wl_columnar_join_source_t left = wl_columnar_join_source(s,
+            rp->ops[0].relation_name, NULL);
+    wl_columnar_join_source_t right = wl_columnar_join_source(s,
+            rp->ops[1].right_relation, NULL);
+    if (!wl_columnar_join_cold_shape(&rp->ops[1], &left, &right)) return false;
+    uint64_t width = left.width;
+    for (uint32_t i = 1; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->op == WL_PLAN_OP_MAP) {
+            width = op->project_count;
+        } else if (op->op == WL_PLAN_OP_JOIN) {
+            if (op->key_count != 1 || !op->right_relation ||
+                op->right_filter_expr.size ||
+                (op->project_count && !op->project_indices)) return false;
+            wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
+                    op->right_relation, NULL);
+            if (rhs.cold || rhs.resident) {
+                uint32_t key = wl_columnar_join_source_key(&rhs,
+                        op->right_keys ? op->right_keys[0] : NULL);
+                if (!wl_columnar_join_source_valid(&rhs, key)) return false;
+                if (width && width + rhs.width > UINT32_MAX) return false;
+                for (uint32_t col = 0; width && col < op->project_count; col++)
+                    if (op->project_indices[col] >=
+                        width + rhs.width) return false;
+                if (width) width += rhs.width;
+            }
+            if (op->project_count) width = op->project_count;
+        }
+    }
+    return true;
+}
+
 static int
 wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
-    eval_stack_t *stack, eval_entry_t *left)
+    eval_stack_t *stack, eval_entry_t *left, const char *cold_left)
 {
 #ifdef WL_PROFILE
     uint64_t started = now_ns();
     sess->profile.join_calls++;
 #endif
-    const wl_columnar_session_cold_relation_t *cold =
-        wl_columnar_session_cold_find(sess, op->right_relation);
+    wl_columnar_join_source_t sources[2] = {
+        wl_columnar_join_source(sess, cold_left, left->rel),
+        wl_columnar_join_source(sess, op->right_relation, NULL)
+    };
     int rc = wl_columnar_session_cold_execution_check(sess);
-    if (rc || op->key_count != 1 || op->materialized ||
-        op->right_filter_expr.size || left->is_delta ||
-        (op->delta_mode != WL_DELTA_AUTO &&
-        op->delta_mode != WL_DELTA_FORCE_FULL))
+    if (rc || left->is_delta || !wl_columnar_join_cold_shape(op, &sources[0],
+        &sources[1]))
         return wl_columnar_join_dispose_left(stack, left, rc ? rc : ENOTSUP);
-    uint32_t lk = col_op_resolve_key(left->rel,
-            op->left_keys ? op->left_keys[0] : NULL, "left", "JOIN",
-            op->right_relation);
-    int resolved = wl_columnar_relation_schema_column_index(cold->ncols,
-            (const char *const *)cold->col_names,
+    uint32_t lk = wl_columnar_join_source_key(&sources[0],
+            op->left_keys ? op->left_keys[0] : NULL);
+    uint32_t rk = wl_columnar_join_source_key(&sources[1],
             op->right_keys ? op->right_keys[0] : NULL);
-    uint32_t rk = resolved < 0 ? 0 : (uint32_t)resolved;
-    const wirelog_column_type_t *right_types = wl_columnar_batch_payload_schema(
-        cold->payload, NULL, NULL);
-    if (!wl_columnar_join_spill_schema(left->rel, lk) ||
-        rk >= cold->ncols || right_types[rk] != WIRELOG_TYPE_INT64)
+    /* Preflight permits an unloaded zero-width resident placeholder; runtime
+     * must still have the real supported left schema before creating readers. */
+    if (!wl_columnar_join_source_valid(&sources[0], lk))
         return wl_columnar_join_dispose_left(stack, left, ENOTSUP);
-    uint64_t joined = (uint64_t)left->rel->ncols + cold->ncols;
+    bool missing_right = !sources[1].cold && !sources[1].resident;
+    uint32_t joined = sources[0].width + (missing_right ? 0 : sources[1].width);
     bool projected = op->project_count && op->project_indices;
-    if (joined > UINT32_MAX || (op->project_count && !op->project_indices))
-        return wl_columnar_join_dispose_left(stack, left, EINVAL);
-    uint32_t width = projected ? op->project_count : (uint32_t)joined;
-    for (uint32_t i = 0; projected && i < width; i++)
-        if (op->project_indices[i] >= joined)
-            return wl_columnar_join_dispose_left(stack, left, EINVAL);
+    uint32_t width = projected ? op->project_count : joined;
     uint64_t type_bytes = (uint64_t)width * sizeof(wirelog_column_type_t);
     if (type_bytes > SIZE_MAX)
         return wl_columnar_join_dispose_left(stack, left, EOVERFLOW);
@@ -1543,34 +1670,46 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
                    WL_COLUMNAR_SPILL_MEMORY : WL_COLUMNAR_SPILL_OVERFLOW));
     wirelog_column_type_t *types = malloc((size_t)type_bytes);
     col_rel_t *out = NULL;
-    wl_columnar_batch_payload_t *input = NULL;
+    wl_columnar_batch_payload_t *inputs[2] = {NULL, NULL};
+    bool owned[2] = {false, false};
     wl_columnar_continuation_t *cont = NULL;
     if (!types) rc = ENOMEM;
     for (uint32_t i = 0; !rc && i < width; i++) {
         uint32_t source = projected ? op->project_indices[i] : i;
-        types[i] = source < left->rel->ncols ?
-            (left->rel->column_types ? left->rel->column_types[source] :
-            WIRELOG_TYPE_INT64) : right_types[source - left->rel->ncols];
+        unsigned side = source < sources[0].width ? 0u : 1u;
+        uint32_t col = side ? source - sources[0].width : source;
+        types[i] = sources[side].types && col < sources[side].width ?
+            sources[side].types[col] : WIRELOG_TYPE_INT64;
     }
-    if (!rc) rc = wl_columnar_join_new_output(sess, left->rel, NULL,
-                "$join", width, 0, false, true, &out);
+    if (!rc) rc = wl_columnar_join_new_output(sess, sources[0].resident,
+                sources[1].resident, "$join", width, 0, false, true, &out);
     if (!rc) rc = col_rel_set_column_types(out, types, width);
     free(types);
     if (!wl_columnar_memory_rollback(&type_token)) abort();
-    if (rc) goto done;
+    if (rc || missing_right) goto done;
     sess->spill_join_selected_count++;
-    wl_columnar_spill_status_t status;
-    if (left->owned && wl_columnar_batch_payload_can_take(left->rel))
-        status = wl_columnar_batch_payload_take(sess->memory_governor,
-                sess->spill_store, &left->rel, NULL, NULL, &input);
-    else
-        status = wl_columnar_batch_payload_capture(sess->memory_governor,
-                sess->spill_store, left->rel, left->rel->nrows,
-                WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, NULL, NULL, &input);
-    rc = wl_columnar_join_spill_error(sess, status);
-    if (rc) goto done;
-    status = wl_columnar_payload_join_create_projected_bounded(
-        sess->memory_governor, input, cold->payload, lk, rk,
+    for (unsigned i = 0; i < 2; i++) {
+        if (sources[i].cold) {
+            inputs[i] = sources[i].cold->payload;
+            continue;
+        }
+        wl_columnar_spill_status_t status;
+        if (i == 0 && left->owned &&
+            wl_columnar_batch_payload_can_take(left->rel))
+            status = wl_columnar_batch_payload_take(sess->memory_governor,
+                    sess->spill_store, &left->rel, NULL, NULL, &inputs[i]);
+        else
+            status = wl_columnar_batch_payload_capture(sess->memory_governor,
+                    sess->spill_store, sources[i].resident,
+                    sources[i].resident->nrows,
+                    WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, NULL, NULL, &inputs[i]);
+        owned[i] = inputs[i] != NULL;
+        rc = wl_columnar_join_spill_error(sess, status);
+        if (rc) goto done;
+    }
+    wl_columnar_spill_status_t status =
+        wl_columnar_payload_join_create_projected_bounded(
+        sess->memory_governor, inputs[0], inputs[1], lk, rk,
         op->project_indices, op->project_count,
         sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
         NULL, NULL, &cont);
@@ -1581,10 +1720,14 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     rc = wl_columnar_join_spill_error(sess, status);
     if (!rc) rc = wl_columnar_join_spill_drain(sess, cont, out);
 done:
+    /* Even self-JOIN drops two reader pins before any temporary owner. The
+     * persistent owner is borrowed on each side and is never released here. */
     wl_columnar_continuation_destroy(cont);
-    if (input &&
-        wl_columnar_batch_payload_release(input) != WL_COLUMNAR_SPILL_OK)
-        abort();
+    for (unsigned i = 0; i < 2; i++)
+        if (owned[i] &&
+            wl_columnar_batch_payload_release(inputs[i]) !=
+            WL_COLUMNAR_SPILL_OK)
+            abort();
     if (rc) {
         col_rel_destroy(out);
         return wl_columnar_join_dispose_left(stack, left,
@@ -1595,6 +1738,18 @@ done:
     sess->profile.join_compute_ns += now_ns() - started;
 #endif
     return wl_columnar_join_publish_after_left(stack, left, out, false);
+}
+
+int
+wl_columnar_join_cold_left(wl_col_session_t *sess, const wl_plan_relation_t *rp,
+    eval_stack_t *stack)
+{
+    if (!wl_columnar_join_cold_prefix(sess, rp) ||
+        !wl_columnar_session_cold_find(sess,
+        rp->ops[0].relation_name)) return ENOTSUP;
+    eval_entry_t left = {0};
+    return wl_columnar_join_cold_run(sess, &rp->ops[1], stack, &left,
+               rp->ops[0].relation_name);
 }
 
 int
@@ -1621,7 +1776,7 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (pop_rc != 0)
         return pop_rc;
     if (wl_columnar_session_cold_find(sess, op->right_relation))
-        return wl_columnar_join_cold_run(sess, op, stack, &left_e);
+        return wl_columnar_join_cold_run(sess, op, stack, &left_e, NULL);
 
     /* right_filtered: non-NULL only when right was pool-allocated by
      * wl_columnar_filter_apply_right_filter (non-cached path: antijoin/semijoin callers).

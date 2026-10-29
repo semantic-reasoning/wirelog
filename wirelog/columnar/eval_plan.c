@@ -173,9 +173,9 @@ session_has_delta_rows(void *ctx, const char *relation_name)
  */
 static int
 wl_columnar_eval_plan_body(const wl_plan_relation_t *rplan, eval_stack_t *stack,
-    wl_col_session_t *sess)
+    wl_col_session_t *sess, uint32_t start)
 {
-    for (uint32_t i = 0; i < rplan->op_count; i++) {
+    for (uint32_t i = start; i < rplan->op_count; i++) {
         const wl_plan_op_t *op = &rplan->ops[i];
         if (sess->tdd_input_run)
             sess->tdd_input_run->current_op = op;
@@ -470,8 +470,13 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                 wl_columnar_session_cold_find(
                 sess, rplan->ops[i].relation_name);
             if (!cold) continue;
-            if (wl_columnar_session_cold_execution_check(sess) ||
-                !wl_columnar_eval_plan_cold_projection(rplan, cold->name,
+            if (wl_columnar_session_cold_execution_check(sess)) return ENOTSUP;
+            if (i == 0 && wl_columnar_join_cold_prefix(sess, rplan)) {
+                int rc = wl_columnar_join_cold_left(sess, rplan, stack);
+                return rc ? rc : wl_columnar_eval_plan_body(rplan, stack, sess,
+                           2);
+            }
+            if (!wl_columnar_eval_plan_cold_projection(rplan, cold->name,
                 cold->ncols, wl_columnar_batch_payload_schema(
                     cold->payload, NULL, NULL))) return ENOTSUP;
             int rc = wl_columnar_ops_cold_projection(rplan, stack, sess);
@@ -479,13 +484,13 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
         }
     }
     if (!sess->tdd_input_run)
-        return wl_columnar_eval_plan_body(rplan, stack, sess);
+        return wl_columnar_eval_plan_body(rplan, stack, sess, 0);
     wl_columnar_eval_tdd_run_t *run = sess->tdd_input_run;
     if (!run->evaluating || run->current_op
         || rplan->ops != run->manifest->owner_ops + run->slice->start
         || rplan->op_count != run->slice->count)
         return EBUSY;
-    int rc = wl_columnar_eval_plan_body(rplan, stack, sess);
+    int rc = wl_columnar_eval_plan_body(rplan, stack, sess, 0);
     run->current_op = NULL;
     return rc;
 }

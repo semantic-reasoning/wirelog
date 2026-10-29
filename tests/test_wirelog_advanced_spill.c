@@ -682,6 +682,87 @@ static void sealed_sets(void)
                 }
 }
 
+static void join_directions(void)
+{
+    for (unsigned empty = 0; empty < 2; empty++)
+        for (unsigned direction = 0; direction < 5; direction++) {
+            wirelog_program_t *p = parse(query);
+            wirelog_session_t *s = NULL;
+            wirelog_session_options_v1_t o = configured();
+            CHECK(wirelog_session_create_with_options(p,
+                WIRELOG_BACKEND_DEFAULT, 1, &o, &s) == WIRELOG_OK);
+            populate(s, empty != 0);
+            if (direction == 4) CHECK(wirelog_session_seal_input(s,
+                    "b") == WIRELOG_OK);
+            if (direction == 1 ||
+                direction >= 3) CHECK(wirelog_session_seal_input(s,
+                    "a") == WIRELOG_OK);
+            if (direction == 2 ||
+                direction == 3) CHECK(wirelog_session_seal_join_input(s,
+                    "b") == WIRELOG_OK);
+            if (direction) check_mutation(s);
+            if (direction == 4) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+            for (unsigned repeat = 0; repeat < 2; repeat++) {
+                events_t e = {0};
+                CHECK(wirelog_session_snapshot(s, observe, &e) == WIRELOG_OK);
+                CHECK(e.count == (empty ? 0u : 4u) &&
+                    e.seen == (empty ? 0u : 15u));
+            }
+            wirelog_session_destroy(s); wirelog_program_free(p);
+            CHECK(live_files() == 0);
+        }
+}
+typedef struct { unsigned seen[3]; } join_chain_events_t;
+static void join_chain_observe(const char *name, const int64_t *row,
+    uint32_t width, void *context)
+{
+    join_chain_events_t *e = context;
+    unsigned idx = !strcmp(name, "result") ? 0u : !strcmp(name,
+            "scan") ? 1u : 2u;
+    CHECK(idx != 2 || !strcmp(name, "second"));
+    CHECK(width == (idx == 0 ? 4u : idx == 1 ? 1u : 3u) && row[0] >= 0 &&
+        row[0] < 8);
+    if (idx != 1) CHECK(row[1] == row[0]+10 && row[2] == row[0]+100);
+    if (idx == 0) CHECK(row[3] == row[0]+1000);
+    unsigned bit = 1u << (unsigned)row[0]; CHECK(!(e->seen[idx]&bit));
+    e->seen[idx] |= bit;
+}
+static void join_chains(void)
+{
+    const char *text =
+        ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n.decl c(k:int64,v:int64)\n"
+        ".decl result(k:int64,x:int64,y:int64,z:int64)\nresult(k,x,y,z+0) :- a(k,x),b(k,y),c(y,z).\n"
+        ".decl scan(k:int64)\nscan(k) :- a(k,x).\n"
+        ".decl second(k:int64,x:int64,y:int64)\nsecond(k,x,y+0) :- a(k,x),b(k,y).\n";
+    for (unsigned order = 0; order < 3; order++) {
+        wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t o = configured();
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
+            &o, &s) == WIRELOG_OK);
+        for (int64_t i = 0; i < 8; i++) {
+            int64_t a[] = {i, 10+i}, b[] = {i, 100+i}, c[] = {100+i, 1000+i};
+            CHECK(wirelog_session_insert(s, "a", a, 1, 2) == WIRELOG_OK);
+            CHECK(wirelog_session_insert(s, "b", b, 1, 2) == WIRELOG_OK);
+            CHECK(wirelog_session_insert(s, "c", c, 1, 2) == WIRELOG_OK);
+        }
+        if (order) {
+            const char *names[] = {"a", "b", "c"};
+            for (unsigned i = 0; i < 3;
+                i++) CHECK(wirelog_session_seal_input(s,
+                    names[order == 1 ? i : 2-i]) == WIRELOG_OK);
+        }
+        if (order == 2) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            join_chain_events_t e = {0};
+            CHECK(wirelog_session_snapshot(s, join_chain_observe,
+                &e) == WIRELOG_OK);
+            CHECK(e.seen[0] == 255 && e.seen[1] == 255 && e.seen[2] == 255);
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(live_files() == 0);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -700,6 +781,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    join_directions(); join_chains();
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
     sealed_sets(); standalone_reads(); output_floor(); mixed_projection();
     unsupported_filters();

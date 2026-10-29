@@ -256,8 +256,12 @@ identical behavior. A sealed JOIN input may additionally feed an exact
 `VARIABLE → MAP → CONSOLIDATE` direct column-projection rule. Column indices
 may repeat or reorder. One FILTER between VARIABLE and MAP may compare one
 INT64 column with one integer literal (`=`, `!=`, `<`, `>`, `<=`, `>=`), with the
-column on the left. Other predicates, arbitrary expressions and cold left JOINs remain
-unsupported. An eligible direct/filtered projection alone is sufficient; a
+column on the left. Other predicates and arbitrary cold expressions remain
+unsupported. An initial `VARIABLE → JOIN` may instead consume a cold left
+source, including two sealed sources or the same binding on both sides.
+Each JOIN uses one INT64 equality key. Chained JOINs continue from an admitted
+resident intermediate; FILTER/MAP before the first cold JOIN, multi-key/cross/
+theta JOINs, non-INT64 keys and right filters remain unsupported. An eligible direct/filtered projection alone is sufficient; a
 JOIN consumer is not required. Reads
 use independent bounded pins; projected output and consolidation remain resident.
 Output capacity is admitted for the full source row count even if no row passes.

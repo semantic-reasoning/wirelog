@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Sealed JOIN inputs in either position** (#1372): bounded readers now consume
+  cold left, both-cold and self-JOIN inputs. Audited chains continue through
+  admitted resident intermediates, preserving single-INT64-key semantics,
+  numeric lane types, transactional failure cleanup and explicit output floors.
+
 - **Multiple sealed inputs** (#1372): independently seal already-loaded numeric
   sources in either order, retaining earlier bindings on a later failure.
   Per-source lookup, destruction and narrow projection schema auditing preserve
