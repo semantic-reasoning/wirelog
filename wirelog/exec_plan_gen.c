@@ -4349,6 +4349,11 @@ wl_plan_free(wl_plan_t *plan)
         free((void *)plan->edb_column_types);
     }
     free((void *)plan->edb_column_type_counts);
+    if (plan->edb_schemas) {
+        for (uint32_t i = 0; i < plan->edb_count; i++)
+            free((void *)plan->edb_schemas[i].columns);
+        free((void *)plan->edb_schemas);
+    }
 
     free(plan);
 }
@@ -4652,6 +4657,41 @@ wl_plan_from_program_with_snapshot(struct wirelog_program *prog,
     plan->edb_column_types
         = (const wirelog_column_type_t *const *)edb_types;
     plan->edb_column_type_counts = (const uint32_t *)edb_type_counts;
+
+    /* Install ownership before any nested allocation can fail. */
+    wl_plan_edb_schema_t *schemas = calloc(edb_count ? edb_count : 1,
+            sizeof(*schemas));
+    if (!schemas) {
+        wl_plan_free(plan); return -1;
+    }
+    plan->edb_schemas = schemas;
+    for (uint32_t i = 0; i < edb_count; i++) {
+        const wl_ir_relation_info_t *rel = NULL;
+        for (uint32_t j = 0; j < prog->relation_count; j++) {
+            if (prog->relations[j].name && !strcmp(prog->relations[j].name,
+                edb_rels[i])) {
+                rel = &prog->relations[j]; break;
+            }
+        }
+        if (!rel || !rel->has_decl || !rel->column_count) continue;
+        bool compound = false;
+        for (uint32_t c = 0; c < rel->column_count; c++)
+            compound |= rel->columns[c].compound_kind !=
+                WIRELOG_COMPOUND_KIND_NONE;
+        if (!compound) continue;
+        wirelog_column_t *columns = calloc(rel->column_count, sizeof(*columns));
+        if (!columns) {
+            wl_plan_free(plan); return -1;
+        }
+        schemas[i].columns = columns;
+        schemas[i].column_count = rel->column_count;
+        schemas[i].has_unsupported_inline_cold_use =
+            rel->has_unsupported_inline_cold_use;
+        for (uint32_t c = 0; c < rel->column_count; c++) {
+            columns[c] = rel->columns[c];
+            columns[c].name = NULL;
+        }
+    }
 
     /* ----------------------------------------------------------------
      * Build strata

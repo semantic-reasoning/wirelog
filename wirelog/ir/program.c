@@ -2177,6 +2177,27 @@ build_atom_scan(const wl_parser_ast_node_t *atom,
 
     uint32_t arg_count = atom->child_count;
     wl_ir_relation_info_t *rel_info = find_relation_info(prog, atom->name);
+    /* Preserve every original use before optimizer cloning/removal and before
+     * physical lowering turns unsupported nested children into anonymous lanes. */
+    for (uint32_t i = 0; rel_info && i < rel_info->column_count; i++) {
+        const wirelog_column_t *col = &rel_info->columns[i];
+        if (col->compound_kind != WIRELOG_COMPOUND_KIND_INLINE) continue;
+        const wl_parser_ast_node_t *arg = i <
+            atom->child_count ? atom->children[i] : NULL;
+        if (!compound_arg_functor_matches(arg, col, prog)) {
+            rel_info->has_unsupported_inline_cold_use = true;
+            continue;
+        }
+        for (uint32_t c = 0; c < arg->child_count; c++) {
+            wl_parser_ast_node_type_t type = arg->children[c]->type;
+            if (type != WL_PARSER_AST_NODE_VARIABLE &&
+                type != WL_PARSER_AST_NODE_WILDCARD &&
+                type != WL_PARSER_AST_NODE_INTEGER &&
+                type != WL_PARSER_AST_NODE_FLOAT &&
+                type != WL_PARSER_AST_NODE_STRING)
+                rel_info->has_unsupported_inline_cold_use = true;
+        }
+    }
     uint32_t physical_count
         = atom_physical_column_count(atom, rel_info, prog);
     scan->column_names

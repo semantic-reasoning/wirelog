@@ -3974,6 +3974,74 @@ col_compute_worker_cap(uint64_t ram_bytes)
  * @see wl_session_create in session.c for vtable dispatch context
  * @see wl_col_session_t memory layout documentation above
  */
+/* Initialize genuine flat INLINE layout before fact loading/host insertion.
+ * Consumer eligibility is separate: unsafe body uses do not alter storage. */
+static int
+wl_columnar_session_inline_schema(col_rel_t *r, const wl_plan_t *plan,
+    uint32_t edb)
+{
+    const wl_plan_edb_schema_t *schema =
+        plan->edb_schemas ? &plan->edb_schemas[edb] : NULL;
+    if (!schema || !schema->columns) return 0;
+    bool has_inline = false;
+    for (uint32_t i = 0; i < schema->column_count; i++) {
+        if (schema->columns[i].compound_kind ==
+            WIRELOG_COMPOUND_KIND_SIDE) return 0;
+        has_inline |= schema->columns[i].compound_kind ==
+            WIRELOG_COMPOUND_KIND_INLINE;
+    }
+    if (!has_inline) return 0;
+    if (!plan->edb_column_types || !plan->edb_column_type_counts ||
+        !plan->edb_column_types[edb] || !plan->intern) return EINVAL;
+    uint64_t physical = 0;
+    for (uint32_t i = 0; i < schema->column_count; i++) {
+        const wirelog_column_t *c = &schema->columns[i];
+        if (c->compound_kind == WIRELOG_COMPOUND_KIND_INLINE) {
+            if (!c->compound_arity ||
+                c->compound_arity > WL_COMPOUND_INLINE_MAX_ARITY ||
+                c->compound_inline_col_offset != physical ||
+                !wl_intern_reverse(plan->intern,
+                c->compound_functor_id)) return EINVAL;
+            physical += c->compound_arity;
+        } else if (c->compound_kind == WIRELOG_COMPOUND_KIND_NONE) physical++;
+        else return EINVAL;
+    }
+    if (physical != plan->edb_column_type_counts[edb]) return EINVAL;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(schema->column_count,
+        sizeof(col_rel_logical_col_t),
+        &bytes) || bytes > SIZE_MAX) return EOVERFLOW;
+    wl_columnar_memory_reservation_t reservation;
+    wl_columnar_memory_reservation_init(&reservation);
+    wl_columnar_memory_admission_status_t admitted =
+        wl_columnar_memory_reserve_checked(
+        wl_columnar_memory_governor_ref_get(r->memory_governor), bytes,
+        &reservation);
+    if (admitted > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) return admitted ==
+               WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC : EOVERFLOW;
+    col_rel_logical_col_t *layout = calloc(schema->column_count,
+            sizeof(*layout));
+    if (!layout) {
+        if (!wl_columnar_memory_rollback(&reservation)) abort(); return ENOMEM;
+    }
+    if (!wl_columnar_memory_commit(&reservation, layout)) abort();
+    for (uint32_t i = 0; i < schema->column_count; i++) {
+        layout[i].kind = schema->columns[i].compound_kind;
+        layout[i].arity = schema->columns[i].compound_arity;
+        layout[i].depth = layout[i].kind ==
+            WIRELOG_COMPOUND_KIND_INLINE ? 1 : 0;
+    }
+    int rc = 0;
+    if (!r->ncols) rc = col_rel_set_schema(r, (uint32_t)physical, NULL);
+    if (!rc) rc = col_rel_set_column_types(r, plan->edb_column_types[edb],
+                (uint32_t)physical);
+    if (!rc) rc = col_rel_apply_compound_schema(r, layout,
+                schema->column_count);
+    free(layout);
+    if (!wl_columnar_memory_release(&reservation)) abort();
+    return rc;
+}
+
 static int
 col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
     const wl_session_options_t *options, wl_session_t **out)
@@ -4453,6 +4521,13 @@ col_session_create_internal(const wl_plan_t *plan, uint32_t num_workers,
                 col_rel_destroy(r);
                 goto oom;
             }
+        }
+        rc = wl_columnar_session_inline_schema(r, plan, i);
+        if (rc != 0) {
+            relation_create_rc = rc == ENOMEM &&
+                r->memory_budget_denial_pending ? ENOSPC : rc;
+            col_rel_destroy(r);
+            goto oom;
         }
         rc = session_add_rel(sess, r);
         if (rc != 0) {

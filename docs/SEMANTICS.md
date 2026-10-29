@@ -1911,3 +1911,18 @@ refusals remain in force. Seed branches can execute again in subsequent rounds;
 this does not promise a universal raw performance improvement. Public heads
 and observer events retain the existing common cutoff. Raw epoch/rule-frontier
 arrays, weighted traces and incremental retraction are separate contracts.
+
+### INLINE declaration provenance for source initialization
+
+Execution plans retain owned logical declaration metadata independently of
+physical child lane types. Declared flat INLINE inputs, including empty and
+all-numeric inputs, receive their real logical arity map at session creation.
+Host inserts still supply the declared physical scalar lanes. Extracted child
+results remain scalar, rather than inheriting the original arity map merely
+because physical widths coincide.
+
+A conservative per-relation summary preserves unsupported nested, whole-value,
+wrong-functor and wrong-arity body uses before optimizer/lowering information
+loss. It does not change existing resident semantics or prevent source schema
+initialization. Missing declaration provenance cannot authorize future compound
+cold reads; this preparation leaves INLINE sealing unsupported.

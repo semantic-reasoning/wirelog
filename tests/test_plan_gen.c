@@ -1631,9 +1631,66 @@ test_load_facts_null_safe(void)
  * Main
  * ---------------------------------------------------------------- */
 
+static void
+test_inline_declaration_provenance(void)
+{
+    TEST("owned INLINE declarations and original consumer provenance");
+    const char *patterns[] = {"pair(s,n)", "pair(nested(s),n)", "whole", "_",
+                              "wrong(s,n)", "pair(s)"};
+    for (unsigned shape = 0; shape < 6; shape++) {
+        char text[1024];
+        snprintf(text, sizeof(text),
+            ".decl a(id:int64,p:pair(symbol,int64) inline,m:int64,q:box/1 inline)\n"
+            ".decl out(id:int64)\n.decl safe(id:int64)\n"
+            "out(i) :- a(i,%s,m,box(z)).\n"
+            "safe(i) :- a(i,pair(s,n),m,box(z)).\n", patterns[shape]);
+        wirelog_error_t err;
+        wirelog_program_t *prog = wirelog_parse_string(text, &err);
+        ASSERT(prog, "INLINE provenance fixture must parse");
+        const wirelog_schema_t *decl = wirelog_program_get_schema(prog, "a");
+        ASSERT(decl && decl->column_count == 4, "logical declaration width");
+        wl_plan_t *plan = NULL;
+        ASSERT(wl_plan_from_program(prog, &plan) == 0 && plan,
+            "plan generation");
+        uint32_t edb = 0;
+        while (edb < plan->edb_count && strcmp(plan->edb_relations[edb],
+            "a")) edb++;
+        ASSERT(edb < plan->edb_count && plan->edb_schemas,
+            "owned EDB declaration");
+        const wl_plan_edb_schema_t *schema = &plan->edb_schemas[edb];
+        ASSERT(schema->column_count == 4 && schema->columns != decl->columns,
+            "logical schema copy");
+        ASSERT(schema->has_unsupported_inline_cold_use == (shape != 0),
+            "unsupported summary survives later safe use");
+        ASSERT(plan->edb_column_type_counts[edb] == 5 &&
+            plan->edb_column_types[edb][1] == WIRELOG_TYPE_STRING &&
+            plan->edb_column_types[edb][2] == WIRELOG_TYPE_INT64 &&
+            plan->edb_column_types[edb][4] == WIRELOG_TYPE_INT64,
+            "packed physical types use logical stride");
+        for (unsigned i = 0; i < 4; i++) {
+            ASSERT(schema->columns[i].name == NULL, "name-less copy");
+            ASSERT(schema->columns[i].compound_kind ==
+                decl->columns[i].compound_kind &&
+                schema->columns[i].compound_arity ==
+                decl->columns[i].compound_arity &&
+                schema->columns[i].compound_functor_id ==
+                decl->columns[i].compound_functor_id &&
+                schema->columns[i].compound_inline_col_offset ==
+                decl->columns[i].compound_inline_col_offset,
+                "semantic declaration metadata preserved");
+        }
+        ASSERT(schema->columns[1].compound_inline_col_offset == 1 &&
+            schema->columns[3].compound_inline_col_offset == 4,
+            "multiple groups with intervening scalar");
+        wl_plan_free(plan); wirelog_program_free(prog);
+    }
+    PASS();
+}
+
 int
 main(void)
 {
+    test_inline_declaration_provenance();
     printf("=== Plan Generator Tests ===\n");
 
     test_delta_name_invariant();

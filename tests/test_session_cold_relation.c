@@ -2502,6 +2502,107 @@ static void reference_join_bounded_scratch(void)
     CHECK(peaks[0] == peaks[1]);
 }
 
+static void inline_initialized_observe(const char *name, const int64_t *row,
+    uint32_t width, void *context)
+{
+    unsigned *bits = context;
+    unsigned which = !strcmp(name, "out") ? 0 : !strcmp(name,
+            "filtered") ? 1 : 2;
+    CHECK(which != 2 || !strcmp(name, "joined"));
+    CHECK(width == 3 && row[0] == 7 && row[1] == 11 && row[2] == 13);
+    CHECK(!(*bits & (1u<<which))); *bits |= 1u<<which;
+}
+static void inline_initialized_sources(void)
+{
+    const char *text =
+        ".decl a(id:int64,p:pair/2 inline)\n.decl b(k:int64,v:int64)\n"
+        ".decl out(id:int64,x:int64,y:int64)\n"
+        ".decl filtered(id:int64,x:int64,y:int64)\n"
+        ".decl joined(id:int64,x:int64,y:int64)\n"
+        "out(i,x,y) :- a(i,pair(x,y)).\n"
+        "filtered(i,x,y) :- a(i,pair(x,y)), x > 0.\n"
+        "joined(i,x,y+0) :- a(i,pair(x,y)),b(x,z).\n";
+    fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    col_rel_t *a = session_find_rel(s, "a");
+    CHECK(a && !a->nrows && a->ncols == 3 && a->column_types &&
+        a->compound_kind == WIRELOG_COMPOUND_KIND_INLINE &&
+        a->compound_count == 1 && a->compound_arity_len == 2 &&
+        a->compound_arity_map[0] == 1 && a->compound_arity_map[1] == 2);
+    int64_t row[] = {7, 11, 13}, b[] = {11, 17};
+    CHECK(wl_session_insert(f.session, "a", row, 1, 3) == 0);
+    CHECK(wl_session_insert(f.session, "b", b, 1, 2) == 0);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        unsigned bits = 0;
+        CHECK(wl_session_snapshot(f.session, inline_initialized_observe,
+            &bits) == 0 && bits == 7);
+        const char *names[] = {"out", "filtered", "joined"};
+        for (unsigned i = 0; i < 3; i++) {
+            col_rel_t *out = session_find_rel(s, names[i]);
+            CHECK(out && out->ncols == 3 &&
+                out->compound_kind == WIRELOG_COMPOUND_KIND_NONE &&
+                !out->compound_count && !out->compound_arity_map);
+        }
+        CHECK(wl_session_step(f.session) == 0);
+    }
+    destroy(&f);
+}
+
+static void inline_initialization_budget(void)
+{
+    const char *text = ".decl a(i:int64,p:pair/2 inline)\n"
+        ".decl out(i:int64)\nout(i) :- a(i,pair(x,y)).\n";
+    uint64_t floor = 0;
+    for (unsigned pass = 0; pass < 3; pass++) {
+        bool fits = pass != 1;
+        fixture_t f = {0}; wirelog_error_t error;
+        f.program = wirelog_parse_string(text, &error); CHECK(f.program);
+        CHECK(wl_plan_from_program(f.program, &f.plan) == 0);
+        uint64_t limit = pass == 0 ? 4*1024*1024 : floor - (fits ? 0 : 1);
+        wl_columnar_memory_resolution_t resolution = {
+            .budget_bytes = limit, .usable_bytes = limit,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+        };
+        f.governor = wl_columnar_memory_governor_ref_create(&resolution);
+        CHECK(f.governor);
+        wl_session_options_t options; wl_session_options_init(&options);
+        options.memory_governor = f.governor;
+        options.spill_directory = test_tmpdir();
+        options.spill_quota_bytes = 1024*1024; options.spill_max_row_bytes = 64;
+        options.spill_join_batch_bytes = 96;
+        options.spill_join_index_bytes =
+            sizeof(wl_columnar_memory_reservation_t)+16;
+        budget_peak = 0;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        int rc = wl_session_create_with_options(wl_backend_columnar(), f.plan,
+                1, &options, &f.session);
+        wl_columnar_memory_governor_test_admitted = NULL;
+        if (!pass) {
+            floor = budget_peak; CHECK(floor > 1);
+        }
+        if (fits) {
+            CHECK(rc == 0 && f.session);
+            col_rel_t *a = session_find_rel(COL_SESSION(f.session), "a");
+            CHECK(a && a->compound_arity_len == 2 && a->ncols == 3);
+        } else CHECK(rc == WL_ERR_MEMORY_BUDGET && !f.session);
+        destroy(&f);
+    }
+    const char *patterns[] = {"pair(nested(s),n)", "whole", "_"};
+    for (unsigned i = 0; i < 3; i++) {
+        char query_text[256];
+        snprintf(query_text, sizeof(query_text),
+            ".decl a(i:int64,p:pair/2 inline)\n"
+            ".decl out(i:int64)\nout(i) :- a(i,%s).\n", patterns[i]);
+        fixture_t f = fixture(query_text, 4*1024*1024, 1024*1024);
+        col_rel_t *a = session_find_rel(COL_SESSION(f.session), "a");
+        CHECK(a && a->compound_kind == WIRELOG_COMPOUND_KIND_INLINE &&
+            a->ncols == 3);
+        destroy(&f);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -2511,6 +2612,8 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    inline_initialization_budget();
+    inline_initialized_sources();
     reference_join_reclamation(); reference_join_bounded_scratch();
     reference_join_directions();
     reference_projection_memory();
