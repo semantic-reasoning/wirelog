@@ -4946,6 +4946,17 @@ wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
     wl_session_t *session, const char *name, wl_columnar_spill_cancel_fn cancel,
     void *context);
 int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
+/* Valid only after the complete cold projection body has been audited. */
+typedef struct {
+    const wl_plan_op_t *map;
+    uint32_t predicate_column;
+    int64_t predicate_literal;
+    uint8_t comparison; /* zero for an unfiltered projection */
+} wl_columnar_eval_plan_cold_projection_t;
+bool wl_columnar_eval_plan_cold_projection_decode(
+    const wl_plan_relation_t *plan, const char *name, uint32_t ncols,
+    const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_projection_t *out);
 bool wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *plan,
     const char *name, uint32_t ncols, const wirelog_column_type_t *types);
 int wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,

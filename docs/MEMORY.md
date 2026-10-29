@@ -4736,8 +4736,10 @@ Generation overflow is refused before capture. Existing resident arrangements
 cannot survive this transition.
 
 The supported plan is serial, nonrecursive, and contains only audited
-VARIABLE/JOIN/MAP/CONSOLIDATE operations. The cold name must occur only as a JOIN
-right input, never a VARIABLE or relation head. Eligible JOINs use one INT64 key,
+VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
+described below. The cold name must have a JOIN right consumer and may also feed
+the exact direct/filtered projection body below; it cannot be a relation head
+or an arbitrary VARIABLE consumer. Eligible JOINs use one INT64 key,
 scalar numeric rows, no timestamps and no right filter. Multiple eligible JOINs
 may consume the same binding. Spill batch/index caps must be positive. Opaque
 rewrites, workers, controlled execution, delta callbacks and competing JOIN
@@ -4895,7 +4897,11 @@ scan-only programs still cannot use `wirelog_session_seal_join_input`.
 Seal preflight and ordinary dispatch share the same full-body predicate. It
 accepts valid reordered/repeated column indices and canonical column-reference
 bytecode matching those indices and source types, with checked lengths and
-integer overflow. General expressions, filters, concatenation, cold left JOINs,
+integer overflow. An optional single FILTER between VARIABLE and MAP accepts
+one INT64 column compared with one integer literal using `=`, `!=`, `<`, `>`,
+`<=` or `>=` (column on the left). For example, `keys(k) :- b(k,v), v >= 164.`
+filters on a column that need not appear in the output. Other predicates,
+arithmetic, multiple filters, concatenation, cold left JOINs,
 opaque rewrites and other raw-column consumers remain explicitly unsupported.
 A raw VARIABLE request for a known cold name returns ENOTSUP rather than treating
 the removed registry entry as empty. No synthetic relation with missing columns
@@ -4907,6 +4913,8 @@ are admitted through the session governor. The complete projected output is
 separately admitted before reading; it remains private until all reads finish.
 The reader and row scratch are bounded independently of source row count, but the
 resident projected result, normal consolidation and head publication are not.
+Output capacity is admitted for the full source row count before reading even
+when the predicate rejects every row; selectivity does not remove that floor.
 A narrow projection avoids full-source rehydration; this is not arbitrary-budget
 or general out-of-core execution. Numeric lanes/types and duplicate rows follow the ordinary relation contract
 before consolidation, including existing FLOAT signed-zero canonicalization.
@@ -4922,7 +4930,11 @@ causes genuine managed-memory refusal. Separate admission measurements show the
 same temporary reader/row overhead at 128 and 8,192 source rows after excluding
 resident output. A 64-column projected output exceeds a real 1 MiB allowance without
 losing the cold owner; the narrow projection can then succeed at that same limit. Earlier JOIN-only proofs are
-not substituted for this projection evidence.
+not substituted for this projection evidence. The same retained-source control,
+constant-scratch comparison and output-floor refusal also run with a selective
+filter. All six signed comparisons include negative and extreme literals;
+public tests compare exact keys for none/some/all passing rows, empty inputs,
+STEP followed by repeated snapshots, and refusal of unsupported filter bodies.
 
 Failures release the append lease, reader and private result before refunding
 credit. The persistent binding stays session-owned and valid for permitted

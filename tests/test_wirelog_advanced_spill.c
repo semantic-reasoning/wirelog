@@ -421,25 +421,70 @@ static void mixed_observe(const char *name, const int64_t *row, uint32_t cols,
 }
 static void mixed_projection(void)
 {
-    const char *text =
-        ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n"
-        ".decl result(k:int64,x:int64,y:int64)\n.decl keys(k:int64)\n"
-        "result(k,x,y + 0) :- a(k,x),b(k,y).\nkeys(k) :- b(k,v).\n";
-    for (unsigned sealed = 0; sealed < 2; sealed++) {
+    const char *predicates[] = {"", ", v >= 164", ", v >= -1", ", v > 999"};
+    for (unsigned mode = 0; mode < 4; mode++)
+        for (unsigned empty = 0; empty < 2; empty++)
+            for (unsigned sealed = 0; sealed < 3; sealed++) {
+                char text[512];
+                snprintf(text, sizeof(text),
+                    ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n"
+                    ".decl result(k:int64,x:int64,y:int64)\n.decl keys(k:int64)\n"
+                    "result(k,x,y + 0) :- a(k,x),b(k,y).\nkeys(k) :- b(k,v)%s.\n",
+                    predicates[mode]);
+                wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+                wirelog_session_options_v1_t o = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1,
+                    &o, &s) == WIRELOG_OK);
+                populate(s, empty != 0);
+                if (sealed) {
+                    CHECK(wirelog_session_seal_join_input(s,
+                        "b") == WIRELOG_OK);
+                    check_mutation(s);
+                }
+                if (sealed == 2) CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    mixed_events_t e = {0};
+                    CHECK(wirelog_session_snapshot(s, mixed_observe,
+                        &e) == WIRELOG_OK);
+                    unsigned count = empty ||
+                        mode == 3 ? 0u : mode == 1 ? 64u : 128u;
+                    CHECK(e.keys == count && e.joined == (empty ? 0u : 4u) &&
+                        e.seen == (empty ? 0u : 15u));
+                    CHECK(e.key_bits[0] == (count == 128 ? UINT64_MAX : 0));
+                    CHECK(e.key_bits[1] == (count ? UINT64_MAX : 0));
+                }
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(live_files() == 0);
+            }
+}
+static void unsupported_filters(void)
+{
+    const char *rules[] = {
+        "keys(k) :- b(k,v), v + 1 > 164.",
+        "keys(k) :- b(k,v), v > k.",
+        "keys(k) :- b(k,v), v > 100, v < 200.",
+        /* An unrelated resident filter must not inherit the cold exception. */
+        "keys(k) :- a(k,v), v > 11.",
+        /* A predicate on the right JOIN input remains unsupported. */
+        "keys(k) :- a(k,v), b(k,w), w > 164."
+    };
+    for (unsigned i = 0; i < sizeof(rules)/sizeof(rules[0]); i++) {
+        char text[512];
+        snprintf(text, sizeof(text),
+            ".decl a(k:int64,v:int64)\n.decl b(k:int64,v:int64)\n"
+            ".decl result(k:int64,x:int64,y:int64)\n.decl keys(k:int64)\n"
+            "result(k,x,y + 0) :- a(k,x),b(k,y).\n%s\n", rules[i]);
         wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
         wirelog_session_options_v1_t o = configured();
         CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
             &o, &s) == WIRELOG_OK);
         populate(s, false);
-        if (sealed) {
-            CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_OK);
-            check_mutation(s);
-        }
-        for (unsigned repeat = 0; repeat < 2; repeat++) {
-            mixed_events_t e = {0};
-            CHECK(wirelog_session_snapshot(s, mixed_observe, &e) == WIRELOG_OK);
-            CHECK(e.keys == 128 && e.joined == 4 && e.seen == 15);
-        }
+        CHECK(wirelog_session_seal_join_input(s, "b") == WIRELOG_ERR_EXEC);
+        /* Failed preflight leaves a usable resident session and input. */
+        mixed_events_t e = {0};
+        CHECK(wirelog_session_snapshot(s, mixed_observe, &e) == WIRELOG_OK);
+        CHECK(e.joined == 4 && e.seen == 15);
         wirelog_session_destroy(s); wirelog_program_free(p);
         CHECK(live_files() == 0);
     }
@@ -459,7 +504,7 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
-    output_floor(); mixed_projection();
+    output_floor(); mixed_projection(); unsupported_filters();
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);
 #else

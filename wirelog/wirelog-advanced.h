@@ -207,10 +207,14 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * Seal one numeric JOIN input as persistent immutable spill input before
  * the first STEP/SNAPSHOT attempt. Load all inputs first. Requires configured
  * spill JOIN caps and a serial nonrecursive plan using only audited
- * VARIABLE/JOIN/MAP/CONSOLIDATE operations. The selected name must have a JOIN
+ * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
+ * The selected name must have a JOIN
  * right consumer with one INT64 key. It may also feed a complete
- * VARIABLE/MAP/CONSOLIDATE rule selecting only columns; projected results and
- * consolidation remain resident. Scan-only sealing and general cold pipelines
+ * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with one
+ * FILTER before MAP comparing an INT64 column with an integer literal
+ * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
+ * remain resident; output capacity is admitted for the source row count even
+ * when no row passes. Scan-only sealing and general cold pipelines
  * are unsupported. No right filter, timestamps, references,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * Optimized plans may therefore be ineligible. Only one input may be sealed.

@@ -606,6 +606,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
             const wl_plan_relation_t *rp = &sp->relations[ri];
             if (!rp->name || strcmp(rp->name, name) == 0 || !rp->ops)
                 return false;
+            bool projection = wl_columnar_eval_plan_cold_projection(rp,
+                    name, ncols, types);
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
                 /* Reject all opaque rewrites, even if top-level names hide
@@ -613,12 +615,12 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 if (op->opaque_data || op->materialized ||
                     (op->op != WL_PLAN_OP_VARIABLE &&
                     op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
-                    op->op != WL_PLAN_OP_CONSOLIDATE) ||
+                    op->op != WL_PLAN_OP_CONSOLIDATE &&
+                    !(projection && op->op == WL_PLAN_OP_FILTER)) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0 &&
-                    !wl_columnar_eval_plan_cold_projection(rp, name, ncols,
-                    types))
+                    !projection)
                     return false;
                 if (!op->right_relation || strcmp(op->right_relation,
                     name) != 0)

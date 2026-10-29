@@ -375,19 +375,51 @@ ordinary_join:
 /* A cold source may bypass resident VARIABLE only for this complete body.
  * Canonical column bytecode is accepted, never arbitrary expressions. */
 bool
-wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
-    const char *name, uint32_t ncols, const wirelog_column_type_t *types)
+wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_projection_t *out)
 {
-    if (!rp || !name || !rp->ops || rp->op_count != 3) return false;
-    const wl_plan_op_t *v = &rp->ops[0], *m = &rp->ops[1];
+    if (!rp || !name || !rp->ops ||
+        (rp->op_count != 3 && rp->op_count != 4)) return false;
+    bool filtered = rp->op_count == 4;
+    const wl_plan_op_t *v = &rp->ops[0], *m = &rp->ops[rp->op_count - 2];
+    wl_columnar_eval_plan_cold_projection_t decoded = {.map = m};
+    if (filtered) {
+        const wl_plan_op_t *f = &rp->ops[1];
+        const wl_plan_expr_buffer_t *e = &f->filter_expr;
+        if (f->op != WL_PLAN_OP_FILTER || !e->data || e->size < 17 ||
+            e->data[0] != WL_PLAN_EXPR_VAR) return false;
+        uint32_t len = (uint32_t)e->data[1] | ((uint32_t)e->data[2] << 8);
+        if (len < 4 || len + 13 != e->size ||
+            memcmp(e->data + 3, "col", 3)) return false;
+        uint32_t col = 0;
+        for (uint32_t j = 6; j < len + 3; j++) {
+            unsigned digit = (unsigned)e->data[j] - '0';
+            if (digit > 9 || col > (UINT32_MAX - digit) / 10) return false;
+            col = col * 10 + digit;
+        }
+        uint32_t pos = len + 3;
+        if (col >= ncols || (types && types[col] != WIRELOG_TYPE_INT64) ||
+            e->data[pos] != WL_PLAN_EXPR_CONST_INT ||
+            e->data[pos + 9] < WL_PLAN_EXPR_CMP_EQ ||
+            e->data[pos + 9] > WL_PLAN_EXPR_CMP_GTE) return false;
+        uint64_t literal = 0;
+        for (unsigned i = 0; i < 8; i++)
+            literal |= (uint64_t)e->data[pos + 1 + i] << (8 * i);
+        memcpy(&decoded.predicate_literal, &literal, sizeof(literal));
+        decoded.predicate_column = col;
+        decoded.comparison = e->data[pos + 9];
+    }
     if (v->op != WL_PLAN_OP_VARIABLE || !v->relation_name ||
         strcmp(v->relation_name, name) || m->op != WL_PLAN_OP_MAP ||
-        rp->ops[2].op != WL_PLAN_OP_CONSOLIDATE ||
+        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE ||
         !m->project_count || !m->project_indices) return false;
-    for (uint32_t i = 0; i < 3; i++) {
+    for (uint32_t i = 0; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->opaque_data || op->materialized || op->right_relation ||
             (i && op->relation_name) || op->right_filter_expr.size ||
+            (op->op != WL_PLAN_OP_FILTER &&
+            (op->filter_expr.size || op->filter_expr.data)) ||
             (op->delta_mode != WL_DELTA_AUTO &&
             op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
     }
@@ -416,7 +448,16 @@ wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
             ((e->data[0] == WL_PLAN_EXPR_VAR_FLOAT) !=
             (types && types[col] == WIRELOG_TYPE_FLOAT))) return false;
     }
+    if (out) *out = decoded;
     return true;
+}
+
+bool
+wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types)
+{
+    return wl_columnar_eval_plan_cold_projection_decode(rp, name, ncols,
+               types, NULL);
 }
 
 int
