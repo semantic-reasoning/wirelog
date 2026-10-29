@@ -1360,7 +1360,7 @@ static void projected(void)
 }
 
 static col_rel_t *reference_source(wl_intern_t *intern, unsigned rows,
-    bool string_key)
+    bool string_key, bool inlined)
 {
     const char *values[] = {"", "alpha", "한글"};
     int64_t ids[3];
@@ -1376,6 +1376,12 @@ static col_rel_t *reference_source(wl_intern_t *intern, unsigned rows,
         int64_t row[] = {string_key?ids[i%3]:(int64_t)(i%3), i, ids[(i+1)%3]};
         CHECK(col_rel_append_row(r, row) == 0);
     }
+    if (inlined) {
+        CHECK(wl_intern_put(intern, "pair") >= 0);
+        col_rel_logical_col_t layout[] = {{WIRELOG_COMPOUND_KIND_NONE, 0, 0},
+                                          {WIRELOG_COMPOUND_KIND_INLINE, 2, 1}};
+        CHECK(col_rel_apply_compound_schema(r, layout, 2) == 0);
+    }
     return r;
 }
 static wl_columnar_batch_payload_t *reference_capture(
@@ -1384,16 +1390,27 @@ static wl_columnar_batch_payload_t *reference_capture(
     unsigned mode)
 {
     wl_columnar_batch_payload_t *p = NULL;
-    CHECK(wl_columnar_batch_payload_capture_with_intern(g, store, r, r->nrows,
-        mode ==
+    wirelog_column_t columns[2] = {0};
+    columns[0].type = r->column_types[0];
+    columns[1].type = WIRELOG_TYPE_INT32;
+    columns[1].compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    columns[1].compound_functor_id = (uint32_t)wl_intern_get(intern, "pair");
+    columns[1].compound_arity = 2; columns[1].compound_inline_col_offset = 1;
+    wl_columnar_batch_payload_storage_t storage = mode ==
         1 ? WL_COLUMNAR_BATCH_PAYLOAD_SPILLED :
-        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
-        intern, NULL, NULL, &p) == OK);
+        WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT;
+    CHECK((r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE ?
+        wl_columnar_batch_payload_capture_with_inline(g, store, r, r->nrows,
+        storage,
+        columns, 2, intern, NULL, NULL, &p) :
+        wl_columnar_batch_payload_capture_with_intern(g, store, r, r->nrows,
+        storage,
+        intern, NULL, NULL, &p)) == OK);
     if (mode == 2)CHECK(wl_columnar_batch_payload_spill(&p, store, NULL,
             NULL) == OK);
     return p;
 }
-static void reference_joins(void)
+static void reference_joins(bool inlined)
 {
     const uint32_t map[] = {5, 1, 4, 2, 5};
     const char *values[] = {"", "alpha", "한글"};
@@ -1405,8 +1422,8 @@ static void reference_joins(void)
             wl_columnar_spill_store_t *store;
             CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 65536, 64,
                 &store) == OK);
-            col_rel_t *l = reference_source(intern, 9, string_key),
-                *r = reference_source(intern, 11, string_key);
+            col_rel_t *l = reference_source(intern, 9, string_key, inlined),
+                *r = reference_source(intern, 11, string_key, inlined);
             wl_columnar_batch_payload_t *lp = reference_capture(g, store, l,
                     intern, mode == 4?2:mode%2);
             wl_columnar_batch_payload_t *rp = reference_capture(g, store, r,
@@ -1427,7 +1444,7 @@ static void reference_joins(void)
             wl_intern_t *foreign = wl_intern_create();
             CHECK(foreign && wl_intern_attach_memory_governor(foreign, g) == 0);
             CHECK(wl_intern_put(foreign, "different-at-zero") == 0);
-            col_rel_t *f = reference_source(foreign, 3, string_key);
+            col_rel_t *f = reference_source(foreign, 3, string_key, inlined);
             wl_columnar_batch_payload_t *fp = reference_capture(g, store, f,
                     foreign, 1); col_rel_destroy(f);
             CHECK(wl_columnar_payload_join_create_reference_projected_bounded(g,
@@ -1435,7 +1452,7 @@ static void reference_joins(void)
                 &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
             CHECK(wl_columnar_batch_payload_release(fp) == OK);
             wl_intern_free(foreign);
-            f = reference_source(intern, 3, !string_key);
+            f = reference_source(intern, 3, !string_key, inlined);
             fp = reference_capture(g, store, f, intern, 0); col_rel_destroy(f);
             CHECK(wl_columnar_payload_join_create_reference_projected_bounded(g,
                 lp, fp, 0, 0, map, 5, 40, index_cap(1), intern, NULL, NULL,
@@ -1491,6 +1508,7 @@ static void reference_joins(void)
                         types[3] == WIRELOG_TYPE_STRING &&
                         types[4] == WIRELOG_TYPE_STRING);
                     CHECK(wl_columnar_batch_payload_uses_intern(out, intern));
+                    CHECK(!wl_columnar_batch_payload_inline_schema(out, NULL));
                     wl_columnar_batch_payload_reader_t *reader;
                     CHECK(wl_columnar_batch_payload_acquire(out,
                         &reader) == OK);
@@ -1533,7 +1551,7 @@ static void reference_joins(void)
 
 int main(void)
 {
-    reference_joins();
+    reference_joins(false); reference_joins(true);
     projected();
     combinations(); failures(); budget(false); budget(true); misses();
     concurrent_self_join(false); concurrent_self_join(true);

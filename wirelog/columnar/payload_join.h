@@ -106,7 +106,10 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_projected_bounded(
 /* Reference-aware ordinary projected JOIN. Keys must both be INT64 or both
  * STRING; every STRING-bearing input must retain the supplied originating
  * intern table, even for non-key lanes. NULL intern is numeric-only. Legacy
- * constructors remain numeric-only; INLINE/weighted/timed inputs are excluded.
+ * constructors remain numeric-only. Validated flat INLINE payloads may supply
+ * scalar physical keys/output lanes; numeric-only INLINE still requires its
+ * originating functor intern table. Output does not inherit source arity maps.
+ * Weighted/timed inputs remain excluded.
  * Output STRING IDs borrow the producer readers' retained capability while a
  * batch is pending. A sink keeping independent payloads must capture with its
  * own intern pin before acknowledgement (and before original-owner retirement).

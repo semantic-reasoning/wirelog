@@ -310,7 +310,9 @@ Every STRING lane is validated at capture, including unprojected lanes. Empty
 strings and non-ASCII strings retain their ordinary intern identity. JOINs
 also preserve STRING payload lanes and compare STRING keys only after both
 inputs prove the same originating intern table. Coincident IDs from another
-table are refused; compound sources remain unsupported. Pins retain backing storage; the
+table are refused; SIDE/nested layouts and whole-compound consumers remain
+unsupported. Declared flat INLINE fields may use the same scalar projection
+and JOIN shapes after source-layout and original-use provenance checks. Pins retain backing storage; the
 public program must still outlive its sessions, and intern storage is a resident
 memory floor. A copied raw ID alone does not extend that lifetime.
 
@@ -1925,4 +1927,9 @@ A conservative per-relation summary preserves unsupported nested, whole-value,
 wrong-functor and wrong-arity body uses before optimizer/lowering information
 loss. It does not change existing resident semantics or prevent source schema
 initialization. Missing declaration provenance cannot authorize future compound
-cold reads; this preparation leaves INLINE sealing unsupported.
+cold reads. Supported scalar field projections and JOINs can seal real flat
+INLINE sources only after validating their initialized layout against these
+declarations and the original-use summary. Numeric-only INLINE still pins the
+functor intern table. Output lanes retain scalar types without the source arity
+map; wrong functor/arity, nested and whole-compound uses refuse before retiring
+the source.

@@ -1499,6 +1499,8 @@ typedef struct {
     const char *const *names;
     const wirelog_column_type_t *types;
     const wl_intern_t *intern;
+    const wl_plan_edb_schema_t *schema;
+    bool schema_valid;
 } wl_columnar_join_source_t;
 
 static wl_columnar_join_source_t
@@ -1527,6 +1529,9 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
             src.types = resident->column_types;
         }
     }
+    src.schema_valid = wl_columnar_session_cold_source_schema(s,
+            name ? name : resident ? resident->name : NULL, src.resident,
+            src.cold ? src.cold->payload : NULL, &src.schema);
     return src;
 }
 
@@ -1542,6 +1547,7 @@ wl_columnar_join_source_key(const wl_columnar_join_source_t *src,
 static bool
 wl_columnar_join_source_references(const wl_columnar_join_source_t *src)
 {
+    if (src->schema) return true; /* Numeric INLINE still owns functor IDs. */
     for (uint32_t c = 0; src->types && c < src->width; c++)
         if (src->types[c] == WIRELOG_TYPE_STRING) return true;
     return false;
@@ -1551,12 +1557,8 @@ static bool
 wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
     uint32_t key)
 {
-    if (key >= src->width || (!src->cold && !src->resident)) return false;
-    const col_rel_t *r = src->resident;
-    if (r && (r->timestamps || r->has_graph_column ||
-        r->compound_kind != WIRELOG_COMPOUND_KIND_NONE || r->compound_count ||
-        r->compound_arity_map || r->compound_arity_len ||
-        r->inline_physical_offset)) return false;
+    if (!src->schema_valid || key >= src->width ||
+        (!src->cold && !src->resident)) return false;
     wirelog_column_type_t type =
         src->types ? src->types[key] : WIRELOG_TYPE_INT64;
     if (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_STRING) return false;
@@ -1575,7 +1577,8 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     const wl_columnar_join_source_t *left,
     const wl_columnar_join_source_t *right)
 {
-    if (op->op != WL_PLAN_OP_JOIN || op->key_count != 1 || op->opaque_data ||
+    if (!left->schema_valid || !right->schema_valid ||
+        op->op != WL_PLAN_OP_JOIN || op->key_count != 1 || op->opaque_data ||
         op->materialized || op->right_filter_expr.size || !op->right_relation ||
         (op->project_count && !op->project_indices) ||
         (op->delta_mode != WL_DELTA_AUTO &&
@@ -1730,7 +1733,15 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
             status = wl_columnar_batch_payload_take(sess->memory_governor,
                     sess->spill_store, &left->rel, NULL, NULL, &inputs[i]);
         else {
-            status =
+            status = sources[i].schema ?
+                wl_columnar_batch_payload_capture_with_inline(
+                sess->memory_governor,
+                sess->spill_store, sources[i].resident,
+                sources[i].resident->nrows,
+                WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+                sources[i].schema->columns,
+                sources[i].schema->column_count, sess->intern, NULL, NULL,
+                &inputs[i]) :
                 wl_columnar_batch_payload_capture_with_intern(
                 sess->memory_governor,
                 sess->spill_store, sources[i].resident,
