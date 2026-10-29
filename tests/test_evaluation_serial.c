@@ -35,6 +35,7 @@ extern bool wl_columnar_eval_delta_test_fail_observer_stream_release_once;
 extern bool wl_columnar_eval_delta_test_fail_prepare_current_alloc;
 extern uint32_t wl_columnar_eval_delta_test_stream_validation_rows;
 extern size_t wl_columnar_session_test_observer_precharged_events;
+extern bool wl_columnar_session_test_fail_frontier_map_allocation;
 extern void (*wl_columnar_session_test_staging_prepared)(
     wl_evaluation_control_t *);
 extern void (*wl_columnar_session_test_before_successor_registration)(
@@ -3218,6 +3219,58 @@ frontier_request_stop(wl_evaluation_control_t *control)
     else wl_evaluation_control_request_cancel(control);
 }
 
+/* Probe only live transaction records; copied stale fields are never followed. */
+static void
+frontier_map_authority(const wl_columnar_eval_private_bindings_t *bindings)
+{
+    CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
+            bindings->session, bindings));
+    const wl_plan_relation_t *plan = bindings->plan;
+    col_rel_t *out = (col_rel_t *)(uintptr_t)1;
+    wl_columnar_eval_private_bindings_t stale = *bindings;
+    stale.generation++;
+    CHECK(wl_columnar_session_delta_source(bindings->session, &stale,
+        plan->ops, &out) == EINVAL && !out);
+    wl_columnar_eval_private_bindings_t *live =
+        (wl_columnar_eval_private_bindings_t *)bindings;
+    uint64_t generation = live->generation;
+    live->generation++;
+    CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+        plan->ops, &out) == EINVAL && !out);
+    live->generation = generation;
+    uint64_t attempt = live->attempt_id;
+    live->attempt_id++;
+    CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+        plan->ops, &out) == EINVAL && !out);
+    live->attempt_id = attempt;
+    const wl_plan_op_t *misaligned = (const wl_plan_op_t *)
+        ((const unsigned char *)plan->ops + 1);
+    CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+        misaligned, &out) == EINVAL && !out);
+    CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+        plan->ops + plan->op_count, &out) == EINVAL && !out);
+    wl_plan_op_t copied = plan->ops[0];
+    CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
+        &copied, &out) == EINVAL && !out);
+    const wl_plan_t *public_plan = bindings->session->plan;
+    for (uint32_t si = 0; si < public_plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < public_plan->strata[si].relation_count;
+            ++ri){
+            const wl_plan_relation_t *other =
+                &public_plan->strata[si].relations[ri];
+            if (strcmp(other->name, plan->name) && other->ops)
+                CHECK(wl_columnar_session_delta_source(bindings->session,
+                    bindings, other->ops, &out) == EINVAL && !out);
+        }
+    const wl_plan_op_t *tail = &plan->ops[plan->op_count - 3];
+    CHECK(tail->op == WL_PLAN_OP_VARIABLE && !strcmp(tail->relation_name,
+        plan->name));
+    CHECK(!wl_columnar_session_delta_source(bindings->session, bindings, tail,
+        &out) && !out);
+    CHECK(wl_columnar_session_observed_bindings_authorized(bindings->session,
+        bindings));
+}
+
 static void
 frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
@@ -3240,25 +3293,7 @@ frontier_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     }
     if (phase == 38) frontier_full = progress;
     if (phase == 36) {
-        CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
-                bindings->session, bindings));
-        wl_columnar_eval_private_bindings_t copy = *bindings;
-        col_rel_t *refused = (col_rel_t *)(uintptr_t)1;
-        CHECK(wl_columnar_session_delta_source(bindings->session, &copy,
-            &bindings->plan->ops[0], &refused) == EINVAL && !refused);
-        const wl_plan_op_t *bad = (const wl_plan_op_t *)
-            ((const unsigned char *)bindings->plan->ops + 1);
-        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
-            bad, &refused) == EINVAL && !refused);
-        wl_plan_op_t foreign = bindings->plan->ops[0];
-        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
-            &foreign, &refused) == EINVAL && !refused);
-        CHECK(wl_columnar_session_delta_source(bindings->session, bindings,
-            bindings->plan->ops + bindings->plan->op_count,
-            &refused) == EINVAL && !refused);
-        CHECK(!wl_columnar_session_delta_source(bindings->session, bindings,
-            &bindings->plan->ops[bindings->plan->op_count - 3],
-            &refused) && !refused);
+        frontier_map_authority(bindings);
         const wl_plan_op_t *selected =
             &bindings->plan->ops[frontier_selected_op];
         const char *source_name = selected->op == WL_PLAN_OP_VARIABLE
@@ -4434,6 +4469,7 @@ append_dispatch_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     if (phase != 28) return;
     CHECK(bindings && wl_columnar_session_observed_bindings_authorized(
             bindings->session, bindings));
+    frontier_map_authority(bindings);
     const wl_plan_op_t *selected = &bindings->plan->ops[append_selected_op];
     if (selected->op == WL_PLAN_OP_VARIABLE) {
         CHECK(!strcmp(selected->relation_name,
@@ -4595,7 +4631,7 @@ test_controlled_persistent_join(void)
     free(actual); free(expected);
 }
 
-static unsigned append_stop_phase, append_stop_head;
+static unsigned append_stop_phase, append_stop_head, append_audit_hits;
 static bool append_stop_work, append_stopped;
 static void
 append_stop_checkpoint(wl_evaluation_control_t *control, unsigned phase,
@@ -4604,6 +4640,9 @@ append_stop_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     append_dispatch_checkpoint(control, phase, progress, bindings);
     if (append_stopped || phase != append_stop_phase
         || (phase == 8 && progress != append_stop_head)) return;
+    if (phase == 43 && ++append_audit_hits < 2) return;
+    if (phase == 44 && (strcmp(bindings->plan->name, "a") ||
+        bindings->plan->ops[progress].op != WL_PLAN_OP_JOIN)) return;
     append_stopped = true;
     if (append_stop_work)
         CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
@@ -4615,9 +4654,12 @@ static void
 test_controlled_append_successors(void)
 {
     const unsigned phases[] = {25, 26, 27, 28, 8, 13, 14, 15};
-    for (unsigned shape = 0; shape < 4; ++shape) {
-        for (unsigned trial = 0; trial < (shape ? 1u : 17u); ++trial) {
-            const char *source = shape == 3
+    const unsigned union_phases[] = {42, 41, 43, 25, 26, 27, 44, 28, 8, 13, 14,
+                                     15};
+    for (unsigned shape = 0; shape < 6; ++shape) {
+        for (unsigned trial = 0; trial < (shape == 3 ? 25u : shape ? 1u : 17u);
+            ++trial){
+            const char *source = shape >= 3
                 ? ".decl l(x:int64)\n.decl r(x:int64,y:int64)\n"
                 ".decl a(x:int64,y:int64)\n.decl b(x:int64,y:int64)\n"
                 "a(x,y) :- l(x), r(x,y), y > 0.\n"
@@ -4662,6 +4704,7 @@ test_controlled_append_successors(void)
             CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
                 &reference));
             ((wl_col_session_t *)reference)->diff_enabled = false;
+            if (shape == 4) ((wl_col_session_t *)session)->diff_enabled = false;
             observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
             observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
             CHECK(actual && expected);
@@ -4674,12 +4717,23 @@ test_controlled_append_successors(void)
             CHECK(!wl_session_insert(session, "r", r, 4, 2));
             CHECK(!wl_session_insert(reference, "r", r, 4, 2));
             CHECK(!observed_multi_step(session) && !wl_session_step(reference));
-            for (unsigned cycle = 0; cycle < (trial ? 1u : 5u); ++cycle) {
+            for (unsigned cycle = 0; cycle < (trial ? 1u : 6u); ++cycle) {
                 actual->count = expected->count = 0;
                 col_rel_t *old = session_find_rel((wl_col_session_t *)session,
                         "a");
                 const int64_t extra[] = {2, 3};
-                if (cycle == 4) {
+                if (shape == 5 && (cycle == 2 || cycle == 3)) {
+                    wl_session_set_delta_cb(session,
+                        cycle == 2 ? NULL : observed_multi_capture,
+                        cycle == 2 ? NULL : actual);
+                    wl_session_set_delta_cb(reference,
+                        cycle == 2 ? NULL : observed_multi_capture,
+                        cycle == 2 ? NULL : expected);
+                }
+                if (cycle == 5) {
+                    CHECK(!wl_session_insert(session, "l", extra, 0, 1));
+                    CHECK(!wl_session_insert(reference, "l", extra, 0, 1));
+                } else if (cycle == 4) {
                     CHECK(!wl_session_remove(session, "l", extra, 1, 1));
                     CHECK(!wl_session_remove(reference, "l", extra, 1, 1));
                 } else {
@@ -4702,8 +4756,10 @@ test_controlled_append_successors(void)
                 append_dispatches = append_selected_rows = 0;
                 append_left_reads = append_right_reads = 0;
                 append_stopped = false; append_stop_phase = UINT_MAX;
+                append_audit_hits = 0;
                 if (trial) {
-                    append_stop_phase = phases[(trial - 1) / 2];
+                    append_stop_phase = (shape ==
+                        3 ? union_phases : phases)[(trial - 1) / 2];
                     append_stop_head = 1;
                     append_stop_work = (trial - 1) % 2 != 0;
                     CHECK(!wl_evaluation_control_configure(control,
@@ -4738,8 +4794,9 @@ test_controlled_append_successors(void)
                 } else {
                     CHECK(!rc);
                     CHECK(append_dispatches == (cycle < 3
-                        ? !shape ? 2u : shape == 3 ? 3u : 0u : 0u));
-                    if (shape == 3 && cycle < 3)
+                        ? !shape ? 2u : (shape == 3 ||
+                        shape == 5) ? 3u : 0u : 0u));
+                    if ((shape == 3 || shape == 5) && cycle < 3)
                         CHECK(append_left_reads == 2 &&
                             append_right_reads == 1);
                     CHECK(append_selected_rows == append_dispatches
@@ -4779,6 +4836,146 @@ test_controlled_append_successors(void)
             free(actual); free(expected);
         }
     }
+}
+
+static wl_columnar_memory_governor_t *frontier_map_governor;
+static wl_columnar_memory_reservation_t frontier_map_pressure;
+static bool frontier_map_fault_fired;
+static unsigned frontier_map_fault;
+
+static void
+frontier_map_fault_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t progress, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)control; (void)progress; (void)bindings;
+    if (frontier_map_fault_fired) return;
+    if (!frontier_map_fault && phase == 1) {
+        uint64_t remaining = frontier_map_governor->budget_bytes
+            - wl_columnar_memory_reserved(frontier_map_governor);
+        CHECK(wl_columnar_memory_reserve_checked(frontier_map_governor,
+            remaining,
+            &frontier_map_pressure) == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+        frontier_map_fault_fired = true;
+    } else if (frontier_map_fault && phase == 42) {
+        wl_columnar_session_test_fail_frontier_map_allocation = true;
+        frontier_map_fault_fired = true;
+    }
+}
+
+static void
+test_controlled_frontier_map_failures(void)
+{
+    /* No JOIN indexes can be reclaimed to hide metadata admission denial. */
+    for (unsigned recursive = 0; recursive < 2; ++recursive)
+        for (unsigned fault = 0; fault < 2; ++fault) {
+            char source[512];
+            snprintf(source, sizeof(source),
+                ".decl l(x:int64)\n.decl a(x:int64)\n.decl b(x:int64)\n"
+                "a(x) :- l(x).\na(x) :- l(x), x > 0.\n%s",
+                recursive ? "a(x) :- b(x).\nb(x) :- a(x).\n"
+                : "b(x) :- l(x).\n");
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            CHECK(program);
+            wl_plan_t *plan = NULL;
+            CHECK(!wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options; wl_session_options_init(&options);
+            options.evaluation_control = control;
+            options.memory_governor = governor;
+            wl_session_t *session = NULL, *reference = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1,
+                &options, &session));
+            CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                &reference));
+            ((wl_col_session_t *)reference)->diff_enabled = false;
+            observed_multi_capture_t *actual = calloc(1, sizeof(*actual));
+            observed_multi_capture_t *expected = calloc(1, sizeof(*expected));
+            CHECK(actual && expected);
+            wl_session_set_delta_cb(session, observed_multi_capture, actual);
+            wl_session_set_delta_cb(reference, observed_multi_capture,
+                expected);
+            const int64_t first = 1, extra = 2;
+            CHECK(!wl_session_insert(session, "l", &first, 1, 1));
+            CHECK(!wl_session_insert(reference, "l", &first, 1, 1));
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            const char *names[] = {"a", "b"};
+            col_rel_t *old[2]; col_relation_snapshot_t snapshots[2];
+            for (unsigned h = 0; h < 2; ++h) {
+                old[h] = session_find_rel((wl_col_session_t *)session,
+                        names[h]);
+                CHECK(old[h]);
+                snapshots[h] = wl_columnar_relation_snapshot(old[h]);
+            }
+            actual->count = expected->count = 0;
+            CHECK(!wl_session_insert(session, "l", &extra, 1, 1));
+            CHECK(!wl_session_insert(reference, "l", &extra, 1, 1));
+            frontier_map_governor =
+                wl_columnar_memory_governor_ref_get(governor);
+            frontier_map_fault = fault; frontier_map_fault_fired = false;
+            wl_columnar_memory_reservation_init(&frontier_map_pressure);
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                frontier_map_fault_checkpoint;
+            int rc = EAGAIN; unsigned turns = 0;
+            while (rc == EAGAIN && !frontier_map_fault_fired) {
+                rc = wl_session_step(session); CHECK(++turns < 100000);
+            }
+            CHECK(frontier_map_fault_fired);
+            /* Release competing credit before advancing any retained cleanup. */
+            if (!fault) CHECK(wl_columnar_memory_rollback(
+                        &frontier_map_pressure));
+            if (rc == EAGAIN) rc = observed_multi_step(session);
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+            CHECK(rc == (fault ? ENOMEM : ENOSPC));
+            CHECK(!wl_columnar_session_test_fail_frontier_map_allocation);
+            CHECK(!actual->count &&
+                ((wl_col_session_t *)session)->pending_input_change);
+            for (unsigned h = 0; h < 2; ++h) {
+                CHECK(session_find_rel((wl_col_session_t *)session,
+                    names[h]) == old[h]);
+                CHECK(wl_columnar_relation_snapshot_equal(snapshots[h],
+                    wl_columnar_relation_snapshot(old[h])));
+            }
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            CHECK(!observed_multi_step(session) && !wl_session_step(reference));
+            CHECK(actual->count == expected->count);
+            qsort(actual->events, actual->count, sizeof(actual->events[0]),
+                observed_multi_order);
+            qsort(expected->events, expected->count,
+                sizeof(expected->events[0]), observed_multi_order);
+            CHECK(!memcmp(actual->events, expected->events,
+                actual->count * sizeof(actual->events[0])));
+            for (unsigned h = 0; h < 2; ++h) {
+                col_rel_t *a = session_find_rel((wl_col_session_t *)session,
+                        names[h]);
+                col_rel_t *b = session_find_rel((wl_col_session_t *)reference,
+                        names[h]);
+                CHECK(a && b && a->ncols == 1 && b->ncols == 1 &&
+                    a->nrows == 2 && b->nrows == 2);
+                for (uint32_t row = 0; row < 2;
+                    ++row) CHECK(a->columns[0][row] == b->columns[0][row]);
+            }
+            unsigned delivered = actual->count;
+            CHECK(!observed_multi_step(session) && actual->count == delivered);
+            CHECK(!wl_session_try_destroy(&session));
+            wl_session_destroy(reference);
+            wl_evaluation_control_release(control); wl_plan_free(plan);
+            wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(frontier_map_governor));
+            wl_columnar_memory_governor_ref_release(governor); free(actual);
+            free(expected);
+        }
 }
 
 static unsigned persistent_stop_phase, persistent_stop_hits;
@@ -12120,6 +12317,7 @@ main(void)
     test_controlled_observed_multi();
     test_controlled_persistent_join();
     test_controlled_append_successors();
+    test_controlled_frontier_map_failures();
     test_controlled_persistent_stops();
     test_controlled_persistent_refusals();
     test_controlled_incremental_consolidate_step();
