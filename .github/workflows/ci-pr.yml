@@ -392,11 +392,58 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           # pkgconfiglite ships from a SourceForge mirror without a
           # checksum; chocolatey's default policy now blocks empty
           # checksums for non-secure sources, so opt in explicitly.
-          choco install pkgconfiglite uncrustify meson -y --allow-empty-checksums
+          # `ninja` is named explicitly: meson requires it to spawn the
+          # build, and the block below verifies it is resolvable no
+          # matter how each package delivered it.
+          choco install pkgconfiglite uncrustify meson ninja -y --allow-empty-checksums
+          if ($LASTEXITCODE -ne 0) { throw "choco install failed with exit code $LASTEXITCODE" }
+          # The Chocolatey meson package is an MSI.  Its PATH entry goes
+          # into the machine registry, which this job's already-snapshotted
+          # environment never sees, and chocolatey creates no shim for it,
+          # so `meson` was unresolvable in every later step (run
+          # 40932685444).  Resolve the install directory (chocolatey's own
+          # registry record first, the MSI's documented default locations
+          # next, filesystem search last) and publish it on GITHUB_PATH
+          # -- the same mechanism the former setup-meson action used.
+          # Fails loudly if either tool is missing or broken.
+          $mesonDir = $null
+          $reg = Get-ItemProperty 'HKLM:\SOFTWARE\chocolatey\installed\meson' -ErrorAction SilentlyContinue
+          if ($reg.installLocation -and (Test-Path (Join-Path $reg.installLocation 'meson.exe'))) {
+            $mesonDir = $reg.installLocation
+          }
+          if (-not $mesonDir) {
+            foreach ($cand in 'C:\Program Files\Meson', 'C:\Program Files\meson', 'C:\Program Files (x86)\Meson', 'C:\Program Files (x86)\meson') {
+              if (Test-Path (Join-Path $cand 'meson.exe')) { $mesonDir = $cand; break }
+            }
+          }
+          if (-not $mesonDir) {
+            $found = Get-ChildItem 'C:\Program Files', 'C:\Program Files (x86)' -Recurse -Filter 'meson.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $found) { throw 'chocolatey reported success but meson.exe was not found' }
+            $mesonDir = Split-Path $found.FullName -Parent
+          }
+          $mesonExe = Join-Path $mesonDir 'meson.exe'
+          if (-not (Test-Path $mesonExe)) { throw "meson.exe not found in $mesonDir" }
+          & $mesonExe --version
+          if ($LASTEXITCODE -ne 0) { throw "meson --version failed with exit code $LASTEXITCODE" }
+          # GITHUB_PATH changes only take effect in later steps, so verify
+          # ninja here by full path (MSI-bundled copy) or via the
+          # chocolatey shim if the package delivered it that way.
+          $ninjaExe = Join-Path $mesonDir 'ninja.exe'
+          if (Test-Path $ninjaExe) {
+            & $ninjaExe --version
+            if ($LASTEXITCODE -ne 0) { throw "ninja --version failed with exit code $LASTEXITCODE" }
+          } else {
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw 'ninja was not resolvable after chocolatey install' }
+            ninja --version
+            if ($LASTEXITCODE -ne 0) { throw "ninja --version failed with exit code $LASTEXITCODE" }
+          }
+          Add-Content $env:GITHUB_PATH $mesonDir
 
       - name: Configure (Linux / macOS)
         if: runner.os != 'Windows'
