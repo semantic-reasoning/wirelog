@@ -60,6 +60,10 @@ typedef enum {
     WL_CONTROLLED_STEP_RETRYABLE,
     /* Provenance changed outside the authorized retryable input path. */
     WL_CONTROLLED_STEP_INVALIDATED,
+    /* Completed public state with legal, unevaluated input mutations. */
+    WL_CONTROLLED_STEP_DIRTY,
+    /* A stopped synchronous SNAPSHOT may only be retried as SNAPSHOT. */
+    WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE,
 } wl_controlled_step_state_t;
 
 /**
@@ -147,6 +151,9 @@ typedef struct {
     void (*session_controlled_mutation_committed)(wl_session_t *session,
         bool insert, const char *relation, uint32_t num_rows,
         uint32_t num_cols);
+    /* Opt in explicitly before a controlled SNAPSHOT may evaluate fresh or
+     * dirty inputs. A read-only completed-snapshot backend need not opt in. */
+    bool session_controlled_snapshot_evaluates;
 } wl_compute_backend_t;
 
 /**

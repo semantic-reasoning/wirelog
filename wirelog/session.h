@@ -315,6 +315,13 @@ wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
  *
  * Evaluate the current state of the backend as a single batch and yield all
  * output tuples (IDB derivations) to the provided callback synchronously.
+ * With attached evaluation control, fresh and normally dirty columnar sessions
+ * evaluate and prepare all tuples under one attempt and cumulative allowance.
+ * Before publication, a stop delivers no tuples or deltas and preserves the
+ * preceding public heads and staged inputs. Reset/raise the control and retry
+ * SNAPSHOT; an unrelated retained STEP must instead be completed with STEP.
+ * Tuple delivery after the prepaid cutoff is indivisible with respect to
+ * control stops; callback-triggered cancellation remains for the next attempt.
  *
  * Returns:
  *    0 on success.

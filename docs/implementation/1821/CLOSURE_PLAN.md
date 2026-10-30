@@ -491,3 +491,15 @@ the observed host. `tests/test_evaluation_lifecycle.c` adds independent generate
 reference parity, repeated callback-free/observed cycles and deterministic
 setup/later-child stops; source and test changes form one atomic unit. Fresh
 and dirty evaluating SNAPSHOT remains the next integration unit (#2295).
+
+
+### Evaluating SNAPSHOT (#2295)
+
+Fresh and dirty snapshots compose private evaluation and charged snapshot
+preparation before the transaction cutoff under one retained control attempt.
+The synchronous call owns final reporting and all ephemeral callback contexts.
+Failed precommit snapshots rebuild on retry; existing STEP continuations remain
+protected. `evaluation_lifecycle` adds nonempty generated reference content,
+phase/attempt witnesses, allocation and control stops, cutoff delivery and an
+explicitly empirical combined allowance boundary. Installed control attachment
+and broader expression/representation qualification remain separate work.

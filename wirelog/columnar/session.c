@@ -230,10 +230,19 @@ typedef struct {
     uint8_t degrees[COL_STACK_MAX];
 } wl_columnar_session_observed_transaction_t;
 
+typedef struct wl_session_snapshot_payload wl_session_snapshot_payload_t;
+static int wl_session_snapshot_prepare(wl_col_session_t *,
+    wl_session_snapshot_payload_t *, col_rel_t *const *, uint32_t);
+static void wl_session_snapshot_deliver(wl_session_snapshot_payload_t *);
+
 struct wl_columnar_controlled_step {
     wl_columnar_session_observed_transaction_t *transaction;
     bool general_observed, transaction_initialized, transaction_discard;
     bool callback_changed;
+    /* Borrowed only while the enclosing synchronous SNAPSHOT owns admission.
+     * Its outer host closes the single evaluation+preparation control attempt. */
+    wl_session_snapshot_payload_t *snapshot;
+    bool snapshot_owned, snapshot_retry;
     size_t transaction_initialized_bytes;
     wl_columnar_eval_serial_framed_host_reply_t reply;
     wl_evaluation_control_t *previous_funding;
@@ -8129,7 +8138,8 @@ static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
 {
-    int rc = wl_evaluation_control_finish(sess->base.evaluation_control,
+    int rc = step->snapshot_owned ? result
+        : wl_evaluation_control_finish(sess->base.evaluation_control,
             sess->base.operation_admission, result, 0);
     step->preflight_phase = COL_CONTROLLED_PREFLIGHT_IDLE;
     step->preflight_op = 0;
@@ -8159,8 +8169,10 @@ col_controlled_step_finish(wl_col_session_t *sess,
     step->default_preflight_charged_actions = 0;
     step->default_preflight_target_found = false;
     step->default_preflight_entry_charged = false;
-    step->operation_active = false;
-    step->operation_id = 0;
+    if (!step->snapshot_owned) {
+        step->operation_active = false;
+        step->operation_id = 0;
+    }
     step->relation_active = false;
     step->primary_result = 0;
     step->refused = result != 0
@@ -10746,6 +10758,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
                     original->relation;
             return 0;
         }
+        /* Gather the entire batch from private candidates before any old
+         * public descriptor is claimed. All scalar leases end in prepare. */
+        if (step->snapshot) {
+            rc = wl_session_snapshot_prepare(sess, step->snapshot,
+                    tx->image, tx->image_count);
+            if (rc) return rc;
+        }
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RELEASE_READERS;
         return 0;
     case WL_SESSION_OBSERVED_RELEASE_READERS: /* Relinquish readers only for descriptors to be exclusively retired. */
@@ -10846,7 +10865,10 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         tx->committed = step->published = true;
         step->observer_cleanup_pending = tx->observer_started;
         tx->index = 0; tx->phase = WL_SESSION_OBSERVED_RETIRE;
+        /* Both batches were fully admitted before the single cutoff. Late
+         * cancellation can affect the next attempt, never this delivery. */
         if (tx->observer_started) wl_columnar_eval_delta_observer_publish(sess);
+        if (step->snapshot) wl_session_snapshot_deliver(step->snapshot);
         return 0;
     }
     case WL_SESSION_OBSERVED_RETIRE:
@@ -10979,7 +11001,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
             if (cancel_rc) return EAGAIN;
             tx->rollback = false;
             tx->phase = WL_SESSION_OBSERVED_CLAIMS; tx->index = 0;
-            if (tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT
+            if (step->snapshot_owned
+                || tx->rollback_result != WL_EVALUATION_CONTROL_WORK_LIMIT
                 || tx->differential.started || tx->append_active ||
                 tx->frontier_started) {
                 step->transaction_discard = true;
@@ -11003,7 +11026,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
             /* Synchronous JOIN/image builders may own a partial index.
              * Retire the entire private image before retrying a stopped
              * differential attempt; only the published image may survive. */
-            if (!tx->committed && (rc != WL_EVALUATION_CONTROL_WORK_LIMIT
+            if (!tx->committed && (step->snapshot_owned
+                || rc != WL_EVALUATION_CONTROL_WORK_LIMIT
                 || tx->differential.started || tx->append_active ||
                 tx->frontier_started)) {
                 step->transaction_discard = true;
@@ -11589,9 +11613,16 @@ wl_columnar_session_observed_general_shape(const wl_col_session_t *sess)
 }
 
 static int
-col_controlled_step(wl_col_session_t *sess)
+col_controlled_step(wl_col_session_t *sess,
+    wl_session_snapshot_payload_t *snapshot)
 {
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->snapshot_retry && !snapshot) return EBUSY;
+    if (step && snapshot) {
+        step->snapshot_owned = true;
+        step->snapshot = snapshot;
+        step->snapshot_retry = false;
+    }
     bool successor_step = false;
     if (step && step->complete && step->recursive_route) {
         if (!step->retryable) {
@@ -11625,7 +11656,8 @@ col_controlled_step(wl_col_session_t *sess)
         int rc = col_controlled_step_static_preflight(sess, true);
         if (rc) return rc;
         uint64_t identity = step->operation_identity;
-        bool general = step->general_observed || step->callback_changed
+        bool general = snapshot || step->general_observed ||
+            step->callback_changed
             || sess->nrels > 3;
         if (step->transaction) {
             if (!step->operation_active) {
@@ -11679,10 +11711,16 @@ col_controlled_step(wl_col_session_t *sess)
             && wl_columnar_eval_plan_numeric_recursive_path_supported(
             &plan->strata[0].relations[0]);
         sess->controlled_step->observed = sess->delta_cb != NULL;
-        sess->controlled_step->general_observed =
-            wl_columnar_session_observed_general_shape(sess);
+        sess->controlled_step->general_observed = snapshot
+            || wl_columnar_session_observed_general_shape(sess);
         if (sess->controlled_step->general_observed)
             sess->controlled_step->recursive_route = false;
+    }
+    if (snapshot) {
+        sess->controlled_step->snapshot = snapshot;
+        sess->controlled_step->snapshot_owned = true;
+        sess->controlled_step->general_observed = true;
+        sess->controlled_step->recursive_route = false;
     }
     return col_controlled_step_drive(sess, sess->controlled_step, false);
 }
@@ -11752,7 +11790,7 @@ col_session_step(wl_session_t *session)
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
     if (cold_rc != 0) return cold_rc;
     if (session->evaluation_control)
-        return col_controlled_step(COL_SESSION(session));
+        return col_controlled_step(COL_SESSION(session), NULL);
     return col_session_step_impl(session);
 }
 
@@ -11764,6 +11802,8 @@ col_session_controlled_step_state(const wl_session_t *session)
     if (sess->cleanup_active || sess->cleanup_pending)
         return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
+    if (step->snapshot_retry && !step->operation_active)
+        return WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE;
     if (step->provenance_invalid
         || (step->complete && step->recursive_route
         && step->provenance_valid
@@ -11775,8 +11815,14 @@ col_session_controlled_step_state(const wl_session_t *session)
         if (step->observed && (!step->published
             || step->observer_cleanup_pending))
             return WL_CONTROLLED_STEP_PENDING;
-        return (step->retryable ||
-               step->successor_mutation_seen) ? WL_CONTROLLED_STEP_RETRYABLE
+        /* The qualified binary route records authorized append provenance
+         * separately from ordinary transaction mutations. No recursive frame
+         * or attempt remains at this successful completed boundary. */
+        if (step->successor_mutation_seen
+            || (step->recursive_route && step->retryable
+            && step->provenance_valid && !step->recursive
+            && !step->operation_active)) return WL_CONTROLLED_STEP_DIRTY;
+        return step->retryable ? WL_CONTROLLED_STEP_RETRYABLE
             : WL_CONTROLLED_STEP_COMPLETE;
     }
     return step->refused ? WL_CONTROLLED_STEP_IDLE
@@ -12662,6 +12708,27 @@ typedef struct {
     wl_columnar_relation_scalar_source_t source;
 } wl_session_snapshot_entry_t;
 
+struct wl_session_snapshot_payload {
+    wl_session_snapshot_entry_t *entries;
+    int64_t *values;
+    size_t count;
+    wl_columnar_memory_reservation_t metadata_credit, values_credit;
+    wirelog_on_tuple_fn callback;
+    void *user_data;
+};
+
+static void
+wl_session_snapshot_deliver(wl_session_snapshot_payload_t *payload)
+{
+    for (size_t i = 0; i < payload->count; ++i) {
+        const wl_session_snapshot_entry_t *entry = &payload->entries[i];
+        for (uint32_t row = 0; row < entry->rows; ++row)
+            payload->callback(entry->name, payload->values + entry->offset
+                + (size_t)row * (entry->width ? entry->width : 1),
+                entry->width, payload->user_data);
+    }
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 void (*wl_columnar_session_test_snapshot_checkpoint)(
     wl_evaluation_control_t *, unsigned, size_t);
@@ -12700,6 +12767,8 @@ wl_session_snapshot_allocate(wl_col_session_t *sess, uint64_t bytes,
             credit, &status, control,
             wl_evaluation_control_active_attempt_id(control));
         if (rc) return rc;
+        if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+            sess->memory_budget_denied = true;
         if (status != WL_COLUMNAR_MEMORY_ADMISSION_OK
             && status != WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
             return status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
@@ -12730,7 +12799,8 @@ wl_session_snapshot_free(void *storage,
 
 static int
 wl_session_snapshot_prepare(wl_col_session_t *sess,
-    wirelog_on_tuple_fn callback, void *user_data)
+    wl_session_snapshot_payload_t *payload,
+    col_rel_t *const *registry, uint32_t registry_count)
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
@@ -12738,11 +12808,8 @@ wl_session_snapshot_prepare(wl_col_session_t *sess,
     size_t count = 0, initialized_entries = 0;
     wl_session_snapshot_entry_t *entries = NULL;
     int64_t *values = NULL;
-    wl_columnar_memory_reservation_t metadata_credit, values_credit;
     int rc = wl_evaluation_control_charge(control, 256);
     if (rc) return rc;
-    wl_columnar_memory_reservation_init(&metadata_credit);
-    wl_columnar_memory_reservation_init(&values_credit);
     for (uint32_t si = 0; si < plan->stratum_count; ++si) {
         rc = wl_evaluation_control_charge(control, 1);
         if (rc) goto cleanup;
@@ -12763,9 +12830,11 @@ wl_session_snapshot_prepare(wl_col_session_t *sess,
     }
     size_t metadata_bytes = count * sizeof(*entries);
     void *metadata_storage = NULL;
-    rc = wl_session_snapshot_allocate(sess, metadata_bytes, &metadata_credit,
+    rc = wl_session_snapshot_allocate(sess, metadata_bytes,
+            &payload->metadata_credit,
             &metadata_storage);
     entries = metadata_storage;
+    payload->entries = entries;
     if (rc) goto cleanup;
     /* Every initialized entry also prepays its cleanup traversal slot. */
     for (size_t offset = 0; offset < (size_t)metadata_bytes;) {
@@ -12791,10 +12860,10 @@ wl_session_snapshot_prepare(wl_col_session_t *sess,
             initialized_entries = index;
             entry->name = plan->strata[si].relations[ri].name;
             col_rel_t *relation = NULL;
-            for (uint32_t slot = 0; slot < sess->nrels; ++slot) {
+            for (uint32_t slot = 0; slot < registry_count; ++slot) {
                 rc = wl_evaluation_control_charge(control, 1);
                 if (rc) goto cleanup;
-                col_rel_t *r = sess->rels[slot];
+                col_rel_t *r = registry[slot];
                 if (!r || !r->name || !entry->name) continue;
                 size_t byte = 0;
                 for (;;) {
@@ -12842,9 +12911,11 @@ wl_session_snapshot_prepare(wl_col_session_t *sess,
             rc = EOVERFLOW; goto cleanup;
         }
         void *value_storage = NULL;
-        rc = wl_session_snapshot_allocate(sess, value_bytes, &values_credit,
+        rc = wl_session_snapshot_allocate(sess, value_bytes,
+                &payload->values_credit,
                 &value_storage);
         values = value_storage;
+        payload->values = values;
         if (rc) goto cleanup;
     }
     for (size_t i = 0; i < count; ++i) {
@@ -12874,25 +12945,16 @@ wl_session_snapshot_prepare(wl_col_session_t *sess,
     }
 cutoff:
     rc = wl_session_snapshot_checkpoint(control, 3, count);
-    if (!rc && values) {
-        for (size_t i = 0; i < count; ++i) {
-            wl_session_snapshot_entry_t *entry = &entries[i];
-            for (uint32_t row = 0; row < entry->rows; ++row)
-                callback(entry->name, values + entry->offset
-                    + (size_t)row * (entry->width ? entry->width : 1),
-                    entry->width, user_data);
-        }
-    }
+    if (!rc) payload->count = count;
 cleanup:
     for (size_t i = 0; i < initialized_entries; ++i) {
         if (entries[i].initialized) {
             int end_rc = wl_columnar_relation_scalar_source_end(
                 &entries[i].source, rc);
+            entries[i].initialized = false;
             if (!rc) rc = end_rc;
         }
     }
-    wl_session_snapshot_free(values, &values_credit);
-    wl_session_snapshot_free(entries, &metadata_credit);
     return rc;
 }
 
@@ -12903,24 +12965,82 @@ col_session_snapshot_controlled(wl_session_t *session,
     wl_col_session_t *sess = COL_SESSION(session);
     wl_evaluation_control_t *control = session->evaluation_control;
     const void *owner = session->operation_admission;
-    if (!control || !owner)
-        return EINVAL;
-
+    if (!control || !owner) return EINVAL;
     wl_controlled_step_state_t state =
         col_session_controlled_step_state(session);
-    if (state == WL_CONTROLLED_STEP_PENDING)
-        return EBUSY;
-    if (state != WL_CONTROLLED_STEP_COMPLETE)
-        return ENOTSUP;
-    if (!callback)
-        return EINVAL;
-
-    int rc = wl_evaluation_control_begin(control, owner);
-    if (rc)
-        return rc;
-
-    rc = wl_session_snapshot_prepare(sess, callback, user_data);
-    return wl_evaluation_control_finish(control, owner, rc, 0);
+    if (state == WL_CONTROLLED_STEP_PENDING
+        || state == WL_CONTROLLED_STEP_RETRYABLE
+        || state == WL_CONTROLLED_STEP_INVALIDATED) return EBUSY;
+    if (!callback) return EINVAL;
+    if (state == WL_CONTROLLED_STEP_IDLE && sess->controlled_step)
+        return ENOTSUP; /* An unrelated refused/stopped STEP owns its route. */
+    bool evaluating = state != WL_CONTROLLED_STEP_COMPLETE;
+    if (evaluating) {
+        int admission = col_controlled_step_static_preflight(sess,
+                state == WL_CONTROLLED_STEP_DIRTY);
+        if (admission) return admission;
+    }
+    /* Never reinterpret another owner's already active attempt. */
+    if (wl_evaluation_control_active_attempt_id(control)) return EBUSY;
+    sess->memory_budget_denied = false;
+    wl_columnar_controlled_step_t *prior = sess->controlled_step;
+    if (prior && prior->snapshot_retry && prior->transaction
+        && (!prior->transaction_initialized ||
+        !prior->transaction->committed)) {
+        int dispose;
+        do {
+            dispose = wl_columnar_session_observed_dispose(sess, prior);
+        } while (dispose == EAGAIN);
+        if (dispose) return dispose;
+        prior->transaction_initialized = false;
+        prior->transaction_initialized_bytes = 0;
+        prior->transaction_discard = false;
+    }
+    wl_session_snapshot_payload_t payload = {0};
+    payload.callback = callback; payload.user_data = user_data;
+    wl_columnar_memory_reservation_init(&payload.metadata_credit);
+    wl_columnar_memory_reservation_init(&payload.values_credit);
+    int rc, cleanup_status = 0;
+    if (evaluating) {
+        do {
+            rc = col_controlled_step(sess, &payload);
+        } while (rc == EAGAIN);
+    } else {
+        rc = wl_evaluation_control_begin(control, owner);
+        if (!rc) rc = wl_session_snapshot_prepare(sess, &payload,
+                    sess->rels, sess->nrels);
+        if (!rc) wl_session_snapshot_deliver(&payload);
+    }
+    wl_session_snapshot_free(payload.values, &payload.values_credit);
+    wl_session_snapshot_free(payload.entries, &payload.metadata_credit);
+    wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (evaluating && step) {
+        /* No stack payload or callback context survives a synchronous call.
+         * Failed precommit snapshots always rebuild their private transaction;
+         * in particular a stopped CLAIMS phase cannot skip payload preparation. */
+        if (rc && step->transaction
+            && (!step->transaction_initialized ||
+            !step->transaction->committed)) {
+            int dispose;
+            do {
+                dispose = wl_columnar_session_observed_dispose(sess, step);
+            } while (dispose == EAGAIN);
+            cleanup_status = dispose;
+            if (!dispose) {
+                step->transaction_initialized = false;
+                step->transaction_initialized_bytes = 0;
+                step->transaction_discard = false;
+            }
+        }
+        step->snapshot = NULL;
+        step->snapshot_owned = false;
+        step->snapshot_retry = rc != 0;
+        step->operation_active = false;
+        step->operation_id = 0;
+    }
+    return wl_evaluation_control_active_attempt_id(control)
+        ? wl_evaluation_control_finish(control, owner, rc, cleanup_status)
+        : rc ? rc : cleanup_status;
 }
 
 static int
@@ -12946,6 +13066,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 
 static const wl_compute_backend_t col_backend = {
     .name = "columnar",
+    .session_controlled_snapshot_evaluates = true,
     .session_create = col_session_create,
     .session_destroy = col_session_destroy,
     .session_insert = col_session_insert,

@@ -52,7 +52,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
-| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; fresh ENOTSUP / pending EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | New admission matrix covers fresh and restored/completed state; observed successor tests cover dirty EBUSY; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
+| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | New admission matrix covers fresh and restored/completed state; observed successor tests cover dirty EBUSY; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
 | E13 / S11 | JOIN output limit, active rollback, foreign observer, cleanup pending | R policies/admission; preserve error distinction and owner; no unrestricted fallback | `test_controlled_observed_preflight_rejections`, `test_controlled_batch_child_domain_rejection`; cross-policy matrix and post-stop resource baselines still G6 |
@@ -448,3 +448,34 @@ duplicate and nonmatching inputs, callback changes, repeated signed cycles,
 setup/later-child stops, reset/retry and governed destruction. Existing
 `evaluation_serial` primitive and initial-host boundary assertions remain
 independent. This adds host coverage, not new operator/representation support.
+
+
+### Evaluating SNAPSHOT integration (#2295)
+
+Fresh and normally dirty controlled snapshots use the general private-head
+transaction. The complete staged registry supplies snapshot rows before
+retirement claims; copied tuples and observer events are admitted before one
+publication cutoff. Evaluation, preparation and the completed report share one
+attempt ID and allowance. After cutoff the complete tuple batch is delivered
+before fallible retirement; callback cancellation remains sticky for the next
+attempt. Stable snapshots keep their independent charged staging path.
+
+The synchronous wrapper drains internal continuations. Its payload and callback
+context never escape the call. Any failed precommit snapshot discards its
+private transaction, including a failure at CLAIMS/CUTOFF; retry reconstructs
+it without skipping preparation. Internal DIRTY and SNAPSHOT_RETRYABLE states
+separate legal evaluation from an unrelated retained STEP. A completed numeric
+recursive host with current authorized append provenance and no active frame
+is normal DIRTY input too; its snapshot rebuilds through preserved recursive
+bodies and the same private transaction. Other backends must
+explicitly opt in before controlled snapshots may evaluate.
+
+`evaluation_lifecycle` proves fresh/dirty observed and callback-free reference
+parity, shared attempt identity, evaluation/preparation/claim/cutoff stops,
+allocation failure, unchanged public registry/heads/input generations, protected
+mutations/STEP during snapshot retry, different retry callback contexts and
+postcutoff full delta/tuple delivery. Generated numeric recursive
+STEP/append/SNAPSHOT, preparation stops/retry and future STEP parity are also
+qualified. Its measured whole-host one-short test is
+empirical and does not replace independent primitive cost oracles. Previously
+unsupported operator and representation domains retain their separate owners.

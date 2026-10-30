@@ -5816,8 +5816,8 @@ test_controlled_observed_step(void)
      * signed set difference exactly once. */
     int64_t added_row = 13;
     CHECK(!wl_session_insert(session, "input", &added_row, 1, 1));
-    CHECK(wl_session_snapshot(session,
-        controlled_observer_snapshot_capture, NULL) == EBUSY);
+    CHECK(session->backend->session_controlled_step_state(session)
+        == WL_CONTROLLED_STEP_DIRTY);
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!controlled_recursive_run(session, control));
     CHECK(capture.count == 4 && capture.rows[3] == 13
@@ -6353,8 +6353,8 @@ test_controlled_observed_filter_successors(void)
         CHECK(!mutate(reference, "input", &changes[i], 1, 1));
         CHECK(session_find_rel((wl_col_session_t *)session, "output") == old
             && old->relation_identity == identity && capture.count == events);
-        CHECK(wl_session_snapshot(session, controlled_observer_snapshot_capture,
-            NULL) == EBUSY);
+        CHECK(session->backend->session_controlled_step_state(session)
+            == WL_CONTROLLED_STEP_DIRTY);
         CHECK(!wl_evaluation_control_reset(control));
         CHECK(!controlled_recursive_run(session, control));
         CHECK(!wl_session_step(reference));
@@ -8136,8 +8136,7 @@ test_controlled_session_admission_matrix(void)
         col_relation_snapshot_t before = wl_columnar_relation_snapshot(input);
         uint32_t registered = session->nrels;
         snapshot_capture_t capture = {0};
-        CHECK(wl_session_snapshot(base, capture_snapshot_tuple, &capture)
-            == ENOTSUP);
+        CHECK(wl_session_snapshot(base, NULL, NULL) == EINVAL);
         CHECK(!capture.count);
         wl_evaluation_control_report_t report;
         CHECK(wl_evaluation_control_report(control, &report) == ENOENT);
