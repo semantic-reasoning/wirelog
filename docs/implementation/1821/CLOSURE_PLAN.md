@@ -503,3 +503,16 @@ protected. `evaluation_lifecycle` adds nonempty generated reference content,
 phase/attempt witnesses, allocation and control stops, cutoff delivery and an
 explicitly empirical combined allowance boundary. Installed control attachment
 and broader expression/representation qualification remain separate work.
+
+
+### Mixed lifecycle qualification bundle (#2294 / #2295)
+
+The third atomic unit qualifies the private payload/delivery names under the
+`wl_columnar_session_` internal namespace and adds cross-EDB staged mutation and alternating
+STEP/SNAPSHOT reference parity, actual live-state admission, supported FLOAT
+schema/value and nullary snapshots, empty/rejected-input positive controls,
+metadata/value budget denial and allocation-failure recovery. The generated
+host suite keeps control-stop checks deterministic and treats elapsed time as
+a watchdog. Whole-host allowance calibration remains empirical. Public control
+attachment, broader scalar/operator domains and cross-platform umbrella closure
+remain owned by #1823, #2299–#2301 and #2304/#2305 respectively.

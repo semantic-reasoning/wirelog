@@ -52,7 +52,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
-| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | New admission matrix covers fresh and restored/completed state; observed successor tests cover dirty EBUSY; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
+| E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
 | E13 / S11 | JOIN output limit, active rollback, foreign observer, cleanup pending | R policies/admission; preserve error distinction and owner; no unrestricted fallback | `test_controlled_observed_preflight_rejections`, `test_controlled_batch_child_domain_rejection`; cross-policy matrix and post-stop resource baselines still G6 |
@@ -479,3 +479,26 @@ STEP/append/SNAPSHOT, preparation stops/retry and future STEP parity are also
 qualified. Its measured whole-host one-short test is
 empirical and does not replace independent primitive cost oracles. Previously
 unsupported operator and representation domains retain their separate owners.
+
+
+### Mixed lifecycle qualification (#2294 / #2295)
+
+`evaluation_lifecycle` additionally stages mutations across multiple EDBs before
+one successor, alternates STEP and evaluating SNAPSHOT, changes callbacks at
+completed boundaries and compares relation-qualified tuples and signed events
+with raw sessions. A source compaction refusal caused by live storage ownership
+must still match the raw contract; admission does not erase that protection.
+Actual in-evaluation hooks reject nested STEP/SNAPSHOT, input mutation,
+destruction and control reset/configure. A separate live STEP and an externally
+active control attempt remain protected.
+
+Supported FLOAT scalar schemas/physical values, nullary output, empty input and
+rejected input are exercised through actual generated snapshot hosts. Empty and
+no-output cases have nonempty positive controls. Metadata/value reservation
+denial remains ENOSPC with denial metadata, distinct from value allocation
+ENOMEM; failed fresh/dirty snapshots preserve heads/events and retry, and
+checked destruction returns all governor credits after program ownership ends.
+The installed typed facade has no evaluation-control attachment API in this
+scope (#1823); these are typed engine/source tests, not a claim of end-to-end
+controlled installed typed-facade coverage. Existing raw typed facade regressions
+remain part of the broader suite. New scalar/operator domains retain #2299–#2301.

@@ -602,6 +602,271 @@ test_recursive_dirty_snapshot(void)
     }
 }
 
+static void
+test_mixed_multiinput_lifecycle(void)
+{
+    const char *source =
+        ".decl input(x:int64)\n.decl mask(x:int64)\n"
+        ".decl first(x:int64)\n.decl second(x:int64)\n"
+        "first(x) :- input(x), mask(x).\nsecond(x) :- first(x).\n";
+    fixture_t f;
+    fixture_create(&f, source);
+    const int64_t rows[] = {1, 2, 3}, masks[] = {1, 3};
+    CHECK(!wl_session_insert(f.session, "input", rows, 3, 1));
+    CHECK(!wl_session_insert(f.reference, "input", rows, 3, 1));
+    CHECK(!wl_session_insert(f.session, "mask", masks, 2, 1));
+    CHECK(!wl_session_insert(f.reference, "mask", masks, 2, 1));
+    CHECK(!step(f.session) && !step(f.reference));
+    for (unsigned cycle = 0; cycle < 6; ++cycle) {
+        bool observed = cycle == 1 || cycle >= 3;
+        wl_session_set_delta_cb(f.session, observed ? capture_delta : NULL,
+            &f.actual);
+        wl_session_set_delta_cb(f.reference, observed ? capture_delta : NULL,
+            &f.expected);
+        f.actual.count = f.expected.count = 0;
+        int64_t value = cycle < 2 ? 4 + cycle : cycle == 2 ? 1
+            : cycle == 3 ? 6 : cycle == 4 ? 3 : 7;
+        int (*mutate)(wl_session_t *, const char *, const int64_t *, uint32_t,
+            uint32_t)
+            = cycle == 2 || cycle == 4 ? wl_session_remove : wl_session_insert;
+        CHECK(!mutate(f.session, "input", &value, 1, 1));
+        CHECK(!mutate(f.reference, "input", &value, 1, 1));
+        int mask_rc = mutate(f.session, "mask", &value, 1, 1);
+        int reference_mask_rc = mutate(f.reference, "mask", &value, 1, 1);
+        /* Compaction cannot rewrite a source backing a live output alias.
+         * Preserve the raw session's ownership refusal, including pending
+         * changes already admitted on the other input. */
+        CHECK(mask_rc == reference_mask_rc);
+        if (cycle == 4) CHECK(mask_rc == 0 || mask_rc == EBUSY);
+        else CHECK(!mask_rc);
+        if (cycle % 2) {
+            capture_t actual = {0}, expected = {0};
+            CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+            CHECK(!step(f.reference));
+            CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+            check_capture(&actual, &expected);
+        } else CHECK(!step(f.session) && !step(f.reference));
+        check_capture(&f.actual, &f.expected);
+        CHECK(!observed || f.actual.count == 2);
+        check_results(&f);
+        unsigned events = f.actual.count;
+        CHECK(!step(f.session) && f.actual.count == events);
+    }
+    fixture_finish(&f);
+}
+
+static fixture_t *live_fixture;
+static unsigned live_hits;
+static void
+check_live_snapshot(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)index;
+    if (phase != 8 || !bindings || live_hits) return;
+    ++live_hits;
+    fixture_t *f = live_fixture;
+    capture_t nested = {0};
+    int64_t row = 99;
+    CHECK(wl_evaluation_control_active_attempt_id(control));
+    CHECK(wl_session_step(f->session) == EBUSY);
+    CHECK(wl_session_snapshot(f->session, capture_tuple, &nested) == EBUSY);
+    CHECK(f->session->backend->session_snapshot(f->session, capture_tuple,
+        &nested) == EBUSY);
+    CHECK(wl_session_insert(f->session, "input", &row, 1, 1) == EBUSY);
+    CHECK(wl_session_remove(f->session, "input", &row, 1, 1) == EBUSY);
+    wl_session_t *destroy = f->session;
+    CHECK(wl_session_try_destroy(&destroy) == EBUSY && destroy == f->session);
+    CHECK(wl_evaluation_control_reset(control) == EBUSY);
+    CHECK(wl_evaluation_control_configure(control, 1) == EBUSY);
+    wl_session_set_delta_cb(f->session, NULL, NULL);
+    CHECK(((wl_col_session_t *)f->session)->delta_cb == capture_delta);
+    CHECK(!nested.count);
+}
+
+static void
+test_snapshot_admission(void)
+{
+    fixture_t f;
+    fixture_init(&f, true);
+    wl_session_set_delta_cb(f.session, capture_delta, &f.actual);
+    wl_session_set_delta_cb(f.reference, capture_delta, &f.expected);
+    const void *owner = f.session->operation_admission;
+    CHECK(!wl_evaluation_control_begin(f.control, owner));
+    capture_t actual = {0}, expected = {0};
+    CHECK(wl_session_snapshot(f.session, capture_tuple, &actual) == EBUSY);
+    CHECK(f.session->backend->session_snapshot(f.session, capture_tuple,
+        &actual) == EBUSY);
+    CHECK(!wl_evaluation_control_finish(f.control, owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.control, &report)
+        && report.attempt_id == 1 && !report.consumed);
+    CHECK(wl_session_snapshot(f.session, NULL, NULL) == EINVAL);
+    CHECK(!wl_evaluation_control_report(f.control,
+        &report) && report.attempt_id == 1);
+    live_fixture = &f; live_hits = 0;
+    wl_columnar_session_test_observed_transaction_checkpoint =
+        check_live_snapshot;
+    CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+    clear_snapshot_hooks(); live_fixture = NULL;
+    CHECK(live_hits == 1);
+    CHECK(!wl_evaluation_control_report(f.control, &report)
+        && report.attempt_id == 2 && !report.result);
+    CHECK(!step(f.reference));
+    CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+    check_capture(&actual, &expected);
+    check_capture(&f.actual, &f.expected);
+    fixture_finish(&f);
+
+    fixture_init(&f, true);
+    wl_columnar_session_test_fail_framed_funding_before_stop = 1;
+    CHECK(wl_session_step(f.session) == EAGAIN);
+    CHECK(!wl_columnar_session_test_fail_framed_funding_before_stop);
+    CHECK(wl_evaluation_control_active_attempt_id(f.control));
+    actual = (capture_t){0};
+    CHECK(wl_session_snapshot(f.session, capture_tuple,
+        &actual) == EBUSY && !actual.count);
+    CHECK(!step(f.session) && !step(f.reference));
+    check_results(&f);
+    fixture_finish(&f);
+}
+
+static void
+test_typed_nullary_and_empty_snapshots(void)
+{
+    const char *typed =
+        ".decl input(a:float,b:float)\n.decl first(a:float,b:float)\n"
+        "first(a,b) :- input(a,b).\n";
+    fixture_t f;
+    fixture_create(&f, typed);
+    int64_t rows[] = {wl_columnar_float_to_bits(1.5),
+                      wl_columnar_float_to_bits(10.5),
+                      wl_columnar_float_to_bits(2.5),
+                      wl_columnar_float_to_bits(20.5)};
+    int64_t next[] = {wl_columnar_float_to_bits(-7.5),
+                      wl_columnar_float_to_bits(30.5)};
+    CHECK(!wl_session_insert(f.session, "input", rows, 2, 2));
+    CHECK(!wl_session_insert(f.reference, "input", rows, 2, 2));
+    capture_t actual = {0}, expected = {0};
+    CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+    CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+    check_capture(&actual, &expected);
+    col_rel_t *first = session_find_rel((wl_col_session_t *)f.session, "first");
+    CHECK(actual.count == 2 && first->column_types
+        && first->column_types[0] == WIRELOG_TYPE_FLOAT
+        && first->column_types[1] == WIRELOG_TYPE_FLOAT);
+    CHECK(!wl_session_insert(f.session, "input", next, 1, 2));
+    CHECK(!wl_session_insert(f.reference, "input", next, 1, 2));
+    CHECK(!step(f.session) && !step(f.reference));
+    check_results(&f);
+    fixture_finish(&f);
+
+    const char *nullary =
+        ".decl input(x:int64)\n.decl first()\nfirst() :- input(x).\n";
+    fixture_create(&f, nullary);
+    int64_t integers[] = {1, 2};
+    CHECK(!wl_session_insert(f.session, "input", integers, 2, 1));
+    CHECK(!wl_session_insert(f.reference, "input", integers, 2, 1));
+    actual = expected = (capture_t){0};
+    CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+    CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+    check_capture(&actual, &expected);
+    CHECK(actual.count == 1 && !actual.events[0].width);
+    fixture_finish(&f);
+
+    const char *filtered =
+        ".decl input(x:int64)\n.decl first(x:int64)\nfirst(x) :- input(x), x < 0.\n";
+    fixture_create(&f, filtered);
+    for (unsigned trial = 0; trial < 3; ++trial) {
+        if (trial) {
+            int64_t value = trial == 1 ? 5 : -1;
+            CHECK(!wl_session_insert(f.session, "input", &value, 1, 1));
+            CHECK(!wl_session_insert(f.reference, "input", &value, 1, 1));
+        }
+        actual = expected = (capture_t){0};
+        reset_snapshot_hooks();
+        CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+        clear_snapshot_hooks();
+        CHECK(evaluation_hits && preparation_hits &&
+            evaluation_id == preparation_id);
+        CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+        check_capture(&actual, &expected);
+        CHECK(actual.count == (trial == 2 ? 1u : 0u));
+        if (trial == 2) CHECK(actual.events[0].row[0] == -1);
+    }
+    fixture_finish(&f);
+}
+
+static wl_columnar_memory_governor_t *pressure_governor;
+static wl_columnar_memory_reservation_t *pressure_credit;
+static unsigned pressure_phase, pressure_hits;
+
+static void
+snapshot_pressure(wl_evaluation_control_t *control, unsigned phase,
+    size_t index)
+{
+    (void)control; (void)index;
+    if (phase != pressure_phase || pressure_hits) return;
+    ++pressure_hits;
+    uint64_t reserved = wl_columnar_memory_reserved(pressure_governor);
+    CHECK(reserved < pressure_governor->budget_bytes);
+    CHECK(wl_columnar_memory_reserve_checked(pressure_governor,
+        pressure_governor->budget_bytes - reserved, pressure_credit)
+        == WL_COLUMNAR_MEMORY_ADMISSION_OK);
+}
+
+static void
+test_snapshot_resource_failures(void)
+{
+    for (unsigned dirty = 0; dirty < 2; ++dirty) {
+        for (unsigned mode = 0; mode < 3; ++mode) {
+            fixture_t f;
+            fixture_init(&f, true);
+            wl_session_set_delta_cb(f.session, capture_delta, &f.actual);
+            wl_session_set_delta_cb(f.reference, capture_delta, &f.expected);
+            if (dirty) {
+                CHECK(!step(f.session) && !step(f.reference));
+                f.actual.count = f.expected.count = 0;
+                int64_t value = 17;
+                CHECK(!wl_session_insert(f.session, "input", &value, 1, 1));
+                CHECK(!wl_session_insert(f.reference, "input", &value, 1, 1));
+            }
+            wl_col_session_t *session = (wl_col_session_t *)f.session;
+            col_rel_t *old = session_find_rel(session, "first");
+            wl_columnar_memory_reservation_t pressure;
+            wl_columnar_memory_reservation_init(&pressure);
+            pressure_hits = 0; pressure_phase = mode == 0 ? 1 : 5;
+            pressure_governor = wl_columnar_memory_governor_ref_get(f.governor);
+            pressure_credit = &pressure;
+            if (mode <
+                2) wl_columnar_session_test_snapshot_checkpoint =
+                    snapshot_pressure;
+            else wl_columnar_session_test_snapshot_allocation = 1;
+            capture_t actual = {0}, expected = {0};
+            int rc = wl_session_snapshot(f.session, capture_tuple, &actual);
+            clear_snapshot_hooks();
+            CHECK(rc == (mode < 2 ? ENOSPC : ENOMEM));
+            CHECK(!actual.count && !f.actual.count
+                && session_find_rel(session, "first") == old
+                && session->memory_budget_denied == (mode < 2));
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(f.control, &report)
+                && report.result == rc && !report.cleanup_status);
+            if (mode < 2) CHECK(pressure_hits == 1 &&
+                    wl_columnar_memory_rollback(&pressure));
+            pressure_credit = NULL; pressure_governor = NULL;
+            CHECK(!wl_evaluation_control_reset(f.control));
+            CHECK(!wl_session_snapshot(f.session, capture_tuple, &actual));
+            CHECK(!session->memory_budget_denied);
+            CHECK(!step(f.reference));
+            CHECK(!wl_session_snapshot(f.reference, capture_tuple, &expected));
+            check_capture(&actual, &expected);
+            check_capture(&f.actual, &f.expected);
+            CHECK(actual.count > 0);
+            fixture_finish(&f);
+        }
+    }
+}
+
 int
 main(void)
 {
@@ -612,6 +877,10 @@ main(void)
     test_snapshot_cutoff_and_allowance();
     test_snapshot_bootstrap_limits();
     test_recursive_dirty_snapshot();
+    test_mixed_multiinput_lifecycle();
+    test_snapshot_admission();
+    test_typed_nullary_and_empty_snapshots();
+    test_snapshot_resource_failures();
     puts("controlled lifecycle: ok");
     return 0;
 }
