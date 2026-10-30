@@ -25,7 +25,7 @@ reference; it does not claim a size reduction. A rebuilt library may have
 different non-`.text` bytes due to LTO metadata.
 
 Main's measurement at any given tip is a moving figure. Read it from the most
-recent concluded `main` run's `wirelog-size-monitor-ubuntu-latest` artifact.
+recent concluded `main` run's `wirelog-size-monitor-ubuntu-26.04` artifact.
 Main-branch measurements remain useful for tracking size changes even while
 the PR ceiling is advisory.
 
@@ -53,7 +53,7 @@ Main-branch measurement is advisory. Its always-run reporting step records
 commit and run identity, measurement, baseline, delta, profile, and status in a
 warning annotation, the job summary, and a platform-specific
 `wirelog-size-monitor-${{ matrix.os }}` artifact. Baseline provenance accepts
-only `wirelog-size-monitor-ubuntu-latest`; ARM measurements cannot authorize
+only `wirelog-size-monitor-ubuntu-26.04`; ARM measurements cannot authorize
 the canonical x86 baseline.
 If setup, profile capture, library lookup, or measurement fails, the report is
 `monitoring-error`; missing data is never replaced with zero or described as a

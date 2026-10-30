@@ -44,12 +44,12 @@ jobs:
       matrix:
         include:
           # Linux - GCC
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: gcc
             cc: gcc
 
           # Linux - Clang
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: clang
             cc: clang
 
@@ -64,9 +64,9 @@ jobs:
             cc: cl
 
           # ARM64 - GCC (GitHub-hosted runner)
-          # Uses GitHub's ubuntu-24.04-arm runner with native ARM64 support
-          - os: ubuntu-24.04-arm
-            os_display: ubuntu-24.04-arm
+          # Uses GitHub's ubuntu-26.04-arm runner with native ARM64 support
+          - os: ubuntu-26.04-arm
+            os_display: ubuntu-26.04-arm
             compiler: gcc
             cc: gcc
 
@@ -77,16 +77,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build abigail-tools
+          sudo apt-get install -y meson ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
           # ARM64 specific: verify NEON / aarch64 SIMD support.  The
           # historical check matched against `matrix.os == 'arm64'`,
           # which never matched the actual runner label
-          # `ubuntu-24.04-arm` and silently no-op'd.  The corrected
+          # `ubuntu-26.04-arm` and silently no-op'd.  The corrected
           # comparison runs on every arm64 matrix entry (#787).
-          if [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ]; then
+          if [ "${{ matrix.os }}" = "ubuntu-26.04-arm" ]; then
             echo "ARM64 runner detected. Verifying ASIMD / NEON support..."
             if [ -f /proc/cpuinfo ] && grep -qE 'asimd|neon' /proc/cpuinfo; then
               echo "ARM64 SIMD (asimd / NEON) support verified"
@@ -98,20 +98,64 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ninja coreutils gnu-tar
+          brew install meson ninja coreutils gnu-tar
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           # pkgconfiglite ships from a SourceForge mirror without a
           # checksum; chocolatey's default policy now blocks empty
           # checksums for non-secure sources, so opt in explicitly.
-          choco install pkgconfiglite -y --allow-empty-checksums
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
+          # `ninja` is named explicitly: meson requires it to spawn the
+          # build, and the block below verifies it is resolvable no
+          # matter how each package delivered it.
+          choco install pkgconfiglite meson ninja -y --allow-empty-checksums
+          if ($LASTEXITCODE -ne 0) { throw "choco install failed with exit code $LASTEXITCODE" }
+          # The Chocolatey meson package is an MSI.  Its PATH entry goes
+          # into the machine registry, which this job's already-snapshotted
+          # environment never sees, and chocolatey creates no shim for it,
+          # so `meson` was unresolvable in every later step (run
+          # 40932685444).  Resolve the install directory (chocolatey's own
+          # registry record first, the MSI's documented default locations
+          # next, filesystem search last) and publish it on GITHUB_PATH
+          # -- the same mechanism the former setup-meson action used.
+          # Fails loudly if either tool is missing or broken.
+          $mesonDir = $null
+          $reg = Get-ItemProperty 'HKLM:\SOFTWARE\chocolatey\installed\meson' -ErrorAction SilentlyContinue
+          if ($reg.installLocation -and (Test-Path (Join-Path $reg.installLocation 'meson.exe'))) {
+            $mesonDir = $reg.installLocation
+          }
+          if (-not $mesonDir) {
+            foreach ($cand in 'C:\Program Files\Meson', 'C:\Program Files\meson', 'C:\Program Files (x86)\Meson', 'C:\Program Files (x86)\meson') {
+              if (Test-Path (Join-Path $cand 'meson.exe')) { $mesonDir = $cand; break }
+            }
+          }
+          if (-not $mesonDir) {
+            $found = Get-ChildItem 'C:\Program Files', 'C:\Program Files (x86)' -Recurse -Filter 'meson.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $found) { throw 'chocolatey reported success but meson.exe was not found' }
+            $mesonDir = Split-Path $found.FullName -Parent
+          }
+          $mesonExe = Join-Path $mesonDir 'meson.exe'
+          if (-not (Test-Path $mesonExe)) { throw "meson.exe not found in $mesonDir" }
+          & $mesonExe --version
+          if ($LASTEXITCODE -ne 0) { throw "meson --version failed with exit code $LASTEXITCODE" }
+          # GITHUB_PATH changes only take effect in later steps, so verify
+          # ninja here by full path (MSI-bundled copy) or via the
+          # chocolatey shim if the package delivered it that way.
+          $ninjaExe = Join-Path $mesonDir 'ninja.exe'
+          if (Test-Path $ninjaExe) {
+            & $ninjaExe --version
+            if ($LASTEXITCODE -ne 0) { throw "ninja --version failed with exit code $LASTEXITCODE" }
+          } else {
+            if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { throw 'ninja was not resolvable after chocolatey install' }
+            ninja --version
+            if ($LASTEXITCODE -ne 0) { throw "ninja --version failed with exit code $LASTEXITCODE" }
+          }
+          Add-Content $env:GITHUB_PATH $mesonDir
 
       - name: Configure (Linux / macOS)
         id: configure-native
@@ -243,9 +287,9 @@ jobs:
   # Mirrors the PR check name and coverage policy from #849.
   # ==========================================================================
   mbedtls-enabled:
-    name: mbedtls-enabled / ubuntu-latest / gcc
+    name: mbedtls-enabled / ubuntu-26.04 / gcc
     needs: [build-matrix]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     continue-on-error: true
 
     steps:
@@ -254,10 +298,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libmbedtls-dev
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
+          sudo apt-get install -y meson ninja-build pkg-config libmbedtls-dev
 
       - name: Configure with mbedTLS enabled
         run: meson setup builddir-mbedtls -Dtests=true -DmbedTLS=enabled
@@ -284,7 +325,7 @@ jobs:
         if: always()
         run: |
           STATUS="${{ job.status }}"
-          echo "## mbedTLS-enabled Results: ubuntu-latest / gcc (main monitor)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## mbedTLS-enabled Results: ubuntu-26.04 / gcc (main monitor)" >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo "Status: **${STATUS}** (non-blocking, sequential phase)" >> "$GITHUB_STEP_SUMMARY"
 
@@ -304,12 +345,12 @@ jobs:
       matrix:
         include:
           # Linux - GCC with ASan/UBSan
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: gcc
             cc: gcc
 
           # Linux - Clang with ASan/UBSan
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: clang
             cc: clang
 
@@ -325,7 +366,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build abigail-tools
+          sudo apt-get install -y meson ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
@@ -333,12 +374,9 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ninja coreutils gnu-tar
+          brew install meson ninja coreutils gnu-tar
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
 
       - name: Configure with sanitizers
         run: >
@@ -356,7 +394,11 @@ jobs:
       - name: Test
         # Required SBOM scans belong to PR and release gates. This main
         # monitor may see host Syft; keep its sanitizer suite instrumented.
-        run: meson test -C builddir --exclude sbom_snapshot --print-errorlogs
+        # Distro meson (1.10.x on ubuntu-26.04) has no `meson test --exclude`,
+        # so the exclusion is built from the configured test list at run time.
+        run: |
+          rest="$(meson introspect --tests builddir | jq -r '.[].name' | grep -Fxv sbom_snapshot | tr '\n' ' ')"
+          meson test -C builddir $rest --print-errorlogs
         env:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
@@ -385,12 +427,12 @@ jobs:
       matrix:
         include:
           # Linux - GCC with TSan
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: gcc
             cc: gcc
 
           # Linux - Clang with TSan
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             compiler: clang
             cc: clang
 
@@ -400,13 +442,10 @@ jobs:
       - name: Install dependencies (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build abigail-tools
+          sudo apt-get install -y meson ninja-build abigail-tools
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang
           fi
-
-      - name: Set up Meson 1.12.0
-        uses: ./.github/actions/setup-meson
 
       # Force POSIX pthreads for TSan (C11 threads.h is uninstrumented)
       - name: Configure with TSan

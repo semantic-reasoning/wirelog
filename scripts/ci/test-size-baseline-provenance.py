@@ -49,7 +49,7 @@ profile={"schema_version":1,"source_sha":"source123","platform":{"system":"Linux
 library=b"fixture library bytes"
 library_digest=hashlib.sha256(library).hexdigest()
 report={"schema_version":1,"status":"within-budget","commit_sha":"source123",
-        "measured_bytes":200,"runner_os":"ubuntu-latest","compiler":"gcc",
+        "measured_bytes":200,"runner_os":"ubuntu-26.04","compiler":"gcc",
         "profile":profile,"profile_sha256":digest_profile(profile),
         "library_sha256":library_digest}
 buf=io.BytesIO()
@@ -69,10 +69,10 @@ def exercise(provenance, corrupt=None, base_sha="base456", candidate_sha="candid
         p=Path(temp)/"provenance.json"; p.write_text(json.dumps(provenance), encoding="utf-8")
         run={"path":".github/workflows/ci-main.yml","event":"push","head_branch":"main",
              "conclusion":"success","head_sha":"source123"}
-        artifact={"id":22,"expired":False,"name":"wirelog-size-monitor-ubuntu-latest",
+        artifact={"id":22,"expired":False,"name":"wirelog-size-monitor-ubuntu-26.04",
                   "digest":"sha256:"+artifact_digest,"archive_download_url":"fixture://zip"}
         if corrupt=="wrong-workflow": run["path"]=".github/workflows/other.yml"
-        if corrupt=="arm-artifact": artifact["name"]="wirelog-size-monitor-ubuntu-24.04-arm"
+        if corrupt=="arm-artifact": artifact["name"]="wirelog-size-monitor-ubuntu-26.04-arm"
         if corrupt=="expired": artifact["expired"]=True
         if corrupt=="digest": artifact["digest"]="sha256:"+"0"*64
         response_report=dict(report)

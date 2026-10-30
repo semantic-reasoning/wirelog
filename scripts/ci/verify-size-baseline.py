@@ -350,7 +350,7 @@ def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, proven
         fail("artifact must come from a successful designated main workflow run for its source SHA")
     artifacts = request(f"{API}/repos/{repo}/actions/runs/{run_id}/artifacts", token).get("artifacts", [])
     artifact = next((a for a in artifacts if str(a.get("id")) == artifact_id), None)
-    if not artifact or artifact.get("expired") or artifact.get("name") != "wirelog-size-monitor-ubuntu-latest":
+    if not artifact or artifact.get("expired") or artifact.get("name") != "wirelog-size-monitor-ubuntu-26.04":
         fail("trusted size measurement artifact is missing, expired, or is not the canonical x86 production artifact")
     digest = artifact.get("digest", "").removeprefix("sha256:")
     if digest != p.get("artifact_sha256"):
@@ -365,8 +365,8 @@ def authorize(repo, base_sha, candidate_sha, base_value, candidate_value, proven
         report = json.loads(zf.read(candidates[0]))
     if not measurement_is_reproducible(report):
         fail("main artifact does not contain an eligible, reproducible size measurement")
-    if report.get("runner_os") != "ubuntu-latest" or report.get("compiler") != "gcc":
-        fail("main artifact does not identify the canonical ubuntu-latest GCC profile")
+    if report.get("runner_os") != "ubuntu-26.04" or report.get("compiler") != "gcc":
+        fail("main artifact does not identify the canonical ubuntu-26.04 GCC profile")
     if report.get("commit_sha") != source_sha or report.get("measured_bytes") != candidate_value:
         fail("artifact measurement source or byte count does not match provenance")
     profile = report.get("profile")

@@ -27,7 +27,7 @@ jobs:
   # ==========================================================================
   editorconfig-check:
     name: EditorConfig check (monitor)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -71,7 +71,7 @@ jobs:
   # ==========================================================================
   uncrustify-check:
     name: uncrustify check (monitor)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
