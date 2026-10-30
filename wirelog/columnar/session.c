@@ -230,10 +230,12 @@ typedef struct {
     uint8_t degrees[COL_STACK_MAX];
 } wl_columnar_session_observed_transaction_t;
 
-typedef struct wl_session_snapshot_payload wl_session_snapshot_payload_t;
+typedef struct wl_columnar_session_snapshot_payload
+    wl_columnar_session_snapshot_payload_t;
 static int wl_session_snapshot_prepare(wl_col_session_t *,
-    wl_session_snapshot_payload_t *, col_rel_t *const *, uint32_t);
-static void wl_session_snapshot_deliver(wl_session_snapshot_payload_t *);
+    wl_columnar_session_snapshot_payload_t *, col_rel_t *const *, uint32_t);
+static void wl_columnar_session_snapshot_deliver(
+    wl_columnar_session_snapshot_payload_t *);
 
 struct wl_columnar_controlled_step {
     wl_columnar_session_observed_transaction_t *transaction;
@@ -241,7 +243,7 @@ struct wl_columnar_controlled_step {
     bool callback_changed;
     /* Borrowed only while the enclosing synchronous SNAPSHOT owns admission.
      * Its outer host closes the single evaluation+preparation control attempt. */
-    wl_session_snapshot_payload_t *snapshot;
+    wl_columnar_session_snapshot_payload_t *snapshot;
     bool snapshot_owned, snapshot_retry;
     size_t transaction_initialized_bytes;
     wl_columnar_eval_serial_framed_host_reply_t reply;
@@ -10868,7 +10870,8 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         /* Both batches were fully admitted before the single cutoff. Late
          * cancellation can affect the next attempt, never this delivery. */
         if (tx->observer_started) wl_columnar_eval_delta_observer_publish(sess);
-        if (step->snapshot) wl_session_snapshot_deliver(step->snapshot);
+        if (step->snapshot) wl_columnar_session_snapshot_deliver(
+                step->snapshot);
         return 0;
     }
     case WL_SESSION_OBSERVED_RETIRE:
@@ -11614,7 +11617,7 @@ wl_columnar_session_observed_general_shape(const wl_col_session_t *sess)
 
 static int
 col_controlled_step(wl_col_session_t *sess,
-    wl_session_snapshot_payload_t *snapshot)
+    wl_columnar_session_snapshot_payload_t *snapshot)
 {
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (step && step->snapshot_retry && !snapshot) return EBUSY;
@@ -12708,7 +12711,7 @@ typedef struct {
     wl_columnar_relation_scalar_source_t source;
 } wl_session_snapshot_entry_t;
 
-struct wl_session_snapshot_payload {
+struct wl_columnar_session_snapshot_payload {
     wl_session_snapshot_entry_t *entries;
     int64_t *values;
     size_t count;
@@ -12718,7 +12721,8 @@ struct wl_session_snapshot_payload {
 };
 
 static void
-wl_session_snapshot_deliver(wl_session_snapshot_payload_t *payload)
+wl_columnar_session_snapshot_deliver(
+    wl_columnar_session_snapshot_payload_t *payload)
 {
     for (size_t i = 0; i < payload->count; ++i) {
         const wl_session_snapshot_entry_t *entry = &payload->entries[i];
@@ -12799,7 +12803,7 @@ wl_session_snapshot_free(void *storage,
 
 static int
 wl_session_snapshot_prepare(wl_col_session_t *sess,
-    wl_session_snapshot_payload_t *payload,
+    wl_columnar_session_snapshot_payload_t *payload,
     col_rel_t *const *registry, uint32_t registry_count)
 {
     wl_evaluation_control_t *control = sess->base.evaluation_control;
@@ -12996,7 +13000,7 @@ col_session_snapshot_controlled(wl_session_t *session,
         prior->transaction_initialized_bytes = 0;
         prior->transaction_discard = false;
     }
-    wl_session_snapshot_payload_t payload = {0};
+    wl_columnar_session_snapshot_payload_t payload = {0};
     payload.callback = callback; payload.user_data = user_data;
     wl_columnar_memory_reservation_init(&payload.metadata_credit);
     wl_columnar_memory_reservation_init(&payload.values_credit);
@@ -13009,7 +13013,7 @@ col_session_snapshot_controlled(wl_session_t *session,
         rc = wl_evaluation_control_begin(control, owner);
         if (!rc) rc = wl_session_snapshot_prepare(sess, &payload,
                     sess->rels, sess->nrels);
-        if (!rc) wl_session_snapshot_deliver(&payload);
+        if (!rc) wl_columnar_session_snapshot_deliver(&payload);
     }
     wl_session_snapshot_free(payload.values, &payload.values_credit);
     wl_session_snapshot_free(payload.entries, &payload.metadata_credit);
