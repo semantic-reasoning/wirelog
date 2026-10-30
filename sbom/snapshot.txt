@@ -8,7 +8,6 @@
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/actions/setup-meson@UNKNOWN:NOASSERTION
-./.github/actions/setup-meson@UNKNOWN:NOASSERTION
 ./.github/workflows/fuzz-evidence-shard.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-main.yml@UNKNOWN:NOASSERTION
 ./.github/workflows/lint-pr.yml@UNKNOWN:NOASSERTION

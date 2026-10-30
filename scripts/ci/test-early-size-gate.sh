@@ -146,7 +146,7 @@ assert 'main size reporter runs through always()' grep -A5 -F 'name: Report bina
 assert 'main size reporter is advisory' grep -A4 -F 'name: Report binary size monitoring' "$main_wf" | grep -Fq 'continue-on-error: true'
 assert 'main size report is uploaded through always()' grep -A6 -F 'name: Upload binary size monitoring evidence' "$main_wf" | grep -Fq 'if: always()'
 assert 'main artifacts have unique platform-qualified names' grep -Fq 'name: wirelog-size-monitor-${{ matrix.os }}' "$main_wf"
-assert 'baseline verifier trusts only canonical ubuntu artifact' grep -Fq 'wirelog-size-monitor-ubuntu-latest' "$root/scripts/ci/verify-size-baseline.py"
+assert 'baseline verifier trusts only canonical ubuntu artifact' grep -Fq 'wirelog-size-monitor-ubuntu-26.04' "$root/scripts/ci/verify-size-baseline.py"
 assert 'main workflow grants no write permission' sh -c '! grep -Eq "^[[:space:]]+(actions|contents):[[:space:]]+write" "$1"' sh "$main_wf"
 assert 'PR required build job identity remains unchanged' grep -Fq 'name: Build / ubuntu-26.04 / gcc' "$wf"
 

@@ -150,11 +150,12 @@ assert 'ci-pr.yml SBOM step sets WIRELOG_SBOM_REQUIRED' \
 
 # The mandatory PR SBOM scan is distinct from the opportunistic scan in full
 # sanitizer suites. Exclude only that exact test: --no-suite sbom also drops
-# the locale and snapshot contract tests.  Workflows still on the pinned
-# setup-meson meson (1.12) use `meson test --exclude`; the PR workflow runs
-# distro meson (1.10.x on ubuntu-26.04), which has no `--exclude`, so it
-# builds the same "everything except sbom_snapshot" set from the configured
-# test list at run time (sanitizer_excludes_snapshot_dynamic).
+# the locale and snapshot contract tests.  The tier1 workflow is still on
+# the pinned setup-meson meson (1.12) and keeps `meson test --exclude`; the
+# PR and main workflows run distro meson (1.10.x on ubuntu-26.04), which has
+# no `--exclude`, so they build the same "everything except sbom_snapshot"
+# set from the configured test list at run time
+# (sanitizer_excludes_snapshot_dynamic).
 sanitizer_excludes_snapshot() {
     local file=$1 job=$2 builddir=$3
     awk -v job="  $job:" \
@@ -185,7 +186,7 @@ sanitizer_excludes_snapshot_dynamic() {
 assert 'ci-pr.yml sanitizer excludes only the duplicate SBOM snapshot' \
     sanitizer_excludes_snapshot_dynamic ci-pr.yml sanitizer-matrix builddir-san
 assert 'ci-main.yml sanitizer excludes only the duplicate SBOM snapshot' \
-    sanitizer_excludes_snapshot ci-main.yml sanitizer-matrix builddir
+    sanitizer_excludes_snapshot_dynamic ci-main.yml sanitizer-matrix builddir
 assert 'tier1-sanitizers.yml sanitizer excludes only the duplicate SBOM snapshot' \
     sanitizer_excludes_snapshot tier1-sanitizers.yml asan-ubsan builddir-san
 assert 'ci-pr.yml still runs the required SBOM suite' \
