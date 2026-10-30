@@ -4793,10 +4793,13 @@ test_controlled_append_successors(void)
                     CHECK(!observed_multi_step(session));
                 } else {
                     CHECK(!rc);
-                    CHECK(append_dispatches == (cycle < 3
+                    /* Clearing the callback now succeeds at a completed boundary.
+                     * Its ordinary insert requests bounded full recomputation. */
+                    bool full = shape == 5 && cycle == 2;
+                    CHECK(append_dispatches == (!full && cycle < 3
                         ? !shape ? 2u : (shape == 3 ||
                         shape == 5) ? 3u : 0u : 0u));
-                    if ((shape == 3 || shape == 5) && cycle < 3)
+                    if (!full && (shape == 3 || shape == 5) && cycle < 3)
                         CHECK(append_left_reads == 2 &&
                             append_right_reads == 1);
                     CHECK(append_selected_rows == append_dispatches
@@ -7732,7 +7735,7 @@ test_controlled_session_step_prefix_resume(void)
         && left->columns[0][2] == 9);
     CHECK(right->columns[0][0] == 2 && right->columns[0][1] == 6
         && right->columns[0][2] == 9);
-    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+    CHECK(!wl_session_insert(session, "input", rows, 1, 1));
 
     CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);
@@ -7891,7 +7894,7 @@ test_controlled_session_snapshot_publication(void)
     actual = (snapshot_capture_t){0};
     CHECK(!wl_session_snapshot(session, capture_snapshot_tuple, &actual));
     check_snapshot_equal(&actual, &expected);
-    CHECK(wl_session_insert(session, "input", rows, 1, 1) == EBUSY);
+    CHECK(!wl_session_insert(session, "input", rows, 1, 1));
 
     CHECK(!wl_session_try_destroy(&session) && !session);
     wl_evaluation_control_release(control);

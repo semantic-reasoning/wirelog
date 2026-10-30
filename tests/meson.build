@@ -6644,3 +6644,15 @@ test('session_cold_relation', test_session_cold_relation_exe, suite: ['unit', 't
 test('session_cold_relation_join_batch_env', test_session_cold_relation_exe,
   env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
   suite: ['unit'], timeout: 120)
+
+# #2294/#2295: generated controlled STEP/SNAPSHOT lifecycle composition.
+test_evaluation_lifecycle_exe = executable(
+  'test_evaluation_lifecycle', files('test_evaluation_lifecycle.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_lifecycle', test_evaluation_lifecycle_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

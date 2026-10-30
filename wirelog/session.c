@@ -894,6 +894,32 @@ wl_session_step(wl_session_t *session)
     return rc;
 }
 
+/* Callback replacement is legal at a quiescent completed boundary. Keep the
+ * generic operation gate closed for retained attempts and other operations. */
+static int
+wl_session_operation_begin_callback(wl_session_t *session)
+{
+    wl_session_admission_t *admission = session->operation_admission;
+    if (!admission) return 0;
+    if (wl_session_admission_lock(admission) != 0) return EIO;
+    int rc = EBUSY;
+    if (!admission->closing && !admission->active_operations
+        && !admission->controlled_step_pending &&
+        !admission->exclusive_attempt) {
+        wl_controlled_step_state_t state = session->backend
+            && session->backend->session_controlled_step_state
+            ? session->backend->session_controlled_step_state(session)
+            : WL_CONTROLLED_STEP_IDLE;
+        if (!admission->controlled_step_complete
+            || state == WL_CONTROLLED_STEP_COMPLETE) {
+            admission->active_operations++;
+            rc = 0;
+        }
+    }
+    wl_session_checked_unlock(admission);
+    return rc;
+}
+
 void
 wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     void *user_data)
@@ -906,7 +932,7 @@ wl_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
                 user_data);
         return;
     }
-    if (wl_session_operation_begin(session) != 0)
+    if (wl_session_operation_begin_callback(session) != 0)
         return;
     if (session->backend && session->backend->session_set_delta_cb)
         session->backend->session_set_delta_cb(session, callback, user_data);

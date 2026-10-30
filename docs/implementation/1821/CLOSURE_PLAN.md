@@ -480,3 +480,14 @@ frontier and observed/unobserved evidence. Initially unobserved acyclic append
 and all previously recorded persistent/weighted/nonlinear obligations remain
 outside this bundle. PR submission occurs after combined validation of all
 three atomic units, including the source formatting stabilized before review.
+
+
+### Callback-free STEP successors (#2294)
+
+The lifecycle integration retains the initial callback-free host and promotes
+only successful completed-session EDB mutations to the general transaction.
+It shares coordinated publication, signed comparison and bounded recovery with
+the observed host. `tests/test_evaluation_lifecycle.c` adds independent generated
+reference parity, repeated callback-free/observed cycles and deterministic
+setup/later-child stops; source and test changes form one atomic unit. Fresh
+and dirty evaluating SNAPSHOT remains the next integration unit (#2295).
