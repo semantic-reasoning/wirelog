@@ -233,6 +233,7 @@ typedef struct {
 struct wl_columnar_controlled_step {
     wl_columnar_session_observed_transaction_t *transaction;
     bool general_observed, transaction_initialized, transaction_discard;
+    bool callback_changed;
     size_t transaction_initialized_bytes;
     wl_columnar_eval_serial_framed_host_reply_t reply;
     wl_evaluation_control_t *previous_funding;
@@ -5711,7 +5712,7 @@ col_controlled_step_record_edge_append(wl_col_session_t *sess, col_rel_t *edge)
     wl_columnar_controlled_step_t *step = sess ? sess->controlled_step : NULL;
     /* General transactions authorize EDB mutations through their owned table;
      * the public mutation-completed callback schedules full recomputation. */
-    if (step && step->general_observed) return;
+    if (step && !step->recursive_route) return;
     if (!step || !step->complete || !step->recursive_route
         || !step->provenance_valid || step->provenance_invalid
         || edge != step->provenance_edge
@@ -7029,6 +7030,9 @@ col_session_set_delta_cb(wl_session_t *session, wirelog_on_delta_fn callback,
     if (!session)
         return;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->controlled_step && sess->controlled_step->complete
+        && sess->delta_cb != callback)
+        sess->controlled_step->callback_changed = true;
     sess->delta_cb = callback;
     sess->delta_data = user_data;
     /* Issue #2121: clearing the callback sets no routing flag.  The next
@@ -11621,7 +11625,8 @@ col_controlled_step(wl_col_session_t *sess)
         int rc = col_controlled_step_static_preflight(sess, true);
         if (rc) return rc;
         uint64_t identity = step->operation_identity;
-        bool general = step->general_observed || sess->nrels > 3;
+        bool general = step->general_observed || step->callback_changed
+            || sess->nrels > 3;
         if (step->transaction) {
             if (!step->operation_active) {
                 rc = wl_evaluation_control_begin(sess->base.evaluation_control,
@@ -11638,7 +11643,7 @@ col_controlled_step(wl_col_session_t *sess)
         col_rel_t *append_source = step->append_source;
         uint64_t append_identity = step->append_identity;
         uint32_t append_begin = step->append_begin;
-        bool observed = step->observed;
+        bool observed = sess->delta_cb != NULL;
         uint64_t operation_id = step->operation_id;
         bool operation_active = step->operation_active;
         memset(step, 0, sizeof(*step));
@@ -11784,8 +11789,30 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
 {
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
-    if (!step || (!step->observed && !step->general_observed))
-        return EBUSY;
+    if (!step) return EBUSY;
+    /* A completed ordinary host has no observer transaction to authenticate
+     * its inputs. Only declared public EDBs may start a private successor.
+     * Admission is read-only: failed and zero-row mutations never promote. */
+    if (!step->recursive_route
+        && ((!step->general_observed
+        && (!step->observed || step->callback_changed))
+        || (step->general_observed && !step->transaction))) {
+        if (!step->complete || step->operation_active
+            || step->observer_cleanup_pending) return EBUSY;
+        if (!relation || !sess->plan || !sess->plan->edb_declared_width
+            || !sess->plan->edb_relations)
+            return ENOTSUP;
+        for (uint32_t i = 0; i < sess->plan->edb_count; ++i) {
+            const char *name = sess->plan->edb_relations[i];
+            if (name && !strcmp(relation, name)) {
+                col_rel_t *input = session_find_rel(sess, name);
+                return input && num_cols == sess->plan->edb_declared_width[i]
+                    ? 0 : ENOTSUP;
+            }
+        }
+        return ENOTSUP;
+    }
+    if (!step->observed && !step->general_observed) return EBUSY;
     if (step->general_observed) {
         const wl_columnar_session_observed_transaction_t *tx =
             step->transaction;
@@ -11850,6 +11877,16 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         return;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->complete && !step->recursive_route
+        && !step->general_observed
+        && (!step->observed || step->callback_changed)) {
+        /* The mutation committed. Capture the existing public heads in the
+         * next general transaction, including an initially unobserved host. */
+        step->general_observed = true;
+        step->published = true;
+        step->successor_mutation_seen = true;
+        return;
+    }
     if (step && step->general_observed && step->complete && step->published) {
         wl_columnar_session_observed_transaction_t *tx = step->transaction;
         col_rel_t *input = NULL;
