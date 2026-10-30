@@ -179,7 +179,8 @@ wl_session_operation_begin_mutation(wl_session_t *session, bool insert,
         : WL_CONTROLLED_STEP_IDLE;
     int rc = EBUSY;
     if (state == WL_CONTROLLED_STEP_COMPLETE
-        || state == WL_CONTROLLED_STEP_RETRYABLE) {
+        || state == WL_CONTROLLED_STEP_RETRYABLE
+        || state == WL_CONTROLLED_STEP_DIRTY) {
         if (insert && session->backend->session_controlled_step_authorize_insert
             && session->backend->session_controlled_step_authorize_insert(
                 session, relation, num_rows, num_cols))
@@ -220,34 +221,30 @@ wl_session_operation_begin_step(wl_session_t *session)
     return 0;
 }
 
-/* A completed controlled initial STEP permits read-only snapshot delivery.
- * Keep the whole callback batch inside the same admission gate so mutations,
- * another STEP, and a concurrent snapshot cannot observe a partial batch. */
+/* SNAPSHOT owns a synchronous operation, including internal evaluation and
+ * the complete callback batch. Only its own stopped attempt can be retried;
+ * a retained STEP continuation remains protected. */
 static int
 wl_session_operation_begin_controlled_snapshot(wl_session_t *session)
 {
     wl_session_admission_t *admission = session->operation_admission;
-    if (!admission)
-        return ENOTSUP;
-
-    if (wl_session_admission_lock(admission) != 0)
-        return EIO;
-    int rc = 0;
-    if (admission->closing || admission->active_operations != 0
-        || admission->controlled_step_pending || admission->exclusive_attempt)
-        rc = EBUSY;
-    else {
+    if (!admission || !session->backend
+        || !session->backend->session_controlled_step_state) return ENOTSUP;
+    if (wl_session_admission_lock(admission) != 0) return EIO;
+    int rc = EBUSY;
+    if (!admission->closing && !admission->active_operations
+        && !admission->controlled_step_pending &&
+        !admission->exclusive_attempt) {
         wl_controlled_step_state_t state =
-            session->backend && session->backend->session_controlled_step_state
-            ? session->backend->session_controlled_step_state(session)
-            : WL_CONTROLLED_STEP_IDLE;
+            session->backend->session_controlled_step_state(session);
         if (state == WL_CONTROLLED_STEP_COMPLETE
-            && admission->controlled_step_complete)
+            || (session->backend->session_controlled_snapshot_evaluates
+            && (state == WL_CONTROLLED_STEP_IDLE
+            || state == WL_CONTROLLED_STEP_DIRTY
+            || state == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE))) {
             admission->active_operations++;
-        else
-            rc = state == WL_CONTROLLED_STEP_PENDING
-                || state == WL_CONTROLLED_STEP_RETRYABLE
-                || state == WL_CONTROLLED_STEP_INVALIDATED ? EBUSY : ENOTSUP;
+            rc = 0;
+        } else if (state == WL_CONTROLLED_STEP_IDLE) rc = ENOTSUP;
     }
     wl_session_checked_unlock(admission);
     return rc;
@@ -271,7 +268,9 @@ wl_session_operation_end_step(wl_session_t *session,
     admission->controlled_step_pending = continuation_pending;
     if (state == WL_CONTROLLED_STEP_COMPLETE
         || state == WL_CONTROLLED_STEP_RETRYABLE
-        || state == WL_CONTROLLED_STEP_INVALIDATED)
+        || state == WL_CONTROLLED_STEP_INVALIDATED
+        || state == WL_CONTROLLED_STEP_DIRTY
+        || state == WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE)
         admission->controlled_step_complete = true;
     else if (state == WL_CONTROLLED_STEP_IDLE)
         admission->controlled_step_complete = false;
@@ -910,7 +909,9 @@ wl_session_operation_begin_callback(wl_session_t *session)
             && session->backend->session_controlled_step_state
             ? session->backend->session_controlled_step_state(session)
             : WL_CONTROLLED_STEP_IDLE;
-        if (!admission->controlled_step_complete
+        if ((!admission->controlled_step_complete
+            && (!session->evaluation_control ||
+            state == WL_CONTROLLED_STEP_IDLE))
             || state == WL_CONTROLLED_STEP_COMPLETE) {
             admission->active_operations++;
             rc = 0;
@@ -958,7 +959,13 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
         rc = EINVAL;
     else
         rc = session->backend->session_snapshot(session, callback, user_data);
-    wl_session_operation_end(session);
+    if (controlled)
+        wl_session_operation_end_step(session,
+            session->backend && session->backend->session_controlled_step_state
+                ? session->backend->session_controlled_step_state(session)
+                : WL_CONTROLLED_STEP_IDLE, false);
+    else
+        wl_session_operation_end(session);
     return rc;
 }
 
