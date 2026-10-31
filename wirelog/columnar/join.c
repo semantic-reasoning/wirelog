@@ -2880,6 +2880,9 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
                     WL_LOG(WL_LOG_SEC_JOIN, WL_LOG_DEBUG,
                         "Bounded join failed with rc=%d after %u rows",
                         join_rc, out->nrows);
+                else
+                    col_join_batch_record_run(sess,
+                        COL_JOIN_BATCH_RUN_ORDINARY);
             }
         }
         if (kc == 0 && col_join_should_parallelize_cross(sess, left, right)) {
@@ -4266,6 +4269,7 @@ wl_columnar_join_diff_op(const wl_plan_op_t *op, eval_stack_t *stack,
             cont = NULL;
         }
         if (bounded_rc == 0) {
+            col_join_batch_record_run(sess, COL_JOIN_BATCH_RUN_DIFFERENTIAL);
             wl_columnar_join_key_scratch_free(&key_scratch, &lk);
             wl_columnar_join_key_scratch_free(&key_scratch, &rk);
             if (right_filtered)

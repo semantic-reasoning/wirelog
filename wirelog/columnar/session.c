@@ -5483,6 +5483,11 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->join_batch_fallback_count = 0;
     out_worker->controlled_materialized_batch_published_count = 0;
     out_worker->join_batch_last_reason = 0;
+    /* So are its bounded runs, per route (#2201). */
+    memset(out_worker->join_batch_runs, 0,
+        sizeof(out_worker->join_batch_runs));
+    memset(out_worker->join_batch_worker_runs, 0,
+        sizeof(out_worker->join_batch_worker_runs));
     out_worker->memory_governor = coordinator->memory_governor;
     wl_columnar_memory_governor_ref_retain(out_worker->memory_governor);
     out_worker->extension_expr_status = 0;

@@ -490,6 +490,91 @@ test_worker_join_batch_reasons_fold(void)
     return 0;
 }
 
+/* #2201: bounded producer runs are counted per route.  A worker starts with
+ * both its own and its folded counts cleared, and its teardown adds each
+ * route's runs -- its own and those it folded from its own workers -- into
+ * the coordinator's worker counts once.  A refused teardown folds nothing,
+ * a repeated destroy adds nothing, and the folded count saturates. */
+static int
+test_worker_join_batch_runs_fold(void)
+{
+    TEST("worker bounded-join runs fold into the coordinator per route");
+
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_col_session_t *coord = make_coordinator(&plan, &prog);
+    if (!coord) {
+        FAIL("coordinator creation");
+        return 1;
+    }
+    coord->join_batch_bytes = 224;
+    coord->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] = 3;
+    coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_PIPELINE] = 2;
+
+    wl_col_session_t worker;
+    memset(&worker, 0, sizeof(worker));
+    int ok = col_worker_session_create(coord, 0, NULL, 0, &worker) == 0;
+    for (unsigned r = 0; ok && r < COL_JOIN_BATCH_RUN_ROUTES; r++)
+        ok = worker.join_batch_runs[r] == 0
+            && worker.join_batch_worker_runs[r] == 0;
+    if (ok) {
+        col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_DIFFERENTIAL);
+        col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_DIFFERENTIAL);
+        col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_PIPELINE);
+        worker.join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY] = 4;
+        ok = worker.join_batch_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL] == 2
+            && worker.join_batch_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 1;
+        /* A refused teardown folds nothing. */
+        worker.filt_cache_active_pins = 1;
+        ok = ok && col_worker_session_destroy(&worker) == EBUSY
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY] == 0
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL]
+            == 0
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 2;
+        worker.filt_cache_active_pins = 0;
+        ok = col_worker_session_destroy(&worker) == 0 && ok
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY] == 4
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL]
+            == 2
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 3
+            && coord->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] == 3
+            && coord->join_batch_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL] == 0
+            && coord->join_batch_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 0;
+        /* Destroying an already destroyed worker adds nothing. */
+        col_worker_session_destroy(&worker);
+        ok = ok
+            && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY] == 4;
+    }
+    if (ok) {
+        /* The folded count saturates instead of wrapping. */
+        coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+            = UINT32_MAX - 1u;
+        memset(&worker, 0, sizeof(worker));
+        ok = col_worker_session_create(coord, 1, NULL, 0, &worker) == 0;
+        if (ok) {
+            col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_ORDINARY);
+            col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_ORDINARY);
+            col_join_batch_record_run(&worker, COL_JOIN_BATCH_RUN_ORDINARY);
+            ok = col_worker_session_destroy(&worker) == 0
+                && coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+                == UINT32_MAX;
+        }
+    }
+    if (ok) {
+        /* A session's own count saturates too. */
+        coord->join_batch_runs[COL_JOIN_BATCH_RUN_PIPELINE] = UINT32_MAX;
+        col_join_batch_record_run(coord, COL_JOIN_BATCH_RUN_PIPELINE);
+        ok = coord->join_batch_runs[COL_JOIN_BATCH_RUN_PIPELINE] == UINT32_MAX;
+    }
+    cleanup_coordinator(coord, plan, prog);
+    if (!ok) {
+        FAIL("per-route run counts, refusal or saturation");
+        return 1;
+    }
+    PASS();
+    return 0;
+}
+
 static int
 test_borrowed_fields(void)
 {
@@ -3761,6 +3846,7 @@ main(int argc, char **argv)
     test_worker_borrows_evaluation_control();
     test_identity_fields();
     test_worker_join_batch_reasons_fold();
+    test_worker_join_batch_runs_fold();
     test_borrowed_fields();
     test_rels_independent();
     test_wq_null();
