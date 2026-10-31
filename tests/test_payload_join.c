@@ -2184,8 +2184,81 @@ static void trace_progress_and_floor(void)
     CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
 }
 
+static void numeric_trace_references_refused(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    CHECK(wl_intern_put(intern, "unary") == 0);
+    col_rel_t *plain = source(1, 2);
+    wl_columnar_trace_store_t *nt = segmented(g, NULL, plain, 1, 0);
+    wl_columnar_trace_store_snapshot_t *ns = snapshot(nt);
+    wl_columnar_batch_payload_t *np = capture(g, NULL, plain, 0);
+    col_rel_destroy(plain);
+    for (unsigned inlined = 0; inlined < 2; inlined++) for (unsigned empty = 0;
+            empty < 2; empty++){
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                             inlined ? WIRELOG_TYPE_INT64 :
+                                             WIRELOG_TYPE_STRING};
+            wirelog_column_t columns[] = {{.type = WIRELOG_TYPE_INT64},
+                                          {.type = WIRELOG_TYPE_INT64,
+                                           .compound_kind =
+                                               WIRELOG_COMPOUND_KIND_INLINE,
+                                           .compound_arity = 1,
+                                           .compound_inline_col_offset = 1}};
+            wl_columnar_trace_store_t *rt;
+            CHECK(wl_columnar_trace_store_create_reference(g, types, 2,
+                inlined ? columns : NULL,
+                inlined ? 2 : 0, intern, &rt) == OK);
+            if (!empty) {
+                col_rel_t *r;
+                CHECK(wl_columnar_relation_new_auto_governed("reference_guard",
+                    2, 1, false, g, &r) == 0);
+                CHECK(col_rel_set_column_types(r, types, 2) == 0);
+                if (inlined) {
+                    const col_rel_logical_col_t layout[] =
+                    {{WIRELOG_COMPOUND_KIND_NONE, 0, 0},
+                     {WIRELOG_COMPOUND_KIND_INLINE, 1, 1}};
+                    CHECK(col_rel_apply_compound_schema(r, layout, 2) == 0);
+                }
+                int64_t values[] = {7, 0};
+                CHECK(col_rel_append_row(r, values) == 0);
+                CHECK(wl_columnar_trace_store_append_capture_reference(rt, r,
+                    inlined ? columns : NULL,
+                    inlined ? 2 : 0, intern, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+                    NULL, NULL, NULL) == OK);
+                col_rel_destroy(r);
+            }
+            wl_columnar_trace_store_snapshot_t *rs = snapshot(rt);
+            uint64_t before = reserved(g);
+            wl_columnar_continuation_t *join = (void *)1;
+            for (unsigned side = 0; side < 2; side++) {
+                CHECK(wl_columnar_payload_join_create_trace_bounded(g,
+                    side ? ns : rs, side ? rs : ns,
+                    0, 0, 32, index_cap(1), NULL, NULL,
+                    &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+                CHECK(wl_columnar_payload_join_create_weighted_trace_bounded(g,
+                    side ? ns : rs, side ? rs : ns,
+                    0, 0, 32, index_cap(1), NULL, NULL,
+                    &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+            }
+            CHECK(wl_columnar_payload_join_create_delta_trace_bounded(g, np, rs,
+                0, 0, 32,
+                index_cap(1), NULL, NULL,
+                &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+            CHECK(reserved(g) == before);
+            wl_columnar_trace_store_snapshot_release(rs);
+            wl_columnar_trace_store_retire(rt);
+        }
+    wl_columnar_trace_store_snapshot_release(ns);
+    wl_columnar_trace_store_retire(nt);
+    CHECK(wl_columnar_batch_payload_release(np) == OK); wl_intern_free(intern);
+    CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
+    numeric_trace_references_refused();
     trace_partial_overflow(); trace_progress_and_floor();
     trace_generations(); trace_signed_errors();
     CHECK(trace_causal_budget(128, false) == trace_causal_budget(512, false));

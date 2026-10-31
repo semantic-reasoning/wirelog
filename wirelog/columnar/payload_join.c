@@ -382,6 +382,14 @@ wl_columnar_payload_join_source_validate(
     const wirelog_column_type_t *types =
         wl_columnar_payload_join_source_schema(source, cols, rows);
     if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
+    /* Reference owners now exist independently of reference JOIN support.
+     * Numeric factories must audit every lane and semantic layout, not just
+     * the physical key (including empty and numeric-only INLINE snapshots). */
+    if (wl_columnar_trace_store_snapshot_inline_schema(source.snapshot, NULL))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    for (uint32_t c = 0; c < *cols; c++)
+        if (types[c] ==
+            WIRELOG_TYPE_STRING) return WL_COLUMNAR_SPILL_UNSUPPORTED;
     return types[key] == WIRELOG_TYPE_INT64
         ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_UNSUPPORTED;
 }

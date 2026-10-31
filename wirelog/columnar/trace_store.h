@@ -1,4 +1,4 @@
-/* Internal append-only numeric Z-set traces over immutable batch payloads. */
+/* Internal append-only Z-set traces over immutable batch payloads. */
 #ifndef WL_COLUMNAR_TRACE_STORE_H
 #define WL_COLUMNAR_TRACE_STORE_H
 
@@ -24,6 +24,25 @@ wl_columnar_spill_status_t wl_columnar_trace_store_create(
     wl_columnar_memory_governor_ref_t *governor,
     const wirelog_column_type_t *types, uint32_t ncols,
     wl_columnar_trace_store_t **out);
+/* Explicit scalar STRING or declared flat INLINE owner. Scalar requires
+ * columns=NULL/count0; INLINE requires the full logical declaration matching
+ * physical types. Copy semantic fields (never names), with aligned governed
+ * storage. The originating intern must be attached to this governor and open
+ * for pin admission. Even an empty owner and numeric-only INLINE retain an
+ * owner pin until all snapshots/cursors and the retired owner drain.
+ * No SIDE/graph/nested handles; caller guarantees expanded fields are scalar.
+ * floor_with_inline includes declaration padding in owner bytes. Intern table
+ * storage and per-payload declaration/pin floors remain additional.
+ * Legacy create/capture/take entrypoints remain numeric-only. */
+wl_columnar_spill_status_t wl_columnar_trace_store_create_reference(
+    wl_columnar_memory_governor_ref_t *governor,
+    const wirelog_column_type_t *types, uint32_t ncols,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_trace_store_t **out);
+wl_columnar_spill_status_t wl_columnar_trace_store_floor_with_inline(
+    uint32_t ncols, uint32_t segments, uint32_t logical_count,
+    uint64_t *owner, uint64_t *nodes, uint64_t *snapshot, uint64_t *cursor);
 wl_columnar_trace_store_state_t wl_columnar_trace_store_state(
     const wl_columnar_trace_store_t *trace);
 
@@ -60,6 +79,28 @@ wl_columnar_spill_status_t wl_columnar_trace_store_append_take(
     wl_columnar_trace_store_t *trace, struct col_rel **source,
     wl_columnar_spill_store_t *store,
     wl_columnar_spill_cancel_fn cancel, void *context);
+/* Reference append supplies the exact originating intern and declaration from
+ * owner creation (names ignored). Caller guarantees source IDs really belong
+ * to that table: coincident integers cannot establish provenance. Wrong supplied
+ * capabilities/layouts are refused, including empty sources. All STRING lanes
+ * and functor IDs are validated by capture before publication/retirement.
+ * Numeric append APIs cannot bypass this explicit reference-owner authority.
+ * Same zero-coordinate signed metadata and exclusive take contract as above.
+ * New reference capture/take needs fresh pins; retired intern returns CLOSED.
+ * Callbacks must not retire intern or mutate supplied declarations/source. */
+wl_columnar_spill_status_t wl_columnar_trace_store_append_capture_reference(
+    wl_columnar_trace_store_t *trace, const struct col_rel *source,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_batch_payload_storage_t storage,
+    wl_columnar_spill_store_t *store,
+    wl_columnar_spill_cancel_fn cancel, void *context);
+wl_columnar_spill_status_t wl_columnar_trace_store_append_take_reference(
+    wl_columnar_trace_store_t *trace, struct col_rel **source,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_store_t *store, wl_columnar_spill_cancel_fn cancel,
+    void *context);
 /* Demote one zero-based segment ordinal; snapshot-pinned nodes return BUSY
  * even without active readers. Already spilled nodes return INVALID.
  * Success changes storage only, preserving ordinals and commit generation. */
@@ -87,6 +128,18 @@ wl_columnar_trace_store_state_t wl_columnar_trace_store_snapshot_state(
 bool wl_columnar_trace_store_snapshot_uses_governor(
     const wl_columnar_trace_store_snapshot_t *snapshot,
     const wl_columnar_memory_governor_ref_t *governor);
+/* Borrowed capability queries under a live snapshot. Identity does not acquire
+ * a fresh pin or assert intern owner admission is open. Declaration names=NULL;
+ * scalar owners return NULL/count0. Snapshot/cursor creation and lazy reads on
+ * an existing owner reuse its retained intern capability after intern retirement,
+ * while reference append/demotion/new owner creation require fresh pin admission.
+ * External spill-store retirement still closes later lazy reader acquisition. */
+bool wl_columnar_trace_store_snapshot_uses_intern(
+    const wl_columnar_trace_store_snapshot_t *snapshot,
+    const wl_intern_t *intern);
+const wirelog_column_t *wl_columnar_trace_store_snapshot_inline_schema(
+    const wl_columnar_trace_store_snapshot_t *snapshot,
+    uint32_t *logical_count);
 
 /* Each cursor independently retains its snapshot, so caller may release its
  * snapshot immediately. At most one payload reader is active per cursor.
@@ -103,5 +156,12 @@ wl_columnar_spill_status_t wl_columnar_trace_store_cursor_read(
     wl_columnar_trace_store_cursor_t *cursor, uint64_t ordinal,
     wl_columnar_spill_cancel_fn cancel, void *context,
     const uint64_t **lanes, wl_columnar_spill_metadata_t *metadata);
+/* Resolve a STRING/functor ID using the cursor's retained owner capability,
+ * including before a row is opened. Borrowed text lives until cursor release,
+ * even after intern/trace owner retirement or cursor segment switches.
+ * No independent output pin is granted; error clears *out. */
+wl_columnar_spill_status_t wl_columnar_trace_store_cursor_resolve_string(
+    const wl_columnar_trace_store_cursor_t *cursor, uint64_t id,
+    const char **out);
 
 #endif
