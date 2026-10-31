@@ -61,6 +61,27 @@ wl_columnar_spill_status_t wl_columnar_batch_payload_take(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out);
 
+/* Explicit reference-aware take: same exclusive heap ownership, admission,
+ * checked retirement and failure atomicity as take(), with capture_with_intern
+ * or capture_with_inline provenance requirements. All IDs/declarations must
+ * originate in the supplied intern. New pins require its owner to remain open;
+ * callbacks must not retire it. Successful payloads retain their own capability.
+ * Legacy take() remains numeric-only. These APIs do not authorize retirement
+ * of a borrowed session/registry relation. */
+wl_columnar_spill_status_t wl_columnar_batch_payload_take_with_intern(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, struct col_rel **source,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out);
+wl_columnar_spill_status_t wl_columnar_batch_payload_take_with_inline(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_spill_store_t *store, struct col_rel **source,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *cancel_context,
+    wl_columnar_batch_payload_t **out);
+
 /* Stream a known number of numeric scalar rows directly into a spilled payload,
  * without a resident relation or rowset. Same-governor store required. Types
  * are copied; source/types/contexts are borrowed only until return. The source

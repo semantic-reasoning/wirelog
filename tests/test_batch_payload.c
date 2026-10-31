@@ -1214,8 +1214,78 @@ take_payload(void)
     wl_columnar_memory_governor_ref_release(other);
 }
 
+static void reference_take(void)
+{
+    for (unsigned inlined = 0; inlined < 2; inlined++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1 << 24);
+        wl_intern_t *intern = wl_intern_create();
+        CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+        wirelog_column_t columns[4];
+        col_rel_t *r;
+        if (inlined) r = inline_source(intern, columns);
+        else {
+            CHECK(wl_intern_put(intern, "alpha") == 0 && wl_intern_put(intern,
+                "beta") == 1);
+            r = source(); r->column_types[0] = WIRELOG_TYPE_STRING;
+            for (uint32_t i = 0; i < r->nrows; i++) r->columns[0][i] = i%2;
+        }
+        CHECK(col_rel_attach_memory_governor(r,
+            g) == 0 && wl_columnar_batch_payload_can_take(r));
+        wl_columnar_spill_store_t *disk;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 1024,
+            &disk) == OK);
+        wl_columnar_batch_payload_t *p = NULL;
+        uint64_t before = reserved(g);
+        CHECK(wl_columnar_batch_payload_take(g, disk, &r, NULL, NULL,
+            &p) == WL_COLUMNAR_SPILL_UNSUPPORTED && !p);
+        CHECK(r && reserved(g) == before &&
+            wl_columnar_spill_store_bytes(disk) == 0);
+        wl_columnar_source_access_reader_t lease = {0};
+        CHECK(col_rel_source_reader_acquire(r, &lease) == 0);
+        CHECK((inlined ? wl_columnar_batch_payload_take_with_inline(g, disk, &r,
+            columns, 4, intern, NULL, NULL, &p)
+            : wl_columnar_batch_payload_take_with_intern(g, disk, &r, intern,
+            NULL, NULL, &p)) == WL_COLUMNAR_SPILL_BUSY && !p);
+        CHECK(r && reserved(g) == before &&
+            wl_columnar_spill_store_bytes(disk) == 0);
+        CHECK(col_rel_source_reader_release(&lease) == 0);
+        bool done = false;
+        for (unsigned point = 0; point < 256; point++) {
+            unsigned remaining = point; col_rel_t *original = r;
+            wl_columnar_spill_status_t status = inlined
+                ? wl_columnar_batch_payload_take_with_inline(g, disk, &r,
+                    columns, 4, intern, cancel, &remaining, &p)
+                : wl_columnar_batch_payload_take_with_intern(g, disk, &r,
+                    intern, cancel, &remaining, &p);
+            if (status == OK) {
+                CHECK(!r && p); done = true; break;
+            }
+            CHECK(status == WL_COLUMNAR_SPILL_CANCELLED && r == original && !p);
+            CHECK(reserved(g) == before &&
+                wl_columnar_spill_store_bytes(disk) == 0);
+        }
+        CHECK(done); wl_intern_free(intern);
+        wl_columnar_batch_payload_reader_t *reader;
+        CHECK(wl_columnar_batch_payload_acquire(p, &reader) == OK);
+        wl_columnar_spill_store_retire(disk);
+        if (inlined) inline_check(reader, 7);
+        else {
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            const char *text;
+            CHECK(wl_columnar_batch_payload_read(reader, 7, NULL, NULL, &lanes,
+                &meta) == OK);
+            CHECK(wl_columnar_batch_payload_resolve_string(reader, lanes[0],
+                &text) == OK && !strcmp(text, "beta"));
+        }
+        wl_columnar_batch_payload_reader_release(reader);
+        CHECK(wl_columnar_batch_payload_release(p) == OK && reserved(g) == 0);
+        wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void)
 {
+    reference_take();
     uint64_t inline_bytes, inline_reader_bytes;
     CHECK(wl_columnar_batch_payload_floor_with_inline(UINT32_MAX, UINT32_MAX,
         UINT32_MAX, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, &inline_bytes,

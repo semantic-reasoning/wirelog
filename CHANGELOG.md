@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Explicit STRING/flat INLINE trace owners retain intern and declaration
+  capabilities across source transfer and snapshot reads; numeric JOIN factories
+  continue rejecting reference-bearing snapshots, including empty inputs (#1372).
+
 - Explicit signed delta-by-trace and trace-by-trace JOINs preserve immutable
   generation boundaries through insertions/retractions, with checked products
   and bounded windows; paired fixed-budget tests prove source reclamation (#1372).

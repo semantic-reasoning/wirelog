@@ -5106,8 +5106,9 @@ does not make the spill store's lifecycle globally thread-safe.
 
 This storage/scan contract does not automatically migrate session relations or
 legacy differential arrangements.
-STRING/INLINE/SIDE/nested provenance, general logical time, mutable-session
-routing and #1373 scheduling remain outside this numeric trace owner.
+Legacy numeric entrypoints reject STRING and compound provenance. Explicit
+reference-owned storage is described below. SIDE/nested, general logical time,
+mutable-session routing and #1373 scheduling remain outside these owners.
 
 The indexed payload JOIN engine also accepts two numeric trace snapshots through
 `wl_columnar_payload_join_create_trace_bounded`. Existing payload constructors,
@@ -5118,6 +5119,46 @@ reader at a time. The same capped right-row index, output batches and 256-action
 publication quantum apply across segment boundaries. Ordinary trace JOIN checks
 all rows for +1 multiplicity before publication. Retiring a trace owner preserves these consumers,
 but retiring its external store may yield CLOSED on later lazy acquisitions.
+
+### Reference-owned trace storage (#1372, internal)
+
+`wl_columnar_trace_store_create_reference` accepts scalar STRING schemas or a
+complete declared flat INLINE schema with the originating governed intern table.
+It copies name-less semantic declarations into aligned, governed owner storage.
+The owner holds an intern pin even with no segments and for numeric-only INLINE
+functors. Physical types, declaration padding, nodes and snapshot directories
+are explicit resident floors; the retained intern vocabulary is additional.
+
+Reference append APIs require the same originating table and semantic declaration
+as the owner. Every source lane and layout is validated before publication or
+retirement, including unused STRING fields. The caller still guarantees that raw
+IDs really originate in the supplied table; equal integers cannot prove origin.
+SIDE, graph and nested handles remain unsupported. Signed weights and zero
+iteration/stratum/worker/reserved coordinates retain their existing contract.
+
+Additive `batch_payload_take_with_intern` and `take_with_inline` use the existing
+capture plus checked-retirement transaction. Exclusive governed heap sources
+are cleared only after all fallible work succeeds. Source-reader BUSY, private
+write/capacity/cancel/allocation failures preserve source and prior trace state.
+Reference trace take and unpinned demotion physically release resident rows;
+numeric capture/take still refuse reference owners. Session registry sealing
+retains its own authority and is not redirected to exclusive-owner take.
+
+Existing reference snapshots/cursors reuse retained intern capability after the
+intern owner retires, including lazy segment switches while the spill store is
+open. Cursor string resolution returns text valid through that cursor's release.
+New reference owners, append and demotion need fresh pin admission and return
+CLOSED after intern retirement; an owner pin never reopens admission. External
+spill-store retirement separately closes later lazy readers. The same per-trace
+transition lock and explicit lifecycle/cross-owner serialization rules apply.
+
+Tests cover empty and numeric-only INLINE pins, Unicode/empty strings, odd-width
+aligned multi-group declarations, capture/take/demotion, exact signed records,
+old/new boundaries, source/provenance refusal, late faults and same-trace
+concurrent lazy transitions. Existing numeric trace JOIN factories audit every
+lane and INLINE declaration, including non-key and empty references, and refuse
+these owners before publication. Explicit reference JOIN acceptance is a later
+unit of this functional group; reference storage alone does not widen consumers.
 
 ### Signed trace and delta consumption (#1372, internal)
 

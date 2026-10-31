@@ -244,9 +244,11 @@ wl_columnar_batch_payload_can_take(const col_rel_t *r)
                0);
 }
 
-wl_columnar_spill_status_t
-wl_columnar_batch_payload_take(wl_columnar_memory_governor_ref_t *g,
+static wl_columnar_spill_status_t
+wl_columnar_batch_payload_take_impl(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_store_t *store, col_rel_t **source,
+    wl_intern_t *intern, const wirelog_column_t *columns,
+    uint32_t logical_count,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_batch_payload_t **out)
 {
@@ -258,8 +260,12 @@ wl_columnar_batch_payload_take(wl_columnar_memory_governor_ref_t *g,
     if (!wl_columnar_batch_payload_can_take(*source))
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     wl_columnar_batch_payload_t *p = NULL;
-    wl_columnar_spill_status_t rc = wl_columnar_batch_payload_capture(g, store,
-            *source, (*source)->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED,
+    wl_columnar_spill_status_t rc = logical_count
+        ? wl_columnar_batch_payload_capture_with_inline(g, store, *source,
+            (*source)->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, columns,
+            logical_count, intern, cancel, cancel_context, &p)
+        : wl_columnar_batch_payload_capture_with_intern(g, store, *source,
+            (*source)->nrows, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, intern,
             cancel, cancel_context, &p);
     if (rc != WL_COLUMNAR_SPILL_OK) return rc;
     if (cancel && cancel(cancel_context)) {
@@ -276,6 +282,44 @@ wl_columnar_batch_payload_take(wl_columnar_memory_governor_ref_t *g,
     }
     if (wl_columnar_batch_payload_release(p) != WL_COLUMNAR_SPILL_OK) abort();
     return rc;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_take(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, col_rel_t **source,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_batch_payload_t **out)
+{
+    return wl_columnar_batch_payload_take_impl(g, store, source, NULL, NULL, 0,
+               cancel, context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_take_with_intern(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, col_rel_t **source, wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_batch_payload_t **out)
+{
+    return wl_columnar_batch_payload_take_impl(g, store, source, intern, NULL,
+               0,
+               cancel, context, out);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_batch_payload_take_with_inline(wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_spill_store_t *store, col_rel_t **source,
+    const wirelog_column_t *columns, uint32_t logical_count,
+    wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_batch_payload_t **out)
+{
+    if (!columns || !logical_count || !intern) {
+        if (out) *out = NULL;
+        return WL_COLUMNAR_SPILL_INVALID;
+    }
+    return wl_columnar_batch_payload_take_impl(g, store, source, intern,
+               columns,
+               logical_count, cancel, context, out);
 }
 
 static wl_columnar_spill_status_t
