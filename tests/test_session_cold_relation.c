@@ -1210,7 +1210,7 @@ static void filtered_shape(void)
     wl_plan_op_t extra[5] = {rp->ops[0], rp->ops[1], rp->ops[1], rp->ops[2],
                              rp->ops[3]};
     wl_plan_relation_t changed = *rp; changed.ops = extra; changed.op_count = 5;
-    CHECK(!wl_columnar_eval_plan_cold_projection(&changed, "b", 2, NULL));
+    CHECK(wl_columnar_eval_plan_cold_projection(&changed, "b", 2, NULL));
     changed.op_count = 4; extra[1] = rp->ops[2]; extra[2] = rp->ops[1];
     extra[3] = rp->ops[3];
     CHECK(!wl_columnar_eval_plan_cold_projection(&changed, "b", 2, NULL));
@@ -3055,6 +3055,149 @@ static void numeric_inline_cold_source(void)
     destroy(&f);
 }
 
+/* Conjunction uses every predicate, including signed boundary comparisons. */
+static void repeated_cold_predicates(void)
+{
+    const int64_t values[] = {INT64_MIN, -1, 0, 1, INT64_MAX};
+    for (unsigned cmp = WL_PLAN_EXPR_CMP_EQ; cmp <= WL_PLAN_EXPR_CMP_GTE; cmp++)
+        for (unsigned literal = 0; literal < 5; literal++) {
+            fixture_t f = fixture(".decl b(k:int64,v:int64)\n"
+                    ".decl keys(k:int64,v:int64)\nkeys(k,v) :- b(k,v).\n",
+                    4*1024*1024, 1024*1024);
+            for (unsigned i = 0; i < 5; i++) {
+                int64_t row[] = {(int64_t)i, values[i]};
+                CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+            }
+            wl_plan_relation_t *rp = (wl_plan_relation_t *)projection_plan(&f);
+            const wl_plan_op_t *saved_ops = rp->ops;
+            uint32_t saved_count = rp->op_count;
+            CHECK(saved_count == 3);
+            uint8_t data[2][17] = {
+                {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+                 WL_PLAN_EXPR_CONST_INT},
+                {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+                 WL_PLAN_EXPR_CONST_INT}
+            };
+            for (unsigned i = 0; i < 2; i++) {
+                int64_t value = i ? values[literal] : INT64_MIN;
+                uint64_t bits; memcpy(&bits, &value, sizeof(bits));
+                for (unsigned j = 0; j < 8;
+                    j++) data[i][8+j] = (uint8_t)(bits >> (8*j));
+                data[i][16] = (uint8_t)(i ? cmp : WL_PLAN_EXPR_CMP_GTE);
+            }
+            wl_plan_op_t ops[5] = {saved_ops[0], {0}, {0}, saved_ops[1],
+                                   saved_ops[2]};
+            for (unsigned i = 0; i < 2; i++) {
+                ops[i+1].op = WL_PLAN_OP_FILTER;
+                ops[i+1].filter_expr = (wl_plan_expr_buffer_t){.data = data[i],
+                                                               .size = 17};
+            }
+            rp->ops = ops; rp->op_count = 5;
+            eval_stack_t stack; eval_stack_init(&stack);
+            CHECK(col_eval_relation_plan(rp, &stack,
+                COL_SESSION(f.session)) == 0);
+            eval_entry_t e = eval_stack_pop(&stack);
+            int64_t expected[5][2]; uint32_t count = e.rel->nrows;
+            for (uint32_t i = 0; i < count; i++)
+                for (unsigned j = 0; j < 2;
+                    j++) expected[i][j] = e.rel->columns[j][i];
+            CHECK(eval_stack_dispose_entry(&stack, &e) == 0);
+            uint64_t before = reserved(&f);
+            data[1][0] = WL_PLAN_EXPR_VAR_FLOAT;
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(reserved(&f) == before &&
+                session_find_rel(COL_SESSION(f.session), "b"));
+            data[1][0] = WL_PLAN_EXPR_VAR;
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == OK);
+            CHECK(!session_find_rel(COL_SESSION(f.session), "b"));
+            before = reserved(&f);
+            data[1][16] = WL_PLAN_EXPR_ARITH_ADD;
+            CHECK(col_eval_relation_plan(rp, &stack,
+                COL_SESSION(f.session)) == ENOTSUP);
+            CHECK(!stack.top && reserved(&f) == before);
+            data[1][16] = (uint8_t)cmp;
+            if (cmp == WL_PLAN_EXPR_CMP_NEQ && literal == 4) {
+                read_fault = 5;
+                CHECK(wl_columnar_ops_cold_projection(rp, &stack,
+                    COL_SESSION(f.session)) == EIO);
+                read_fault = 0;
+                CHECK(!stack.top && reserved(&f) == before);
+                wl_columnar_ops_test_map_fail_output_alloc = true;
+                CHECK(wl_columnar_ops_cold_projection(rp, &stack,
+                    COL_SESSION(f.session)) == ENOMEM);
+                wl_columnar_ops_test_map_fail_output_alloc = false;
+                CHECK(!stack.top && reserved(&f) == before);
+            }
+            for (unsigned repeat = 0; repeat < 2; repeat++) {
+                CHECK(col_eval_relation_plan(rp, &stack,
+                    COL_SESSION(f.session)) == 0);
+                e = eval_stack_pop(&stack);
+                CHECK(e.rel->nrows == count && e.rel->ncols == 2);
+                for (uint32_t i = 0; i < count; i++)
+                    for (unsigned j = 0; j < 2;
+                        j++) CHECK(e.rel->columns[j][i] == expected[i][j]);
+                CHECK(eval_stack_dispose_entry(&stack, &e) == 0);
+                CHECK(reserved(&f) == before);
+            }
+            rp->ops = saved_ops; rp->op_count = saved_count;
+            destroy(&f);
+        }
+}
+
+static void parsed_repeated_predicates(void)
+{
+    fixture_t f = fixture(".decl b(k:int64,v:int64)\n.decl keys(k:int64)\n"
+            "keys(k) :- b(k,v), v >= 101, v < 105, v != 103.\n",
+            4*1024*1024, 1024*1024);
+    const wl_plan_relation_t *rp = projection_plan(&f);
+    CHECK(rp->op_count == 6);
+    for (unsigned i = 1; i < 4; i++) CHECK(rp->ops[i].op == WL_PLAN_OP_FILTER);
+    for (int64_t i = 0; i < 6; i++) {
+        int64_t row[] = {i, 100+i};
+        CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+    }
+    CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+    eval_stack_t stack; eval_stack_init(&stack);
+    CHECK(col_eval_relation_plan(rp, &stack, COL_SESSION(f.session)) == 0);
+    eval_entry_t e = eval_stack_pop(&stack);
+    CHECK(e.rel->nrows == 3 && e.rel->columns[0][0] == 1 &&
+        e.rel->columns[0][1] == 2 && e.rel->columns[0][2] == 4);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0); destroy(&f);
+}
+
+static void repeated_predicate_scratch(void)
+{
+    uint64_t temporary[2];
+    for (unsigned size = 0; size < 2; size++) {
+        fixture_t f = fixture(".decl b(k:int64,v:int64)\n.decl keys(k:int64)\n"
+                "keys(k) :- b(k,v), v >= 0, v != 7, v < 1000.\n",
+                4*1024*1024, 1024*1024);
+        unsigned rows = size ? 512 : 64;
+        for (unsigned i = 0; i < rows; i++) {
+            int64_t row[] = {(int64_t)i, (int64_t)i};
+            CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+        }
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        CHECK(!session_find_rel(COL_SESSION(f.session), "b"));
+        uint64_t before = reserved(&f); budget_peak = before;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(wl_columnar_ops_cold_projection(projection_plan(&f), &stack,
+            COL_SESSION(f.session)) == 0);
+        uint64_t output = reserved(&f)-before;
+        CHECK(budget_peak >= before+output);
+        temporary[size] = budget_peak-before-output;
+        eval_entry_t e = eval_stack_pop(&stack);
+        CHECK(e.rel->nrows == rows-1);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        wl_columnar_memory_governor_test_admitted = NULL; destroy(&f);
+    }
+    CHECK(temporary[0] > 0 && temporary[0] == temporary[1]);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -3064,6 +3207,8 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    repeated_cold_predicates(); parsed_repeated_predicates();
+    repeated_predicate_scratch();
     inline_source_refusals(); numeric_inline_cold_source();
     inline_projection_failures(); inline_projection_memory();
     inline_join_reclamation(); inline_join_bounded_scratch();

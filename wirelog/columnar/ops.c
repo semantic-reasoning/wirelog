@@ -374,9 +374,12 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
         &decoded)) return ENOTSUP;
     const wl_plan_op_t *op = decoded.map;
     uint32_t width = op->project_count;
-    uint64_t bytes;
+    uint64_t bytes, predicate_bytes;
     if (!wl_columnar_memory_size_mul(width,
         sizeof(int64_t) + sizeof(wirelog_column_type_t), &bytes) ||
+        !wl_columnar_memory_size_mul(decoded.filter_count,
+        sizeof(wl_columnar_eval_plan_cold_predicate_t), &predicate_bytes) ||
+        !wl_columnar_memory_size_add(bytes, predicate_bytes, &bytes) ||
         bytes > SIZE_MAX) return EOVERFLOW;
     wl_ops_scratch_t scratch;
     int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, bytes,
@@ -384,15 +387,22 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     if (rc) return rc;
     int64_t *row = malloc((size_t)width * sizeof(*row));
     wirelog_column_type_t *types = malloc((size_t)width * sizeof(*types));
+    wl_columnar_eval_plan_cold_predicate_t *predicates = decoded.filter_count
+        ? malloc((size_t)predicate_bytes) : NULL;
     col_rel_t *out = NULL;
     wl_columnar_batch_payload_reader_t *reader = NULL;
     col_rel_append_batch_t batch = {0};
     bool appending = false;
-    if (!row || !types) {
+    if (!row || !types || (decoded.filter_count && !predicates)) {
         rc = ENOMEM; goto done;
     }
     const wirelog_column_type_t *schema =
         wl_columnar_batch_payload_schema(cold->payload, NULL, NULL);
+    for (uint32_t i = 0; i < decoded.filter_count; i++)
+        if (!wl_columnar_eval_plan_cold_predicate_decode(&plan->ops[i + 1],
+            cold->ncols, schema, &predicates[i])) {
+            rc = ENOTSUP; goto done;
+        }
     for (uint32_t i = 0; i < width;
         i++) types[i] = schema[op->project_indices[i]];
 #ifdef WL_SESSION_TEST_HOOKS
@@ -417,12 +427,12 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
         status = wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL,
                 &lanes, &metadata);
         if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
-        if (decoded.comparison) {
+        bool keep = true;
+        for (uint32_t i = 0; keep && i < decoded.filter_count; i++) {
             int64_t value;
-            memcpy(&value, &lanes[decoded.predicate_column], sizeof(value));
-            int64_t literal = decoded.predicate_literal;
-            bool keep = false;
-            switch (decoded.comparison) {
+            memcpy(&value, &lanes[predicates[i].column], sizeof(value));
+            int64_t literal = predicates[i].literal;
+            switch (predicates[i].comparison) {
             case WL_PLAN_EXPR_CMP_EQ: keep = value == literal; break;
             case WL_PLAN_EXPR_CMP_NEQ: keep = value != literal; break;
             case WL_PLAN_EXPR_CMP_LT: keep = value < literal; break;
@@ -431,8 +441,8 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
             case WL_PLAN_EXPR_CMP_GTE: keep = value >= literal; break;
             default: rc = ENOTSUP; goto done;
             }
-            if (!keep) continue;
         }
+        if (!keep) continue;
         for (uint32_t i = 0; i < width; i++)
             memcpy(&row[i], &lanes[op->project_indices[i]], sizeof(row[i]));
         rc = col_rel_append_batch_row(&batch, row);
@@ -458,7 +468,7 @@ done:
         if (ended) rc = ended;
     }
     wl_columnar_batch_payload_reader_release(reader);
-    free(types); free(row);
+    free(predicates); free(types); free(row);
     wl_ops_scratch_release(&scratch);
     if (rc == ENOSPC) sess->memory_budget_denied = true;
     if (!rc) rc = eval_stack_push(stack, out, true);
