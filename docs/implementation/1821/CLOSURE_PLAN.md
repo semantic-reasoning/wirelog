@@ -530,7 +530,12 @@ and deterministic recovery hooks. The default differential setting stays on.
 Foreign active raw frames and the existing one-source incremental retraction
 staging refusal remain protected. A bounded reconstruction is the selected
 implementation for these ordinary removals; new incremental trace machinery is
-not a prerequisite for their scalar semantics. Physical weight/timestamp
-intersections remain #2296/#2301/#2300, default general recursion remains #2302,
-and the complete shared recovery/cap audit remains #1953. Follow those concrete
-remaining predicates; neither #2296 nor #1953 is closed by this bundle alone.
+not a prerequisite for their scalar semantics. This bundle now also includes
+physical scalar timestamp/signed-weight transport, actual session/removal
+intersections and retirement, with explicit per-operator dispositions in
+[PHYSICAL_METADATA_AUDIT.md](PHYSICAL_METADATA_AUDIT.md). The full iteration-cap
+inventory and required convergence/precedence/retry fixes are recorded in
+[ITERATION_CAP_AUDIT.md](ITERATION_CAP_AUDIT.md). Persistent weighted traces and
+compound/spill representations retain #2301/#2300, default general recursion
+retains #2302, and other shared lifecycle obligations retain #1953. Neither
+#2296 nor #1953 is closed by this bundle alone.

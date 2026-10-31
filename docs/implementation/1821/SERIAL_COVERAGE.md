@@ -49,7 +49,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E04 / S10 | Completed observed or initially callback-free acyclic STEP plus declared-input insert/remove → private full candidates → signed comparison and atomic registry image | R, reusable ordinary route; no three-slot/four-binding cap; charged preparation, reversible old-head/staging claims, prepaid cutoff, retained cleanup; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_filter_successors`; repeated signed cycles, later-claim cancellation, no replay, reference output and stable/zero governor balances. #1820 recovery contract retained |
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
-| E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical metadata intersections remain open |
+| E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical scalar intersections are qualified in PHYSICAL_METADATA_AUDIT.md |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
 | E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
@@ -527,9 +527,13 @@ retirement; a late work stop can be reported without rolling back delivery.
 Frozen reports, subsequent insert/evaluation, checked destruction and zero
 governor credit after full ownership teardown are asserted.
 
-These scalar set/signed-notification tests do not establish physical trace
-weights or timestamps. Required representation/operator intersections remain
-with #2301/#2300 and #2296; raw flag admission, persistent trace internals and
-other recursive domains are not claimed. #1953's other lifecycle/cap audits and
-#2293's platform/final-SHA acceptance remain open. This bundle advances these
-rows rather than closing either issue from partial evidence.
+The extended bundle qualifies physical scalar timestamp/signed-weight
+transport, value-projection dispositions, stable consolidation representatives,
+actual session/removal recovery and timestamp ownership retirement; see
+[PHYSICAL_METADATA_AUDIT.md](PHYSICAL_METADATA_AUDIT.md). The complete iteration-cap
+inventory and convergence/stop/retry fixes are in
+[ITERATION_CAP_AUDIT.md](ITERATION_CAP_AUDIT.md). Raw foreign flag admission,
+persistent weighted traces, compound/spill representations, other recursive
+domains and #2293's platform/final-SHA acceptance are not inferred from these
+results. These remaining predicates retain their existing issue owners;
+completion of this bundle alone does not close every #2296/#1953 obligation.

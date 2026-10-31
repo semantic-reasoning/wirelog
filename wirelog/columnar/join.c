@@ -6157,9 +6157,6 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
         &ctx->source, left, false);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
-    if (ctx->source.timestamps) {
-        rc = ENOTSUP; goto done;
-    }
     col_rel_t *right = NULL;
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
@@ -6193,9 +6190,6 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
         &ctx->join_right, right, false);
     rc = wl_columnar_join_attempt_return(control, id, rc);
     if (rc) goto done;
-    if (ctx->join_right.timestamps) {
-        rc = ENOTSUP; goto done;
-    }
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
     if (rc) goto done;

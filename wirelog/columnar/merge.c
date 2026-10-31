@@ -4976,13 +4976,9 @@ wl_columnar_merge_concat_attempt_start_owned(const wl_plan_op_t *op,
         rc = wl_columnar_merge_concat_charge(control, id,
                 WL_COLUMNAR_MERGE_CONCAT_WORK);
         if (rc) goto done;
-        bool no_ts = !ctx->sources[side].timestamps;
+        /* Raw two-source CONCAT deliberately projects physical metadata. */
         rc = wl_columnar_merge_concat_tail(control, id, 4, side);
-        if (rc > 0 || no_ts) {
-            if (rc) goto done;
-        } else {
-            rc = ENOTSUP; goto done;
-        }
+        if (rc) goto done;
     }
     wl_columnar_relation_scalar_source_t *left = &ctx->sources[0];
     wl_columnar_relation_scalar_source_t *right = &ctx->sources[1];

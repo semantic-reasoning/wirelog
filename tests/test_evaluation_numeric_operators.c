@@ -4336,6 +4336,14 @@ reduce_literal_matrix(void)
                     for (unsigned claim = 0; claim < 2; ++claim) {
                         col_rel_t *input = reduce_literal_input(fp != 0,
                                 empty != 0);
+                        CHECK(!col_rel_enable_timestamps(input));
+                        const int64_t physical_weights[] = {0, 1, -1, 3, -4};
+                        for (uint32_t row = 0; row < input->nrows; ++row)
+                            input->timestamps[row] = (col_delta_timestamp_t){
+                                .iteration = 100-row, .stratum = row%3,
+                                .worker = row%2, ._reserved = 0,
+                                .multiplicity = physical_weights[row%5]
+                            };
                         reduce_fixture_t f;
                         reduce_fixture_init(&f, input, false, 0, claim != 0);
                         f.op.agg_fn = functions[kind];
@@ -5989,10 +5997,17 @@ concat_resource_and_compatibility(void)
             1) CHECK(!col_rel_enable_timestamps(a.binary.inputs[1]));
         else a.binary.op.materialized = true;
         concat_run(&a);
-        CHECK(!a.binary.status.committed &&
-            a.binary.status.semantic_result == ENOTSUP);
-        binary_assert_originals(&a.binary);
-        binary_fixture_close(&a.binary, false);
+        if (mode == 1) {
+            CHECK(a.binary.status.committed &&
+                !a.binary.status.semantic_result);
+            concat_literal_result(&a, 1, 3, 2, -1, -1);
+            binary_fixture_close(&a.binary, true);
+        } else {
+            CHECK(!a.binary.status.committed &&
+                a.binary.status.semantic_result == ENOTSUP);
+            binary_assert_originals(&a.binary);
+            binary_fixture_close(&a.binary, false);
+        }
     }
     /* NULL operation control retains actual raw two-entry/K-copy behavior. */
     concat_fixture_t raw;

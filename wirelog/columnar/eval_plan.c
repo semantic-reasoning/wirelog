@@ -2129,7 +2129,6 @@ wl_columnar_eval_plan_composed_source_consume(
                 WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD;
         return 0;
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_HOLD:
-        if (!child_result && record->source.timestamps) child_result = ENOTSUP;
         if (child_result) {
             record->semantic_result = child_result;
             record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END;
@@ -2189,7 +2188,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
             || record->source_slot >= COL_STACK_MAX)) rc = EINVAL;
         if (!rc) {
             const col_rel_t *rel = stack->items[record->source_slot].rel;
-            if (stack->top != record->runtime_depth || rel->timestamps
+            if (stack->top != record->runtime_depth
                 || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
                 rc = ENOTSUP;
         }
