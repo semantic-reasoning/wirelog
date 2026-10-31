@@ -4,6 +4,7 @@
 
 #include "columnar/batch_payload.h"
 #include "columnar/continuation.h"
+#include "columnar/trace_store.h"
 
 /* Both owners remain caller-owned. Separate readers pin them (also for self
  * JOIN), so release/demotion is BUSY until active cancellation or destruction.
@@ -121,6 +122,24 @@ wl_columnar_payload_join_create_reference_projected_bounded(
     uint32_t left_key, uint32_t right_key, const uint32_t *projection,
     uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
     const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
+/* Ordinary bounded JOIN of two immutable numeric trace snapshots, through the
+ * same production engine as the payload constructors. Both complete inputs must
+ * have multiplicity +1. Each independent cursor retains its snapshot; callers
+ * may release snapshots and retire trace owners after successful construction.
+ * Later appends cannot extend an existing producer's input. External spill stores
+ * must remain open for later lazy segment acquisitions (otherwise CLOSED).
+ * Snapshot/node O(segments) metadata is additional to the fixed index/batch caps;
+ * one payload reader per side and bounded directory lookup, no O(rows) offsets.
+ * Trace lifecycle/cross-owner shared-store serialization restrictions apply to
+ * publication as well as construction/cancel/destruction. Legacy single-payload
+ * constructors still acquire readers eagerly and retain reference capabilities. */
+wl_columnar_spill_status_t wl_columnar_payload_join_create_trace_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out);
 /* Only for a continuation returned by these constructors; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */

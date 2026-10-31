@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- The existing capped payload JOIN engine consumes segmented numeric trace
+  snapshots with pinned generation boundaries and bounded reader/index scratch
+  while retaining legacy eager reference-reader capabilities (#1372).
+
 - Internal numeric Z-set traces own mixed resident/spilled immutable segments,
   preserve signed contributions in generation-pinned snapshots, and reclaim
   transferred source rows with governed directory and one-reader scratch (#1372).
