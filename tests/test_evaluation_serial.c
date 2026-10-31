@@ -7425,16 +7425,16 @@ test_controlled_batch_delta_selectors(void)
         {{true, 3}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
         {{false, 0}, {true, 2}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
         {{false, 0}, {true, 3}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
-        {{true, 1}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, true},
-        {{false, 0}, {true, 1}, WL_DELTA_AUTO, WL_DELTA_AUTO, true},
+        {{true, 1}, {false, 0}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
+        {{false, 0}, {true, 1}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
         {{true, 1}, {true, 1}, WL_DELTA_FORCE_FULL,
          WL_DELTA_FORCE_FULL, false},
         {{false, 0}, {false, 0}, WL_DELTA_FORCE_DELTA,
-         WL_DELTA_AUTO, true},
+         WL_DELTA_AUTO, false},
         {{false, 0}, {false, 0}, WL_DELTA_FORCE_EMPTY,
-         WL_DELTA_AUTO, true},
+         WL_DELTA_AUTO, false},
         {{false, 0}, {false, 0}, WL_DELTA_FORCE_EMPTY_AFTER_SEED,
-         WL_DELTA_AUTO, true},
+         WL_DELTA_AUTO, false},
         {{false, 0}, {false, 0}, (wl_delta_mode_t)99,
          WL_DELTA_AUTO, true},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
@@ -7445,7 +7445,7 @@ test_controlled_batch_delta_selectors(void)
          WL_DELTA_AUTO, false},
         {{true, 2}, {true, 3}, WL_DELTA_AUTO, WL_DELTA_AUTO, false},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
-         WL_DELTA_FORCE_DELTA, true},
+         WL_DELTA_FORCE_DELTA, false},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
          WL_DELTA_FORCE_EMPTY, true},
         {{false, 0}, {false, 0}, WL_DELTA_AUTO,
@@ -7561,9 +7561,10 @@ test_controlled_batch_delta_selectors(void)
             /* Full inputs produce the four key-1 combinations. Equal/larger
              * delta contents are
              * deliberately disjoint so accidental delta selection differs. */
-            CHECK(result && result->nrows == (ci == 15 ? 0u : 4u)
+            bool empty = ci == 6 || ci == 7 || ci == 10 || ci == 15;
+            CHECK(result && result->nrows == (empty ? 0u : 4u)
                 && result->ncols == 4);
-            if (ci != 15) CHECK(result->columns[1][0] == 1
+            if (!empty) CHECK(result->columns[1][0] == 1
                     && result->columns[3][0] == 3
                     && result->columns[1][1] == 1 && result->columns[3][1] == 4
                     && result->columns[1][2] == 2 && result->columns[3][2] == 3

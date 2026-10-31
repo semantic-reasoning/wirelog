@@ -6891,6 +6891,9 @@ typedef struct wl_columnar_eval_private_bindings {
 
 bool wl_columnar_session_observed_bindings_authorized(
     const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
+/* Iteration-zero scalar selectors admitted by the materialized batch host.
+ * JOIN-right has no VARIABLE FORCE_EMPTY semantics. */
+bool wl_columnar_eval_plan_scalar_selector_supported(const wl_plan_op_t *);
 /* Exact host-owned occurrence override for acyclic appends or qualified SCC
  * row frontiers. NULL means full evaluation; an empty delta remains a nonNULL
  * immutable source through child ACK and never a public full-source index key. */
