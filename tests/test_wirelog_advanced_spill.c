@@ -1019,6 +1019,76 @@ static void inline_public_joins(void)
     }
 }
 
+typedef struct {uint64_t ids[3]; unsigned bits;} scan_join_public_events_t;
+static void scan_join_public_observe(const char *name,
+    const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *context)
+{
+    scan_join_public_events_t *e = context;
+    CHECK(!strcmp(name,
+        "result") && diff == 1 && row->logical_ncols == 3 &&
+        row->physical_nlanes == 3);
+    CHECK(row->types[0] == WIRELOG_TYPE_INT64 &&
+        row->types[1] == WIRELOG_TYPE_STRING &&
+        row->types[2] == WIRELOG_TYPE_INT64);
+    CHECK(row->physical_types[1] == WIRELOG_TYPE_STRING);
+    unsigned k = (unsigned)row->lanes[0];
+    CHECK(k < 3 && row->lanes[1] == e->ids[k] && row->lanes[2] == 100+k);
+    CHECK(!(e->bits&(1u<<k))); e->bits |= 1u<<k;
+}
+static void public_scan_join(void)
+{
+    const char *comparisons[] = {"=", "!=", "<", ">", "<=", ">="};
+    unsigned masks[] = {2, 5, 1, 4, 3, 6};
+    for (unsigned compound = 0; compound < 2; compound++)
+        for (unsigned cmp = 0; cmp < 6; cmp++)
+            for (unsigned direction = 0; direction < 5; direction++) {
+                char text[1024]; snprintf(text, sizeof(text),
+                    "%s\n.decl b(s:symbol,w:int64)\n.decl result(k:int64,s:symbol,w:int64)\n"
+                    "a(0,\"zero\",7).\na(1,\"one\",7).\na(2,\"two\",7).\n"
+                    "b(\"zero\",100).\nb(\"one\",101).\nb(\"two\",102).\n"
+                    "result(k,s,w) :- %s, g = 7, k %s 1, b(s,w).\n",
+                    compound ? ".decl a(p:pair(int64,symbol) inline,g:int64)" :
+                    ".decl a(k:int64,s:symbol,g:int64)",
+                    compound ? "a(pair(k,s),g)" : "a(k,s,g)", comparisons[cmp]);
+                wirelog_program_t *p = parse(text);
+                wirelog_session_t *session = NULL;
+                wirelog_session_options_v1_t options = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &options,
+                    &session) == WIRELOG_OK);
+                int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+                CHECK(wirelog_program_get_facts(p, "a", &facts, &rows,
+                    &cols) == 0 && rows == 3 && cols == 3);
+                scan_join_public_events_t expected = {0};
+                for (unsigned i = 0; i < 3;
+                    i++) expected.ids[facts[3*i]] = (uint64_t)facts[3*i+1];
+                free(facts);
+                if (direction == 4)CHECK(wirelog_session_seal_input(session,
+                        "b") == WIRELOG_OK);
+                if (direction == 1 || direction >= 3) {
+                    wirelog_error_t seal = wirelog_session_seal_input(session,
+                            "a");
+                    if (seal != WIRELOG_OK)fprintf(stderr,
+                            "public scan seal compound=%u cmp=%u direction=%u error=%d\n",
+                            compound, cmp, direction, seal);
+                    CHECK(seal == WIRELOG_OK);
+                }
+                if (direction == 2 ||
+                    direction == 3) CHECK(wirelog_session_seal_input(session,
+                        "b") == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    scan_join_public_events_t events = expected;
+                    CHECK(wirelog_session_snapshot_typed(session,
+                        scan_join_public_observe, &events) == WIRELOG_OK);
+                    CHECK(events.bits == masks[cmp]);
+                    CHECK(wirelog_session_step(session) == WIRELOG_OK);
+                }
+                wirelog_session_destroy(session); wirelog_program_free(p);
+                CHECK(live_files() == 0);
+            }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1043,6 +1113,7 @@ int main(void)
     join_directions(); join_chains();
     descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
     sealed_sets(); standalone_reads(); output_floor(); mixed_projection();
+    public_scan_join();
     unsupported_filters();
     join_batch_knob();
 #ifdef _WIN32

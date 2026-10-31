@@ -358,8 +358,8 @@ col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
 /* Read scratch is one pinned payload row plus one projected row/schema. The
  * complete projected output remains resident and independently admitted. */
 int
-wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
-    eval_stack_t *stack, wl_col_session_t *sess)
+wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *sess, uint32_t end)
 {
     wl_columnar_eval_plan_cold_projection_t decoded;
     wl_columnar_session_cold_relation_t *cold = plan && plan->ops &&
@@ -368,19 +368,26 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
             plan->ops[0].relation_name) : NULL;
     if (!sess || !stack || !cold ||
         wl_columnar_session_cold_execution_check(sess) ||
-        !wl_columnar_eval_plan_cold_projection_decode(plan,
+        !wl_columnar_eval_plan_cold_scan_decode(plan,
         cold->name, cold->ncols, wl_columnar_batch_payload_schema(
             cold->payload, NULL, NULL),
-        &decoded)) return ENOTSUP;
-    const wl_plan_op_t *op = decoded.map;
-    uint32_t width = op->project_count;
-    uint64_t bytes, predicate_bytes;
+        end, &decoded)) return ENOTSUP;
+    uint32_t width = decoded.map ? decoded.map->project_count : cold->ncols;
+    uint32_t logical_count = 0;
+    const wirelog_column_t *logical = decoded.map ? NULL :
+        wl_columnar_batch_payload_inline_schema(cold->payload, &logical_count);
+    if (logical_count && !logical) return ENOTSUP;
+    uint64_t bytes, predicate_bytes, layout_bytes;
     if (!wl_columnar_memory_size_mul(width,
         sizeof(int64_t) + sizeof(wirelog_column_type_t) + sizeof(uint32_t),
         &bytes) ||
         !wl_columnar_memory_size_mul(decoded.filter_count,
         sizeof(wl_columnar_eval_plan_cold_predicate_t), &predicate_bytes) ||
         !wl_columnar_memory_size_add(bytes, predicate_bytes, &bytes) ||
+        !wl_columnar_memory_size_mul(logical_count,
+        sizeof(col_rel_logical_col_t),
+        &layout_bytes) || !wl_columnar_memory_size_add(bytes, layout_bytes,
+        &bytes) ||
         bytes > SIZE_MAX) return EOVERFLOW;
     wl_ops_scratch_t scratch;
     int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, bytes,
@@ -391,17 +398,20 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     wl_columnar_eval_plan_cold_predicate_t *predicates = decoded.filter_count
         ? malloc((size_t)predicate_bytes) : NULL;
     uint32_t *indices = malloc((size_t)width * sizeof(*indices));
+    col_rel_logical_col_t *layout = logical_count ? calloc(logical_count,
+            sizeof(*layout)) : NULL;
     col_rel_t *out = NULL;
     wl_columnar_batch_payload_reader_t *reader = NULL;
     col_rel_append_batch_t batch = {0};
     bool appending = false;
-    if (!row || !types || !indices || (decoded.filter_count && !predicates)) {
+    if (!row || !types || !indices || (logical_count && !layout) ||
+        (decoded.filter_count && !predicates)) {
         rc = ENOMEM; goto done;
     }
     const wirelog_column_type_t *schema =
         wl_columnar_batch_payload_schema(cold->payload, NULL, NULL);
     uint32_t stage_width = cold->ncols, next_predicate = 0;
-    for (uint32_t i = 1; i < plan->op_count - 1; i++) {
+    for (uint32_t i = 1; i < end; i++) {
         if (plan->ops[i].op == WL_PLAN_OP_MAP) {
             stage_width = plan->ops[i].project_count;
             continue;
@@ -422,7 +432,7 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
         rc = ENOTSUP; goto done;
     }
     for (uint32_t i = 0; i < width; i++) {
-        if (!wl_columnar_eval_plan_cold_column(plan, plan->op_count - 1,
+        if (!wl_columnar_eval_plan_cold_column(plan, end,
             i, cold->ncols, &indices[i])) {
             rc = ENOTSUP; goto done;
         }
@@ -433,11 +443,24 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
         rc = ENOMEM; goto done;
     }
 #endif
-    rc = wl_columnar_relation_new_auto_governed("$map", width, cold->nrows,
-            false, sess->memory_governor, &out);
+    rc =
+        wl_columnar_relation_new_named_governed(decoded.map ? "$map" :
+            cold->name,
+            width, decoded.map ? NULL : (const char *const *)cold->col_names,
+            cold->nrows, false, sess->memory_governor, &out);
     if (rc) goto done;
     rc = col_rel_set_column_types(out, types, width);
     if (rc) goto done;
+    for (uint32_t i = 0; i < logical_count; i++) {
+        layout[i].kind = logical[i].compound_kind;
+        layout[i].arity = logical[i].compound_arity;
+        layout[i].depth = layout[i].kind ==
+            WIRELOG_COMPOUND_KIND_INLINE ? 1 : 0;
+    }
+    if (logical_count) {
+        rc = col_rel_apply_compound_schema(out, layout, logical_count);
+        if (rc) goto done;
+    }
     wl_columnar_spill_status_t status =
         wl_columnar_batch_payload_acquire(cold->payload, &reader);
     if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
@@ -491,7 +514,7 @@ done:
         if (ended) rc = ended;
     }
     wl_columnar_batch_payload_reader_release(reader);
-    free(indices); free(predicates); free(types); free(row);
+    free(layout); free(indices); free(predicates); free(types); free(row);
     wl_ops_scratch_release(&scratch);
     if (rc == ENOSPC) sess->memory_budget_denied = true;
     if (!rc) rc = eval_stack_push(stack, out, true);
@@ -500,6 +523,14 @@ done:
         return wl_columnar_ops_dispose_entry(stack, &entry, rc);
     }
     return rc;
+}
+
+int
+wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *sess)
+{
+    if (!plan || !plan->op_count) return ENOTSUP;
+    return wl_columnar_ops_cold_scan(plan, stack, sess, plan->op_count - 1);
 }
 
 int

@@ -4951,7 +4951,7 @@ filters on a column that need not appear in the output. Multiple filters are
 sequential conjunctions; all must accept the row. Their descriptors are decoded
 once into governed plan-sized scratch, independent of source row count. Final
 source-column indices are also admitted and composed once before reading. Other predicates,
-arithmetic, boolean-expression predicates, concatenation, FILTER/MAP before a cold JOIN,
+arithmetic, boolean-expression predicates, concatenation,
 opaque rewrites and other raw-column consumers remain explicitly unsupported.
 A raw VARIABLE request for a known cold name returns ENOTSUP rather than treating
 the removed registry entry as empty. No synthetic relation with missing columns
@@ -5019,12 +5019,53 @@ release attempt resources before retry. Fixed-intern two-cardinality tests
 keep JOIN scratch unchanged under fixed index/batch caps; retained-source
 controls cover one and both input owners without hiding resident output costs.
 
+### Bounded scan prefixes feeding JOIN (#1372)
+
+A nonempty sequence of the audited direct-column MAP/FILTER stages may now
+precede the first JOIN. For example, a declared `result(k,s,w)` head can use
+`result(k,s,w) :- a(k,s), k >= 0, k = 1, b(s,w).` with an INT64 `k` and
+STRING `s`. The parser may retain a predicate after JOIN as well as push it
+before JOIN; both are audited and executed in order. This new route permits
+subsequent single-key INT64/STRING JOINs, canonical direct-column MAPs and the
+same six INT64/literal FILTER comparisons, ending at CONSOLIDATE. It validates
+actual stage-local types and widths through every JOIN projection and MAP,
+including right-derived lanes. A valid prefix never grants an exception to an
+unsafe suffix or another rule. Sealing and runtime use the same complete audit
+for every binding; unsupported mutations are refused before scanning.
+
+The cold prefix reads each source ordinal once, with governed row/mapping/
+predicate/layout scratch independent of row count. Only its final prefix result
+is materialized, privately, with capacity admitted for the **entire source row
+count**, even if every predicate rejects. It is handed to the first JOIN exactly
+once as an owned resident relation. FILTER-only prefixes preserve original column
+names and semantic flat INLINE layout/declaration identity; any MAP produces
+scalar lanes with ordinary generated names, including width-preserving maps.
+A resident FILTER-only left prefix also preserves declaration identity when the
+right input is cold. No fake relation with missing payload columns is used.
+
+The suffix executes ordinary resident JOIN/MAP/FILTER operators. Its intermediate
+results, output, consolidation and retained intern table are additional resident
+floors; this route does not promise bounded total memory or arbitrary-budget
+completion. Missing right inputs retain ordinary empty-result typing. Known
+right inputs must have a supported initialized schema. The older immediate
+VARIABLE/JOIN route keeps its streaming behavior and existing scope; this
+extension does not globally enable FILTERs on arbitrary plans.
+
+Tests compare scalar and INLINE STRING results across resident, left/right-only
+cold, both-cold and both sealing orders; cover parsed comparisons, remapped and
+right-derived suffix predicates, repeated execution, late read and suffix
+allocation failures with retry. A paired workload uses the same calibrated
+allowance with the actual original source retained or reclaimed: only the
+reclaimed case completes. A widened all-rejected prefix still refuses its real
+capacity floor and a narrower retry succeeds. Private-attempt cleanup does not
+claim whole-STEP rollback of previously published heads. Mutable/differential
+traces, general expressions and SIDE/nested layouts remain outside this route.
+
 ### Remaining #1372 implementation groups
 
 The sealed scalar numeric/STRING and declared flat INLINE field JOIN/projection
 subsets now have actual persistent cold storage,
-resident reclamation and evaluator consumers. General cold VARIABLE/direct-column access beyond the exact direct-projection
-subset, mutable relations, persistent trace/differential storage and their
+resident reclamation and evaluator consumers. General cold VARIABLE access beyond the audited scan/JOIN pipelines, mutable relations, persistent trace/differential storage and their
 arrangement consumers remain separate integration work. They require stable
 identity/generation and pin/cleanup ownership across updates, signed differences
 and retractions. Unsupported consumers remain explicitly ineligible for sealing.

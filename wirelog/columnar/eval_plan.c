@@ -427,71 +427,87 @@ wl_columnar_eval_plan_cold_column(const wl_plan_relation_t *rp,
     return true;
 }
 
+/* Canonical direct-column MAP lane grammar shared with JOIN suffix audits. */
+bool
+wl_columnar_eval_plan_cold_map_lane(const wl_plan_op_t *m, uint32_t i,
+    uint32_t width, wirelog_column_type_t type)
+{
+    if (!m || m->op != WL_PLAN_OP_MAP || !m->project_count ||
+        !m->project_indices || i >= m->project_count ||
+        m->project_indices[i] >= width ||
+        (m->map_exprs == NULL) != (m->map_expr_count == 0) ||
+        (m->map_expr_count &&
+        m->map_expr_count != m->project_count)) return false;
+    if (!m->map_expr_count) return true;
+    const wl_plan_expr_buffer_t *e = &m->map_exprs[i];
+    if (!e->size && !e->data) return true;
+    if (!e->data || e->size < 7 ||
+        (e->data[0] != WL_PLAN_EXPR_VAR &&
+        e->data[0] != WL_PLAN_EXPR_VAR_FLOAT &&
+        e->data[0] != WL_PLAN_EXPR_VAR_STRING)) return false;
+    uint16_t len; memcpy(&len, e->data + 1, sizeof(len));
+    if ((uint32_t)len + 3 != e->size ||
+        memcmp(e->data + 3, "col", 3)) return false;
+    uint32_t col = 0;
+    for (uint32_t j = 6; j < e->size; j++) {
+        unsigned digit = (unsigned)e->data[j] - '0';
+        if (digit > 9 || col > (UINT32_MAX - digit) / 10) return false;
+        col = col * 10 + digit;
+    }
+    return col == m->project_indices[i] &&
+           ((e->data[0] == WL_PLAN_EXPR_VAR_FLOAT) ==
+           (type == WIRELOG_TYPE_FLOAT)) &&
+           (e->data[0] != WL_PLAN_EXPR_VAR_STRING ||
+           type == WIRELOG_TYPE_STRING);
+}
+
 static bool
 wl_columnar_eval_plan_cold_map(const wl_plan_relation_t *rp, uint32_t stage,
-    uint32_t ncols, const wirelog_column_type_t *types)
+    uint32_t width, uint32_t ncols, const wirelog_column_type_t *types)
 {
     const wl_plan_op_t *m = &rp->ops[stage];
     if (!m->project_count || !m->project_indices) return false;
-    if ((m->map_exprs == NULL) != (m->map_expr_count == 0) ||
-        (m->map_expr_count && m->map_expr_count != m->project_count))
-        return false;
     for (uint32_t i = 0; i < m->project_count; i++) {
         uint32_t source;
         if (!wl_columnar_eval_plan_cold_column(rp, stage,
-            m->project_indices[i], ncols, &source)) return false;
-        if (!m->map_expr_count) continue;
-        const wl_plan_expr_buffer_t *e = &m->map_exprs[i];
-        if (!e->size && !e->data) continue;
-        if (!e->data || e->size < 7 ||
-            (e->data[0] != WL_PLAN_EXPR_VAR &&
-            e->data[0] != WL_PLAN_EXPR_VAR_FLOAT &&
-            e->data[0] != WL_PLAN_EXPR_VAR_STRING)) return false;
-        uint16_t len;
-        memcpy(&len, e->data + 1, sizeof(len));
-        if ((uint32_t)len + 3 != e->size ||
-            memcmp(e->data + 3, "col", 3)) return false;
-        uint32_t col = 0;
-        for (uint32_t j = 6; j < e->size; j++) {
-            unsigned digit = (unsigned)e->data[j] - '0';
-            if (digit > 9 || col > (UINT32_MAX - digit) / 10) return false;
-            col = col * 10 + digit;
-        }
-        if (col != m->project_indices[i] ||
-            ((e->data[0] == WL_PLAN_EXPR_VAR_FLOAT) !=
-            (types && types[source] == WIRELOG_TYPE_FLOAT)) ||
-            (e->data[0] == WL_PLAN_EXPR_VAR_STRING &&
-            (!types || types[source] != WIRELOG_TYPE_STRING))) return false;
+            m->project_indices[i], ncols, &source) ||
+            !wl_columnar_eval_plan_cold_map_lane(m, i, width,
+            types ? types[source] : WIRELOG_TYPE_INT64)) return false;
     }
     return true;
 }
 
-/* Complete scalarizing scan: stage-local FILTER/MAP operations, at least one
- * MAP, and a terminal CONSOLIDATE. Mapping composition avoids intermediate
- * resident rowsets; arbitrary expression programs remain unsupported. */
+/* Audit stage-local FILTER/MAP operations ending before JOIN or terminal
+ * CONSOLIDATE. Standalone scans require a MAP; FILTER-only JOIN prefixes
+ * preserve the source layout. Arbitrary expressions remain unsupported. */
 bool
-wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
+wl_columnar_eval_plan_cold_scan_decode(const wl_plan_relation_t *rp,
     const char *name, uint32_t ncols, const wirelog_column_type_t *types,
-    wl_columnar_eval_plan_cold_projection_t *out)
+    uint32_t end, wl_columnar_eval_plan_cold_projection_t *out)
 {
-    if (!rp || !name || !rp->ops || rp->op_count < 3) return false;
+    if (!rp || !name || !rp->ops || end < 2 ||
+        end >= rp->op_count) return false;
     const wl_plan_op_t *v = &rp->ops[0];
     if (v->op != WL_PLAN_OP_VARIABLE || !v->relation_name ||
         strcmp(v->relation_name, name) ||
-        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+        (rp->ops[end].op != WL_PLAN_OP_JOIN &&
+        (rp->ops[end].op != WL_PLAN_OP_CONSOLIDATE ||
+        end != rp->op_count - 1))) return false;
     wl_columnar_eval_plan_cold_projection_t decoded = {0};
     uint32_t width = ncols;
-    for (uint32_t i = 0; i < rp->op_count; i++) {
+    for (uint32_t i = 0; i <= end; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
+        if (i == end && op->op == WL_PLAN_OP_JOIN) break;
         if (op->opaque_data || op->materialized || op->right_relation ||
             (i && op->relation_name) || op->right_filter_expr.size ||
+            op->right_filter_expr.data ||
             (op->op != WL_PLAN_OP_FILTER &&
             (op->filter_expr.size || op->filter_expr.data)) ||
             (op->delta_mode != WL_DELTA_AUTO &&
             op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
-        if (!i || i == rp->op_count - 1) continue;
+        if (!i || i == end) continue;
         if (op->op == WL_PLAN_OP_MAP) {
-            if (!wl_columnar_eval_plan_cold_map(rp, i, ncols,
+            if (!wl_columnar_eval_plan_cold_map(rp, i, width, ncols,
                 types)) return false;
             decoded.map = op; width = op->project_count;
         } else if (op->op == WL_PLAN_OP_FILTER) {
@@ -504,9 +520,20 @@ wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
             decoded.filter_count++;
         } else return false;
     }
-    if (!decoded.map) return false;
+    if (!decoded.map && rp->ops[end].op == WL_PLAN_OP_CONSOLIDATE) return false;
     if (out) *out = decoded;
     return true;
+}
+
+bool
+wl_columnar_eval_plan_cold_projection_decode(const wl_plan_relation_t *rp,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_projection_t *out)
+{
+    return rp && rp->ops && rp->op_count &&
+           rp->ops[rp->op_count - 1].op == WL_PLAN_OP_CONSOLIDATE &&
+           wl_columnar_eval_plan_cold_scan_decode(rp, name, ncols, types,
+               rp->op_count - 1, out);
 }
 
 bool
@@ -533,12 +560,50 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                 return rc ? rc : wl_columnar_eval_plan_body(rplan, stack, sess,
                            2);
             }
+            uint32_t join_index;
+            if (i == 0 && wl_columnar_join_cold_scan_prefix(sess, rplan,
+                &join_index)) {
+                int rc = wl_columnar_ops_cold_scan(rplan, stack, sess,
+                        join_index);
+                return rc ? rc : wl_columnar_eval_plan_body(rplan, stack, sess,
+                           join_index);
+            }
             if (!wl_columnar_eval_plan_cold_projection(rplan, cold->name,
                 cold->ncols, wl_columnar_batch_payload_schema(
                     cold->payload, NULL, NULL))) return ENOTSUP;
             int rc = wl_columnar_ops_cold_projection(rplan, stack, sess);
             return rc ? rc : col_op_consolidate(stack, sess);
         }
+    }
+    uint32_t join_index;
+    if (sess->cold_relation && wl_columnar_join_cold_scan_prefix(sess, rplan,
+        &join_index)) {
+        int rc = wl_columnar_session_cold_execution_check(sess);
+        if (rc) return rc;
+        wl_plan_relation_t prefix = *rplan;
+        prefix.op_count = join_index;
+        rc = wl_columnar_eval_plan_body(&prefix, stack, sess, 0);
+        if (rc) return rc;
+        /* A resident FILTER retains INLINE layout but uses a temporary name.
+         * Restore the audited declaration identity on its owned prefix so a
+         * cold right JOIN can validate functor provenance before capture. */
+        bool mapped = false;
+        for (uint32_t i = 1; i < join_index; i++)
+            mapped |= rplan->ops[i].op == WL_PLAN_OP_MAP;
+        if (!mapped) {
+            eval_entry_t entry;
+            rc = eval_stack_pop_relation(stack, &entry);
+            if (rc) return rc;
+            if (!entry.owned) rc = ENOTSUP;
+            else rc = wl_columnar_relation_rename_checked(entry.rel,
+                        rplan->ops[0].relation_name);
+            if (!rc) rc = eval_stack_push(stack, entry.rel, true);
+            if (rc) {
+                int disposed = eval_stack_dispose_entry(stack, &entry);
+                return disposed ? disposed : rc;
+            }
+        }
+        return wl_columnar_eval_plan_body(rplan, stack, sess, join_index);
     }
     if (!sess->tdd_input_run)
         return wl_columnar_eval_plan_body(rplan, stack, sess, 0);

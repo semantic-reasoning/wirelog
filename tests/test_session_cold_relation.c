@@ -1,4 +1,5 @@
 /* Persistent #1372 sealed-input reclamation through the ordinary evaluator. */
+#define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "columnar/internal.h"
 #include "columnar/batch_payload.h"
 #include "columnar/columnar_nanoarrow.h"
@@ -3353,6 +3354,580 @@ static void composed_cold_stages(void)
     CHECK(temporary[0] > 0 && temporary[0] == temporary[1]);
 }
 
+/* Explicit prefix and suffix plans cover source names, remapped STRING keys,
+ * scalarized INLINE fields and a second JOIN after a MAP. */
+static void cold_scan_join_stages(void)
+{
+    for (unsigned compound = 0; compound < 2; compound++)
+        for (unsigned shape = 0; shape < 3; shape++)
+            for (unsigned direction = 0; direction < 5; direction++)
+                for (unsigned empty = 0; empty < 3; empty++) {
+                    fixture_t f = fixture(compound ?
+                            ".decl a(k:int64,p:pair(symbol,int64) inline)\n"
+                            ".decl b(s:symbol,w:int64)\n.decl result(k:int64,s:symbol,w:int64)\n"
+                            "result(k,s,w) :- a(k,pair(s,v)),b(s,w).\n" :
+                            ".decl a(k:int64,s:symbol,v:int64)\n"
+                            ".decl b(s:symbol,w:int64)\n.decl result(k:int64,s:symbol,w:int64)\n"
+                            "result(k,s,w) :- a(k,s,v),b(s,w).\n",
+                            4*1024*1024, 1024*1024);
+                    wl_col_session_t *session = COL_SESSION(f.session);
+                    if (!compound) {
+                        const char *names[] = {"number", "symbol_key", "extra"};
+                        CHECK(session_remove_rel(session, "a") == 0);
+                        col_rel_t *named = NULL;
+                        CHECK(wl_columnar_relation_new_named_governed("a", 3,
+                            names, 4, false,
+                            session->memory_governor, &named) == 0);
+                        CHECK(session_add_rel(session, named) == 0);
+                    }
+                    int64_t ids[] = {wl_intern_put(session->intern, "left"),
+                                     wl_intern_put(session->intern, "right")};
+                    for (unsigned i = 0; i < 4; i++) {
+                        int64_t row[] = {i, ids[i%2], 100+i};
+                        CHECK(wl_session_insert(f.session, "a", row, 1,
+                            3) == 0);
+                        if (empty == 1) CHECK(wl_session_remove(f.session, "a",
+                                row, 1, 3) == 0);
+                    }
+                    for (unsigned i = 0; i < 2; i++) {
+                        int64_t row[] = {ids[i], 900+i};
+                        CHECK(wl_session_insert(f.session, "b", row, 1,
+                            2) == 0);
+                        if (empty == 2) CHECK(wl_session_remove(f.session, "b",
+                                row, 1, 2) == 0);
+                    }
+                    wirelog_column_type_t at[] = {WIRELOG_TYPE_INT64,
+                                                  WIRELOG_TYPE_STRING,
+                                                  WIRELOG_TYPE_INT64},
+                        bt[] = {WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT64};
+                    CHECK(col_rel_set_column_types(session_find_rel(session,
+                        "a"), at, 3) == 0);
+                    CHECK(col_rel_set_column_types(session_find_rel(session,
+                        "b"), bt, 2) == 0);
+                    wl_plan_relation_t *rp = join_body(&f, "result");
+                    const wl_plan_op_t *saved = rp->ops;
+                    uint32_t count = rp->op_count;
+                    uint32_t map[] = {1, 0, 2}, projection[] = {0, 1, 4},
+                        projected[] = {1, 0, 4},
+                        suffix_map[] = {2, 0, 1},
+                        suffix_projection[] = {1, 2, 4};
+                    const char *lk[] =
+                    {shape ? "col0" : compound ? "col1" : "symbol_key"},
+                        *rk[] = {"col0"}, *later[] = {"col2"};
+                    uint8_t predicate[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o',
+                                             'l',
+                                             shape ? '1' : '0',
+                                             WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0,
+                                             0, 0, 0, 0,
+                                             WL_PLAN_EXPR_CMP_GTE};
+                    wl_plan_op_t ops[10] = {{.op = WL_PLAN_OP_VARIABLE,
+                                             .relation_name = "a"}};
+                    unsigned n = 1;
+                    if (shape) ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                                         .project_count = 3,
+                                                         .project_indices =
+                                                             map};
+                    ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                              .filter_expr = {.data = predicate,
+                                                              .size = 17}};
+                    unsigned ji = n;
+                    ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                              .right_relation = "b",
+                                              .key_count = 1,
+                                              .left_keys = lk, .right_keys = rk,
+                                              .project_count = 3,
+                                              .project_indices =
+                                                  shape ? projected :
+                                                  projection};
+                    uint8_t right_predicate[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c',
+                                                   'o', 'l', '2',
+                                                   WL_PLAN_EXPR_CONST_INT, 0x84,
+                                                   3, 0, 0, 0, 0, 0, 0,
+                                                   WL_PLAN_EXPR_CMP_GTE};
+                    uint8_t remapped_predicate[17];
+                    memcpy(remapped_predicate, right_predicate, 17);
+                    remapped_predicate[6] = '0';
+                    remapped_predicate[16] = WL_PLAN_EXPR_CMP_EQ;
+                    if (shape == 2) {
+                        ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                                  .filter_expr =
+                                                  {.data = right_predicate,
+                                                   .size = 17}};
+                        ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                                  .project_count = 3,
+                                                  .project_indices =
+                                                      suffix_map};
+                        ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                                  .filter_expr =
+                                                  {.data = remapped_predicate,
+                                                   .size = 17}};
+                        ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                                  .right_relation = "b",
+                                                  .key_count = 1,
+                                                  .left_keys = later,
+                                                  .right_keys = rk,
+                                                  .project_count = 3,
+                                                  .project_indices =
+                                                      suffix_projection};
+                    }
+                    ops[n++] = (wl_plan_op_t){.op = WL_PLAN_OP_CONSOLIDATE};
+                    rp->ops = ops; rp->op_count = n;
+                    uint32_t audited = 0;
+                    bool audit_ok = wl_columnar_join_cold_scan_prefix(session,
+                            rp, &audited);
+                    if (!audit_ok) fprintf(stderr,
+                            "pipeline audit compound=%u shape=%u direction=%u empty=%u names=%s,%s width=%u\n",
+                            compound, shape, direction, empty,
+                            session_find_rel(session, "a")->col_names[0],
+                            session_find_rel(session, "a")->col_names[1],
+                            session_find_rel(session, "a")->ncols);
+                    CHECK(audit_ok && audited == ji);
+                    eval_stack_t stack; eval_stack_init(&stack);
+                    eval_entry_t entry;
+                    uint32_t expected_rows = empty ? 0u : shape == 2 ? 1u : 3u;
+                    int64_t expected[3][3];
+                    for (uint32_t i = 0; i < expected_rows; i++) {
+                        unsigned k = shape == 2 ? 2 : i+1;
+                        expected[i][0] = k; expected[i][1] = ids[k%2];
+                        expected[i][2] = 900+k%2;
+                    }
+                    if (shape == 2) {
+                        const wirelog_column_type_t wrong_types[] =
+                        {WIRELOG_TYPE_STRING, WIRELOG_TYPE_FLOAT,
+                         WIRELOG_TYPE_UINT64, WIRELOG_TYPE_BOOL};
+                        for (unsigned bad = 0; bad < 4; bad++) {
+                            bt[1] = wrong_types[bad];
+                            CHECK(col_rel_set_column_types(session_find_rel(
+                                    session, "b"), bt, 2) == 0);
+                            CHECK(!wl_columnar_join_cold_scan_prefix(session,
+                                rp, NULL));
+                        }
+                        bt[1] = WIRELOG_TYPE_INT64;
+                        CHECK(col_rel_set_column_types(session_find_rel(session,
+                            "b"), bt, 2) == 0);
+                        remapped_predicate[6] = '3';
+                        CHECK(!wl_columnar_join_cold_scan_prefix(session, rp,
+                            NULL)); remapped_predicate[6] = '0';
+                        remapped_predicate[16] = WL_PLAN_EXPR_ARITH_ADD;
+                        CHECK(!wl_columnar_join_cold_scan_prefix(session, rp,
+                            NULL));
+                        remapped_predicate[16] = WL_PLAN_EXPR_CMP_EQ;
+                        ops[ji+
+                            1].right_filter_expr =
+                            (wl_plan_expr_buffer_t){.data = right_predicate,
+                                                    .size = 17};
+                        CHECK(!wl_columnar_join_cold_scan_prefix(session, rp,
+                            NULL));
+                        ops[ji+
+                            1].right_filter_expr = (wl_plan_expr_buffer_t){0};
+                        later[0] = "col1"; /* INT64 after remap, right key is STRING. */
+                        uint64_t before = reserved(&f);
+                        CHECK(wl_columnar_session_seal_input(f.session, "a",
+                            NULL, NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+                        CHECK(reserved(&f) == before &&
+                            session_find_rel(session, "a")); later[0] = "col2";
+                    }
+                    seal_direction(&f, direction);
+                    uint64_t before = reserved(&f),
+                        disk =
+                        wl_columnar_spill_store_bytes(session->spill_store);
+                    if (direction == 3 && !empty) {
+                        read_fault = 4;
+                        CHECK(col_eval_relation_plan(rp, &stack,
+                            session) == EIO);
+                        read_fault = 0;
+                        CHECK(!stack.top && reserved(&f) == before &&
+                            wl_columnar_spill_store_bytes(
+                                session->spill_store) == disk);
+                        wl_columnar_ops_test_map_fail_output_alloc = true;
+                        CHECK(col_eval_relation_plan(rp, &stack,
+                            session) == ENOMEM);
+                        wl_columnar_ops_test_map_fail_output_alloc = false;
+                        CHECK(!stack.top && reserved(&f) == before);
+                        /* Failure after the prefix reader finishes, in JOIN capture/read. */
+                        read_fault = 5;
+                        CHECK(col_eval_relation_plan(rp, &stack,
+                            session) == EIO);
+                        read_fault = 0;
+                        CHECK(!stack.top && reserved(&f) == before &&
+                            wl_columnar_spill_store_bytes(
+                                session->spill_store) == disk);
+                    }
+                    if (direction && shape == 2) {
+                        later[0] = "col1";
+                        CHECK(wl_columnar_session_cold_execution_check(
+                                session) == ENOTSUP);
+                        CHECK(reserved(&f) == before); later[0] = "col2";
+                    }
+                    if (direction == 1 || direction >= 3) {
+                        CHECK(wl_columnar_ops_cold_scan(rp, &stack, session,
+                            ji) == 0);
+                        entry = eval_stack_pop(&stack);
+                        if (!shape) {
+                            CHECK(!strcmp(entry.rel->name, "a"));
+                            CHECK(col_rel_col_idx(entry.rel,
+                                compound ? "col1" : "symbol_key") == 1);
+                            CHECK(entry.rel->compound_kind ==
+                                (compound ? WIRELOG_COMPOUND_KIND_INLINE :
+                                WIRELOG_COMPOUND_KIND_NONE));
+                            if (compound) CHECK(entry.rel->compound_arity_len ==
+                                    2 && entry.rel->compound_arity_map[1] == 2);
+                        } else CHECK(entry.rel->compound_kind ==
+                                WIRELOG_COMPOUND_KIND_NONE &&
+                                !entry.rel->compound_arity_map);
+                        CHECK(eval_stack_dispose_entry(&stack,
+                            &entry) == 0 && reserved(&f) == before);
+                    }
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        int eval_rc = col_eval_relation_plan(rp, &stack,
+                                session);
+                        if (eval_rc)fprintf(stderr,
+                                "pipeline eval compound=%u shape=%u direction=%u empty=%u rc=%d\n",
+                                compound, shape, direction, empty, eval_rc);
+                        CHECK(eval_rc == 0);
+                        entry = eval_stack_pop(&stack);
+                        CHECK(entry.rel->nrows == expected_rows &&
+                            entry.rel->column_types &&
+                            entry.rel->column_types[1] == WIRELOG_TYPE_STRING);
+                        for (uint32_t i = 0; i < expected_rows; i++)
+                            for (unsigned c = 0; c < 3;
+                                c++) CHECK(entry.rel->columns[c][i] ==
+                                    expected[i][c]);
+                        CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+                    }
+                    rp->ops = saved; rp->op_count = count; destroy(&f);
+                }
+}
+
+static void cold_scan_join_budget(void)
+{
+    uint64_t allowance = 0;
+    for (unsigned pass = 0; pass < 4; pass++) {
+        budget_peak = 0;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        fixture_t f = fixture(query,
+                pass == 0 ? 8*1024*1024 : pass == 3 ? 1024*1024 : allowance,
+                1024*1024);
+        for (unsigned i = 0; i < 8192; i++) {
+            int64_t row[] = {i, 100+i};
+            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        }
+        int64_t right[] = {7, 900};
+        CHECK(wl_session_insert(f.session, "b", right, 1, 2) == 0);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        uint32_t indices[64] = {0}, projection[] = {0, 5};
+        const char *keys[] = {"col0"};
+        uint8_t predicate[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+                                 WL_PLAN_EXPR_CONST_INT,
+                                 0, 0, 0, 0, 0, 0, 0, 0, WL_PLAN_EXPR_CMP_GTE};
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+            {.op = WL_PLAN_OP_MAP, .project_indices = indices,
+             .project_count = 4},
+            {.op = WL_PLAN_OP_FILTER,
+             .filter_expr = {.data = predicate, .size = 17}},
+            {.op = WL_PLAN_OP_JOIN, .right_relation = "b", .left_keys = keys,
+             .right_keys = keys, .key_count = 1,
+             .project_indices = projection, .project_count = 2},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        rp->ops = ops; rp->op_count = 5;
+        wl_columnar_session_test_retain_cold_source = pass == 2;
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        wl_columnar_session_test_retain_cold_source = false;
+        CHECK(!session_find_rel(COL_SESSION(f.session), "a"));
+        eval_stack_t stack; eval_stack_init(&stack);
+        uint64_t before = reserved(&f);
+        if (pass == 3) {
+            ops[1].project_count = 64; projection[1] = 65;
+            predicate[16] = WL_PLAN_EXPR_CMP_LT;
+            CHECK(col_eval_relation_plan(rp, &stack,
+                COL_SESSION(f.session)) == ENOSPC);
+            CHECK(!stack.top && reserved(&f) == before &&
+                wl_session_budget_denied(f.session));
+            ops[1].project_count = 4; projection[1] = 5;
+            predicate[16] = WL_PLAN_EXPR_CMP_GTE;
+        }
+        int rc = col_eval_relation_plan(rp, &stack, COL_SESSION(f.session));
+        if (pass == 2)CHECK(rc == ENOSPC && !stack.top &&
+                reserved(&f) == before && wl_session_budget_denied(f.session));
+        else {
+            CHECK(rc == 0); eval_entry_t entry = eval_stack_pop(&stack);
+            CHECK(entry.rel->nrows == 1 && entry.rel->ncols == 2 &&
+                entry.rel->columns[0][0] == 7 &&
+                entry.rel->columns[1][0] == 900);
+            CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+        }
+        if (pass == 0)allowance = budget_peak;
+        else if (pass < 3)CHECK(budget_peak <= allowance);
+        rp->ops = saved; rp->op_count = count; destroy(&f);
+        wl_columnar_memory_governor_test_admitted = NULL;
+    }
+}
+
+static unsigned suffix_failure_calls;
+static void fail_suffix_filter(eval_stack_t *stack, eval_entry_t *entry)
+{
+    (void)stack;
+    CHECK(entry->owned && entry->rel && !strcmp(entry->rel->name, "$join"));
+    suffix_failure_calls++;
+    wl_columnar_filter_test_before_filter_dispose = NULL;
+    wl_columnar_relation_test_fail_next_metadata_alloc();
+}
+
+static void parsed_cold_scan_join(void)
+{
+    const char *comparisons[] = {"=", "!=", "<", ">", "<=", ">="};
+    for (unsigned cmp = 0; cmp < 6; cmp++) {
+        char text[768]; snprintf(text, sizeof(text),
+            ".decl a(k:int64,s:symbol,g:int64)\n.decl b(s:symbol,w:int64)\n"
+            ".decl result(k:int64,s:symbol,w:int64)\n"
+            "a(0,\"zero\",7).\na(1,\"one\",7).\na(2,\"two\",7).\n"
+            "b(\"zero\",100).\nb(\"one\",101).\nb(\"two\",102).\n"
+            "result(k,s,w) :- a(k,s,g), g = 7, k %s 1, b(s,w).\n",
+            comparisons[cmp]);
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        wl_plan_relation_t *rp = join_body(&f, "result"); uint32_t index = 0;
+        CHECK(rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
+            !strcmp(rp->ops[0].relation_name, "a"));
+        if (rp->ops[1].op != WL_PLAN_OP_FILTER)fprintf(stderr,
+                "no parsed prefix cmp=%u op1=%u\n", cmp, rp->ops[1].op);
+        CHECK(rp->ops[1].op == WL_PLAN_OP_FILTER);
+        CHECK(wl_columnar_join_cold_scan_prefix(COL_SESSION(f.session), rp,
+            &index) && index >= 2);
+        CHECK(rp->ops[index+1].op == WL_PLAN_OP_FILTER);
+        if (!cmp) {
+            /* A valid rule cannot authorize another consumer's unsafe suffix. */
+            CHECK(rp->op_count <= 32);
+            wl_plan_op_t unsafe_ops[32];
+            memcpy(unsafe_ops, rp->ops, rp->op_count*sizeof(*unsafe_ops));
+            uint8_t bad[17]; CHECK(unsafe_ops[index+1].filter_expr.size == 17);
+            memcpy(bad, unsafe_ops[index+1].filter_expr.data, 17); bad[6] = '1';
+            unsafe_ops[index+
+                1].filter_expr = (wl_plan_expr_buffer_t){.data = bad,
+                                                         .size = 17};
+            wl_plan_relation_t consumers[2] = {*rp, *rp};
+            consumers[1].name = "unsafe"; consumers[1].ops = unsafe_ops;
+            wl_plan_stratum_t *stratum = NULL;
+            for (uint32_t si = 0; si < f.plan->stratum_count; si++)
+                for (uint32_t ri = 0; ri < f.plan->strata[si].relation_count;
+                    ri++)
+                    if (&f.plan->strata[si].relations[ri] ==
+                        rp) stratum = (wl_plan_stratum_t *)&f.plan->strata[si];
+            CHECK(stratum && stratum->relation_count == 1);
+            const wl_plan_relation_t *original = stratum->relations;
+            stratum->relations = consumers; stratum->relation_count = 2;
+            uint64_t before = reserved(&f);
+            CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(reserved(&f) == before &&
+                session_find_rel(COL_SESSION(f.session), "a"));
+            stratum->relations = original; stratum->relation_count = 1;
+        }
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        eval_stack_t stack; eval_stack_init(&stack);
+        wl_plan_op_t *suffix = (wl_plan_op_t *)&rp->ops[index+1];
+        wl_plan_expr_buffer_t original_suffix = suffix->filter_expr;
+        uint8_t malformed[17]; CHECK(original_suffix.size == 17);
+        memcpy(malformed, original_suffix.data, 17);
+        malformed[16] = WL_PLAN_EXPR_ARITH_ADD;
+        suffix->filter_expr = (wl_plan_expr_buffer_t){.data = malformed,
+                                                      .size = 17};
+        uint64_t unchanged = reserved(&f);
+        CHECK(col_eval_relation_plan(rp, &stack,
+            COL_SESSION(f.session)) == ENOTSUP && !stack.top &&
+            reserved(&f) == unchanged);
+        suffix->filter_expr = original_suffix;
+        if (!cmp) {
+            (void)session_find_rel(COL_SESSION(f.session), "result"); /* Admit lazy registry hash. */
+            uint64_t before = reserved(&f); suffix_failure_calls = 0;
+            wl_columnar_filter_test_before_filter_dispose = fail_suffix_filter;
+            CHECK(col_eval_relation_plan(rp, &stack,
+                COL_SESSION(f.session)) == ENOMEM);
+            if (suffix_failure_calls != 1 || stack.top ||
+                reserved(&f) != before) fprintf(stderr,
+                    "suffix failure calls=%u top=%u reserved=%llu before=%llu\n",
+                    suffix_failure_calls, stack.top,
+                    (unsigned long long)reserved(&f),
+                    (unsigned long long)before);
+            CHECK(suffix_failure_calls == 1 && !stack.top &&
+                reserved(&f) == before);
+            suffix_failure_calls = 0; unsigned callbacks = 0;
+            wl_columnar_filter_test_before_filter_dispose = fail_suffix_filter;
+            CHECK(wl_session_snapshot(f.session, count_only,
+                &callbacks) == ENOMEM);
+            CHECK(suffix_failure_calls == 1 && !callbacks);
+        }
+        CHECK(col_eval_relation_plan(rp, &stack, COL_SESSION(f.session)) == 0);
+        eval_entry_t entry = eval_stack_pop(&stack);
+        unsigned expected[] = {1, 2, 1, 1, 2, 2};
+        CHECK(entry.rel->nrows == expected[cmp]);
+        for (uint32_t i = 0; i < entry.rel->nrows;
+            i++) CHECK(entry.rel->columns[2][i] ==
+                100+entry.rel->columns[0][i]);
+        CHECK(eval_stack_dispose_entry(&stack, &entry) == 0); destroy(&f);
+    }
+}
+
+static void cold_scan_join_self_missing(void)
+{
+    for (unsigned missing = 0; missing < 2; missing++) {
+        fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
+        for (int64_t i = 0; i < 4; i++) {
+            int64_t row[] = {i, 100+i};
+            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        }
+        CHECK(session_remove_rel(COL_SESSION(f.session), "b") == 0);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        const char *keys[] = {"col0"}; uint32_t projection[] = {0, 3};
+        uint8_t predicate[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+                                 WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0, 0, 0, 0, 0,
+                                 WL_PLAN_EXPR_CMP_GTE};
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+            {.op = WL_PLAN_OP_FILTER,
+             .filter_expr = {.data = predicate, .size = 17}},
+            {.op = WL_PLAN_OP_JOIN, .right_relation = missing ? "b" : "a",
+             .left_keys = keys, .right_keys = keys,
+             .key_count = 1, .project_count = 2, .project_indices = projection},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        rp->ops = ops; rp->op_count = 4;
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        eval_stack_t stack; eval_stack_init(&stack);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            CHECK(col_eval_relation_plan(rp, &stack,
+                COL_SESSION(f.session)) == 0);
+            eval_entry_t entry = eval_stack_pop(&stack);
+            CHECK(entry.rel->nrows == (missing ? 0u : 3u) &&
+                entry.rel->ncols == 2 &&
+                entry.rel->column_types[0] == WIRELOG_TYPE_INT64 &&
+                entry.rel->column_types[1] == WIRELOG_TYPE_INT64);
+            for (uint32_t i = 0; i < entry.rel->nrows;
+                i++) CHECK(entry.rel->columns[0][i] == i+1 &&
+                    entry.rel->columns[1][i] == 101+i);
+            CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+        }
+        rp->ops = saved; rp->op_count = count; destroy(&f);
+    }
+}
+
+static void cold_scan_join_key_names(void)
+{
+    const char *names[] = {"col0", "col1", "col01", "col+1", "col4294967296",
+                           "col4294967297", "col18446744073709551616", "col-1",
+                           "colmissing", "col"};
+    for (size_t n = 0; n < sizeof(names)/sizeof(names[0]); n++) {
+        fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
+        wl_col_session_t *session = COL_SESSION(f.session);
+        int64_t row[] = {1, wl_intern_put(session->intern, "value")};
+        int64_t right[] = {1, 5};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        CHECK(wl_session_insert(f.session, "b", right, 1, 2) == 0);
+        col_rel_t *left = session_find_rel(session, "a");
+        wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                         WIRELOG_TYPE_STRING};
+        CHECK(col_rel_set_column_types(left, types, 2) == 0);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        uint32_t columns[] = {0, 1};
+        const char *left_keys[] = {names[n]}, *right_keys[] = {"col0"};
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+            {.op = WL_PLAN_OP_MAP, .project_indices = columns,
+             .project_count = 2},
+            {.op = WL_PLAN_OP_JOIN, .right_relation = "b",
+             .left_keys = left_keys,
+             .right_keys = right_keys, .key_count = 1},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        rp->ops = ops; rp->op_count = 4;
+        /* Derive the oracle from ordinary lookup, including LP64/LLP64
+         * strtol differences and its unknown-name fallback to lane zero. */
+        int runtime_key = col_rel_col_idx(left, names[n]);
+        bool valid = runtime_key != 1;
+        CHECK(wl_columnar_join_cold_scan_prefix(session, rp, NULL) == valid);
+        uint64_t before = reserved(&f);
+        if (!valid) {
+            CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(reserved(&f) == before && session_find_rel(session, "a") &&
+                session_find_rel(session, "b"));
+        }
+        left_keys[0] = "col0";
+        CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+        left_keys[0] = names[n];
+        before = reserved(&f);
+        CHECK(wl_columnar_session_cold_execution_check(session) ==
+            (valid ? 0 : ENOTSUP));
+        CHECK(reserved(&f) == before);
+        if (!valid) left_keys[0] = "col0";
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(col_eval_relation_plan(rp, &stack, session) == 0);
+        eval_entry_t entry = eval_stack_pop(&stack);
+        CHECK(entry.rel && entry.rel->nrows == 1 && entry.rel->ncols == 4);
+        CHECK(entry.rel->columns[0][0] == 1 &&
+            entry.rel->columns[1][0] == row[1] &&
+            entry.rel->columns[2][0] == 1 && entry.rel->columns[3][0] == 5);
+        CHECK(entry.rel->column_types[1] == WIRELOG_TYPE_STRING);
+        CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+        rp->ops = saved; rp->op_count = count; destroy(&f);
+    }
+}
+
+static void cold_scan_map_only_right_audit(void)
+{
+    fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
+    wl_col_session_t *session = COL_SESSION(f.session);
+    int64_t row[] = {1, wl_intern_put(session->intern, "value")};
+    CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+    CHECK(wl_session_insert(f.session, "b", row, 1, 2) == 0);
+    col_rel_t *left = session_find_rel(session, "a");
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_STRING};
+    CHECK(col_rel_set_column_types(left, types, 2) == 0);
+    wl_plan_relation_t *rp = join_body(&f, "result");
+    const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+    uint32_t column[] = {1}; const char *keys[] = {"col0"};
+    wl_plan_op_t ops[] = {
+        {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+        {.op = WL_PLAN_OP_MAP, .project_indices = column, .project_count = 1},
+        {.op = WL_PLAN_OP_JOIN, .right_relation = "b", .left_keys = keys,
+         .right_keys = keys, .key_count = 1},
+        {.op = WL_PLAN_OP_CONSOLIDATE}
+    };
+    rp->ops = ops; rp->op_count = 4;
+    uint64_t before = reserved(&f);
+    CHECK(!wl_columnar_join_cold_scan_prefix(session, rp, NULL));
+    CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+        NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(reserved(&f) == before && session_find_rel(session, "b"));
+    types[1] = WIRELOG_TYPE_INT64;
+    CHECK(col_rel_set_column_types(left, types, 2) == 0);
+    column[0] = 2;
+    CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+        NULL) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    column[0] = 1;
+    CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) == OK);
+    types[1] = WIRELOG_TYPE_STRING;
+    CHECK(col_rel_set_column_types(left, types, 2) == 0);
+    before = reserved(&f); eval_stack_t stack; eval_stack_init(&stack);
+    CHECK(wl_columnar_session_cold_execution_check(session) == ENOTSUP);
+    CHECK(reserved(&f) == before && !stack.top);
+    types[1] = WIRELOG_TYPE_INT64;
+    CHECK(col_rel_set_column_types(left, types, 2) == 0);
+    CHECK(col_eval_relation_plan(rp, &stack, session) == 0);
+    eval_entry_t entry = eval_stack_pop(&stack);
+    CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+    rp->ops = saved; rp->op_count = count; destroy(&f);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -3362,6 +3937,11 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    cold_scan_join_key_names();
+    cold_scan_map_only_right_audit();
+    cold_scan_join_self_missing();
+    cold_scan_join_budget(); parsed_cold_scan_join();
+    cold_scan_join_stages();
     composed_cold_stages();
     repeated_cold_predicates(); parsed_repeated_predicates();
     repeated_predicate_scratch();

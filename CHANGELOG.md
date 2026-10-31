@@ -4,10 +4,15 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
-- Cold standalone scans compose ordered direct-column MAP/FILTER stages without
-  intermediate rowsets, preserving stage-local types and scalar INLINE fields.
-
 ### Added
+
+- Cold direct MAP/FILTER scans can feed audited JOIN pipelines, preserving
+  FILTER-only names/INLINE provenance and validating stage-local suffix types.
+  Narrow resident suffix predicates support parsed pushed-down conditions;
+  prefix and JOIN/FILTER output memory floors remain explicit (#1372).
+
+- Cold standalone scans compose ordered direct-column MAP/FILTER stages without
+  intermediate rowsets, preserving stage-local types and scalar INLINE fields (#1372).
 
 - **Repeated cold projection predicates** (#1372): sealed scalar and flat INLINE
   field projections accept consecutive narrow INT64/literal FILTER operators.
