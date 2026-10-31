@@ -893,6 +893,10 @@ wl_columnar_filter_test_control(uint64_t limit, const void *owner)
     return control;
 }
 
+/* Dedicated legal physical provenance cases: 1=all, 2=positive col0, 3=none.
+ * Legacy adversarial sentinel fixtures and literal budgets remain unchanged. */
+static unsigned wl_columnar_filter_test_physical_pattern;
+
 static col_rel_t *
 wl_columnar_filter_test_source(uint32_t width, uint32_t rows, bool typed,
     bool timestamps, bool long_names)
@@ -941,6 +945,14 @@ wl_columnar_filter_test_source(uint32_t width, uint32_t rows, bool typed,
             relation->timestamps[r].worker = r % 5;
             relation->timestamps[r]._reserved = r % 13;
             relation->timestamps[r].multiplicity = r % 2 ? -3 : 5;
+            if (wl_columnar_filter_test_physical_pattern) {
+                const int64_t weights[] = {0, 1, -1, 3, -4};
+                relation->timestamps[r] = (col_delta_timestamp_t){
+                    .iteration = 101 + r, .stratum = 2 * r,
+                    .worker = r % 3, ._reserved = 0,
+                    .multiplicity = weights[r % 5]
+                };
+            }
         }
     }
     relation->has_graph_column = width != 0;
@@ -1415,6 +1427,27 @@ wl_columnar_filter_test_parity(uint32_t width, uint32_t rows, bool typed,
     CHECK(actual_stack->top == 1);
     wl_columnar_filter_test_equal(actual_stack->items[0].rel,
         raw_stack->items[0].rel);
+    if (wl_columnar_filter_test_physical_pattern) {
+        const col_rel_t *actual = actual_stack->items[0].rel;
+        const int64_t weights[] = {0, 1, -1, 3, -4};
+        uint32_t selected = 0;
+        CHECK(timestamps && actual->timestamps && !typed);
+        for (uint32_t r = 0; r < rows; ++r) {
+            bool keep = wl_columnar_filter_test_physical_pattern == 1
+                || (wl_columnar_filter_test_physical_pattern == 2 && r % 7 > 3);
+            if (!keep) continue;
+            CHECK(selected < actual->nrows);
+            const col_delta_timestamp_t *ts = &actual->timestamps[selected];
+            CHECK(ts->iteration == 101 + r && ts->stratum == 2 * r
+                && ts->worker == r % 3 && ts->_reserved == 0
+                && ts->multiplicity == weights[r % 5]);
+            for (uint32_t c = 0; c < width; ++c)
+                CHECK(actual->columns[c][selected]
+                    == (int64_t)(r % 7) - 3 + (int64_t)c * 11);
+            ++selected;
+        }
+        CHECK(actual->nrows == selected);
+    }
     CHECK(scenario->sentinel_next > 1 && scenario->filter_turns > 1);
     wl_evaluation_control_report_t report =
         wl_columnar_filter_test_complete(scenario);
@@ -6253,6 +6286,16 @@ main(void)
     wl_columnar_filter_test_constant(&floating, WL_PLAN_EXPR_CONST_FLOAT,
         wl_columnar_float_to_bits(-4.0));
     wl_columnar_filter_test_opcode(&floating, WL_PLAN_EXPR_CMP_FLOAT_GT);
+    const uint32_t physical_widths[] = {0, 3, 17};
+    for (unsigned w = 0; w < 3; ++w)
+        for (unsigned selection = 1; selection <= 3; ++selection) {
+            if (!physical_widths[w] && selection == 2) continue;
+            wl_columnar_filter_test_physical_pattern = selection;
+            wl_columnar_filter_test_parity(physical_widths[w], 14, false,
+                true, false, selection == 1 ? &yes
+                : selection == 2 ? &mixed : &no, 0, false);
+        }
+    wl_columnar_filter_test_physical_pattern = 0;
     wl_columnar_filter_test_parity(0, 0, false, false, false, NULL, 0, false);
     wl_columnar_filter_test_parity(0, 3, false, true, false, &yes, 0, false);
     wl_columnar_filter_test_parity(1, 0, false, false, false, &yes, 0, false);
