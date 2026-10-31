@@ -179,7 +179,9 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
         || !wl_columnar_session_controlled_batch_authorized(session, control,
         id, operation_identity)
         || plan->op_count != 5 || plan->ops[0].op != WL_PLAN_OP_VARIABLE
+        || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[0])
         || plan->ops[1].op != WL_PLAN_OP_JOIN
+        || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[1])
         || plan->ops[2].op != WL_PLAN_OP_FILTER
         || plan->ops[3].op != WL_PLAN_OP_MAP
         || plan->ops[4].op != WL_PLAN_OP_CONSOLIDATE)) return ENOTSUP;
@@ -1488,7 +1490,9 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
             request->operation, request->operation_id,
             request->operation_identity)
             || rp->op_count != 5 || rp->ops[0].op != WL_PLAN_OP_VARIABLE
+            || !wl_columnar_eval_plan_scalar_selector_supported(&rp->ops[0])
             || rp->ops[1].op != WL_PLAN_OP_JOIN
+            || !wl_columnar_eval_plan_scalar_selector_supported(&rp->ops[1])
             || rp->ops[2].op != WL_PLAN_OP_FILTER
             || rp->ops[3].op != WL_PLAN_OP_MAP
             || rp->ops[4].op != WL_PLAN_OP_CONSOLIDATE)) return ENOTSUP;

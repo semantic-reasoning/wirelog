@@ -6060,7 +6060,9 @@ test_composed_controlled_batch_fallback_owner(void)
     f.session.join_batch_bytes = 224;
     wl_plan_op_t rejected_ops[5];
     memcpy(rejected_ops, body->ops, sizeof(rejected_ops));
-    rejected_ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+    /* DELTA is an admitted scalar selector; unknown modes still refuse
+     * before allocating an authenticated fallback owner. */
+    rejected_ops[0].delta_mode = (wl_delta_mode_t)99;
     wl_plan_relation_t rejected_body = *body;
     rejected_body.ops = rejected_ops;
     CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
