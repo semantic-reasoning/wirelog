@@ -860,6 +860,8 @@ typedef struct {
     wl_columnar_relation_managed_retirement_t storage;
     wl_mem_ledger_t *ledger;
     uint64_t ledger_bytes;
+    uint64_t ledger_timestamp_bytes, timestamp_bytes;
+    uint32_t owned_columns;
     uint32_t column, prior_column;
     unsigned phase;
     bool ready, committed;
@@ -4421,8 +4423,8 @@ int wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
     wl_columnar_relation_append_batch_t *batch,
     wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
     const int64_t *values, uint32_t width);
-/* Stamp derived sorted caches on an already sorted-and-unique private noTS
- * output, using scalar row comparison. The caller completes dedup first.
+/* Stamp derived sorted caches on an already sorted-and-unique private scalar
+ * output. The caller completes dedup and any timestamp transport first.
  * Requires original native-thread HELD fixed-one writer, current control/ID,
  * and exclusively serialized output lifetime. No later append is permitted.
  * Does not scan/verify ordering or uniqueness, or change rows/generations.
@@ -6644,11 +6646,12 @@ extern int wl_columnar_join_test_attempt_fail_allocation;
  * Protocol refusal leaves both outputs untouched. No other context aliasing. */
 int wl_columnar_eval_stack_filter_finish(
     wl_columnar_eval_stack_cleanup_frame_t *, int, int *, bool *);
-/* Initial serial nonrecursive scalar sorted distinct. No delta/timestamps,
- * differential/retraction/TDD/parallel context. Caller pins immutable plan,
- * session, source and governor through ACK. Always private materialization,
- * including zero/one row; logical parity does not imply allocation parity.
- * NULL control delegates raw CONSOLIDATE. Reuse common FILTER step/ACK. */
+/* Serial nonrecursive scalar sorted distinct preserves the first incoming
+* representative's complete timestamp when present. No delta or active
+* differential/retraction/TDD/parallel context. Caller pins immutable plan,
+* session, source and governor through ACK. Always private materialization,
+* including zero/one row; logical parity does not imply allocation parity.
+* NULL control delegates raw CONSOLIDATE. Reuse common FILTER step/ACK. */
 int wl_columnar_filter_consolidate_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);

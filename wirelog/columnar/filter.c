@@ -2590,7 +2590,7 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     rc =
         wl_columnar_relation_scalar_source_begin_attempt_controlled(
         &ctx->source,
-        input, false);
+        input, true);
     rc = wl_columnar_filter_attempt_return(control, attempt_id, rc);
     if (rc)
         goto done;
@@ -2608,9 +2608,6 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     if (rc)
         goto done;
     ctx->width = width; ctx->nrows = rows;
-    if (input->timestamps) {
-        rc = ENOTSUP; goto done;
-    }
     /* Even trivial inputs must reject nonfinite FLOAT values before sorting.
      * Each row/column is separately paid, including non-FLOAT columns. */
     for (uint32_t row = 0; row < rows; ++row) {

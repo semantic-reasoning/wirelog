@@ -7187,11 +7187,14 @@ wl_columnar_session_recursive_transaction_shape(const wl_col_session_t *sess)
     const wl_plan_t *plan = sess->plan;
     if (!plan || !plan->strata ||
         plan->stratum_count > MAX_STRATA) return false;
-    /* Preserve the independently qualified binary fast path and its tariffs. */
+    /* Timestamped sources use preserved-body set reconstruction. Keep the
+     * independently qualified value-only binary fast path for other inputs. */
+    bool timestamp_source = sess->rels && sess->nrels && sess->rels[0]
+        && sess->rels[0]->timestamps;
     if (!sess->delta_cb && plan->stratum_count == 1
         && plan->strata[0].relation_count == 1 && plan->strata[0].relations
         && wl_columnar_eval_plan_numeric_recursive_path_supported(
-            &plan->strata[0].relations[0])) return false;
+            &plan->strata[0].relations[0]) && !timestamp_source) return false;
     for (uint32_t i = 0; i < plan->stratum_count; ++i) {
         const wl_plan_stratum_t *stratum = &plan->strata[i];
         if (!stratum->is_recursive) continue;
@@ -7930,11 +7933,12 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
     }
 #endif
     wl_evaluation_control_t *grant = NULL;
-    /* Recursive capture adds a bound child-begin transition to the relation
-     * host's finite call chain. Keep that protocol allowance explicit; all
-     * evaluator work remains charged to the independent session operation. */
+    /* Ordinary CONCAT cleanup reaches five fixed384 host payments (including
+     * binary finish); four would repeatedly exhaust the grant before progress.
+     * Recursive capture adds bound child-begin transitions. These finite
+     * protocol allowances do not change the independent operation debit. */
     uint64_t host_quanta = step->recursive_route || step->general_observed
-        ? 8 : 4;
+        ? 8 : 5;
     int rc = wl_evaluation_control_create(host_quanta * UINT64_C(384),
             &grant);
     if (rc) return EAGAIN;
