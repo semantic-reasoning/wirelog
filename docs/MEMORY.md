@@ -5104,11 +5104,21 @@ retirement remain externally serialized against reads. Different trace owners
 sharing an external spill store must serialize cursor operations as well; this
 does not make the spill store's lifecycle globally thread-safe.
 
-This storage/scan contract does not automatically migrate session relations,
-legacy differential arrangements or JOIN execution. Segmented indexed and signed
-JOIN consumers belong to the following units of the same functional PR group.
+This storage/scan contract does not automatically migrate session relations or
+legacy differential arrangements. Signed JOIN consumption remains follow-up work.
 STRING/INLINE/SIDE/nested provenance, general logical time, mutable-session
 routing and #1373 scheduling remain outside this numeric trace owner.
+
+The indexed payload JOIN engine also accepts two numeric trace snapshots through
+`wl_columnar_payload_join_create_trace_bounded`. Existing payload constructors,
+including the production reference/projected cold JOIN route, use the same source
+cursor engine and retain their eager readers and intern capabilities. Trace
+cursors independently retain immutable snapshot boundaries, opening one segment
+reader at a time. The same capped right-row index, output batches and 256-action
+publication quantum apply across segment boundaries. Ordinary trace JOIN checks
+all rows for +1 multiplicity before publication; signed consumption remains a
+separate explicit contract. Retiring a trace owner preserves these consumers,
+but retiring its external store may yield CLOSED on later lazy acquisitions.
 
 ### Remaining #1372 implementation groups
 

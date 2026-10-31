@@ -8,6 +8,64 @@
 #define WL_COLUMNAR_PAYLOAD_JOIN_END UINT32_MAX
 #define WL_COLUMNAR_PAYLOAD_JOIN_QUANTUM 256u
 
+/* A single payload keeps its eager reader/capability for the producer lifetime.
+ * A trace cursor independently pins its snapshot and opens one segment lazily. */
+typedef struct {
+    wl_columnar_batch_payload_t *payload;
+    wl_columnar_trace_store_snapshot_t *snapshot;
+} wl_columnar_payload_join_source_t;
+typedef struct {
+    wl_columnar_batch_payload_reader_t *payload;
+    wl_columnar_trace_store_cursor_t *trace;
+} wl_columnar_payload_join_cursor_t;
+
+static const wirelog_column_type_t *
+wl_columnar_payload_join_source_schema(wl_columnar_payload_join_source_t source,
+    uint32_t *cols, uint32_t *rows)
+{
+    return source.snapshot
+        ? wl_columnar_trace_store_snapshot_schema(source.snapshot, cols, rows)
+        : wl_columnar_batch_payload_schema(source.payload, cols, rows);
+}
+static bool
+wl_columnar_payload_join_source_governor(
+    wl_columnar_payload_join_source_t source,
+    wl_columnar_memory_governor_ref_t *g)
+{
+    return source.snapshot
+        ? wl_columnar_trace_store_snapshot_uses_governor(source.snapshot, g)
+        : wl_columnar_batch_payload_uses_governor(source.payload, g);
+}
+static wl_columnar_spill_status_t
+wl_columnar_payload_join_source_acquire(
+    wl_columnar_payload_join_source_t source,
+    wl_columnar_payload_join_cursor_t *cursor)
+{
+    return source.snapshot
+        ? wl_columnar_trace_store_cursor_acquire(source.snapshot,
+               &cursor->trace)
+        : wl_columnar_batch_payload_acquire(source.payload, &cursor->payload);
+}
+static void
+wl_columnar_payload_join_source_release(
+    wl_columnar_payload_join_cursor_t *cursor)
+{
+    wl_columnar_batch_payload_reader_release(cursor->payload);
+    wl_columnar_trace_store_cursor_release(cursor->trace);
+    memset(cursor, 0, sizeof(*cursor));
+}
+static wl_columnar_spill_status_t
+wl_columnar_payload_join_source_read(wl_columnar_payload_join_cursor_t *cursor,
+    uint32_t row, wl_columnar_spill_cancel_fn cancel, void *context,
+    const uint64_t **lanes, wl_columnar_spill_metadata_t *meta)
+{
+    return cursor->trace
+        ? wl_columnar_trace_store_cursor_read(cursor->trace, row, cancel,
+               context, lanes, meta)
+        : wl_columnar_batch_payload_read(cursor->payload, row, cancel,
+               context, lanes, meta);
+}
+
 typedef struct {
     wl_columnar_memory_reservation_t reservation;
     uint32_t slots[];
@@ -28,7 +86,7 @@ typedef enum {
 typedef struct {
     wl_columnar_memory_reservation_t reservation;
     wl_columnar_memory_governor_ref_t *governor;
-    wl_columnar_batch_payload_reader_t *left, *right;
+    wl_columnar_payload_join_cursor_t left, right;
     wl_columnar_payload_join_index_t *index;
     wl_columnar_payload_join_projection_t *projection;
     uint32_t output_cols;
@@ -131,8 +189,8 @@ wl_columnar_payload_join_cancel(void *context)
     p->stopped = true;
     if (p->error ==
         WL_COLUMNAR_SPILL_OK) p->error = WL_COLUMNAR_SPILL_CANCELLED;
-    wl_columnar_batch_payload_reader_release(p->left); p->left = NULL;
-    wl_columnar_batch_payload_reader_release(p->right); p->right = NULL;
+    wl_columnar_payload_join_source_release(&p->left);
+    wl_columnar_payload_join_source_release(&p->right);
     wl_columnar_payload_join_free(p->index); p->index = NULL;
     wl_columnar_payload_join_free(p->projection); p->projection = NULL;
     col_rel_destroy(p->batch); p->batch = NULL;
@@ -197,7 +255,7 @@ wl_columnar_payload_join_produce(void *context,
             }
             const uint64_t *lanes;
             wl_columnar_spill_metadata_t meta;
-            p->error = wl_columnar_batch_payload_read(p->right,
+            p->error = wl_columnar_payload_join_source_read(&p->right,
                     p->window_start + p->build_row, p->cancel,
                     p->cancel_context, &lanes, &meta);
             if (p->error != WL_COLUMNAR_SPILL_OK) break;
@@ -227,7 +285,7 @@ wl_columnar_payload_join_produce(void *context,
         }
         if (!p->started) {
             wl_columnar_spill_metadata_t meta;
-            p->error = wl_columnar_batch_payload_read(p->left, p->row,
+            p->error = wl_columnar_payload_join_source_read(&p->left, p->row,
                     p->cancel, p->cancel_context, &p->left_lanes, &meta);
             if (p->error != WL_COLUMNAR_SPILL_OK) break;
             p->left_multiplicity = meta.multiplicity;
@@ -241,7 +299,7 @@ wl_columnar_payload_join_produce(void *context,
         }
         const uint64_t *right;
         wl_columnar_spill_metadata_t meta;
-        p->error = wl_columnar_batch_payload_read(p->right,
+        p->error = wl_columnar_payload_join_source_read(&p->right,
                 p->window_start + p->candidate,
                 p->cancel, p->cancel_context, &right, &meta);
         if (p->error != WL_COLUMNAR_SPILL_OK) break;
@@ -314,8 +372,24 @@ wl_columnar_payload_join_schema(wl_columnar_batch_payload_t *payload,
 }
 
 static wl_columnar_spill_status_t
+wl_columnar_payload_join_source_validate(
+    wl_columnar_payload_join_source_t source,
+    uint32_t key, uint32_t *cols, uint32_t *rows, const wl_intern_t *intern)
+{
+    if (!source.snapshot)
+        return wl_columnar_payload_join_schema(source.payload, key, cols, rows,
+                   intern);
+    const wirelog_column_type_t *types =
+        wl_columnar_payload_join_source_schema(source, cols, rows);
+    if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
+    return types[key] == WIRELOG_TYPE_INT64
+        ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_UNSUPPORTED;
+}
+
+static wl_columnar_spill_status_t
 wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
-    wl_columnar_batch_payload_t *left, wl_columnar_batch_payload_t *right,
+    wl_columnar_payload_join_source_t left,
+    wl_columnar_payload_join_source_t right,
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out, bool weighted, bool bounded,
@@ -324,18 +398,20 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
 {
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
-    if (!g || !wl_columnar_batch_payload_uses_governor(left, g)
-        || !wl_columnar_batch_payload_uses_governor(right,
+    if (!g || !wl_columnar_payload_join_source_governor(left, g)
+        || !wl_columnar_payload_join_source_governor(right,
         g)) return WL_COLUMNAR_SPILL_INVALID;
     uint32_t lc, lr, rc, rr;
-    wl_columnar_spill_status_t status = wl_columnar_payload_join_schema(left,
+    wl_columnar_spill_status_t status =
+        wl_columnar_payload_join_source_validate(left,
             left_key, &lc, &lr, intern);
     if (status != WL_COLUMNAR_SPILL_OK) return status;
-    status = wl_columnar_payload_join_schema(right, right_key, &rc, &rr,
+    status = wl_columnar_payload_join_source_validate(right, right_key, &rc,
+            &rr,
             intern);
     if (status != WL_COLUMNAR_SPILL_OK) return status;
-    if (wl_columnar_batch_payload_schema(left, NULL, NULL)[left_key] !=
-        wl_columnar_batch_payload_schema(right, NULL, NULL)[right_key])
+    if (wl_columnar_payload_join_source_schema(left, NULL, NULL)[left_key] !=
+        wl_columnar_payload_join_source_schema(right, NULL, NULL)[right_key])
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     if (lc > UINT32_MAX - rc) return WL_COLUMNAR_SPILL_OVERFLOW;
     uint32_t input_cols = lc + rc;
@@ -381,9 +457,9 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
     p->output_cols = cols;
     p->capacity = (uint32_t)capacity; p->cancel = cancel;
     p->cancel_context = cancel_context;
-    status = wl_columnar_batch_payload_acquire(left, &p->left);
+    status = wl_columnar_payload_join_source_acquire(left, &p->left);
     if (status != WL_COLUMNAR_SPILL_OK) goto fail;
-    status = wl_columnar_batch_payload_acquire(right, &p->right);
+    status = wl_columnar_payload_join_source_acquire(right, &p->right);
     if (status != WL_COLUMNAR_SPILL_OK) goto fail;
     if (project_count) {
         status = wl_columnar_payload_join_allocate(g, projection_bytes,
@@ -403,7 +479,9 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
         uint32_t rows = side ? rr : lr;
         for (uint32_t row = 0; row < rows; row++) {
             const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
-            status = wl_columnar_batch_payload_read(side ? p->right : p->left,
+            status =
+                wl_columnar_payload_join_source_read(side ? &p->right :
+                    &p->left,
                     row, cancel, cancel_context, &lanes, &meta);
             if (status != WL_COLUMNAR_SPILL_OK) goto fail;
             if (meta.iteration || meta.stratum || meta.worker ||
@@ -420,9 +498,9 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
         }
     }
     const wirelog_column_type_t *left_types =
-        wl_columnar_batch_payload_schema(left, NULL, NULL);
+        wl_columnar_payload_join_source_schema(left, NULL, NULL);
     const wirelog_column_type_t *right_types =
-        wl_columnar_batch_payload_schema(right, NULL, NULL);
+        wl_columnar_payload_join_source_schema(right, NULL, NULL);
     for (uint32_t c = 0; c < cols; c++) {
         uint32_t source = p->projection ? p->projection->columns[c] : c;
         p->types[c] = source <
@@ -476,7 +554,9 @@ wl_columnar_payload_join_create(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                false, 0, NULL, 0, NULL);
 }
@@ -488,7 +568,9 @@ wl_columnar_payload_join_create_weighted(wl_columnar_memory_governor_ref_t *g,
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, true,
                false, 0, NULL, 0, NULL);
 }
@@ -500,7 +582,9 @@ wl_columnar_payload_join_create_bounded(wl_columnar_memory_governor_ref_t *g,
     uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                true, index_bytes, NULL, 0, NULL);
 }
@@ -513,7 +597,9 @@ wl_columnar_payload_join_create_weighted_bounded(
     uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, true,
                true, index_bytes, NULL, 0, NULL);
 }
@@ -527,7 +613,9 @@ wl_columnar_payload_join_create_projected_bounded(
     wl_columnar_spill_cancel_fn cancel, void *cancel_context,
     wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                true, index_bytes, projection, project_count, NULL);
 }
@@ -541,7 +629,25 @@ wl_columnar_payload_join_create_reference_projected_bounded(
     const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out)
 {
-    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                true, index_bytes, projection, project_count, intern);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_trace_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.snapshot = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, false,
+               true, index_bytes, NULL, 0, NULL);
 }

@@ -1551,8 +1551,220 @@ static void reference_joins(bool inlined)
     }
 }
 
+/* Preserve original global IDs/keys while splitting into governed segments. */
+static wl_columnar_trace_store_t *segmented(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_spill_store_t *store,
+    const col_rel_t *input, uint32_t chunk, unsigned mode)
+{
+    wl_columnar_trace_store_t *trace;
+    CHECK(wl_columnar_trace_store_create(g, input->column_types, input->ncols,
+        &trace) == OK);
+    for (uint32_t start = 0;;) {
+        uint32_t count = input->nrows - start;
+        if (count > chunk) count = chunk;
+        col_rel_t *part;
+        CHECK(wl_columnar_relation_new_auto_governed("trace_join_fixture",
+            input->ncols, count ? count : 1, input->timestamps != NULL,
+            g, &part) == 0);
+        CHECK(col_rel_set_column_types(part, input->column_types,
+            input->ncols) == 0);
+        for (uint32_t c = 0; c < input->ncols; c++)
+            memcpy(part->columns[c], input->columns[c] + start,
+                (size_t)count * 8);
+        if (input->timestamps)
+            memcpy(part->timestamps, input->timestamps + start,
+                (size_t)count * sizeof(*part->timestamps));
+        part->nrows = count;
+        bool spill = mode == 1 || (mode == 2 && (start/chunk)%2 == 0);
+        CHECK(wl_columnar_trace_store_append_capture(trace, part,
+            spill ? WL_COLUMNAR_BATCH_PAYLOAD_SPILLED :
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+            store, NULL, NULL) == OK);
+        part->nrows = 0; /* Empty boundaries exercise repeated cumulative ends. */
+        CHECK(wl_columnar_trace_store_append_capture(trace, part,
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, store, NULL, NULL) == OK);
+        col_rel_destroy(part);
+        start += count;
+        if (start == input->nrows) break;
+    }
+    return trace;
+}
+static wl_columnar_trace_store_snapshot_t *snapshot(
+    wl_columnar_trace_store_t *t)
+{
+    wl_columnar_trace_store_snapshot_t *s;
+    CHECK(wl_columnar_trace_store_snapshot_acquire(t, &s) == OK); return s;
+}
+static void trace_combinations(void)
+{
+    for (unsigned a = 0; a < 3; a++) for (unsigned b = 0; b < 3; b++)
+            for (unsigned self = 0; self < 2; self++) {
+                wl_columnar_memory_governor_ref_t *g = governor(1 << 22);
+                wl_columnar_spill_store_t *store;
+                CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22,
+                    1024, &store) == OK);
+                col_rel_t *l = source(17, 3), *r = source(self ? 17 : 23, 3);
+                wl_columnar_trace_store_t *lt = segmented(g, store, l, 5, a);
+                wl_columnar_trace_store_t *rt = self ? lt : segmented(g, store,
+                        r, 7, b);
+                wl_columnar_trace_store_snapshot_t *ls = snapshot(lt),
+                    *rs = snapshot(rt);
+                wl_columnar_continuation_t *join;
+                CHECK(wl_columnar_payload_join_create_trace_bounded(g, ls, rs,
+                    0, 0,
+                    96, index_cap(3), NULL, NULL, &join) == OK);
+                /* A later commit cannot extend this producer. Snapshot pins prevent
+                 * replacing a reader that has not yet been acquired lazily. */
+                col_rel_t *extra;
+                CHECK(wl_columnar_relation_new_auto_governed("later", 3, 1,
+                    false, g, &extra) == 0);
+                CHECK(col_rel_set_column_types(extra, l->column_types, 3) == 0);
+                int64_t lanes[] = {1, 10000, 0};
+                CHECK(col_rel_append_row(extra, lanes) == 0);
+                CHECK(wl_columnar_trace_store_append_capture(lt, extra,
+                    WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, store, NULL,
+                    NULL) == OK);
+                CHECK(wl_columnar_trace_store_demote(lt, 1, store, NULL,
+                    NULL) == WL_COLUMNAR_SPILL_BUSY);
+                col_rel_destroy(extra);
+                wl_columnar_trace_store_snapshot_release(ls);
+                wl_columnar_trace_store_snapshot_release(rs);
+                wl_columnar_trace_store_retire(lt);
+                if (!self) wl_columnar_trace_store_retire(rt);
+                sink_t s; wl_columnar_continuation_sink_t sink;
+                sink_init(&s, &sink, g);
+                bool seen[17 * 23] = {false};
+                drain(join, &s, &sink, l->nrows, r->nrows, 3, 3, seen);
+                wl_columnar_continuation_destroy(join);
+                col_rel_destroy(l); col_rel_destroy(r);
+                wl_columnar_spill_store_retire(store);
+                CHECK(reserved(g) == 0);
+                wl_columnar_memory_governor_ref_release(g);
+            }
+}
+static void trace_failures(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 22);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22, 1024,
+        &store) == OK);
+    col_rel_t *r = source(17, 3);
+    wl_columnar_trace_store_t *t = segmented(g, store, r, 5, 1);
+    wl_columnar_trace_store_snapshot_t *ss = snapshot(t);
+    uint64_t floor = reserved(g);
+    for (unsigned mode = 0; mode < 7; mode++) {
+        bool stop = false;
+        wl_columnar_continuation_t *join = NULL;
+        CHECK(wl_columnar_payload_join_create_trace_bounded(g, ss, ss, 0, 0,
+            48, index_cap(3), cancelled, &stop, &join) == OK);
+        sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+        if (mode < 4) {
+            s.failure = mode + 1;
+            wl_columnar_continuation_status_t status;
+            do {
+                status = wl_columnar_continuation_publish(join, &sink);
+            }while (status == WL_COLUMNAR_CONTINUATION_PROGRESS);
+            CHECK(status == (mode == 0 ? WL_COLUMNAR_CONTINUATION_SINK_FAILURE :
+                mode == 1 ? WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE :
+                mode == 2 ? WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS :
+                WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED));
+            /* No input reads when retrying a frozen pending output. */
+            if (mode != 2) {
+                read_fail = true;
+                CHECK(wl_columnar_continuation_publish(join, &sink) == status);
+                read_fail = false;
+            }
+            s.failure = 0;
+            bool seen[17 * 17] = {false};
+            if (mode == 2) {
+                /* Consume already committed output through the same oracle. */
+                wl_columnar_batch_payload_t *out =
+                    wl_columnar_join_batch_payload_sink_take(&s.owned);
+                CHECK(out); CHECK(wl_columnar_batch_payload_release(out) == OK);
+                wl_columnar_continuation_destroy(join);
+                CHECK(reserved(g) == floor); continue;
+            }
+            drain(join, &s, &sink, 17, 17, 3, 3, seen);
+        } else {
+            if (mode == 4) read_fail_after = 9;
+            if (mode == 5) stop = true;
+            if (mode == 6) wl_columnar_spill_store_retire(store);
+            wl_columnar_continuation_status_t status;
+            do {
+                status = wl_columnar_continuation_publish(join, &sink);
+            }while (status == WL_COLUMNAR_CONTINUATION_PROGRESS);
+            CHECK(status == WL_COLUMNAR_CONTINUATION_INVALID);
+            CHECK(!s.owned.ready && wl_columnar_payload_join_error(join) ==
+                (mode == 4 ? WL_COLUMNAR_SPILL_IO : mode ==
+                5 ? WL_COLUMNAR_SPILL_CANCELLED : WL_COLUMNAR_SPILL_CLOSED));
+            read_fail_after = 0; stop = false;
+            CHECK(wl_columnar_continuation_publish(join,
+                &sink) == WL_COLUMNAR_CONTINUATION_INVALID);
+        }
+        wl_columnar_continuation_destroy(join);
+        if (mode != 6) CHECK(reserved(g) == floor);
+    }
+    wl_columnar_trace_store_snapshot_release(ss);
+    wl_columnar_trace_store_retire(t);
+    col_rel_destroy(r); CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+static void trace_limits(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 22);
+    col_rel_t *r = source(0, 2);
+    wl_columnar_trace_store_t *empty = segmented(g, NULL, r, 5, 0);
+    wl_columnar_trace_store_snapshot_t *e = snapshot(empty);
+    col_rel_destroy(r); r = source(5, 2);
+    wl_columnar_trace_store_t *t = segmented(g, NULL, r, 2, 0);
+    wl_columnar_trace_store_snapshot_t *s = snapshot(t);
+    wl_columnar_continuation_t *join;
+    CHECK(wl_columnar_payload_join_create_trace_bounded(g, e, s, 0, 0, 32,
+        index_cap(1), NULL, NULL, &join) == OK);
+    sink_t sink_context; wl_columnar_continuation_sink_t sink;
+    sink_init(&sink_context, &sink, g);
+    CHECK(wl_columnar_continuation_publish(join,
+        &sink) == WL_COLUMNAR_CONTINUATION_DONE);
+    wl_columnar_continuation_destroy(join);
+    uint64_t before = reserved(g);
+    for (unsigned fail = 1; fail <= 2; fail++) {
+        allocation_fail = fail;
+        CHECK(wl_columnar_payload_join_create_trace_bounded(g, s, s, 0, 0, 32,
+            index_cap(1), NULL, NULL, &join) == WL_COLUMNAR_SPILL_ALLOCATION);
+        CHECK(!join && reserved(g) == before); allocation_fail = 0;
+    }
+    CHECK(wl_columnar_payload_join_create_trace_bounded(g, s, s, 0, 0, 32,
+        index_cap(1)-1, NULL, NULL, &join) == WL_COLUMNAR_SPILL_MEMORY);
+    CHECK(!join && reserved(g) == before);
+    CHECK(wl_columnar_payload_join_create_trace_bounded(g, s, s, 2, 0, 32,
+        index_cap(1), NULL, NULL, &join) == WL_COLUMNAR_SPILL_INVALID);
+    wl_columnar_trace_store_snapshot_release(e);
+    wl_columnar_trace_store_retire(empty);
+    wl_columnar_trace_store_snapshot_release(s);
+    wl_columnar_trace_store_retire(t);
+    col_rel_destroy(r);
+    col_rel_t *signed_source;
+    CHECK(wl_columnar_relation_new_auto_governed("signed", 2, 1, true, g,
+        &signed_source) == 0);
+    const wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                           WIRELOG_TYPE_INT64};
+    CHECK(col_rel_set_column_types(signed_source, types, 2) == 0);
+    int64_t values[] = {1, 0};
+    CHECK(col_rel_append_row(signed_source, values) == 0);
+    signed_source->timestamps[0].multiplicity = -1;
+    t = segmented(g, NULL, signed_source, 1, 0); s = snapshot(t);
+    CHECK(wl_columnar_payload_join_create_trace_bounded(g, s, s, 0, 0, 32,
+        index_cap(1), NULL, NULL, &join) == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(!join);
+    wl_columnar_trace_store_snapshot_release(s);
+    wl_columnar_trace_store_retire(t);
+    col_rel_destroy(signed_source); CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
+    trace_combinations(); trace_failures(); trace_limits();
     reference_joins(false); reference_joins(true);
     projected();
     combinations(); failures(); budget(false); budget(true); misses();
