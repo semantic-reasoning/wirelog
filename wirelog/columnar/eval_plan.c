@@ -1200,6 +1200,22 @@ wl_columnar_eval_plan_numeric_source_lookup(
     }
 }
 
+bool
+wl_columnar_eval_plan_scalar_selector_supported(const wl_plan_op_t *op)
+{
+    if (op->op != WL_PLAN_OP_VARIABLE && op->op != WL_PLAN_OP_JOIN)
+        return false;
+    switch (op->delta_mode) {
+    case WL_DELTA_AUTO:
+    case WL_DELTA_FORCE_FULL:
+    case WL_DELTA_FORCE_DELTA: return true;
+    case WL_DELTA_FORCE_EMPTY:
+    case WL_DELTA_FORCE_EMPTY_AFTER_SEED:
+        return op->op == WL_PLAN_OP_VARIABLE;
+    default: return false;
+    }
+}
+
 static void
 wl_columnar_eval_plan_numeric_source_select(
     wl_columnar_eval_plan_numeric_attempt_t *record)
@@ -1776,11 +1792,9 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
             || begin != 0 || end != plan->op_count || initial_depth != 0
             || plan->op_count != 5
             || plan->ops[0].op != WL_PLAN_OP_VARIABLE
-            || (plan->ops[0].delta_mode != WL_DELTA_AUTO
-            && plan->ops[0].delta_mode != WL_DELTA_FORCE_FULL)
+            || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[0])
             || plan->ops[1].op != WL_PLAN_OP_JOIN
-            || (plan->ops[1].delta_mode != WL_DELTA_AUTO
-            && plan->ops[1].delta_mode != WL_DELTA_FORCE_FULL)
+            || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[1])
             || plan->ops[2].op != WL_PLAN_OP_FILTER
             || !plan->ops[2].filter_expr.data
             || !plan->ops[2].filter_expr.size

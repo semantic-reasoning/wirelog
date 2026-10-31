@@ -7727,16 +7727,14 @@ col_controlled_step_preflight(wl_col_session_t *sess,
                 if (!col_controlled_step_controlled_op(op)) return ENOTSUP;
                 if (step->preflight_op == 0
                     && (op->op != WL_PLAN_OP_VARIABLE
-                    || (op->delta_mode != WL_DELTA_AUTO
-                    && op->delta_mode != WL_DELTA_FORCE_FULL)))
+                    || !wl_columnar_eval_plan_scalar_selector_supported(op)))
                     return ENOTSUP;
                 if (step->preflight_op == 1
                     && (op->op != WL_PLAN_OP_JOIN || op->materialized
                     || !op->right_relation || !op->key_count
                     || !op->left_keys || !op->right_keys)) return ENOTSUP;
                 if (step->preflight_op == 1
-                    && op->delta_mode != WL_DELTA_AUTO
-                    && op->delta_mode != WL_DELTA_FORCE_FULL)
+                    && !wl_columnar_eval_plan_scalar_selector_supported(op))
                     return ENOTSUP;
                 if (step->preflight_op == 2
                     && (op->op != WL_PLAN_OP_FILTER
@@ -7848,12 +7846,8 @@ col_controlled_step_preflight(wl_col_session_t *sess,
             COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA) {
             step->preflight_variable_delta = found;
             step->preflight_variable_delta_rows = found ? found->nrows : 0;
-            wl_delta_mode_t mode = relation->ops[0].delta_mode;
-            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
-                return ENOTSUP;
-            if (mode == WL_DELTA_AUTO && found && found->nrows
-                && found->nrows < step->preflight_variable_full->nrows)
-                return ENOTSUP;
+            /* The child selects full/delta/empty from these immutable sources.
+             * A smaller delta is legal; it must not force a raw fallback. */
             step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_FULL;
         } else if (step->preflight_phase ==
             COL_CONTROLLED_PREFLIGHT_JOIN_FULL) {
@@ -7865,12 +7859,6 @@ col_controlled_step_preflight(wl_col_session_t *sess,
             COL_CONTROLLED_PREFLIGHT_JOIN_DELTA) {
             step->preflight_join_delta = found;
             step->preflight_join_delta_rows = found ? found->nrows : 0;
-            wl_delta_mode_t mode = relation->ops[1].delta_mode;
-            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
-                return ENOTSUP;
-            if (mode == WL_DELTA_AUTO && found && found->nrows
-                && found->nrows < step->preflight_join_full->nrows)
-                return ENOTSUP;
             step->preflight_phase = COL_CONTROLLED_PREFLIGHT_READY;
             step->controlled_materialized_batch_fallback = true;
         }
