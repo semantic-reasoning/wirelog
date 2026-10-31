@@ -6692,3 +6692,13 @@ test_evaluation_physical_exe = executable(
 )
 test('evaluation_physical', test_evaluation_physical_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+test_evaluation_iteration_cap_exe = executable(
+  'test_evaluation_iteration_cap', files('test_evaluation_iteration_cap.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_iteration_cap', test_evaluation_iteration_cap_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

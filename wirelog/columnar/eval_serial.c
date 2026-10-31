@@ -37,6 +37,7 @@ enum {
 };
 
 #ifdef WL_SESSION_TEST_HOOKS
+uint32_t wl_columnar_eval_serial_test_iteration_limit;
 void (*wl_columnar_eval_serial_test_framed_checkpoint)(
     wl_columnar_eval_serial_framed_attempt_t *);
 int wl_columnar_eval_serial_test_framed_fail_allocation = -1;
@@ -1640,6 +1641,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
     /* Cleared here so every exit below reports "heads not final" unless one
      * of the two completion points is reached. */
     sess->eval_stratum_heads_final = false;
+    sess->eval_stratum_iteration_capped = false;
     if (sess->cleanup_active)
         return EBUSY;
     int readiness_rc = wl_columnar_session_cleanup_ready(sess);
@@ -1871,7 +1873,8 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
      * When EVAL_STRIDE == 1 the behaviour is identical to the prior single-
      * pass loop.
      */
-    for (iter = 0; iter < MAX_ITERATIONS; iter++) {
+    const uint32_t iteration_limit = wl_columnar_eval_serial_iteration_limit();
+    for (iter = 0; iter < iteration_limit; iter++) {
         bool outer_any_new = false; /* any sub-pass produced new tuples  */
         int outer_rc = 0;           /* error propagated from inner loop  */
         bool publication_failed = false;
@@ -1957,6 +1960,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
             if (eff_iter
                 > 0) { /* only skip from effective iteration 1 onward */
                 bool all_deltas_net_zero = true;
+                bool all_deltas_empty = true;
                 for (uint32_t ri = 0; ri < nrels; ri++) {
                     const char *dname = sp->relations[ri].delta_name;
                     col_rel_t *delta = session_find_rel(sess, dname);
@@ -1964,6 +1968,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                         /* Empty delta: net multiplicity is zero */
                         continue;
                     }
+                    all_deltas_empty = false;
                     /* Compute net multiplicity for this delta relation */
                     int64_t net_mult = 0;
                     for (uint32_t row = 0; row < delta->nrows; row++) {
@@ -1975,8 +1980,11 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     }
                 }
                 if (all_deltas_net_zero) {
-                    /* All deltas zero net-multiplicity: skip to next outer iter */
-                    outer_continue_next = true;
+                    /* No physical frontier can enable another derivation.
+                     * A nonempty signed net-zero frontier is different: its
+                     * distinct tuples may still matter, so do not certify it. */
+                    converged = all_deltas_empty;
+                    outer_continue_next = !all_deltas_empty;
                     break;
                 }
             }
@@ -1993,7 +2001,7 @@ col_eval_stratum(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
                     }
                 }
                 if (all_rules_empty) {
-                    outer_continue_next = true;
+                    converged = true;
                     break;
                 }
             }
@@ -2334,6 +2342,7 @@ stride_error:
      * non-recursive strata and outer session logic see the correct state. */
     sess->diff_operators_active = saved_diff_operators_active;
 
+    sess->eval_stratum_iteration_capped = iter == iteration_limit;
     sess->total_iterations = final_eff_iter;
 
     /* Issue #914: current_iteration is deliberately left at final_eff_iter (> 0)
@@ -2344,7 +2353,8 @@ stride_error:
     /* Issue #106 (US-106-005): Record per-rule frontier at convergence with epoch.
      * When stratum converges at effective iteration I, record (outer_epoch, I).
      * On next incremental snapshot, skip fires when eff_iter > I. */
-    for (uint32_t ri = 0; ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
+    for (uint32_t ri = 0; !sess->eval_stratum_iteration_capped
+        && ri < nrels && rule_id_base + ri < MAX_RULES; ri++) {
         uint32_t rule_id = rule_id_base + ri;
         sess->frontier_ops->record_rule_convergence(sess, rule_id,
             sess->outer_epoch, final_eff_iter);
@@ -2353,7 +2363,8 @@ stride_error:
     /* Phase 4: Update per-stratum frontier after recursive stratum evaluation.
      * strat_frontier was computed incrementally via delta timestamps (eff_iter),
      * so it already holds the effective iteration index at convergence. */
-    if (strat_frontier.iteration != UINT32_MAX) {
+    if (!sess->eval_stratum_iteration_capped
+        && strat_frontier.iteration != UINT32_MAX) {
         sess->frontier_ops->record_stratum_convergence(sess, stratum_idx,
             sess->outer_epoch, strat_frontier.iteration);
 
@@ -2393,7 +2404,7 @@ stride_error:
      * can still be refused -- see the comment on it -- but that concerns a
      * $d$ delta, not a head.  Move this with that boundary if a step whose
      * failure is propagated is added below. */
-    sess->eval_stratum_heads_final = true;
+    sess->eval_stratum_heads_final = !sess->eval_stratum_iteration_capped;
 
     /* Cleanup all delta relations after frontier has been computed.  A
      * refusal keeps the registry owner, and unlike the sub-pass removal

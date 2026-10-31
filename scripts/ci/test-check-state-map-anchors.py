@@ -460,7 +460,8 @@ def main() -> int:
                  " `col_session_insert`, `col_session_remove`,"
                  " `col_session_snapshot_impl`,"
                  " `col_session_step_impl`, `session_note_inserted_input`,"
-                 " `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` |",
+                 " `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action`,"
+                 " `wl_columnar_session_note_iteration_cap` |",
                  "| — |")
 
         # The two fail-closed guards are wired to main(), not merely present.

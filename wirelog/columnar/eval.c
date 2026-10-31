@@ -7421,11 +7421,12 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             goto done;
     }
 
-    for (uint32_t iter = 0; iter < MAX_ITERATIONS; iter++) {
+    const uint32_t iteration_limit = wl_columnar_eval_serial_iteration_limit();
+    uint32_t iter;
+    for (iter = 0; iter < iteration_limit; iter++) {
         bool outer_any_new = false;
         bool converged = false;
         bool stride_all_skipped = true;
-        bool outer_continue_next = false;
 
         for (uint32_t sub = 0; sub < EVAL_STRIDE; sub++) {
             uint32_t eff_iter = iter * EVAL_STRIDE + sub;
@@ -7659,7 +7660,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                         for (uint32_t ri = 0; ri < nrels; ri++)
                             col_rel_destroy(ctxs[w].delta_rels[ri]);
                 }
-                outer_continue_next = true;
+                converged = true;
                 break;
             }
 
@@ -7780,11 +7781,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 
         if (stride_all_skipped)
             continue;
-        if (outer_continue_next)
-            continue;
         if (converged || !outer_any_new)
             break;
     } /* end outer loop */
+    coord->eval_stratum_iteration_capped = iter == iteration_limit;
 
 done:
     /* An owner lifetime record owns queue messages and slot arrays across a
@@ -7886,7 +7886,7 @@ done:
         rc = wl_columnar_eval_serial_canonicalize_aggregates(sp, coord);
     coord->tdd_final_merge_ns += now_ns() - merge_t0;
 
-    if (rc == 0) {
+    if (rc == 0 && !coord->eval_stratum_iteration_capped) {
         tdd_record_recursive_convergence(coord, sp, stratum_idx,
             rule_id_base, final_eff_iter);
         /* Preserve completed history, but never mark refused finalization
@@ -8121,6 +8121,7 @@ col_eval_stratum_tdd(const wl_plan_stratum_t *sp,
 
     if (coord->base.evaluation_control) return ENOTSUP;
 
+    coord->eval_stratum_iteration_capped = false;
     if (tdd_stratum_has_unsupported_lftj(sp))
         return col_eval_stratum(sp, coord, stratum_idx);
 
@@ -8231,7 +8232,10 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
     wl_workqueue_wait_all(coord->wq);
 
     /* Collect first worker error (if any) */
+    coord->eval_stratum_iteration_capped = false;
     for (uint32_t w = 0; w < num_workers; w++) {
+        coord->eval_stratum_iteration_capped |=
+            ctxs[w].worker_sess->eval_stratum_iteration_capped;
         record_worker_expr_status(coord, ctxs[w].worker_sess,
             ctxs[w].rc);
         if (ctxs[w].rc != 0 && rc == 0)
@@ -8245,7 +8249,8 @@ col_eval_stratum_multiworker(const wl_plan_stratum_t *sp,
      * The global minimum iteration is the conservative bound: the coordinator
      * can safely claim "all workers have processed up to iteration min_iter",
      * enabling the frontier skip optimization for subsequent incremental eval. */
-    if (wl_frontier_progress_all_converged(&coord->progress, stratum_idx,
+    if (!coord->eval_stratum_iteration_capped
+        && wl_frontier_progress_all_converged(&coord->progress, stratum_idx,
         coord->outer_epoch)) {
         uint32_t min_iter = wl_frontier_progress_min_iteration(
             &coord->progress, stratum_idx, coord->outer_epoch);
