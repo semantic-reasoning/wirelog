@@ -389,7 +389,11 @@ wl_columnar_session_diff_index(wl_col_session_t *sess,
     col_diff_arrangement_t **out, bool *build)
 {
     *out = NULL; *build = false;
-    if (!sess->diff_enabled || !bindings || sess->spill_join_batch_bytes
+    /* Fixed bindings belong to the legacy framed host, not a general
+     * transaction that can own a persistent index image. Its source reads
+     * remain authenticated by the evaluator and use the bounded local index. */
+    if (!sess->diff_enabled || !bindings || !bindings->dynamic_entries
+        || sess->spill_join_batch_bytes
         || sess->join_batch_bytes)
         return 0;
     if (!wl_columnar_session_observed_bindings_authorized(sess, bindings))
@@ -11839,6 +11843,27 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step) return EBUSY;
+    if (step->recursive_route && !insert) {
+        /* The qualified binary host has retired its frame. Authenticate the
+         * old closure before the EDB changes; a successful removal will use
+         * the existing private preserved-body reconstruction, not reuse it. */
+        if (!step->complete || step->operation_active || step->recursive
+            || step->observer_cleanup_pending || sess->cleanup_active
+            || sess->cleanup_pending || sess->delta_observer
+            || sess->delta_publish_active) return EBUSY;
+        if (!col_controlled_step_provenance_current(sess, step)) return EINVAL;
+        const wl_plan_t *plan = sess->plan;
+        if (!relation || strcmp(relation, "edge") != 0 || num_cols != 2
+            || !plan || plan->stratum_count != 1 || !plan->strata
+            || plan->strata[0].relation_count != 1
+            || !plan->strata[0].bodies
+            || !plan->strata[0].bodies[0].declared_int64
+            || plan->strata[0].bodies[0].declared_width != 2
+            || !plan->strata[0].bodies[0].ops
+            || !plan->strata[0].bodies[0].op_count)
+            return ENOTSUP;
+        return 0;
+    }
     /* A completed ordinary host has no observer transaction to authenticate
      * its inputs. Only declared public EDBs may start a private successor.
      * Admission is read-only: failed and zero-row mutations never promote. */
@@ -11926,6 +11951,18 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         return;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->recursive_route && !insert) {
+        /* Admission proved a quiescent authenticated boundary. The mutation
+         * committed, so its new input generation deliberately supersedes the
+         * old append-only provenance. Zero/failed requests never get here. */
+        step->recursive_route = false;
+        step->provenance_valid = false;
+        step->provenance_edge = NULL;
+        step->general_observed = true;
+        step->published = true;
+        step->successor_mutation_seen = true;
+        return;
+    }
     if (step && step->complete && !step->recursive_route
         && !step->general_observed
         && (!step->observed || step->callback_changed)) {
