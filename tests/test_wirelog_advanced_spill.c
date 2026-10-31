@@ -525,7 +525,7 @@ static void unsupported_filters(void)
     const char *rules[] = {
         "keys(k) :- b(k,v), v + 1 > 164.",
         "keys(k) :- b(k,v), v > k.",
-        "keys(k) :- b(k,v), v > 100, v < 200.",
+        "keys(k) :- b(k,v), v > 100, v + 1 < 200.",
         /* An unrelated resident filter must not inherit the cold exception. */
         "keys(k) :- a(k,v), v + 1 > 11.",
         /* A predicate on the right JOIN input remains unsupported. */
@@ -783,9 +783,14 @@ static void reference_public_observe(const char *name,
             row->lanes[2] == row->lanes[0]);
     CHECK(!(e->bits[idx]&(1u<<key))); e->bits[idx] |= 1u<<key;
 }
+static const char *const projection_predicates[] = {
+    "", ", k >= 1", ", k >= 0, k < 2, k != 1",
+    ", k >= 0, k < 3, k != -1", ", k >= 2, k < 2"
+};
+static const unsigned projection_predicate_masks[] = {7, 6, 1, 7, 0};
 static void reference_public_projections(void)
 {
-    for (unsigned filtered = 0; filtered < 2; filtered++)
+    for (unsigned filtered = 0; filtered < 5; filtered++)
         for (unsigned empty = 0; empty < 2; empty++)
             for (unsigned order = 0; order < 3; order++) {
                 char text[1024];
@@ -795,7 +800,7 @@ static void reference_public_projections(void)
                     "a(0,\"\",\"unused\").\na(1,\"alpha\",\"unused\").\na(2,\"한글\",\"unused\").\n"
                     "b(\"\",0).\nb(\"alpha\",1).\nb(\"한글\",2).\n"
                     "result(s,k,s) :- a(k,s,u)%s.\nother(s,k) :- b(s,k).\n",
-                    filtered ? ", k >= 1" : "");
+                    projection_predicates[filtered]);
                 wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
                 wirelog_session_options_v1_t o = configured();
                 CHECK(wirelog_session_create_with_options(p,
@@ -829,7 +834,8 @@ static void reference_public_projections(void)
                     reference_public_events_t e = expected;
                     CHECK(wirelog_session_snapshot_typed(s,
                         reference_public_observe, &e) == WIRELOG_OK);
-                    CHECK(e.bits[0] == (empty ? 0u : filtered ? 6u : 7u) &&
+                    CHECK(e.bits[0] ==
+                        (empty ? 0u : projection_predicate_masks[filtered]) &&
                         e.bits[1] == (empty ? 0u : 7u));
                 }
                 wirelog_session_destroy(s); wirelog_program_free(p);
@@ -912,7 +918,7 @@ static void reference_public_joins(void)
 
 static void inline_public_projections(void)
 {
-    for (unsigned filtered = 0; filtered < 2; filtered++)
+    for (unsigned filtered = 0; filtered < 5; filtered++)
         for (unsigned empty = 0; empty < 2; empty++)
             for (unsigned order = 0; order < 3; order++) {
                 char text[1024];
@@ -922,7 +928,7 @@ static void inline_public_projections(void)
                     "a(0,\"\",\"unused\").\na(1,\"alpha\",\"unused\").\na(2,\"한글\",\"unused\").\n"
                     "b(\"\",0).\nb(\"alpha\",1).\nb(\"한글\",2).\n"
                     "result(s,k,s) :- a(pair(k,s),box(u))%s.\nother(s,k) :- b(pair(s,k)).\n",
-                    filtered ? ", k >= 1" : "");
+                    projection_predicates[filtered]);
                 wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
                 wirelog_session_options_v1_t o = configured();
                 CHECK(wirelog_session_create_with_options(p,
@@ -956,7 +962,8 @@ static void inline_public_projections(void)
                     reference_public_events_t e = expected;
                     CHECK(wirelog_session_snapshot_typed(s,
                         reference_public_observe, &e) == WIRELOG_OK);
-                    CHECK(e.bits[0] == (empty ? 0u : filtered ? 6u : 7u) &&
+                    CHECK(e.bits[0] ==
+                        (empty ? 0u : projection_predicate_masks[filtered]) &&
                         e.bits[1] == (empty ? 0u : 7u));
                 }
                 wirelog_session_destroy(s); wirelog_program_free(p);

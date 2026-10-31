@@ -6,6 +6,11 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- **Repeated cold projection predicates** (#1372): sealed scalar and flat INLINE
+  field projections accept consecutive narrow INT64/literal FILTER operators.
+  One pinned scan applies every predicate with governed plan-sized scratch;
+  projected output capacity remains admitted for the complete source row count.
+
 - **Flat INLINE cold field consumers** (#1372): bounded projection/JOIN paths
   consume declared scalar children, including STRING keys and payloads, through
   either cold input, self JOINs and resident intermediate chains. Source layout

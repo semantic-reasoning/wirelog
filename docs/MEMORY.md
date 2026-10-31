@@ -4941,11 +4941,13 @@ A known but unused source or a source with unsupported consumers is refused.
 Seal preflight and ordinary dispatch share the same full-body predicate. It
 accepts valid reordered/repeated column indices and canonical column-reference
 bytecode matching those indices and source types, with checked lengths and
-integer overflow. An optional single FILTER between VARIABLE and MAP accepts
-one INT64 column compared with one integer literal using `=`, `!=`, `<`, `>`,
+integer overflow. Optional consecutive FILTERs between VARIABLE and MAP each
+accept one INT64 column compared with one integer literal using `=`, `!=`, `<`, `>`,
 `<=` or `>=` (column on the left). For example, `keys(k) :- b(k,v), v >= 164.`
-filters on a column that need not appear in the output. Other predicates,
-arithmetic, multiple filters, concatenation, FILTER/MAP before a cold JOIN,
+filters on a column that need not appear in the output. Multiple filters are
+sequential conjunctions; all must accept the row. Their descriptors are decoded
+once into governed plan-sized scratch, independent of source row count. Other predicates,
+arithmetic, boolean-expression predicates, concatenation, FILTER/MAP before a cold JOIN,
 opaque rewrites and other raw-column consumers remain explicitly unsupported.
 A raw VARIABLE request for a known cold name returns ENOTSUP rather than treating
 the removed registry entry as empty. No synthetic relation with missing columns

@@ -220,8 +220,8 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
  * The selected name must have an eligible consumer: a JOIN input with
  * one matching INT64 or STRING equality key or a complete
- * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with one
- * FILTER before MAP comparing an INT64 column with an integer literal
+ * VARIABLE/MAP/CONSOLIDATE rule selecting only columns, optionally with
+ * consecutive FILTERs before MAP, each comparing an INT64 column with an integer literal
  * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
  * remain resident; output capacity is admitted for the source row count even
  * when no row passes. Projection-only programs need no JOIN consumer.

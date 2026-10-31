@@ -4963,10 +4963,16 @@ bool wl_columnar_session_cold_source_schema(const wl_col_session_t *session,
 /* Valid only after the complete cold projection body has been audited. */
 typedef struct {
     const wl_plan_op_t *map;
-    uint32_t predicate_column;
-    int64_t predicate_literal;
-    uint8_t comparison; /* zero for an unfiltered projection */
+    uint32_t filter_count;
 } wl_columnar_eval_plan_cold_projection_t;
+typedef struct {
+    uint32_t column;
+    int64_t literal;
+    uint8_t comparison;
+} wl_columnar_eval_plan_cold_predicate_t;
+bool wl_columnar_eval_plan_cold_predicate_decode(const wl_plan_op_t *filter,
+    uint32_t ncols, const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_predicate_t *out);
 bool wl_columnar_eval_plan_cold_projection_decode(
     const wl_plan_relation_t *plan, const char *name, uint32_t ncols,
     const wirelog_column_type_t *types,
