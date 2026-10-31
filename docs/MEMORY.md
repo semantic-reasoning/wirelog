@@ -5105,7 +5105,7 @@ sharing an external spill store must serialize cursor operations as well; this
 does not make the spill store's lifecycle globally thread-safe.
 
 This storage/scan contract does not automatically migrate session relations or
-legacy differential arrangements. Signed JOIN consumption remains follow-up work.
+legacy differential arrangements.
 STRING/INLINE/SIDE/nested provenance, general logical time, mutable-session
 routing and #1373 scheduling remain outside this numeric trace owner.
 
@@ -5116,16 +5116,53 @@ cursor engine and retain their eager readers and intern capabilities. Trace
 cursors independently retain immutable snapshot boundaries, opening one segment
 reader at a time. The same capped right-row index, output batches and 256-action
 publication quantum apply across segment boundaries. Ordinary trace JOIN checks
-all rows for +1 multiplicity before publication; signed consumption remains a
-separate explicit contract. Retiring a trace owner preserves these consumers,
+all rows for +1 multiplicity before publication. Retiring a trace owner preserves these consumers,
 but retiring its external store may yield CLOSED on later lazy acquisitions.
+
+### Signed trace and delta consumption (#1372, internal)
+
+`wl_columnar_payload_join_create_weighted_trace_bounded` joins two snapshot
+prefixes. `wl_columnar_payload_join_create_delta_trace_bounded` joins a numeric
+payload delta against a snapshot, retaining the delta reader eagerly. Both use
+the same production window-index/continuation engine. All records must have zero
+logical coordinates; matching pairs emit checked signed multiplicity products,
+including zero. Negative records are contributions, not physical deletions.
+There is no consolidation, timestamp stripping or general logical-time support.
+Storage generation identifies a committed prefix and is not logical time.
+
+A producer retains its original snapshot across later insertion/retraction
+appends. New snapshots observe the new contributions. Overflow discards only the
+current private batch, leaves already acknowledged output visible and becomes
+sticky. Frozen output survives sink retry without additional input reads.
+Trace owner retirement and external store retirement retain their distinct
+contracts above. Producer operations over different trace owners sharing a store
+remain serialized; this is not a global spill-store concurrency guarantee.
+
+Tests interleave six consumers across insertion, full cancellation and reinsertion
+generations, comparing exact signed contribution multisets and independent sums.
+They cover both trace and delta input modes, zero/MIN/MAX weights, unmatched
+potential overflow, partial-batch overflow, surviving prior output, complete
+logical-coordinate refusal, failed-publication retry and cleanup. Segmented
+build tests exercise the 256-action clear/build quantum and cancellation.
+
+A paired workload uses the same 1,025-row mixed history and 65,536-byte allowance.
+Keeping its two governed source chunks causes real JOIN constructor MEMORY;
+transferring them to spilled segments physically retires source rows and lets
+the entire signed JOIN complete. With the same three segments, schema and caps,
+257 and 1,025 rows require identical constructor scratch. O(segments) directory
+and node floors are measured separately by trace storage tests. A below-floor
+JOIN refusal preserves a previously opened snapshot cursor and succeeds after
+restoring admission. Input-transition, snapshot, reader, index, producer, output
+and retained-output floors remain additional; arbitrary-budget completion is
+not promised. No automatic mutable-session or legacy differential-arrangement
+migration, SIDE/nested support, or #1373 scheduling is introduced.
 
 ### Remaining #1372 implementation groups
 
 The sealed scalar numeric/STRING and declared flat INLINE field JOIN/projection
 subsets now have actual persistent cold storage,
-resident reclamation and evaluator consumers. General cold VARIABLE access beyond the audited scan/JOIN pipelines, mutable relations, persistent trace/differential storage and their
-arrangement consumers remain separate integration work. They require stable
+resident reclamation and evaluator consumers. General cold VARIABLE access beyond the audited scan/JOIN pipelines, mutable relations and automatic persistent trace/differential arrangement
+integration remain separate work beyond the explicit numeric snapshot consumers. They require stable
 identity/generation and pin/cleanup ownership across updates, signed differences
 and retractions. Unsupported consumers remain explicitly ineligible for sealing.
 SIDE/nested-reference ownership also needs a concrete provenance decision.

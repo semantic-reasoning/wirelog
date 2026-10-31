@@ -141,6 +141,31 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_trace_bounded(
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out);
+/* Explicit zero-coordinate signed trace JOINs. The weighted snapshot variant
+ * accepts two immutable trace prefixes; delta_trace accepts a numeric payload
+ * on the left and a trace snapshot on the right. The delta reader is acquired
+ * eagerly. All inputs require zero logical coordinates; arbitrary signed/zero
+ * multiplicities use the common checked product, sticky overflow and frozen
+ * retry contract described above. No consolidation or timestamp stripping.
+ * Old producers retain their snapshot boundary across insertion/retraction
+ * appends. A new snapshot must be acquired to observe newer contributions.
+ * Storage commit generation is not logical time. No legacy differential
+ * arrangement or mutable public session routing changes are implied. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_weighted_trace_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
+wl_columnar_spill_status_t wl_columnar_payload_join_create_delta_trace_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
+    uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
 /* Only for a continuation returned by these constructors; NULL is INVALID.
  * Reports producer errors, not errors owned by the publication sink. */
 wl_columnar_spill_status_t wl_columnar_payload_join_error(

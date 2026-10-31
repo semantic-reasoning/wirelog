@@ -61,6 +61,7 @@ bench_backend_src = files(
   subdir_wirelog / 'columnar/continuation.c',
   subdir_wirelog / 'columnar/join_batch.c',
   subdir_wirelog / 'columnar/batch_payload.c',
+  subdir_wirelog / 'columnar/trace_store.c',
   subdir_wirelog / 'columnar/payload_join.c',
   subdir_wirelog / 'columnar/join_pipeline.c',
   subdir_wirelog / 'columnar/diff_join_batch.c',
