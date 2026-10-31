@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Explicit signed delta-by-trace and trace-by-trace JOINs preserve immutable
+  generation boundaries through insertions/retractions, with checked products
+  and bounded windows; paired fixed-budget tests prove source reclamation (#1372).
+
 - The existing capped payload JOIN engine consumes segmented numeric trace
   snapshots with pinned generation boundaries and bounded reader/index scratch
   while retaining legacy eager reference-reader capabilities (#1372).
