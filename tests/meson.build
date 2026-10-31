@@ -6680,3 +6680,15 @@ test_evaluation_differential_exe = executable(
 )
 test('evaluation_differential', test_evaluation_differential_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# #2296/#1953: actual physical timestamps and signed multiplicity transport.
+test_evaluation_physical_exe = executable(
+  'test_evaluation_physical', files('test_evaluation_physical.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_physical', test_evaluation_physical_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
