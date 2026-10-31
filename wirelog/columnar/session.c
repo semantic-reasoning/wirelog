@@ -468,6 +468,9 @@ size_t wl_columnar_session_test_observer_precharged_events;
 bool wl_columnar_session_test_fail_frontier_map_allocation;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
 void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
+uint32_t wl_columnar_session_test_iteration_limit;
+void (*wl_columnar_session_test_iteration_checkpoint)(
+    wl_evaluation_control_t *, uint32_t, bool);
 void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
@@ -5247,6 +5250,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * point either: the worker's flag describes the worker's own stratum and
      * must never be merged upward. */
     out_worker->eval_stratum_heads_final = false;
+    out_worker->eval_stratum_iteration_capped = false;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -6681,6 +6685,24 @@ col_session_note_stratum_done(wl_col_session_t *sess, uint32_t si)
         sess->uncommitted_strata_done = (uint16_t)done;
 }
 
+/* Raw cap status remains zero for compatibility, but the partial model is
+ * not stable. Retain input staging and the original observer baseline. */
+static void
+wl_columnar_session_note_iteration_cap(wl_col_session_t *sess, uint32_t si)
+{
+    col_session_note_stratum_done(sess, si); /* extent to clear on retry */
+    sess->pending_input_change = true;
+    sess->pending_full_input_eval = true;
+    sess->snapshot_stable_valid = false;
+    sess->plain_step_completion_pending = false;
+    sess->plain_step_completion_active = false;
+    sess->plain_step_completion_phase = WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE;
+    sess->plain_step_completion_step_context = false;
+    wl_columnar_eval_delta_observer_set_active(sess, false);
+    wl_columnar_delta_events_clear(sess);
+    col_session_reclaim_quiescent(sess);
+}
+
 static int
 col_session_step_impl(wl_session_t *session)
 {
@@ -6917,6 +6939,10 @@ col_session_step_impl(wl_session_t *session)
             sess->plain_step_completion_active = false;
             col_session_reclaim_quiescent(sess);
             return rc;
+        }
+        if (sess->eval_stratum_iteration_capped) {
+            wl_columnar_session_note_iteration_cap(sess, si);
+            return 0;
         }
         if (sess->plain_step_completion_step_context) {
             col_session_note_stratum_done(sess, si);
@@ -10697,8 +10723,23 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             }
             tx->round_index++; return 0;
         }
+        /* A round is one effective serial sub-pass, not an outer stride.
+         * The unchanged round that proves convergence consumes allowance too. */
+        uint64_t effective_limit =
+            (uint64_t)wl_columnar_eval_serial_iteration_limit() * EVAL_STRIDE;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_iteration_limit)
+            effective_limit = wl_columnar_session_test_iteration_limit;
+        if (wl_columnar_session_test_iteration_checkpoint)
+            wl_columnar_session_test_iteration_checkpoint(control,
+                tx->round + 1, tx->round_changed);
+#endif
         if (tx->round_changed) {
-            if (++tx->round >= MAX_ITERATIONS) return EOVERFLOW;
+            if (++tx->round >= effective_limit) {
+                rc = wl_evaluation_control_charge_attempt(control,
+                        step->operation_id, 0);
+                return rc ? rc : EOVERFLOW;
+            }
             tx->round_index = tx->round_begin;
             tx->phase = WL_SESSION_RECURSIVE_SEED;
         } else {
@@ -12262,6 +12303,9 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         int resume_rc = col_session_step_impl(session);
         if (resume_rc != 0)
             return resume_rc;
+        if (sess->eval_stratum_iteration_capped)
+            return col_session_emit_snapshot(sess->plan, sess, callback,
+                       user_data);
     }
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
@@ -12498,7 +12542,8 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
                 (double)(sess->tdd_final_merge_ns - merge_base) / 1e6);
         }
 
-        if (tdd_cc_active && rc == 0 && pre_saved) {
+        if (tdd_cc_active && rc == 0 && pre_saved
+            && !sess->eval_stratum_iteration_capped) {
             uint32_t *tdd_counts
                 = (uint32_t *)calloc(cnrels, sizeof(uint32_t));
             col_rel_t **tdd_saved
@@ -12629,6 +12674,11 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
+        if (sess->eval_stratum_iteration_capped) {
+            sess->tdd_decision_tracking_active = false;
+            wl_columnar_session_note_iteration_cap(sess, si);
+            return col_session_emit_snapshot(plan, sess, callback, user_data);
+        }
         col_session_note_stratum_done(sess, si);
     }
     sess->tdd_decision_tracking_active = false;

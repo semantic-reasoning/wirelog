@@ -191,6 +191,23 @@ now_ns(void)
 #define COL_FILTER_STACK 64u
 #define MAX_ITERATIONS 4096u
 #define EVAL_STRIDE 8u /* sub-passes per outer iteration (Issue #237) */
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern uint32_t wl_columnar_eval_serial_test_iteration_limit;
+extern uint32_t wl_columnar_session_test_iteration_limit;
+extern void (*wl_columnar_session_test_iteration_checkpoint)(
+    wl_evaluation_control_t *, uint32_t, bool);
+#endif
+
+static inline uint32_t
+wl_columnar_eval_serial_iteration_limit(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_serial_test_iteration_limit)
+        return wl_columnar_eval_serial_test_iteration_limit;
+#endif
+    return MAX_ITERATIONS;
+}
 #define MAX_STRATA 32
 #define MAX_RULES 64
 #define COL_MAT_CACHE_MAX 64u
@@ -2795,6 +2812,9 @@ typedef struct wl_col_session_t {
      * made; it is neither a gate nor a predicate, and nothing may consult it
      * later.  False is the safe default: it makes the caller restore. */
     bool eval_stratum_heads_final;
+    /* Last evaluator outcome; consume before calling another stratum. Legacy
+     * cap exhaustion returns zero but cannot commit stable-model bookkeeping. */
+    bool eval_stratum_iteration_capped;
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;
