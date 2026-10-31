@@ -1879,6 +1879,27 @@ synchronize nothing, and tests read them after the operator call returns.
 | `join.c:wl_columnar_antijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count ANTIJOIN emits for tests; counter only |
 | `join.c:wl_columnar_semijoin_emit` | `wl_columnar_join_test_probe_emits` | `atomic_fetch_add_explicit` | relaxed | Count SEMIJOIN emits for tests; counter only |
 
+### Bounded JOIN producers on worker sessions (#2201)
+
+Under `WIRELOG_JOIN_BATCH_BYTES`, the bounded JOIN producers (ordinary,
+differential and the fused pipeline) also run on worker sessions, so up to
+one producer per worker runs at once. A producer is confined to the worker
+thread that created it and is drained before its JOIN operator returns. Its
+descriptor, scratch batch, arrangement pin and run and fallback counts
+belong to that worker: the pin is taken on the worker's own arrangement
+registry, whose entries the worker clones from the coordinator as schema
+only, without storage. Besides the process-wide `WL_LOG` sink, whose
+thresholds are fixed at `wl_log_init()` and whose emit uses stdio (see
+`wirelog/util/log.h`; section 10.4 covers fork), the cross-thread state a
+producer reaches includes the session's memory governor, the source-access
+gates of the relations it reads (on a worker these can be views of the
+coordinator's storage, which the ordinary JOIN reads under its arrangement
+probe's reader and the pipeline under a reader it acquires for the drain),
+and, on non-recursive workers, the atomic output counter they share. The
+counts reach the coordinator only through the teardown fold, on the
+coordinator's thread. This adds no atomic operation and no row to the
+atomics audit.
+
 ### Controlled ordinary JOIN confinement
 
 The prepared producer-only col_join_batch_control_* API is confined to the

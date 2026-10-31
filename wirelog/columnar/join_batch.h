@@ -15,7 +15,9 @@
  * pipeline consumption (a JOIN with a row-local FILTER/MAP tail on the eval
  * stack), LFTJ, cross joins, ephemeral hash fallback, K-Fusion and
  * multiworker transport are outside this unit; see docs/MEMORY.md "Bounded
- * join sub-batches".
+ * join sub-batches".  The producer runs on calling and worker sessions,
+ * one per session at a time, but not in a worker run that resolves its
+ * operands by input slot (#2201).
  */
 #ifndef WL_COLUMNAR_JOIN_BATCH_H
 #define WL_COLUMNAR_JOIN_BATCH_H
@@ -35,7 +37,7 @@ typedef enum {
     COL_JOIN_BATCH_EXCLUDED_CROSS = 2,          /* key_count == 0 */
     COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT = 3,    /* right side is a delta */
     COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT = 4, /* right filter expression */
-    COL_JOIN_BATCH_EXCLUDED_WORKER = 5,         /* TDD worker session */
+    COL_JOIN_BATCH_EXCLUDED_WORKER = 5,         /* slot-resolved worker run */
     COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT = 6, /* no persistent arrangement */
     COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE = 7,  /* batch budget < one row */
     COL_JOIN_BATCH_EXCLUDED_PIPELINE = 8,       /* downstream not consumable */

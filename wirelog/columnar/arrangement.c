@@ -1049,10 +1049,6 @@ col_arrangement_pin_entry(wl_col_session_t *session, col_arr_entry_t *entry,
     return 0;
 }
 
-static bool
-col_session_has_exact_relation(const wl_col_session_t *session,
-    const col_rel_t *source, const char *name);
-
 int
 col_session_pin_existing_arrangement(wl_session_t *sess,
     const col_rel_t *source, const uint32_t *key_cols, uint32_t key_count,
@@ -1142,7 +1138,7 @@ col_session_pin_arrangement(wl_session_t *sess, const char *rel_name,
     return col_arrangement_pin_entry(COL_SESSION(sess), entry, arr, pin);
 }
 
-static bool
+bool
 col_session_has_exact_relation(const wl_col_session_t *session,
     const col_rel_t *source, const char *name)
 {

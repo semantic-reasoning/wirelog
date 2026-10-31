@@ -5568,6 +5568,11 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->diff_arr_entries = NULL;
     out_worker->diff_arr_count = 0;
     out_worker->diff_arr_cap = 0;
+    /* An open differential transaction belongs to the coordinator's
+     * registry; the worker's starts empty and with none open, which the
+     * bounded differential producer checks before it begins its own
+     * (#2201). */
+    out_worker->diff_txn_count = 0;
     wl_columnar_memory_reservation_init(
         &out_worker->diff_arr_registry_reservation);
     out_worker->diff_arr_registry_reserved_bytes = 0;

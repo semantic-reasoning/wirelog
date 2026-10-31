@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -146,7 +147,9 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
     if (sess->join_batch_bytes == 0)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_OFF;
-    if (sess->coordinator || sess->diff_operators_active)
+    /* As for the ordinary producer, a worker run that resolves operands by
+     * input slot is excluded, other worker sessions are not (#2201). */
+    if (sess->tdd_input_run || sess->diff_operators_active)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SESSION;
 
     join = &plan->ops[join_index];
@@ -608,6 +611,15 @@ pipeline_setup_stages(const wl_plan_relation_t *plan, uint32_t join_index,
     return 0;
 }
 
+/* Release the reader try_eval holds on the right operand while it drains
+ * the producer.  The release is mandatory, as for the producer's own. */
+static void
+pipeline_release_right_reader(wl_columnar_source_access_reader_t *reader)
+{
+    if (reader->owner && col_rel_source_reader_release(reader) != 0)
+        abort();
+}
+
 int
 wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     uint32_t join_index, eval_stack_t *stack, wl_col_session_t *sess,
@@ -621,6 +633,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     wl_columnar_join_selection_t selection;
     col_rel_t *out = NULL;
     wl_columnar_continuation_t *continuation = NULL;
+    wl_columnar_source_access_reader_t right_reader = { 0 };
     wl_join_pipeline_sink_t sink_ctx;
     wl_columnar_continuation_sink_t sink;
     uint32_t tail_end = UINT32_MAX;
@@ -658,7 +671,8 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         return EINVAL;
     /* A missing right relation joins to an empty result in the ordinary
      * JOIN.  ENOENT from col_join_batch_producer_create below is a
-     * different case, an unavailable arrangement, and stays a fallback. */
+     * different case, an unavailable arrangement or a right name that does
+     * not pin this relation (#2201), and stays a fallback. */
     right = session_find_rel(sess, join->right_relation);
     if (!right) {
         if (decline)
@@ -768,13 +782,21 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         return ENOTSUP;
     }
 
-    rc = col_join_batch_producer_create(sess, join,
-            stack->items[stack->top - 1].rel,
-            stack->items[stack->top - 1].is_delta, lk, rk, join->key_count,
-            sess->join_batch_bytes, &continuation);
+    /* The producer holds no reader on its inputs.  On a worker the right
+     * operand can be a view of the coordinator's storage, so hold a reader
+     * on it from before the producer pins its arrangement until the
+     * producer is destroyed (#2201), as the ordinary JOIN holds its probe's;
+     * a busy source fails here before any batch is drawn. */
+    rc = col_rel_source_reader_acquire(right, &right_reader);
+    if (rc == 0)
+        rc = col_join_batch_producer_create(sess, join,
+                stack->items[stack->top - 1].rel,
+                stack->items[stack->top - 1].is_delta, lk, rk,
+                join->key_count, sess->join_batch_bytes, &continuation);
     free(lk);
     free(rk);
     if (rc != 0) {
+        pipeline_release_right_reader(&right_reader);
         pipeline_stages_release(stages, tail_end - join_index);
         col_rel_destroy(stage_template);
         return rc;
@@ -824,6 +846,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         col_rel_destroy(out);
         wl_columnar_continuation_cancel(continuation);
         wl_columnar_continuation_destroy(continuation);
+        pipeline_release_right_reader(&right_reader);
         pipeline_stages_release(stages, tail_end - join_index);
         return rc;
     }
@@ -836,6 +859,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             col_rel_destroy(out);
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
+            pipeline_release_right_reader(&right_reader);
             pipeline_stages_release(stages, tail_end - join_index);
             return rc;
         }
@@ -867,6 +891,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             pipeline_sink_abort(&sink_ctx);
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
+            pipeline_release_right_reader(&right_reader);
             col_rel_destroy(out);
             pipeline_stages_release(stages, tail_end - join_index);
             if (eval_stack_repush_entry(stack, &left_entry) != 0)
@@ -885,6 +910,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
             out->nrows - before)) {
             wl_columnar_continuation_cancel(continuation);
             wl_columnar_continuation_destroy(continuation);
+            pipeline_release_right_reader(&right_reader);
             col_rel_destroy(out);
             pipeline_stages_release(stages, tail_end - join_index);
             if (eval_stack_repush_entry(stack, &left_entry) != 0)
@@ -893,6 +919,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         }
     }
     wl_columnar_continuation_destroy(continuation);
+    pipeline_release_right_reader(&right_reader);
     pipeline_stages_release(stages, tail_end - join_index);
     stages = NULL;
     rc = eval_entry_dispose(&left_entry);

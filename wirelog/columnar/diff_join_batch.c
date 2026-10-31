@@ -433,6 +433,10 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
     right = session_find_rel(sess, op->right_relation);
     if (!right)
         return ENOENT;
+    /* The arrangement is pinned by name, by a scan of the relations; refuse
+     * unless that scan finds this same relation (#2201). */
+    if (!col_session_has_exact_relation(sess, right, op->right_relation))
+        return ENOENT;
     /* A key index outside either input, such as column 0 of a zero-column
      * relation, is refused before any reservation, reader or arrangement
      * is taken, as in the non-differential producer (#2202). */
