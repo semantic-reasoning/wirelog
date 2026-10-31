@@ -141,6 +141,23 @@ wl_columnar_spill_status_t wl_columnar_payload_join_create_trace_bounded(
     uint32_t left_key, uint32_t right_key, uint64_t batch_bytes,
     uint64_t index_bytes, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out);
+/* Reference-aware ordinary projected snapshot JOIN. Same complete schema,
+ * originating-intern, matching INT64/STRING key and scalar projection rules as
+ * reference_projected_bounded(), with trace_bounded() snapshot lifetimes.
+ * Numeric factories remain numeric-only, including unused STRING/INLINE lanes.
+ * Retained cursor owners back pending STRING IDs even after segment switches
+ * and intern owner retirement. Independent output capture still needs a fresh
+ * intern pin BEFORE intern owner retirement; after retirement it returns CLOSED
+ * without invalidating borrowed pending data. No automatic session routing. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
 /* Explicit zero-coordinate signed trace JOINs. The weighted snapshot variant
  * accepts two immutable trace prefixes; delta_trace accepts a numeric payload
  * on the left and a trace snapshot on the right. The delta reader is acquired
