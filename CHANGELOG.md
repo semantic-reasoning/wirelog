@@ -4,6 +4,9 @@ All notable changes to wirelog are documented in this file.
 
 ## [Unreleased]
 
+- Cold standalone scans compose ordered direct-column MAP/FILTER stages without
+  intermediate rowsets, preserving stage-local types and scalar INLINE fields.
+
 ### Added
 
 - **Repeated cold projection predicates** (#1372): sealed scalar and flat INLINE

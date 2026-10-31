@@ -4973,6 +4973,8 @@ typedef struct {
 bool wl_columnar_eval_plan_cold_predicate_decode(const wl_plan_op_t *filter,
     uint32_t ncols, const wirelog_column_type_t *types,
     wl_columnar_eval_plan_cold_predicate_t *out);
+bool wl_columnar_eval_plan_cold_column(const wl_plan_relation_t *plan,
+    uint32_t end, uint32_t column, uint32_t ncols, uint32_t *source);
 bool wl_columnar_eval_plan_cold_projection_decode(
     const wl_plan_relation_t *plan, const char *name, uint32_t ncols,
     const wirelog_column_type_t *types,
