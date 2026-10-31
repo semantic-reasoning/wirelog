@@ -1522,8 +1522,9 @@ The existing top-one and initially-empty begin APIs retain their contracts.
 
 The private `wl_columnar_merge_concat_attempt_*` interface materializes the
 left rows followed by the right rows, retaining duplicates and supporting empty
-and nullary inputs. It requires two ordinary scalar entries of equal width,
-without timestamps, in the initial serial domain. Non-NULL operation control
+and nullary inputs. It requires two ordinary scalar entries of equal width
+in the initial serial domain. Timestamped inputs are accepted; the result
+projects values and omits stamps, matching raw two-input CONCAT. Non-NULL operation control
 never falls back to raw execution; the raw single-entry K-copy marker remains
 outside this controlled domain. Output is owned, flat and non-delta, with no
 K-way optimization segment array. Input segment arrays remain independent
@@ -1549,7 +1550,8 @@ empty-frame claim; depths1..32 use the genuine expected-depth stack claim.
 Before any lookup or publication, paid abstract-depth preflight visits every
 opcode: VARIABLE adds one, CONCAT requires two and removes one, supported
 numeric children require one and preserve depth, and final depth must be one.
-Prebound inputs are checked separately for the scalar/noTS domain. Registry,
+Prebound inputs receive scalar representation checks; each consumer owns its
+timestamp preservation or value-projection contract. Registry,
 plan and borrowed registry storage remain immutable and live through ACK.
 Prebound owned entries retire only through their controlled child transactions.
 
@@ -1979,7 +1981,11 @@ persistent index ownership.
 Raw incremental removal still stages one input relation at a time; attempting
 another relation's removal before evaluating retains its EBUSY contract. This
 is separate from a foreign source lease. Scalar signed notifications are not
-physical differential trace weights/timestamps. Their transport intersections
-and remaining recursive/resource/configuration domains stay under #2293's
-children. The `evaluation_differential` tests qualify the predicates above,
-including deterministic source/index/probe/claim/cutoff stops and retry.
+physical differential trace weights/timestamps. Their actual scalar transport,
+projection, removal and retirement intersections are now qualified in
+[the physical metadata audit](implementation/1821/PHYSICAL_METADATA_AUDIT.md).
+The separate [iteration-cap audit](implementation/1821/ITERATION_CAP_AUDIT.md)
+records all cap dispositions and required fixes. Remaining persistent weighted
+trace, general recursive/resource/configuration and platform domains retain
+#2293's existing owners. The `evaluation_differential` tests qualify the
+predicates above, including source/index/probe/claim/cutoff stops and retry.

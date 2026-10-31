@@ -2169,9 +2169,6 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
         &ctx->source, left, false);
     rc = wl_columnar_ops_reduce_attempt_return(control, id, rc);
     if (rc) goto done;
-    if (ctx->source.timestamps) {
-        rc = ENOTSUP; goto done;
-    }
     rc = wl_columnar_ops_reduce_attempt_charge(control, id,
             WL_COLUMNAR_OPS_REDUCE_ATTEMPT_WORK);
     if (rc) goto done;

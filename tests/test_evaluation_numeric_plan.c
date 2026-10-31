@@ -2970,6 +2970,15 @@ test_consolidate_shape_refusals(void)
             uint64_t generation = f.input->storage_generation;
             int64_t bits = rows ? f.input->columns[0][0] : 0;
             fixture_begin(&f, &plan, 0, 1); run(&f);
+            if (!shape) {
+                CHECK(!f.record.semantic_result && f.record.completed == 1);
+                eval_stack_t *result =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                CHECK(result->top == 1 && result->items[0].rel->timestamps
+                    && result->items[0].rel->nrows == rows);
+                CHECK(f.input->storage_generation == generation);
+                fixture_close(&f); continue;
+            }
             CHECK(f.record.semantic_result == (shape < 2 ? ENOTSUP : EINVAL)
                 && !f.record.completed && !f.session.memory_budget_denied);
             eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
@@ -6023,9 +6032,13 @@ test_composed_domain_and_repeated_source(void)
                     wl_columnar_eval_stack_cleanup_stack(f.frame), f.input,
                     false));
         composed_begin(&f, &ts_body, registry, 1, prebound); composed_run(&f);
-        CHECK(f.record.semantic_result == ENOTSUP && !f.record.completed
+        CHECK(!f.record.semantic_result && f.record.completed == 2 - prebound
             && !f.record.source_slot_borrowed && !f.record.source_initialized);
-        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->top == prebound);
+        eval_stack_t *result = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(result->top == 1);
+        if (!prebound) CHECK(!result->items[0].rel->nrows
+                && !result->items[0].rel->timestamps);
+        else CHECK(result->items[0].rel->timestamps);
         composed_close(&f);
     }
 }

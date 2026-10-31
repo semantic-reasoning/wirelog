@@ -12,6 +12,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Observe real private operator publication before its input is retired. */
+void (*wl_columnar_eval_stack_test_physical_publication)(wl_col_session_t *,
+    const col_rel_t *, const col_rel_t *);
+#endif
+
 static wl_atomic_u64 wl_next_cleanup_receipt_session_generation = 1u;
 
 int
@@ -1275,6 +1281,11 @@ wl_columnar_eval_stack_unary_commit_attempt_body(
     frame->unary_committed = true;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;
     *committed = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_physical_publication)
+        wl_columnar_eval_stack_test_physical_publication(frame->session,
+            frame->unary_retired.rel, entry->rel);
+#endif
     return 0;
 }
 
@@ -2472,6 +2483,11 @@ wl_columnar_eval_stack_binary_commit_owned(
     frame->stack.top = ctx->top - 1;
     ctx->committed = true;
     *committed = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_physical_publication)
+        wl_columnar_eval_stack_test_physical_publication(frame->session,
+            ctx->retired[0].rel, frame->stack.items[ctx->top - 2].rel);
+#endif
     return 0;
 }
 
