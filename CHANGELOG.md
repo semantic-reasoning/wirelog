@@ -6,6 +6,18 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Signed reference trace/trace and delta/trace JOINs preserve STRING/INLINE
+  generations and checked weighted contributions; paired budget tests distinguish
+  reclaimed row storage from irreducible intern/output ownership floors (#1372).
+
+- Reference trace snapshots support bounded projected INT64/STRING-key JOINs
+  through the common production engine, retaining INLINE provenance and pending
+  output capabilities across lazy segment changes and owner retirement (#1372).
+
+- Explicit STRING/flat INLINE trace owners retain intern and declaration
+  capabilities across source transfer and snapshot reads; numeric JOIN factories
+  continue rejecting reference-bearing snapshots, including empty inputs (#1372).
+
 - Explicit signed delta-by-trace and trace-by-trace JOINs preserve immutable
   generation boundaries through insertions/retractions, with checked products
   and bounded windows; paired fixed-budget tests prove source reclamation (#1372).

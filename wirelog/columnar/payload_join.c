@@ -346,44 +346,34 @@ wl_columnar_payload_join_produce(void *context,
 }
 
 static wl_columnar_spill_status_t
-wl_columnar_payload_join_schema(wl_columnar_batch_payload_t *payload,
-    uint32_t key, uint32_t *cols, uint32_t *rows, const wl_intern_t *intern)
-{
-    const wirelog_column_type_t *types =
-        wl_columnar_batch_payload_schema(payload, cols, rows);
-    uint32_t logical;
-    if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
-    const wirelog_column_t *columns =
-        wl_columnar_batch_payload_inline_schema(payload, &logical);
-    if (columns && (!intern || !wl_columnar_batch_payload_uses_intern(payload,
-        intern) ||
-        wl_columnar_spill_validate_inline_schema(types, *cols, columns,
-        logical) != WL_COLUMNAR_SPILL_OK))
-        return WL_COLUMNAR_SPILL_UNSUPPORTED;
-    if ((types[key] != WIRELOG_TYPE_INT64 &&
-        !(intern &&
-        types[key] ==
-        WIRELOG_TYPE_STRING))) return WL_COLUMNAR_SPILL_UNSUPPORTED;
-    for (uint32_t c = 0; c < *cols; c++)
-        if (types[c] == WIRELOG_TYPE_STRING &&
-            !wl_columnar_batch_payload_uses_intern(payload, intern))
-            return WL_COLUMNAR_SPILL_UNSUPPORTED;
-    return WL_COLUMNAR_SPILL_OK;
-}
-
-static wl_columnar_spill_status_t
 wl_columnar_payload_join_source_validate(
     wl_columnar_payload_join_source_t source,
     uint32_t key, uint32_t *cols, uint32_t *rows, const wl_intern_t *intern)
 {
-    if (!source.snapshot)
-        return wl_columnar_payload_join_schema(source.payload, key, cols, rows,
-                   intern);
     const wirelog_column_type_t *types =
         wl_columnar_payload_join_source_schema(source, cols, rows);
     if (!types || key >= *cols) return WL_COLUMNAR_SPILL_INVALID;
-    return types[key] == WIRELOG_TYPE_INT64
-        ? WL_COLUMNAR_SPILL_OK : WL_COLUMNAR_SPILL_UNSUPPORTED;
+    uint32_t logical = 0;
+    const wirelog_column_t *columns = source.snapshot
+        ? wl_columnar_trace_store_snapshot_inline_schema(source.snapshot,
+            &logical)
+        : wl_columnar_batch_payload_inline_schema(source.payload, &logical);
+    bool owns_intern = intern && (source.snapshot
+        ? wl_columnar_trace_store_snapshot_uses_intern(source.snapshot, intern)
+        : wl_columnar_batch_payload_uses_intern(source.payload, intern));
+    if (columns && (!owns_intern ||
+        wl_columnar_spill_validate_inline_schema(types, *cols, columns,
+        logical) != WL_COLUMNAR_SPILL_OK))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    if (types[key] != WIRELOG_TYPE_INT64 &&
+        !(intern && types[key] == WIRELOG_TYPE_STRING))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    /* Audit every lane, including non-keys and projected-away references.
+     * Old factories pass NULL and retain their complete numeric restriction. */
+    for (uint32_t c = 0; c < *cols; c++)
+        if (types[c] == WIRELOG_TYPE_STRING && !owns_intern)
+            return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    return WL_COLUMNAR_SPILL_OK;
 }
 
 static wl_columnar_spill_status_t
@@ -650,6 +640,57 @@ wl_columnar_payload_join_create_trace_bounded(
                (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                true, index_bytes, NULL, 0, NULL);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.snapshot = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, false,
+               true, index_bytes, projection, project_count, intern);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.snapshot = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               true, index_bytes, projection, project_count, intern);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_delta_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_batch_payload_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               true, index_bytes, projection, project_count, intern);
 }
 
 wl_columnar_spill_status_t

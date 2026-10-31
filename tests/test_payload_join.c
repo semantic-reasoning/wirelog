@@ -2184,8 +2184,957 @@ static void trace_progress_and_floor(void)
     CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
 }
 
+/* Reference fixtures preserve global row identity across lazy segment changes. */
+static void reference_columns(const col_rel_t *r, wl_intern_t *intern,
+    wirelog_column_t columns[2])
+{
+    memset(columns, 0, 2 * sizeof(*columns));
+    columns[0].type = r->column_types[0];
+    columns[1].type = WIRELOG_TYPE_INT32;
+    columns[1].compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+    columns[1].compound_functor_id = (uint32_t)wl_intern_get(intern, "pair");
+    columns[1].compound_arity = 2;
+    columns[1].compound_inline_col_offset = 1;
+}
+static wl_columnar_trace_store_t *reference_segmented(
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_spill_store_t *store,
+    const col_rel_t *r, wl_intern_t *intern, uint32_t chunk, unsigned mode)
+{
+    bool inlined = r->compound_kind == WIRELOG_COMPOUND_KIND_INLINE;
+    wirelog_column_t columns[2]; reference_columns(r, intern, columns);
+    wl_columnar_trace_store_t *t;
+    CHECK(wl_columnar_trace_store_create_reference(g, r->column_types, 3,
+        inlined ? columns : NULL, inlined ? 2 : 0, intern, &t) == OK);
+    for (uint32_t start = 0;;) {
+        uint32_t count = r->nrows - start;
+        if (count > chunk) count = chunk;
+        col_rel_t *part;
+        CHECK(wl_columnar_relation_new_auto_governed("reference_segment", 3,
+            count ? count : 1, r->timestamps != NULL, g, &part) == 0);
+        CHECK(col_rel_set_column_types(part, r->column_types, 3) == 0);
+        if (inlined) {
+            col_rel_logical_col_t layout[] = {{WIRELOG_COMPOUND_KIND_NONE, 0,
+                                               0},
+                                              {WIRELOG_COMPOUND_KIND_INLINE, 2,
+                                               1}};
+            CHECK(col_rel_apply_compound_schema(part, layout, 2) == 0);
+        }
+        for (unsigned c = 0; c < 3; c++)
+            memcpy(part->columns[c], r->columns[c] + start,
+                count * sizeof(int64_t));
+        if (r->timestamps) memcpy(part->timestamps, r->timestamps + start,
+                count * sizeof(*part->timestamps));
+        part->nrows = count;
+        bool spilled = mode == 1 || (mode == 2 && (start/chunk)%2 == 0);
+        CHECK(wl_columnar_trace_store_append_capture_reference(t, part,
+            inlined ? columns : NULL, inlined ? 2 : 0, intern,
+            spilled ? WL_COLUMNAR_BATCH_PAYLOAD_SPILLED :
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+            store, NULL, NULL) == OK);
+        part->nrows = 0;
+        CHECK(wl_columnar_trace_store_append_capture_reference(t, part,
+            inlined ? columns : NULL, inlined ? 2 : 0, intern,
+            WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, store, NULL, NULL) == OK);
+        col_rel_destroy(part); start += count;
+        if (start == r->nrows) break;
+    }
+    return t;
+}
+static void reference_trace_joins(void)
+{
+    const char *values[] = {"", "alpha", "한글"};
+    const uint32_t map[] = {5, 1, 4, 2, 5};
+    for (unsigned inline_mode = 0; inline_mode < 2; inline_mode++)
+        for (unsigned string_key = 0; string_key < 2; string_key++)
+            for (unsigned mode = 0; mode < 5; mode++) {
+                wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+                wl_intern_t *intern = wl_intern_create();
+                CHECK(intern && wl_intern_attach_memory_governor(intern,
+                    g) == 0);
+                wl_columnar_spill_store_t *store;
+                CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20,
+                    64, &store) == OK);
+                col_rel_t *l = reference_source(intern, mode == 4 ? 0 : 9,
+                        string_key, inline_mode);
+                col_rel_t *r = reference_source(intern, 11, string_key,
+                        inline_mode);
+                wl_columnar_trace_store_t *lt = reference_segmented(g, store, l,
+                        intern, 2, mode%3);
+                wl_columnar_trace_store_t *rt = mode ==
+                    3 ? lt : reference_segmented(g, store, r, intern, 3,
+                        (mode+1)%3);
+                col_rel_destroy(l); col_rel_destroy(r);
+                wl_columnar_trace_store_snapshot_t *ls = snapshot(lt),
+                    *rs = snapshot(rt);
+                wl_intern_t *foreign = wl_intern_create();
+                CHECK(foreign && wl_intern_attach_memory_governor(foreign,
+                    g) == 0);
+                CHECK(wl_intern_put(foreign, "foreign-zero") == 0);
+                uint64_t before = reserved(g);
+                wl_columnar_continuation_t *join;
+                CHECK(
+                    wl_columnar_payload_join_create_reference_trace_projected_bounded
+                        (g,
+                    ls, rs, 0, 0, map, 5, 40, index_cap(1), foreign, NULL, NULL,
+                    &join)
+                    == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+                CHECK(reserved(g) == before); wl_intern_free(foreign);
+                for (unsigned fault = 1; fault <= 3; fault++) {
+                    before = reserved(g); allocation_fail = fault;
+                    CHECK(
+                        wl_columnar_payload_join_create_reference_trace_projected_bounded
+                            (g,
+                        ls, rs, 0, 0, map, 5, 40, index_cap(1), intern, NULL,
+                        NULL, &join)
+                        == WL_COLUMNAR_SPILL_ALLOCATION && !join);
+                    CHECK(reserved(g) == before);
+                }
+                uint32_t copied_map[5]; memcpy(copied_map, map, sizeof(map));
+                CHECK(
+                    wl_columnar_payload_join_create_reference_trace_projected_bounded
+                        (g,
+                    ls, rs, 0, 0, copied_map, 5, 40, index_cap(3), intern, NULL,
+                    NULL, &join) == OK);
+                memset(copied_map, 0xff, sizeof(copied_map));
+                wl_columnar_trace_store_snapshot_release(ls);
+                wl_columnar_trace_store_snapshot_release(rs);
+                wl_columnar_trace_store_retire(lt);
+                if (rt != lt) wl_columnar_trace_store_retire(rt);
+                sink_t s; wl_columnar_continuation_sink_t sink;
+                sink_init(&s, &sink, g);
+                wl_columnar_join_batch_payload_sink_init_with_intern(&s.owned,
+                    &s.inner,
+                    g, NULL, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+                s.failure = mode == 4 ? 0 : mode;
+                bool seen[9][11] = {{false}}; unsigned total = 0;
+                wl_columnar_batch_payload_t *retained = NULL;
+                for (unsigned calls = 0;; calls++) {
+                    CHECK(calls < 10000);
+                    wl_columnar_continuation_status_t step =
+                        wl_columnar_continuation_publish(join, &sink);
+                    if (step == WL_COLUMNAR_CONTINUATION_PROGRESS) continue;
+                    if (step == WL_COLUMNAR_CONTINUATION_SINK_FAILURE ||
+                        step == WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE) {
+                        s.failure = 0; read_fail = true;
+                        step = wl_columnar_continuation_publish(join, &sink);
+                        read_fail = false; /* Frozen retry cannot reread segments. */
+                    }
+                    CHECK(step == WL_COLUMNAR_CONTINUATION_OK ||
+                        step == WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS ||
+                        step == WL_COLUMNAR_CONTINUATION_DONE);
+                    s.failure = 0;
+                    wl_columnar_batch_payload_t *out =
+                        wl_columnar_join_batch_payload_sink_take(&s.owned);
+                    if (out) {
+                        uint32_t cols, rows, logical = UINT32_MAX;
+                        const wirelog_column_type_t *types =
+                            wl_columnar_batch_payload_schema(out, &cols, &rows);
+                        CHECK(cols == 5 && rows == 1 &&
+                            types[0] == WIRELOG_TYPE_STRING &&
+                            types[1] == WIRELOG_TYPE_INT64 &&
+                            types[2] == WIRELOG_TYPE_INT64 &&
+                            types[3] == WIRELOG_TYPE_STRING &&
+                            types[4] == WIRELOG_TYPE_STRING);
+                        CHECK(!wl_columnar_batch_payload_inline_schema(out,
+                            &logical) && !logical);
+                        wl_columnar_batch_payload_reader_t *reader;
+                        CHECK(wl_columnar_batch_payload_acquire(out,
+                            &reader) == OK);
+                        const uint64_t *lanes;
+                        wl_columnar_spill_metadata_t meta;
+                        CHECK(wl_columnar_batch_payload_read(reader, 0, NULL,
+                            NULL, &lanes, &meta) == OK);
+                        unsigned i = (unsigned)lanes[1], j = (unsigned)lanes[2];
+                        CHECK(i < 9 && j < (mode == 3 ? 9u : 11u) &&
+                            i%3 == j%3 && !seen[i][j]);
+                        seen[i][j] = true; total++;
+                        CHECK(!strcmp(wl_intern_reverse(intern,
+                            (int64_t)lanes[0]),
+                            values[(j+1)%3]) &&
+                            !strcmp(wl_intern_reverse(intern,
+                            (int64_t)lanes[3]),
+                            values[(i+1)%3]) && lanes[0] == lanes[4]);
+                        CHECK(meta.multiplicity == 1 && !meta.iteration &&
+                            !meta.stratum && !meta.worker);
+                        wl_columnar_batch_payload_reader_release(reader);
+                        if (!retained) retained = out;
+                        else CHECK(wl_columnar_batch_payload_release(out) ==
+                                OK);
+                    }
+                    if (step == WL_COLUMNAR_CONTINUATION_DONE) break;
+                }
+                CHECK(total == (mode == 4 ? 0u : mode == 3 ? 27u : 33u));
+                wl_columnar_continuation_destroy(join);
+                wl_columnar_spill_store_retire(store); wl_intern_free(intern);
+                if (retained) {
+                    wl_columnar_batch_payload_reader_t *reader;
+                    CHECK(wl_columnar_batch_payload_acquire(retained,
+                        &reader) == OK);
+                    const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                    CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL,
+                        &lanes, &meta) == OK);
+                    const char *text;
+                    CHECK(wl_columnar_batch_payload_resolve_string(reader,
+                        lanes[0], &text) == OK && text);
+                    wl_columnar_batch_payload_reader_release(reader);
+                    CHECK(wl_columnar_batch_payload_release(retained) == OK);
+                }
+                CHECK(reserved(g) == 0);
+                wl_columnar_memory_governor_ref_release(g);
+            }
+}
+
+typedef struct {
+    sink_t sink;
+    wl_intern_t *intern;
+    const col_rel_t *pending;
+    int64_t first[6];
+    unsigned calls;
+} reference_borrow_t;
+static wl_columnar_continuation_status_t reference_borrow_begin(void *v,
+    const wl_columnar_continuation_batch_t *batch)
+{
+    reference_borrow_t *b = v; const col_rel_t *r = batch->payload;
+    CHECK(r && r->ncols == 6 && r->nrows == 1 && !r->compound_arity_map);
+    if (b->pending) CHECK(b->pending == r);
+    b->pending = r;
+    for (unsigned c = 0; c < 6; c++) {
+        if (b->calls) CHECK(b->first[c] == r->columns[c][0]);
+        b->first[c] = r->columns[c][0];
+        if (r->column_types[c] == WIRELOG_TYPE_STRING)
+            CHECK(wl_intern_reverse(b->intern, r->columns[c][0]));
+    }
+    b->calls++; return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+}
+static void reference_trace_retirement(void)
+{
+    for (unsigned inlined = 0; inlined < 2; inlined++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+        wl_intern_t *intern = wl_intern_create();
+        CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 64,
+            &store) == OK);
+        col_rel_t *r = reference_source(intern, 7, true, inlined);
+        wl_columnar_trace_store_t *t = reference_segmented(g, store, r, intern,
+                2, 2);
+        col_rel_destroy(r);
+        wl_columnar_trace_store_snapshot_t *ss = snapshot(t);
+        wl_intern_free(intern); /* Existing owner capability permits lazy construction. */
+        wl_columnar_continuation_t *join;
+        CHECK(wl_columnar_payload_join_create_reference_trace_projected_bounded(
+                g,
+                ss, ss, 0, 0, NULL, 0, 48, index_cap(3), intern, NULL, NULL,
+                &join) == OK);
+        wl_columnar_trace_store_snapshot_release(ss);
+        wl_columnar_trace_store_retire(t);
+        reference_borrow_t b = {0}; b.intern = intern;
+        wl_columnar_continuation_sink_t sink; sink_init(&b.sink, &sink, g);
+        sink.context = &b; sink.begin = reference_borrow_begin;
+        wl_columnar_continuation_status_t step;
+        do {
+            step = wl_columnar_continuation_publish(join, &sink);
+        }while (step == WL_COLUMNAR_CONTINUATION_PROGRESS);
+        CHECK(step == WL_COLUMNAR_CONTINUATION_SINK_FAILURE && b.calls == 1);
+        sink_t owned; wl_columnar_continuation_sink_t owned_sink;
+        sink_init(&owned, &owned_sink, g);
+        wl_columnar_join_batch_payload_sink_init_with_intern(&owned.owned,
+            &owned.inner, g, NULL, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+        uint64_t before = reserved(g);
+        read_fail = true;
+        CHECK(wl_columnar_continuation_publish(join,
+            &owned_sink) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE);
+        CHECK(owned.owned.error == WL_COLUMNAR_SPILL_CLOSED &&
+            !owned.owned.ready && reserved(g) == before);
+        CHECK(wl_columnar_continuation_publish(join,
+            &sink) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE && b.calls == 2);
+        read_fail = false;
+        wl_columnar_spill_store_retire(store);
+        CHECK(wl_columnar_continuation_publish(join,
+            &sink) == WL_COLUMNAR_CONTINUATION_SINK_FAILURE && b.calls == 3);
+        wl_columnar_continuation_destroy(join);
+        CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+static void reference_trace_numeric_inline(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    col_rel_t *r = reference_source(intern, 2, false, true);
+    r->column_types[2] = WIRELOG_TYPE_INT64;
+    wl_columnar_trace_store_t *t = reference_segmented(g, NULL, r, intern, 1,
+            0);
+    col_rel_destroy(r); wl_columnar_trace_store_snapshot_t *ss = snapshot(t);
+    wl_columnar_continuation_t *join;
+    uint64_t before = reserved(g);
+    CHECK(wl_columnar_payload_join_create_reference_trace_projected_bounded(g,
+        ss, ss, 0, 0, NULL, 0, 48, index_cap(1), NULL, NULL, NULL, &join)
+        == WL_COLUMNAR_SPILL_UNSUPPORTED && !join && reserved(g) == before);
+    CHECK(wl_columnar_payload_join_create_reference_trace_projected_bounded(g,
+        ss, ss, 0, 0, NULL, 0, 48, index_cap(1), intern, NULL, NULL,
+        &join) == OK);
+    wl_columnar_trace_store_snapshot_release(ss);
+    wl_columnar_trace_store_retire(t);
+    wl_intern_free(intern);
+    sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+    unsigned rows = 0;
+    for (;;) {
+        wl_columnar_continuation_status_t step =
+            wl_columnar_continuation_publish(join, &sink);
+        CHECK(step == WL_COLUMNAR_CONTINUATION_OK ||
+            step == WL_COLUMNAR_CONTINUATION_PROGRESS ||
+            step == WL_COLUMNAR_CONTINUATION_DONE);
+        wl_columnar_batch_payload_t *out =
+            wl_columnar_join_batch_payload_sink_take(&s.owned);
+        if (out) {
+            uint32_t n; wl_columnar_batch_payload_schema(out, NULL, &n);
+            rows += n;
+            CHECK(!wl_columnar_batch_payload_inline_schema(out, NULL));
+            CHECK(wl_columnar_batch_payload_release(out) == OK);
+        }
+        if (step == WL_COLUMNAR_CONTINUATION_DONE) break;
+    }
+    CHECK(rows == 2); wl_columnar_continuation_destroy(join);
+    CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+}
+
+static col_rel_t *reference_history(wl_columnar_memory_governor_ref_t *g,
+    wl_intern_t *intern, uint32_t start, uint32_t count, int64_t weight,
+    bool inlined)
+{
+    const char *words[] = {"", "alpha", "한글"};
+    int64_t ids[3];
+    for (unsigned i = 0; i < 3; i++) {
+        ids[i] = wl_intern_put(intern, words[i]); CHECK(ids[i] >= 0);
+    }
+    CHECK(wl_intern_put(intern, "pair") >= 0);
+    col_rel_t *r;
+    CHECK(wl_columnar_relation_new_auto_governed("reference_history", 3,
+        count ? count : 1, true, g, &r) == 0);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_STRING, WIRELOG_TYPE_INT64,
+                                     WIRELOG_TYPE_STRING};
+    CHECK(col_rel_set_column_types(r, types, 3) == 0);
+    if (inlined) {
+        col_rel_logical_col_t layout[] = {{WIRELOG_COMPOUND_KIND_NONE, 0, 0},
+                                          {WIRELOG_COMPOUND_KIND_INLINE, 2, 1}};
+        CHECK(col_rel_apply_compound_schema(r, layout, 2) == 0);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t id = start + i;
+        r->columns[0][i] = ids[id%3]; r->columns[1][i] = id;
+        r->columns[2][i] = ids[(id+1)%3];
+        r->timestamps[i] = (col_delta_timestamp_t){.multiplicity = weight};
+    }
+    r->nrows = count; return r;
+}
+static wl_columnar_spill_status_t reference_signed_create(bool delta,
+    wl_columnar_memory_governor_ref_t *g, wl_columnar_batch_payload_t *lp,
+    wl_columnar_trace_store_snapshot_t *ls,
+    wl_columnar_trace_store_snapshot_t *rs,
+    wl_intern_t *intern, uint64_t bytes, wl_columnar_spill_cancel_fn cancel,
+    void *context, wl_columnar_continuation_t **out)
+{
+    return delta ?
+           wl_columnar_payload_join_create_reference_delta_trace_projected_bounded
+           (
+        g, lp, rs, 0, 0, NULL, 0, bytes, index_cap(2), intern, cancel, context,
+        out)
+        :
+           wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded
+           (
+        g, ls, rs, 0, 0, NULL, 0, bytes, index_cap(2), intern, cancel, context,
+        out);
+}
+static void reference_signed_generations(void)
+{
+    const int64_t left_weights[] = {-2, 0, 3}, right_weights[] = {1, -1, 2};
+    const char *words[] = {"", "alpha", "한글"};
+    for (unsigned delta = 0; delta < 2; delta++) for (unsigned inlined = 0;
+            inlined < 2; inlined++){
+            wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+            wl_intern_t *intern = wl_intern_create();
+            CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+            wl_columnar_spill_store_t *store;
+            CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 64,
+                &store) == OK);
+            col_rel_t *r = reference_history(g, intern, 0, 3, 1, inlined);
+            for (unsigned i = 0; i < 3;
+                i++) r->timestamps[i].multiplicity = left_weights[i];
+            wl_columnar_batch_payload_t *lp = reference_capture(g, store, r,
+                    intern, 1);
+            wl_columnar_trace_store_t *lt = reference_segmented(g, store, r,
+                    intern, 1, 2), *rt;
+            wl_columnar_trace_store_snapshot_t *ls = snapshot(lt);
+            wirelog_column_t columns[2]; reference_columns(r, intern, columns);
+            CHECK(wl_columnar_trace_store_create_reference(g, r->column_types,
+                3, inlined ? columns : NULL, inlined ? 2 : 0, intern,
+                &rt) == OK);
+            col_rel_destroy(r);
+            wl_columnar_continuation_t *joins[3]; sink_t sinks[3];
+            wl_columnar_continuation_sink_t outputs[3];
+            for (unsigned gen = 0; gen < 3; gen++) {
+                r = reference_history(g, intern, 0, 3, right_weights[gen],
+                        inlined);
+                CHECK(wl_columnar_trace_store_append_take_reference(rt, &r,
+                    inlined ? columns : NULL, inlined ? 2 : 0, intern, store,
+                    NULL, NULL) == OK && !r);
+                wl_columnar_trace_store_snapshot_t *rs = snapshot(rt);
+                CHECK(wl_columnar_trace_store_snapshot_state(rs).generation ==
+                    gen + 1);
+                CHECK(reference_signed_create(delta, g, lp, ls, rs, intern, 48,
+                    NULL, NULL, &joins[gen]) == OK);
+                wl_columnar_trace_store_snapshot_release(rs);
+                sink_init(&sinks[gen], &outputs[gen], g);
+                wl_columnar_join_batch_payload_sink_init_with_intern(
+                    &sinks[gen].owned, &sinks[gen].inner, g, NULL,
+                    WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+                sinks[gen].failure = 2; /* Hold each old generation pending while history grows. */
+                CHECK(wl_columnar_continuation_publish(joins[gen],
+                    &outputs[gen]) == WL_COLUMNAR_CONTINUATION_COMMIT_FAILURE);
+            }
+            wl_columnar_trace_store_snapshot_release(ls);
+            wl_columnar_trace_store_retire(lt);
+            wl_columnar_trace_store_retire(rt);
+            bool done[3] = {0}; unsigned counts[3] = {0};
+            unsigned contributions[3][3][3] = {{{0}}};
+            int64_t sums[3][3] = {{0}};
+            wl_columnar_batch_payload_t *retained = NULL;
+            for (unsigned round = 0; !done[0] || !done[1] || !done[2];
+                round++){
+                CHECK(round < 1000);
+                for (unsigned gen = 0; gen < 3; gen++) if (!done[gen]) {
+                        sinks[gen].failure = 0; if (!round) read_fail = true;
+                        wl_columnar_continuation_status_t step =
+                            wl_columnar_continuation_publish(joins[gen],
+                                &outputs[gen]);
+                        read_fail = false;
+                        CHECK(step == WL_COLUMNAR_CONTINUATION_OK ||
+                            step == WL_COLUMNAR_CONTINUATION_PROGRESS ||
+                            step == WL_COLUMNAR_CONTINUATION_DONE);
+                        wl_columnar_batch_payload_t *out =
+                            wl_columnar_join_batch_payload_sink_take(
+                            &sinks[gen].owned);
+                        if (out) {
+                            uint32_t n, c;
+                            const wirelog_column_type_t *types =
+                                wl_columnar_batch_payload_schema(out, &c, &n);
+                            CHECK(c == 6 && n == 1 &&
+                                types[0] == WIRELOG_TYPE_STRING &&
+                                types[3] == WIRELOG_TYPE_STRING &&
+                                types[2] == WIRELOG_TYPE_STRING &&
+                                types[5] == WIRELOG_TYPE_STRING &&
+                                types[1] == WIRELOG_TYPE_INT64 &&
+                                types[4] == WIRELOG_TYPE_INT64);
+                            CHECK(!wl_columnar_batch_payload_inline_schema(out,
+                                NULL));
+                            wl_columnar_batch_payload_reader_t *reader;
+                            CHECK(wl_columnar_batch_payload_acquire(out,
+                                &reader) == OK);
+                            const uint64_t *lanes;
+                            wl_columnar_spill_metadata_t meta;
+                            CHECK(wl_columnar_batch_payload_read(reader, 0,
+                                NULL, NULL, &lanes, &meta) == OK);
+                            const char *resolved[6] = {0};
+                            for (unsigned lane = 0; lane < 6; lane++)
+                                if (types[lane] == WIRELOG_TYPE_STRING)
+                                    CHECK(
+                                        wl_columnar_batch_payload_resolve_string
+                                        (
+                                            reader, lanes[lane],
+                                            &resolved[lane]) == OK);
+                            /* Lookup by the COMPLETE emitted tuple, including
+                             * both scalar IDs and all four resolved strings.
+                             * Do not aggregate by only a JOIN key/left ID. */
+                            unsigned tuple = 0;
+                            for (; tuple < 3; tuple++) {
+                                if (lanes[1] != tuple ||
+                                    lanes[4] != tuple) continue;
+                                if (strcmp(resolved[0], words[tuple]) ||
+                                    strcmp(resolved[3], words[tuple]) ||
+                                    strcmp(resolved[2], words[(tuple+1)%3]) ||
+                                    strcmp(resolved[5],
+                                    words[(tuple+1)%3])) continue;
+                                break;
+                            }
+                            CHECK(tuple < 3 && !meta.iteration &&
+                                !meta.stratum && !meta.worker);
+                            unsigned contribution = 0;
+                            if (left_weights[tuple]) {
+                                for (; contribution <= gen; contribution++)
+                                    if (meta.multiplicity ==
+                                        left_weights[tuple]*
+                                        right_weights[contribution]) break;
+                                CHECK(contribution <= gen);
+                            } else CHECK(meta.multiplicity == 0);
+                            contributions[gen][tuple][contribution]++;
+                            counts[gen]++;
+                            sums[gen][tuple] += meta.multiplicity;
+                            wl_columnar_batch_payload_reader_release(reader);
+                            if (!retained) retained = out;
+                            else CHECK(wl_columnar_batch_payload_release(out) ==
+                                    OK);
+                        }
+                        done[gen] = step == WL_COLUMNAR_CONTINUATION_DONE;
+                    }
+            }
+            for (unsigned gen = 0; gen < 3; gen++) {
+                CHECK(counts[gen] == 3*(gen+1));
+                unsigned nonzero_tuples = 0;
+                for (unsigned tuple = 0; tuple < 3; tuple++) {
+                    CHECK(sums[gen][tuple] ==
+                        left_weights[tuple]*(gen == 0 ? 1 : gen == 1 ? 0 : 2));
+                    nonzero_tuples += sums[gen][tuple] != 0;
+                    for (unsigned contribution = 0; contribution < 3;
+                        contribution++) {
+                        unsigned expected = left_weights[tuple]
+                            ? (contribution <= gen ? 1u : 0u)
+                            : (contribution == 0 ? gen+1 : 0u);
+                        CHECK(contributions[gen][tuple][contribution] ==
+                            expected);
+                    }
+                }
+                CHECK(nonzero_tuples == (gen == 1 ? 0u : 2u));
+                wl_columnar_continuation_destroy(joins[gen]);
+            }
+            CHECK(wl_columnar_batch_payload_release(lp) == OK);
+            wl_columnar_spill_store_retire(store); wl_intern_free(intern);
+            wl_columnar_batch_payload_reader_t *reader;
+            CHECK(wl_columnar_batch_payload_acquire(retained, &reader) == OK);
+            const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+            const char *text;
+            CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL, &lanes,
+                &meta) == OK);
+            CHECK(wl_columnar_batch_payload_resolve_string(reader, lanes[0],
+                &text) == OK && text);
+            wl_columnar_batch_payload_reader_release(reader);
+            CHECK(wl_columnar_batch_payload_release(retained) == OK);
+            CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+        }
+}
+
+static void reference_signed_errors(void)
+{
+    const int64_t lhs[] = {INT64_MIN, INT64_MAX, INT64_MIN, INT64_MAX, 0};
+    const int64_t rhs[] = {1, 1, -1, 2, INT64_MIN};
+    for (unsigned kind = 0; kind < 2; kind++) for (unsigned k = 0; k < 5; k++)
+            for (unsigned mismatch = 0; mismatch < 2; mismatch++) {
+                wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+                wl_intern_t *intern = wl_intern_create();
+                CHECK(intern && wl_intern_attach_memory_governor(intern,
+                    g) == 0);
+                col_rel_t *l = reference_history(g, intern, 0, 1, lhs[k], true),
+                    *r = reference_history(g, intern, mismatch ? 1 : 0, 1,
+                        rhs[k], true);
+                wl_columnar_trace_store_t *lt = reference_segmented(g, NULL, l,
+                        intern, 1, 0),
+                    *rt = reference_segmented(g, NULL, r, intern, 1, 0);
+                wl_columnar_trace_store_snapshot_t *ls = snapshot(lt),
+                    *rs = snapshot(rt);
+                wl_columnar_batch_payload_t *lp = reference_capture(g, NULL, l,
+                        intern, 0);
+                wl_columnar_continuation_t *join;
+                CHECK(reference_signed_create(kind, g, lp, ls, rs, intern, 48,
+                    NULL, NULL, &join) == OK);
+                sink_t s; wl_columnar_continuation_sink_t sink;
+                sink_init(&s, &sink, g);
+                wl_columnar_join_batch_payload_sink_init_with_intern(&s.owned,
+                    &s.inner, g, NULL, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+                    intern);
+                wl_columnar_continuation_status_t status =
+                    wl_columnar_continuation_publish(join, &sink);
+                bool overflow = k == 2 || k == 3;
+                if (mismatch) CHECK(status == WL_COLUMNAR_CONTINUATION_DONE &&
+                        !s.owned.ready);
+                else if (overflow) {
+                    CHECK(status == WL_COLUMNAR_CONTINUATION_INVALID &&
+                        !s.owned.ready);
+                    CHECK(wl_columnar_payload_join_error(join) ==
+                        WL_COLUMNAR_SPILL_OVERFLOW);
+                    CHECK(wl_columnar_continuation_publish(join,
+                        &sink) == WL_COLUMNAR_CONTINUATION_INVALID);
+                } else {
+                    CHECK(status == WL_COLUMNAR_CONTINUATION_OK);
+                    wl_columnar_batch_payload_t *out =
+                        wl_columnar_join_batch_payload_sink_take(&s.owned);
+                    wl_columnar_batch_payload_reader_t *reader;
+                    CHECK(wl_columnar_batch_payload_acquire(out,
+                        &reader) == OK);
+                    const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                    CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL,
+                        &lanes, &meta) == OK);
+                    CHECK(meta.multiplicity ==
+                        (k == 0 ? INT64_MIN : k == 1 ? INT64_MAX : 0));
+                    wl_columnar_batch_payload_reader_release(reader);
+                    CHECK(wl_columnar_batch_payload_release(out) == OK);
+                }
+                wl_columnar_continuation_destroy(join);
+                CHECK(wl_columnar_batch_payload_release(lp) == OK);
+                /* Full delta validation rejects even a nonmatching time. */
+                for (unsigned coordinate = 0; coordinate < 3; coordinate++) {
+                    l->timestamps[0] =
+                        (col_delta_timestamp_t){.multiplicity = 1};
+                    if (coordinate == 0) l->timestamps[0].iteration = 1;
+                    if (coordinate == 1) l->timestamps[0].stratum = 1;
+                    if (coordinate == 2) l->timestamps[0].worker = 1;
+                    lp = reference_capture(g, NULL, l, intern, 0);
+                    CHECK(reference_signed_create(true, g, lp, ls, rs, intern,
+                        48, NULL, NULL,
+                        &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+                    CHECK(wl_columnar_batch_payload_release(lp) == OK);
+                }
+                wl_columnar_trace_store_snapshot_release(ls);
+                wl_columnar_trace_store_snapshot_release(rs);
+                wl_columnar_trace_store_retire(lt);
+                wl_columnar_trace_store_retire(rt);
+                col_rel_destroy(l); col_rel_destroy(r); wl_intern_free(intern);
+                CHECK(reserved(g) == 0);
+                wl_columnar_memory_governor_ref_release(g);
+            }
+}
+
+static void reference_signed_late_failures(void)
+{
+    const uint32_t map[] = {5, 1, 4, 2, 5};
+    for (unsigned delta = 0; delta < 2; delta++) for (unsigned mode = 0;
+            mode < 5; mode++){
+            wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+            wl_intern_t *intern = wl_intern_create();
+            CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+            wl_columnar_spill_store_t *store;
+            CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 64,
+                &store) == OK);
+            col_rel_t *l = reference_history(g, intern, 0, 1, 2, true),
+                *r = reference_history(g, intern, 0, 2, 1, true);
+            r->columns[0][1] = r->columns[0][0];
+            if (mode == 0 ||
+                mode == 4) r->timestamps[1].multiplicity = INT64_MAX;
+            wl_columnar_trace_store_t *lt = reference_segmented(g, store, l,
+                    intern, 1, 1),
+                *rt = reference_segmented(g, store, r, intern, 1, 1);
+            wl_columnar_trace_store_snapshot_t *ls = snapshot(lt),
+                *rs = snapshot(rt);
+            wl_columnar_batch_payload_t *lp = reference_capture(g, store, l,
+                    intern, 1);
+            col_rel_destroy(l); col_rel_destroy(r);
+            bool stop = false; wl_columnar_continuation_t *join;
+            CHECK((delta ?
+                wl_columnar_payload_join_create_reference_delta_trace_projected_bounded
+                    (g,
+                lp, rs, 0, 0, map, 5, mode == 4 ? 80 : 40, index_cap(1), intern,
+                cancelled, &stop, &join)
+            :
+                wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded
+                    (g,
+                ls, rs, 0, 0, map, 5, mode == 4 ? 80 : 40, index_cap(1), intern,
+                cancelled, &stop, &join)) == OK);
+            wl_columnar_trace_store_snapshot_release(ls);
+            wl_columnar_trace_store_snapshot_release(rs);
+            wl_columnar_trace_store_retire(lt);
+            wl_columnar_trace_store_retire(rt);
+            sink_t s; wl_columnar_continuation_sink_t sink;
+            sink_init(&s, &sink, g);
+            wl_columnar_join_batch_payload_sink_init_with_intern(&s.owned,
+                &s.inner, g, NULL, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+            wl_columnar_batch_payload_t *retained = NULL;
+            if (mode != 4) {
+                CHECK(wl_columnar_continuation_publish(join,
+                    &sink) == WL_COLUMNAR_CONTINUATION_OK);
+                retained = wl_columnar_join_batch_payload_sink_take(&s.owned);
+                CHECK(retained);
+            }
+            if (mode == 1) read_fail = true;
+            if (mode == 2) stop = true;
+            if (mode == 3) wl_columnar_spill_store_retire(store);
+            CHECK(wl_columnar_continuation_publish(join,
+                &sink) == WL_COLUMNAR_CONTINUATION_INVALID && !s.owned.ready);
+            CHECK(wl_columnar_payload_join_error(join) ==
+                (mode == 1 ? WL_COLUMNAR_SPILL_IO : mode ==
+                2 ? WL_COLUMNAR_SPILL_CANCELLED : mode ==
+                3 ? WL_COLUMNAR_SPILL_CLOSED : WL_COLUMNAR_SPILL_OVERFLOW));
+            read_fail = false; stop = false;
+            CHECK(wl_columnar_continuation_publish(join,
+                &sink) == WL_COLUMNAR_CONTINUATION_INVALID);
+            wl_columnar_continuation_destroy(join);
+            CHECK(wl_columnar_batch_payload_release(lp) == OK);
+            if (mode != 3) wl_columnar_spill_store_retire(store);
+            wl_intern_free(intern);
+            if (retained) {
+                wl_columnar_batch_payload_reader_t *reader;
+                CHECK(wl_columnar_batch_payload_acquire(retained,
+                    &reader) == OK);
+                const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                const char *text;
+                CHECK(wl_columnar_batch_payload_read(reader, 0, NULL, NULL,
+                    &lanes,
+                    &meta) == OK && meta.multiplicity == 2 && lanes[2] == 0);
+                CHECK(wl_columnar_batch_payload_resolve_string(reader, lanes[0],
+                    &text) == OK && !strcmp(text, "alpha"));
+                wl_columnar_batch_payload_reader_release(reader);
+                CHECK(wl_columnar_batch_payload_release(retained) == OK);
+            }
+            CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+        }
+}
+
+/* Identical vocabulary, history, segment count, caps and allowance. Only
+ * retaining versus transferring real governed source allocations differs. */
+static uint64_t reference_causal_budget(uint32_t chunk, bool retain)
+{
+    const uint64_t limit = 65536;
+    wl_columnar_memory_governor_ref_t *g = governor(limit);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22, 1024,
+        &store) == OK);
+    col_rel_t *held[2] = {0}; wl_columnar_trace_store_t *t = NULL;
+    wirelog_column_t columns[2];
+    for (unsigned segment = 0; segment < 2; segment++) {
+        col_rel_t *r = reference_history(g, intern, segment*chunk, chunk, 1,
+                true);
+        for (uint32_t i = 0; i < chunk; i++) {
+            r->columns[0][i] = 0;
+            r->timestamps[i].multiplicity = (int64_t)(i%3)-1;
+        }
+        reference_columns(r, intern, columns);
+        if (!t) CHECK(wl_columnar_trace_store_create_reference(g,
+                r->column_types, 3, columns, 2, intern, &t) == OK);
+        uint64_t before = reserved(g);
+        if (retain) {
+            CHECK(wl_columnar_trace_store_append_capture_reference(t, r,
+                columns, 2, intern, WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, store,
+                NULL, NULL) == OK);
+            held[segment] = r;
+        } else {
+            CHECK(wl_columnar_trace_store_append_take_reference(t, &r, columns,
+                2, intern, store, NULL, NULL) == OK && !r);
+            CHECK(reserved(g) < before);
+        }
+    }
+    col_rel_t *r = reference_history(g, intern, 2*chunk, 1, 1, true);
+    r->columns[0][0] = 0;
+    CHECK(wl_columnar_trace_store_append_capture_reference(t, r, columns, 2,
+        intern, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, store, NULL, NULL) == OK);
+    col_rel_destroy(r); r = reference_history(g, intern, 99, 1, -2, true);
+    r->columns[0][0] = 0;
+    wl_columnar_batch_payload_t *delta = reference_capture(g, store, r, intern,
+            0); col_rel_destroy(r);
+    wl_columnar_trace_store_snapshot_t *ss = snapshot(t);
+    CHECK(wl_columnar_trace_store_snapshot_state(ss).segments == 3);
+    uint64_t before = reserved(g); wl_columnar_continuation_t *join;
+    wl_columnar_spill_status_t status =
+        wl_columnar_payload_join_create_reference_delta_trace_projected_bounded(
+        g,
+        delta, ss, 0, 0, NULL, 0, 48*256, index_cap(127), intern, NULL,
+        NULL, &join);
+    uint64_t scratch = reserved(g) - before;
+    if (retain) CHECK(status == WL_COLUMNAR_SPILL_MEMORY && !join &&
+            reserved(g) == before);
+    else {
+        CHECK(status == OK && join);
+        sink_t s; wl_columnar_continuation_sink_t sink; sink_init(&s, &sink, g);
+        wl_columnar_join_batch_payload_sink_init_with_intern(&s.owned, &s.inner,
+            g, NULL, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, intern);
+        bool seen[1025] = {0}; unsigned total = 0; uint64_t peak = reserved(g);
+        for (unsigned calls = 0;; calls++) {
+            CHECK(calls < 10000);
+            wl_columnar_continuation_status_t step =
+                wl_columnar_continuation_publish(join, &sink);
+            CHECK(step == WL_COLUMNAR_CONTINUATION_OK ||
+                step == WL_COLUMNAR_CONTINUATION_PROGRESS ||
+                step == WL_COLUMNAR_CONTINUATION_DONE);
+            if (reserved(g) > peak) peak = reserved(g);
+            CHECK(peak <= limit);
+            wl_columnar_batch_payload_t *out =
+                wl_columnar_join_batch_payload_sink_take(&s.owned);
+            if (out) {
+                uint32_t rows;
+                wl_columnar_batch_payload_schema(out, NULL, &rows);
+                wl_columnar_batch_payload_reader_t *reader;
+                CHECK(wl_columnar_batch_payload_acquire(out, &reader) == OK);
+                if (reserved(g) > peak) peak = reserved(g);
+                for (uint32_t row = 0; row < rows; row++) {
+                    const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+                    CHECK(wl_columnar_batch_payload_read(reader, row, NULL,
+                        NULL, &lanes, &meta) == OK);
+                    unsigned id = (unsigned)lanes[4];
+                    CHECK(id <= 2*chunk && !seen[id] && lanes[0] == 0 &&
+                        lanes[1] == 99 && lanes[3] == 0);
+                    CHECK(meta.multiplicity ==
+                        -2*(id == 2*chunk ? 1 : (int64_t)((id%chunk)%3)-1));
+                    const char *word; const char *words[] = {"", "alpha", "한글"};
+                    CHECK(wl_columnar_batch_payload_resolve_string(reader,
+                        lanes[5], &word) == OK && !strcmp(word,
+                        words[(id+1)%3]));
+                    seen[id] = true; total++;
+                }
+                wl_columnar_batch_payload_reader_release(reader);
+                CHECK(wl_columnar_batch_payload_release(out) == OK);
+            }
+            if (step == WL_COLUMNAR_CONTINUATION_DONE) break;
+        }
+        CHECK(total == 2*chunk+1 && peak <= limit && peak > before+scratch);
+        wl_columnar_continuation_destroy(join); CHECK(reserved(g) == before);
+    }
+    wl_columnar_trace_store_snapshot_release(ss);
+    wl_columnar_trace_store_retire(t);
+    CHECK(wl_columnar_batch_payload_release(delta) == OK);
+    col_rel_destroy(held[0]); col_rel_destroy(held[1]);
+    wl_columnar_spill_store_retire(store); wl_intern_free(intern);
+    CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+    return scratch;
+}
+static void reference_intern_floor(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(65536);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    wl_columnar_spill_store_t *store;
+    CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 20, 64,
+        &store) == OK);
+    col_rel_t *r = reference_history(g, intern, 0, 128, 1, true);
+    wirelog_column_t columns[2]; reference_columns(r, intern, columns);
+    wl_columnar_trace_store_t *t;
+    CHECK(wl_columnar_trace_store_create_reference(g, r->column_types, 3,
+        columns, 2, intern, &t) == OK);
+    CHECK(wl_columnar_trace_store_append_capture_reference(t, r, columns, 2,
+        intern, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT, store, NULL, NULL) == OK);
+    col_rel_destroy(r); uint64_t resident = reserved(g);
+    CHECK(wl_columnar_trace_store_demote(t, 0, store, NULL, NULL) == OK);
+    CHECK(reserved(g) + 128*3*8 < resident);
+    wl_columnar_trace_store_snapshot_t *ss = snapshot(t);
+    wl_columnar_trace_store_cursor_t *cursor;
+    CHECK(wl_columnar_trace_store_cursor_acquire(ss, &cursor) == OK);
+    const uint64_t *lanes; wl_columnar_spill_metadata_t meta;
+    CHECK(wl_columnar_trace_store_cursor_read(cursor, 0, NULL, NULL, &lanes,
+        &meta) == OK);
+    col_rel_t *probe;
+    CHECK(wl_columnar_relation_new_auto_governed("intern_floor_denied", 3, 1024,
+        true, g, &probe) == 0);
+    col_rel_destroy(probe);
+    uint64_t floor = reserved(g), previous = floor;
+    unsigned count = 0;
+    for (; count < 10000; count++) {
+        char word[512]; memset(word, 'x', sizeof(word));
+        CHECK(snprintf(word, 32, "distinct-%u", count) > 0);
+        size_t prefix = strlen(word); word[prefix] = '-';
+        word[sizeof(word)-1] = 0;
+        uint64_t before = reserved(g);
+        int64_t id;
+        int put = wl_intern_put_checked(intern, word, &id);
+        if (put) {
+            CHECK(put == WL_INTERN_ERR_MEMORY_BUDGET && id == -1 &&
+                wl_intern_get(intern, word) == -1 && reserved(g) == before);
+            break;
+        }
+        CHECK(reserved(g) > previous); previous = reserved(g);
+    }
+    CHECK(count > 10 && count < 10000 &&
+        reserved(g) >= floor + (uint64_t)count * 512);
+    /* Rows are already spilled; growing distinct intern storage is not credited
+     * as reclaimable row memory. Genuine source allocation must now refuse. */
+    uint64_t full_floor = reserved(g);
+    col_rel_t *denied = NULL;
+    CHECK(wl_columnar_relation_new_auto_governed("intern_floor_denied", 3, 1024,
+        true, g, &denied) == ENOSPC && !denied && reserved(g) == full_floor);
+    CHECK(wl_columnar_trace_store_snapshot_state(ss).rows == 128);
+    CHECK(wl_columnar_trace_store_cursor_read(cursor, 127, NULL, NULL, &lanes,
+        &meta) == OK);
+    const char *word;
+    CHECK(wl_columnar_trace_store_cursor_resolve_string(cursor, lanes[0],
+        &word) == OK && !strcmp(word, "alpha"));
+    wl_columnar_trace_store_snapshot_release(ss);
+    wl_columnar_trace_store_retire(t); wl_intern_free(intern);
+    CHECK(wl_columnar_trace_store_cursor_read(cursor, 0, NULL, NULL, &lanes,
+        &meta) == OK);
+    wl_columnar_trace_store_cursor_release(cursor);
+    wl_columnar_spill_store_retire(store);
+    CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+}
+
+static void numeric_trace_references_refused(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(1 << 20);
+    wl_intern_t *intern = wl_intern_create();
+    CHECK(intern && wl_intern_attach_memory_governor(intern, g) == 0);
+    CHECK(wl_intern_put(intern, "unary") == 0);
+    col_rel_t *plain = source(1, 2);
+    wl_columnar_trace_store_t *nt = segmented(g, NULL, plain, 1, 0);
+    wl_columnar_trace_store_snapshot_t *ns = snapshot(nt);
+    wl_columnar_batch_payload_t *np = capture(g, NULL, plain, 0);
+    col_rel_destroy(plain);
+    for (unsigned inlined = 0; inlined < 2; inlined++) for (unsigned empty = 0;
+            empty < 2; empty++){
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64,
+                                             inlined ? WIRELOG_TYPE_INT64 :
+                                             WIRELOG_TYPE_STRING};
+            wirelog_column_t columns[] = {{.type = WIRELOG_TYPE_INT64},
+                                          {.type = WIRELOG_TYPE_INT64,
+                                           .compound_kind =
+                                               WIRELOG_COMPOUND_KIND_INLINE,
+                                           .compound_arity = 1,
+                                           .compound_inline_col_offset = 1}};
+            wl_columnar_trace_store_t *rt;
+            CHECK(wl_columnar_trace_store_create_reference(g, types, 2,
+                inlined ? columns : NULL,
+                inlined ? 2 : 0, intern, &rt) == OK);
+            if (!empty) {
+                col_rel_t *r;
+                CHECK(wl_columnar_relation_new_auto_governed("reference_guard",
+                    2, 1, false, g, &r) == 0);
+                CHECK(col_rel_set_column_types(r, types, 2) == 0);
+                if (inlined) {
+                    const col_rel_logical_col_t layout[] =
+                    {{WIRELOG_COMPOUND_KIND_NONE, 0, 0},
+                     {WIRELOG_COMPOUND_KIND_INLINE, 1, 1}};
+                    CHECK(col_rel_apply_compound_schema(r, layout, 2) == 0);
+                }
+                int64_t values[] = {7, 0};
+                CHECK(col_rel_append_row(r, values) == 0);
+                CHECK(wl_columnar_trace_store_append_capture_reference(rt, r,
+                    inlined ? columns : NULL,
+                    inlined ? 2 : 0, intern, WL_COLUMNAR_BATCH_PAYLOAD_RESIDENT,
+                    NULL, NULL, NULL) == OK);
+                col_rel_destroy(r);
+            }
+            wl_columnar_trace_store_snapshot_t *rs = snapshot(rt);
+            uint64_t before = reserved(g);
+            wl_columnar_continuation_t *join = (void *)1;
+            for (unsigned side = 0; side < 2; side++) {
+                CHECK(wl_columnar_payload_join_create_trace_bounded(g,
+                    side ? ns : rs, side ? rs : ns,
+                    0, 0, 32, index_cap(1), NULL, NULL,
+                    &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+                CHECK(wl_columnar_payload_join_create_weighted_trace_bounded(g,
+                    side ? ns : rs, side ? rs : ns,
+                    0, 0, 32, index_cap(1), NULL, NULL,
+                    &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+            }
+            CHECK(wl_columnar_payload_join_create_delta_trace_bounded(g, np, rs,
+                0, 0, 32,
+                index_cap(1), NULL, NULL,
+                &join) == WL_COLUMNAR_SPILL_UNSUPPORTED && !join);
+            CHECK(reserved(g) == before);
+            wl_columnar_trace_store_snapshot_release(rs);
+            wl_columnar_trace_store_retire(rt);
+        }
+    wl_columnar_trace_store_snapshot_release(ns);
+    wl_columnar_trace_store_retire(nt);
+    CHECK(wl_columnar_batch_payload_release(np) == OK); wl_intern_free(intern);
+    CHECK(reserved(g) == 0); wl_columnar_memory_governor_ref_release(g);
+}
+
 int main(void)
 {
+    CHECK(reference_causal_budget(128, false) == reference_causal_budget(512,
+        false));
+    reference_causal_budget(512, true); reference_intern_floor();
+    reference_signed_late_failures();
+    reference_signed_generations(); reference_signed_errors();
+    reference_trace_joins(); reference_trace_retirement();
+    reference_trace_numeric_inline();
+    numeric_trace_references_refused();
     trace_partial_overflow(); trace_progress_and_floor();
     trace_generations(); trace_signed_errors();
     CHECK(trace_causal_budget(128, false) == trace_causal_budget(512, false));

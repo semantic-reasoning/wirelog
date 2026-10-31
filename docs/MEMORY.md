@@ -5106,8 +5106,9 @@ does not make the spill store's lifecycle globally thread-safe.
 
 This storage/scan contract does not automatically migrate session relations or
 legacy differential arrangements.
-STRING/INLINE/SIDE/nested provenance, general logical time, mutable-session
-routing and #1373 scheduling remain outside this numeric trace owner.
+Legacy numeric entrypoints reject STRING and compound provenance. Explicit
+reference-owned storage is described below. SIDE/nested, general logical time,
+mutable-session routing and #1373 scheduling remain outside these owners.
 
 The indexed payload JOIN engine also accepts two numeric trace snapshots through
 `wl_columnar_payload_join_create_trace_bounded`. Existing payload constructors,
@@ -5118,6 +5119,109 @@ reader at a time. The same capped right-row index, output batches and 256-action
 publication quantum apply across segment boundaries. Ordinary trace JOIN checks
 all rows for +1 multiplicity before publication. Retiring a trace owner preserves these consumers,
 but retiring its external store may yield CLOSED on later lazy acquisitions.
+
+### Reference-owned trace storage (#1372, internal)
+
+`wl_columnar_trace_store_create_reference` accepts scalar STRING schemas or a
+complete declared flat INLINE schema with the originating governed intern table.
+It copies name-less semantic declarations into aligned, governed owner storage.
+The owner holds an intern pin even with no segments and for numeric-only INLINE
+functors. Physical types, declaration padding, nodes and snapshot directories
+are explicit resident floors; the retained intern vocabulary is additional.
+
+Reference append APIs require the same originating table and semantic declaration
+as the owner. Every source lane and layout is validated before publication or
+retirement, including unused STRING fields. The caller still guarantees that raw
+IDs really originate in the supplied table; equal integers cannot prove origin.
+SIDE, graph and nested handles remain unsupported. Signed weights and zero
+iteration/stratum/worker/reserved coordinates retain their existing contract.
+
+Additive `batch_payload_take_with_intern` and `take_with_inline` use the existing
+capture plus checked-retirement transaction. Exclusive governed heap sources
+are cleared only after all fallible work succeeds. Source-reader BUSY, private
+write/capacity/cancel/allocation failures preserve source and prior trace state.
+Reference trace take and unpinned demotion physically release resident rows;
+numeric capture/take still refuse reference owners. Session registry sealing
+retains its own authority and is not redirected to exclusive-owner take.
+
+Existing reference snapshots/cursors reuse retained intern capability after the
+intern owner retires, including lazy segment switches while the spill store is
+open. Cursor string resolution returns text valid through that cursor's release.
+New reference owners, append and demotion need fresh pin admission and return
+CLOSED after intern retirement; an owner pin never reopens admission. External
+spill-store retirement separately closes later lazy readers. The same per-trace
+transition lock and explicit lifecycle/cross-owner serialization rules apply.
+
+Tests cover empty and numeric-only INLINE pins, Unicode/empty strings, odd-width
+aligned multi-group declarations, capture/take/demotion, exact signed records,
+old/new boundaries, source/provenance refusal, late faults and same-trace
+concurrent lazy transitions. Existing numeric trace JOIN factories audit every
+lane and INLINE declaration, including non-key and empty references, and refuse
+these owners before publication. Reference storage alone does not widen legacy consumers.
+
+`wl_columnar_payload_join_create_reference_trace_projected_bounded` explicitly
+consumes two reference snapshots through the existing common capped JOIN engine.
+Both keys must be INT64 or both STRING. The supplied originating intern must
+match every STRING-bearing or INLINE input, including non-key and projected-away
+fields and numeric-only INLINE functors. Complete-input ordinary multiplicity
+validation still requires +1 at zero coordinates. Payload and snapshot sources
+share schema/provenance validation; old payload factories retain eager readers.
+
+Direct projections can omit keys, duplicate or reorder flattened physical lanes.
+Output is scalar, without source INLINE arity maps. Each cursor retains its
+snapshot boundary and owner capability across lazy segment changes; callers may
+release snapshots and retire trace owners after construction. Existing reference
+snapshots can construct and run producers after intern owner retirement, while
+external stores must remain open for future lazy segment acquisitions.
+
+Pending STRING output borrows the producer's retained capability. A sink retaining
+independent output must capture its own intern pin before acknowledgement and
+before intern owner retirement. After intern retirement that capture fails CLOSED;
+the pending batch remains frozen and its borrowed IDs remain readable until
+producer disposal. Retrying a frozen output does not reread segments. Successfully
+captured output survives producer/input/intern-owner disposal through its own pin.
+These are explicit internal consumers, with no automatic mutable-session routing.
+
+### Signed reference consumers and memory floor (#1372, internal)
+
+`wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded`
+accepts two immutable reference snapshots;
+`wl_columnar_payload_join_create_reference_delta_trace_projected_bounded` accepts
+an eagerly pinned reference delta payload and a lazy trace snapshot. Both reuse
+the same complete provenance/schema validation, bounded window index and direct
+scalar projection engine. All logical coordinates must be zero; arbitrary signed
+int64 weights, including zero, emit checked matching products without consolidation.
+Overflow discards only the current private batch; earlier acknowledged output
+remains independently owned. Pending output and fresh intern-pin admission retain
+the ordinary reference consumer contracts above. These APIs do not route legacy
+differential arrangements, which retain their existing metadata semantics.
+
+Tests interleave producers pinned before and after insertion, full cancellation
+and reinsertion, comparing resolved strings, types, exact contributions and
+independent weighted state sums. Both snapshot and delta variants cover MIN/MAX/zero
+weights, nonmatching overflow avoidance, complete nonmatching logical-time refusal,
+late I/O/cancel/store closure, frozen retries and private-batch overflow versus
+previously acknowledged output. Direct projections retain scalar output semantics.
+
+The reference causal fixture uses the same 65,536-byte allowance, four-string
+vocabulary, three segments, schema/history, 127-row index cap and 256-row output
+capacity. Keeping both original 512-row governed sources causes genuine JOIN
+admission failure; reference take frees those allocations and permits the full
+signed JOIN plus independently pinned output capture/readers within the same
+allowance. Fixed vocabulary/segment/cap comparisons at 128 and 512 rows per source
+show equal producer/reader/index scratch, separately from retained outputs and
+O(segments) metadata. Existing legacy allowances are unchanged.
+
+A separate fixture first spills rows, then grows distinct intern strings. An
+identical governed source allocation admitted before vocabulary growth is denied
+after it; failed intern growth and source admission preserve earlier snapshots,
+resolvable strings and credits. Intern growth may need replacement-allocation
+headroom as well as its retained floor. Spilling rows does not reclaim intern
+strings retained by live owners, so no general out-of-core guarantee follows from
+successful row transfer. Owner/declaration/node/directory, output and intern floors
+remain additional to the explicit index/batch caps. Automatic mutable-session and
+differential routing, general logical time, SIDE/nested values and scheduling
+remain follow-up work; this group does not close #1372.
 
 ### Signed trace and delta consumption (#1372, internal)
 
