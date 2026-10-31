@@ -158,6 +158,31 @@ wl_columnar_payload_join_create_reference_trace_projected_bounded(
     uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
     const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
     void *cancel_context, wl_columnar_continuation_t **out);
+/* Explicit signed reference snapshot and delta-payload/snapshot JOINs. Same
+ * reference/projection/capability contract as the ordinary snapshot factory,
+ * but all int64 multiplicities at zero coordinates are accepted. Each match
+ * emits a checked product, including zero, without consolidation. Overflow
+ * discards the current private batch; already acknowledged output survives.
+ * Delta payload readers are eager; trace cursors retain immutable generations.
+ * Neither factory routes legacy differential arrangements or mutable sessions. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_delta_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_batch_payload_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out);
 /* Explicit zero-coordinate signed trace JOINs. The weighted snapshot variant
  * accepts two immutable trace prefixes; delta_trace accepts a numeric payload
  * on the left and a trace snapshot on the right. The delta reader is acquired
