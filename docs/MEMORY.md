@@ -5182,6 +5182,47 @@ producer disposal. Retrying a frozen output does not reread segments. Successful
 captured output survives producer/input/intern-owner disposal through its own pin.
 These are explicit internal consumers, with no automatic mutable-session routing.
 
+### Signed reference consumers and memory floor (#1372, internal)
+
+`wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded`
+accepts two immutable reference snapshots;
+`wl_columnar_payload_join_create_reference_delta_trace_projected_bounded` accepts
+an eagerly pinned reference delta payload and a lazy trace snapshot. Both reuse
+the same complete provenance/schema validation, bounded window index and direct
+scalar projection engine. All logical coordinates must be zero; arbitrary signed
+int64 weights, including zero, emit checked matching products without consolidation.
+Overflow discards only the current private batch; earlier acknowledged output
+remains independently owned. Pending output and fresh intern-pin admission retain
+the ordinary reference consumer contracts above. These APIs do not route legacy
+differential arrangements, which retain their existing metadata semantics.
+
+Tests interleave producers pinned before and after insertion, full cancellation
+and reinsertion, comparing resolved strings, types, exact contributions and
+independent weighted state sums. Both snapshot and delta variants cover MIN/MAX/zero
+weights, nonmatching overflow avoidance, complete nonmatching logical-time refusal,
+late I/O/cancel/store closure, frozen retries and private-batch overflow versus
+previously acknowledged output. Direct projections retain scalar output semantics.
+
+The reference causal fixture uses the same 65,536-byte allowance, four-string
+vocabulary, three segments, schema/history, 127-row index cap and 256-row output
+capacity. Keeping both original 512-row governed sources causes genuine JOIN
+admission failure; reference take frees those allocations and permits the full
+signed JOIN plus independently pinned output capture/readers within the same
+allowance. Fixed vocabulary/segment/cap comparisons at 128 and 512 rows per source
+show equal producer/reader/index scratch, separately from retained outputs and
+O(segments) metadata. Existing legacy allowances are unchanged.
+
+A separate fixture first spills rows, then grows distinct intern strings. An
+identical governed source allocation admitted before vocabulary growth is denied
+after it; failed intern growth and source admission preserve earlier snapshots,
+resolvable strings and credits. Intern growth may need replacement-allocation
+headroom as well as its retained floor. Spilling rows does not reclaim intern
+strings retained by live owners, so no general out-of-core guarantee follows from
+successful row transfer. Owner/declaration/node/directory, output and intern floors
+remain additional to the explicit index/batch caps. Automatic mutable-session and
+differential routing, general logical time, SIDE/nested values and scheduling
+remain follow-up work; this group does not close #1372.
+
 ### Signed trace and delta consumption (#1372, internal)
 
 `wl_columnar_payload_join_create_weighted_trace_bounded` joins two snapshot

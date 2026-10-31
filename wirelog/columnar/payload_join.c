@@ -660,6 +660,40 @@ wl_columnar_payload_join_create_reference_trace_projected_bounded(
 }
 
 wl_columnar_spill_status_t
+wl_columnar_payload_join_create_weighted_reference_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_trace_store_snapshot_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.snapshot = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               true, index_bytes, projection, project_count, intern);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_reference_delta_trace_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_batch_payload_t *left,
+    wl_columnar_trace_store_snapshot_t *right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *cancel_context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g,
+               (wl_columnar_payload_join_source_t){.payload = left},
+               (wl_columnar_payload_join_source_t){.snapshot = right}, left_key,
+               right_key, batch_bytes, cancel, cancel_context, out, true,
+               true, index_bytes, projection, project_count, intern);
+}
+
+wl_columnar_spill_status_t
 wl_columnar_payload_join_create_weighted_trace_bounded(
     wl_columnar_memory_governor_ref_t *g,
     wl_columnar_trace_store_snapshot_t *left,
