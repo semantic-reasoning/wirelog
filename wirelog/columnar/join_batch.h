@@ -130,6 +130,22 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     const uint32_t *lk, const uint32_t *rk, uint32_t kc,
     uint64_t batch_bytes, wl_columnar_continuation_t **out);
 
+/* As col_join_batch_producer_create, over the explicit relation @right
+ * instead of the one registered under @op->right_relation (#2201): the
+ * producer never looks a relation up by name.  It holds a source reader
+ * on @right, admits the bytes col_arrangement_owned_bytes gives for
+ * @right's rows under the producer's governor, and builds its own index
+ * over @right, keyed by @rk; it pins no registry arrangement.  Destroy or
+ * cancel frees the index, then returns its admission, then the reader.
+ * Returns as col_join_batch_producer_create, with EINVAL for a NULL
+ * @right and EBUSY when @right is write-locked; nothing is left reserved
+ * or held on failure. */
+int
+col_join_batch_producer_create_over(wl_col_session_t *sess,
+    const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
+    const col_rel_t *right, const uint32_t *lk, const uint32_t *rk,
+    uint32_t kc, uint64_t batch_bytes, wl_columnar_continuation_t **out);
+
 /* The MAXIMUM rows per batch the producer settled on; 0 for a NULL
  * continuation.  An emitted batch can be shorter: since #1481 the scratch
  * grows on demand, and a grow the governor refuses is answered with a short
@@ -147,6 +163,12 @@ col_join_batch_scratch_capacity(const wl_columnar_continuation_t *cont);
  * continuation.  Test surface for the per-producer bound (#1370). */
 uint64_t
 col_join_batch_descriptor_bytes(const wl_columnar_continuation_t *cont);
+
+/* The bytes of the index a producer created over an explicit right
+ * relation owns while it lives, as col_arrangement_owned_bytes gives them
+ * (#2201); 0 for any other producer, after cancel, or for NULL. */
+uint64_t
+col_join_batch_index_bytes(const wl_columnar_continuation_t *cont);
 
 /* Copy of the producer's full cursor for tests and diagnostics. */
 bool

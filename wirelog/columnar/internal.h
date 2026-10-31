@@ -3602,6 +3602,20 @@ col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
     return true;
 }
 
+/* A hash index a caller owns over an explicit relation (#2201).
+ * col_arrangement_owned_bytes gives the bytes a build over @nrows rows
+ * allocates (EOVERFLOW for a count the builder refuses), so the caller can
+ * admit them first.  col_arrangement_build_owned builds a zeroed @arr with
+ * no ledger or governor over all of @rel's rows, keyed by @key_cols (which
+ * it borrows, not owns), and checks that the build allocated exactly
+ * that; col_arrangement_owned_release frees the tables. */
+int
+col_arrangement_owned_bytes(uint32_t nrows, uint64_t *bytes);
+int
+col_arrangement_build_owned(col_arrangement_t *arr, const col_rel_t *rel,
+    uint32_t *key_cols, uint32_t key_count);
+void
+col_arrangement_owned_release(col_arrangement_t *arr);
 /* True when the first relation named @name in @session's relation array --
  * the one a pin by name finds -- is @source. */
 bool
