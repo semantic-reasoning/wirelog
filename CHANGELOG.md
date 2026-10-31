@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Reference trace snapshots support bounded projected INT64/STRING-key JOINs
+  through the common production engine, retaining INLINE provenance and pending
+  output capabilities across lazy segment changes and owner retirement (#1372).
+
 - Explicit STRING/flat INLINE trace owners retain intern and declaration
   capabilities across source transfer and snapshot reads; numeric JOIN factories
   continue rejecting reference-bearing snapshots, including empty inputs (#1372).

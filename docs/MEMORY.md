@@ -5157,8 +5157,30 @@ aligned multi-group declarations, capture/take/demotion, exact signed records,
 old/new boundaries, source/provenance refusal, late faults and same-trace
 concurrent lazy transitions. Existing numeric trace JOIN factories audit every
 lane and INLINE declaration, including non-key and empty references, and refuse
-these owners before publication. Explicit reference JOIN acceptance is a later
-unit of this functional group; reference storage alone does not widen consumers.
+these owners before publication. Reference storage alone does not widen legacy consumers.
+
+`wl_columnar_payload_join_create_reference_trace_projected_bounded` explicitly
+consumes two reference snapshots through the existing common capped JOIN engine.
+Both keys must be INT64 or both STRING. The supplied originating intern must
+match every STRING-bearing or INLINE input, including non-key and projected-away
+fields and numeric-only INLINE functors. Complete-input ordinary multiplicity
+validation still requires +1 at zero coordinates. Payload and snapshot sources
+share schema/provenance validation; old payload factories retain eager readers.
+
+Direct projections can omit keys, duplicate or reorder flattened physical lanes.
+Output is scalar, without source INLINE arity maps. Each cursor retains its
+snapshot boundary and owner capability across lazy segment changes; callers may
+release snapshots and retire trace owners after construction. Existing reference
+snapshots can construct and run producers after intern owner retirement, while
+external stores must remain open for future lazy segment acquisitions.
+
+Pending STRING output borrows the producer's retained capability. A sink retaining
+independent output must capture its own intern pin before acknowledgement and
+before intern owner retirement. After intern retirement that capture fails CLOSED;
+the pending batch remains frozen and its borrowed IDs remain readable until
+producer disposal. Retrying a frozen output does not reread segments. Successfully
+captured output survives producer/input/intern-owner disposal through its own pin.
+These are explicit internal consumers, with no automatic mutable-session routing.
 
 ### Signed trace and delta consumption (#1372, internal)
 
