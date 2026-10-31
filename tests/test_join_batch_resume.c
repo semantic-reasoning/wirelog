@@ -3854,15 +3854,27 @@ test_eligibility_ordering(void)
         == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
     ok = ok && col_join_batch_eligibility(sess, 1, false, true)
         == COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
+    /* A worker session follows the same order, and is eligible otherwise
+     * (#2201). */
     sess->coordinator = sess;
-    /* Worker sessions take precedence over every keyed/cross and
-     * right-shape exclusion. */
+    ok = ok && col_join_batch_eligibility(sess, 0, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
+    ok = ok && col_join_batch_eligibility(sess, 1, true, true)
+        == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, false)
+        == COL_JOIN_BATCH_ELIGIBLE;
+    /* A run that resolves its operands by input slot takes precedence over
+     * every keyed/cross and right-shape exclusion. */
+    sess->tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
     ok = ok && col_join_batch_eligibility(sess, 0, false, false)
         == COL_JOIN_BATCH_EXCLUDED_WORKER;
     ok = ok && col_join_batch_eligibility(sess, 0, true, true)
         == COL_JOIN_BATCH_EXCLUDED_WORKER;
     ok = ok && col_join_batch_eligibility(sess, 1, true, true)
         == COL_JOIN_BATCH_EXCLUDED_WORKER;
+    ok = ok && col_join_batch_eligibility(sess, 1, false, false)
+        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+    sess->tdd_input_run = NULL;
     sess->coordinator = NULL;
     /* Cross joins are checked before either right-side exclusion. */
     ok = ok && col_join_batch_eligibility(sess, 0, true, true)
@@ -5182,24 +5194,86 @@ test_existence_join_nonempty_nullary_cleanup(void)
         FAIL("existence join nullary refusal, result or reuse mismatch");
 }
 
+/* #2201: both producers pin the right arrangement by name, by a scan of
+ * the session's relations, while the JOIN resolves its right operand
+ * through the relation hash.  Should the two ever name different
+ * relations, the producers refuse with ENOENT, as for an unavailable
+ * arrangement, before taking any reservation or pin, instead of pinning
+ * the arrangement of another relation. */
+static void
+test_join_batch_refuses_shadowed_right(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    col_rel_t *shadow = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline;
+    bool ok;
+
+    TEST("bounded producers refuse a right name bound to another relation");
+    ok = fixture_init(&f, 1u << 24, keys, 2, 2, 2);
+    shadow = ok ? make_right_named("shadow", 2, 1) : NULL;
+    ok = ok && shadow && session_add_rel(f.sess, shadow) == 0;
+    if (!ok) {
+        if (shadow && !ok)
+            col_rel_destroy(shadow);
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    /* Give the later relation the right operand's name and rebuild the
+     * hash: the hash chain answers with the later relation, the scan with
+     * the earlier one. */
+    ok = wl_columnar_relation_rename_checked(shadow, "right") == 0;
+    session_rel_free_hash(f.sess);
+    ok = ok && session_rel_build_hash(f.sess) == 0
+        && session_find_rel(f.sess, "right") == shadow;
+    if (!ok) {
+        FAIL("could not shadow the right name");
+        fixture_fini(&f);
+        return;
+    }
+    baseline = reserved_of(f.sess);
+    ok = col_join_batch_producer_create(f.sess, &f.op, f.left, false, KEY0,
+            KEY0, 1, 4096, &cont) == ENOENT && cont == NULL;
+    ok = ok && col_diff_join_batch_producer_create(f.sess, &f.op, f.left,
+            false, KEY0, KEY0, 1, 4096, &cont) == ENOENT && cont == NULL;
+    for (uint32_t i = 0; ok && i < f.sess->arr_count; i++)
+        ok = f.sess->arr_entries[i].pin_count == 0;
+    ok = ok && reserved_of(f.sess) == baseline;
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("a producer accepted a shadowed right name or kept state");
+}
+
 static void
 test_join_batch_eligibility_order(void)
 {
     wl_col_session_t session;
     wl_col_session_t worker;
+    wl_col_session_t slot_run;
 
     TEST("bounded join eligibility has deterministic exclusion ordering");
     memset(&session, 0, sizeof(session));
     memset(&worker, 0, sizeof(worker));
+    memset(&slot_run, 0, sizeof(slot_run));
     session.join_batch_bytes = 4096;
     worker.join_batch_bytes = 4096;
     worker.coordinator = &session;
+    slot_run = worker;
+    slot_run.tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
     if (col_join_batch_eligibility(NULL, 1, true, true)
         != COL_JOIN_BATCH_EXCLUDED_OFF
         || col_join_batch_eligibility(&session, 0, true, true)
         != COL_JOIN_BATCH_EXCLUDED_CROSS
-        || col_join_batch_eligibility(&worker, 1, true, true)
+        || col_join_batch_eligibility(&slot_run, 1, true, true)
         != COL_JOIN_BATCH_EXCLUDED_WORKER
+        || col_join_batch_eligibility(&worker, 1, false, false)
+        != COL_JOIN_BATCH_ELIGIBLE
         || col_join_batch_eligibility(&session, 1, true, true)
         != COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT
         || col_join_batch_eligibility(&session, 1, false, true)
@@ -7207,6 +7281,7 @@ main(void)
     test_diff_nonempty_nullary_left_cleanup();
     test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
+    test_join_batch_refuses_shadowed_right();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
     test_sink_prepare_resize_failure();

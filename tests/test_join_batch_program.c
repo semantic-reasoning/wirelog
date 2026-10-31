@@ -145,6 +145,17 @@ oracle_two_hop(const edges_t *e, pairs_t *out)
                 pairs_add(out, e->from[i], e->to[j]);
 }
 
+/* hop(x, z) :- edge(x, y), edge(y, z), z != 7, as a set. */
+static void
+oracle_two_hop_filtered(const edges_t *e, pairs_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    for (uint32_t i = 0; i < e->n; i++)
+        for (uint32_t j = 0; j < e->n; j++)
+            if (e->to[i] == e->from[j] && e->to[j] != 7)
+                pairs_add(out, e->from[i], e->to[j]);
+}
+
 /* The transitive closure of edge, by repeated two-hop extension. */
 static void
 oracle_closure(const edges_t *e, pairs_t *out)
@@ -245,6 +256,7 @@ typedef struct {
     uint32_t fallbacks;
     uint8_t reason;
     uint32_t routes; /* insert routes taken by this snapshot */
+    uint16_t warned; /* reasons warned about, folded from workers too */
     /* bounded producer runs by route: the session's own, and its workers' */
     uint32_t runs[COL_JOIN_BATCH_RUN_ROUTES];
     uint32_t worker_runs[COL_JOIN_BATCH_RUN_ROUTES];
@@ -324,6 +336,7 @@ snapshot(wl_session_t *s, const char *relation, outcome_t *out)
     out->got.relation = relation;
     COL_SESSION(s)->join_batch_fallback_count = 0;
     COL_SESSION(s)->join_batch_last_reason = 0;
+    COL_SESSION(s)->join_batch_warned_reasons = 0;
     memset(COL_SESSION(s)->join_batch_runs, 0,
         sizeof(COL_SESSION(s)->join_batch_runs));
     memset(COL_SESSION(s)->join_batch_worker_runs, 0,
@@ -331,12 +344,17 @@ snapshot(wl_session_t *s, const char *relation, outcome_t *out)
     out->rc = wl_session_snapshot(s, collect, &out->got);
     out->fallbacks = COL_SESSION(s)->join_batch_fallback_count;
     out->reason = COL_SESSION(s)->join_batch_last_reason;
+    out->warned = COL_SESSION(s)->join_batch_warned_reasons;
     memcpy(out->runs, COL_SESSION(s)->join_batch_runs, sizeof(out->runs));
     memcpy(out->worker_runs, COL_SESSION(s)->join_batch_worker_runs,
         sizeof(out->worker_runs));
 
     out->routes = wl_columnar_session_test_insert_route_taken - routes;
 }
+
+/* The warned-reasons bit of worker-session, which a worker's teardown
+ * folds into the session whatever reason it recorded last. */
+#define WARNED_WORKER ((uint16_t)(1u << COL_JOIN_BATCH_EXCLUDED_WORKER))
 
 /* Route bits for expect_t's run masks (#2201). */
 #define RUN_ORD (1u << COL_JOIN_BATCH_RUN_ORDINARY)
@@ -345,10 +363,11 @@ snapshot(wl_session_t *s, const char *relation, outcome_t *out)
 
 /* What one snapshot must show: its rc, whether its rows must equal the
  * oracle, the last recorded reason (ELIGIBLE: nothing recorded;
- * REASON_COUNT: not checked), whether it took the insert route, the
- * routes on which the session itself must have completed a bounded run
- * (0: not checked), and the routes on which its workers must have (0: no
- * worker completed one on any route). */
+ * REASON_COUNT: not checked), whether it took the insert route, and
+ * exactly the routes on which the session itself, and its workers,
+ * completed a bounded run: each listed route nonzero, each other zero.
+ * When workers must have completed runs, no worker may have recorded
+ * worker-session either. */
 typedef struct {
     int rc;
     bool exact;
@@ -358,17 +377,13 @@ typedef struct {
     unsigned workers;
 } expect_t;
 
-/* True when every route in @mask has a nonzero count in @runs, and, for
- * @all_zero_if_empty with an empty @mask, every count is zero. */
+/* True when exactly the routes in @mask have a nonzero count in @runs. */
 static bool
-runs_match(const uint32_t *runs, unsigned mask, bool all_zero_if_empty)
+runs_match(const uint32_t *runs, unsigned mask)
 {
-    for (unsigned r = 0; r < COL_JOIN_BATCH_RUN_ROUTES; r++) {
-        if ((mask & (1u << r)) && runs[r] == 0)
+    for (unsigned r = 0; r < COL_JOIN_BATCH_RUN_ROUTES; r++)
+        if (((mask & (1u << r)) != 0) != (runs[r] != 0))
             return false;
-        if (!mask && all_zero_if_empty && runs[r] != 0)
-            return false;
-    }
     return true;
 }
 
@@ -383,17 +398,18 @@ check(const char *label, const outcome_t *o, const expect_t *want,
         ? o->fallbacks == 0
         : (o->fallbacks > 0 && o->reason == (uint8_t)want->reason)))
         && (o->routes != 0) == want->route
-        && runs_match(o->runs, want->own, false)
-        && runs_match(o->worker_runs, want->workers, true);
+        && runs_match(o->runs, want->own)
+        && runs_match(o->worker_runs, want->workers)
+        && (want->workers == 0 || (o->warned & WARNED_WORKER) == 0);
 
     if (!ok)
         printf("\n    %s: rc=%d rows=%u dup=%u fallbacks=%u reason=%s "
-            "route=%u runs=%u/%u/%u worker runs=%u/%u/%u", label, o->rc,
-            o->got.rows.count, o->got.duplicates, o->fallbacks,
-            col_join_batch_eligibility_name(
+            "route=%u runs=%u/%u/%u worker runs=%u/%u/%u warned=%#x",
+            label, o->rc, o->got.rows.count, o->got.duplicates,
+            o->fallbacks, col_join_batch_eligibility_name(
                 (col_join_batch_eligibility_t)o->reason), o->routes,
             o->runs[0], o->runs[1], o->runs[2], o->worker_runs[0],
-            o->worker_runs[1], o->worker_runs[2]);
+            o->worker_runs[1], o->worker_runs[2], (unsigned)o->warned);
     return ok;
 }
 
@@ -404,11 +420,26 @@ static const char *TWO_HOP =
     ".decl hop(x: int64, z: int64)\n"
     "hop(x, z) :- edge(x, y), edge(y, z).\n";
 
+/* The two-hop rule with a row-local FILTER after the JOIN, which the fused
+ * JOIN pipeline consumes. */
+static const char *TWO_HOP_FILTERED =
+    ".decl edge(x: int64, y: int64)\n"
+    ".decl hop(x: int64, z: int64)\n"
+    "hop(x, z) :- edge(x, y), edge(y, z), z != 7.\n";
+
 static const char *CLOSURE =
     ".decl edge(x: int64, y: int64)\n"
     ".decl path(x: int64, y: int64)\n"
     "path(x, y) :- edge(x, y).\n"
     "path(x, z) :- path(x, y), edge(y, z).\n";
+
+/* The closure as a self-join of the recursive relation, which TDD evaluates
+ * with the bdx strategy where the linear closure takes owner. */
+static const char *CLOSURE_SELF_JOIN =
+    ".decl edge(x: int64, y: int64)\n"
+    ".decl path(x: int64, y: int64)\n"
+    "path(x, y) :- edge(x, y).\n"
+    "path(x, z) :- path(x, y), path(y, z).\n";
 
 /* A K = 4 recursive rule, which the default planner fuses. */
 static const char *FOUR_WAY =
@@ -472,9 +503,13 @@ run_case(const char *name, const char *src, const char *relation,
 
 /* After a snapshot fails with EOVERFLOW under the legacy row cap, past at
  * least one committed batch of the hub key's 301 matches, the session is
- * reusable: with the cap cleared the next snapshot is exact. */
+ * reusable: with the cap cleared the next snapshot is exact.  With
+ * @on_workers the stratum is split across four non-recursive workers,
+ * which share one output counter (#2201); when they overflow it, the
+ * parallel evaluation returns EAGAIN and the stratum is evaluated again on
+ * the calling session, which overflows the cap in turn. */
 static void
-run_reuse_after_overflow(void)
+run_reuse_after_overflow(bool on_workers)
 {
     static pairs_t oracle;
     static outcome_t o;
@@ -485,10 +520,14 @@ run_reuse_after_overflow(void)
     bool ok;
 
     tests_run++;
-    printf("  [%2d] two-hop, W=1, reuse after a capped snapshot", tests_run);
+    printf("  [%2d] two-hop%s, W=%u, reuse after a capped snapshot",
+        tests_run, on_workers ? " on parallel workers" : "",
+        on_workers ? 4u : 1u);
     set_mode(MODE_STRICT);
     setenv("WIRELOG_JOIN_OUTPUT_LIMIT", "100", 1);
-    s = open_session(TWO_HOP, 1, &plan, &prog);
+    if (on_workers)
+        setenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+    s = open_session(TWO_HOP, on_workers ? 4u : 1u, &plan, &prog);
     unsetenv("WIRELOG_JOIN_OUTPUT_LIMIT");
     edges_init(&e, false);
     ok = s && insert_edges(s, &e) == 0;
@@ -505,7 +544,8 @@ run_reuse_after_overflow(void)
     }
     if (ok) {
         const expect_t exact = {
-            0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
+            0, true, COL_JOIN_BATCH_ELIGIBLE, false,
+            on_workers ? 0u : RUN_ORD, on_workers ? RUN_ORD : 0u
         };
         COL_SESSION(s)->join_output_limit = 0;
         oracle_two_hop(&e, &oracle);
@@ -526,11 +566,15 @@ int
 main(void)
 {
     /* Nothing recorded, rows exact, and the calling session completed a
-     * bounded run: on the ordinary route for the two-hop rule, and on the
+     * bounded run: on the ordinary route for the two-hop rule, on the
+     * pipeline route for the filtered two-hop rule, and on the
      * differential route for the recursive closure; or the insert route,
-     * recorded, with no bounded run. */
+     * recorded, with no bounded run on any session. */
     const expect_t two_hop_bounded = {
         0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
+    };
+    const expect_t filtered_bounded = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_PIPE, 0
     };
     const expect_t closure_bounded = {
         0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_DIFF, 0
@@ -538,14 +582,27 @@ main(void)
     const expect_t routed = {
         0, true, COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE, true, 0, 0
     };
-    const expect_t in_workers = {
-        0, true, COL_JOIN_BATCH_EXCLUDED_WORKER, false, 0, 0
+    const expect_t four_way_rows = {
+        0, true, COL_JOIN_BATCH_REASON_COUNT, false, RUN_DIFF, 0
     };
-    const expect_t refused = {
-        ENOTSUP, false, COL_JOIN_BATCH_ELIGIBLE, false, 0, 0
+    /* On workers (#2201): nothing recorded and rows exact, and the workers
+     * completed bounded runs -- differential runs on TDD workers (from
+     * their second iteration on, a recursive worker evaluates its JOIN
+     * differentially; the calling session's own differential runs come
+     * from the rounds it evaluates itself), ordinary or pipeline runs on
+     * non-recursive workers.  The self-joined closure still records
+     * delta-right, an exclusion of its own, and no worker-session. */
+    const expect_t tdd_bounded = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_DIFF, RUN_DIFF
     };
-    const expect_t exact_only = {
-        0, true, COL_JOIN_BATCH_REASON_COUNT, false, 0, 0
+    const expect_t tdd_self_join = {
+        0, true, COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT, false, 0, RUN_DIFF
+    };
+    const expect_t parallel_bounded = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, 0, RUN_ORD
+    };
+    const expect_t parallel_pipeline = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, 0, RUN_PIPE
     };
     const uint32_t workers[] = { 1, 4 };
 
@@ -566,6 +623,12 @@ main(void)
             MODE_RECORD, &two_hop_bounded, &routed);
         run_case("two-hop", TWO_HOP, "hop", oracle_two_hop, workers[w],
             MODE_STRICT, &two_hop_bounded, &two_hop_bounded);
+        run_case("filtered two-hop", TWO_HOP_FILTERED, "hop",
+            oracle_two_hop_filtered, workers[w], MODE_RECORD,
+            &filtered_bounded, &routed);
+        run_case("filtered two-hop", TWO_HOP_FILTERED, "hop",
+            oracle_two_hop_filtered, workers[w], MODE_STRICT,
+            &filtered_bounded, &filtered_bounded);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
             MODE_RECORD, &closure_bounded, &routed);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
@@ -573,36 +636,50 @@ main(void)
         /* The four-way rule records several fallbacks (a JOIN feeding
          * another JOIN is pipeline-not-consumable, and its semi-naive
          * rounds read right deltas), so strict mode would refuse it and
-         * only its rows are checked.  The default planner fuses the rule;
+         * its reason is not checked.  The default planner fuses the rule;
          * with the knob set no K-Fusion branch session is cloned at any
          * worker count (#1382). */
         kfusion_clones = 0;
         check_no_clones = true;
         wl_columnar_kfusion_test_clone = count_kfusion_clone;
         run_case("four-way rule", FOUR_WAY, "r", oracle_four_way, workers[w],
-            MODE_RECORD, &exact_only, NULL);
+            MODE_RECORD, &four_way_rows, NULL);
         wl_columnar_kfusion_test_clone = NULL;
         check_no_clones = false;
     }
 
-    /* Worker routes at W=4: a recursive stratum on TDD workers, and a
-     * non-recursive stratum split across workers.  Joins inside a worker
-     * are one-shot and recorded as worker-session, and no worker completes
-     * a bounded run; strict mode refuses. */
+    /* Worker routes at W=4 (#2201): recursive strata on TDD workers (the
+     * linear closure takes the owner strategy, the self-joined closure
+     * bdx), and non-recursive strata split across workers.  Joins inside
+     * the workers run bounded, and strict mode succeeds where the calling
+     * session's would.  The snapshot after an incremental insert takes the
+     * insert route, whose clones run with the knob off and record
+     * insert-route.  In strict mode the route is refused and the full
+     * re-evaluation is bounded: on workers again for the non-recursive
+     * strata, and on the calling session for the recursive closure. */
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
     run_case("closure on TDD workers", CLOSURE, "path", oracle_closure, 4,
-        MODE_RECORD, &in_workers, NULL);
+        MODE_RECORD, &tdd_bounded, &routed);
     run_case("closure on TDD workers", CLOSURE, "path", oracle_closure, 4,
-        MODE_STRICT, &refused, NULL);
+        MODE_STRICT, &tdd_bounded, &closure_bounded);
+    run_case("self-joined closure on TDD workers", CLOSURE_SELF_JOIN, "path",
+        oracle_closure, 4, MODE_RECORD, &tdd_self_join, NULL);
     unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
     setenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER", "1", 1);
     run_case("two-hop on parallel workers", TWO_HOP, "hop", oracle_two_hop, 4,
-        MODE_RECORD, &in_workers, NULL);
+        MODE_RECORD, &parallel_bounded, &routed);
     run_case("two-hop on parallel workers", TWO_HOP, "hop", oracle_two_hop, 4,
-        MODE_STRICT, &refused, NULL);
+        MODE_STRICT, &parallel_bounded, &parallel_bounded);
+    run_case("filtered two-hop on parallel workers", TWO_HOP_FILTERED, "hop",
+        oracle_two_hop_filtered, 4, MODE_RECORD, &parallel_pipeline,
+        &routed);
+    run_case("filtered two-hop on parallel workers", TWO_HOP_FILTERED, "hop",
+        oracle_two_hop_filtered, 4, MODE_STRICT, &parallel_pipeline,
+        &parallel_pipeline);
     unsetenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
 
-    run_reuse_after_overflow();
+    run_reuse_after_overflow(false);
+    run_reuse_after_overflow(true);
 
     printf("%d run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

@@ -39,7 +39,12 @@ col_join_batch_eligibility(const wl_col_session_t *sess, uint32_t key_count,
 {
     if (!sess || sess->join_batch_bytes == 0)
         return COL_JOIN_BATCH_EXCLUDED_OFF;
-    if (sess->coordinator)
+    /* A worker run that resolves its JOIN operands by input slot (a TDD
+     * bound run or insert clone) may read a range piece or delta under
+     * the relation's name, which the producer, pinning by name, would not
+     * see (#2201).  Other worker sessions resolve by name and are no
+     * exclusion of their own. */
+    if (sess->tdd_input_run)
         return COL_JOIN_BATCH_EXCLUDED_WORKER;
     if (key_count == 0)
         return COL_JOIN_BATCH_EXCLUDED_CROSS;
@@ -785,6 +790,10 @@ col_join_batch_producer_create_internal(wl_col_session_t *sess,
         return EINVAL;
     right = session_find_rel(sess, op->right_relation);
     if (!right)
+        return ENOENT;
+    /* The arrangement is pinned by name, by a scan of the relations; refuse
+     * unless that scan finds this same relation (#2201). */
+    if (!col_session_has_exact_relation(sess, right, op->right_relation))
         return ENOENT;
     if (runner) {
         rc = col_rel_source_reader_acquire(left, &left_reader);

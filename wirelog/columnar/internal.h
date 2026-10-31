@@ -3602,6 +3602,11 @@ col_join_keys_match_rel(const col_rel_t *left, uint32_t lr,
     return true;
 }
 
+/* True when the first relation named @name in @session's relation array --
+ * the one a pin by name finds -- is @source. */
+bool
+col_session_has_exact_relation(const wl_col_session_t *session,
+    const col_rel_t *source, const char *name);
 /* Acquire only a fresh index. Stale pinned entries defer rebuild and reject
  * new leases. Protects index storage, not source mutation or destruction;
  * release every lease before session teardown. Final release invalidates

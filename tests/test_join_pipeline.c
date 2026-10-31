@@ -126,6 +126,14 @@ test_projection_pipeline(void)
         == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE,
         "JOIN -> FILTER* -> projection MAP is eligible");
     CHECK(map_index == 3, "preflight returns the consuming MAP index");
+    /* A worker session that resolves operands by name is no exclusion of
+     * its own (#2201). */
+    sess.coordinator = &sess;
+    map_index = UINT32_MAX;
+    CHECK(wl_columnar_join_pipeline_preflight(&plan, 0, &sess, &map_index)
+        == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE && map_index == 3,
+        "worker session without input slots is eligible");
+    sess.coordinator = NULL;
 }
 
 static void
@@ -220,13 +228,13 @@ test_conservative_exclusions(void)
         && rejected_index == UINT32_MAX,
         "rejected preflight clears map index");
     ops[1].materialized = false;
-    sess.coordinator = (wl_col_session_t *)1;
+    sess.tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
     rejected_index = 7;
     CHECK(wl_columnar_join_pipeline_preflight(&plan, 0, &sess, &rejected_index)
         == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SESSION
         && rejected_index == UINT32_MAX,
-        "worker/coordinator session is excluded and clears index");
-    sess.coordinator = NULL;
+        "slot-resolved worker run is excluded and clears index");
+    sess.tdd_input_run = NULL;
 
     plan.op_count = 2;
     sess.diff_operators_active = true;
@@ -1600,6 +1608,60 @@ sel_zero_column_session(bool with_row)
         return NULL;
     }
     return sess;
+}
+
+/* #2201: the pipeline holds a source reader on the right operand while it
+ * drains the producer, so a right operand under a writer fails with EBUSY
+ * before the left input leaves the stack, and the reader is released once
+ * the pipeline has run. */
+static void
+test_pipeline_holds_right_reader(void)
+{
+    static const char *const left_names[] = { "k", "v" };
+    static const int64_t left_rows[] = { 0, 10, 1, 20 };
+    wl_columnar_source_access_writer_t writer = { 0 };
+    wl_col_session_t *sess = sel_session();
+    col_rel_t *right = sess ? session_find_rel(sess, "right") : NULL;
+    col_rel_t *left = pipeline_relation("left", left_names, 2, left_rows, 2);
+    uint32_t next_index = UINT32_MAX;
+    eval_stack_t stack;
+    sel_plan_t p;
+    int rc;
+
+    CHECK(sess && right && left, "reader fixture");
+    if (!sess || !right || !left) {
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        return;
+    }
+    sel_plan_init(&p, WL_DELTA_FORCE_FULL);
+    eval_stack_init(&stack);
+    if (eval_stack_push_delta(&stack, left, true, false) != 0) {
+        col_rel_destroy(left);
+        pipeline_session_destroy(sess);
+        CHECK(false, "reader fixture stack");
+        return;
+    }
+    sess->join_batch_bytes = SEL_BATCH_BYTES;
+    CHECK(col_rel_source_writer_acquire(right, &writer) == 0,
+        "the right operand can be write-locked");
+    rc = wl_columnar_join_pipeline_try_eval(&p.plan, 0, &stack, sess,
+            &next_index, NULL);
+    CHECK(rc == EBUSY && stack.top == 1 && stack.items[0].rel == left,
+        "a write-locked right operand is EBUSY and keeps the left input");
+    CHECK(wl_columnar_source_access_writer_release(&writer) == 0,
+        "the writer is released");
+    rc = wl_columnar_join_pipeline_try_eval(&p.plan, 0, &stack, sess,
+            &next_index, NULL);
+    CHECK(rc == 1 && stack.top == 1 && stack.items[0].rel != left,
+        "the pipeline runs once the writer is gone");
+    memset(&writer, 0, sizeof(writer));
+    rc = col_rel_source_writer_acquire(right, &writer);
+    CHECK(rc == 0, "the pipeline released its reader on the right operand");
+    if (rc == 0)
+        (void)wl_columnar_source_access_writer_release(&writer);
+    (void)eval_stack_drain(&stack);
+    pipeline_session_destroy(sess);
 }
 
 static void
@@ -5048,6 +5110,7 @@ main(void)
     test_pipeline_right_selection_matches_join();
     test_pipeline_key_types_match_join();
     test_pipeline_zero_column_right_declines();
+    test_pipeline_holds_right_reader();
     test_pipeline_zero_column_left_declines();
     test_successor_classifier_table();
     test_relation_sink_successor_is_not_a_fallback();

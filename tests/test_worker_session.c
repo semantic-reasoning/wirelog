@@ -511,9 +511,15 @@ test_worker_join_batch_runs_fold(void)
     coord->join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY] = 3;
     coord->join_batch_worker_runs[COL_JOIN_BATCH_RUN_PIPELINE] = 2;
 
+    /* An open differential transaction is the coordinator's; the worker
+     * starts with none (#2201). */
+    coord->diff_txn_count = 1;
+
     wl_col_session_t worker;
     memset(&worker, 0, sizeof(worker));
     int ok = col_worker_session_create(coord, 0, NULL, 0, &worker) == 0;
+    ok = ok && worker.diff_txn_count == 0;
+    coord->diff_txn_count = 0;
     for (unsigned r = 0; ok && r < COL_JOIN_BATCH_RUN_ROUTES; r++)
         ok = worker.join_batch_runs[r] == 0
             && worker.join_batch_worker_runs[r] == 0;

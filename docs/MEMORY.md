@@ -1280,27 +1280,37 @@ eligible keyed join run the resumable sub-batch producer in
 `wirelog/columnar/join_batch.c` instead of the one-shot probe loop.
 Eligible means: `key_count > 0`, a persistent primary arrangement on the
 right relation, no right-side delta, no right filter expression, and a
-coordinator or single session (TDD workers are excluded, so the shared row
-counter never applies).  Every other shape falls back to the one-shot join;
-the session records the fallback count and last reason and logs one `JOIN`
-warning per reason.  A worker session starts with its own count and reason
-cleared, and its teardown folds them into the coordinator (#1382), so a
-coordinator's count includes what its workers recorded once they are
-destroyed.  The snapshot route for an incremental insert (#2114) runs its
-joins on a worker clone with the knob turned off; when a stratum it reaches
-has a JOIN, a snapshot that attempts the route records `insert-route`
-without strict mode; strict mode, recording nothing, refuses the route
-before it mutates anything, so the snapshot is evaluated in full (#1382).
-With the knob set, K-Fusion also evaluates its branches serially on the
-calling session instead of on parallel branch sessions (#1382); a branch
-session has no coordinator, so its joins would otherwise run the bounded
-producer concurrently and record nothing on the session.  The legacy row
-cap (`WIRELOG_JOIN_OUTPUT_LIMIT`) is then checked against each join's own
-output, as at one worker, instead of the counter a parallel branch set
-shares (#959).  `WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes
-knob is set) turns a fallback into an `ENOTSUP` failure, which is the
-explicit bounded-mode result for unsupported shapes.  Differential keyed
-joins have the separate producer described below.
+session that does not resolve the JOIN's operands by input slot.  The runs
+that do are a TDD bound run and an insert clone, which may read a range
+piece or a delta under the relation's name while the producer pins the
+arrangement by name.  A JOIN in one that reached the bounded-mode decision
+would record `worker-session`, but both clear or refuse the knob before
+evaluating (#1382).  Other worker sessions, TDD workers and non-recursive
+workers alike, have been eligible since #2201; where non-recursive workers
+share one output counter, the producer charges it per committed batch.
+Every other shape falls back to the one-shot join; the session records the
+fallback count and last reason and logs one `JOIN` warning per reason.
+The session also counts the bounded runs that complete, per route
+(ordinary, differential, pipeline; #2201).  A worker session starts with
+its own counts and reason cleared, and its teardown folds them into the
+coordinator (#1382, #2201), so a coordinator's counts include what its
+workers recorded once they are destroyed.  The snapshot route for an
+incremental insert (#2114) runs its joins on a worker clone with the knob
+turned off; when a stratum it reaches has a JOIN, a snapshot that attempts
+the route records `insert-route` without strict mode; strict mode,
+recording nothing, refuses the route before it mutates anything, so the
+snapshot is evaluated in full (#1382).  With the knob set, K-Fusion also
+evaluates its branches serially on the calling session instead of on
+parallel branch sessions (#1382): a branch session is a shallow copy of
+the calling session, so its joins would otherwise run the bounded producer
+concurrently, and K-Fusion does not fold a branch session's records into
+the calling session.  The legacy row cap (`WIRELOG_JOIN_OUTPUT_LIMIT`) is
+then checked against each join's own output, as at one worker, instead of
+the counter a parallel branch set shares (#959).
+`WIRELOG_JOIN_BATCH_STRICT=1` (ignored unless the bytes knob is set) turns
+a fallback into an `ENOTSUP` failure, which is the explicit bounded-mode
+result for unsupported shapes.  Differential keyed joins have the separate
+producer described below.
 
 The internal col_join_batch_control_* interface can bind an already prepared
 ordinary JOIN continuation to one active evaluation-control attempt. Binding
@@ -1459,19 +1469,19 @@ strict differential `JOIN -> REDUCE` is not refused as
 bounded-mode rules below, which refuse its excluded shapes.
 
 - For a keyed JOIN without a right filter that is not materialized, in a
-  session that is not a worker session, the pipeline first applies the
-  JOIN's right-operand selection, a key-column range check and the key-type
-  check, in that order and before looking at what follows the JOIN.  A
-  missing right relation, a forced-empty right operand, or a key that
-  resolves outside a zero-column input is left to the ordinary JOIN, whose
-  result stands in both modes and nothing is recorded; there a zero-column
-  input with rows (the left, or a right that remains after the right
-  filter) fails with `EINVAL`, except that a missing or forced-empty right
-  keeps its empty result; when neither input is a zero-column input with
-  rows, an empty zero-column input yields the empty result (#2170, #2209).
-  A FLOAT key paired with a non-FLOAT key is `EINVAL`, as from the ordinary
-  JOIN.  A `$d$` or `$r$` right operand records `delta-right`, and strict
-  mode refuses it with `ENOTSUP` before the JOIN runs.
+  session that does not resolve operands by input slot (#2201), the pipeline
+  first applies the JOIN's right-operand selection, a key-column range check
+  and the key-type check, in that order and before looking at what follows
+  the JOIN.  A missing right relation, a forced-empty right operand, or a
+  key that resolves outside a zero-column input is left to the ordinary
+  JOIN, whose result stands in both modes and nothing is recorded; there a
+  zero-column input with rows (the left, or a right that remains after the
+  right filter) fails with `EINVAL`, except that a missing or forced-empty
+  right keeps its empty result; when neither input is a zero-column input
+  with rows, an empty zero-column input yields the empty result (#2170,
+  #2209).  A FLOAT key paired with a non-FLOAT key is `EINVAL`, as from the
+  ordinary JOIN.  A `$d$` or `$r$` right operand records `delta-right`, and
+  strict mode refuses it with `ENOTSUP` before the JOIN runs.
 - Otherwise, when the session, the JOIN or the shape of its tail is not
   consumable, what reads the JOIN's output decides.  If the output reaches
   the end of the plan only through CONCAT, CONSOLIDATE, or an EXCHANGE that
@@ -1628,35 +1638,36 @@ multiplicities.  (Until #2173 each batch carried the signed product
 `left * right`, which failed the join with `EINVAL` on overflow.)  Stale
 input, generation changes, overflow, cancellation, or failed admission
 discard the output relation and release the differential pin exactly once.
-Materialized/cache joins and delta-right, filtered, cross and worker shapes
-remain on their existing one-shot paths until their publication contracts
-are bounded.  Since #1382 the differential join decides them with the same
-eligibility check as the ordinary join and then excludes materialized joins.
-Without strict mode each records its reason (`worker-session`, `cross-join`,
-`delta-right`, `filtered-right` or `materialized`, and `row-too-large` when
-create refuses a batch budget below one output row); under
-`WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP` instead of running
-one-shot and records nothing.  A materialized join whose result is already
-cached is copied from the cache before this decision, so it is neither
-recorded nor refused.  Under strict mode a differential evaluation therefore
-fails as soon as one of its joins reads a delta on the right or filters the
-right relation; it is a diagnostic setting.  A keyed differential join whose
-left input, or whose right operand after selection and the right filter, has
-rows but no columns fails with `EINVAL` with the knob off or on, as the
-ordinary JOIN does, before the cache lookup and the bounded-mode decision,
-so nothing is recorded (#2202, #2209).  A missing or forced-empty right
-operand still yields the empty result first, a right whose filter leaves no
-rows is not refused by this check and takes the filtered-right path above,
-and an error from the right relation's filter, which runs before the check,
-is returned instead.  For a shape eligible for bounded mode that passes this
-check, an empty input on either side is joined one-shot without the
-producer, and nothing is recorded or refused; an excluded shape is still
-recorded, or refused under strict mode, before that decision.  Two empty
-zero-column inputs therefore yield the empty result with or without strict
-mode; before #2202 the producer refused their zero-width output, recorded as
-`row-too-large`, or `ENOTSUP` under strict mode.  The producer itself
-rejects a key index outside either input with `EINVAL`, before any
-reservation, reader or arrangement is taken (#2202).
+Materialized/cache joins and delta-right, filtered and cross shapes remain
+on their existing one-shot paths until their publication contracts are
+bounded; runs that resolve operands by input slot do not reach the
+differential join, since they refuse or clear differential operators.  Since
+#1382 the differential join decides them with the same eligibility check as
+the ordinary join and then excludes materialized joins.  Without strict mode
+each records its reason (`cross-join`, `delta-right`, `filtered-right` or
+`materialized`, and `row-too-large` when create refuses a batch budget below
+one output row); under `WIRELOG_JOIN_BATCH_STRICT` each returns `ENOTSUP`
+instead of running one-shot and records nothing.  A materialized join whose
+result is already cached is copied from the cache before this decision, so
+it is neither recorded nor refused.  Under strict mode a differential
+evaluation therefore fails as soon as one of its joins reads a delta on the
+right or filters the right relation; it is a diagnostic setting.  A keyed
+differential join whose left input, or whose right operand after selection
+and the right filter, has rows but no columns fails with `EINVAL` with the
+knob off or on, as the ordinary JOIN does, before the cache lookup and the
+bounded-mode decision, so nothing is recorded (#2202, #2209).  A missing or
+forced-empty right operand still yields the empty result first, a right
+whose filter leaves no rows is not refused by this check and takes the
+filtered-right path above, and an error from the right relation's filter,
+which runs before the check, is returned instead.  For a shape eligible for
+bounded mode that passes this check, an empty input on either side is joined
+one-shot without the producer, and nothing is recorded or refused; an
+excluded shape is still recorded, or refused under strict mode, before that
+decision.  Two empty zero-column inputs therefore yield the empty result
+with or without strict mode; before #2202 the producer refused their
+zero-width output, recorded as `row-too-large`, or `ENOTSUP` under strict
+mode.  The producer itself rejects a key index outside either input with
+`EINVAL`, before any reservation, reader or arrangement is taken (#2202).
 
 A governor denial on these bounded paths is reported as a budget denial: the
 JOIN returns `ENOSPC`, and `wl_columnar_session_budget_denied()` is true
@@ -1699,23 +1710,25 @@ describe the repository's workloads, not a bound: an EDB-only star join on
 one key multiplies its inputs' per-key fanouts.
 
 Cross joins and the ephemeral hash path also stay one-shot.  On the
-non-differential path outside worker sessions, a join with no key columns
-(`key_count == 0`) is excluded from the bounded producer and, when it
-reaches the eligibility check, records `cross-join`; an otherwise eligible
-keyed join whose persistent arrangement is unavailable runs the ephemeral
-hash probe and records `no-arrangement`; under `WIRELOG_JOIN_BATCH_STRICT`
-both return `ENOTSUP`.  The differential bounded path requires a key
-column, so outside worker sessions a differential cross join runs as
-one-shot `$join_diff`; since #1382 it records `cross-join` and strict mode
-refuses it, as on the non-differential path.  In a worker session either
-kind of join that reaches the JOIN operator's bounded-mode decision records
-`worker-session` instead, and strict mode refuses it there.  When this
-paragraph was written (#1370), the knob-on test suite ran 613 cross joins
-with at most 6,400 output rows, the ten `bench_flowlog` programs one (100
-rows), and DOOP 16 before its run stopped (10,792 rows in total), and no
-workload recorded the `no-arrangement` fallback.  These counts describe the
-repository's workloads, not a bound: a cross join's output is the product
-of its inputs' row counts.
+non-differential path, a join with no key columns (`key_count == 0`) is
+excluded from the bounded producer and, when it reaches the eligibility
+check, records `cross-join`; an otherwise eligible keyed join whose
+persistent arrangement is unavailable runs the ephemeral hash probe and
+records `no-arrangement`; under `WIRELOG_JOIN_BATCH_STRICT` both return
+`ENOTSUP`.  The differential bounded path requires a key column, so a
+differential cross join runs as one-shot `$join_diff`; since #1382 it
+records `cross-join` and strict mode refuses it, as on the non-differential
+path.  In a run that resolves operands by input slot either kind of join
+that reaches the JOIN operator's bounded-mode decision records
+`worker-session` instead, and strict mode refuses it there; the bound and
+insert runs that are such runs clear or refuse the knob before evaluating
+(#1382), so session evaluation does not reach that decision with the knob
+set (#2201).  When this paragraph was written (#1370), the knob-on test
+suite ran 613 cross joins with at most 6,400 output rows, the ten
+`bench_flowlog` programs one (100 rows), and DOOP 16 before its run stopped
+(10,792 rows in total), and no workload recorded the `no-arrangement`
+fallback.  These counts describe the repository's workloads, not a bound: a
+cross join's output is the product of its inputs' row counts.
 
 When this paragraph was written (#1370), bounded mode was checked by two gates
 over the test suite without its tidy, abi, perf and bench suites.  The knob-on
@@ -1770,7 +1783,10 @@ publishing its batches downstream one at a time (bounded exchange) is #1383,
 after #1373.  The non-differential producer holds no source reader on its
 inputs, which is safe only because it is drained synchronously before the
 operator returns; that must change before #1383 publishes batches
-asynchronously.
+asynchronously.  On a worker the right operand can be a view of the
+coordinator's storage, so the ordinary JOIN drains the producer while its
+primary arrangement probe holds a reader on that operand, and the fused
+pipeline acquires one on it for the drain (#2201).
 
 Controlled initial STEP also has a deliberately narrow #1821 compatibility
 route for `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE`. It materializes the
@@ -1783,40 +1799,53 @@ retry do not.
 
 Where bounded mode runs, as the program-level test
 `test_join_batch_program_{default,nofusion}` measures it in both planner
-builds at one and four workers:
+builds at one and four workers, reading the per-route run counts:
 
 - strata whose inputs are below the parallel thresholds are evaluated on the
   calling session, where joins of an eligible shape run bounded (the
-  two-hop and closure programs succeed under strict mode; the K = 4
-  recursive rule records its excluded shapes);
+  two-hop, filtered two-hop and closure programs succeed under strict mode,
+  on the ordinary, pipeline and differential routes; the K = 4 recursive
+  rule records its excluded shapes);
 - a snapshot after an incremental insert takes the insert route (#2114),
   whose worker clones run with the knob off, and records `insert-route`;
   strict mode refuses the route and the full re-evaluation is bounded;
-- a recursive stratum on TDD workers and a non-recursive stratum split
-  across workers (reached in that test by forcing
-  `WIRELOG_TDD_MIN_ROWS_PER_WORKER` and
-  `WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER` to 1) run their joins one-shot
-  inside the workers, recorded as `worker-session` and folded into the
-  coordinator's count; strict mode returns `ENOTSUP`;
+- at four workers, with `WIRELOG_TDD_MIN_ROWS_PER_WORKER` or
+  `WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER` forced to 1, the workers
+  themselves run the producer (#2201): TDD workers on the differential
+  route for the linear closure, which takes the owner strategy, and for
+  the self-joined closure, which takes bdx and still records its own
+  `delta-right` exclusion; non-recursive workers on the ordinary route for
+  two-hop and on the pipeline route for the filtered two-hop.  Nothing
+  records `worker-session`, and strict mode succeeds for the linear
+  closure and both two-hop programs.  In strict mode the full
+  re-evaluation after an insert ran on workers again for the non-recursive
+  programs and on the calling session for the closure;
 - K-Fusion runs its branches serially on the calling session, so no branch
   session exists while the knob is set.
 
-So bounded JOIN is not available inside workers: no worker runs the
-producer, which is also why no worker can emit more than one payload into
-the one-payload-per-worker transport.  Enabling it there is a follow-up
-issue (a name-free arrangement lease, or a producer-owned hash over the
-slot-resolved right input, for the insert and bound runs; worker arrangement
-caches and folding for full-path TDD workers).  Which route a given
-production workload takes depends on its data sizes and is not claimed here.
+With W workers up to W producers run at once, one per worker, each within
+the per-producer bound above, and all of them are admitted by the session's
+single memory governor; the aggregate working set is therefore up to W
+times the per-producer bound, plus each worker's output relation.  Each
+worker still publishes one relation per JOIN operator, so no worker emits
+more than one payload into the one-payload-per-worker transport; bounded
+exchange is still #1383 after #1373.  The insert route's clones and the
+TDD bound runs still clear or refuse the knob: they resolve the right
+operand by input slot, and running the producer there needs an
+arrangement lease keyed by the slot-resolved relation, or a hash the
+producer builds over it, instead of the lease by name.  Which route a
+given production workload takes depends on its data sizes and is not
+claimed here.
 
 The shapes bounded mode excludes record these reasons, and each is refused
 under `WIRELOG_JOIN_BATCH_STRICT`: `cross-join`, `delta-right`,
-`filtered-right`, `worker-session`, `no-arrangement`, `row-too-large`,
-`pipeline-not-consumable`, `materialized` (differential path; a cached
-result is copied before the decision and is neither recorded nor refused),
-`lftj` and `insert-route`.  A controlled attempt on the JOIN route of #1821
-refuses the knob with `ENOTSUP` without recording a reason; the numeric plan
-driver that dispatches it is not yet reached from session evaluation.
+`filtered-right`, `worker-session` (a run that resolves operands by input
+slot), `no-arrangement`, `row-too-large`, `pipeline-not-consumable`,
+`materialized` (differential path; a cached result is copied before the
+decision and is neither recorded nor refused), `lftj` and `insert-route`.
+A controlled attempt on the JOIN route of #1821 refuses the knob with
+`ENOTSUP` without recording a reason; the numeric plan driver that
+dispatches it is not yet reached from session evaluation.
 Strict mode therefore refuses incremental differential programs whose joins
 read a right delta, LFTJ chains, and recursive multi-way rules (whose joins
 feed joins and read right deltas); it is a diagnostic setting.  A keyed
