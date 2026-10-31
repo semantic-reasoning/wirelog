@@ -3198,6 +3198,161 @@ static void repeated_predicate_scratch(void)
     CHECK(temporary[0] > 0 && temporary[0] == temporary[1]);
 }
 
+/* Explicit plans exercise compositions the parser need not emit. Every stage
+ * uses the preceding stage's columns, not the source's physical ordinals. */
+static void composed_cold_stages(void)
+{
+    const wirelog_column_type_t kinds[] = {WIRELOG_TYPE_INT64,
+                                           WIRELOG_TYPE_FLOAT,
+                                           WIRELOG_TYPE_UINT64,
+                                           WIRELOG_TYPE_BOOL,
+                                           WIRELOG_TYPE_STRING,
+                                           WIRELOG_TYPE_STRING};
+    uint64_t temporary[2] = {0};
+    for (unsigned kind = 0; kind < 6; kind++)
+        for (unsigned size = 0; size < (kind ? 2u : 4u); size++) {
+            unsigned rows = size == 0 ? 0 : size == 1 ? 4 : size ==
+                2 ? 64 : 512;
+            bool compound = kind == 5;
+            fixture_t f = fixture(compound ?
+                    ".decl b(k:int64,p:pair(symbol,int64) inline)\n"
+                    ".decl keys(k:int64,s:symbol,v:int64)\n"
+                    "keys(k,s,v) :- b(k,pair(s,v)).\n" :
+                    ".decl b(k:int64,v:int64,w:int64)\n"
+                    ".decl keys(k:int64,v:int64,w:int64)\nkeys(k,v,w) :- b(k,v,w).\n",
+                    4*1024*1024, 1024*1024);
+            wl_col_session_t *session = COL_SESSION(f.session);
+            col_rel_t *source = session_find_rel(session, "b");
+            wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, kinds[kind],
+                                             WIRELOG_TYPE_INT64};
+            for (unsigned i = 0; i < (rows ? rows : 1); i++) {
+                uint64_t bits = kind == 1 ? UINT64_C(0xbff8000000000000) :
+                    kind == 2 ? UINT64_MAX : kind == 3 ? 1 :
+                    kind >= 4 ? (uint64_t)wl_intern_put(session->intern,
+                        reference_values[i%3]) : 100+i;
+                int64_t row[] = {(int64_t)i, 0, 200+i};
+                memcpy(&row[1], &bits, sizeof(bits));
+                CHECK(wl_session_insert(f.session, "b", row, 1, 3) == 0);
+                if (!rows) CHECK(wl_session_remove(f.session, "b", row, 1,
+                        3) == 0);
+            }
+            source = session_find_rel(session, "b");
+            if (!compound) CHECK(col_rel_set_column_types(source, NULL,
+                    3) == 0);
+            CHECK(col_rel_set_column_types(source, types, 3) == 0);
+            wl_plan_relation_t *rp = (wl_plan_relation_t *)projection_plan(&f);
+            const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+            CHECK(count == 3);
+            uint32_t first[] = {1, 2, 0, 1}, second[] = {2, 0, 1, 0},
+                third[] = {3, 0, 2};
+            uint8_t lower[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0',
+                                 WL_PLAN_EXPR_CONST_INT, 1, 0, 0, 0, 0, 0, 0, 0,
+                                 WL_PLAN_EXPR_CMP_GTE};
+            uint8_t upper[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '1',
+                                 WL_PLAN_EXPR_CONST_INT, 3, 0, 0, 0, 0, 0, 0, 0,
+                                 WL_PLAN_EXPR_CMP_LT};
+            wl_plan_op_t ops[7] = {saved[0],
+                                   {.op = WL_PLAN_OP_MAP, .project_count = 4,
+                                    .project_indices = first},
+                                   {.op = WL_PLAN_OP_MAP, .project_count = 4,
+                                    .project_indices = second},
+                                   {.op = WL_PLAN_OP_FILTER,
+                                    .filter_expr = {.data = lower, .size = 17}},
+                                   {.op = WL_PLAN_OP_MAP, .project_count = 3,
+                                    .project_indices = third},
+                                   {.op = WL_PLAN_OP_FILTER,
+                                    .filter_expr = {.data = upper, .size = 17}},
+                                   saved[2]};
+            uint8_t canonical[4][7];
+            wl_plan_expr_buffer_t valid_exprs[4];
+            for (unsigned i = 0; i < 4; i++) {
+                uint8_t code[7] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'};
+                code[6] = (uint8_t)('0' + second[i]);
+                if (i == 1 || i == 3)
+                    code[0] = kind == 1 ? WL_PLAN_EXPR_VAR_FLOAT :
+                        kind >= 4 ? WL_PLAN_EXPR_VAR_STRING : WL_PLAN_EXPR_VAR;
+                memcpy(canonical[i], code, sizeof(code));
+                valid_exprs[i] = (wl_plan_expr_buffer_t){.data = canonical[i],
+                                                         .size = 7};
+            }
+            ops[2].map_exprs = valid_exprs; ops[2].map_expr_count = 4;
+            rp->ops = ops; rp->op_count = 7;
+            eval_stack_t stack; eval_stack_init(&stack);
+            CHECK(col_eval_relation_plan(rp, &stack, session) == 0);
+            eval_entry_t entry = eval_stack_pop(&stack);
+            uint32_t expected_rows = entry.rel->nrows; int64_t expected[2][3];
+            CHECK(expected_rows == (rows ? 2u : 0u));
+            for (uint32_t i = 0; i < expected_rows; i++)
+                for (unsigned c = 0; c < 3; c++)
+                    expected[i][c] = entry.rel->columns[c][i];
+            CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+            uint64_t before = reserved(&f);
+            second[0] = 4;
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) ==
+                WL_COLUMNAR_SPILL_UNSUPPORTED);
+            CHECK(reserved(&f) == before && session_find_rel(session, "b"));
+            second[0] = 2;
+            uint8_t wrong[7] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'};
+            wl_plan_expr_buffer_t expressions[4] = {{.data = wrong, .size = 7}};
+            ops[2].map_exprs = expressions; ops[2].map_expr_count = 4;
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL, NULL) ==
+                WL_COLUMNAR_SPILL_UNSUPPORTED);
+            ops[2].map_exprs = valid_exprs; ops[2].map_expr_count = 4;
+            if (kind) {
+                lower[6] = '1';
+                CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                    NULL) ==
+                    WL_COLUMNAR_SPILL_UNSUPPORTED);
+                lower[6] = '0';
+            }
+            CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == OK);
+            CHECK(!session_find_rel(session, "b")); before = reserved(&f);
+            third[0] = 4;
+            CHECK(col_eval_relation_plan(rp, &stack, session) == ENOTSUP);
+            CHECK(!stack.top && reserved(&f) == before); third[0] = 3;
+            if (rows) {
+                read_fault = rows;
+                CHECK(wl_columnar_ops_cold_projection(rp, &stack,
+                    session) == EIO);
+                read_fault = 0;
+                CHECK(!stack.top && reserved(&f) == before);
+                wl_columnar_ops_test_map_fail_output_alloc = true;
+                CHECK(wl_columnar_ops_cold_projection(rp, &stack,
+                    session) == ENOMEM);
+                wl_columnar_ops_test_map_fail_output_alloc = false;
+                CHECK(!stack.top && reserved(&f) == before);
+            }
+            budget_peak = before;
+            wl_columnar_memory_governor_test_admitted = budget_admitted;
+            CHECK(wl_columnar_ops_cold_projection(rp, &stack, session) == 0);
+            uint64_t output = reserved(&f) - before;
+            if (!kind &&
+                size >= 2) temporary[size-2] = budget_peak-before-output;
+            wl_columnar_memory_governor_test_admitted = NULL;
+            entry = eval_stack_pop(&stack);
+            CHECK(entry.rel->nrows == expected_rows && entry.rel->ncols == 3 &&
+                entry.rel->column_types[0] == kinds[kind] &&
+                entry.rel->column_types[1] == WIRELOG_TYPE_INT64 &&
+                entry.rel->column_types[2] == WIRELOG_TYPE_INT64 &&
+                entry.rel->compound_kind == WIRELOG_COMPOUND_KIND_NONE &&
+                !entry.rel->compound_count && !entry.rel->compound_arity_map);
+            CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+            for (unsigned repeat = 0; repeat < 2; repeat++) {
+                CHECK(col_eval_relation_plan(rp, &stack, session) == 0);
+                entry = eval_stack_pop(&stack);
+                CHECK(entry.rel->nrows == expected_rows);
+                for (uint32_t i = 0; i < expected_rows; i++)
+                    for (unsigned c = 0; c < 3; c++)
+                        CHECK(entry.rel->columns[c][i] == expected[i][c]);
+                CHECK(eval_stack_dispose_entry(&stack, &entry) == 0);
+                CHECK(reserved(&f) == before);
+            }
+            rp->ops = saved; rp->op_count = count; destroy(&f);
+        }
+    CHECK(temporary[0] > 0 && temporary[0] == temporary[1]);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -3207,6 +3362,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    composed_cold_stages();
     repeated_cold_predicates(); parsed_repeated_predicates();
     repeated_predicate_scratch();
     inline_source_refusals(); numeric_inline_cold_source();
