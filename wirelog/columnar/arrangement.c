@@ -744,6 +744,66 @@ arr_build_full_impl(col_arrangement_t *arr, const col_rel_t *rel)
     return 0;
 }
 
+/* #2201: the bytes arr_build_full_impl allocates when it builds a zeroed
+ * arrangement over @nrows rows -- the bucket heads, plus a row chain of
+ * max(nrows, 16) entries when there is any row -- or EOVERFLOW for a row
+ * count it refuses. */
+int
+col_arrangement_owned_bytes(uint32_t nrows, uint64_t *bytes)
+{
+    uint32_t nbuckets;
+    uint32_t cap;
+
+    if (!bytes)
+        return EINVAL;
+    *bytes = 0;
+    if (nrows > UINT32_MAX / 2u)
+        return EOVERFLOW;
+    nbuckets = arr_next_pow2(nrows > 0 ? nrows * 2u : 16u);
+    if (nbuckets == 0)
+        return EOVERFLOW;
+    cap = nrows == 0 ? 0u : nrows < 16u ? 16u : nrows;
+    *bytes = (uint64_t)nbuckets * sizeof(uint64_t)
+        + (uint64_t)cap * sizeof(uint32_t);
+    return 0;
+}
+
+int
+col_arrangement_build_owned(col_arrangement_t *arr, const col_rel_t *rel,
+    uint32_t *key_cols, uint32_t key_count)
+{
+    uint64_t expected = 0;
+    int rc;
+
+    if (!arr || arr->ht_head || arr->ht_next || arr->nbuckets
+        || arr->ht_cap || arr->ledger || arr->memory_governor
+        || !arr_key_cols_valid(rel, key_cols, key_count))
+        return EINVAL;
+    rc = col_arrangement_owned_bytes(rel->nrows, &expected);
+    if (rc != 0)
+        return rc;
+    arr->key_cols = key_cols;
+    arr->key_count = key_count;
+    rc = arr_build_full_impl(arr, rel);
+    if (rc != 0) {
+        arr_free_contents(arr);
+        return rc;
+    }
+    /* The caller admitted @expected bytes before the build; a build that
+     * allocated anything else would leave the admission wrong. */
+    if (arr_ledger_bytes(arr) != expected) {
+        arr_free_contents(arr);
+        return EINVAL;
+    }
+    return 0;
+}
+
+void
+col_arrangement_owned_release(col_arrangement_t *arr)
+{
+    arr_free_contents(arr);
+}
+
 /* Ledger-aware wrapper: the build may free and reallocate ht_head/ht_next
  * on several paths, so the charge is reconciled once from the before/after
  * footprint instead of at each malloc (Issue #1380). */

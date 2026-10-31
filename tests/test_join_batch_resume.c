@@ -58,6 +58,8 @@ wl_test_unsetenv_(const char *name)
 
 /* Defined under WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS in testlib_prod. */
 extern void wl_columnar_diff_join_batch_test_fail_allocation_at(uint32_t n);
+/* Also in testlib_prod: fail the next owned index build (#2201). */
+extern void wl_columnar_join_batch_test_fail_next_index_build(void);
 
 static int tests_run;
 static int tests_passed;
@@ -5194,6 +5196,296 @@ test_existence_join_nonempty_nullary_cleanup(void)
         FAIL("existence join nullary refusal, result or reuse mismatch");
 }
 
+/* #2201: col_arrangement_owned_bytes predicts exactly what a build of a
+ * zeroed arrangement over that many rows allocates, including no row chain
+ * for an empty relation, and refuses row counts the builder refuses. */
+static void
+test_owned_index_sizing(void)
+{
+    static const uint32_t counts[] = { 0, 1, 7, 8, 9, 15, 16, 17, 1000 };
+    uint64_t bytes = 0;
+    bool ok = true;
+
+    TEST("owned index sizing matches a real build");
+    for (size_t i = 0; ok && i < sizeof(counts) / sizeof(counts[0]); i++) {
+        col_rel_t *rel = make_right_named("sized", counts[i], 1);
+        col_arrangement_t arr;
+        uint32_t key = 0;
+        memset(&arr, 0, sizeof(arr));
+        ok = rel && col_arrangement_owned_bytes(counts[i], &bytes) == 0
+            && col_arrangement_build_owned(&arr, rel, &key, 1) == 0
+            && arr.indexed_rows == counts[i] && arr.generation != 0
+            && bytes == (uint64_t)arr.nbuckets * sizeof(uint64_t)
+            + (uint64_t)arr.ht_cap * sizeof(uint32_t);
+        if (!ok)
+            printf("\n    n=%u predicted=%llu buckets=%u cap=%u", counts[i],
+                (unsigned long long)bytes, arr.nbuckets, arr.ht_cap);
+        col_arrangement_owned_release(&arr);
+        ok = ok && !arr.ht_head && !arr.ht_next;
+        col_rel_destroy(rel);
+    }
+    ok = ok && col_arrangement_owned_bytes(0x40000000u, &bytes) == 0
+        && col_arrangement_owned_bytes(0x40000001u, &bytes) == EOVERFLOW
+        && col_arrangement_owned_bytes(UINT32_MAX, &bytes) == EOVERFLOW;
+    if (ok)
+        PASS();
+    else
+        FAIL("predicted bytes differ from the build, or a bound moved");
+}
+
+/* An unregistered relation named "slot" with rows of its own, standing in
+ * for an input-slot operand: keys 0..2, two rows each, values 5000+. */
+static col_rel_t *
+make_slot_right(void)
+{
+    const char *cn[] = { "k", "r" };
+    col_rel_t *slot = make_rel("slot", 2, cn);
+    for (int64_t k = 0; slot && k < 3; k++)
+        for (int64_t f = 0; f < 2; f++) {
+            int64_t row[] = { k, 5000 + 10 * k + f };
+            if (col_rel_append_row(slot, row) != 0) {
+                col_rel_destroy(slot);
+                return NULL;
+            }
+        }
+    return slot;
+}
+
+/* Bytes @out holds admitted under the session governor: what the relation
+ * sink admits as it grows the output. */
+static uint64_t
+output_reserved(const col_rel_t *out)
+{
+    return out->retained_reserved_bytes + out->descriptor_reserved_bytes
+           + out->metadata_reserved_bytes;
+}
+
+/* #2201: a producer created over an explicit right relation joins that
+ * relation, not the one registered under the operator's right name; it
+ * takes no registry entry or pin, admits its own index before building
+ * it, holds a reader on the relation while it lives, and returns all of
+ * it at destroy. */
+static void
+test_owned_index_reads_given_relation(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2, 1 };
+    col_rel_t *slot = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline, index_bytes = 0, live;
+    uint32_t arr_count;
+    bool ok;
+
+    TEST("owned-index producer joins the given relation, not the name");
+    ok = fixture_init(&f, 1u << 24, keys, 4, 3, 4);
+    slot = ok ? make_slot_right() : NULL;
+    if (!ok || !slot) {
+        col_rel_destroy(slot);
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    arr_count = f.sess->arr_count;
+    baseline = reserved_of(f.sess) - output_reserved(f.out);
+    ok = col_join_batch_producer_create_over(f.sess, &f.op, f.left, false,
+            slot, KEY0, KEY0, 1, 3u * 32u, &cont) == 0
+        && col_arrangement_owned_bytes(slot->nrows, &index_bytes) == 0
+        && col_join_batch_index_bytes(cont) == index_bytes
+        && index_bytes > 0;
+    live = reserved_of(f.sess);
+    ok = ok && live - output_reserved(f.out) >= baseline + index_bytes
+        + col_join_batch_descriptor_bytes(cont)
+        && !no_reader_holds(slot);
+    ok = ok && col_join_batch_run_to_relation(cont, f.sess, f.out) == 0
+        && nested_loop_equal(f.left, slot, f.out)
+        && f.sess->arr_count == arr_count;
+    for (uint32_t i = 0; ok && i < f.sess->arr_count; i++)
+        ok = f.sess->arr_entries[i].pin_count == 0;
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    ok = ok && reserved_of(f.sess) - output_reserved(f.out) == baseline
+        && no_reader_holds(slot);
+    col_rel_destroy(slot);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("rows, registry, reservation or reader mismatch");
+}
+
+/* #2201: an empty explicit right builds the 16-bucket index with no row
+ * chain and joins to nothing. */
+static void
+test_owned_index_empty_right(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1 };
+    const char *cn[] = { "k", "r" };
+    col_rel_t *empty = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline;
+    bool ok;
+
+    TEST("owned-index producer over an empty right relation");
+    ok = fixture_init(&f, 1u << 24, keys, 2, 2, 2);
+    empty = ok ? make_rel("slot", 2, cn) : NULL;
+    if (!ok || !empty) {
+        col_rel_destroy(empty);
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    baseline = reserved_of(f.sess) - output_reserved(f.out);
+    ok = col_join_batch_producer_create_over(f.sess, &f.op, f.left, false,
+            empty, KEY0, KEY0, 1, 4096, &cont) == 0
+        && col_join_batch_index_bytes(cont) == 16u * sizeof(uint64_t)
+        && col_join_batch_run_to_relation(cont, f.sess, f.out) == 0
+        && f.out->nrows == 0;
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    ok = ok && reserved_of(f.sess) - output_reserved(f.out) == baseline
+        && no_reader_holds(empty);
+    col_rel_destroy(empty);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("empty right did not join to nothing or kept state");
+}
+
+/* #2201: index admission, the build and the scratch after the build can
+ * each fail; every failure returns the descriptor, the index reservation
+ * and the reader on the right, and leaves no continuation. */
+static void
+test_owned_index_failures_release(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2 };
+    col_rel_t *slot = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline, descriptor = 0, index_bytes = 0, scratch_floor;
+    bool ok;
+
+    TEST("owned-index create failures release everything");
+    ok = fixture_init(&f, 1u << 24, keys, 3, 3, 2);
+    slot = ok ? make_slot_right() : NULL;
+    if (!ok || !slot) {
+        col_rel_destroy(slot);
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    /* Measure the descriptor and index bytes from one create. */
+    baseline = reserved_of(f.sess);
+    ok = col_join_batch_producer_create_over(f.sess, &f.op, f.left, false,
+            slot, KEY0, KEY0, 1, 4096, &cont) == 0;
+    if (ok) {
+        descriptor = col_join_batch_descriptor_bytes(cont);
+        index_bytes = col_join_batch_index_bytes(cont);
+        scratch_floor = reserved_of(f.sess) - baseline;
+        wl_columnar_continuation_destroy(cont);
+        cont = NULL;
+    } else {
+        scratch_floor = 0;
+    }
+    ok = ok && descriptor > 0 && index_bytes > 0
+        && scratch_floor > descriptor + index_bytes;
+    fixture_fini(&f);
+
+    /* Each budget admits everything before one step and not that step:
+     * the index, then the scratch batch after the index is built. */
+    const uint64_t short_of[] = { descriptor + index_bytes - 1u,
+                                  scratch_floor - 1u };
+    for (size_t i = 0; ok && i < 2; i++) {
+        uint64_t base;
+        ok = fixture_init(&f, 1u << 24, keys, 3, 3, 2);
+        base = ok ? reserved_of(f.sess) : 0;
+        fixture_fini(&f);
+        ok = ok && fixture_init(&f, base + short_of[i], keys, 3, 3, 2);
+        if (ok) {
+            int rc;
+            base = reserved_of(f.sess);
+            f.sess->memory_budget_denied = false;
+            rc = col_join_batch_producer_create_over(f.sess, &f.op, f.left,
+                    false, slot, KEY0, KEY0, 1, 4096, &cont);
+            ok = rc == ENOSPC && cont == NULL
+                && f.sess->memory_budget_denied
+                && reserved_of(f.sess) == base && no_reader_holds(slot);
+            if (!ok)
+                printf("\n    budget step %zu: rc=%d", i, rc);
+        }
+        fixture_fini(&f);
+    }
+
+    /* The build itself fails after admission. */
+    if (ok) {
+        uint64_t base;
+        ok = fixture_init(&f, 1u << 24, keys, 3, 3, 2);
+        base = ok ? reserved_of(f.sess) : 0;
+        wl_columnar_join_batch_test_fail_next_index_build();
+        ok = ok && col_join_batch_producer_create_over(f.sess, &f.op,
+                f.left, false, slot, KEY0, KEY0, 1, 4096, &cont) == ENOMEM
+            && cont == NULL && reserved_of(f.sess) == base
+            && no_reader_holds(slot);
+        fixture_fini(&f);
+    }
+    /* Argument refusals take nothing. */
+    if (ok) {
+        ok = fixture_init(&f, 1u << 24, keys, 3, 3, 2)
+            && col_join_batch_producer_create_over(f.sess, &f.op, f.left,
+                false, NULL, KEY0, KEY0, 1, 4096, &cont) == EINVAL
+            && cont == NULL;
+        fixture_fini(&f);
+    }
+    col_rel_destroy(slot);
+    if (ok)
+        PASS();
+    else
+        FAIL("a create failure kept a reservation, reader or continuation");
+}
+
+/* #2201: cancel returns the index, its reservation and the reader before
+ * destroy, and destroy after cancel releases nothing twice. */
+static void
+test_owned_index_cancel_releases(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2, 1, 0 };
+    col_rel_t *slot = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_columnar_continuation_sink_t sink;
+    col_join_batch_relation_sink_t sctx;
+    uint64_t index_bytes = 0, before_cancel;
+    bool ok;
+
+    TEST("owned-index cancel releases the index before destroy");
+    ok = fixture_init(&f, 1u << 24, keys, 5, 3, 2);
+    slot = ok ? make_slot_right() : NULL;
+    ok = ok && slot
+        && col_join_batch_producer_create_over(f.sess, &f.op, f.left, false,
+            slot, KEY0, KEY0, 1, 2u * 32u, &cont) == 0
+        && col_join_batch_relation_sink_init(&sctx, &sink, f.sess, f.out)
+        == 0
+        && wl_columnar_continuation_publish(cont, &sink)
+        == WL_COLUMNAR_CONTINUATION_OK;
+    if (ok) {
+        index_bytes = col_join_batch_index_bytes(cont);
+        before_cancel = reserved_of(f.sess);
+        wl_columnar_continuation_cancel(cont);
+        ok = index_bytes > 0
+            && reserved_of(f.sess) == before_cancel - index_bytes
+            && no_reader_holds(slot);
+    }
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    col_rel_destroy(slot);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("cancel kept the index, its bytes or the reader");
+}
+
 /* #2201: both producers pin the right arrangement by name, by a scan of
  * the session's relations, while the JOIN resolves its right operand
  * through the relation hash.  Should the two ever name different
@@ -7282,6 +7574,11 @@ main(void)
     test_diff_operator_empty_input_nothing_to_bound();
     test_join_batch_eligibility_order();
     test_join_batch_refuses_shadowed_right();
+    test_owned_index_sizing();
+    test_owned_index_reads_given_relation();
+    test_owned_index_empty_right();
+    test_owned_index_failures_release();
+    test_owned_index_cancel_releases();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
     test_sink_prepare_resize_failure();

@@ -31,6 +31,24 @@
 #include <pthread.h>
 #endif
 
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+#if defined(_MSC_VER)
+static __declspec(thread) bool test_fail_index_build;
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+static _Thread_local bool test_fail_index_build;
+#else
+static __thread bool test_fail_index_build;
+#endif
+
+/* The next owned index build on this thread fails with ENOMEM after its
+ * bytes are admitted (#2201). */
+void
+wl_columnar_join_batch_test_fail_next_index_build(void)
+{
+    test_fail_index_build = true;
+}
+#endif
+
 /* ---- eligibility ------------------------------------------------------- */
 
 col_join_batch_eligibility_t
@@ -177,6 +195,15 @@ typedef struct {
     col_arrangement_pin_t pin;
     wl_columnar_source_access_reader_t runner_left_reader;
     wl_columnar_source_access_reader_t runner_right_reader;
+    /* An explicit right relation (#2201): the producer builds and owns its
+     * index over it instead of pinning a registry arrangement by name, and
+     * holds a reader on it while the index lives. */
+    col_arrangement_t own_arr;
+    wl_columnar_memory_reservation_t index_reservation;
+    bool index_reserved;
+    bool index_committed;
+    uint64_t index_bytes;
+    wl_columnar_source_access_reader_t own_right_reader;
     const col_arrangement_t *arr;
     /* The union keeps the raw allocation tail aligned for key_row on
      * compilers without C11 _Alignof support. */
@@ -704,6 +731,22 @@ producer_release_lease(col_join_batch_producer_t *p)
 {
     if (p->pin.active)
         col_arrangement_pin_release(&p->pin);
+    /* The owned index: free its tables, then return its admission, then
+     * the reader on the relation it indexed.  Each step clears its state,
+     * so cancel followed by destroy releases nothing twice. */
+    col_arrangement_owned_release(&p->own_arr);
+    if (p->index_reserved) {
+        bool released = p->index_committed
+            ? wl_columnar_memory_release(&p->index_reservation)
+            : wl_columnar_memory_rollback(&p->index_reservation);
+        if (!released)
+            abort();
+        p->index_reserved = false;
+        p->index_committed = false;
+    }
+    if (p->own_right_reader.owner)
+        if (col_rel_source_reader_release(&p->own_right_reader) != 0)
+            abort();
     if (p->runner_left_reader.owner)
         if (col_rel_source_reader_release(&p->runner_left_reader) != 0)
             abort();
@@ -764,8 +807,9 @@ producer_destroy(void *context)
 static int
 col_join_batch_producer_create_internal(wl_col_session_t *sess,
     const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
-    const uint32_t *lk, const uint32_t *rk, uint32_t kc,
-    uint64_t batch_bytes, bool runner, wl_columnar_continuation_t **out)
+    const col_rel_t *bound_right, const uint32_t *lk, const uint32_t *rk,
+    uint32_t kc, uint64_t batch_bytes, bool runner,
+    wl_columnar_continuation_t **out)
 {
     col_join_batch_producer_t *p;
     const col_rel_t *right;
@@ -786,15 +830,22 @@ col_join_batch_producer_create_internal(wl_col_session_t *sess,
     if (out)
         *out = NULL;
     if (!sess || !op || !left || !lk || !rk || kc == 0 || !out
-        || !op->right_relation || batch_bytes == 0)
+        || (!bound_right && !op->right_relation) || batch_bytes == 0
+        || (bound_right && runner))
         return EINVAL;
-    right = session_find_rel(sess, op->right_relation);
-    if (!right)
-        return ENOENT;
-    /* The arrangement is pinned by name, by a scan of the relations; refuse
-     * unless that scan finds this same relation (#2201). */
-    if (!col_session_has_exact_relation(sess, right, op->right_relation))
-        return ENOENT;
+    if (bound_right) {
+        /* An explicit right relation is indexed by the producer itself and
+         * is never looked up by name (#2201). */
+        right = bound_right;
+    } else {
+        right = session_find_rel(sess, op->right_relation);
+        if (!right)
+            return ENOENT;
+        /* The arrangement is pinned by name, by a scan of the relations;
+         * refuse unless that scan finds this same relation (#2201). */
+        if (!col_session_has_exact_relation(sess, right, op->right_relation))
+            return ENOENT;
+    }
     if (runner) {
         rc = col_rel_source_reader_acquire(left, &left_reader);
         if (rc)
@@ -906,10 +957,59 @@ col_join_batch_producer_create_internal(wl_col_session_t *sess,
         p->descriptor_committed = true;
     }
 
+    /* An explicit right relation: hold a reader on it, admit the index's
+     * exact bytes under the producer's governor, then build the index the
+     * producer owns until destroy or cancel (#2201). */
+    if (bound_right) {
+        rc = col_rel_source_reader_acquire(right, &p->own_right_reader);
+        if (rc != 0)
+            goto fail;
+        rc = col_arrangement_owned_bytes(right->nrows, &p->index_bytes);
+        if (rc != 0)
+            goto fail;
+        if (p->descriptor_governor) {
+            wl_columnar_memory_reservation_init(&p->index_reservation);
+            wl_columnar_memory_admission_status_t admission
+                = wl_columnar_memory_reserve_checked(
+                    wl_columnar_memory_governor_ref_get(
+                        p->descriptor_governor),
+                    p->index_bytes, &p->index_reservation);
+            if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                if (admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED)
+                    sess->memory_budget_denied = true;
+                rc = admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
+                    ? ENOSPC
+                    : admission == WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW
+                    ? EOVERFLOW : ENOMEM;
+                goto fail;
+            }
+            p->index_reserved = true;
+        }
+#ifdef WL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS
+        if (test_fail_index_build) {
+            test_fail_index_build = false;
+            rc = ENOMEM;
+            goto fail;
+        }
+#endif
+        rc = col_arrangement_build_owned(&p->own_arr, right, p->rk, kc);
+        if (rc != 0)
+            goto fail;
+        if (p->index_reserved) {
+            if (!wl_columnar_memory_commit(&p->index_reservation,
+                &p->own_arr)) {
+                rc = EINVAL;
+                goto fail;
+            }
+            p->index_committed = true;
+        }
+        p->arr = &p->own_arr;
+    }
+
     /* One lease for the whole continuation.  The registry refuses to
      * relocate entries while any lease is active, so the arrangement
      * pointer stays valid until destroy or cancel. */
-    if (!runner) {
+    if (!runner && !bound_right) {
         rc = col_session_pin_arrangement(&sess->base, op->right_relation,
                 rk, kc, &p->pin);
         if (rc != 0 || !p->pin.arr) {
@@ -1035,7 +1135,21 @@ col_join_batch_producer_create(wl_col_session_t *sess,
     uint64_t batch_bytes, wl_columnar_continuation_t **out)
 {
     return col_join_batch_producer_create_internal(sess, op, left,
-               left_is_delta, lk, rk, kc, batch_bytes, false, out);
+               left_is_delta, NULL, lk, rk, kc, batch_bytes, false, out);
+}
+
+int
+col_join_batch_producer_create_over(wl_col_session_t *sess,
+    const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,
+    const col_rel_t *right, const uint32_t *lk, const uint32_t *rk,
+    uint32_t kc, uint64_t batch_bytes, wl_columnar_continuation_t **out)
+{
+    if (out)
+        *out = NULL;
+    if (!right)
+        return EINVAL;
+    return col_join_batch_producer_create_internal(sess, op, left,
+               left_is_delta, right, lk, rk, kc, batch_bytes, false, out);
 }
 
 static const col_join_batch_producer_t *
@@ -1067,6 +1181,13 @@ col_join_batch_descriptor_bytes(const wl_columnar_continuation_t *cont)
     const col_join_batch_producer_t *p = producer_of(cont);
     return p && p->descriptor_reservation.governor
            ? p->descriptor_reservation.bytes : 0;
+}
+
+uint64_t
+col_join_batch_index_bytes(const wl_columnar_continuation_t *cont)
+{
+    const col_join_batch_producer_t *p = producer_of(cont);
+    return p && p->own_arr.ht_head ? p->index_bytes : 0;
 }
 
 bool
@@ -1390,7 +1511,7 @@ col_join_batch_runner_start(wl_col_session_t *sess, const wl_plan_op_t *op,
     if (!out || !control || !attempt_id)
         return EINVAL;
     int rc = col_join_batch_producer_create_internal(sess, op, left,
-            left_is_delta, lk, rk, key_count, batch_bytes, true, out);
+            left_is_delta, NULL, lk, rk, key_count, batch_bytes, true, out);
     if (rc)
         return rc;
     rc = col_join_batch_control_bind(*out, control, attempt_id);
