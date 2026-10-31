@@ -5061,6 +5061,55 @@ capacity floor and a narrower retry succeeds. Private-attempt cleanup does not
 claim whole-STEP rollback of previously published heads. Mutable/differential
 traces, general expressions and SIDE/nested layouts remain outside this route.
 
+### Segmented immutable Z-set trace snapshots (#1372, internal)
+
+`columnar/trace_store.h` adds an explicit numeric scalar trace owner composed
+of existing immutable batch payloads. Append capture keeps its input owner;
+append take transfers an exclusively owned governed heap relation, physically
+retires its row storage, and clears the source pointer. All rows are validated
+before publication: physical schemas/governors must agree and timestamp
+iteration/stratum/worker/reserved coordinates must be zero. Signed int64 weights,
+including negative retraction contributions and zero, remain exact. This is a
+zero-coordinate Z-set, not a general logical-time trace or consolidated set.
+
+Each append commits a stable ordinal range and storage generation. An immutable
+snapshot retains only its committed boundary: later appends are invisible to it.
+Total rows and segment count are each limited to UINT32_MAX, including empty
+segments; generation overflow is refused before source retirement. Snapshot and
+node descriptors are governed O(segment count) metadata. A snapshot directory
+uses binary search (at most 32 comparisons) even across repeated empty segments,
+without any O(row count) offset table. Each cursor independently retains its
+snapshot and holds at most one active payload reader, so read scratch depends
+on row width rather than historical cardinality. Source, payload, metadata,
+transition, and output allocations remain additional resident floors.
+
+Demotion replaces an unpinned resident segment with the existing spill format
+and releases resident row storage. A snapshot pin makes demotion BUSY even if
+no cursor has opened that segment. Failed admission, allocation, cancellation,
+or I/O preserves the old generation and source; append take performs no
+fallible work after source retirement. Retirement closes new owner operations
+and keeps all owner nodes alive until the final snapshot/cursor drains. An
+empty snapshot also retains that owner lifetime.
+
+The spill store remains externally owned. Trace retirement alone permits old
+snapshots to continue reading while the store stays open. After spill-store
+retirement, an already opened segment reader remains usable, but later lazy
+acquisition returns CLOSED. This failure is not an empty result. No successful
+cross-segment drain is promised across external store retirement.
+
+A governed per-owner mutex serializes lazy segment reader transitions so
+independent cursors of the same trace can read concurrently. Actual per-reader
+I/O occurs outside that lock. Explicit acquisition/release, append, demotion and
+retirement remain externally serialized against reads. Different trace owners
+sharing an external spill store must serialize cursor operations as well; this
+does not make the spill store's lifecycle globally thread-safe.
+
+This storage/scan contract does not automatically migrate session relations,
+legacy differential arrangements or JOIN execution. Segmented indexed and signed
+JOIN consumers belong to the following units of the same functional PR group.
+STRING/INLINE/SIDE/nested provenance, general logical time, mutable-session
+routing and #1373 scheduling remain outside this numeric trace owner.
+
 ### Remaining #1372 implementation groups
 
 The sealed scalar numeric/STRING and declared flat INLINE field JOIN/projection

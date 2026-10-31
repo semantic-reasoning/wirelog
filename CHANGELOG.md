@@ -6,6 +6,10 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Internal numeric Z-set traces own mixed resident/spilled immutable segments,
+  preserve signed contributions in generation-pinned snapshots, and reclaim
+  transferred source rows with governed directory and one-reader scratch (#1372).
+
 - Cold direct MAP/FILTER scans can feed audited JOIN pipelines, preserving
   FILTER-only names/INLINE provenance and validating stage-local suffix types.
   Narrow resident suffix predicates support parsed pushed-down conditions;

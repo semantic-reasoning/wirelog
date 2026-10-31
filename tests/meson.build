@@ -137,6 +137,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/join.c',
     '../wirelog/columnar/join_batch.c',
     '../wirelog/columnar/batch_payload.c',
+    '../wirelog/columnar/trace_store.c',
     '../wirelog/columnar/payload_join.c',
     '../wirelog/columnar/join_pipeline.c',
     '../wirelog/columnar/diff_join_batch.c',
@@ -2095,6 +2096,7 @@ backend_src = files(
   '../wirelog/columnar/continuation.c',
   '../wirelog/columnar/join_batch.c',
   '../wirelog/columnar/batch_payload.c',
+    '../wirelog/columnar/trace_store.c',
   '../wirelog/columnar/payload_join.c',
   '../wirelog/columnar/join_pipeline.c',
   '../wirelog/columnar/diff_join_batch.c',
@@ -6656,3 +6658,15 @@ test_evaluation_lifecycle_exe = executable(
 )
 test('evaluation_lifecycle', test_evaluation_lifecycle_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# #1372 segmented numeric trace ownership and lazy bounded cursors.
+test_trace_store_exe = executable(
+  'test_trace_store', files('test_trace_store.c',
+    '../wirelog/columnar/trace_store.c', '../wirelog/columnar/batch_payload.c',
+    '../wirelog/columnar/spill.c'),
+  c_args: ['-DWL_TEST_TRACE_STORE=1', '-DWL_TEST_BATCH_PAYLOAD=1', '-DWL_TEST_SPILL=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+)
+test('trace_store', test_trace_store_exe, suite: ['unit', 'tsan'], timeout: 120)
