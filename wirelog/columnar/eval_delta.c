@@ -3824,6 +3824,20 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         sess->retraction_right_pass = false;
         sess->diff_operators_active = false;
     }
+    /* Detach/reseed replaced the heads: a convergence frontier for their old
+     * contents cannot skip this full reconstruction. Differential bulk resets
+     * intentionally preserve iteration, so explicitly invalidate this prefix
+     * through the existing sentinel reset operations. */
+    col_frontier_epoch_ops.reset_stratum_frontier(sess, stratum_idx,
+        sess->outer_epoch);
+    uint32_t rule_base = 0;
+    if (sess->plan)
+        for (uint32_t si = 0; si < stratum_idx; ++si)
+            rule_base += sess->plan->strata[si].relation_count;
+    for (uint32_t ri = 0; ri < sp->relation_count
+        && rule_base + ri < MAX_RULES; ++ri)
+        col_frontier_epoch_ops.reset_rule_frontier(sess, rule_base + ri,
+            sess->outer_epoch);
     rc = col_eval_stratum(sp, sess, stratum_idx);
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_eval_delta_test_after_eval)
@@ -3833,7 +3847,7 @@ col_stratum_step_with_delta(const wl_plan_stratum_t *sp, wl_col_session_t *sess,
         rc = EBUSY;
     sess->retraction_seeded = saved_retraction_seeded;
     sess->diff_operators_active = saved_diff_operators_active;
-    if (rc != 0)
+    if (rc != 0 || sess->eval_stratum_iteration_capped)
         goto cleanup;
 
     /* Steps 3-4: consolidate each IDB relation, fire callbacks for new rows */

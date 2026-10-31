@@ -191,6 +191,23 @@ now_ns(void)
 #define COL_FILTER_STACK 64u
 #define MAX_ITERATIONS 4096u
 #define EVAL_STRIDE 8u /* sub-passes per outer iteration (Issue #237) */
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern uint32_t wl_columnar_eval_serial_test_iteration_limit;
+extern uint32_t wl_columnar_session_test_iteration_limit;
+extern void (*wl_columnar_session_test_iteration_checkpoint)(
+    wl_evaluation_control_t *, uint32_t, bool);
+#endif
+
+static inline uint32_t
+wl_columnar_eval_serial_iteration_limit(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_serial_test_iteration_limit)
+        return wl_columnar_eval_serial_test_iteration_limit;
+#endif
+    return MAX_ITERATIONS;
+}
 #define MAX_STRATA 32
 #define MAX_RULES 64
 #define COL_MAT_CACHE_MAX 64u
@@ -843,6 +860,8 @@ typedef struct {
     wl_columnar_relation_managed_retirement_t storage;
     wl_mem_ledger_t *ledger;
     uint64_t ledger_bytes;
+    uint64_t ledger_timestamp_bytes, timestamp_bytes;
+    uint32_t owned_columns;
     uint32_t column, prior_column;
     unsigned phase;
     bool ready, committed;
@@ -2795,6 +2814,9 @@ typedef struct wl_col_session_t {
      * made; it is neither a gate nor a predicate, and nothing may consult it
      * later.  False is the safe default: it makes the caller restore. */
     bool eval_stratum_heads_final;
+    /* Last evaluator outcome; consume before calling another stratum. Legacy
+     * cap exhaustion returns zero but cannot commit stable-model bookkeeping. */
+    bool eval_stratum_iteration_capped;
     wl_columnar_eval_delta_rollback_t *delta_rollback;
     uint64_t delta_rollback_reserved_bytes;
     wl_columnar_eval_delta_observer_t *delta_observer;
@@ -4401,8 +4423,8 @@ int wl_columnar_relation_append_batch_selected_source_row_operator_controlled(
     wl_columnar_relation_append_batch_t *batch,
     wl_columnar_relation_scalar_source_t *source, uint32_t source_row,
     const int64_t *values, uint32_t width);
-/* Stamp derived sorted caches on an already sorted-and-unique private noTS
- * output, using scalar row comparison. The caller completes dedup first.
+/* Stamp derived sorted caches on an already sorted-and-unique private scalar
+ * output. The caller completes dedup and any timestamp transport first.
  * Requires original native-thread HELD fixed-one writer, current control/ID,
  * and exclusively serialized output lifetime. No later append is permitted.
  * Does not scan/verify ordering or uniqueness, or change rows/generations.
@@ -6624,11 +6646,12 @@ extern int wl_columnar_join_test_attempt_fail_allocation;
  * Protocol refusal leaves both outputs untouched. No other context aliasing. */
 int wl_columnar_eval_stack_filter_finish(
     wl_columnar_eval_stack_cleanup_frame_t *, int, int *, bool *);
-/* Initial serial nonrecursive scalar sorted distinct. No delta/timestamps,
- * differential/retraction/TDD/parallel context. Caller pins immutable plan,
- * session, source and governor through ACK. Always private materialization,
- * including zero/one row; logical parity does not imply allocation parity.
- * NULL control delegates raw CONSOLIDATE. Reuse common FILTER step/ACK. */
+/* Serial nonrecursive scalar sorted distinct preserves the first incoming
+* representative's complete timestamp when present. No delta or active
+* differential/retraction/TDD/parallel context. Caller pins immutable plan,
+* session, source and governor through ACK. Always private materialization,
+* including zero/one row; logical parity does not imply allocation parity.
+* NULL control delegates raw CONSOLIDATE. Reuse common FILTER step/ACK. */
 int wl_columnar_filter_consolidate_attempt_start(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *);
@@ -6891,6 +6914,9 @@ typedef struct wl_columnar_eval_private_bindings {
 
 bool wl_columnar_session_observed_bindings_authorized(
     const wl_col_session_t *, const wl_columnar_eval_private_bindings_t *);
+/* Iteration-zero scalar selectors admitted by the materialized batch host.
+ * JOIN-right has no VARIABLE FORCE_EMPTY semantics. */
+bool wl_columnar_eval_plan_scalar_selector_supported(const wl_plan_op_t *);
 /* Exact host-owned occurrence override for acyclic appends or qualified SCC
  * row frontiers. NULL means full evaluation; an empty delta remains a nonNULL
  * immutable source through child ACK and never a public full-source index key. */

@@ -1335,6 +1335,46 @@ probe_rejections(void)
             if (mode == 8) f.session.join_batch_bytes = 1;
             if (mode == 9) f.session.num_workers = 2;
             if (mode == 10) f.left->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+            if (mode == 2 || mode == 3) {
+                col_rel_t *physical = mode == 2 ? f.left : f.registry[0];
+                const int64_t weights[] = {0, 1, -1, 3, -4};
+                col_delta_timestamp_t stamps[5];
+                CHECK(physical->nrows <= 5 && physical->timestamps);
+                wl_columnar_relation_touch_storage(physical);
+                for (uint32_t r = 0; r < physical->nrows; ++r) {
+                    stamps[r] = (col_delta_timestamp_t){.iteration = 100-r,
+                                                        .stratum = r%3,
+                                                        .worker = r%2,
+                                                        ._reserved = 0,
+                                                        .multiplicity =
+                                                            weights[r]};
+                    physical->timestamps[r] = stamps[r];
+                }
+                col_relation_snapshot_t image =
+                    wl_columnar_relation_snapshot(physical);
+                /* Empty key list is an existence probe: every left row has
+                 * a match in this nonempty right input. Output is a value
+                 * projection, independent of the incoming signed weights. */
+                probe_compare(&f, anti ? 0 : 3);
+                const col_rel_t *out = wl_columnar_eval_stack_cleanup_stack(
+                    f.frame)->items[0].rel;
+                CHECK(!out->timestamps);
+                for (uint32_t r = 0; r < out->nrows; ++r)
+                    for (uint32_t c = 0; c < 2; ++c)
+                        CHECK(out->columns[c][r] == (int64_t)r+c);
+                CHECK(wl_columnar_relation_snapshot_equal(image,
+                    wl_columnar_relation_snapshot(physical)));
+                for (uint32_t r = 0; r < physical->nrows; ++r) {
+                    const col_delta_timestamp_t *a = &physical->timestamps[r];
+                    const col_delta_timestamp_t *b = &stamps[r];
+                    CHECK(a->iteration == b->iteration &&
+                        a->stratum == b->stratum
+                        && a->worker == b->worker && a->_reserved == 0
+                        && a->multiplicity == b->multiplicity);
+                }
+                fixture_close(&f);
+                continue;
+            }
             eval_entry_t before =
                 wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0];
             run(&f);

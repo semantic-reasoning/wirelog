@@ -1055,6 +1055,16 @@ distinct stop errors through both facades, without exposing these internal types
 
 ### Publication-cutoff state map (#1953; both paths implemented)
 
+The raw serial iteration-cap exit also preserves pending inputs, requests a
+full retry, invalidates snapshot stability and clears plain-STEP completion
+tokens through `wl_columnar_session_note_iteration_cap`. Its historical status
+is zero; that status does not establish convergence. The table below includes
+these writers. A configured controlled attempt instead returns `EOVERFLOW`
+before private heads or notifications are published if its effective
+fixed-point allowance is exhausted; cancellation/work exhaustion observed at
+that decision takes precedence. See
+[the complete cap inventory](implementation/1821/ITERATION_CAP_AUDIT.md).
+
 A callback-free W1 STEP arms `EVALUATE_REMAINING` after each fully successful
 stratum, including checked cleanup. A later ordinary error preserves that
 completed prefix; STEP or SNAPSHOT resumes at the next stratum. A failed first
@@ -1171,17 +1181,17 @@ call.
 | field | written by | read by | verdict |
 |---|---|---|---|
 | `last_inserted_relation` | `col_controlled_step_recursive_drive`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action`, `wl_columnar_session_seal_join_input` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `session_snapshot_insert`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` | PRESERVE |
-| `pending_input_change` | `col_controlled_step_recursive_drive`, `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_observed_action` | PRESERVE |
-| `pending_full_input_eval` | `col_controlled_step_recursive_drive`, `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_observed_action` | PRESERVE |
+| `pending_input_change` | `col_controlled_step_recursive_drive`, `col_session_create_internal`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_observed_action` | PRESERVE |
+| `pending_full_input_eval` | `col_controlled_step_recursive_drive`, `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_observed_action` | PRESERVE |
 | `has_evaluated` | `col_controlled_step_recursive_drive`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` | PRESERVE |
-| `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_observed_action` | `col_session_snapshot_impl` | PRESERVE |
+| `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl` | PRESERVE |
 | `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_prepare`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` | PRESERVE |
 | `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
-| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_seal_join_input` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
-| `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
-| `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
-| `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The snapshot path never writes it, so the snapshot cutoff has nothing to perform here. |
+| `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_seal_join_input` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
+| `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_note_iteration_cap` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
+| `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
+| `plain_step_completion_active` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl`, `col_session_step_impl` | **COMMIT** on the step path -- a re-entrancy latch, not progress. While it stays set beside `plain_step_completion_pending`, the entry guard of both `col_session_step_impl` and `col_session_snapshot_impl` returns `EBUSY` above every line that would clear it. The successful snapshot publication path does not write it, so its publication cutoff has nothing to perform here. Capped snapshot recovery clears it through `wl_columnar_session_note_iteration_cap` before returning a partial raw image. |
 | `col_rel_t::base_nrows` | `col_controlled_step_recursive_drive`, `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_reset_rows_locked`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_seed_shadow_apply_remove`, `tdd_empty_relation_candidate`, `tdd_seed_bdx_coordinator_idb`, `wl_columnar_eval_serial_canonicalize_aggregate_locked`, `wl_columnar_merge_incremental_delta_attempt_advance`, `wl_columnar_relation_new_empty_governed_like_locked`, `wl_retraction_restore`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_rel_compact_impl`, `col_rel_deep_copy`, `col_rel_deep_copy_governed_impl`, `col_rel_install_shared_view_unprotected`, `col_rel_mutable_image_validate`, `col_session_remove`, `col_session_remove_incremental`, `col_stratum_step_retraction_nonrecursive`, `session_private_rel_truncate`, `session_snapshot_insert`, `session_seed_shadow_apply_remove`, `session_seed_shadow_plan_remove`, `wl_columnar_eval_delta_observer_begin`, `wl_retraction_stage_prepare`, `wl_columnar_eval_delta_build_action`, `wl_columnar_managed_candidate_input_shape`, `wl_columnar_merge_incremental_delta_attempt_advance`, `wl_columnar_session_observed_action`, `col_session_controlled_mutation_committed` | PRESERVE -- the insert route (`session_snapshot_insert`) takes rows `[base_nrows, nrows)` of the inserted relation as the rows an incremental insert appended, so committing the bookkeeping's `base_nrows = nrows` on a stopped attempt would make the retry find no inserted rows and leave the heads without them. `col_controlled_step_recursive_drive` advances this boundary only in `FINALIZE_COMMITTED`, after successful publication; a stopped attempt retains the old boundary. That is the whole verified consequence; see the note below before adding another |
 
 Two non-field actions sit in the same region and need their own verdicts.
@@ -1512,8 +1522,9 @@ The existing top-one and initially-empty begin APIs retain their contracts.
 
 The private `wl_columnar_merge_concat_attempt_*` interface materializes the
 left rows followed by the right rows, retaining duplicates and supporting empty
-and nullary inputs. It requires two ordinary scalar entries of equal width,
-without timestamps, in the initial serial domain. Non-NULL operation control
+and nullary inputs. It requires two ordinary scalar entries of equal width
+in the initial serial domain. Timestamped inputs are accepted; the result
+projects values and omits stamps, matching raw two-input CONCAT. Non-NULL operation control
 never falls back to raw execution; the raw single-entry K-copy marker remains
 outside this controlled domain. Output is owned, flat and non-delta, with no
 K-way optimization segment array. Input segment arrays remain independent
@@ -1539,7 +1550,8 @@ empty-frame claim; depths1..32 use the genuine expected-depth stack claim.
 Before any lookup or publication, paid abstract-depth preflight visits every
 opcode: VARIABLE adds one, CONCAT requires two and removes one, supported
 numeric children require one and preserve depth, and final depth must be one.
-Prebound inputs are checked separately for the scalar/noTS domain. Registry,
+Prebound inputs receive scalar representation checks; each consumer owns its
+timestamp preservation or value-projection contract. Registry,
 plan and borrowed registry storage remain immutable and live through ACK.
 Prebound owned entries retire only through their controlled child transactions.
 
@@ -1933,3 +1945,47 @@ declarations and the original-use summary. Numeric-only INLINE still pins the
 functor intern table. Output lanes retain scalar types without the source arity
 map; wrong functor/arity, nested and whole-compound uses refuse before retiring
 the source.
+
+### Controlled scalar selectors and completed recursive removal
+
+The non-strict, iteration-zero scalar materialized batch fallback admits
+VARIABLE AUTO/FORCE_FULL/FORCE_DELTA/FORCE_EMPTY/FORCE_EMPTY_AFTER_SEED and
+JOIN-right AUTO/FORCE_FULL/FORCE_DELTA. AUTO uses a nonempty smaller delta;
+JOIN-right AUTO keeps its full source when the left is already delta.
+FORCE_DELTA uses an available nonempty delta, or the existing unseeded base-case
+full source when none exists. VARIABLE FORCE_EMPTY produces an empty source;
+FORCE_EMPTY_AFTER_SEED has AUTO behavior in this admitted iteration-zero domain.
+These are internal execution-plan contracts, not new public selector APIs.
+Strict batching, output policy, worker and foreign active-state checks remain
+unchanged. The owned evaluator authenticates sources and bills selection,
+materialization and JOIN work under the same attempt.
+
+A completed, quiescent callback-free binary INT64 recursive `edge`/`path` host
+can accept removal of declared edge rows when its old input/head provenance and
+preserved body are valid. A successful nonzero removal switches the next
+operation to bounded private full reconstruction. Failed and zero-row requests
+leave the completed fast path intact; an actual foreign source reader can still
+return EBUSY. The reconstructed heads and signed observer differences publish
+at the existing common cutoff. Fixed private bindings use a bounded local JOIN
+index; only authenticated dynamic general-transaction bindings can request
+persistent index ownership.
+
+| Removal lifecycle boundary | State disposition |
+|---|---|
+| Mutation admission/refusal | Validate the old completed provenance before editing inputs. Failure does not promote or replace the frozen evaluation report. |
+| Successful nonzero mutation | Keep public old heads and notification baseline; the changed EDB remains pending for private reconstruction. Obsolete append-only provenance no longer authenticates a completed result. |
+| Stop before cutoff | Drain/dispose private children and reversible claims; preserve old public heads and pending changed inputs. Caller reset/retry uses a new report, with no events from the failed candidate. |
+| Cutoff and delivery | Publish one registry image and admitted signed event batch. Late cancellation cannot split or replay that batch; late reported work exhaustion does not roll back committed output. |
+| Completion and later calls | Retire retained ownership exactly once. A no-op retry does not repeat events; later mutations re-evaluate from current inputs. Session/control ownership teardown returns governor credit to zero. |
+
+Raw incremental removal still stages one input relation at a time; attempting
+another relation's removal before evaluating retains its EBUSY contract. This
+is separate from a foreign source lease. Scalar signed notifications are not
+physical differential trace weights/timestamps. Their actual scalar transport,
+projection, removal and retirement intersections are now qualified in
+[the physical metadata audit](implementation/1821/PHYSICAL_METADATA_AUDIT.md).
+The separate [iteration-cap audit](implementation/1821/ITERATION_CAP_AUDIT.md)
+records all cap dispositions and required fixes. Remaining persistent weighted
+trace, general recursive/resource/configuration and platform domains retain
+#2293's existing owners. The `evaluation_differential` tests qualify the
+predicates above, including source/index/probe/claim/cutoff stops and retry.

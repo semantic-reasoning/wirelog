@@ -2970,6 +2970,15 @@ test_consolidate_shape_refusals(void)
             uint64_t generation = f.input->storage_generation;
             int64_t bits = rows ? f.input->columns[0][0] : 0;
             fixture_begin(&f, &plan, 0, 1); run(&f);
+            if (!shape) {
+                CHECK(!f.record.semantic_result && f.record.completed == 1);
+                eval_stack_t *result =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                CHECK(result->top == 1 && result->items[0].rel->timestamps
+                    && result->items[0].rel->nrows == rows);
+                CHECK(f.input->storage_generation == generation);
+                fixture_close(&f); continue;
+            }
             CHECK(f.record.semantic_result == (shape < 2 ? ENOTSUP : EINVAL)
                 && !f.record.completed && !f.session.memory_budget_denied);
             eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
@@ -6023,9 +6032,13 @@ test_composed_domain_and_repeated_source(void)
                     wl_columnar_eval_stack_cleanup_stack(f.frame), f.input,
                     false));
         composed_begin(&f, &ts_body, registry, 1, prebound); composed_run(&f);
-        CHECK(f.record.semantic_result == ENOTSUP && !f.record.completed
+        CHECK(!f.record.semantic_result && f.record.completed == 2 - prebound
             && !f.record.source_slot_borrowed && !f.record.source_initialized);
-        CHECK(wl_columnar_eval_stack_cleanup_stack(f.frame)->top == prebound);
+        eval_stack_t *result = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(result->top == 1);
+        if (!prebound) CHECK(!result->items[0].rel->nrows
+                && !result->items[0].rel->timestamps);
+        else CHECK(result->items[0].rel->timestamps);
         composed_close(&f);
     }
 }
@@ -6060,7 +6073,9 @@ test_composed_controlled_batch_fallback_owner(void)
     f.session.join_batch_bytes = 224;
     wl_plan_op_t rejected_ops[5];
     memcpy(rejected_ops, body->ops, sizeof(rejected_ops));
-    rejected_ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+    /* DELTA is an admitted scalar selector; unknown modes still refuse
+     * before allocating an authenticated fallback owner. */
+    rejected_ops[0].delta_mode = (wl_delta_mode_t)99;
     wl_plan_relation_t rejected_body = *body;
     rejected_body.ops = rejected_ops;
     CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(

@@ -4548,8 +4548,7 @@ wl_columnar_relation_scalar_retirement_prepare(
         if (rc) return rc;
         s->phase = 1;
     } else if (s->phase == 1) {
-        if (r->pool_owned || r->arena_owned || r->timestamps
-            || r->timestamp_capacity || r->retract_backup_columns
+        if (r->pool_owned || r->arena_owned || r->retract_backup_columns
             || r->retract_backup_timestamps ||
             r->retract_backup_timestamp_capacity
             || r->retract_backup_nrows || r->retract_backup_base_nrows
@@ -4558,7 +4557,7 @@ wl_columnar_relation_scalar_retirement_prepare(
             || r->compound_count || r->compound_arity_map ||
             r->compound_arity_len
             || r->inline_physical_offset || r->memory_budget_denial_pending
-            || r->pool_name_reserved_bytes || r->ledger_ts_bytes
+            || r->pool_name_reserved_bytes
             || r->deferred_relation_next || r->deferred_relation_session
             || r->storage_owner != r || !r->relation_identity
             || r->storage_owner_identity != r->relation_identity
@@ -4570,6 +4569,25 @@ wl_columnar_relation_scalar_retirement_prepare(
             || (r->ncols && (!r->schema.children || !r->col_names))))
             || (!r->schema_ok && (r->schema.release || r->schema.children
             || r->schema.n_children || r->col_names))) return ENOTSUP;
+        if ((r->timestamps != NULL) != (r->timestamp_capacity != 0)
+            || (r->timestamps && r->timestamp_capacity < r->nrows)
+            || !wl_columnar_memory_size_mul(r->timestamp_capacity,
+            sizeof(col_delta_timestamp_t), &s->timestamp_bytes)
+            || (!r->mem_ledger && r->ledger_ts_bytes)) return EINVAL;
+        if (r->timestamps) {
+            const void *ts = r->timestamps;
+            if (ts == (const void *)r || ts == (const void *)r->columns
+                || ts == (const void *)r->merge_columns
+                || ts == (const void *)r->row_scratch
+                || ts == (const void *)r->col_names
+                || ts == (const void *)r->column_types
+                || ts == (const void *)r->dedup_slots
+                || ts == (const void *)r->name
+                || ts == (const void *)r->schema.children
+                || ts == (const void *)r->schema.name
+                || ts == (const void *)r->schema.format
+                || ts == (const void *)r->schema.metadata) return EINVAL;
+        }
         s->storage.governor = r->memory_governor
             ? wl_columnar_memory_governor_ref_get(r->memory_governor) : NULL;
         for (size_t i = 0; i < 4; ++i) {
@@ -4586,9 +4604,28 @@ wl_columnar_relation_scalar_retirement_prepare(
                 &r->pool_name_reservation))
             return ENOTSUP;
         s->ledger = r->mem_ledger;
+        /* Deferred accounting can leave either unbilled storage or an unpaid
+         * refund after raw consolidation already freed the stamp array.
+         * The recorded charge is authoritative, independently of live bytes. */
+        s->ledger_timestamp_bytes = r->ledger_ts_bytes;
         s->phase = 2;
     } else if (s->phase == 2) {
         if (s->column == r->ncols) {
+            if ((r->timestamps || s->ledger_timestamp_bytes)
+                && s->storage.governor) {
+                col_rel_payload_shape_t shape = {
+                    .ncols = r->ncols, .owned_columns = s->owned_columns,
+                    .column_capacity = r->capacity,
+                    .timestamp_capacity = r->timestamp_capacity,
+                    .merge_capacity = r->merge_buf_cap,
+                    .active_table = r->columns != NULL,
+                    .merge_table = r->merge_columns != NULL,
+                    .scratch = r->row_scratch != NULL
+                };
+                uint64_t bytes;
+                if (!col_rel_payload_shape_bytes(&shape, &bytes)
+                    || bytes > r->retained_reserved_bytes) return EINVAL;
+            }
             s->column = 0;
             s->ready = true;
             return wl_evaluation_control_charge_attempt(control, id, 0);
@@ -4604,8 +4641,22 @@ wl_columnar_relation_scalar_retirement_prepare(
                 child->release != expected_schema.release
                 || !r->col_names[c])
                 return ENOTSUP;
+            if (r->timestamps) {
+                const void *ts = r->timestamps;
+                if (ts == (const void *)child
+                    || ts == (const void *)child->name
+                    || ts == (const void *)child->format
+                    || ts == (const void *)child->metadata) return EINVAL;
+            }
         }
+        if (r->timestamps
+            && ((r->columns && (void *)r->timestamps == r->columns[c])
+            || (r->merge_columns
+            && (void *)r->timestamps == r->merge_columns[c])
+            || (r->col_names
+            && (void *)r->timestamps == r->col_names[c]))) return EINVAL;
         if (r->columns && r->columns[c]) {
+            ++s->owned_columns;
             uint64_t bytes = (uint64_t)r->capacity * sizeof(int64_t);
             if (!wl_columnar_memory_size_add(s->ledger_bytes, bytes,
                 &s->ledger_bytes)) return EOVERFLOW;
@@ -4721,17 +4772,26 @@ wl_columnar_relation_scalar_retirement_step(
         free(r->row_scratch); r->row_scratch = NULL;
         free(r->column_types); r->column_types = NULL;
         free(r->dedup_slots); r->dedup_slots = NULL;
+        s->phase = r->timestamps ? 14 : 12;
+        break;
+    case 14:
+        free(r->timestamps); r->timestamps = NULL;
+        r->timestamp_capacity = 0;
         s->phase = 12;
         break;
     case 12:
-        if (s->ledger && s->ledger_bytes) {
+        if (s->ledger && (s->ledger_bytes || s->ledger_timestamp_bytes)) {
             wl_columnar_mem_ledger_publication_prepared_t ledger = {0};
-            wl_columnar_mem_ledger_publication_request_t request = {
-                WL_MEM_SUBSYS_RELATION, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
-                s->ledger_bytes
+            wl_columnar_mem_ledger_publication_request_t requests[2] = {
+                {WL_MEM_SUBSYS_RELATION,
+                 WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE, s->ledger_bytes},
+                {WL_MEM_SUBSYS_TIMESTAMP,
+                 WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+                 s->ledger_timestamp_bytes}
             };
+            size_t count = s->ledger_timestamp_bytes ? 2 : 1;
             rc = wl_columnar_mem_ledger_publication_prepare_controlled(
-                s->ledger, &request, 1, &ledger, control);
+                s->ledger, requests, count, &ledger, control);
             if (!rc) rc =
                     wl_columnar_mem_ledger_publication_acquire_controlled(
                     &ledger);
@@ -4748,8 +4808,10 @@ wl_columnar_relation_scalar_retirement_step(
             if (wl_columnar_mem_ledger_publication_apply(&ledger)
                 || wl_columnar_mem_ledger_publication_release(&ledger)) abort();
         }
+        r->ledger_ts_bytes = 0;
         r->mem_ledger = NULL;
         s->ledger = NULL;
+        s->ledger_bytes = s->ledger_timestamp_bytes = 0;
         s->phase = 10;
         break;
     case 10:
@@ -17374,7 +17436,9 @@ wl_columnar_relation_append_batch_mark_sorted_operator_controlled(
             128);
     if (rc) return rc;
     col_rel_t *output = batch->raw.relation;
-    bool supported = output->storage_owner == output && !output->timestamps
+    /* Stable scalar sorting/dedup transports each selected timestamp before
+     * sealing. Metadata does not change the value-order cache invariant. */
+    bool supported = output->storage_owner == output
         && !output->pool_owned && !output->arena_owned
         && output->compound_kind == WIRELOG_COMPOUND_KIND_NONE;
     int tail = wl_columnar_relation_constructor_attempt_tail(control,

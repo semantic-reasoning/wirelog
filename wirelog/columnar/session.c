@@ -389,7 +389,11 @@ wl_columnar_session_diff_index(wl_col_session_t *sess,
     col_diff_arrangement_t **out, bool *build)
 {
     *out = NULL; *build = false;
-    if (!sess->diff_enabled || !bindings || sess->spill_join_batch_bytes
+    /* Fixed bindings belong to the legacy framed host, not a general
+     * transaction that can own a persistent index image. Its source reads
+     * remain authenticated by the evaluator and use the bounded local index. */
+    if (!sess->diff_enabled || !bindings || !bindings->dynamic_entries
+        || sess->spill_join_batch_bytes
         || sess->join_batch_bytes)
         return 0;
     if (!wl_columnar_session_observed_bindings_authorized(sess, bindings))
@@ -464,6 +468,9 @@ size_t wl_columnar_session_test_observer_precharged_events;
 bool wl_columnar_session_test_fail_frontier_map_allocation;
 void (*wl_columnar_session_test_before_successor_registration)(col_rel_t *);
 void (*wl_columnar_session_test_staging_prepared)(wl_evaluation_control_t *);
+uint32_t wl_columnar_session_test_iteration_limit;
+void (*wl_columnar_session_test_iteration_checkpoint)(
+    wl_evaluation_control_t *, uint32_t, bool);
 void (*wl_columnar_session_test_observed_transaction_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint32_t,
     const wl_columnar_eval_private_bindings_t *);
@@ -5243,6 +5250,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
      * point either: the worker's flag describes the worker's own stratum and
      * must never be merged upward. */
     out_worker->eval_stratum_heads_final = false;
+    out_worker->eval_stratum_iteration_capped = false;
     out_worker->arr_entries = NULL;
     out_worker->arr_count = 0;
     out_worker->arr_cap = 0;
@@ -6677,6 +6685,24 @@ col_session_note_stratum_done(wl_col_session_t *sess, uint32_t si)
         sess->uncommitted_strata_done = (uint16_t)done;
 }
 
+/* Raw cap status remains zero for compatibility, but the partial model is
+ * not stable. Retain input staging and the original observer baseline. */
+static void
+wl_columnar_session_note_iteration_cap(wl_col_session_t *sess, uint32_t si)
+{
+    col_session_note_stratum_done(sess, si); /* extent to clear on retry */
+    sess->pending_input_change = true;
+    sess->pending_full_input_eval = true;
+    sess->snapshot_stable_valid = false;
+    sess->plain_step_completion_pending = false;
+    sess->plain_step_completion_active = false;
+    sess->plain_step_completion_phase = WL_COLUMNAR_PLAIN_STEP_COMPLETION_NONE;
+    sess->plain_step_completion_step_context = false;
+    wl_columnar_eval_delta_observer_set_active(sess, false);
+    wl_columnar_delta_events_clear(sess);
+    col_session_reclaim_quiescent(sess);
+}
+
 static int
 col_session_step_impl(wl_session_t *session)
 {
@@ -6913,6 +6939,10 @@ col_session_step_impl(wl_session_t *session)
             sess->plain_step_completion_active = false;
             col_session_reclaim_quiescent(sess);
             return rc;
+        }
+        if (sess->eval_stratum_iteration_capped) {
+            wl_columnar_session_note_iteration_cap(sess, si);
+            return 0;
         }
         if (sess->plain_step_completion_step_context) {
             col_session_note_stratum_done(sess, si);
@@ -7157,11 +7187,14 @@ wl_columnar_session_recursive_transaction_shape(const wl_col_session_t *sess)
     const wl_plan_t *plan = sess->plan;
     if (!plan || !plan->strata ||
         plan->stratum_count > MAX_STRATA) return false;
-    /* Preserve the independently qualified binary fast path and its tariffs. */
+    /* Timestamped sources use preserved-body set reconstruction. Keep the
+     * independently qualified value-only binary fast path for other inputs. */
+    bool timestamp_source = sess->rels && sess->nrels && sess->rels[0]
+        && sess->rels[0]->timestamps;
     if (!sess->delta_cb && plan->stratum_count == 1
         && plan->strata[0].relation_count == 1 && plan->strata[0].relations
         && wl_columnar_eval_plan_numeric_recursive_path_supported(
-            &plan->strata[0].relations[0])) return false;
+            &plan->strata[0].relations[0]) && !timestamp_source) return false;
     for (uint32_t i = 0; i < plan->stratum_count; ++i) {
         const wl_plan_stratum_t *stratum = &plan->strata[i];
         if (!stratum->is_recursive) continue;
@@ -7727,16 +7760,14 @@ col_controlled_step_preflight(wl_col_session_t *sess,
                 if (!col_controlled_step_controlled_op(op)) return ENOTSUP;
                 if (step->preflight_op == 0
                     && (op->op != WL_PLAN_OP_VARIABLE
-                    || (op->delta_mode != WL_DELTA_AUTO
-                    && op->delta_mode != WL_DELTA_FORCE_FULL)))
+                    || !wl_columnar_eval_plan_scalar_selector_supported(op)))
                     return ENOTSUP;
                 if (step->preflight_op == 1
                     && (op->op != WL_PLAN_OP_JOIN || op->materialized
                     || !op->right_relation || !op->key_count
                     || !op->left_keys || !op->right_keys)) return ENOTSUP;
                 if (step->preflight_op == 1
-                    && op->delta_mode != WL_DELTA_AUTO
-                    && op->delta_mode != WL_DELTA_FORCE_FULL)
+                    && !wl_columnar_eval_plan_scalar_selector_supported(op))
                     return ENOTSUP;
                 if (step->preflight_op == 2
                     && (op->op != WL_PLAN_OP_FILTER
@@ -7848,12 +7879,8 @@ col_controlled_step_preflight(wl_col_session_t *sess,
             COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA) {
             step->preflight_variable_delta = found;
             step->preflight_variable_delta_rows = found ? found->nrows : 0;
-            wl_delta_mode_t mode = relation->ops[0].delta_mode;
-            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
-                return ENOTSUP;
-            if (mode == WL_DELTA_AUTO && found && found->nrows
-                && found->nrows < step->preflight_variable_full->nrows)
-                return ENOTSUP;
+            /* The child selects full/delta/empty from these immutable sources.
+             * A smaller delta is legal; it must not force a raw fallback. */
             step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_FULL;
         } else if (step->preflight_phase ==
             COL_CONTROLLED_PREFLIGHT_JOIN_FULL) {
@@ -7865,12 +7892,6 @@ col_controlled_step_preflight(wl_col_session_t *sess,
             COL_CONTROLLED_PREFLIGHT_JOIN_DELTA) {
             step->preflight_join_delta = found;
             step->preflight_join_delta_rows = found ? found->nrows : 0;
-            wl_delta_mode_t mode = relation->ops[1].delta_mode;
-            if (mode != WL_DELTA_AUTO && mode != WL_DELTA_FORCE_FULL)
-                return ENOTSUP;
-            if (mode == WL_DELTA_AUTO && found && found->nrows
-                && found->nrows < step->preflight_join_full->nrows)
-                return ENOTSUP;
             step->preflight_phase = COL_CONTROLLED_PREFLIGHT_READY;
             step->controlled_materialized_batch_fallback = true;
         }
@@ -7912,11 +7933,12 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
     }
 #endif
     wl_evaluation_control_t *grant = NULL;
-    /* Recursive capture adds a bound child-begin transition to the relation
-     * host's finite call chain. Keep that protocol allowance explicit; all
-     * evaluator work remains charged to the independent session operation. */
+    /* Ordinary CONCAT cleanup reaches five fixed384 host payments (including
+     * binary finish); four would repeatedly exhaust the grant before progress.
+     * Recursive capture adds bound child-begin transitions. These finite
+     * protocol allowances do not change the independent operation debit. */
     uint64_t host_quanta = step->recursive_route || step->general_observed
-        ? 8 : 4;
+        ? 8 : 5;
     int rc = wl_evaluation_control_create(host_quanta * UINT64_C(384),
             &grant);
     if (rc) return EAGAIN;
@@ -10705,8 +10727,23 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             }
             tx->round_index++; return 0;
         }
+        /* A round is one effective serial sub-pass, not an outer stride.
+         * The unchanged round that proves convergence consumes allowance too. */
+        uint64_t effective_limit =
+            (uint64_t)wl_columnar_eval_serial_iteration_limit() * EVAL_STRIDE;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_iteration_limit)
+            effective_limit = wl_columnar_session_test_iteration_limit;
+        if (wl_columnar_session_test_iteration_checkpoint)
+            wl_columnar_session_test_iteration_checkpoint(control,
+                tx->round + 1, tx->round_changed);
+#endif
         if (tx->round_changed) {
-            if (++tx->round >= MAX_ITERATIONS) return EOVERFLOW;
+            if (++tx->round >= effective_limit) {
+                rc = wl_evaluation_control_charge_attempt(control,
+                        step->operation_id, 0);
+                return rc ? rc : EOVERFLOW;
+            }
             tx->round_index = tx->round_begin;
             tx->phase = WL_SESSION_RECURSIVE_SEED;
         } else {
@@ -11851,6 +11888,27 @@ col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step) return EBUSY;
+    if (step->recursive_route && !insert) {
+        /* The qualified binary host has retired its frame. Authenticate the
+         * old closure before the EDB changes; a successful removal will use
+         * the existing private preserved-body reconstruction, not reuse it. */
+        if (!step->complete || step->operation_active || step->recursive
+            || step->observer_cleanup_pending || sess->cleanup_active
+            || sess->cleanup_pending || sess->delta_observer
+            || sess->delta_publish_active) return EBUSY;
+        if (!col_controlled_step_provenance_current(sess, step)) return EINVAL;
+        const wl_plan_t *plan = sess->plan;
+        if (!relation || strcmp(relation, "edge") != 0 || num_cols != 2
+            || !plan || plan->stratum_count != 1 || !plan->strata
+            || plan->strata[0].relation_count != 1
+            || !plan->strata[0].bodies
+            || !plan->strata[0].bodies[0].declared_int64
+            || plan->strata[0].bodies[0].declared_width != 2
+            || !plan->strata[0].bodies[0].ops
+            || !plan->strata[0].bodies[0].op_count)
+            return ENOTSUP;
+        return 0;
+    }
     /* A completed ordinary host has no observer transaction to authenticate
      * its inputs. Only declared public EDBs may start a private successor.
      * Admission is read-only: failed and zero-row mutations never promote. */
@@ -11938,6 +11996,18 @@ col_session_controlled_mutation_committed(wl_session_t *session,
         return;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step && step->recursive_route && !insert) {
+        /* Admission proved a quiescent authenticated boundary. The mutation
+         * committed, so its new input generation deliberately supersedes the
+         * old append-only provenance. Zero/failed requests never get here. */
+        step->recursive_route = false;
+        step->provenance_valid = false;
+        step->provenance_edge = NULL;
+        step->general_observed = true;
+        step->published = true;
+        step->successor_mutation_seen = true;
+        return;
+    }
     if (step && step->complete && !step->recursive_route
         && !step->general_observed
         && (!step->observed || step->callback_changed)) {
@@ -12237,6 +12307,9 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         int resume_rc = col_session_step_impl(session);
         if (resume_rc != 0)
             return resume_rc;
+        if (sess->eval_stratum_iteration_capped)
+            return col_session_emit_snapshot(sess->plan, sess, callback,
+                       user_data);
     }
     const wl_plan_t *plan = sess->plan;
     sess->extension_expr_status = 0;
@@ -12473,7 +12546,8 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
                 (double)(sess->tdd_final_merge_ns - merge_base) / 1e6);
         }
 
-        if (tdd_cc_active && rc == 0 && pre_saved) {
+        if (tdd_cc_active && rc == 0 && pre_saved
+            && !sess->eval_stratum_iteration_capped) {
             uint32_t *tdd_counts
                 = (uint32_t *)calloc(cnrels, sizeof(uint32_t));
             col_rel_t **tdd_saved
@@ -12604,6 +12678,11 @@ col_session_snapshot_impl(wl_session_t *session, wirelog_on_tuple_fn callback,
         }
         if (sess->eval_arena)
             wl_arena_reset(sess->eval_arena);
+        if (sess->eval_stratum_iteration_capped) {
+            sess->tdd_decision_tracking_active = false;
+            wl_columnar_session_note_iteration_cap(sess, si);
+            return col_session_emit_snapshot(plan, sess, callback, user_data);
+        }
         col_session_note_stratum_done(sess, si);
     }
     sess->tdd_decision_tracking_active = false;

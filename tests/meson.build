@@ -6670,3 +6670,55 @@ test_trace_store_exe = executable(
   link_with: [testlib_prod],
 )
 test('trace_store', test_trace_store_exe, suite: ['unit', 'tsan'], timeout: 120)
+# #2296: scalar source selectors and legal differential/removal routes.
+test_evaluation_differential_exe = executable(
+  'test_evaluation_differential', files('test_evaluation_differential.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_differential', test_evaluation_differential_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+# #2296/#1953: actual physical timestamps and signed multiplicity transport.
+test_evaluation_physical_exe = executable(
+  'test_evaluation_physical', files('test_evaluation_physical.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+  link_with: [testlib_prod_memory_hooks],
+)
+test('evaluation_physical', test_evaluation_physical_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_evaluation_iteration_cap_exe = executable(
+  'test_evaluation_iteration_cap', files('test_evaluation_iteration_cap.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_iteration_cap', test_evaluation_iteration_cap_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_evaluation_session_physical_exe = executable(
+  'test_evaluation_session_physical', files('test_evaluation_session_physical.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_session_physical', test_evaluation_session_physical_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
+test_evaluation_physical_retirement_exe = executable(
+  'test_evaluation_physical_retirement', files('test_evaluation_physical_retirement.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_physical_retirement', test_evaluation_physical_retirement_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

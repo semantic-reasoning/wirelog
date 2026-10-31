@@ -356,8 +356,15 @@ negative_cases(void)
             if (mode == 5) host->op.op = WL_PLAN_OP_FILTER;
             eval_entry_t before = stack->items[0];
             host_run(host);
-            CHECK(host->done && host->status.semantic_result == ENOTSUP);
-            CHECK(!memcmp(&before, &stack->items[0], sizeof(before)));
+            if (mode == 1) {
+                CHECK(host->done && !host->status.semantic_result
+                    && host->status.committed);
+                CHECK(stack->items[0].rel->timestamps);
+                CHECK(stack->items[0].rel->nrows == rows);
+            } else {
+                CHECK(host->done && host->status.semantic_result == ENOTSUP);
+                CHECK(!memcmp(&before, &stack->items[0], sizeof(before)));
+            }
             (void)host_finish(host); col_rel_destroy(input);
         }
     for (unsigned special = 0; special < 3; ++special) {
@@ -1060,9 +1067,81 @@ incremental_prefixes(void)
     }
 }
 
+/* Stable representative selection must preserve provenance, not choose the
+ * smallest timestamp or sum signed weights of equal value tuples. */
+static void
+physical_representatives(void)
+{
+    const uint32_t widths[] = {0, 1, 17};
+    const int64_t weights[] = {0, 1, -1, 3, -4};
+    for (unsigned w = 0; w < 3; ++w) for (unsigned prefix = 0; prefix < 2;
+            ++prefix) {
+            col_rel_t *input = source_new(widths[w], 14, 3, false);
+            col_rel_t *reference = source_new(widths[w], 14, 3, false);
+            CHECK(!col_rel_enable_timestamps(input));
+            CHECK(!col_rel_enable_timestamps(reference));
+            col_delta_timestamp_t saved[14];
+            for (unsigned r = 0; r < 14; ++r) {
+                saved[r] = (col_delta_timestamp_t){.iteration = 100-r,
+                                                   .stratum = r%3,
+                                                   .worker = r%2,
+                                                   ._reserved = 0,
+                                                   .multiplicity = weights[r%
+                                                           5]};
+                input->timestamps[r] = reference->timestamps[r] = saved[r];
+            }
+            if (prefix) {
+                uint32_t sorted = widths[w] ? 7 : 1;
+                input->sorted_nrows = reference->sorted_nrows = sorted;
+                input->run_count = reference->run_count = 1;
+                input->run_ends[0] = reference->run_ends[0] = sorted;
+            }
+            col_relation_snapshot_t before =
+                wl_columnar_relation_snapshot(input);
+            host_t *host = host_new(input, false, 0, 0);
+            eval_stack_t raw = {0};
+            CHECK(!eval_stack_push(&raw, reference, false));
+            CHECK(!col_op_consolidate(&raw, host->session));
+            host_run(host);
+            CHECK(host->done && !host->status.semantic_result &&
+                host->status.committed);
+            col_rel_t *actual =
+                wl_columnar_eval_stack_cleanup_stack(host->frame)->items[0].rel;
+            CHECK(actual->timestamps && raw.items[0].rel->timestamps);
+            CHECK(actual->nrows == (widths[w] ? 7u : 1u));
+            relations_equal(actual, raw.items[0].rel);
+            for (unsigned r = 0; r < actual->nrows; ++r) {
+                unsigned first = widths[w] ? r : 0;
+                const col_delta_timestamp_t *a = &actual->timestamps[r];
+                const col_delta_timestamp_t *b =
+                    &raw.items[0].rel->timestamps[r];
+                const col_delta_timestamp_t *e = &saved[first];
+                CHECK(a->iteration == e->iteration && a->stratum == e->stratum
+                    && a->worker == e->worker && a->_reserved == 0
+                    && a->multiplicity == e->multiplicity);
+                CHECK(b->iteration == e->iteration && b->stratum == e->stratum
+                    && b->worker == e->worker && b->_reserved == 0
+                    && b->multiplicity == e->multiplicity);
+            }
+            CHECK(wl_columnar_relation_snapshot_equal(before,
+                wl_columnar_relation_snapshot(input)));
+            for (unsigned r = 0; r < 14; ++r) {
+                CHECK(input->timestamps[r].iteration == saved[r].iteration
+                    && input->timestamps[r].stratum == saved[r].stratum
+                    && input->timestamps[r].worker == saved[r].worker
+                    && input->timestamps[r]._reserved == 0
+                    && input->timestamps[r].multiplicity ==
+                    saved[r].multiplicity);
+            }
+            CHECK(!eval_stack_drain(&raw)); col_rel_destroy(reference);
+            (void)host_finish(host); col_rel_destroy(input);
+        }
+}
+
 int
 main(void)
 {
+    physical_representatives();
     static const uint32_t widths[] = {0, 1, 7, 17, 129};
     static const uint32_t rows[] = {0, 1, 2, 19, 130};
     for (unsigned w = 0; w < sizeof(widths) / sizeof(widths[0]); ++w)
