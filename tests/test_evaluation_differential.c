@@ -19,9 +19,16 @@
 static int
 finish_step(wl_session_t *session)
 {
+    uint64_t attempt = 0;
     for (unsigned turn = 0; turn < 1000000; ++turn) {
         int rc = wl_session_step(session);
         if (rc != EAGAIN) return rc;
+        if (session->evaluation_control) {
+            uint64_t active = wl_evaluation_control_active_attempt_id(
+                session->evaluation_control);
+            CHECK(active && (!attempt || attempt == active));
+            attempt = active;
+        }
     }
     CHECK(false);
     return EIO;
@@ -72,6 +79,20 @@ check_output(wl_session_t *base, const tuple_t *expected, unsigned count)
 
 /* Independent iteration-zero scalar oracle. The delta flags are source
  * metadata, not an injected session->delta_seeded/current_iteration state. */
+static bool batch_stop_work, batch_stop_hit, batch_selected_delta;
+
+static void
+stop_selected_batch(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    if (phase != 7 || batch_stop_hit) return;
+    batch_stop_hit = true; batch_selected_delta = progress != 0;
+    if (batch_stop_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
 static void
 test_batch_selectors(void)
 {
@@ -160,6 +181,33 @@ test_batch_selectors(void)
                     qsort(expected, count, sizeof(*expected), tuple_order);
                     CHECK(!finish_step(reference));
                     check_output(reference, expected, count);
+                    if (lm == 0 && (rm == 0 || rm == 2) && ld == 2 && rd == 2) {
+                        col_rel_t *input = session_find_rel(
+                            (wl_col_session_t *)controlled, "a");
+                        col_relation_snapshot_t before =
+                            wl_columnar_relation_snapshot(input);
+                        batch_stop_work = rm == 2; batch_stop_hit = false;
+                        wl_columnar_join_test_attempt_checkpoint =
+                            stop_selected_batch;
+                        int stopped = finish_step(controlled);
+                        wl_columnar_join_test_attempt_checkpoint = NULL;
+                        CHECK(stopped == (batch_stop_work
+                            ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                            : WL_EVALUATION_CONTROL_CANCELLED));
+                        CHECK(batch_stop_hit &&
+                            batch_selected_delta == (rm == 2));
+                        CHECK(!session_find_rel((wl_col_session_t *)controlled,
+                            "output"));
+                        CHECK(!((wl_col_session_t *)controlled)
+                            ->controlled_materialized_batch_published_count);
+                        CHECK(wl_columnar_relation_snapshot_equal(before,
+                            wl_columnar_relation_snapshot(input)));
+                        CHECK(!wl_evaluation_control_active_attempt_id(
+                                control));
+                        CHECK(!wl_evaluation_control_reset(control));
+                        CHECK(!wl_evaluation_control_configure(control,
+                            UINT64_C(1000000)));
+                    }
                     CHECK(!finish_step(controlled));
                     check_output(controlled, expected, count);
                     CHECK(((wl_col_session_t *)controlled)
@@ -505,12 +553,172 @@ test_generated_differential_mutations(void)
         }
 }
 
+static unsigned recovery_phase;
+static bool recovery_work, recovery_hit, recovery_join;
+
+static void
+request_recovery_stop(wl_evaluation_control_t *control)
+{
+    recovery_hit = true;
+    if (recovery_work)
+        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+stop_reconstruction(wl_evaluation_control_t *control, unsigned phase,
+    uint32_t index, const wl_columnar_eval_private_bindings_t *bindings)
+{
+    (void)index;
+    if (recovery_join || recovery_hit || phase != recovery_phase
+        || (phase == 8 && !bindings)) return;
+    request_recovery_stop(control);
+}
+
+static void
+stop_join(wl_evaluation_control_t *control, unsigned phase, uint64_t progress)
+{
+    (void)progress;
+    if (!recovery_join || recovery_hit || phase != recovery_phase) return;
+    request_recovery_stop(control);
+}
+
+static void
+test_recursive_removal_recovery(void)
+{
+    const char *source =
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    const unsigned phases[] = {3, 6, 8, 13, 14, 15, 28, 29, 0};
+    for (unsigned trial = 0; trial < 9; ++trial)
+        for (unsigned work = 0; work < 2; ++work) {
+            wirelog_error_t error;
+            wirelog_program_t *program = wirelog_parse_string(source, &error);
+            wl_plan_t *plan = NULL;
+            CHECK(program && !wl_plan_from_program(program, &plan));
+            wl_evaluation_control_t *control = NULL;
+            CHECK(!wl_evaluation_control_create(0, &control));
+            wl_columnar_memory_resolution_t resolution = {
+                .budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .usable_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+                .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+            };
+            wl_columnar_memory_governor_ref_t *governor =
+                wl_columnar_memory_governor_ref_create(&resolution);
+            CHECK(governor);
+            wl_session_options_t options;
+            wl_session_options_init(&options);
+            options.evaluation_control = control;
+            options.memory_governor = governor;
+            wl_session_t *session = NULL;
+            CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan,
+                1, &options, &session));
+            const int64_t initial[] = {1, 2, 2, 3, 3, 4}, removed[] = {2, 3};
+            CHECK(!wl_session_insert(session, "edge", initial, 3, 2));
+            CHECK(!finish_step(session));
+            wl_col_session_t *columnar = (wl_col_session_t *)session;
+            col_rel_t *edge = session_find_rel(columnar, "edge");
+            col_rel_t *old_path = session_find_rel(columnar, "path");
+            col_relation_snapshot_t old_snapshot =
+                wl_columnar_relation_snapshot(old_path);
+            wl_evaluation_control_report_t before = {0}, after = {0};
+            CHECK(!wl_evaluation_control_report(control, &before));
+            /* A real foreign reader still protects destructive mutation.
+             * Refusal must not promote the completed recursive host. */
+            wl_columnar_source_access_reader_t reader = {0};
+            CHECK(!col_rel_source_reader_acquire(edge, &reader));
+            CHECK(wl_session_remove(session, "edge", removed, 1, 2) == EBUSY);
+            CHECK(!col_rel_source_reader_release(&reader));
+            CHECK(!wl_evaluation_control_report(control, &after));
+            CHECK(!memcmp(&before, &after, sizeof(before)));
+            CHECK(session->backend->session_controlled_step_state(session)
+                == WL_CONTROLLED_STEP_COMPLETE);
+            capture_t actual = {0}, expected = {0};
+            wl_session_set_delta_cb(session, capture_delta, &actual);
+            CHECK(!wl_session_remove(session, "edge", removed, 1, 2));
+            col_relation_snapshot_t input_snapshot =
+                wl_columnar_relation_snapshot(edge);
+            CHECK(!wl_evaluation_control_configure(control,
+                UINT64_C(1000000000)));
+            recovery_phase = phases[trial]; recovery_work = work != 0;
+            recovery_hit = false; recovery_join = trial == 6 || trial == 7;
+            wl_columnar_session_test_observed_transaction_checkpoint =
+                stop_reconstruction;
+            wl_columnar_join_test_attempt_checkpoint = stop_join;
+            if (trial == 8) {
+                recovery_hit = true;
+                if (work) CHECK(!wl_evaluation_control_configure(control, 1));
+                else wl_evaluation_control_request_cancel(control);
+            }
+            int rc = finish_step(session);
+            wl_columnar_session_test_observed_transaction_checkpoint = NULL;
+            wl_columnar_join_test_attempt_checkpoint = NULL;
+            if (!recovery_hit) fprintf(stderr,
+                    "unreached recovery trial=%u phase=%u\n",
+                    trial, recovery_phase);
+            CHECK(recovery_hit &&
+                !wl_evaluation_control_active_attempt_id(control));
+            bool committed = trial == 5;
+            int stopped = work ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                : WL_EVALUATION_CONTROL_CANCELLED;
+            CHECK(rc == (committed && !work ? 0 : stopped));
+            CHECK(wl_columnar_relation_snapshot_equal(input_snapshot,
+                wl_columnar_relation_snapshot(edge)));
+            if (!committed) {
+                CHECK(!actual.count && columnar->pending_input_change);
+                CHECK(session_find_rel(columnar, "path") == old_path);
+                CHECK(wl_columnar_relation_snapshot_equal(old_snapshot,
+                    wl_columnar_relation_snapshot(old_path)));
+                CHECK(!col_rel_source_reader_acquire(old_path, &reader));
+                CHECK(!col_rel_source_reader_release(&reader));
+            } else CHECK(actual.count == 4 && !columnar->pending_input_change);
+            memset(&before, 0, sizeof(before));
+            memset(&after, 0, sizeof(after));
+            CHECK(!wl_evaluation_control_report(control, &before)
+                && before.result == rc && !before.cleanup_status);
+            CHECK(!wl_evaluation_control_report(control, &after));
+            CHECK(!memcmp(&before, &after, sizeof(before)));
+            CHECK(!wl_evaluation_control_reset(control));
+            CHECK(!wl_evaluation_control_configure(control, 0));
+            CHECK(!finish_step(session));
+            if (!committed) {
+                CHECK(!wl_evaluation_control_report(control, &after));
+                CHECK(after.attempt_id != before.attempt_id && !after.result);
+            }
+            const int64_t lost[][2] = {{1, 3}, {1, 4}, {2, 3}, {2, 4}};
+            for (unsigned i = 0; i < 4; ++i)
+                capture_delta("path", lost[i], 2, -1, &expected);
+            check_capture(&actual, &expected);
+            const int64_t remaining[] = {1, 2, 3, 4};
+            check_path(session, remaining, 2);
+            unsigned delivered = actual.count;
+            CHECK(!finish_step(session) && actual.count == delivered);
+            const int64_t next[] = {1, 3};
+            CHECK(!wl_session_insert(session, "edge", next, 1, 2));
+            CHECK(!finish_step(session));
+            capture_delta("path", lost[0], 2, 1, &expected);
+            capture_delta("path", lost[1], 2, 1, &expected);
+            check_capture(&actual, &expected);
+            const int64_t final_edges[] = {1, 2, 3, 4, 1, 3};
+            check_path(session, final_edges, 3);
+            CHECK(!wl_session_try_destroy(&session));
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan); wirelog_program_free(program);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor)));
+            wl_columnar_memory_governor_ref_release(governor);
+        }
+}
+
 int
 main(void)
 {
     test_batch_selectors();
     test_recursive_removal_successor();
     test_generated_differential_mutations();
+    test_recursive_removal_recovery();
     puts("evaluation differential tests passed");
     return 0;
 }

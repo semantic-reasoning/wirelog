@@ -1933,3 +1933,43 @@ declarations and the original-use summary. Numeric-only INLINE still pins the
 functor intern table. Output lanes retain scalar types without the source arity
 map; wrong functor/arity, nested and whole-compound uses refuse before retiring
 the source.
+
+### Controlled scalar selectors and completed recursive removal
+
+The non-strict, iteration-zero scalar materialized batch fallback admits
+VARIABLE AUTO/FORCE_FULL/FORCE_DELTA/FORCE_EMPTY/FORCE_EMPTY_AFTER_SEED and
+JOIN-right AUTO/FORCE_FULL/FORCE_DELTA. AUTO uses a nonempty smaller delta;
+JOIN-right AUTO keeps its full source when the left is already delta.
+FORCE_DELTA uses an available nonempty delta, or the existing unseeded base-case
+full source when none exists. VARIABLE FORCE_EMPTY produces an empty source;
+FORCE_EMPTY_AFTER_SEED has AUTO behavior in this admitted iteration-zero domain.
+These are internal execution-plan contracts, not new public selector APIs.
+Strict batching, output policy, worker and foreign active-state checks remain
+unchanged. The owned evaluator authenticates sources and bills selection,
+materialization and JOIN work under the same attempt.
+
+A completed, quiescent callback-free binary INT64 recursive `edge`/`path` host
+can accept removal of declared edge rows when its old input/head provenance and
+preserved body are valid. A successful nonzero removal switches the next
+operation to bounded private full reconstruction. Failed and zero-row requests
+leave the completed fast path intact; an actual foreign source reader can still
+return EBUSY. The reconstructed heads and signed observer differences publish
+at the existing common cutoff. Fixed private bindings use a bounded local JOIN
+index; only authenticated dynamic general-transaction bindings can request
+persistent index ownership.
+
+| Removal lifecycle boundary | State disposition |
+|---|---|
+| Mutation admission/refusal | Validate the old completed provenance before editing inputs. Failure does not promote or replace the frozen evaluation report. |
+| Successful nonzero mutation | Keep public old heads and notification baseline; the changed EDB remains pending for private reconstruction. Obsolete append-only provenance no longer authenticates a completed result. |
+| Stop before cutoff | Drain/dispose private children and reversible claims; preserve old public heads and pending changed inputs. Caller reset/retry uses a new report, with no events from the failed candidate. |
+| Cutoff and delivery | Publish one registry image and admitted signed event batch. Late cancellation cannot split or replay that batch; late reported work exhaustion does not roll back committed output. |
+| Completion and later calls | Retire retained ownership exactly once. A no-op retry does not repeat events; later mutations re-evaluate from current inputs. Session/control ownership teardown returns governor credit to zero. |
+
+Raw incremental removal still stages one input relation at a time; attempting
+another relation's removal before evaluating retains its EBUSY contract. This
+is separate from a foreign source lease. Scalar signed notifications are not
+physical differential trace weights/timestamps. Their transport intersections
+and remaining recursive/resource/configuration domains stay under #2293's
+children. The `evaluation_differential` tests qualify the predicates above,
+including deterministic source/index/probe/claim/cutoff stops and retry.

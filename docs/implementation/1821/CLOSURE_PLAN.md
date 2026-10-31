@@ -516,3 +516,21 @@ host suite keeps control-stop checks deterministic and treats elapsed time as
 a watchdog. Whole-host allowance calibration remains empirical. Public control
 attachment, broader scalar/operator domains and cross-platform umbrella closure
 remain owned by #1823, #2299–#2301 and #2304/#2305 respectively.
+
+### Differential selectors and recursive removal (#2296 / #1953)
+
+This bundle contains three atomic units: admit qualified scalar selectors
+through the controlled materialized batch host; promote completed callback-free
+binary recursive removals to private preserved-body reconstruction and correct
+fixed-binding index ownership; then qualify source/claim/cutoff interruption,
+retry, signed delivery and later operations. `evaluation_differential` includes
+375 independent selector combinations, natural generated mutation references
+and deterministic recovery hooks. The default differential setting stays on.
+
+Foreign active raw frames and the existing one-source incremental retraction
+staging refusal remain protected. A bounded reconstruction is the selected
+implementation for these ordinary removals; new incremental trace machinery is
+not a prerequisite for their scalar semantics. Physical weight/timestamp
+intersections remain #2296/#2301/#2300, default general recursion remains #2302,
+and the complete shared recovery/cap audit remains #1953. Follow those concrete
+remaining predicates; neither #2296 nor #1953 is closed by this bundle alone.

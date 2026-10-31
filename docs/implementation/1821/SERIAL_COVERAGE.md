@@ -49,7 +49,7 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E04 / S10 | Completed observed or initially callback-free acyclic STEP plus declared-input insert/remove → private full candidates → signed comparison and atomic registry image | R, reusable ordinary route; no three-slot/four-binding cap; charged preparation, reversible old-head/staging claims, prepaid cutoff, retained cleanup; S/F/O | `test_controlled_observed_multi`, `test_controlled_observed_filter_successors`; repeated signed cycles, later-claim cancellation, no replay, reference output and stable/zero governor balances. #1820 recovery contract retained |
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
-| E07 / S08 | `current_iteration`, `retraction_seeded`, `retraction_right_pass`, or `diff_operators_active` at initial host admission | R, static refusal before attempt/operator; no new owner | `test_controlled_session_admission_matrix`; this is injected-state refusal, not differential execution; G3 |
+| E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical metadata intersections remain open |
 | E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
 | E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
 | E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
@@ -502,3 +502,34 @@ The installed typed facade has no evaluation-control attachment API in this
 scope (#1823); these are typed engine/source tests, not a claim of end-to-end
 controlled installed typed-facade coverage. Existing raw typed facade regressions
 remain part of the broader suite. New scalar/operator domains retain #2299–#2301.
+
+## Differential selector and removal qualification (#2296 / #1953)
+
+The `evaluation_differential` suite adds the following current dispositions to
+E07/F04/F04a and the selector intersection of E08/C04. It does not enable the raw
+synchronous differential dispatcher inside a controlled attempt.
+
+| Predicate | Controlled destination and evidence | Remaining boundary |
+|---|---|---|
+| Non-strict scalar five-op batch fallback, iteration zero | VARIABLE AUTO/FULL/DELTA/EMPTY/EMPTY_AFTER_SEED and JOIN-right AUTO/FULL/DELTA use existing charged composed reads and JOIN. 375 internal-plan/source combinations compare exact tuples to an independent selector oracle and the same raw plan. Smaller matching deltas distinguish selection from a full read; right AUTO stays full when left is delta. Stops immediately after right selection retry without publication. | Internal-plan selector contracts are labeled as such; no compiler-generated claim for edited modes. Strict/output/worker/foreign-state guards stay unchanged. |
+| Completed callback-free binary INT64 `edge`/`path` host with preserved declared body | Read-only admission proves quiescence and current old closure/input provenance. Only a successful nonzero removal promotes to the existing general transaction; old public heads survive until cutoff. Generated default differential-enabled tests cover STEP/SNAPSHOT, append-before-remove, repeated same-source removals, callback changes at completed boundaries and later mutations. | A failed or zero request does not promote. Real source readers still refuse destructive removal. General recursive domains remain #2302. |
+| Fixed versus dynamic private bindings at ordinary controlled JOIN | Fixed bindings decline general-only persistent index reuse and keep the authenticated bounded local index. Dynamic bindings still require the exact live general transaction identity; copied/forged dynamic bindings are rejected. | No new index owner or raw fallback is introduced. |
+| Generated scalar JOIN/dependent/stratified-negative mutations | Public insert/remove operations drive observed/callback-free STEP and SNAPSHOT. Nine cycles include mixed mutations, duplicates, missing removals, left/right deletion, restoration and genuinely empty results with nonempty controls. A raw observed STEP naturally selects differential mode; controlled hooks independently witness private evaluation and the absence of append overrides on removal. Exact relation-qualified tuples and signed events match references. | The raw incremental removal producer still stages one input relation at a time. A conflicting second input removal remains EBUSY; same-input accumulation and later operations remain usable. |
+
+`test_recursive_removal_recovery` supplies route-local #1953 evidence with actual
+session admission: pre-cancel/entry exhaustion, metadata/lease/child/claim/cutoff
+stops, private JOIN index building and no-output probing, and late post-cutoff
+stops. EAGAIN retains one attempt ID. Precommit returns preserve the old head
+identity/content, changed EDB generation and pending input; released claims
+permit a new reader. Reset/raised-limit retry starts a fresh report and emits
+exactly the removed tuples once. Post-cutoff delivery completes before retained
+retirement; a late work stop can be reported without rolling back delivery.
+Frozen reports, subsequent insert/evaluation, checked destruction and zero
+governor credit after full ownership teardown are asserted.
+
+These scalar set/signed-notification tests do not establish physical trace
+weights or timestamps. Required representation/operator intersections remain
+with #2301/#2300 and #2296; raw flag admission, persistent trace internals and
+other recursive domains are not claimed. #1953's other lifecycle/cap audits and
+#2293's platform/final-SHA acceptance remain open. This bundle advances these
+rows rather than closing either issue from partial evidence.
