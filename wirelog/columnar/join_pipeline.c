@@ -907,6 +907,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         col_rel_destroy(out);
         return rc;
     }
+    col_join_batch_record_run(sess, COL_JOIN_BATCH_RUN_PIPELINE);
     if (next_index)
         *next_index = tail_end;
     return 1;

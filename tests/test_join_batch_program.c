@@ -11,8 +11,10 @@
  * cases, WIRELOG_JOIN_BATCH_STRICT) before creating its session, runs a
  * program through wl_session_*, and checks the snapshot against an oracle
  * the test computes from its own edge list.  The fallback count and last
- * reason are read after the snapshot returns, when every worker of that
- * snapshot has been destroyed and has folded its records into the session.
+ * reason, and the bounded runs completed per route by the session and by
+ * its workers (#2201), are read after the snapshot returns, when every
+ * worker of that snapshot has been destroyed and has folded its records
+ * into the session.
  *
  * Strict mode refuses every recorded fallback, so in these programs a
  * strict snapshot that succeeds ran no excluded shape: each of its joins
@@ -243,6 +245,9 @@ typedef struct {
     uint32_t fallbacks;
     uint8_t reason;
     uint32_t routes; /* insert routes taken by this snapshot */
+    /* bounded producer runs by route: the session's own, and its workers' */
+    uint32_t runs[COL_JOIN_BATCH_RUN_ROUTES];
+    uint32_t worker_runs[COL_JOIN_BATCH_RUN_ROUTES];
     collected_t got;
 } outcome_t;
 
@@ -319,21 +324,53 @@ snapshot(wl_session_t *s, const char *relation, outcome_t *out)
     out->got.relation = relation;
     COL_SESSION(s)->join_batch_fallback_count = 0;
     COL_SESSION(s)->join_batch_last_reason = 0;
+    memset(COL_SESSION(s)->join_batch_runs, 0,
+        sizeof(COL_SESSION(s)->join_batch_runs));
+    memset(COL_SESSION(s)->join_batch_worker_runs, 0,
+        sizeof(COL_SESSION(s)->join_batch_worker_runs));
     out->rc = wl_session_snapshot(s, collect, &out->got);
     out->fallbacks = COL_SESSION(s)->join_batch_fallback_count;
     out->reason = COL_SESSION(s)->join_batch_last_reason;
+    memcpy(out->runs, COL_SESSION(s)->join_batch_runs, sizeof(out->runs));
+    memcpy(out->worker_runs, COL_SESSION(s)->join_batch_worker_runs,
+        sizeof(out->worker_runs));
+
     out->routes = wl_columnar_session_test_insert_route_taken - routes;
 }
 
+/* Route bits for expect_t's run masks (#2201). */
+#define RUN_ORD (1u << COL_JOIN_BATCH_RUN_ORDINARY)
+#define RUN_DIFF (1u << COL_JOIN_BATCH_RUN_DIFFERENTIAL)
+#define RUN_PIPE (1u << COL_JOIN_BATCH_RUN_PIPELINE)
+
 /* What one snapshot must show: its rc, whether its rows must equal the
  * oracle, the last recorded reason (ELIGIBLE: nothing recorded;
- * REASON_COUNT: not checked), and whether it took the insert route. */
+ * REASON_COUNT: not checked), whether it took the insert route, the
+ * routes on which the session itself must have completed a bounded run
+ * (0: not checked), and the routes on which its workers must have (0: no
+ * worker completed one on any route). */
 typedef struct {
     int rc;
     bool exact;
     col_join_batch_eligibility_t reason;
     bool route;
+    unsigned own;
+    unsigned workers;
 } expect_t;
+
+/* True when every route in @mask has a nonzero count in @runs, and, for
+ * @all_zero_if_empty with an empty @mask, every count is zero. */
+static bool
+runs_match(const uint32_t *runs, unsigned mask, bool all_zero_if_empty)
+{
+    for (unsigned r = 0; r < COL_JOIN_BATCH_RUN_ROUTES; r++) {
+        if ((mask & (1u << r)) && runs[r] == 0)
+            return false;
+        if (!mask && all_zero_if_empty && runs[r] != 0)
+            return false;
+    }
+    return true;
+}
 
 static bool
 check(const char *label, const outcome_t *o, const expect_t *want,
@@ -345,13 +382,18 @@ check(const char *label, const outcome_t *o, const expect_t *want,
         || (want->reason == COL_JOIN_BATCH_ELIGIBLE
         ? o->fallbacks == 0
         : (o->fallbacks > 0 && o->reason == (uint8_t)want->reason)))
-        && (o->routes != 0) == want->route;
+        && (o->routes != 0) == want->route
+        && runs_match(o->runs, want->own, false)
+        && runs_match(o->worker_runs, want->workers, true);
 
     if (!ok)
         printf("\n    %s: rc=%d rows=%u dup=%u fallbacks=%u reason=%s "
-            "route=%u", label, o->rc, o->got.rows.count, o->got.duplicates,
-            o->fallbacks, col_join_batch_eligibility_name(
-                (col_join_batch_eligibility_t)o->reason), o->routes);
+            "route=%u runs=%u/%u/%u worker runs=%u/%u/%u", label, o->rc,
+            o->got.rows.count, o->got.duplicates, o->fallbacks,
+            col_join_batch_eligibility_name(
+                (col_join_batch_eligibility_t)o->reason), o->routes,
+            o->runs[0], o->runs[1], o->runs[2], o->worker_runs[0],
+            o->worker_runs[1], o->worker_runs[2]);
     return ok;
 }
 
@@ -462,7 +504,9 @@ run_reuse_after_overflow(void)
                 (unsigned long long)COL_SESSION(s)->join_output_peak);
     }
     if (ok) {
-        const expect_t exact = { 0, true, COL_JOIN_BATCH_ELIGIBLE, false };
+        const expect_t exact = {
+            0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
+        };
         COL_SESSION(s)->join_output_limit = 0;
         oracle_two_hop(&e, &oracle);
         snapshot(s, "hop", &o);
@@ -481,17 +525,27 @@ run_reuse_after_overflow(void)
 int
 main(void)
 {
-    /* Nothing recorded, rows exact; with or without the insert route. */
-    const expect_t bounded = { 0, true, COL_JOIN_BATCH_ELIGIBLE, false };
+    /* Nothing recorded, rows exact, and the calling session completed a
+     * bounded run: on the ordinary route for the two-hop rule, and on the
+     * differential route for the recursive closure; or the insert route,
+     * recorded, with no bounded run. */
+    const expect_t two_hop_bounded = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
+    };
+    const expect_t closure_bounded = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_DIFF, 0
+    };
     const expect_t routed = {
-        0, true, COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE, true
+        0, true, COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE, true, 0, 0
     };
     const expect_t in_workers = {
-        0, true, COL_JOIN_BATCH_EXCLUDED_WORKER, false
+        0, true, COL_JOIN_BATCH_EXCLUDED_WORKER, false, 0, 0
     };
-    const expect_t refused = { ENOTSUP, false, COL_JOIN_BATCH_ELIGIBLE, false };
+    const expect_t refused = {
+        ENOTSUP, false, COL_JOIN_BATCH_ELIGIBLE, false, 0, 0
+    };
     const expect_t exact_only = {
-        0, true, COL_JOIN_BATCH_REASON_COUNT, false
+        0, true, COL_JOIN_BATCH_REASON_COUNT, false, 0, 0
     };
     const uint32_t workers[] = { 1, 4 };
 
@@ -509,13 +563,13 @@ main(void)
      * mode the route is refused and the full re-evaluation is bounded. */
     for (uint32_t w = 0; w < 2; w++) {
         run_case("two-hop", TWO_HOP, "hop", oracle_two_hop, workers[w],
-            MODE_RECORD, &bounded, &routed);
+            MODE_RECORD, &two_hop_bounded, &routed);
         run_case("two-hop", TWO_HOP, "hop", oracle_two_hop, workers[w],
-            MODE_STRICT, &bounded, &bounded);
+            MODE_STRICT, &two_hop_bounded, &two_hop_bounded);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
-            MODE_RECORD, &bounded, &routed);
+            MODE_RECORD, &closure_bounded, &routed);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
-            MODE_STRICT, &bounded, &bounded);
+            MODE_STRICT, &closure_bounded, &closure_bounded);
         /* The four-way rule records several fallbacks (a JOIN feeding
          * another JOIN is pipeline-not-consumable, and its semi-naive
          * rounds read right deltas), so strict mode would refuse it and
@@ -533,7 +587,8 @@ main(void)
 
     /* Worker routes at W=4: a recursive stratum on TDD workers, and a
      * non-recursive stratum split across workers.  Joins inside a worker
-     * are one-shot and recorded as worker-session; strict mode refuses. */
+     * are one-shot and recorded as worker-session, and no worker completes
+     * a bounded run; strict mode refuses. */
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
     run_case("closure on TDD workers", CLOSURE, "path", oracle_closure, 4,
         MODE_RECORD, &in_workers, NULL);

@@ -45,6 +45,15 @@ typedef enum {
     COL_JOIN_BATCH_REASON_COUNT                 /* not a reason */
 } col_join_batch_eligibility_t;
 
+/* The routes a bounded producer run is counted under (#2201).  The values
+ * index wl_col_session_t's join_batch_runs and join_batch_worker_runs. */
+typedef enum {
+    COL_JOIN_BATCH_RUN_ORDINARY = 0,     /* ordinary keyed JOIN */
+    COL_JOIN_BATCH_RUN_DIFFERENTIAL = 1, /* differential keyed JOIN */
+    COL_JOIN_BATCH_RUN_PIPELINE = 2,     /* fused JOIN pipeline */
+    COL_JOIN_BATCH_RUN_ROUTES            /* not a route */
+} col_join_batch_run_route_t;
+
 col_join_batch_eligibility_t
 col_join_batch_eligibility(const wl_col_session_t *sess, uint32_t key_count,
     bool used_right_delta, bool has_right_filter);
@@ -58,12 +67,20 @@ void
 col_join_batch_record_fallback(wl_col_session_t *sess,
     col_join_batch_eligibility_t reason);
 
+/* Count one bounded producer run that completed on @sess under @route:
+ * a saturating increment of sess->join_batch_runs[route] (#2201). */
+void
+col_join_batch_record_run(wl_col_session_t *sess,
+    col_join_batch_run_route_t route);
+
 /* Fold the fallbacks @worker recorded into @coordinator (#1382): adds the
  * count (saturating), takes the worker's last reason when it recorded any,
  * and merges the warned-reasons mask, so workers created later do not warn
  * again about a reason already warned about (workers of the same round may
- * each warn once).  Called once per worker, on the coordinator's thread,
- * when the worker's teardown is reported. */
+ * each warn once).  It also adds, per route, the worker's own runs and the
+ * runs it folded from its own workers into the coordinator's
+ * join_batch_worker_runs, saturating (#2201).  Called once per worker, on
+ * the coordinator's thread, when the worker's teardown is reported. */
 void
 col_join_batch_fold_worker(wl_col_session_t *coordinator,
     const wl_col_session_t *worker);

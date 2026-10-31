@@ -109,6 +109,33 @@ col_join_batch_record_fallback(wl_col_session_t *sess,
             col_join_batch_eligibility_name(reason));
 }
 
+#define COL_JOIN_BATCH_SESSION_RUN_SLOTS \
+        (sizeof(((wl_col_session_t *)0)->join_batch_runs) / sizeof(uint32_t))
+#if defined(_MSC_VER)
+typedef char col_join_batch_run_routes_check_
+    [(COL_JOIN_BATCH_RUN_ROUTES == COL_JOIN_BATCH_SESSION_RUN_SLOTS) ? 1 : -1];
+#else
+_Static_assert(COL_JOIN_BATCH_RUN_ROUTES == COL_JOIN_BATCH_SESSION_RUN_SLOTS,
+    "join_batch_runs has one counter per route");
+#endif
+#undef COL_JOIN_BATCH_SESSION_RUN_SLOTS
+
+static uint32_t
+join_batch_saturating_add(uint32_t a, uint32_t b)
+{
+    return b > UINT32_MAX - a ? UINT32_MAX : a + b;
+}
+
+void
+col_join_batch_record_run(wl_col_session_t *sess,
+    col_join_batch_run_route_t route)
+{
+    if (!sess || (unsigned)route >= COL_JOIN_BATCH_RUN_ROUTES)
+        return;
+    sess->join_batch_runs[route]
+        = join_batch_saturating_add(sess->join_batch_runs[route], 1u);
+}
+
 void
 col_join_batch_fold_worker(wl_col_session_t *coordinator,
     const wl_col_session_t *worker)
@@ -117,6 +144,11 @@ col_join_batch_fold_worker(wl_col_session_t *coordinator,
 
     if (!coordinator || !worker)
         return;
+    for (unsigned r = 0; r < COL_JOIN_BATCH_RUN_ROUTES; r++)
+        coordinator->join_batch_worker_runs[r] = join_batch_saturating_add(
+            coordinator->join_batch_worker_runs[r],
+            join_batch_saturating_add(worker->join_batch_runs[r],
+            worker->join_batch_worker_runs[r]));
     coordinator->join_batch_warned_reasons |= worker->join_batch_warned_reasons;
     count = worker->join_batch_fallback_count;
     if (count == 0)

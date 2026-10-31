@@ -2658,6 +2658,12 @@ typedef struct wl_col_session_t {
     /* Published, authorized controlled materializing fallback count. */
     uint64_t controlled_materialized_batch_published_count;
     uint16_t join_batch_warned_reasons; /* one WL_LOG warning per reason */
+    /* Bounded producer runs that completed, per route, indexed by
+     * col_join_batch_run_route_t (columnar/join_batch.h) (#2201):
+     * join_batch_runs counts this session's own runs, and
+     * join_batch_worker_runs the runs its workers' teardowns folded in. */
+    uint32_t join_batch_runs[3];
+    uint32_t join_batch_worker_runs[3];
     /* Issue #959: high-water mark of a single join's output, per session.
      * Workers are separate sessions, so each carries its own -- which is the
      * number needed to decide whether dividing the row cap by W is right:
