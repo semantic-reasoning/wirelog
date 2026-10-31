@@ -13086,8 +13086,8 @@ col_rel_new_auto(const char *name, uint32_t ncols)
 }
 
 int
-wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
-    uint32_t initial_capacity, bool timestamps,
+wl_columnar_relation_new_named_governed(const char *name, uint32_t ncols,
+    const char *const *names, uint32_t initial_capacity, bool timestamps,
     wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
 {
     col_rel_t *r = NULL;
@@ -13101,7 +13101,7 @@ wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     rc = wl_columnar_relation_alloc_governed(&r, name, governor);
     if (rc != 0)
         return rc;
-    rc = col_rel_set_schema_impl_capacity(r, ncols, NULL,
+    rc = col_rel_set_schema_impl_capacity(r, ncols, names,
             initial_capacity, timestamps, &denied);
     if (rc != 0) {
         col_rel_destroy(r);
@@ -13109,6 +13109,15 @@ wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
     }
     *out = r;
     return 0;
+}
+
+int
+wl_columnar_relation_new_auto_governed(const char *name, uint32_t ncols,
+    uint32_t initial_capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    return wl_columnar_relation_new_named_governed(name, ncols, NULL,
+               initial_capacity, timestamps, governor, out);
 }
 
 /* File-scope array bounds enforce this on default MSVC C mode as well as

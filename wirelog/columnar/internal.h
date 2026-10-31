@@ -4960,9 +4960,9 @@ bool wl_columnar_session_cold_source_schema(const wl_col_session_t *session,
     const char *name, const col_rel_t *resident,
     const struct wl_columnar_batch_payload *payload,
     const wl_plan_edb_schema_t **schema);
-/* Valid only after the complete cold projection body has been audited. */
+/* Valid only after the complete cold scan body/prefix has been audited. */
 typedef struct {
-    const wl_plan_op_t *map;
+    const wl_plan_op_t *map; /* Last MAP, or NULL for a FILTER-only JOIN prefix. */
     uint32_t filter_count;
 } wl_columnar_eval_plan_cold_projection_t;
 typedef struct {
@@ -4975,6 +4975,18 @@ bool wl_columnar_eval_plan_cold_predicate_decode(const wl_plan_op_t *filter,
     wl_columnar_eval_plan_cold_predicate_t *out);
 bool wl_columnar_eval_plan_cold_column(const wl_plan_relation_t *plan,
     uint32_t end, uint32_t column, uint32_t ncols, uint32_t *source);
+bool wl_columnar_eval_plan_cold_map_lane(const wl_plan_op_t *map,
+    uint32_t column, uint32_t width, wirelog_column_type_t type);
+bool wl_columnar_eval_plan_cold_scan_decode(const wl_plan_relation_t *plan,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types,
+    uint32_t end, wl_columnar_eval_plan_cold_projection_t *out);
+bool wl_columnar_join_cold_scan_prefix(const wl_col_session_t *session,
+    const wl_plan_relation_t *plan, uint32_t *join_index);
+int wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *session, uint32_t end);
+int wl_columnar_relation_new_named_governed(const char *name, uint32_t ncols,
+    const char *const *names, uint32_t capacity, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out);
 bool wl_columnar_eval_plan_cold_projection_decode(
     const wl_plan_relation_t *plan, const char *name, uint32_t ncols,
     const wirelog_column_type_t *types,

@@ -1610,6 +1610,175 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     return true;
 }
 
+/* The extended scan route audits actual stage schemas, not just widths. These
+ * iterative queries use constant audit memory; every preceding stage has
+ * already been checked before its result is queried. */
+static bool
+wl_columnar_join_scan_width(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t end, uint32_t *out)
+{
+    uint64_t width = wl_columnar_join_source(s, rp->ops[0].relation_name,
+            NULL).width;
+    for (uint32_t i = 1; i < end; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->op == WL_PLAN_OP_JOIN) {
+            width += wl_columnar_join_source(s, op->right_relation, NULL).width;
+            if (width > UINT32_MAX) return false;
+            if (op->project_count) width = op->project_count;
+        } else if (op->op == WL_PLAN_OP_MAP) width = op->project_count;
+    }
+    *out = (uint32_t)width;
+    return true;
+}
+
+static bool
+wl_columnar_join_scan_type(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t end, uint32_t column,
+    wirelog_column_type_t *type)
+{
+    uint32_t width;
+    if (!wl_columnar_join_scan_width(s, rp, end, &width) || column >= width)
+        return false;
+    for (uint32_t i = end; i > 1; ) {
+        const wl_plan_op_t *op = &rp->ops[--i];
+        if (op->op == WL_PLAN_OP_MAP) column = op->project_indices[column];
+        else if (op->op == WL_PLAN_OP_JOIN) {
+            if (op->project_count) column = op->project_indices[column];
+            if (!wl_columnar_join_scan_width(s, rp, i, &width)) return false;
+            if (column < width) continue;
+            wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
+                    op->right_relation, NULL);
+            column -= width;
+            if (column >= rhs.width) {
+                /* Ordinary missing-right JOIN produces no rows and assigns
+                 * INT64 to projected lanes outside its left schema. */
+                if (rhs.cold || rhs.resident) return false;
+                *type = WIRELOG_TYPE_INT64; return true;
+            }
+            *type = rhs.types ? rhs.types[column] : WIRELOG_TYPE_INT64;
+            return true;
+        }
+    }
+    wl_columnar_join_source_t source = wl_columnar_join_source(s,
+            rp->ops[0].relation_name, NULL);
+    if (column >= source.width) return false;
+    *type = source.types ? source.types[column] : WIRELOG_TYPE_INT64;
+    return true;
+}
+
+static uint32_t
+wl_columnar_join_scan_key(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t end, uint32_t width,
+    const char *name)
+{
+    bool original = true;
+    for (uint32_t i = 1; i < end; i++)
+        if (rp->ops[i].op == WL_PLAN_OP_MAP || rp->ops[i].op == WL_PLAN_OP_JOIN)
+            original = false;
+    if (original) {
+        wl_columnar_join_source_t source = wl_columnar_join_source(s,
+                rp->ops[0].relation_name, NULL);
+        return wl_columnar_join_source_key(&source, name);
+    }
+    /* MAP/JOIN outputs have ordinary auto-generated col<N> names. Match
+     * their lookup fallback without constructing a synthetic relation. */
+    if (name && !strncmp(name, "col", 3)) {
+        char *endptr;
+        long column = strtol(name + 3, &endptr, 10);
+        /* Keep the ordinary schema resolver's narrowing and signed return
+         * semantics, including oversized numeric spellings on LP64. */
+        if (!*endptr && column >= 0 && (uint32_t)column < width) {
+            int key = (int)column;
+            return key < 0 ? 0 : (uint32_t)key;
+        }
+    }
+    return 0;
+}
+
+bool
+wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t *join_index)
+{
+    if (!s || !rp || !rp->ops || rp->op_count < 4 ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+    uint32_t first = 1;
+    while (first < rp->op_count && (rp->ops[first].op == WL_PLAN_OP_MAP ||
+        rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
+    if (first < 2 || first >= rp->op_count ||
+        rp->ops[first].op != WL_PLAN_OP_JOIN) return false;
+    wl_columnar_join_source_t source = wl_columnar_join_source(s,
+            rp->ops[0].relation_name, NULL);
+    if (!source.schema_valid || !source.width ||
+        (!source.cold && !source.resident) ||
+        !wl_columnar_eval_plan_cold_scan_decode(rp, rp->ops[0].relation_name,
+        source.width, source.types, first, NULL)) return false;
+    for (uint32_t c = 0; c < source.width; c++) {
+        wirelog_column_type_t type =
+            source.types ? source.types[c] : WIRELOG_TYPE_INT64;
+        if (type < WIRELOG_TYPE_INT32 || type > WIRELOG_TYPE_BOOL ||
+            (type == WIRELOG_TYPE_STRING && (!source.intern ||
+            (source.cold && !wl_columnar_batch_payload_uses_intern(
+                source.cold->payload, source.intern))))) return false;
+    }
+    for (uint32_t i = first; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->opaque_data || op->materialized || op->relation_name ||
+            (op->op != WL_PLAN_OP_FILTER &&
+            (op->filter_expr.size || op->filter_expr.data)) ||
+            op->right_filter_expr.size || op->right_filter_expr.data ||
+            (op->delta_mode != WL_DELTA_AUTO &&
+            op->delta_mode != WL_DELTA_FORCE_FULL))
+            return false;
+        uint32_t width;
+        if (!wl_columnar_join_scan_width(s, rp, i, &width)) return false;
+        if (op->op == WL_PLAN_OP_MAP) {
+            if (op->right_relation || !op->project_count ||
+                !op->project_indices)
+                return false;
+            for (uint32_t c = 0; c < op->project_count; c++) {
+                wirelog_column_type_t type;
+                if (!wl_columnar_join_scan_type(s, rp, i,
+                    op->project_indices[c], &type) ||
+                    !wl_columnar_eval_plan_cold_map_lane(op, c, width,
+                    type)) return false;
+            }
+        } else if (op->op == WL_PLAN_OP_FILTER) {
+            wl_columnar_eval_plan_cold_predicate_t predicate;
+            wirelog_column_type_t type;
+            if (op->right_relation ||
+                !wl_columnar_eval_plan_cold_predicate_decode(op, width, NULL,
+                &predicate) || !wl_columnar_join_scan_type(s, rp, i,
+                predicate.column, &type) || type != WIRELOG_TYPE_INT64)
+                return false;
+        } else if (op->op == WL_PLAN_OP_JOIN) {
+            if (op->key_count != 1 || !op->right_relation ||
+                (op->project_count && !op->project_indices)) return false;
+            uint32_t key = wl_columnar_join_scan_key(s, rp, i, width,
+                    op->left_keys ? op->left_keys[0] : NULL);
+            wirelog_column_type_t type;
+            if (!wl_columnar_join_scan_type(s, rp, i, key, &type) ||
+                (type != WIRELOG_TYPE_INT64 &&
+                type != WIRELOG_TYPE_STRING)) return false;
+            wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
+                    op->right_relation, NULL);
+            if (!rhs.schema_valid) return false;
+            if (!rhs.cold && !rhs.resident) continue;
+            uint32_t right_key = wl_columnar_join_source_key(&rhs,
+                    op->right_keys ? op->right_keys[0] : NULL);
+            if (!wl_columnar_join_source_valid(&rhs, right_key) ||
+                type !=
+                (rhs.types ? rhs.types[right_key] : WIRELOG_TYPE_INT64) ||
+                (uint64_t)width + rhs.width > UINT32_MAX) return false;
+            for (uint32_t c = 0; c < op->project_count; c++)
+                if (op->project_indices[c] >= width + rhs.width) return false;
+        } else if (op->op != WL_PLAN_OP_CONSOLIDATE || i != rp->op_count - 1 ||
+            op->right_relation) return false;
+    }
+    if (join_index) *join_index = first;
+    return true;
+}
+
 /* The same complete prefix contract is used before retirement and at runtime.
 * Its first JOIN creates an ordinary resident entry for the audited suffix. */
 bool

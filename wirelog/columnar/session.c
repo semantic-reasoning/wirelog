@@ -769,12 +769,23 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 return false;
             bool projection = wl_columnar_session_cold_projection_rule(sess,
                     rp);
+            bool scan_join = wl_columnar_join_cold_scan_prefix(sess, rp, NULL);
+            uint32_t scan_end = 1;
+            while (scan_end < rp->op_count &&
+                (rp->ops[scan_end].op == WL_PLAN_OP_MAP ||
+                rp->ops[scan_end].op == WL_PLAN_OP_FILTER)) scan_end++;
+            /* A malformed MAP-only prefix must not fall through the legacy
+             * right-input check just because it contains no FILTER opcode. */
+            if (rp->op_count && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
+                scan_end > 1 && scan_end < rp->op_count &&
+                rp->ops[scan_end].op == WL_PLAN_OP_JOIN && !scan_join)
+                return false;
             bool selected_projection = projection &&
                 !strcmp(rp->ops[0].relation_name, name);
             bool selected_join = rp->op_count &&
                 rp->ops[0].relation_name &&
                 !strcmp(rp->ops[0].relation_name, name) &&
-                wl_columnar_join_cold_prefix(sess, rp);
+                (wl_columnar_join_cold_prefix(sess, rp) || scan_join);
             if (selected_projection || selected_join) consumer = true;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
@@ -784,7 +795,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     (op->op != WL_PLAN_OP_VARIABLE &&
                     op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
                     op->op != WL_PLAN_OP_CONSOLIDATE &&
-                    !(projection && op->op == WL_PLAN_OP_FILTER)) ||
+                    !((projection || scan_join) &&
+                    op->op == WL_PLAN_OP_FILTER)) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0 &&

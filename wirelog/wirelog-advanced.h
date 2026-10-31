@@ -226,10 +226,14 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * (=, !=, <, >, <=, >=; column on the left). Projected results and consolidation
  * remain resident; output capacity is admitted for the source row count even
  * when no row passes. Projection-only programs need no JOIN consumer.
- * A cold left input is consumed by an initial VARIABLE/JOIN pair; both sides
- * may be sealed, including a self-JOIN. Subsequent JOINs consume an admitted
- * resident intermediate. No FILTER/MAP before that first cold JOIN, multi-key,
- * cross/theta JOIN, other key types, right filter, timestamps, whole compound
+ * A cold left input is consumed by an initial VARIABLE/JOIN pair, or by a
+ * nonempty audited direct MAP/FILTER scan prefix before the first JOIN.
+ * The latter route permits subsequent JOINs, direct MAPs and the same narrow
+ * FILTERs. Prefix output, JOIN/FILTER intermediates and final output remain
+ * resident and admitted; the prefix reserves full source-row capacity even
+ * when no row passes. FILTER-only prefixes preserve names/INLINE layout; MAP
+ * scalarizes fields. Both sides may be sealed, including a self-JOIN.
+ * No multi-key, cross/theta JOIN, other key types, right filter, timestamps, whole compound
  * values, SIDE/nested layouts,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * JOINs and standalone direct/filtered projections accept STRING lanes from
