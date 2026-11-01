@@ -4757,14 +4757,14 @@ The supported plan is serial, nonrecursive, and contains only audited
 VARIABLE/JOIN/MAP/CONSOLIDATE operations, plus the restricted projection FILTER
 described below. The cold name must have an eligible consumer: a JOIN input
 or the exact direct/filtered projection body below; it cannot be a relation head
-or an arbitrary VARIABLE consumer. Eligible JOINs use one matching INT64 or
-STRING key, supported scalar lanes (including declared flat INLINE fields),
+or an arbitrary VARIABLE consumer. Eligible JOINs use matching INT64/STRING equality key pairs, supported scalar lanes (including declared flat INLINE fields),
 no timestamps and no right filter. Multiple eligible JOINs
-may consume the same binding. A cold left source requires an initial
-VARIABLE/JOIN pair. Both inputs can be sealed, and a self-JOIN acquires two
+may consume the same binding. A cold left source requires an initial VARIABLE/JOIN pair or the audited
+direct MAP/narrow FILTER prefix described below. Both inputs can be sealed, and a self-JOIN acquires two
 independent reader pins over one persistent owner. A subsequent JOIN consumes
-an admitted resident intermediate. FILTER/MAP before the first cold JOIN,
-multi-key/cross/theta JOINs and other key types are refused. Available source
+an admitted resident intermediate. Composite rules require direct MAPs and
+narrow FILTERs throughout their suffix. Cross/theta JOINs and other key types
+are refused. Available source
 schemas and projection bounds are checked before retirement and again at
 execution; an unloaded resident counterpart is checked when its schema exists.
 Spill batch/index caps must be positive. Opaque
@@ -5026,7 +5026,7 @@ precede the first JOIN. For example, a declared `result(k,s,w)` head can use
 `result(k,s,w) :- a(k,s), k >= 0, k = 1, b(s,w).` with an INT64 `k` and
 STRING `s`. The parser may retain a predicate after JOIN as well as push it
 before JOIN; both are audited and executed in order. This new route permits
-subsequent single-key INT64/STRING JOINs, canonical direct-column MAPs and the
+subsequent INT64/STRING equality JOINs, canonical direct-column MAPs and the
 same six INT64/literal FILTER comparisons, ending at CONSOLIDATE. It validates
 actual stage-local types and widths through every JOIN projection and MAP,
 including right-derived lanes. A valid prefix never grants an exception to an
@@ -5416,7 +5416,7 @@ whole compound reconstruction, SIDE or nested-handle ownership is introduced.
 `wirelog_session_begin_cold_input`, `wirelog_session_append_cold_input` and
 `wirelog_session_finish_cold_input` load an initially empty declared scalar or
 flat INLINE EDB without first retaining its complete rows. This route supports
-ordinary MAP/FILTER scans and audited single-key equality JOINs, including scan
+ordinary MAP/FILTER scans and audited equality JOINs, including scan
 prefixes, left/right/both/self and chained consumers. Finished traces, existing
 sealed payloads and resident opposite inputs share the bounded JOIN engine;
 trace inputs are never materialized as a full resident relation. Each side
@@ -5516,10 +5516,11 @@ JOIN remain ineligible. High distinct-group cardinality can still exhaust the
 resident index/result budget.
 
 
-### Composite numeric cold JOIN keys (#1372 follow-up)
+### Composite cold JOIN keys (#1372 follow-up)
 
-Explicit sealed and chunked numeric inputs support two or more INT64 equality
-pairs through the existing ordinary bounded JOIN producer. Every pair must
+Explicit sealed and chunked inputs support two or more INT64/STRING equality
+pairs, including mixed tuples and scalar fields of validated flat INLINE
+inputs, through the existing ordinary bounded JOIN producer. Every pair must
 match; hash collisions only select candidates. Reordered and repeated key
 positions are valid. The constructor copies its two key vectors into one
 separately admitted O(key count) allocation, so caller arrays need not survive
@@ -5531,8 +5532,10 @@ full-input tuple index or per-row hash cache is introduced. Source readers,
 key metadata, batches, resident prefixes and results remain governed floors.
 An intermediate that exceeds the configured encoded-row cap is refused; a
 small source does not waive this real row-width requirement. STRING and INLINE
-sources remain excluded from this new numeric route, including empty inputs
-and projected-away reference lanes.
+sources require their exact originating intern and declaration capability,
+including empty inputs and projected-away reference lanes. Corresponding keys
+must have matching physical types; IDs are compared without remapping. Legacy
+numeric factories still refuse all reference-bearing input schemas.
 
 The admission audit and execution share resolved key positions, including
 virtual col<N> names on fresh declarations and chunked bindings. Composite
@@ -5540,3 +5543,36 @@ rules permit the audited direct MAP/narrow INT64 FILTER prefix and suffix,
 including later JOINs. Computed MAP tails retain their previous behavior for
 all-one-key rules only. Source retirement occurs only after complete consumer
 validation; invalid later keys and unsupported consumers preserve their owners.
+
+
+The measured 64-bit producer descriptor grows from 280 to 288 bytes for the
+optional key pointer, including legacy calls. Composite metadata is a 96-byte
+header (including its 88-byte reservation) plus 8 bytes per equality pair:
+112 bytes for two pairs, 120 for three. Runtime construction also temporarily
+holds 8 bytes per pair for resolved column indices; these are released after
+the producer copies them. These costs are additional to reader/index/output
+floors. With two keys, a 116-byte three-row index cap and a 24-byte output batch,
+reference trace self-JOIN construction reserves 2,693 bytes at both 64 and 256
+rows. Both cases contain eight segments; their separately charged source owners
+are 5,408 bytes. This measures constructor scratch, not total output memory.
+
+The public composite fixture loads 40,960 rows of 1,024 INT64 lanes (320 MiB raw)
+under the unchanged 256 MiB configured budget (255,013,684 usable bytes). One
+reused 2 MiB host buffer is outside the governor. Every row shares the first
+key; the second selects four exact output tuples. A 4 KiB index cap and 16 KiB
+batch cap are used, with the actual wide encoded-row cap set to 8,216 bytes.
+Chunked load/finish/JOIN succeeds; resident insertion of the same rows refuses.
+A full-width scan remains a legitimate output-budget refusal under that limit.
+
+The internal retained-chunk control uses actual governed row owners: keeping
+53 chunks (112,017,408 retained bytes) refuses the next append at row 13,568.
+Releasing those owners permits retry, completion and the same four-row JOIN
+under the same budget. The unretained case loads all 160 segments; measured
+base/loaded/peak reservations are 134,693,376 / 136,089,880 / 138,411,040 bytes.
+The retained control peaks at 253,187,814 bytes. Disk use is 337,187,840 bytes;
+trace owner, nodes, directory and cursor floors are separately 4,304 / 20,480 /
+1,400 / 112 bytes. Values describe this build and fixture rather than universal
+minimum budgets. Intern storage, resident intermediates and high-cardinality
+results remain independent floors. Aggregate-over-JOIN, automatic all-resident
+composite spilling, weighted composite APIs, SIDE/nested layouts and mutable
+arrangements remain outside this group.

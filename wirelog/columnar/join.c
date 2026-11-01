@@ -1670,9 +1670,7 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
         op->right_filter_expr.data || !op->right_relation ||
         (op->project_count && !op->project_indices) ||
         (op->delta_mode != WL_DELTA_AUTO &&
-        op->delta_mode != WL_DELTA_FORCE_FULL) ||
-        wl_columnar_join_source_references(left) ||
-        wl_columnar_join_source_references(right))
+        op->delta_mode != WL_DELTA_FORCE_FULL))
         return false;
     bool have_left = left->cold || left->resident,
         have_right = right->cold || right->resident;
@@ -1682,10 +1680,10 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
         if (have_left && !wl_columnar_join_source_valid(left, lk)) return false;
         if (have_right && !wl_columnar_join_source_valid(right,
             rk)) return false;
-        if ((have_left && left->types &&
-            left->types[lk] != WIRELOG_TYPE_INT64) ||
-            (have_right && right->types &&
-            right->types[rk] != WIRELOG_TYPE_INT64)) return false;
+        if (have_left && have_right &&
+            (left->types ? left->types[lk] : WIRELOG_TYPE_INT64) !=
+            (right->types ? right->types[rk] :
+            WIRELOG_TYPE_INT64)) return false;
     }
     if (have_left && have_right) {
         uint64_t width = (uint64_t)left->width + right->width;
@@ -1780,11 +1778,6 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
         (first > 1 && !wl_columnar_eval_plan_cold_scan_decode(rp,
         rp->ops[0].relation_name,
         source.width, source.types, first, NULL))) return false;
-    bool composite = false;
-    for (uint32_t i = first; i < rp->op_count; i++)
-        composite |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
-            rp->ops[i].key_count > 1;
-    if (composite && wl_columnar_join_source_references(&source)) return false;
     for (uint32_t c = 0; c < source.width; c++) {
         wirelog_column_type_t type =
             source.types ? source.types[c] : WIRELOG_TYPE_INT64;
@@ -1828,9 +1821,7 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
                 (op->project_count && !op->project_indices)) return false;
             wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
                     op->right_relation, NULL);
-            if (!rhs.schema_valid ||
-                (composite &&
-                wl_columnar_join_source_references(&rhs))) return false;
+            if (!rhs.schema_valid) return false;
             bool present = rhs.cold || rhs.resident;
             for (uint32_t k = 0; k < op->key_count; k++) {
                 uint32_t key = wl_columnar_join_scan_key(s, rp, i, width,
@@ -1838,7 +1829,7 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
                 wirelog_column_type_t type;
                 if (!wl_columnar_join_scan_type(s, rp, i, key, &type) ||
                     (type != WIRELOG_TYPE_INT64 &&
-                    (composite || type != WIRELOG_TYPE_STRING))) return false;
+                    type != WIRELOG_TYPE_STRING)) return false;
                 if (!present) continue;
                 uint32_t right_key = wl_columnar_join_source_key(&rhs,
                         op->right_keys ? op->right_keys[k] : NULL);
@@ -2079,7 +2070,7 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         right_keys,
         op->key_count, op->project_indices, op->project_count,
         sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
-        NULL, NULL, NULL, &cont) :
+        sess->intern, NULL, NULL, &cont) :
         wl_columnar_payload_join_create_sources_projected_bounded(
         sess->memory_governor, descriptors[0], descriptors[1], lk, rk,
         op->project_indices, op->project_count,

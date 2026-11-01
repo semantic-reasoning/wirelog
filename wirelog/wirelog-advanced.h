@@ -219,7 +219,7 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * spill JOIN caps and a serial nonrecursive plan using only audited
  * VARIABLE/JOIN/MAP/CONSOLIDATE operations and the restricted FILTER below.
  * The selected name must have an eligible consumer: a JOIN input with
- * one matching INT64 or STRING equality key or a complete
+ * one or more matching INT64/STRING equality key pairs or a complete
  * VARIABLE followed by ordered direct-column MAP/FILTER stages and terminal
  * CONSOLIDATE (at least one MAP). Each FILTER compares a stage-local INT64
  * column with an integer literal
@@ -233,14 +233,15 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * resident and admitted; the prefix reserves full source-row capacity even
  * when no row passes. FILTER-only prefixes preserve names/INLINE layout; MAP
  * scalarizes fields. Both sides may be sealed, including a self-JOIN.
- * Numeric inputs also support multiple INT64 equality key pairs; every MAP
- * in a composite-key rule must be a direct projection. Key metadata is governed.
+ * Multiple INT64/STRING equality key pairs are supported, including mixed
+ * tuples and scalar flat INLINE fields. Each pair must have matching types.
+ * Every MAP in a composite-key rule must be direct. Key metadata is governed.
  * No cross/theta JOIN, other key types, right filter, timestamps, whole compound
  * values, SIDE/nested layouts,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * JOINs and standalone direct/filtered projections accept STRING lanes from
  * the originating program intern table, including non-key payload columns.
- * Both JOIN keys must have the same type; reference IDs are never remapped.
+ * Corresponding JOIN keys must have the same type; IDs are never remapped.
  * Declared flat INLINE sources may supply scalar child lanes through these
  * projection/JOIN shapes. The initialized layout and original body-use
  * provenance must agree with the plan; nested/whole-value/wrong-functor or
@@ -285,7 +286,7 @@ wirelog_session_seal_input(wirelog_session_t *session,
 /** Begin explicitly chunked loading of an empty declared scalar/flat INLINE EDB.
  * Requires the same serial spill-enabled ordinary mode as seal_input, before
  * evaluation, and supports audited MAP/FILTER scans, equality JOINs (including
- * composite INT64 keys on numeric inputs)
+ * mixed INT64/STRING composite keys and scalar flat INLINE fields)
  * and direct global/grouped COUNT or INT64 SUM/MIN/MAX consumers.
  * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
  * resident facts first; additional empty inputs may begin and preloaded inputs

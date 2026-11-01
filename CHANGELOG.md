@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Composite cold JOINs accept mixed INT64/STRING and scalar flat INLINE keys
+  with whole-source provenance checks and a public fixed-budget proof (#1372).
+
 - Explicit cold JOINs support copied, governed composite INT64 equality keys
   across resident, sealed and chunked sources, including audited chains (#1372).
 

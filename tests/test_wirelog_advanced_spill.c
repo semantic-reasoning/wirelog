@@ -1295,15 +1295,17 @@ static void chunked_public_references(void)
             }
 }
 
-static void chunked_public_budget(bool aggregate)
+static void chunked_public_budget(unsigned workload)
 {
+    bool aggregate = workload == 1, composite = workload == 2;
     /* One reused 2 MiB caller buffer, not a hidden full host-side input. */
     const unsigned total = WL_TEST_COLD_ROWS, chunk = WL_TEST_COLD_CHUNK;
     int64_t *rows = malloc((size_t)chunk*WL_TEST_COLD_WIDTH*sizeof(*rows));
     CHECK(rows);
     environment("WIRELOG_MEMORY_BUDGET", "268435456");
     for (unsigned mode = 0; mode < 3; mode++) {
-        char *text = wl_test_cold_query(mode == 2 ? 1 : aggregate ? 2 : 0);
+        char *text = wl_test_cold_query(mode ==
+                2 ? 1 : aggregate ? 2 : composite ? 3 : 0);
         wirelog_program_t *p = parse(text); free(text);
         wirelog_session_t *s = NULL;
         wirelog_session_options_v1_t options = configured();
@@ -1314,15 +1316,17 @@ static void chunked_public_budget(bool aggregate)
         CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
             &options, &s) == WIRELOG_OK);
         if (mode != 2 && !aggregate) for (int64_t i = 0; i < 4; i++) {
-                int64_t row[] = {i, 10+i};
-                CHECK(wirelog_session_insert(s, "a", row, 1, 2) == WIRELOG_OK);
+                int64_t row[] = {7, i, 10+i};
+                CHECK(wirelog_session_insert(s, "a", composite ? row : row+1, 1,
+                    composite ? 3 : 2) == WIRELOG_OK);
             }
         if (mode != 1) CHECK(wirelog_session_begin_cold_input(s,
                 "b") == WIRELOG_OK);
         wirelog_error_t error = WIRELOG_OK; unsigned admitted = 0;
         for (unsigned first = 0; first < total && error == WIRELOG_OK;
             first += chunk) {
-            if (aggregate) wl_test_cold_group_rows(rows, first);
+            if (composite) wl_test_cold_composite_rows(rows, first);
+            else if (aggregate) wl_test_cold_group_rows(rows, first);
             else wl_test_cold_rows(rows, first);
             error = mode == 1 ? wirelog_session_insert(s, "b", rows, chunk,
                     WL_TEST_COLD_WIDTH) :
@@ -1331,8 +1335,8 @@ static void chunked_public_budget(bool aggregate)
             if (error == WIRELOG_OK) admitted += chunk;
         }
         printf(
-            "public chunked budget=268435456 aggregate=%u mode=%u admitted_rows=%u total_rows=%u status=%d\n",
-            aggregate, mode, admitted, total, (int)error);
+            "public chunked budget=268435456 workload=%u mode=%u admitted_rows=%u total_rows=%u status=%d\n",
+            workload, mode, admitted, total, (int)error);
         if (mode == 1) CHECK(error == WIRELOG_ERR_MEMORY_BUDGET);
         else {
             CHECK(error == WIRELOG_OK);
@@ -1869,6 +1873,137 @@ static void composite_public_numeric(void)
                 }
 }
 
+typedef struct {
+    bool seen[19][23];
+    int64_t ids[3];
+} composite_reference_events_t;
+static void composite_reference_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    if (strcmp(name, "result")) return;
+    composite_reference_events_t *e = context;
+    CHECK(cols == 3 && row[0] >= 0 && row[0] < 19 && row[1] >= 0 &&
+        row[1] < 23);
+    CHECK(row[0]%3 == row[1]%3 && row[2] == e->ids[row[0]%3] &&
+        !e->seen[row[0]][row[1]]);
+    e->seen[row[0]][row[1]] = true;
+}
+static void composite_reference_typed(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    if (strcmp(name, "result")) return;
+    CHECK(diff == 1 && row->logical_ncols == 3 && row->physical_nlanes == 3);
+    CHECK(row->types[0] == WIRELOG_TYPE_INT64 &&
+        row->types[1] == WIRELOG_TYPE_INT64 &&
+        row->types[2] == WIRELOG_TYPE_STRING);
+    CHECK(row->physical_types[0] == WIRELOG_TYPE_INT64 &&
+        row->physical_types[1] == WIRELOG_TYPE_INT64 &&
+        row->physical_types[2] == WIRELOG_TYPE_STRING);
+    int64_t values[3]; memcpy(values, row->lanes, sizeof(values));
+    composite_reference_observe(name, values, 3, context);
+}
+static void composite_public_references(void)
+{
+    for (unsigned inlined = 0; inlined < 2; inlined++)
+        for (unsigned count = 2; count <= 3; count++)
+            for (unsigned lm = 0; lm < 3; lm++) for (unsigned rm = 0; rm < 3;
+                    rm++)
+                    for (unsigned empty = 0; empty < 2; empty++) {
+                        char text[1024];
+                        snprintf(text, sizeof(text),
+                            ".decl seed(s:symbol,k:int64)\nseed(\"\",0).\nseed(\"alpha\",1).\nseed(\"한글\",2).\nseed(\"unused\",3).\n%s\n.decl b(t:int64,k:int64,s:symbol,y:int64,u:symbol)\n.decl result(x:int64,y:int64,s:symbol)\nresult(x,y,s) :- %s,b(%s,k,s,y,v).\n",
+                            inlined ?
+                            ".decl a(p:pair(int64,symbol) inline,t:int64,x:int64,u:symbol)"
+                            :
+                            ".decl a(k:int64,s:symbol,t:int64,x:int64,u:symbol)",
+                            inlined ? "a(pair(k,s),t,x,u)" : "a(k,s,t,x,u)",
+                            count == 3 ? "t" : "q");
+                        wirelog_program_t *p = parse(text);
+                        wirelog_session_t *session = NULL;
+                        wirelog_session_options_v1_t options = configured();
+                        options.spill_max_row_bytes = 128;
+                        options.spill_join_batch_bytes = 24;
+                        options.spill_join_index_bytes = 256;
+                        CHECK(wirelog_session_create_with_options(p,
+                            WIRELOG_BACKEND_DEFAULT, 1, &options,
+                            &session) == WIRELOG_OK);
+                        int64_t *facts = NULL; uint32_t rows, cols;
+                        int64_t ids[4];
+                        CHECK(wirelog_program_get_facts(p, "seed", &facts,
+                            &rows, &cols) == 0 && rows == 4 && cols == 2);
+                        for (unsigned i = 0; i < 4; i++) {
+                            CHECK(facts[2*i+1] >= 0 && facts[2*i+1] < 4);
+                            ids[facts[2*i+1]] = facts[2*i];
+                        }
+                        free(facts);
+                        int64_t left[19*5], right[23*5];
+                        for (unsigned i = 0; i < 19; i++) {
+                            left[5*i] = 7; left[5*i+1] = ids[i%3];
+                            left[5*i+2] = i%5; left[5*i+3] = i;
+                            left[5*i+4] = ids[3];
+                        }
+                        for (unsigned i = 0; i < 23; i++) {
+                            right[5*i] = i%5; right[5*i+1] = 7;
+                            right[5*i+2] = ids[i%3]; right[5*i+3] = i;
+                            right[5*i+4] = ids[3];
+                        }
+                        /* Empty resident sources still acquire the declared physical schema. */
+                        if (lm != 2) CHECK(wirelog_session_insert(session, "a",
+                                left, empty ? 0 : 19, 5) == WIRELOG_OK);
+                        if (rm != 2) CHECK(wirelog_session_insert(session, "b",
+                                right, 23, 5) == WIRELOG_OK);
+                        for (unsigned side = 0; side < 2; side++) {
+                            unsigned mode = side ? rm : lm;
+                            const char *name = side ? "b" : "a";
+                            if (mode ==
+                                1) CHECK(wirelog_session_seal_input(session,
+                                    name) == WIRELOG_OK);
+                            if (mode == 2) {
+                                CHECK(wirelog_session_begin_cold_input(session,
+                                    name) == WIRELOG_OK);
+                                int64_t *data = side ? right : left;
+                                int64_t invalid[5];
+                                memcpy(invalid, data, sizeof(invalid));
+                                invalid[4] = INT64_MAX;
+                                CHECK(wirelog_session_append_cold_input(session,
+                                    name, invalid, 1, 5) == WIRELOG_ERR_EXEC);
+                                unsigned n = side ? 23 : empty ? 0 : 19;
+                                for (unsigned first = 0; first < n;
+                                    first += 3) {
+                                    unsigned chunk = n-first < 3 ? n-first : 3;
+                                    CHECK(wirelog_session_append_cold_input(
+                                            session, name, data+first*5, chunk,
+                                            5) == WIRELOG_OK);
+                                }
+                                CHECK(wirelog_session_finish_cold_input(session,
+                                    name) == WIRELOG_OK);
+                            }
+                        }
+                        for (unsigned repeat = 0; repeat < 2; repeat++) {
+                            composite_reference_events_t raw = {0}, typed = {0};
+                            memcpy(raw.ids, ids, sizeof(raw.ids));
+                            memcpy(typed.ids, ids, sizeof(typed.ids));
+                            CHECK(wirelog_session_step(session) == WIRELOG_OK);
+                            CHECK(wirelog_session_snapshot(session,
+                                composite_reference_observe,
+                                &raw) == WIRELOG_OK);
+                            CHECK(wirelog_session_snapshot_typed(session,
+                                composite_reference_typed,
+                                &typed) == WIRELOG_OK);
+                            for (unsigned l = 0; l < 19; l++) for (unsigned r =
+                                    0;
+                                    r < 23; r++) {
+                                    bool expected = !empty && l%3 == r%3 &&
+                                        (count == 2 || l%5 == r%5);
+                                    CHECK(raw.seen[l][r] == expected &&
+                                        typed.seen[l][r] == expected);
+                                }
+                        }
+                        wirelog_session_destroy(session);
+                        wirelog_program_free(p); CHECK(!live_files());
+                    }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1891,10 +2026,10 @@ int main(void)
     cold_group_counts("count"); cold_group_counts("sum");
     cold_group_counts("min"); cold_group_counts("max");
     cold_integer_aggregates();
-    composite_public_numeric();
+    composite_public_numeric(); composite_public_references();
     chunked_public_scans(); chunked_public_joins();
     chunked_public_references(); chunked_public_budget(false);
-    chunked_public_budget(true);
+    chunked_public_budget(true); chunked_public_budget(2);
     inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();

@@ -450,8 +450,9 @@ wl_columnar_payload_join_create_keys_impl(wl_columnar_memory_governor_ref_t *g,
         for (uint32_t k = 0; k < key_count; k++) {
             if (left_keys[k] >= lc || right_keys[k] >= rc)
                 return WL_COLUMNAR_SPILL_INVALID;
-            if (lt[left_keys[k]] != WIRELOG_TYPE_INT64 ||
-                rt[right_keys[k]] != WIRELOG_TYPE_INT64)
+            if (lt[left_keys[k]] != rt[right_keys[k]] ||
+                (lt[left_keys[k]] != WIRELOG_TYPE_INT64 &&
+                !(intern && lt[left_keys[k]] == WIRELOG_TYPE_STRING)))
                 return WL_COLUMNAR_SPILL_UNSUPPORTED;
         }
     }
@@ -622,11 +623,9 @@ wl_columnar_payload_join_create_sources_keys_projected_bounded(
     *out = NULL;
     if (!key_count || !left_keys ||
         !right_keys) return WL_COLUMNAR_SPILL_INVALID;
-    /* Initial tuple route is numeric-only over the entire input schema. */
-    if (intern) return WL_COLUMNAR_SPILL_UNSUPPORTED;
     return wl_columnar_payload_join_create_keys_impl(g, left, right,
                left_keys[0], right_keys[0], batch_bytes, cancel, context, out,
-               false, true, index_bytes, projection, project_count, NULL,
+               false, true, index_bytes, projection, project_count, intern,
                left_keys, right_keys, key_count);
 }
 

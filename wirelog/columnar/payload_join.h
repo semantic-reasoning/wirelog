@@ -28,10 +28,11 @@ wl_columnar_payload_join_create_sources_projected_bounded(
     const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
     void *context, wl_columnar_continuation_t **out);
 
-/* Ordinary numeric tuple equality through the same bounded window engine.
- * Positive count and non-NULL, in-range key vectors are required; every pair
- * is INT64. This initial entry refuses STRING/INLINE input provenance and
- * requires intern == NULL, including empty and projected-away inputs.
+/* Ordinary tuple equality through the same bounded window engine.
+ * Positive count and non-NULL, in-range key vectors are required. Each pair
+ * has matching INT64 or STRING types. STRING/flat INLINE sources require the
+ * exact originating intern, including empty and projected-away inputs.
+ * NULL intern preserves the complete numeric-only source restriction.
  * The producer copies both vectors into separately governed O(key_count)
  * metadata before returning. Caller arrays may then be changed/freed.
  * Index caps retain their bucket/link meaning; key metadata and reader/output
