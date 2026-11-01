@@ -234,8 +234,11 @@ find_relation(const wl_plan_t *plan, const char *name, uint32_t *si_out,
     return false;
 }
 
-/* Set on the coordinator before the call, to show the executor runs on a
- * clone that does not inherit them: each one makes the bound runner refuse. */
+/* Set on the coordinator before the call: the operand-selecting flags, each
+ * of which makes the bound runner refuse, to show the executor runs on a
+ * clone that does not inherit them, and the bounded join knob without
+ * strict mode, which the clone keeps (#2201), so the case's rows must come
+ * out the same with its JOINs bounded or recorded as fallbacks. */
 static bool flags_on_coordinator;
 
 /* When non-zero, the stratum call must fail with exactly this code; the
@@ -315,8 +318,8 @@ run_case(const case_t *c, uint32_t workers)
             coord->retraction_seeded = true;
             coord->retraction_right_pass = true;
             coord->diff_operators_active = true;
-            coord->join_batch_bytes = 1u << 20;
-            coord->join_batch_strict = true;
+            coord->join_batch_bytes = 224;
+            coord->join_batch_strict = false;
         }
         int rc = wl_columnar_eval_tdd_insert_stratum(coord,
                 &plan->strata[si], changed, deltas, 1, head_delta);
@@ -324,8 +327,8 @@ run_case(const case_t *c, uint32_t workers)
             bool kept = coord->delta_seeded && coord->retraction_seeded
                 && coord->retraction_right_pass
                 && coord->diff_operators_active
-                && coord->join_batch_bytes == (1u << 20)
-                && coord->join_batch_strict;
+                && coord->join_batch_bytes == 224
+                && !coord->join_batch_strict;
             coord->delta_seeded = false;
             coord->retraction_seeded = false;
             coord->retraction_right_pass = false;
@@ -783,8 +786,8 @@ main(void)
             tests_passed++;
             printf(" ... PASS\n");
         }
-        /* Every case again with the coordinator's operand-selecting and
-         * batching flags set. */
+        /* Every case again with the coordinator's operand-selecting flags
+         * and its bounded join knob set. */
         flags_on_coordinator = true;
         for (uint32_t i = 0; i < sizeof(CASES) / sizeof(CASES[0]); i++) {
             tests_run++;

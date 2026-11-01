@@ -1275,8 +1275,8 @@ differential pin or replacement transaction before destroying relations.
 
 ## 10a. Bounded join sub-batches (#1446)
 
-`WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
-eligible keyed join run the resumable sub-batch producer in
+`WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes
+an eligible keyed join run the resumable sub-batch producer in
 `wirelog/columnar/join_batch.c` instead of the one-shot probe loop.
 Eligible means: `key_count > 0`, no right filter expression, and either a
 persistent primary arrangement on the right relation with no right-side
@@ -1285,23 +1285,26 @@ The runs that do are a TDD bound run and an insert clone, which may read a
 range piece or a delta under the relation's name.  There the producer
 builds an index of its own over the relation the slot holds
 (`col_join_batch_producer_create_over`) and pins nothing by name, so a
-delta right operand is eligible too (#2201); insert clones still run with
-the knob turned off (below).  Other worker sessions, TDD workers and
-non-recursive workers alike, have also been eligible since #2201; where
-non-recursive workers share one output counter, the producer charges it
-per committed batch.  No JOIN records `worker-session` since #2201.
-Every other shape falls back to the one-shot join; the session records the
-fallback count and last reason and logs one `JOIN` warning per reason.
-The session also counts the bounded runs that complete, per route
-(ordinary, differential, pipeline; #2201).  A worker session starts with
-its own counts and reason cleared, and its teardown folds them into the
-coordinator (#1382, #2201), so a coordinator's counts include what its
-workers recorded once they are destroyed.  The snapshot route for an
-incremental insert (#2114) runs its joins on a worker clone with the knob
-turned off; when a stratum it reaches has a JOIN, a snapshot that attempts
-the route records `insert-route` without strict mode; strict mode,
-recording nothing, refuses the route before it mutates anything, so the
-snapshot is evaluated in full (#1382).  With the knob set, K-Fusion also
+delta right operand is eligible too (#2201).  Other worker sessions, TDD
+workers and non-recursive workers alike, have also been eligible since
+that change; where non-recursive workers share one output counter, the
+producer charges it per committed batch.  No JOIN records `worker-session`
+since #2201.  Every other shape falls back to the one-shot join; the
+session records the fallback count and last reason and logs one `JOIN`
+warning per reason.  The session also counts the bounded runs that
+complete, per route (ordinary, differential, pipeline; #2201).  A worker
+session starts with its own counts and reason cleared, and its teardown
+folds them into the coordinator (#1382, #2201), so a coordinator's counts
+include what its workers recorded once they are destroyed.  The snapshot
+route for an incremental insert (#2114) runs its joins on worker clones
+that keep the knob, strict mode included, since #2201; their JOINs run the
+producer over the relations their slots hold, and their teardown folds
+their counts into the session.  Strict mode can therefore refuse a clone's
+JOIN after an earlier stratum's heads were merged; the snapshot then
+evaluates in full, as after any refusal of the route.  A memory budget
+denial on a clone is not folded: `wl_columnar_session_budget_denied` reads
+the session's and its TDD workers' flags, not an insert clone's, as for
+the one-shot JOIN a clone runs.  With the knob set, K-Fusion also
 evaluates its branches serially on the calling session instead of on
 parallel branch sessions (#1382): a branch session is a shallow copy of
 the calling session, so its joins would otherwise run the bounded producer
@@ -1822,9 +1825,14 @@ builds at one and four workers, reading the per-route run counts:
   two-hop, filtered two-hop and closure programs succeed under strict mode,
   on the ordinary, pipeline and differential routes; the K = 4 recursive
   rule records its excluded shapes);
-- a snapshot after an incremental insert takes the insert route (#2114),
-  whose worker clones run with the knob off, and records `insert-route`;
-  strict mode refuses the route and the full re-evaluation is bounded;
+- a snapshot after an incremental insert takes the insert route (#2114) in
+  both modes, and its clones run the producer on the pipeline route,
+  recording nothing (#2201); at four workers the clones run concurrently.
+  A strict snapshot whose route merges one stratum's heads and then has a
+  clone refuse a JOIN that feeds another JOIN returns `ENOTSUP` from the
+  full evaluation that follows, and a snapshot whose clone overflows the
+  legacy row cap returns `EOVERFLOW`.  With strict mode or the cap
+  cleared, the next snapshot is exact;
 - at four workers, with `WIRELOG_TDD_MIN_ROWS_PER_WORKER` or
   `WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER` forced to 1, the workers
   themselves run the producer (#2201): TDD workers on the differential
@@ -1840,27 +1848,28 @@ builds at one and four workers, reading the per-route run counts:
   session exists while the knob is set.
 
 With W workers up to W producers run at once, one per worker, each within
-the per-producer bound above, and all of them are admitted by the session's
-single memory governor; the aggregate working set is therefore up to W
-times the per-producer bound, plus each worker's output relation.  Each
-worker still publishes one relation per JOIN operator, so no worker emits
-more than one payload into the one-payload-per-worker transport; bounded
-exchange is still #1383 after #1373.  A TDD bound run reads the knob from
-its worker and runs the producer over the slot's relation (#2201), with
-`I(n)` added to that producer's bound; the insert route's clones still
-clear the knob before evaluating.  The expanded and CSPA K1 bound forms
-are exercised only by unit tests (`test_tdd_occurrence_execution`); in
-the instances that test runs, the first JOIN feeds another JOIN and
-records `pipeline-not-consumable`, so strict mode refuses them.  Which
-route a given production workload takes depends on its data sizes and is
-not claimed here, and no performance claim is made.
+the per-producer bound above, and all of them are admitted by the
+session's single memory governor; the aggregate working set is therefore
+up to W times the per-producer bound, plus each worker's output relation.
+Each worker still publishes one relation per JOIN operator, so no worker
+emits more than one payload into the one-payload-per-worker transport;
+bounded exchange is still #1383 after #1373.  A TDD bound run reads the
+knob from its worker and runs the producer over the slot's relation
+(#2201), with `I(n)` added to that producer's bound; so does each
+insert-route clone, up to one producer per clone, all admitted by the
+session's governor. The expanded and CSPA K1 bound forms are exercised
+only by unit tests (`test_tdd_occurrence_execution`); in the instances
+that test runs, the first JOIN feeds another JOIN and records
+`pipeline-not-consumable`, so strict mode refuses them.  Which route a
+given production workload takes depends on its data sizes and is not
+claimed here, and no performance claim is made.
 
 The shapes bounded mode excludes record these reasons, and each is refused
 under `WIRELOG_JOIN_BATCH_STRICT`: `cross-join`, `delta-right`,
 `filtered-right`, `no-arrangement`, `row-too-large`, `pipeline-not-consumable`,
 `materialized` (differential path; a cached result is copied before the
-decision and is neither recorded nor refused), `lftj` and `insert-route`.
-`worker-session` is no longer recorded since #2201.
+decision and is neither recorded nor refused) and `lftj`.  Neither
+`worker-session` nor `insert-route` is recorded since #2201.
 A controlled attempt on the JOIN route of #1821 refuses the knob with
 `ENOTSUP` without recording a reason; the numeric plan driver that
 dispatches it is not yet reached from session evaluation.

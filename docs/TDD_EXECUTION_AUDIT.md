@@ -336,14 +336,15 @@ instance the binder lists can begin on a worker in a plain state: a worker
 with retraction or delta seeding or differential operators active is refused
 before evaluation, and so is a run the memory governor denies; a worker with
 the bounded join knob set is not refused since #2201.
-`wl_columnar_eval_tdd_insert_stratum()` runs the instances on one worker
-clone with those session flags cleared, since a clone copies them from the
-coordinator, and it also clears the clone's bounded join batching, strict
-mode included, so that is off for these runs.  With `WIRELOG_JOIN_BATCH_BYTES`
-set and without strict mode, a snapshot that attempts this route through a
-stratum with a JOIN records the `insert-route` fallback; under
-`WIRELOG_JOIN_BATCH_STRICT` the route is refused, recording nothing, before
-anything is mutated, and the snapshot is evaluated in full instead (#1382).
+`wl_columnar_eval_tdd_insert_stratum()` runs the instances on worker clones
+with those session flags cleared, since a clone copies them from the
+coordinator.  Since #2201 the clones keep the session's bounded join
+batching, strict mode included, so an eligible JOIN an instance evaluates
+runs the bounded producer over the relation its right slot holds; the
+`insert-route` fallback is no longer recorded.  Under
+`WIRELOG_JOIN_BATCH_STRICT` a clone's JOIN can be refused with `ENOTSUP`
+after an earlier stratum's heads were merged, and the snapshot is then
+evaluated in full, as after any refusal of the route.
 
 `meson test -C builddir tdd_occurrence_execution` runs all five active alternatives
 of the unmodified generated CSPA `valueAlias` plan with independently partitioned

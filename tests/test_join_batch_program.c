@@ -16,6 +16,10 @@
  * worker of that snapshot has been destroyed and has folded its records
  * into the session.
  *
+ * A snapshot after an incremental insert takes the insert route (#2114),
+ * whose worker clones keep the knob since #2201 and run their JOINs on the
+ * bounded producer.
+ *
  * Strict mode refuses every recorded fallback, so in these programs a
  * strict snapshot that succeeds ran no excluded shape: each of its joins
  * was bounded or had nothing to bound.
@@ -73,6 +77,30 @@ count_kfusion_clone(wl_col_session_t *parent, wl_col_session_t *child,
     (void)child;
     if (before)
         kfusion_clones++;
+}
+
+/* The most tasks one insert-route round ran in parallel, and the strata
+ * whose heads the insert route merged, through the test hooks (#2201). */
+static uint32_t insert_max_tasks;
+static uint32_t insert_merges;
+
+static void
+record_insert_round(const wl_plan_stratum_t *sp, uint32_t units,
+    uint32_t pieces, uint32_t tasks)
+{
+    (void)sp;
+    (void)units;
+    (void)pieces;
+    if (tasks > insert_max_tasks)
+        insert_max_tasks = tasks;
+}
+
+static int
+count_insert_merge(const wl_plan_stratum_t *sp)
+{
+    (void)sp;
+    insert_merges++;
+    return 0;
 }
 
 /* ---- the input and its oracles ------------------------------------------ */
@@ -154,6 +182,27 @@ oracle_two_hop_filtered(const edges_t *e, pairs_t *out)
         for (uint32_t j = 0; j < e->n; j++)
             if (e->to[i] == e->from[j] && e->to[j] != 7)
                 pairs_add(out, e->from[i], e->to[j]);
+}
+
+/* quad(x, w) :- hop(x, y), edge(y, z), edge(z, w), with hop the two-hop
+ * relation: the pairs joined by an edge path of length 4, as a set. */
+static void
+oracle_four_hop(const edges_t *e, pairs_t *out)
+{
+    static pairs_t hop, three;
+
+    oracle_two_hop(e, &hop);
+    memset(&three, 0, sizeof(three));
+    for (uint32_t p = 0; p < hop.count; p++)
+        for (uint32_t i = 0; i < e->n; i++)
+            if (hop.row[p][1] == e->from[i])
+                pairs_add(&three, hop.row[p][0], e->to[i]);
+    memset(out, 0, sizeof(*out));
+    for (uint32_t p = 0; p < three.count; p++)
+        for (uint32_t i = 0; i < e->n; i++)
+            if (three.row[p][1] == e->from[i])
+                pairs_add(out, three.row[p][0], e->to[i]);
+    out->overflow = hop.overflow || three.overflow;
 }
 
 /* The transitive closure of edge, by repeated two-hop extension. */
@@ -482,8 +531,15 @@ run_case(const char *name, const char *src, const char *relation,
         oracle_fn(&e, &oracle);
         ok = col_session_insert_incremental(s, "edge", row, 1, 2) == 0;
         if (ok) {
+            insert_max_tasks = 0;
             snapshot(s, relation, &o);
             ok = check("snapshot after insert", &o, second, &oracle);
+            /* At four workers the insert route's clones ran concurrently,
+             * so TSan sees their producers side by side (#2201). */
+            if (ok && second->route && workers > 1 && insert_max_tasks < 2) {
+                printf("\n    insert route ran %u task(s)", insert_max_tasks);
+                ok = false;
+            }
         }
     }
     close_session(s, plan, prog);
@@ -562,14 +618,161 @@ run_reuse_after_overflow(bool on_workers)
     }
 }
 
+/* A program whose insert route reaches two strata: hop, a JOIN followed by
+ * a MAP, and quad, whose first JOIN feeds a second, which strict mode
+ * refuses as pipeline-not-consumable. */
+static const char *TWO_STRATA =
+    ".decl edge(x: int64, y: int64)\n"
+    ".decl hop(x: int64, z: int64)\n"
+    ".decl quad(x: int64, w: int64)\n"
+    "hop(x, z) :- edge(x, y), edge(y, z).\n"
+    "quad(x, w) :- hop(x, y), edge(y, z), edge(z, w).\n";
+
+/* #2201: the insert route's clones keep the knob, so a JOIN they run can
+ * fail after an earlier stratum's heads were merged.  The first snapshot
+ * runs without strict mode; with strict mode set before the insert, the
+ * route merges hop's heads, and quad's clone refuses its first JOIN with
+ * ENOTSUP.  The snapshot then evaluates in full, which strict mode refuses
+ * as well, so it returns ENOTSUP with the full evaluation still pending.
+ * With strict mode cleared the next snapshot, a full evaluation on the
+ * calling session, is exact and records quad's first JOIN as
+ * pipeline-not-consumable. */
+static void
+run_strict_after_merge(void)
+{
+    static pairs_t oracle;
+    static outcome_t o;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_session_t *s;
+    edges_t e;
+    bool ok;
+    const expect_t exact = {
+        0, true, COL_JOIN_BATCH_EXCLUDED_PIPELINE, false, RUN_ORD, 0
+    };
+
+    tests_run++;
+    printf("  [%2d] strict insert route fails after a merged stratum",
+        tests_run);
+    set_mode(MODE_RECORD);
+    s = open_session(TWO_STRATA, 1, &plan, &prog);
+    edges_init(&e, false);
+    ok = s && insert_edges(s, &e) == 0;
+    if (ok) {
+        oracle_four_hop(&e, &oracle);
+        snapshot(s, "quad", &o);
+        ok = o.rc == 0 && same_set(&o.got.rows, o.got.duplicates, &oracle);
+        if (!ok)
+            printf("\n    first snapshot rc=%d rows=%u", o.rc,
+                o.got.rows.count);
+    }
+    if (ok) {
+        int64_t row[2] = { (int64_t)CHAIN, (int64_t)CHAIN + 1 };
+        COL_SESSION(s)->join_batch_strict = true;
+        ok = col_session_insert_incremental(s, "edge", row, 1, 2) == 0;
+    }
+    if (ok) {
+        insert_merges = 0;
+        wl_columnar_eval_tdd_insert_test_after_merge = count_insert_merge;
+        snapshot(s, "quad", &o);
+        wl_columnar_eval_tdd_insert_test_after_merge = NULL;
+        ok = o.rc == ENOTSUP && insert_merges >= 1
+            && COL_SESSION(s)->pending_full_input_eval;
+        if (!ok)
+            printf("\n    strict snapshot rc=%d merges=%u pending=%d", o.rc,
+                insert_merges, (int)COL_SESSION(s)->pending_full_input_eval);
+    }
+    if (ok) {
+        edges_init(&e, true);
+        oracle_four_hop(&e, &oracle);
+        COL_SESSION(s)->join_batch_strict = false;
+        snapshot(s, "quad", &o);
+        ok = check("snapshot without strict mode", &o, &exact, &oracle);
+    }
+    close_session(s, plan, prog);
+    clear_env();
+    if (ok) {
+        printf(" ... PASS\n");
+    } else {
+        printf(" ... FAIL\n");
+        tests_failed++;
+    }
+}
+
+/* #2201: a clone of the insert route that overflows the legacy row cap
+ * fails the snapshot with EOVERFLOW, which the route returns directly;
+ * with the cap cleared the next snapshot, a full evaluation, is exact.
+ * The cap is set after the first snapshot, whose own hub join would
+ * overflow it, and the inserted edge (HUB + 1, 0) reaches the hub key's
+ * FAN + 1 successors.  At @workers clones each clone gets its share of
+ * the cap. */
+static void
+run_insert_overflow_reuse(uint32_t workers)
+{
+    static pairs_t oracle;
+    static outcome_t o;
+    wl_plan_t *plan = NULL;
+    wirelog_program_t *prog = NULL;
+    wl_session_t *s;
+    edges_t e;
+    bool ok;
+    const expect_t exact = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
+    };
+
+    tests_run++;
+    printf("  [%2d] two-hop, W=%u, reuse after a capped insert route",
+        tests_run, workers);
+    set_mode(MODE_RECORD);
+    if (workers > 1)
+        setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
+    s = open_session(TWO_HOP, workers, &plan, &prog);
+    edges_init(&e, false);
+    ok = s && insert_edges(s, &e) == 0;
+    if (ok) {
+        snapshot(s, "hop", &o);
+        ok = o.rc == 0;
+    }
+    if (ok) {
+        int64_t row[2] = { (int64_t)HUB + 1, 0 };
+        COL_SESSION(s)->join_output_limit = 100;
+        ok = col_session_insert_incremental(s, "edge", row, 1, 2) == 0;
+    }
+    if (ok) {
+        snapshot(s, "hop", &o);
+        ok = o.rc == EOVERFLOW && o.routes == 0
+            && COL_SESSION(s)->pending_full_input_eval;
+        if (!ok)
+            printf("\n    capped snapshot rc=%d routes=%u", o.rc, o.routes);
+    }
+    if (ok) {
+        e.from[e.n] = HUB + 1;
+        e.to[e.n++] = 0;
+        oracle_two_hop(&e, &oracle);
+        COL_SESSION(s)->join_output_limit = 0;
+        snapshot(s, "hop", &o);
+        ok = check("snapshot after clearing the cap", &o, &exact, &oracle);
+    }
+    close_session(s, plan, prog);
+    clear_env();
+    if (ok) {
+        printf(" ... PASS\n");
+    } else {
+        printf(" ... FAIL\n");
+        tests_failed++;
+    }
+}
+
 int
 main(void)
 {
     /* Nothing recorded, rows exact, and the calling session completed a
      * bounded run: on the ordinary route for the two-hop rule, on the
      * pipeline route for the filtered two-hop rule, and on the
-     * differential route for the recursive closure; or the insert route,
-     * recorded, with no bounded run on any session. */
+     * differential route for the recursive closure.  After an incremental
+     * insert, the insert route with nothing recorded and its clones'
+     * bounded runs on the pipeline route (#2201): in the bound slices of
+     * these programs each JOIN is followed by a MAP. */
     const expect_t two_hop_bounded = {
         0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_ORD, 0
     };
@@ -579,8 +782,8 @@ main(void)
     const expect_t closure_bounded = {
         0, true, COL_JOIN_BATCH_ELIGIBLE, false, RUN_DIFF, 0
     };
-    const expect_t routed = {
-        0, true, COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE, true, 0, 0
+    const expect_t insert_pipe = {
+        0, true, COL_JOIN_BATCH_ELIGIBLE, true, 0, RUN_PIPE
     };
     const expect_t four_way_rows = {
         0, true, COL_JOIN_BATCH_REASON_COUNT, false, RUN_DIFF, 0
@@ -612,27 +815,27 @@ main(void)
     printf("test_join_batch_program (default)\n");
 #endif
     clear_env();
+    wl_columnar_eval_tdd_insert_test_round = record_insert_round;
 
     /* Coordinator routes: the first snapshot evaluates on the calling
      * session (these strata are below the parallel thresholds), so it runs
      * bounded and strict mode succeeds.  The snapshot after an incremental
-     * insert takes the insert route and records insert-route; in strict
-     * mode the route is refused and the full re-evaluation is bounded. */
+     * insert takes the insert route in both modes. */
     for (uint32_t w = 0; w < 2; w++) {
         run_case("two-hop", TWO_HOP, "hop", oracle_two_hop, workers[w],
-            MODE_RECORD, &two_hop_bounded, &routed);
+            MODE_RECORD, &two_hop_bounded, &insert_pipe);
         run_case("two-hop", TWO_HOP, "hop", oracle_two_hop, workers[w],
-            MODE_STRICT, &two_hop_bounded, &two_hop_bounded);
+            MODE_STRICT, &two_hop_bounded, &insert_pipe);
         run_case("filtered two-hop", TWO_HOP_FILTERED, "hop",
             oracle_two_hop_filtered, workers[w], MODE_RECORD,
-            &filtered_bounded, &routed);
+            &filtered_bounded, &insert_pipe);
         run_case("filtered two-hop", TWO_HOP_FILTERED, "hop",
             oracle_two_hop_filtered, workers[w], MODE_STRICT,
-            &filtered_bounded, &filtered_bounded);
+            &filtered_bounded, &insert_pipe);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
-            MODE_RECORD, &closure_bounded, &routed);
+            MODE_RECORD, &closure_bounded, &insert_pipe);
         run_case("closure", CLOSURE, "path", oracle_closure, workers[w],
-            MODE_STRICT, &closure_bounded, &closure_bounded);
+            MODE_STRICT, &closure_bounded, &insert_pipe);
         /* The four-way rule records several fallbacks (a JOIN feeding
          * another JOIN is pipeline-not-consumable, and its semi-naive
          * rounds read right deltas), so strict mode would refuse it and
@@ -653,33 +856,35 @@ main(void)
      * bdx), and non-recursive strata split across workers.  Joins inside
      * the workers run bounded, and strict mode succeeds where the calling
      * session's would.  The snapshot after an incremental insert takes the
-     * insert route, whose clones run with the knob off and record
-     * insert-route.  In strict mode the route is refused and the full
-     * re-evaluation is bounded: on workers again for the non-recursive
-     * strata, and on the calling session for the recursive closure. */
+     * insert route in both modes, with clones running concurrently; for
+     * the self-joined closure, whose first snapshot records delta-right,
+     * the insert route's clones read a delta right operand bounded. */
     setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", "1", 1);
     run_case("closure on TDD workers", CLOSURE, "path", oracle_closure, 4,
-        MODE_RECORD, &tdd_bounded, &routed);
+        MODE_RECORD, &tdd_bounded, &insert_pipe);
     run_case("closure on TDD workers", CLOSURE, "path", oracle_closure, 4,
-        MODE_STRICT, &tdd_bounded, &closure_bounded);
+        MODE_STRICT, &tdd_bounded, &insert_pipe);
     run_case("self-joined closure on TDD workers", CLOSURE_SELF_JOIN, "path",
-        oracle_closure, 4, MODE_RECORD, &tdd_self_join, NULL);
+        oracle_closure, 4, MODE_RECORD, &tdd_self_join, &insert_pipe);
     unsetenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER");
     setenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER", "1", 1);
     run_case("two-hop on parallel workers", TWO_HOP, "hop", oracle_two_hop, 4,
-        MODE_RECORD, &parallel_bounded, &routed);
+        MODE_RECORD, &parallel_bounded, &insert_pipe);
     run_case("two-hop on parallel workers", TWO_HOP, "hop", oracle_two_hop, 4,
-        MODE_STRICT, &parallel_bounded, &parallel_bounded);
+        MODE_STRICT, &parallel_bounded, &insert_pipe);
     run_case("filtered two-hop on parallel workers", TWO_HOP_FILTERED, "hop",
         oracle_two_hop_filtered, 4, MODE_RECORD, &parallel_pipeline,
-        &routed);
+        &insert_pipe);
     run_case("filtered two-hop on parallel workers", TWO_HOP_FILTERED, "hop",
         oracle_two_hop_filtered, 4, MODE_STRICT, &parallel_pipeline,
-        &parallel_pipeline);
+        &insert_pipe);
     unsetenv("WIRELOG_NONREC_TDD_MIN_ROWS_PER_WORKER");
 
     run_reuse_after_overflow(false);
     run_reuse_after_overflow(true);
+    run_insert_overflow_reuse(1);
+    run_insert_overflow_reuse(4);
+    run_strict_after_merge();
 
     printf("%d run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
