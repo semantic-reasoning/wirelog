@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Explicit cold JOINs support copied, governed composite INT64 equality keys
+  across resident, sealed and chunked sources, including audited chains (#1372).
+
 - Cold INT64 SUM/MIN/MAX stream checked direct operands, preserving source-order
   overflow and resident empty/extrema semantics (#1372 follow-up).
 

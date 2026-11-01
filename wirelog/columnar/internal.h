@@ -5568,6 +5568,8 @@ col_op_map_output_types(const wl_plan_op_t *op, const col_rel_t *input,
 int
 wl_columnar_filter_op(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess);
+uint32_t wl_columnar_join_cold_source_key(const wl_col_session_t *s,
+    const char *relation, const char *key);
 bool wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     const wl_plan_relation_t *rp);
 int wl_columnar_join_cold_left(wl_col_session_t *s,

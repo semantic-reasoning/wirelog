@@ -1870,7 +1870,11 @@ static void cold_join_preflight(void)
                                              WIRELOG_TYPE_INT64};
             uint32_t bad = 99;
             if (kind == 0) op->key_count = 0;
-            if (kind == 1) op->key_count = 2;
+            const char *invalid_keys[] = {"col0", NULL};
+            if (kind == 1) {
+                op->key_count = 2; op->left_keys = invalid_keys;
+                op->right_keys = invalid_keys;
+            }
             if (kind == 2) op->right_filter_expr.size = 1;
             if (kind == 3) {
                 op->project_count = 1; op->project_indices = &bad;
@@ -4607,6 +4611,232 @@ static void cold_many_groups_floor(void)
     destroy(&f);
 }
 
+/* Generated names on fresh declarations and trace bindings must resolve like
+* the ordinary named schema, including platform-specific strtol narrowing. */
+static void cold_virtual_key_names(void)
+{
+    const char *names[] = {"col0", "col1", "col01", "col+1", "col4294967296",
+                           "col4294967297", "col18446744073709551616", "col-1",
+                           "colmissing", "col"};
+    for (unsigned n = 0; n < sizeof(names)/sizeof(names[0]); n++) {
+        fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
+        wl_col_session_t *session = COL_SESSION(f.session);
+        int64_t left[] = {1, 5}, right[] = {2, 5};
+        CHECK(wl_session_insert(f.session, "a", left, 1, 2) == 0);
+        col_rel_t *a = session_find_rel(session, "a");
+        int key = col_rel_col_idx(a, names[n]); if (key < 0) key = 0;
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        const char *keys[] = {names[n]};
+        wl_plan_op_t ops[] = {
+            {.op = WL_PLAN_OP_VARIABLE, .relation_name = "a"},
+            {.op = WL_PLAN_OP_JOIN, .right_relation = "b", .left_keys = keys,
+             .right_keys = keys, .key_count = 1},
+            {.op = WL_PLAN_OP_CONSOLIDATE}
+        };
+        rp->ops = ops; rp->op_count = 3;
+        CHECK(wl_columnar_join_cold_source_key(session, "b",
+            names[n]) == (uint32_t)key);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        CHECK(wl_columnar_join_cold_source_key(session, "b",
+            names[n]) == (uint32_t)key);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "b", right, 1,
+            2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        CHECK(wl_columnar_join_cold_source_key(session, "b",
+            names[n]) == (uint32_t)key);
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(col_eval_relation_plan(rp, &stack, session) == 0);
+        eval_entry_t out = eval_stack_pop(&stack);
+        CHECK(out.rel->nrows == (key == 1 ? 1u : 0u));
+        if (key == 1) CHECK(out.rel->columns[0][0] == 1 &&
+                out.rel->columns[1][0] == 5 && out.rel->columns[2][0] == 2 &&
+                out.rel->columns[3][0] == 5);
+        CHECK(eval_stack_dispose_entry(&stack, &out) == 0);
+        rp->ops = saved; rp->op_count = count; destroy(&f);
+    }
+}
+
+static void composite_numeric_admission(void)
+{
+    const char *text =
+        ".decl a(k:int64,j:int64,x:int64)\n.decl b(k:int64,j:int64,y:int64)\n.decl result(x:int64,y:int64)\nresult(x,y) :- a(k,j,x),b(k,j,y).\n";
+    for (unsigned state = 0; state < 3; state++) {
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") == OK);
+        if (state) CHECK(wl_columnar_session_begin_cold_input(f.session,
+                "b") == OK);
+        if (state == 2) CHECK(wl_columnar_session_finish_cold_input(f.session,
+                "b") == OK);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        wl_plan_op_t ops[3] = {saved[0], saved[1], saved[2]};
+        const char *left_keys[] = {"col0", "col2"};
+        ops[1].left_keys = left_keys; rp->ops = ops;
+        /* Later key domain on a copied loading schema cannot hide behind
+         * an empty right placeholder or the first integer key. */
+        wl_columnar_session_cold_relation_t *cold = s->cold_relation;
+        while (strcmp(cold->name, "a")) cold = cold->next;
+        cold->trace_types[2] = WIRELOG_TYPE_FLOAT;
+        uint64_t before = reserved(&f);
+        CHECK(!wl_columnar_join_cold_prefix(s, rp));
+        if (!state) CHECK(wl_columnar_session_begin_cold_input(f.session,
+                "b") == WL_COLUMNAR_SPILL_UNSUPPORTED);
+        CHECK(reserved(&f) == before);
+        cold->trace_types[2] = WIRELOG_TYPE_INT64;
+        rp->ops = saved; rp->op_count = count;
+        destroy(&f);
+    }
+}
+
+static void composite_computed_tail_refused(void)
+{
+    fixture_t f =
+        fixture(
+        ".decl a(k:int64,j:int64,x:int64)\n.decl b(k:int64,j:int64,y:int64)\n.decl result(x:int64,y:int64)\nresult(x,y) :- a(k,j,x),b(k,j,y).\n",
+        4*1024*1024, 1024*1024);
+    wl_plan_relation_t *rp = join_body(&f, "result");
+    const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+    uint8_t zero[] = {WL_PLAN_EXPR_CONST_INT, 0, 0, 0, 0, 0, 0, 0, 0};
+    wl_plan_expr_buffer_t expressions[] = {{.data = zero, .size = sizeof(zero)},
+                                           {.data = zero,
+                                            .size = sizeof(zero)}};
+    wl_plan_op_t ops[] = {saved[0], saved[1], {.op = WL_PLAN_OP_MAP,
+                                               .project_count = 2,
+                                               .map_expr_count = 2,
+                                               .map_exprs = expressions},
+                          saved[2]};
+    rp->ops = ops; rp->op_count = 4;
+    uint64_t before = reserved(&f);
+    CHECK(wl_columnar_session_begin_cold_input(f.session,
+        "a") == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(wl_columnar_session_begin_cold_input(f.session,
+        "b") == WL_COLUMNAR_SPILL_UNSUPPORTED);
+    CHECK(reserved(&f) == before && !COL_SESSION(f.session)->cold_relation);
+    rp->ops = saved; rp->op_count = count; destroy(&f);
+}
+
+static void composite_numeric_chains(void)
+{
+    const char *text =
+        ".decl a(k:int64,j:int64,t:int64,x:int64)\n.decl b(t:int64,k:int64,j:int64,y:int64)\n.decl c(k:int64,j:int64,z:int64)\n.decl result(x:int64,y:int64,z:int64)\nresult(x,y,z) :- a(k,j,t,x),b(t,k,j,y),c(k,j,z).\n";
+    for (unsigned mode = 0; mode < 4; mode++) {
+        fixture_t f = fixture_options(text, 4*1024*1024, 4*1024*1024, 1024*1024,
+                128);
+        unsigned methods[3] = {mode == 1 ? 1u : mode == 2 ? 2u : 0u,
+                               mode == 1 ||
+                               mode == 2 ? 1u : mode == 3 ? 2u : 0u,
+                               mode == 1 ? 1u : mode == 3 ? 2u : 0u};
+        const char *names[] = {"a", "b", "c"};
+        int64_t a[32], b[32], c[24]; int64_t *data[] = {a, b, c};
+        for (unsigned i = 0; i < 8; i++) {
+            a[4*i] = i%2; a[4*i+1] = i%3; a[4*i+2] = i%5; a[4*i+3] = 10+i;
+            b[4*i] = i%5; b[4*i+1] = i%2; b[4*i+2] = i%3; b[4*i+3] = 100+i;
+            c[3*i] = i%2; c[3*i+1] = i%3; c[3*i+2] = 1000+i;
+        }
+        for (unsigned i = 0; i < 3; i++) if (methods[i] != 2)
+                CHECK(wl_session_insert(f.session, names[i], data[i], 8,
+                    i == 2 ? 3 : 4) == 0);
+        for (unsigned i = 0; i < 3; i++) {
+            if (methods[i] == 1) CHECK(wl_columnar_session_seal_input(f.session,
+                    names[i], NULL, NULL) == OK);
+            if (methods[i] == 2) {
+                unsigned cols = i == 2 ? 3 : 4;
+                CHECK(wl_columnar_session_begin_cold_input(f.session,
+                    names[i]) == OK);
+                for (unsigned first = 0; first < 8; first += 2)
+                    CHECK(wl_columnar_session_append_cold_input(f.session,
+                        names[i], data[i]+first*cols, 2, cols) == OK);
+                CHECK(wl_columnar_session_finish_cold_input(f.session,
+                    names[i]) == OK);
+            }
+        }
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        CHECK(rp->op_count == 4 && rp->ops[1].op == WL_PLAN_OP_JOIN &&
+            rp->ops[1].key_count == 3 && rp->ops[2].op == WL_PLAN_OP_JOIN &&
+            rp->ops[2].key_count == 2);
+        CHECK(!strcmp(rp->ops[1].left_keys[2],
+            "col2") && !strcmp(rp->ops[1].right_keys[2], "col0"));
+        eval_stack_t stack; eval_stack_init(&stack);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            int rc = col_eval_relation_plan(rp, &stack, COL_SESSION(f.session));
+            if (rc) fprintf(stderr, "composite chain mode=%u repeat=%u rc=%d\n",
+                    mode, repeat, rc);
+            CHECK(rc == 0);
+            eval_entry_t out = eval_stack_pop(&stack);
+            CHECK(out.rel->ncols == 3 && out.rel->nrows == 12);
+            bool seen[8][8] = {{false}};
+            for (unsigned row = 0; row < out.rel->nrows; row++) {
+                int64_t left = out.rel->columns[0][row]-10,
+                    right = out.rel->columns[2][row]-1000;
+                CHECK(left >= 0 && left < 8 && right >= 0 && right < 8 &&
+                    left%6 == right%6);
+                CHECK(out.rel->columns[1][row] == 100+left &&
+                    !seen[left][right]); seen[left][right] = true;
+            }
+            CHECK(eval_stack_dispose_entry(&stack, &out) == 0);
+        }
+        destroy(&f);
+    }
+}
+static void composite_numeric_prefix(void)
+{
+    for (unsigned filter = 0; filter < 2; filter++) {
+        fixture_t f =
+            fixture(
+            ".decl a(k:int64,j:int64,t:int64,x:int64)\n.decl b(t:int64,k:int64,j:int64,y:int64)\n.decl result(x:int64,y:int64)\nresult(x,y) :- a(k,j,t,x),b(t,k,j,y).\n",
+            4*1024*1024, 1024*1024);
+        int64_t a[] = {7, 1, 2, 10, 7, 2, 3, 20},
+            b[] = {2, 7, 1, 100, 3, 7, 2, 200};
+        CHECK(wl_session_insert(f.session, "a", a, 2,
+            4) == 0 && wl_session_insert(f.session, "b", b, 2, 4) == 0);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops;
+        uint32_t saved_count = rp->op_count;
+        CHECK(saved_count == 3 && saved[1].key_count == 3);
+        uint32_t projection[] = {2, 0, 1, 3};
+        const char *keys[] = {"col1", "col2", "col0"};
+        uint8_t predicate[17] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '3',
+                                 WL_PLAN_EXPR_CONST_INT, 15, 0, 0, 0, 0, 0, 0,
+                                 0, WL_PLAN_EXPR_CMP_GTE};
+        wl_plan_op_t ops[5] = {saved[0],
+                               {.op = WL_PLAN_OP_MAP, .project_count = 4,
+                                .project_indices = projection}, {0}, {0}, {0}};
+        unsigned join = filter ? 3 : 2;
+        if (filter) ops[2] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                            .filter_expr = {.data = predicate,
+                                                            .size = 17}};
+        ops[join] = saved[1]; ops[join].left_keys = keys;
+        ops[join+1] = saved[2];
+        rp->ops = ops; rp->op_count = join+2;
+        uint32_t first = 0;
+        CHECK(wl_columnar_join_cold_scan_prefix(COL_SESSION(f.session), rp,
+            &first) && first == join);
+        CHECK(!wl_columnar_join_cold_prefix(COL_SESSION(f.session), rp));
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL,
+            NULL) == OK && wl_columnar_session_seal_input(f.session, "b", NULL,
+            NULL) == OK);
+        eval_stack_t stack; eval_stack_init(&stack);
+        CHECK(col_eval_relation_plan(rp, &stack, COL_SESSION(f.session)) == 0);
+        eval_entry_t out = eval_stack_pop(&stack);
+        CHECK(out.rel->nrows == (filter ? 1u : 2u));
+        for (unsigned i = 0; i < out.rel->nrows;
+            i++) CHECK(out.rel->columns[1][i] == out.rel->columns[0][i]*10 &&
+                (!filter || out.rel->columns[0][i] == 20));
+        CHECK(eval_stack_dispose_entry(&stack, &out) == 0);
+        uint64_t before = reserved(&f);
+        read_fault = 1;
+        CHECK(col_eval_relation_plan(rp, &stack,
+            COL_SESSION(f.session)) == EIO && !stack.top &&
+            reserved(&f) == before);
+        CHECK(col_eval_relation_plan(rp, &stack, COL_SESSION(f.session)) == 0);
+        out = eval_stack_pop(&stack);
+        CHECK(eval_stack_dispose_entry(&stack, &out) == 0);
+        rp->ops = saved; rp->op_count = saved_count; destroy(&f);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -4616,6 +4846,9 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    cold_virtual_key_names(); composite_numeric_admission();
+    composite_computed_tail_refused();
+    composite_numeric_chains(); composite_numeric_prefix();
     cold_global_internal();
     cold_group_internal();
     cold_integer_internal(); cold_aggregate_mixed_eligibility();

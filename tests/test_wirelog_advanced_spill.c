@@ -1760,6 +1760,115 @@ static void cold_integer_aggregates(void)
             }
 }
 
+typedef struct { bool seen[33][49]; unsigned keys, right_rows;
+} composite_events_t;
+static void composite_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    if (strcmp(name, "result")) return;
+    composite_events_t *e = context;
+    CHECK(cols == 2 && row[0] >= 0 && row[0] < 33 && row[1] >= 0 &&
+        row[1] < e->right_rows);
+    unsigned l = (unsigned)row[0], r = (unsigned)row[1];
+    CHECK(l%3 == r%3 && (e->keys == 2 || l%5 == r%5));
+    CHECK(!e->seen[l][r]); e->seen[l][r] = true;
+}
+static void composite_typed(const char *name, const wirelog_typed_row_v1_t *row,
+    int32_t diff, void *context)
+{
+    if (strcmp(name, "result")) return;
+    CHECK(diff == 1 && row->logical_ncols == 2 && row->physical_nlanes == 2);
+    for (unsigned i = 0; i < 2;
+        i++) CHECK(row->types[i] == WIRELOG_TYPE_INT64 &&
+            row->physical_types[i] == WIRELOG_TYPE_INT64);
+    int64_t values[2]; memcpy(values, row->lanes, sizeof(values));
+    composite_observe(name, values, 2, context);
+}
+static void composite_public_numeric(void)
+{
+    for (unsigned keys = 2; keys <= 3; keys++)
+        for (unsigned self = 0; self < 2; self++)
+            for (unsigned lm = 0; lm < 3; lm++) for (unsigned rm = 0;
+                    rm < (self ? 1u : 3u); rm++){
+                    char text[512];
+                    snprintf(text, sizeof(text),
+                        ".decl a(k:int64,j:int64,t:int64,x:int64)\n.decl b(t:int64,k:int64,j:int64,y:int64)\n.decl result(x:int64,y:int64)\nresult(x,y) :- a(k,j,t,x),%s.\n",
+                        self ? (keys ==
+                        3 ? "a(k,j,t,y)" : "a(k,j,u,y)") : (keys ==
+                        3 ? "b(t,k,j,y)" : "b(u,k,j,y)"));
+                    wirelog_program_t *p = parse(text);
+                    wirelog_session_t *session = NULL;
+                    wirelog_session_options_v1_t options = configured();
+                    options.spill_join_batch_bytes = 16;
+                    options.spill_join_index_bytes = 256;
+                    CHECK(wirelog_session_create_with_options(p,
+                        WIRELOG_BACKEND_DEFAULT, 1, &options,
+                        &session) == WIRELOG_OK);
+                    int64_t left[33*4], right[49*4];
+                    for (unsigned i = 0; i < 33; i++) {
+                        left[4*i] = 7; left[4*i+1] = i%3; left[4*i+2] = i%5;
+                        left[4*i+3] = i;
+                    }
+                    for (unsigned i = 0; i < 49; i++) {
+                        right[4*i] = i%5; right[4*i+1] = 7; right[4*i+2] = i%3;
+                        right[4*i+3] = i;
+                    }
+                    if (lm != 2) CHECK(wirelog_session_insert(session, "a",
+                            left, 33, 4) == WIRELOG_OK);
+                    if (!self && rm != 2) CHECK(wirelog_session_insert(session,
+                            "b", right, 49, 4) == WIRELOG_OK);
+                    for (unsigned side = 0; side < (self ? 1u : 2u); side++) {
+                        const char *name = side ? "b" : "a";
+                        unsigned mode = side ? rm : lm;
+                        if (mode == 1) CHECK(wirelog_session_seal_input(session,
+                                name) == WIRELOG_OK);
+                        if (mode == 2) {
+                            CHECK(wirelog_session_begin_cold_input(session,
+                                name) == WIRELOG_OK);
+                            unsigned rows = side ? 49 : 33;
+                            int64_t *data = side ? right : left;
+                            for (unsigned first = 0; first < rows; first += 7) {
+                                unsigned count = rows-first <
+                                    7 ? rows-first : 7;
+                                CHECK(wirelog_session_append_cold_input(session,
+                                    name, data+4*first, count,
+                                    4) == WIRELOG_OK);
+                            }
+                            CHECK(wirelog_session_finish_cold_input(session,
+                                name) == WIRELOG_OK);
+                        }
+                    }
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        composite_events_t e = {.keys = keys,
+                                                .right_rows = self ? 33u : 49u},
+                                                    typed = {.keys = keys,
+                                                             .right_rows =
+                                                                 self ? 33u :
+                                                                 49u};
+                        CHECK(wirelog_session_step(session) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot(session,
+                            composite_observe, &e) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot_typed(session,
+                            composite_typed, &typed) == WIRELOG_OK);
+                        for (unsigned l = 0; l < 33; l++) for (unsigned r = 0;
+                                r < e.right_rows; r++) {
+                                bool expected = l%3 == r%3 &&
+                                    (keys == 2 || l%5 == r%5);
+                                if (e.seen[l][r] != expected ||
+                                    typed.seen[l][r] != expected)
+                                    fprintf(stderr,
+                                        "composite keys=%u self=%u modes=%u/%u pair=%u/%u expected=%u actual=%u typed=%u\n",
+                                        keys, self, lm, rm, l, r, expected,
+                                        e.seen[l][r], typed.seen[l][r]);
+                                CHECK(e.seen[l][r] == expected &&
+                                    typed.seen[l][r] == expected);
+                            }
+                    }
+                    wirelog_session_destroy(session); wirelog_program_free(p);
+                    CHECK(!live_files());
+                }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1782,6 +1891,7 @@ int main(void)
     cold_group_counts("count"); cold_group_counts("sum");
     cold_group_counts("min"); cold_group_counts("max");
     cold_integer_aggregates();
+    composite_public_numeric();
     chunked_public_scans(); chunked_public_joins();
     chunked_public_references(); chunked_public_budget(false);
     chunked_public_budget(true);
