@@ -7319,9 +7319,482 @@ test_forced_bare_failures(void)
         }
 }
 
+static col_rel_t *anti_identity_input;
+static uint32_t *anti_identity_segments;
+static unsigned anti_identity_commits;
+static bool anti_identity_owned;
+static void
+anti_identity_cutoff(const eval_entry_t *retired, const eval_entry_t *entry)
+{
+    CHECK(entry->rel == anti_identity_input &&
+        entry->owned == anti_identity_owned
+        && !entry->is_delta && !entry->seg_boundaries && !entry->seg_count);
+    CHECK(!retired->rel && !retired->owned && !retired->is_delta
+        && !retired->continuation &&
+        retired->kind == WL_COLUMNAR_EVAL_ENTRY_RELATION
+        && retired->seg_boundaries == anti_identity_segments);
+    CHECK(++anti_identity_commits == 1);
+}
+
+static void
+anti_until_decision(fixture_t *f, wl_columnar_filter_context_t **ctx)
+{
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 2000 &&
+            f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        if (f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD) {
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, ctx,
+                &f->record));
+            if ((*ctx)->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE) return;
+        }
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+static void
+test_empty_anti_identity(void)
+{
+    static const char *keys[] = {"col0"};
+    for (unsigned owned = 0; owned < 2; ++owned)
+        for (unsigned bare = 0; bare < 2; ++bare)
+            for (unsigned segments = 0; segments < 4; ++segments) {
+                fixture_t f; fixture_init(&f, 2, 3, 0);
+                /* Build valid native and Arrow names through the schema API. */
+                col_rel_destroy(f.input); f.input = NULL;
+                CHECK(!col_rel_alloc(&f.input, "left"));
+                const char *names[] = {"col0", "payload"};
+                CHECK(!col_rel_set_schema(f.input, 2, names));
+                for (int64_t r = 0; r < 3; ++r) {
+                    int64_t row[] = {r, r+1};
+                    CHECK(!col_rel_append_row(f.input, row));
+                }
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel =
+                    f.input;
+                f.input->sorted_nrows = 3; f.input->run_count = 1;
+                f.input->run_ends[0] = 3;
+                /* ANTI accepts non-colN names and valid physical graph metadata. */
+                f.input->has_graph_column = true; f.input->graph_col_idx = 1;
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                eval_entry_t *entry = &stack->items[0];
+                entry->owned = owned != 0; entry->is_delta = true;
+                entry->seg_count = segments == 2 ? 7 : segments == 3 ? 0 : 2;
+                if (segments != 2) {
+                    entry->seg_boundaries = malloc(2*sizeof(uint32_t));
+                    CHECK(entry->seg_boundaries);
+                    entry->seg_boundaries[0] = 0; entry->seg_boundaries[1] = 3;
+                }
+                col_rel_t *right = bare ? bare_source("right") : source_new(2,
+                        0);
+                if (!bare) CHECK(!wl_columnar_relation_rename_checked(right,
+                        "right"));
+                col_rel_t *registry[] = {f.input, right};
+                f.session.rels = registry; f.session.nrels = 2;
+                wl_plan_op_t op = {.op = WL_PLAN_OP_ANTIJOIN,
+                                   .right_relation = "right",
+                                   .key_count = 1, .left_keys = keys,
+                                   .right_keys = keys};
+                wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+                col_rel_t *raw_left = NULL;
+                CHECK(!col_rel_deep_copy(f.input, &raw_left, NULL));
+                raw_left->sorted_nrows = 3; raw_left->run_count = 1;
+                raw_left->run_ends[0] = 3;
+                wl_col_session_t raw = {0};
+                col_rel_t *raw_registry[] = {raw_left, right};
+                raw.rels = raw_registry; raw.nrels = 2;
+                eval_stack_t expected = {0};
+                CHECK(!eval_stack_push_delta(&expected, raw_left, owned != 0,
+                    true));
+                expected.items[0].seg_count = entry->seg_count;
+                if (entry->seg_boundaries) {
+                    expected.items[0].seg_boundaries = malloc(2*
+                            sizeof(uint32_t));
+                    CHECK(expected.items[0].seg_boundaries);
+                    memcpy(expected.items[0].seg_boundaries,
+                        entry->seg_boundaries, 2*sizeof(uint32_t));
+                }
+                CHECK(!col_op_antijoin(&op, &expected, &raw));
+                CHECK(expected.top == 1 && expected.items[0].rel == raw_left
+                    && expected.items[0].owned == (owned != 0) &&
+                    !expected.items[0].is_delta
+                    && !expected.items[0].seg_boundaries &&
+                    !expected.items[0].seg_count);
+                col_relation_snapshot_t source_image =
+                    wl_columnar_relation_snapshot(f.input);
+                fixture_begin(&f, &plan, 0, 1);
+                anti_identity_input = f.input; anti_identity_owned = owned != 0;
+                anti_identity_segments = entry->seg_boundaries;
+                anti_identity_commits = 0;
+                wl_columnar_eval_stack_test_anti_metadata_committed =
+                    anti_identity_cutoff;
+                run(&f);
+                wl_columnar_eval_stack_test_anti_metadata_committed = NULL;
+                CHECK(!f.record.semantic_result && f.record.completed == 1 &&
+                    anti_identity_commits == 1);
+                CHECK(entry->rel == f.input && entry->owned == (owned != 0)
+                    && !entry->is_delta && !entry->seg_boundaries &&
+                    !entry->seg_count
+                    && f.input->sorted_nrows == 3 && f.input->run_count == 1
+                    && f.input->has_graph_column &&
+                    !strcmp(f.input->col_names[1], "payload"));
+                same_relation(entry->rel, expected.items[0].rel);
+                CHECK(wl_columnar_relation_snapshot_equal(source_image,
+                    wl_columnar_relation_snapshot(f.input)));
+                CHECK(!eval_stack_drain(&expected));
+                if (!owned) col_rel_destroy(raw_left);
+                empty_filter_raw_drain(&raw);
+                /* Normal ACK preserves the live relation; eventual frame owner
+                * frees an owned input once. No relation enters the receipt. */
+                CHECK(!wl_columnar_eval_plan_numeric_attempt_ack(&f.record,
+                    f.funding, f.funding_id));
+                CHECK(entry->rel == anti_identity_input &&
+                    entry->rel->columns[0][1] == 1);
+                if (owned) f.input = NULL;
+                composed_close(&f); col_rel_destroy(right);
+            }
+}
+
+static void
+test_missing_probe_exact_order(void)
+{
+    for (unsigned semi = 0; semi < 2; ++semi)
+        for (unsigned bare = 0; bare < 2; ++bare) {
+            fixture_t f; fixture_init(&f, 2, 3, 0);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            if (bare) {
+                col_rel_destroy(f.input); f.input = bare_source("input");
+                stack->items[0].rel = f.input;
+            } else CHECK(!col_rel_enable_timestamps(f.input));
+            stack->items[0].is_delta = true;
+            stack->items[0].seg_boundaries = malloc(2*sizeof(uint32_t));
+            CHECK(stack->items[0].seg_boundaries);
+            stack->items[0].seg_boundaries[0] = 0;
+            stack->items[0].seg_boundaries[1] = f.input->nrows;
+            stack->items[0].seg_count = 2;
+            eval_entry_t before = stack->items[0];
+            static const char *irrelevant[] = {NULL};
+            wl_plan_op_t op =
+            {.op = semi ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN,
+             .right_relation = "missing", .project_count = 99,
+             .project_indices = NULL,
+             .key_count = 1, .left_keys = irrelevant,
+             .right_keys = irrelevant};
+            wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+            fixture_begin(&f, &plan, 0, 1); run(&f);
+            CHECK(!f.record.semantic_result && f.record.completed == 1);
+            const eval_entry_t *after = &stack->items[0];
+            CHECK(after->rel == before.rel && after->owned == before.owned
+                && after->is_delta == before.is_delta &&
+                after->seg_boundaries == before.seg_boundaries
+                && after->seg_count == before.seg_count &&
+                after->kind == before.kind
+                && after->continuation == before.continuation);
+            /* The raw no-op ignores the same invalid projection/keys and
+             * does not free/alter the borrowed original segment allocation. */
+            wl_col_session_t raw = {0}; eval_stack_t expected = {0};
+            expected.items[0] = before; expected.top = 1;
+            CHECK(!(semi ? col_op_semijoin(&op, &expected,
+                &raw) : col_op_antijoin(&op, &expected, &raw)));
+            CHECK(expected.items[0].rel == before.rel
+                && expected.items[0].seg_boundaries == before.seg_boundaries
+                && expected.items[0].is_delta);
+            expected.items[0] = (eval_entry_t){0}; expected.top = 0;
+            fixture_close(&f);
+        }
+}
+
+static void
+test_present_empty_probe_metadata(void)
+{
+    static const char *keys[] = {"col0"};
+    for (unsigned semi = 0; semi < 2; ++semi)
+        for (unsigned left_state = 0; left_state < 4; ++left_state)
+            for (unsigned right_bare = 0; right_bare < 2; ++right_bare) {
+                fixture_t f; fixture_init(&f, 2, left_state == 2 ? 0 : 3, 0);
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                if (left_state == 0) {
+                    col_rel_destroy(f.input); f.input = bare_source("input");
+                    stack->items[0].rel = f.input;
+                }
+                if (left_state == 1) CHECK(!col_rel_enable_timestamps(f.input));
+                if (left_state == 3) {
+                    free(f.input->col_names[1]); f.input->col_names[1] = NULL;
+                }
+                col_rel_t *right =
+                    right_bare ? bare_source("right") : source_new(2, 0);
+                if (!right_bare) CHECK(!wl_columnar_relation_rename_checked(
+                            right, "right"));
+                col_rel_t *registry[] = {f.input, right};
+                f.session.rels = registry; f.session.nrels = 2;
+                uint32_t projection[] = {1, 0, 19};
+                wl_plan_op_t op =
+                {.op = semi ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN,
+                 .right_relation = "right", .key_count = 1,
+                 .left_keys = keys, .right_keys = keys,
+                 .project_count = semi ? 3 : 0,
+                 .project_indices = semi ? projection : NULL};
+                wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+                fixture_begin(&f, &plan, 0, 1); run(&f);
+                CHECK(!f.record.semantic_result && f.record.completed == 1);
+                const col_rel_t *actual = stack->items[0].rel;
+                CHECK(stack->items[0].owned && !stack->items[0].is_delta &&
+                    !actual->timestamps
+                    && actual != f.input &&
+                    actual->ncols == (semi ? 3 : f.input->ncols)
+                    && actual->nrows == (semi || left_state == 0 ||
+                    left_state == 2 ? 0 : 3));
+                if (!semi && actual->nrows) for (uint32_t r = 0; r < 3; ++r)
+                        for (uint32_t c = 0; c < 2;
+                            ++c) CHECK(actual->columns[c][r] ==
+                                f.input->columns[c][r]);
+                eval_stack_t expected = {0};
+                CHECK(!eval_stack_push(&expected, f.input, false));
+                wl_col_session_t raw = {0}; raw.rels = registry; raw.nrels = 2;
+                CHECK(!(semi ? col_op_semijoin(&op, &expected, &raw)
+                    : col_op_antijoin(&op, &expected, &raw)));
+                same_relation(actual, expected.items[0].rel);
+                CHECK(expected.items[0].owned && !expected.items[0].is_delta);
+                CHECK(!eval_stack_drain(&expected));
+                empty_filter_raw_drain(&raw);
+                fixture_close(&f); col_rel_destroy(right);
+            }
+}
+
+static void
+anti_cancel_cutoff(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)progress;
+    if (phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE)
+        wl_evaluation_control_request_cancel(control);
+}
+
+static fixture_t *anti_reentry_fixture;
+static wl_columnar_filter_context_t *anti_reentry_context;
+static unsigned anti_reentry_checkpoints, anti_reentry_calls;
+static bool anti_reentry_late_cancel;
+
+static void
+anti_reentry_refuse(void)
+{
+    fixture_t *f = anti_reentry_fixture;
+    wl_columnar_filter_context_t *ctx = anti_reentry_context;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    eval_entry_t before = stack->items[0];
+    bool committed = ctx->committed;
+    unsigned checkpoints = anti_reentry_checkpoints;
+    CHECK(wl_columnar_eval_stack_unary_commit_anti_keep_all_context_owned(
+            f->frame, ctx, &ctx->committed, &f->record) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_commit_attempt_owned(
+            f->frame, &ctx->committed, &f->record) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_commit_numeric_join_owned(
+            f->frame, &ctx->committed, &f->record) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
+            f->frame, ctx, &ctx->committed, &f->record) == EBUSY);
+    col_rel_t **output = NULL;
+    CHECK(wl_columnar_eval_stack_unary_output_owned(f->frame, &output,
+        &f->record) == EBUSY && !output);
+    CHECK(wl_columnar_eval_stack_unary_reset_owned(f->frame,
+        &f->record) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_finish(f->frame, 0) == EBUSY);
+    CHECK(checkpoints == anti_reentry_checkpoints
+        && ctx->committed == committed
+        && !memcmp(&before, &stack->items[0], sizeof(before)));
+    ++anti_reentry_calls;
+}
+
+static void
+anti_reentry_tail(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t progress)
+{
+    (void)control; (void)progress;
+    ++anti_reentry_checkpoints;
+    if (phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE)
+        anti_reentry_refuse();
+}
+
+static void
+anti_reentry_committed(const eval_entry_t *retired, const eval_entry_t *entry)
+{
+    anti_identity_cutoff(retired, entry);
+    anti_reentry_refuse();
+    CHECK(retired->seg_boundaries == anti_identity_segments);
+    if (anti_reentry_late_cancel)
+        wl_evaluation_control_request_cancel(anti_reentry_fixture->operation);
+}
+
+static void
+test_anti_reentry(void)
+{
+    uint64_t baseline = 0;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        fixture_t f; fixture_init(&f, 2, 3, 0);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        eval_entry_t *entry = &stack->items[0];
+        entry->is_delta = true;
+        entry->seg_boundaries = malloc(2*sizeof(uint32_t));
+        CHECK(entry->seg_boundaries);
+        entry->seg_boundaries[0] = 0; entry->seg_boundaries[1] = 3;
+        entry->seg_count = 2;
+        col_rel_t *right = bare_source("right");
+        col_rel_t *registry[] = {right}; f.session.rels = registry;
+        f.session.nrels = 1;
+        wl_plan_op_t op = {.op = WL_PLAN_OP_ANTIJOIN,
+                           .right_relation = "right"};
+        wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+        fixture_begin(&f, &plan, 0, 1);
+        anti_until_decision(&f, &anti_reentry_context);
+        anti_identity_input = f.input; anti_identity_owned = false;
+        anti_identity_segments = entry->seg_boundaries;
+        anti_identity_commits = 0;
+        anti_reentry_fixture = &f;
+        anti_reentry_checkpoints = anti_reentry_calls = 0;
+        anti_reentry_late_cancel = mode == 2;
+        wl_columnar_eval_stack_test_checkpoint =
+            mode ? anti_reentry_tail : NULL;
+        wl_columnar_eval_stack_test_anti_metadata_committed = mode
+            ? anti_reentry_committed : anti_identity_cutoff;
+        run(&f);
+        wl_columnar_eval_stack_test_checkpoint = NULL;
+        wl_columnar_eval_stack_test_anti_metadata_committed = NULL;
+        CHECK(!f.record.semantic_result && f.record.completed == 1
+            && anti_reentry_calls == (mode ? 2u : 0u) &&
+            anti_identity_commits == 1
+            && !anti_reentry_context->join_metadata_busy
+            && entry->rel == f.input && !entry->seg_boundaries &&
+            !entry->is_delta);
+        CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0,
+            0));
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.operation, &report));
+        if (!mode) baseline = report.consumed;
+        else CHECK(report.consumed == baseline);
+        fixture_close(&f); col_rel_destroy(right);
+    }
+    anti_reentry_fixture = NULL; anti_reentry_context = NULL;
+}
+
+static void
+test_anti_cutoff_refusals(void)
+{
+    for (unsigned negative = 0; negative < 7; ++negative) {
+        fixture_t f; fixture_init(&f, 2, 3, 0);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        stack->items[0].is_delta = true;
+        stack->items[0].seg_boundaries = malloc(2*sizeof(uint32_t));
+        CHECK(stack->items[0].seg_boundaries);
+        stack->items[0].seg_boundaries[0] = 0;
+        stack->items[0].seg_boundaries[1] = 3;
+        stack->items[0].seg_count = 2;
+        eval_entry_t before = stack->items[0];
+        col_rel_t *right = bare_source("right");
+        col_rel_t *registry[] = {f.input, right}; f.session.rels = registry;
+        f.session.nrels = 2;
+        wl_plan_op_t op = {.op = WL_PLAN_OP_ANTIJOIN,
+                           .right_relation = "right"};
+        wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+        fixture_begin(&f, &plan, 0, 1);
+        wl_columnar_filter_context_t *ctx = NULL; anti_until_decision(&f, &ctx);
+        CHECK(ctx->join_disposition ==
+            WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL);
+        CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+        bool committed = false;
+        if (negative < 6) {
+            ctx->busy = true;
+            col_relation_snapshot_t saved = ctx->join_input_snapshot;
+            const wl_plan_op_t *saved_op = ctx->join_operation;
+            if (negative == 0) ++ctx->join_input_snapshot.view_generation;
+            if (negative == 1) ctx->join_operation = NULL;
+            if (negative == 2) ctx->source_initialized = true;
+            if (negative ==
+                3) ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_REPLACE;
+            if (negative == 4) ctx->busy = false;
+            wl_columnar_filter_context_t copy = *ctx;
+            int rc =
+                wl_columnar_eval_stack_unary_commit_anti_keep_all_context_owned(
+                f.frame, negative == 5 ? &copy : ctx, &committed, &f.record);
+            CHECK(rc && !committed && !ctx->join_metadata_busy
+                && stack->items[0].rel == before.rel
+                && stack->items[0].seg_boundaries == before.seg_boundaries
+                && stack->items[0].seg_count == before.seg_count &&
+                stack->items[0].is_delta);
+            ctx->busy = false; ctx->source_initialized = false;
+            ctx->join_input_snapshot = saved; ctx->join_operation = saved_op;
+            ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL;
+        }
+        wl_columnar_eval_stack_test_checkpoint = anti_cancel_cutoff;
+        run(&f);
+        wl_columnar_eval_stack_test_checkpoint = NULL;
+        CHECK(!ctx->join_metadata_busy
+            && f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+            && !f.record.completed && stack->items[0].rel == before.rel
+            && stack->items[0].owned == before.owned && stack->items[0].is_delta
+            && stack->items[0].seg_boundaries == before.seg_boundaries
+            && stack->items[0].seg_boundaries[1] == 3 &&
+            stack->items[0].seg_count == 2);
+        fixture_close(&f); col_rel_destroy(right);
+    }
+}
+
+/* Empirical host admission pair, separate from existing literal primitive
+ * tariff oracles. Only the source-derived final256 region may be refused. */
+static uint64_t
+anti_host_budget_case(uint64_t limit, uint64_t measured)
+{
+    fixture_t f; fixture_init(&f, 2, 3, limit);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    stack->items[0].is_delta = true;
+    stack->items[0].seg_boundaries = malloc(2*sizeof(uint32_t));
+    CHECK(stack->items[0].seg_boundaries);
+    stack->items[0].seg_boundaries[0] = 0;
+    stack->items[0].seg_boundaries[1] = 3;
+    stack->items[0].seg_count = 2;
+    uint32_t *segments = stack->items[0].seg_boundaries;
+    col_rel_t *right = bare_source("right");
+    col_rel_t *registry[] = {right}; f.session.rels = registry;
+    f.session.nrels = 1;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_ANTIJOIN, .right_relation = "right"};
+    wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+    fixture_begin(&f, &plan, 0, 1);
+    anti_identity_input = f.input; anti_identity_owned = false;
+    anti_identity_segments = segments; anti_identity_commits = 0;
+    wl_columnar_eval_stack_test_anti_metadata_committed = anti_identity_cutoff;
+    run(&f);
+    wl_columnar_eval_stack_test_anti_metadata_committed = NULL;
+    bool refused = limit && limit < measured;
+    CHECK(f.record.semantic_result ==
+        (refused ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+    CHECK(anti_identity_commits == (refused ? 0u : 1u));
+    CHECK(stack->items[0].rel == f.input);
+    if (refused) CHECK(stack->items[0].seg_boundaries == segments
+            && stack->items[0].is_delta && stack->items[0].seg_count == 2);
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+        f.record.semantic_result, 0)
+        == f.record.semantic_result);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report));
+    if (limit) CHECK(report.consumed == (refused ? measured-256 : measured));
+    fixture_close(&f); col_rel_destroy(right);
+    return report.consumed;
+}
+
+static void
+test_anti_host_budget(void)
+{
+    uint64_t measured = anti_host_budget_case(0, 0);
+    CHECK(measured > 256);
+    CHECK(anti_host_budget_case(measured-1, measured) == measured-256);
+    CHECK(anti_host_budget_case(measured, measured) == measured);
+}
+
 int
 main(void)
 {
+    test_anti_reentry();
+    test_anti_host_budget(); test_anti_cutoff_refusals();
+    test_empty_anti_identity(); test_missing_probe_exact_order();
+    test_present_empty_probe_metadata();
     test_forced_bare_selectors(); test_forced_bare_failures();
     test_empty_right_filter_setup(); test_empty_filter_compiler_resources();
     test_bare_source_borrow(); test_bare_ordinary_join();

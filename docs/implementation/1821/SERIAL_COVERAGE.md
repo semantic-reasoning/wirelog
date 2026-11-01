@@ -717,3 +717,39 @@ These are internal selector fixtures, not a claim that the compiler emits every
 selector on the current public default route. Present-empty SEMI/ANTI, LFTJ
 qualification and the remaining strict/cache/cap/shared/observed/successor
 policies still follow in the same grouped PR.
+
+### Present-empty standalone probes and ANTI identity (#2297)
+
+Standalone SEMI/ANTI resolve the actual FULL right relation before source or
+projection checks. A missing right preserves the entire original entry,
+including delta and segment metadata. A present bare descriptor instead uses
+its genuine empty-source reader and funded END. SEMI creates the raw projected
+empty schema; ANTI copies when required by empty/unnamed/timestamped input.
+For ordinary nonempty named input ANTI preserves the original relation and
+ownership, graph and sort metadata, and clears delta/segments as raw does.
+
+That identity disposition has a dedicated authenticated numeric cutoff. It
+checks the original entry and captured source generation after all readers and
+temporaries drain, then transfers only the segment allocation into the inert
+normal retirement slot. Existing finish frees that allocation once and never
+retires the live relation. Fixed original work regions are CONTEXT224,
+STATE192, three SCRATCH128 regions and CUTOFF256; the existing FIRST_FINISH256
+pays normal segment disposal. These are logical work envelopes, not latency
+bounds. The call-local guard blocks recursive output/commit/reset and duplicate
+cutoffs before old-target access or output mutation, and clears on every exit.
+
+Tests compare actual raw missing-right and present-empty dispositions; cover
+owned/borrowed sources, bare/initialized right, valid graph/names/sort metadata,
+timestamp and unnamed copy branches, NULL/non-NULL segment pointers with zero
+and nonzero counts, stale snapshots and wrong context/op/disposition, original
+cancellation and an empirical exact/one-short host admission pair. Real
+pre-cutoff and post-cutoff recursive calls leave checkpoint and original work
+counts unchanged. Cancellation requested after cutoff does not undo success.
+
+A real configured64 pipeline fixture truncates before a bare FULL SEMI right,
+restores the entire owned 28-row prefix, then independently executes that probe
+once. Its distinct nonempty delta canary prevents accidental delta lookup from
+passing. The physical-width hint selects this fallback only; the standalone
+reader supplies authority. LFTJ first-pass error order and the remaining
+strict/cache/cap/shared/observed/successor policies remain separate units in
+this grouped PR.

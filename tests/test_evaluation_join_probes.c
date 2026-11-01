@@ -17,7 +17,8 @@
 
 static wl_evaluation_control_t *active;
 static wl_session_t *active_session;
-static bool funding_test, short_grant, ordinary_decline;
+static bool funding_test, short_grant, ordinary_decline, bare_gate_case;
+static unsigned bare_gate_starts;
 static uint64_t selected_limit, selected_id;
 static unsigned selected_consumers, refused_grants, paid_grants, probe_starts;
 static unsigned prepared, consumers, indexes, schemas, stop_schema, stop_event;
@@ -97,6 +98,25 @@ join_checkpoint(wl_evaluation_control_t *control, unsigned phase, uint64_t row)
 {
     (void)row;
     CHECK(control == active);
+    if (bare_gate_case && phase == 1) {
+        wl_col_session_t *session = (wl_col_session_t *)active_session;
+        wl_columnar_eval_serial_framed_attempt_t *root = NULL;
+        CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+            session, &root));
+        const wl_plan_op_t *op = &root->child.plan->ops[root->child.cursor];
+        if (op->op == WL_PLAN_OP_SEMIJOIN) {
+            eval_stack_t *stack = NULL;
+            CHECK(!root->child.join_host && !strcmp(op->right_relation,
+                "gate"));
+            stack =
+                wl_columnar_eval_stack_cleanup_stack(session->cleanup_active);
+            CHECK(stack);
+            CHECK(stack->top == 1 && stack->items[0].owned
+                && stack->items[0].rel->nrows == 28 &&
+                stack->items[0].rel->ncols == 4);
+            ++bare_gate_starts;
+        }
+    }
     if (phase == 28) {
         CHECK(prepared || ordinary_decline); ++indexes;
     }
@@ -168,7 +188,7 @@ expected_tuple(unsigned kind, unsigned a, unsigned b)
     if (kind != 1 && kind != 2 && kind != 4 && a >= b) return false;
     switch (kind) {
     case 3: case 4: case 9: return true;
-    case 5: case 8: case 11: return false;
+    case 5: case 8: case 11: case 17: return false;
     case 7: return b != 1 && b != 4;
     case 12: case 14: case 15: return a != 4;
     case 13: return a != 4 && (LONG_MAX > INT_MAX ? a == 1 : true);
@@ -225,7 +245,8 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
                               .key_count = 1,
                               .left_keys = kind == 5 ? null_left : kind ==
                                   8 ? unknown_left : kind >=
-                                  12 ? suffix_left[kind - 12] : left,
+                                  12 &&
+                                  kind <= 16 ? suffix_left[kind - 12] : left,
                               .right_keys = right,
                               .project_count = 2, .project_indices = project};
     if (!missing && kind != 5 && kind != 8) ops[n++] = (wl_plan_op_t){
@@ -282,8 +303,13 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
     for (unsigned i = 0; i < 2; ++i) {
         CHECK(!wl_session_insert(sessions[i], "a", data, 8, 2));
         CHECK(!wl_session_insert(sessions[i], "b", data, 8, 2));
-        CHECK(!wl_session_insert(sessions[i], "gate", gate,
-            kind == 6 ? 4096 : kind >= 12 ? 1 : 3, 1));
+        if (kind != 17) CHECK(!wl_session_insert(sessions[i], "gate", gate,
+                kind == 6 ? 4096 : kind >= 12 ? 1 : 3, 1));
+        else {
+            const col_rel_t *full =
+                session_find_rel((wl_col_session_t *)sessions[i], "gate");
+            CHECK(full && !full->schema_ok && !full->ncols && !full->nrows);
+        }
         if (kind == 11) CHECK(!wl_session_remove(sessions[i], "gate", gate, 3,
                 1));
         CHECK(!wl_session_insert(sessions[i], "blocked", blocked,
@@ -295,6 +321,7 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
             10 ? 1 : 64;
     }
     active_session = controlled; ordinary_decline = kind == 10;
+    bare_gate_case = kind == 17; bare_gate_starts = 0;
     probe_starts = refused_grants = paid_grants = 0; short_grant = true;
     if (funding_test) {
         wl_columnar_session_test_framed_grant_limit = funding_limit;
@@ -337,14 +364,16 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
             kind, rc, prepared, consumers, schemas, indexes);
     CHECK(!rc && prepared == (kind == 10 ? 0u : 1u));
     if (!missing && kind != 5 && kind != 9 && kind != 10 &&
-        kind != 11) CHECK(probe_starts);
+        kind != 11 && kind != 17) CHECK(probe_starts);
+    if (kind == 17) CHECK(bare_gate_starts == 1);
     if (funding_test) CHECK(refused_grants && refused_grants == paid_grants);
     wl_columnar_session_test_framed_grant_limit = NULL;
     wl_columnar_session_test_framed_grant_finished = NULL;
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(active, &report) && !report.result);
     CHECK((kind == 9 || schemas) && (kind == 4 || kind == 10 || consumers));
-    if (!missing && kind != 5 && kind != 9 && kind != 11) CHECK(indexes);
+    if (!missing && kind != 5 && kind != 9 && kind != 11 &&
+        kind != 17) CHECK(indexes);
     wl_columnar_join_test_schema_checkpoint = NULL;
     wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
     wl_columnar_join_test_attempt_checkpoint = NULL;
@@ -388,7 +417,7 @@ run(unsigned kind, unsigned schema_stop, unsigned event_stop, bool work)
 int
 main(void)
 {
-    for (unsigned kind = 0; kind < 17; ++kind) run(kind, 0, 0, false);
+    for (unsigned kind = 0; kind < 18; ++kind) run(kind, 0, 0, false);
     for (unsigned point = 1; point <= 7; ++point)
         for (unsigned work = 0; work < 2; ++work) run(0, point, 0, work);
     for (unsigned event = 1; event <= 20; ++event)

@@ -893,8 +893,9 @@ static int
 wl_columnar_eval_stack_unary_forward(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
-        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)) return EINVAL;
+    if (frame->filter.join_metadata_busy) return EBUSY;
+    if (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
         || frame->session->cleanup_active != frame
         || !wl_columnar_eval_stack_unary_thread_valid(frame))
         return EINVAL;
@@ -1184,6 +1185,8 @@ wl_columnar_eval_stack_unary_commit_numeric_join_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
     const void *owner)
 {
+    if (wl_columnar_eval_stack_unary_frame_valid(frame)
+        && frame->filter.join_metadata_busy) return EBUSY;
     if (committed) *committed = false;
     int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
     if (rc) return rc;
@@ -1230,11 +1233,156 @@ wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
                delta);
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_anti_metadata_committed)(
+    const eval_entry_t *, const eval_entry_t *);
+#endif
+
+enum {
+    WL_COLUMNAR_ANTI_META_CONTEXT_WORK = 224,
+    WL_COLUMNAR_ANTI_META_STATE_WORK = 192,
+    WL_COLUMNAR_ANTI_META_SCRATCH_WORK = 128,
+    WL_COLUMNAR_ANTI_META_CUTOFF_WORK = 256
+};
+typedef char wl_columnar_anti_metadata_fits_t[
+        WL_COLUMNAR_ANTI_META_CUTOFF_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+/* Original fixed validation is split from per-record scratch checks and the
+* terminal metadata cutoff. Each original debit covers only that region;
+* existing FIRST_FINISH256 pays the unchanged segment-only disposer. No
+* relation or scalar retirement authority enters unary_retired here.
+* Context224 covers fixed identity/op/phase/thread validation; STATE192
+* covers inert-slot/reader/temporary checks; each SCRATCH128 covers one of
+* three fixed records. CUTOFF256 covers original entry+snapshot comparisons,
+* final tail, fixed transfer and the filter/status caller suffix. No region
+* scans segments or rows. These logical envelopes do not bound allocator or
+* instrumentation callback latency, and no whole-call quantum is claimed. */
+static int
+wl_columnar_eval_stack_anti_keep_all_body(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t *ctx, bool *committed,
+    const wl_columnar_eval_plan_numeric_attempt_t *r)
+{
+    int rc = wl_columnar_eval_stack_attempt_charge(r->control, r->attempt_id,
+            WL_COLUMNAR_ANTI_META_CONTEXT_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_eval_stack_attempt_charge(r->control, r->attempt_id,
+            WL_COLUMNAR_ANTI_META_STATE_WORK);
+    if (rc) return rc;
+    if (frame->unary_scalar_mode || frame->unary_scalar_started
+        || frame->unary_scalar_prepared || frame->unary_scalar_committed
+        || frame->unary_committed
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || ctx->source_initialized || ctx->join_right_initialized
+        || ctx->source_bare || ctx->join_right_bare || ctx->join_initialized
+        || ctx->batch_initialized || ctx->program || ctx->heap || ctx->admitted
+        || ctx->ref_held || ctx->governor || ctx->output || ctx->private_output
+        || ctx->table.programs || ctx->table.allocated || ctx->table.admitted
+        || ctx->table.ref_held) return EBUSY;
+    if ((ctx->source_empty_reader.identity &&
+        (ctx->source_empty_reader.identity != &ctx->source_empty_reader
+        || ctx->source_empty_reader.phase !=
+        WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED))
+        || (ctx->join_empty_reader.identity &&
+        (ctx->join_empty_reader.identity != &ctx->join_empty_reader
+        || ctx->join_empty_reader.phase !=
+        WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED))) return EBUSY;
+    for (unsigned i = 0; i < WL_COLUMNAR_JOIN_SCRATCH_COUNT; ++i) {
+        rc = wl_columnar_eval_stack_attempt_charge(r->control, r->attempt_id,
+                WL_COLUMNAR_ANTI_META_SCRATCH_WORK);
+        if (rc) return rc;
+        const wl_columnar_join_scratch_t *scratch = &ctx->join_scratch[i];
+        if (scratch->initialized || scratch->allocated || scratch->admitted
+            || scratch->ref_held || scratch->physical || scratch->governor)
+            return EBUSY;
+    }
+    rc = wl_columnar_eval_stack_attempt_charge(r->control, r->attempt_id,
+            WL_COLUMNAR_ANTI_META_CUTOFF_WORK);
+    if (rc) return rc;
+    if (!wl_columnar_eval_stack_unary_original_matches(frame)
+        || !wl_columnar_relation_snapshot_valid(ctx->join_input_snapshot)
+        || !wl_columnar_relation_snapshot_equal(ctx->join_input_snapshot,
+        wl_columnar_relation_snapshot(frame->unary_snapshot.rel)))
+        return EINVAL;
+    rc = wl_columnar_eval_stack_attempt_tail(r->control, r->attempt_id,
+            WL_COLUMNAR_EVAL_STACK_UNARY_COMMIT_CUTOFF_PHASE, frame->unary_top);
+    if (rc) return rc;
+    /* Irreversible, callback-free transfer: historical snapshot owns nothing. */
+    eval_entry_t *entry = &frame->stack.items[frame->unary_index];
+    frame->unary_retired.seg_boundaries = entry->seg_boundaries;
+    frame->unary_retired.seg_count = entry->seg_count;
+    entry->seg_boundaries = NULL; entry->seg_count = 0; entry->is_delta = false;
+    frame->unary_committed = true;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;
+    *committed = true;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_anti_metadata_committed)
+        wl_columnar_eval_stack_test_anti_metadata_committed(
+            &frame->unary_retired, entry);
+#endif
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_unary_commit_anti_keep_all_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t *ctx, bool *committed, const void *owner)
+{
+    if (!owner || !committed) return EINVAL;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (frame->stream_host || ctx != &frame->filter) return EBUSY;
+    /* Refuse recursion/duplicate publication before old-control access. */
+    if (ctx->join_metadata_busy || ctx->committed
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE)
+        return EBUSY;
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    bool child = r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        || ((r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        && (r->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD));
+    if (!child || r->cursor >= r->end || !r->plan
+        || r->plan->ops[r->cursor].op != WL_PLAN_OP_ANTIJOIN
+        || ctx->join_operation != &r->plan->ops[r->cursor]
+        || ctx->identity != ctx || ctx->frame != frame
+        || ctx->session != frame->session ||
+        frame->session->cleanup_active != frame
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE || !ctx->busy
+        || !ctx->thread_valid || !ctx->pin_owned || !ctx->unary_started
+        || !ctx->join_decision_pending || ctx->committed ||
+        ctx->execution_result
+        || ctx->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL
+        || ctx->control != r->control || ctx->attempt_id != r->attempt_id
+        || frame->unary_control != r->control ||
+        frame->unary_attempt_id != r->attempt_id)
+        return EINVAL;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(ctx->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (ctx->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(ctx->owner_thread, pthread_self())) return EINVAL;
+#endif
+    rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc) return rc;
+    ctx->join_metadata_busy = true;
+    rc = wl_columnar_eval_stack_anti_keep_all_body(frame, ctx, committed, r);
+    ctx->join_metadata_busy = false;
+    return rc;
+}
+
 static int
 wl_columnar_eval_stack_unary_commit_attempt_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
     bool publication_is_delta)
 {
+    if (wl_columnar_eval_stack_unary_frame_valid(frame)
+        && frame->filter.join_metadata_busy) return EBUSY;
     if (!committed)
         return EINVAL;
     *committed = false;
@@ -1345,7 +1493,8 @@ wl_columnar_eval_stack_unary_finish_body(
 {
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
-    if (frame->unary_scalar_mode) return EBUSY;
+    if (frame->filter.join_metadata_busy || frame->unary_scalar_mode)
+        return EBUSY;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_IDLE)
         return EINVAL;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_DONE)
@@ -1574,6 +1723,7 @@ wl_columnar_eval_stack_unary_reset_owned(
 {
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
+    if (frame->filter.join_metadata_busy) return EBUSY;
     if (frame->numeric_plan_owner != owner) return EBUSY;
     if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
