@@ -5498,5 +5498,19 @@ private result growth is admitted separately. Row ordinals survive output
 relocation. With fixed groups, attempt state does not grow with input rows.
 Group cardinality still has a resident index/result floor; refusal discards the
 whole private attempt and preserves the immutable source for retry.
-Other aggregate functions, expressions, recursive/signed/control aggregation
-and aggregate-over-JOIN remain ineligible.
+Direct INT64 SUM/MIN/MAX use the same streaming path and group ownership.
+Operand lanes resolve through the audited prefix; expression, operand and result
+domains must agree. MIN/MAX initialize from the first surviving value. SUM uses
+checked addition in source order, including across segments, and returns ERANGE
+on intermediate overflow even if the mathematical final sum would fit. Zero
+sums still produce a row; empty/all-filtered inputs do not.
+
+The shared public-budget experiment uses a 2 MiB host chunk to load 320 MiB of
+physical lanes under a 256 MiB budget and produces four exact SUM groups.
+Resident insertion and full-width materialization refuse under that same
+budget. Retaining actual governed input chunks also refuses; releasing those
+owners permits retry without raising the limit. Trace segment/directory storage
+and resident intern storage remain separate from aggregate attempt state.
+Expressions, FLOAT/AVG, recursive/signed/control aggregation and aggregate-over-
+JOIN remain ineligible. High distinct-group cardinality can still exhaust the
+resident index/result budget.

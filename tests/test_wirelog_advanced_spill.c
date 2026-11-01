@@ -1295,7 +1295,7 @@ static void chunked_public_references(void)
             }
 }
 
-static void chunked_public_budget(void)
+static void chunked_public_budget(bool aggregate)
 {
     /* One reused 2 MiB caller buffer, not a hidden full host-side input. */
     const unsigned total = WL_TEST_COLD_ROWS, chunk = WL_TEST_COLD_CHUNK;
@@ -1303,7 +1303,7 @@ static void chunked_public_budget(void)
     CHECK(rows);
     environment("WIRELOG_MEMORY_BUDGET", "268435456");
     for (unsigned mode = 0; mode < 3; mode++) {
-        char *text = wl_test_cold_query(mode == 2);
+        char *text = wl_test_cold_query(mode == 2 ? 1 : aggregate ? 2 : 0);
         wirelog_program_t *p = parse(text); free(text);
         wirelog_session_t *s = NULL;
         wirelog_session_options_v1_t options = configured();
@@ -1313,7 +1313,7 @@ static void chunked_public_budget(void)
         options.spill_join_batch_bytes = 16384;
         CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
             &options, &s) == WIRELOG_OK);
-        if (mode != 2) for (int64_t i = 0; i < 4; i++) {
+        if (mode != 2 && !aggregate) for (int64_t i = 0; i < 4; i++) {
                 int64_t row[] = {i, 10+i};
                 CHECK(wirelog_session_insert(s, "a", row, 1, 2) == WIRELOG_OK);
             }
@@ -1322,7 +1322,8 @@ static void chunked_public_budget(void)
         wirelog_error_t error = WIRELOG_OK; unsigned admitted = 0;
         for (unsigned first = 0; first < total && error == WIRELOG_OK;
             first += chunk) {
-            wl_test_cold_rows(rows, first);
+            if (aggregate) wl_test_cold_group_rows(rows, first);
+            else wl_test_cold_rows(rows, first);
             error = mode == 1 ? wirelog_session_insert(s, "b", rows, chunk,
                     WL_TEST_COLD_WIDTH) :
                 wirelog_session_append_cold_input(s, "b", rows, chunk,
@@ -1330,8 +1331,8 @@ static void chunked_public_budget(void)
             if (error == WIRELOG_OK) admitted += chunk;
         }
         printf(
-            "public chunked budget=268435456 mode=%u admitted_rows=%u total_rows=%u status=%d\n",
-            mode, admitted, total, (int)error);
+            "public chunked budget=268435456 aggregate=%u mode=%u admitted_rows=%u total_rows=%u status=%d\n",
+            aggregate, mode, admitted, total, (int)error);
         if (mode == 1) CHECK(error == WIRELOG_ERR_MEMORY_BUDGET);
         else {
             CHECK(error == WIRELOG_OK);
@@ -1340,6 +1341,10 @@ static void chunked_public_budget(void)
                 unsigned calls = 0;
                 CHECK(wirelog_session_snapshot(s, count_event,
                     &calls) == WIRELOG_ERR_MEMORY_BUDGET && !calls);
+            } else if (aggregate) {
+                unsigned seen = 0;
+                CHECK(wirelog_session_snapshot(s, wl_test_cold_group_observe,
+                    &seen) == WIRELOG_OK && seen == 15);
             } else {
                 events_t e = {0};
                 CHECK(wirelog_session_snapshot(s, observe,
@@ -1511,7 +1516,7 @@ static void cold_global_counts(void)
         }
 }
 
-typedef struct { unsigned count, position; int64_t rows[128][3];
+typedef struct { unsigned count, position; bool reference; int64_t rows[128][3];
 } cold_group_result_t;
 static void cold_group_observe(const char *name, const int64_t *row,
     uint32_t cols, void *context)
@@ -1526,6 +1531,14 @@ static void cold_group_typed(const char *name,
 {
     if (strcmp(name, "result")) return;
     CHECK(diff == 1 && row->logical_ncols == 3 && row->physical_nlanes == 3);
+    cold_group_result_t *result = context;
+    for (unsigned i = 0; i < 3; i++) {
+        wirelog_column_type_t expected = result->reference &&
+            i ==
+            (result->position ==
+            2 ? 1u : 2u) ? WIRELOG_TYPE_STRING : WIRELOG_TYPE_INT64;
+        CHECK(row->types[i] == expected && row->physical_types[i] == expected);
+    }
     int64_t values[3]; memcpy(values, row->lanes, sizeof(values));
     cold_group_observe(name, values, 3, context);
 }
@@ -1536,14 +1549,17 @@ static int cold_group_compare(const void *left, const void *right)
         i++) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
     return 0;
 }
-static void cold_group_counts(void)
+static void cold_group_counts(const char *function)
 {
     for (unsigned position = 0; position < 3; position++)
         for (unsigned inlined = 0; inlined < 2; inlined++)
             for (unsigned empty = 0; empty < 2; empty++) {
                 cold_group_result_t oracle = {0};
                 for (unsigned mode = 0; mode < 3; mode++) {
-                    char text[1024];
+                    char text[1024], head[80];
+                    snprintf(head, sizeof(head),
+                        position == 0 ? "%s(v),k,s" : position ==
+                        1 ? "k,%s(v),s" : "k,s,%s(v)", function);
                     snprintf(text, sizeof(text),
                         ".decl seed(s:symbol,k:int64)\n"
                         "seed(\"zeta\",0).\nseed(\"alpha\",1).\n"
@@ -1554,8 +1570,7 @@ static void cold_group_counts(void)
                         position == 0 ? "n:int64,k:int64,s:symbol" : position ==
                         1 ? "k:int64,n:int64,s:symbol" :
                         "k:int64,s:symbol,n:int64",
-                        position == 0 ? "count(v),k,s" : position ==
-                        1 ? "k,count(v),s" : "k,s,count(v)",
+                        head,
                         inlined ? "a(pair(k,s),v)" : "a(k,s,v)");
                     wirelog_program_t *p = parse(text);
                     wirelog_session_t *session = NULL;
@@ -1589,7 +1604,8 @@ static void cold_group_counts(void)
                         2) CHECK(wirelog_session_finish_cold_input(session,
                             "a") == WIRELOG_OK);
                     for (unsigned repeat = 0; repeat < 2; repeat++) {
-                        cold_group_result_t result = {0}, typed = {0};
+                        cold_group_result_t result = {0},
+                            typed = {.position = position, .reference = true};
                         CHECK(wirelog_session_step(session) == WIRELOG_OK);
                         CHECK(wirelog_session_snapshot(session,
                             cold_group_observe, &result) == WIRELOG_OK);
@@ -1608,12 +1624,139 @@ static void cold_group_counts(void)
                             sizeof(result.rows)));
                         CHECK(result.count == (empty ? 0u : 64u));
                         for (unsigned i = 0; i < result.count;
-                            i++) CHECK(result.rows[i][position] == 3 ||
-                                result.rows[i][position] == 6);
+                            i++) CHECK((strcmp(function,
+                                "min") == 0 || strcmp(function,
+                                "max") == 0) ? result.rows[i][position] ==
+                                1 : (result.rows[i][position] == 3 ||
+                                result.rows[i][position] == 6));
                     }
                     wirelog_session_destroy(session); wirelog_program_free(p);
                     CHECK(!live_files());
                 }
+            }
+}
+
+static void cold_integer_aggregates(void)
+{
+    const char *functions[] = {"sum", "min", "max"};
+    for (unsigned fn = 0; fn < 3; fn++)
+        for (unsigned grouped = 0; grouped < 2; grouped++)
+            for (unsigned filtered = 0; filtered < 3; filtered++)
+                for (unsigned extreme = 0; extreme < 2; extreme++) {
+                    cold_group_result_t oracle = {0};
+                    cold_count_result_t global = {0};
+                    for (unsigned mode = 0; mode < 3; mode++) {
+                        char text[512], head[80];
+                        snprintf(head, sizeof(head),
+                            grouped ? "k,%s(v),s" : "%s(v)", functions[fn]);
+                        snprintf(text, sizeof(text),
+                            ".decl a(k:int64,v:int64,s:int64)\n.decl result(%s)\nresult(%s) :- a(k,v,s)%s.\n",
+                            grouped ? "k:int64,n:int64,s:int64" : "n:int64",
+                            head,
+                            filtered == 1 ? ",v<0" : filtered ==
+                            2 ? ",v>100" : "");
+                        wirelog_program_t *p = parse(text);
+                        wirelog_session_t *session = NULL;
+                        wirelog_session_options_v1_t options = configured();
+                        CHECK(wirelog_session_create_with_options(p,
+                            WIRELOG_BACKEND_DEFAULT, 1, &options,
+                            &session) == WIRELOG_OK);
+                        int64_t values[] = {-9, 4, -9, 0, 7, 4};
+                        if (extreme) {
+                            values[0] = INT64_MIN; values[1] = INT64_MAX;
+                            values[2] = 0; values[3] = 0; values[4] = 0;
+                            values[5] = 0;
+                        }
+                        if (mode ==
+                            2) CHECK(wirelog_session_begin_cold_input(session,
+                                "a") == WIRELOG_OK);
+                        for (unsigned i = 0; i < 6; i++) {
+                            int64_t row[] = {extreme ? 0 : (int64_t)(i%2),
+                                             values[i], 3};
+                            CHECK((mode ==
+                                2 ? wirelog_session_append_cold_input(session,
+                                "a", row, 1,
+                                3) : wirelog_session_insert(session, "a", row,
+                                1, 3)) == WIRELOG_OK);
+                        }
+                        if (mode == 1) CHECK(wirelog_session_seal_input(session,
+                                "a") == WIRELOG_OK);
+                        if (mode ==
+                            2) CHECK(wirelog_session_finish_cold_input(session,
+                                "a") == WIRELOG_OK);
+                        for (unsigned repeat = 0; repeat < 2; repeat++) {
+                            CHECK(wirelog_session_step(session) == WIRELOG_OK);
+                            if (grouped) {
+                                cold_group_result_t result = {0}, typed = {0};
+                                CHECK(wirelog_session_snapshot(session,
+                                    cold_group_observe, &result) == WIRELOG_OK);
+                                CHECK(wirelog_session_snapshot_typed(session,
+                                    cold_group_typed, &typed) == WIRELOG_OK);
+                                qsort(result.rows, result.count,
+                                    sizeof(result.rows[0]), cold_group_compare);
+                                qsort(typed.rows, typed.count,
+                                    sizeof(typed.rows[0]), cold_group_compare);
+                                if (!mode) oracle = result;
+                                CHECK(result.count == oracle.count &&
+                                    result.count == typed.count);
+                                CHECK(!memcmp(result.rows, oracle.rows,
+                                    sizeof(result.rows)) && !memcmp(result.rows,
+                                    typed.rows, sizeof(result.rows)));
+                            } else {
+                                cold_count_result_t result = {0}, typed = {0};
+                                CHECK(wirelog_session_snapshot(session,
+                                    cold_count_observe, &result) == WIRELOG_OK);
+                                CHECK(wirelog_session_snapshot_typed(session,
+                                    cold_count_typed, &typed) == WIRELOG_OK);
+                                if (!mode) global = result;
+                                CHECK(result.rows == global.rows &&
+                                    result.count == global.count &&
+                                    result.rows == typed.rows &&
+                                    result.count == typed.count);
+                            }
+                        }
+                        wirelog_session_destroy(session);
+                        wirelog_program_free(p); CHECK(!live_files());
+                    }
+                }
+    /* A mathematically fitting final SUM must still reject an intermediate
+     * overflow in source order, including a segment boundary. */
+    for (unsigned grouped = 0; grouped < 2; grouped++)
+        for (unsigned negative = 0; negative < 2; negative++)
+            for (unsigned mode = 0; mode < 3; mode++) {
+                char text[256];
+                snprintf(text, sizeof(text),
+                    ".decl a(k:int64,v:int64)\n.decl result(%s)\nresult(%s) :- a(k,v).\n",
+                    grouped ? "k:int64,n:int64" : "n:int64",
+                    grouped ? "k,sum(v)" : "sum(v)");
+                wirelog_program_t *p = parse(text);
+                wirelog_session_t *session = NULL;
+                wirelog_session_options_v1_t options = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &options,
+                    &session) == WIRELOG_OK);
+                int64_t values[] = {negative ? INT64_MIN : INT64_MAX,
+                                    negative ? -1 : 1, negative ? 1 : -1};
+                if (mode == 2) CHECK(wirelog_session_begin_cold_input(session,
+                        "a") == WIRELOG_OK);
+                for (unsigned i = 0; i < 3; i++) {
+                    int64_t row[] = {0, values[i]};
+                    CHECK((mode ==
+                        2 ? wirelog_session_append_cold_input(session, "a", row,
+                        1, 2) : wirelog_session_insert(session, "a", row, 1,
+                        2)) == WIRELOG_OK);
+                }
+                if (mode == 1) CHECK(wirelog_session_seal_input(session,
+                        "a") == WIRELOG_OK);
+                if (mode == 2) CHECK(wirelog_session_finish_cold_input(session,
+                        "a") == WIRELOG_OK);
+                unsigned calls = 0;
+                CHECK(wirelog_session_snapshot(session, count_event,
+                    &calls) != WIRELOG_OK && !calls);
+                CHECK(wirelog_session_snapshot(session, count_event,
+                    &calls) != WIRELOG_OK && !calls);
+                wirelog_session_destroy(session); wirelog_program_free(p);
+                CHECK(!live_files());
             }
 }
 
@@ -1636,9 +1779,12 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     cold_global_counts();
-    cold_group_counts();
+    cold_group_counts("count"); cold_group_counts("sum");
+    cold_group_counts("min"); cold_group_counts("max");
+    cold_integer_aggregates();
     chunked_public_scans(); chunked_public_joins();
-    chunked_public_references(); chunked_public_budget();
+    chunked_public_references(); chunked_public_budget(false);
+    chunked_public_budget(true);
     inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();

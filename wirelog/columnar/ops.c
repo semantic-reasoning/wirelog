@@ -579,6 +579,22 @@ wl_columnar_ops_cold_group_grow(wl_col_session_t *sess,
     return 0;
 }
 
+/* The first surviving row initializes extrema; SUM preserves input order. */
+static int
+wl_columnar_ops_cold_aggregate_update(wirelog_agg_fn_t fn,
+    int64_t current, int64_t value, int64_t *result)
+{
+    switch (fn) {
+    case WIRELOG_AGG_COUNT: *result = current + 1; return 0;
+    case WIRELOG_AGG_SUM:
+        return wl_columnar_arithmetic_checked_add_int64(current, value, result)
+            ? ERANGE : 0;
+    case WIRELOG_AGG_MIN: *result = current < value ? current : value; return 0;
+    case WIRELOG_AGG_MAX: *result = current > value ? current : value; return 0;
+    default: return ENOTSUP;
+    }
+}
+
 /* Aggregate prefixes stream physical rows; ordinary scan output floors remain
  * unchanged. Only a fully constructed private reduction reaches the stack. */
 int
@@ -679,7 +695,7 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
         wl_columnar_trace_store_cursor_acquire(cold->trace_snapshot, &cursor) :
         wl_columnar_batch_payload_acquire(cold->payload, &reader);
     if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
-    int64_t count = 0;
+    int64_t aggregate = 0; bool seen = false;
     for (uint32_t ordinal = 0; ordinal < cold->nrows; ordinal++) {
         const uint64_t *lanes;
         wl_columnar_spill_metadata_t metadata;
@@ -708,8 +724,15 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
             }
         }
         if (!keep) continue;
+        int64_t value = 1;
+        if (reduce->agg_fn != WIRELOG_AGG_COUNT)
+            memcpy(&value, &lanes[decoded.operand], sizeof(value));
         if (!group_count) {
-            count++; continue;
+            if (!seen) aggregate = value;
+            else rc = wl_columnar_ops_cold_aggregate_update(reduce->agg_fn,
+                        aggregate, value, &aggregate);
+            if (rc) goto done;
+            seen = true; continue;
         }
         uint64_t hash = UINT64_C(1469598103934665603);
         for (uint32_t i = 0; i < group_count; i++) {
@@ -734,8 +757,11 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
         }
         if (found) {
             uint32_t row = groups[slot].row;
-            rc = col_rel_append_batch_set(&batch, row, aggregate_index,
-                    out->columns[aggregate_index][row] + 1);
+            int64_t updated;
+            rc = wl_columnar_ops_cold_aggregate_update(reduce->agg_fn,
+                    out->columns[aggregate_index][row], value, &updated);
+            if (!rc) rc = col_rel_append_batch_set(&batch, row, aggregate_index,
+                        updated);
         } else {
             if (!capacity || out->nrows >= capacity / 2) {
                 rc = wl_columnar_ops_cold_group_grow(sess, &groups, &capacity,
@@ -744,7 +770,7 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
                 slot = (uint32_t)hash & (capacity - 1);
                 while (groups[slot].hash) slot = (slot + 1) & (capacity - 1);
             }
-            tuple[aggregate_index] = 1;
+            tuple[aggregate_index] = value;
             uint32_t row = out->nrows;
             rc = col_rel_append_batch_row(&batch, tuple);
             if (!rc) groups[slot] = (wl_columnar_ops_cold_group_t){hash, row};
@@ -758,13 +784,13 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     }
 #endif
     rc = wl_columnar_relation_new_named_governed("$reduce", 1, NULL,
-            count ? 1 : 0, false, sess->memory_governor, &out);
+            seen ? 1 : 0, false, sess->memory_governor, &out);
     if (rc) goto done;
     wirelog_column_type_t type = WIRELOG_TYPE_INT64;
     rc = col_rel_set_column_types(out, &type, 1);
-    if (!rc && count) {
+    if (!rc && seen) {
         bool denied = false;
-        rc = col_rel_append_rows_atomic(out, &count, 1, 1, &denied);
+        rc = col_rel_append_rows_atomic(out, &aggregate, 1, 1, &denied);
         if (denied) rc = ENOSPC;
     }
     goto done;

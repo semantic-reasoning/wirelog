@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Cold INT64 SUM/MIN/MAX stream checked direct operands, preserving source-order
+  overflow and resident empty/extrema semantics (#1372 follow-up).
+
 - Cold COUNT groups direct INT64/STRING keys with governed index growth and
   retryable private-output failure (#1372 follow-up).
 
