@@ -200,15 +200,27 @@ typedef struct {
 
 /* Bind the prepared producer to one active operation attempt and transfer
  * exclusive stepping ownership from generic continuation publication.
- * The bound API is serialized on the thread that calls bind.  A producer
+ * The bound API is serialized on the thread that calls bind. A producer
  * created by col_join_batch_producer_create_over is refused with ENOTSUP
- * (#2201). */
+ * (#2201). One INT64 key and 1..64 output lanes retain their historical
+ * tariff. Other scalar shapes validate one key/column, hash one byte,
+ * compare one key and write one cell per fixed-unit action; a wide row
+ * stays private until complete. This does not make the raw constructor's
+ * synchronous setup part of the step bound. */
 int
 col_join_batch_control_bind(wl_columnar_continuation_t *cont,
     wl_evaluation_control_t *control, uint64_t attempt_id);
 
+#ifdef WL_SESSION_TEST_HOOKS
+/* Generalized producer: phase1 precedes a cell write, phase2 precedes row
+* visibility. The scratch descriptor remains private until BATCH_READY. */
+extern void (*wl_columnar_join_batch_test_control_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t, const col_rel_t *);
+#endif
+
 /* Perform at most max_work units, charging before each state transition or
- * bounded tuple/hash action. Complete private rows remain hidden until peek. */
+ * bounded tuple/hash action. Complete private rows remain hidden until peek.
+ * A zero max_work is sticky execution-error/EINVAL, unlike runner advance. */
 col_join_batch_control_status_t
 col_join_batch_control_step(wl_columnar_continuation_t *cont,
     uint64_t max_work, col_join_batch_control_result_t *result);

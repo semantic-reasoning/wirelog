@@ -4469,6 +4469,16 @@ test_join_batch_resume_exe = executable(
 
 test('join_batch_resume', test_join_batch_resume_exe)
 
+test_join_batch_controlled_domains_exe = executable(
+  'test_join_batch_controlled_domains', files('test_join_batch_controlled_domains.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('join_batch_controlled_domains', test_join_batch_controlled_domains_exe,
+     suite: ['unit', 'tsan'], timeout: 60)
+
 # Issue #1505: owned right-filter cleanup on early join exits.
 # Issue #1720: the Linux allocation-failure cases need -Wl,--wrap=calloc, and
 # a b_lto=false target cannot link the LTO'd libtestlib_prod.a under clang --
