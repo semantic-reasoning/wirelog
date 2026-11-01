@@ -574,6 +574,11 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
  * a time and use the common per-cell controlled append, never a wide raw copy. */
 enum { WL_COLUMNAR_LFTJ_ACTION_UNITS = 72u };
 enum { WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS = 8u };
+/* Fixed authentic-token/canonical-owner/snapshot validation plus one raw
+ * arithmetic stage, or the existing per-input postcheck. No dynamic scan.
+ * Acquisition retains its separate ACTION72. These are original work fees,
+ * not reservations for the raw algorithm's different workspace. */
+enum { WL_COLUMNAR_LFTJ_SOURCE_CHECK_UNITS = 192u };
 
 static bool
 wl_columnar_lftj_allocation_work_add(uint64_t *total, uint64_t work)
@@ -627,8 +632,84 @@ wl_columnar_lftj_attempt_fail(wl_columnar_lftj_attempt_t *a, int rc)
 }
 
 static int
+wl_columnar_lftj_input_held(const wl_columnar_lftj_input_attempt_t *in)
+{
+    const wl_columnar_source_access_reader_t *r = &in->reader;
+    if (!in->reader_held || !in->relation
+        || r->identity != (uintptr_t)r || r->acquire_stage || r->release_stage
+        || r->transferable || !wl_columnar_source_access_reader_thread_equal(r)
+        || r->secondary_owner != &in->relation->descriptor_access
+        || !wl_columnar_relation_snapshot_equal(in->snapshot,
+        wl_columnar_relation_snapshot(in->relation))) return EINVAL;
+    col_rel_t *owner = NULL;
+    int rc = col_rel_storage_owner_resolve(in->relation, &owner);
+    if (rc) return rc;
+    if (r->owner != &owner->source_access) return EINVAL;
+    uint64_t descriptor = atomic_load_explicit(&r->secondary_owner->state,
+            memory_order_acquire);
+    uint64_t storage = atomic_load_explicit(&r->owner->state,
+            memory_order_acquire);
+    return !descriptor || descriptor == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+           || !storage || storage == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+           ? EINVAL : 0;
+}
+
+static int
+wl_columnar_lftj_source_precheck(wl_columnar_lftj_attempt_t *a,
+    wl_columnar_lftj_input_attempt_t *in)
+{
+    int rc = wl_columnar_lftj_attempt_charge(a,
+            WL_COLUMNAR_LFTJ_SOURCE_CHECK_UNITS);
+    if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+    rc = wl_columnar_lftj_input_held(in);
+    if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+    bool valid = true;
+    switch (in->source_phase) {
+    case WL_COLUMNAR_LFTJ_SOURCE_KEY:
+        if (in->key_col >= in->relation->ncols)
+            return wl_columnar_lftj_attempt_fail(a, EINVAL);
+        break;
+    case WL_COLUMNAR_LFTJ_SOURCE_CELLS:
+        valid = wl_columnar_memory_size_mul(in->relation->nrows,
+                in->relation->ncols, &in->raw_bytes); break;
+    case WL_COLUMNAR_LFTJ_SOURCE_ROW_BYTES:
+        valid = wl_columnar_memory_size_mul(in->raw_bytes, sizeof(int64_t),
+                &in->raw_bytes); break;
+    case WL_COLUMNAR_LFTJ_SOURCE_ADD_ROWS:
+        valid = wl_columnar_memory_size_add(a->raw_preflight_scratch_bytes,
+                in->raw_bytes, &a->raw_preflight_scratch_bytes); break;
+    case WL_COLUMNAR_LFTJ_SOURCE_COLUMN_BYTES:
+        valid = wl_columnar_memory_size_mul(in->relation->ncols,
+                sizeof(int64_t), &in->raw_bytes); break;
+    case WL_COLUMNAR_LFTJ_SOURCE_ADD_COLUMNS:
+        valid = wl_columnar_memory_size_add(a->raw_preflight_scratch_bytes,
+                in->raw_bytes, &a->raw_preflight_scratch_bytes); break;
+    case WL_COLUMNAR_LFTJ_SOURCE_COMPLETE:
+        ++a->cursor; return 0;
+    default: return wl_columnar_lftj_attempt_fail(a, EINVAL);
+    }
+    if (!valid) return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+    ++in->source_phase;
+    return 0;
+}
+
+static int
 wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
 {
+    if (!a->raw_preflight_initialized) {
+        int rc = wl_columnar_lftj_attempt_charge(a, 8);
+        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+        uint64_t bytes;
+        if (!wl_columnar_memory_size_mul(a->metadata->k,
+            sizeof(wl_lftj_input_t) + sizeof(col_sorted_arrangement_probe_t)
+            + sizeof(col_rel_t *) + sizeof(wl_columnar_source_access_reader_t)
+            + sizeof(bool) + 3u*sizeof(uint32_t), &bytes)
+            || !wl_columnar_memory_size_add(0, bytes,
+            &a->raw_preflight_scratch_bytes))
+            return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
+        a->raw_preflight_initialized = true;
+        return 0;
+    }
     if (!a->inputs) {
         int rc = wl_columnar_lftj_attempt_charge(a, 16);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
@@ -643,6 +724,24 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         if (a->session->rels != a->registry
             || a->session->nrels != a->registry_count)
             return wl_columnar_lftj_attempt_fail(a, EBUSY);
+        if (in->source_phase == WL_COLUMNAR_LFTJ_SOURCE_READER) {
+            rc = wl_columnar_lftj_attempt_charge(a,
+                    WL_COLUMNAR_LFTJ_ACTION_UNITS);
+            if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+            bool held = false;
+            rc = col_rel_source_reader_acquire_step(in->relation, &in->reader,
+                    &held);
+            if (rc == EAGAIN) return 0;
+            if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+            if (held) {
+                in->reader_held = true;
+                in->snapshot = wl_columnar_relation_snapshot(in->relation);
+                in->source_phase = WL_COLUMNAR_LFTJ_SOURCE_KEY;
+            }
+            return 0;
+        }
+        if (in->source_phase != WL_COLUMNAR_LFTJ_SOURCE_LOOKUP)
+            return wl_columnar_lftj_source_precheck(a, in);
         uint32_t private_count = a->private_bindings
             ? a->private_bindings->count : 0;
         uint32_t count = a->registry_count + private_count;
@@ -701,7 +800,10 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         if (!rel) return wl_columnar_lftj_attempt_fail(a, ENOENT);
         in->relation = rel;
         in->key_col = a->metadata->key_cols[i];
-        a->input_count = ++a->cursor;
+        /* Include this slot before its very first descriptor acquisition.
+         * This is cleanup high-water, not number of fully acquired readers. */
+        a->input_count = a->cursor + 1u;
+        in->source_phase = WL_COLUMNAR_LFTJ_SOURCE_READER;
         return 0;
     }
     a->cursor = 0;
@@ -714,20 +816,12 @@ wl_columnar_lftj_attempt_acquire(wl_columnar_lftj_attempt_t *a)
 {
     if (a->cursor < a->input_count) {
         int rc = wl_columnar_lftj_attempt_charge(a,
-                WL_COLUMNAR_LFTJ_ACTION_UNITS);
+                WL_COLUMNAR_LFTJ_SOURCE_CHECK_UNITS);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[a->cursor];
-        bool acquired = false;
-        rc = col_rel_source_reader_acquire_step(in->relation, &in->reader,
-                &acquired);
-        if (rc == EAGAIN)
-            return 0;
-        if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-        if (!acquired)
-            return 0;
-
-        rc = wl_columnar_lftj_attempt_charge(a,
-                WL_COLUMNAR_LFTJ_ACTION_UNITS);
+        /* The complete raw sizing pass precedes type/shape compatibility.
+         * Reuse genuinely HELD readers; acquire_step is not a held requery. */
+        rc = wl_columnar_lftj_input_held(in);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         col_rel_t *rel = in->relation;
         uint32_t key = in->key_col;
@@ -1322,6 +1416,8 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
                     &released);
             if (rc) return rc;
             if (!released) return 0;
+            in->reader_held = false;
+            in->snapshot = (col_relation_snapshot_t){0};
             a->cleanup_input_stage = 1;
             return 0;
         }

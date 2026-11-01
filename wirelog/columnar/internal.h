@@ -7063,9 +7063,25 @@ typedef enum {
     WL_COLUMNAR_LFTJ_JOIN_ADVANCE_KEY
 } wl_columnar_lftj_join_phase_t;
 
+typedef enum {
+    WL_COLUMNAR_LFTJ_SOURCE_LOOKUP,
+    WL_COLUMNAR_LFTJ_SOURCE_READER,
+    WL_COLUMNAR_LFTJ_SOURCE_KEY,
+    WL_COLUMNAR_LFTJ_SOURCE_CELLS,
+    WL_COLUMNAR_LFTJ_SOURCE_ROW_BYTES,
+    WL_COLUMNAR_LFTJ_SOURCE_ADD_ROWS,
+    WL_COLUMNAR_LFTJ_SOURCE_COLUMN_BYTES,
+    WL_COLUMNAR_LFTJ_SOURCE_ADD_COLUMNS,
+    WL_COLUMNAR_LFTJ_SOURCE_COMPLETE
+} wl_columnar_lftj_source_phase_t;
+
 typedef struct {
     col_rel_t *relation;
     wl_columnar_source_access_reader_t reader;
+    col_relation_snapshot_t snapshot;
+    wl_columnar_lftj_source_phase_t source_phase;
+    bool reader_held;
+    uint64_t raw_bytes;
     uint32_t nrows, ncols, key_col;
     wirelog_column_type_t key_type;
     /* Bounded, side-effect-free registry discovery.  A candidate slot is
@@ -7101,6 +7117,8 @@ typedef struct wl_columnar_lftj_attempt {
     uint32_t scratch_size_cursor;
     uint64_t row_bytes;
     bool scratch_size_initialized;
+    uint64_t raw_preflight_scratch_bytes;
+    bool raw_preflight_initialized;
     uint64_t allocation_work_total, allocation_work_charged;
     uint32_t binary_offset[WL_LFTJ_MAX_K];
     int64_t *output_types;
