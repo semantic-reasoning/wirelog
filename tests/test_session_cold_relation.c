@@ -3947,13 +3947,13 @@ static void chunked_retain(col_rel_t *chunk)
         chunk->ncols == WL_TEST_COLD_WIDTH);
     chunked_retained[chunked_retained_count++] = chunk;
 }
-static void chunked_causal_budget(void)
+static void chunked_causal_budget(bool aggregate)
 {
     const uint64_t budget = WL_TEST_COLD_BUDGET, usable = budget-budget/20;
     const uint64_t chunk_bytes = (uint64_t)WL_TEST_COLD_CHUNK*
         WL_TEST_COLD_WIDTH*8;
     CHECK((uint64_t)WL_TEST_COLD_ROWS*WL_TEST_COLD_WIDTH*8 > budget);
-    char *text = wl_test_cold_query(0);
+    char *text = wl_test_cold_query(aggregate ? 2 : 0);
     int64_t *rows = malloc((size_t)chunk_bytes); CHECK(rows);
     for (unsigned retain = 0; retain < 2; retain++) {
         budget_peak = 0;
@@ -3962,10 +3962,10 @@ static void chunked_causal_budget(void)
                 UINT64_C(512)*1024*1024, WL_TEST_COLD_WIDTH*8+24);
         wl_col_session_t *s = COL_SESSION(f.session);
         s->spill_join_index_bytes = 4096; s->spill_join_batch_bytes = 16384;
-        for (int64_t i = 0; i < 4; i++) {
-            int64_t row[] = {i, 10+i};
-            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
-        }
+        if (!aggregate) for (int64_t i = 0; i < 4; i++) {
+                int64_t row[] = {i, 10+i};
+                CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+            }
         uint64_t base = reserved(&f);
         CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
         wl_columnar_session_test_retained_cold_chunk =
@@ -3973,7 +3973,8 @@ static void chunked_causal_budget(void)
         unsigned first = 0;
         wl_columnar_spill_status_t status = OK;
         for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
-            wl_test_cold_rows(rows, first); uint64_t before = reserved(&f);
+            if (aggregate) wl_test_cold_group_rows(rows, first);
+            else wl_test_cold_rows(rows, first); uint64_t before = reserved(&f);
             status = wl_columnar_session_append_cold_input(f.session, "b", rows,
                     WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH);
             if (status != OK) break;
@@ -4000,7 +4001,8 @@ static void chunked_causal_budget(void)
         unsigned refused_at = first;
         /* Releasing the actual retained chunks permits retry under the SAME limit. */
         for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
-            wl_test_cold_rows(rows, first);
+            if (aggregate) wl_test_cold_group_rows(rows, first);
+            else wl_test_cold_rows(rows, first);
             CHECK(wl_columnar_session_append_cold_input(f.session, "b", rows,
                 WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH) == OK);
         }
@@ -4013,16 +4015,51 @@ static void chunked_causal_budget(void)
             state.segments == WL_TEST_COLD_ROWS/WL_TEST_COLD_CHUNK);
         uint64_t loaded = reserved(&f),
             disk = wl_columnar_spill_store_bytes(s->spill_store);
-        events_t e = {0};
-        CHECK(wl_session_snapshot(f.session, observe,
-            &e) == 0 && e.seen == 15 && e.count == 4);
+        if (aggregate) {
+            const wl_plan_relation_t *rp = NULL;
+            for (uint32_t i = 0; i < f.plan->stratum_count; i++)
+                for (uint32_t j = 0; j < f.plan->strata[i].relation_count; j++)
+                    if (!strcmp(f.plan->strata[i].relations[j].name, "result"))
+                        rp = &f.plan->strata[i].relations[j];
+            CHECK(rp && rp->op_count == 3 &&
+                rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
+                rp->ops[1].op == WL_PLAN_OP_REDUCE &&
+                rp->ops[1].agg_fn == WIRELOG_AGG_SUM &&
+                rp->ops[1].group_by_count == 1 &&
+                rp->ops[2].op == WL_PLAN_OP_CONSOLIDATE);
+            uint64_t ingestion_peak = budget_peak;
+            budget_peak = loaded;
+            eval_stack_t stack; eval_stack_init(&stack);
+            CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == 0);
+            uint64_t attempt_peak = budget_peak-loaded;
+            eval_entry_t result = eval_stack_pop(&stack);
+            CHECK(result.rel->nrows == 4 && result.rel->ncols == 2);
+            CHECK(eval_stack_dispose_entry(&stack,
+                &result) == 0 && reserved(&f) == loaded);
+            printf(
+                "aggregate groups=4 buckets=8 index_bytes=128 attempt_extra_peak=%llu source_loaded=%llu host_chunk=%llu\n",
+                (unsigned long long)attempt_peak, (unsigned long long)loaded,
+                (unsigned long long)chunk_bytes);
+            if (budget_peak < ingestion_peak) budget_peak = ingestion_peak;
+        }
+
+        if (aggregate) {
+            unsigned seen = 0;
+            CHECK(wl_session_snapshot(f.session, wl_test_cold_group_observe,
+                &seen) == 0 && seen == 15);
+        } else {
+            events_t e = {0};
+            CHECK(wl_session_snapshot(f.session, observe,
+                &e) == 0 && e.seen == 15 && e.count == 4);
+        }
         CHECK(budget_peak <= usable);
         uint64_t owner, nodes, directory_bytes, cursor;
         CHECK(wl_columnar_trace_store_floor(WL_TEST_COLD_WIDTH, state.segments,
             &owner, &nodes, &directory_bytes, &cursor) == OK);
         printf(
-            "chunked budget=%llu usable=%llu retain=%u refused_at=%u retained_source_bytes=%llu base=%llu loaded=%llu peak=%llu disk=%llu segments=%u owner=%llu nodes=%llu directory=%llu cursor=%llu host_chunk=%llu\n",
-            (unsigned long long)budget, (unsigned long long)usable, retain,
+            "chunked aggregate=%u budget=%llu usable=%llu retain=%u refused_at=%u retained_source_bytes=%llu base=%llu loaded=%llu peak=%llu disk=%llu segments=%u owner=%llu nodes=%llu directory=%llu cursor=%llu host_chunk=%llu\n",
+            aggregate, (unsigned long long)budget, (unsigned long long)usable,
+            retain,
             refused_at, (unsigned long long)retained_bytes,
             (unsigned long long)base, (unsigned long long)loaded,
             (unsigned long long)budget_peak, (unsigned long long)disk,
@@ -4340,7 +4377,7 @@ static void cold_global_internal(void)
             &e) == 0 && reserved(&f) == before);
         wl_plan_relation_t bad = *rp; wl_plan_op_t ops[5];
         memcpy(ops, rp->ops, 4*sizeof(*ops)); bad.ops = ops;
-        ops[2].agg_fn = WIRELOG_AGG_SUM;
+        ops[2].agg_fn = WIRELOG_AGG_AVG;
         CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
             NULL));
         ops[2] = rp->ops[2]; ops[2].agg_result_type = WL_PLAN_AGG_OPERAND_FLOAT;
@@ -4458,6 +4495,118 @@ static void cold_group_internal(void)
     CHECK(extra[0] > 0 && extra[0] == extra[1]);
 }
 
+static void cold_aggregate_mixed_eligibility(void)
+{
+    const char *text =
+        ".decl a(k:int64,v:int64)\n.decl b(k:int64,u:int64,v:int64)\n"
+        ".decl scan(k:int64)\n.decl joined(k:int64,v:int64)\n.decl result(k:int64,n:int64)\n.decl other(n:int64)\n"
+        "scan(k) :- a(k,v).\njoined(k,v) :- a(k,x),b(k,u,v).\nresult(k,sum(v)) :- a(k,v).\nother(max(v)) :- b(k,u,v).\n";
+    for (unsigned mode = 0; mode < 2; mode++) {
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        int64_t rows[] = {1, 4, 1, 4, 2, -5};
+        int64_t right[] = {1, 99, 4, 1, 99, 4, 2, 99, -5};
+        CHECK(wl_session_insert(f.session, "b", right, 3, 3) == 0);
+        if (mode) CHECK(wl_columnar_session_seal_input(f.session, "b", NULL,
+                NULL) == OK);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") == OK);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", rows, 3,
+            2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "a") == OK);
+        CHECK(wl_session_step(f.session) == 0);
+        col_rel_t *result = session_find_rel(COL_SESSION(f.session), "result");
+        CHECK(result && result->nrows == 2);
+        CHECK(result->columns[0][0] == 1 && result->columns[1][0] == 8);
+        CHECK(result->columns[0][1] == 2 && result->columns[1][1] == -5);
+        destroy(&f);
+    }
+    const char *bad[] = {
+        ".decl a(v:int64)\n.decl result(n:int64)\n.decl bad(n:int64)\nresult(count(v)) :- a(v).\nbad(v+1) :- a(v).\n",
+        ".decl a(v:float)\n.decl result(n:float)\nresult(sum(v)) :- a(v).\n",
+        ".decl a(v:symbol)\n.decl result(n:symbol)\nresult(min(v)) :- a(v).\n",
+        ".decl a(v:int64)\n.decl result(n:int64)\nresult(sum(v+1)) :- a(v).\n"
+    };
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        fixture_t f = fixture(bad[i], 4*1024*1024, 1024*1024);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") != OK);
+        destroy(&f);
+    }
+}
+static void cold_integer_internal(void)
+{
+    fixture_t f =
+        fixture(
+        ".decl b(k:int64,v:int64)\n.decl result(n:int64)\nresult(sum(v)) :- b(k,v).\n",
+        4*1024*1024, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    int64_t rows[] = {0, INT64_MAX, 0, 1, 0, -1};
+    CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+    for (unsigned i = 0; i < 3;
+        i++) CHECK(wl_columnar_session_append_cold_input(f.session, "b",
+            rows+2*i, 1, 2) == OK);
+    CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+    const wl_plan_relation_t *rp = cold_aggregate_plan(&f);
+    CHECK(rp->op_count == 3 && rp->ops[1].op == WL_PLAN_OP_REDUCE);
+    uint64_t before = reserved(&f); eval_stack_t stack; eval_stack_init(&stack);
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == ERANGE);
+        CHECK(!stack.top && reserved(&f) == before);
+    }
+    wl_plan_relation_t plan = *rp; wl_plan_op_t ops[3];
+    memcpy(ops, rp->ops, sizeof(ops)); plan.ops = ops;
+    ops[1].agg_fn = WIRELOG_AGG_MIN;
+    CHECK(wl_columnar_ops_cold_aggregate(&plan, &stack, s) == 0);
+    eval_entry_t e = eval_stack_pop(&stack); CHECK(e.rel->columns[0][0] == -1);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0 && reserved(&f) == before);
+    /* Operand resolution follows stage-local MAP indices, not original columns. */
+    wl_plan_op_t mapped_ops[4] = {ops[0], {0}, ops[1], ops[2]};
+    uint32_t projection[] = {1, 0};
+    mapped_ops[1] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP, .project_count = 2,
+                                   .project_indices = projection};
+    wl_plan_relation_t mapped = plan; mapped.ops = mapped_ops;
+    mapped.op_count = 4;
+    CHECK(wl_columnar_ops_cold_aggregate(&mapped, &stack, s) == 0);
+    e = eval_stack_pop(&stack); CHECK(e.rel->columns[0][0] == 0);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0 && reserved(&f) == before);
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_STRING};
+    CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&plan, "b", 2, types,
+        NULL));
+    ops[1].agg_operand_type = WL_PLAN_AGG_OPERAND_FLOAT;
+    CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&plan, "b", 2, NULL,
+        NULL));
+    ops[1] = rp->ops[1]; ops[1].agg_expr.data = NULL; ops[1].agg_expr.size = 0;
+    CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&plan, "b", 2, NULL,
+        NULL));
+    destroy(&f);
+}
+
+static void cold_many_groups_floor(void)
+{
+    fixture_t f =
+        fixture(
+        ".decl b(k:int64,v:int64)\n.decl result(k:int64,n:int64)\nresult(k,sum(v)) :- b(k,v).\n",
+        256*1024, 1024*1024);
+    CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+    int64_t rows[512];
+    for (unsigned first = 0; first < 4096; first += 256) {
+        for (unsigned i = 0; i < 256; i++) {
+            rows[2*i] = first+i; rows[2*i+1] = 1;
+        }
+        CHECK(wl_columnar_session_append_cold_input(f.session, "b", rows, 256,
+            2) == OK);
+    }
+    CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+    uint64_t before = reserved(&f); eval_stack_t stack; eval_stack_init(&stack);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        CHECK(wl_columnar_ops_cold_aggregate(cold_aggregate_plan(&f), &stack,
+            COL_SESSION(f.session)) == ENOSPC);
+        CHECK(!stack.top && reserved(&f) == before);
+    }
+    printf(
+        "aggregate many_groups=4096 budget=262144 baseline=%llu refused_without_limit_change=1\n",
+        (unsigned long long)before);
+    destroy(&f);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -4469,8 +4618,11 @@ int main(void)
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     cold_global_internal();
     cold_group_internal();
+    cold_integer_internal(); cold_aggregate_mixed_eligibility();
+    cold_many_groups_floor();
     chunked_internal(); chunked_join_failure();
-    chunked_reference_failures(); chunked_causal_budget();
+    chunked_reference_failures(); chunked_causal_budget(false);
+    chunked_causal_budget(true);
     cold_scan_join_key_names();
     cold_scan_map_only_right_audit();
     cold_scan_join_self_missing();

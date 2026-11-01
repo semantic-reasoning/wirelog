@@ -559,7 +559,10 @@ wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
         name) != 0 ||
         rp->ops[end + 1].op != WL_PLAN_OP_CONSOLIDATE ||
         reduce->op != WL_PLAN_OP_REDUCE ||
-        reduce->agg_fn != WIRELOG_AGG_COUNT ||
+        (reduce->agg_fn != WIRELOG_AGG_COUNT &&
+        reduce->agg_fn != WIRELOG_AGG_SUM &&
+        reduce->agg_fn != WIRELOG_AGG_MIN &&
+        reduce->agg_fn != WIRELOG_AGG_MAX) ||
         reduce->group_by_count == UINT32_MAX ||
         (reduce->group_by_count && !reduce->group_by_indices) ||
         (!reduce->group_by_count && reduce->group_by_indices) ||
@@ -625,6 +628,10 @@ wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
         if (column >= width || !wl_columnar_eval_plan_cold_column(rp, end,
             column, ncols, &decoded.operand)) return false;
     }
+    if (reduce->agg_fn != WIRELOG_AGG_COUNT &&
+        (!expr->data || !expr->size || expr->data[0] != WL_PLAN_EXPR_VAR ||
+        reduce->agg_operand_type != WL_PLAN_AGG_OPERAND_SCALAR ||
+        (types && types[decoded.operand] != WIRELOG_TYPE_INT64))) return false;
     if (out) *out = decoded;
     return true;
 }
