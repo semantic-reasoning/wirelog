@@ -615,3 +615,22 @@ STEP/SNAPSHOT/successor policy qualifications remain required before claiming
 all E08/E09/F01–F03/F02a–d/C04 predicates closed. The empty probe fixture
 retains an initialized scalar schema after removing all rows; an unspecialized
 empty EDB descriptor still needs its own bounded source disposition.
+
+
+### Authentic unspecialized empty-source reader (#2297, primitive)
+
+`relation_empty_source` exercises the real no-insert INT64 EDB constructor
+state, separately from initialized empty FLOAT/STRING tables. A distinct
+empty-source record acquires both descriptor and canonical-owner gates before
+checking the fixed no-payload image. It preserves declared width/graph
+metadata without manufacturing physical columns or scalar HELD authority.
+First insert, direct schema mutation and checked destruction refuse while
+that lease is held, and succeed after its actual gate releases complete.
+
+Original-attempt acquisition and validation remain separate from independently
+funded END. Tests cover partial acquisition, pre-validation and late stops,
+wrong-thread/copy/stale-ID calls, malformed payload/Arrow/alias states, frozen
+original reports, and normal insertion/scalar reading after drain. This is a
+source primitive foundation; VARIABLE/JOIN/probe/LFTJ destination integration
+for unspecialized empty EDBs remains outstanding until exercised through the
+real session hosts.

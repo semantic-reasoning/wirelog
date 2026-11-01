@@ -16467,6 +16467,226 @@ wl_columnar_relation_scalar_source_end(
     return source->first_result;
 }
 
+enum {
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_INIT_WORK =
+        (sizeof(wl_columnar_relation_empty_source_t) + 7u) / 8u + 64u
+};
+typedef char wl_columnar_relation_empty_source_init_fits_t[
+        WL_COLUMNAR_RELATION_EMPTY_SOURCE_INIT_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_test_empty_source_checkpoint)(
+    const wl_columnar_relation_empty_source_t *);
+#endif
+
+static bool
+wl_columnar_relation_empty_source_thread(
+    const wl_columnar_relation_empty_source_t *a)
+{
+    if (!a->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+int
+wl_columnar_relation_empty_source_begin(wl_columnar_relation_empty_source_t *a,
+    const col_rel_t *relation, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!a || !relation || !control || !id) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_RELATION_EMPTY_SOURCE_INIT_WORK);
+    if (rc) return rc;
+    if (a->identity && (a->identity != a || a->phase !=
+        WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED)) return EBUSY;
+    memset(a, 0, sizeof(*a));
+    a->identity = a; a->descriptor = relation; a->attempt_id = id;
+    a->control_identity = wl_evaluation_control_identity(control);
+#if defined(WL_HAVE_C11_THREADS)
+    a->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->owner_thread = GetCurrentThreadId();
+#else
+    a->owner_thread = pthread_self();
+#endif
+    a->thread_valid = true;
+    a->phase = WL_COLUMNAR_RELATION_EMPTY_SOURCE_ACQUIRE;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) {
+        a->result = rc; return rc;
+    }
+    a->control = control; a->control_retained = true;
+    return 0;
+}
+
+static bool
+wl_columnar_relation_empty_source_lease(
+    const wl_columnar_relation_empty_source_t *a)
+{
+    const col_rel_t *r = a->descriptor;
+    const wl_columnar_source_access_reader_t *lease = &a->reader;
+    return r && lease->identity == (uintptr_t)lease && lease->thread_valid
+           && wl_columnar_source_access_reader_thread_equal(lease)
+           && lease->owner == &r->source_access
+           && lease->secondary_owner == &r->descriptor_access
+           && !lease->acquire_stage && !lease->release_stage
+           && !lease->transferable;
+}
+
+/* Fixed no-payload constructor image, inspected only under BOTH real gates.
+ * Declared width and graph declaration describe future initialization; they
+ * are not physical lanes. No reservation/token/array is synthesized. */
+static int
+wl_columnar_relation_empty_source_shape(
+    wl_columnar_relation_empty_source_t *a)
+{
+    const col_rel_t *r = a->descriptor;
+    if (!wl_columnar_relation_empty_source_lease(a)) return EINVAL;
+    if (r->storage_owner != r || r->storage_owner_identity !=
+        r->relation_identity || r->storage_owner_generation !=
+        r->storage_generation || !wl_columnar_relation_snapshot_valid(
+            wl_columnar_relation_snapshot(r))) return EINVAL;
+    if (r->schema_ok || r->ncols || r->nrows) return ENOTSUP;
+    if (r->capacity || r->columns || r->column_types || r->col_names
+        || r->schema.release || r->schema.format || r->schema.name
+        || r->schema.metadata || r->schema.flags || r->schema.n_children
+        || r->schema.children || r->schema.dictionary || r->schema.private_data
+        || r->sorted_nrows || r->merge_columns
+        || r->merge_buf_cap || r->base_nrows || r->timestamps
+        || r->timestamp_capacity || r->pool_owned || r->arena_owned
+        || r->mem_ledger || !r->memory_governor
+        || r->metadata_reserved_bytes || r->pool_name_reserved_bytes
+        || r->dedup_reserved_bytes || r->retained_reserved_bytes
+        || r->ledger_ts_bytes || r->row_scratch || r->retract_backup_columns
+        || r->retract_backup_timestamps || r->retract_backup_timestamp_capacity
+        || r->retract_backup_nrows || r->retract_backup_base_nrows
+        || r->retract_backup_capacity || r->retract_backup_sorted_nrows
+        || r->col_shared || r->run_count || r->retract_backup_run_count
+        || r->dedup_slots || r->dedup_cap || r->dedup_count
+        || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE || r->compound_count
+        || r->compound_arity_map || r->compound_arity_len
+        || r->inline_physical_offset || r->deferred_relation_next
+        || r->deferred_relation_session || atomic_load_explicit(
+            &r->storage_alias_borrows, memory_order_acquire)) return EINVAL;
+    if (r->descriptor_reservation.identity != &r->descriptor_reservation
+        || r->descriptor_reservation.governor !=
+        wl_columnar_memory_governor_ref_get(r->memory_governor)
+        || atomic_load_explicit(&r->descriptor_reservation.state,
+        memory_order_acquire) != WL_COLUMNAR_MEMORY_RESERVATION_COMMITTED
+        || atomic_load_explicit(&r->descriptor_reservation.owner_bits,
+        memory_order_acquire) != (uint64_t)(uintptr_t)r
+        || r->descriptor_reserved_bytes < sizeof(*r)
+        || r->descriptor_reservation.bytes != r->descriptor_reserved_bytes)
+        return EINVAL;
+    for (unsigned i = 0; i < COL_MAX_RUNS; ++i)
+        if (r->run_ends[i] || r->retract_backup_run_ends[i]) return EINVAL;
+    a->snapshot = wl_columnar_relation_snapshot(r);
+    a->declared_ncols = r->declared_ncols;
+    a->has_graph_column = r->has_graph_column;
+    a->graph_col_idx = r->graph_col_idx;
+    return 0;
+}
+
+int
+wl_columnar_relation_empty_source_step(wl_columnar_relation_empty_source_t *a,
+    bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a || !wl_columnar_relation_empty_source_thread(a)
+        || a->ending || a->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED)
+        return EINVAL;
+    if (a->result) return a->result;
+    int rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 0);
+    if (rc) {
+        a->result = rc; return rc;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_relation_test_empty_source_checkpoint)
+        wl_columnar_relation_test_empty_source_checkpoint(a);
+#endif
+    if (a->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_ACQUIRE) {
+        rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 1);
+        if (rc) goto failed;
+        bool held = false;
+        rc = col_rel_source_reader_acquire_step(a->descriptor, &a->reader,
+                &held);
+        if (rc == EAGAIN) return 0;
+        if (rc) goto failed;
+        if (held) a->phase = WL_COLUMNAR_RELATION_EMPTY_SOURCE_VALIDATE;
+        return 0;
+    }
+    if (a->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_VALIDATE) {
+        rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id,
+                128);
+        if (rc) goto failed;
+        rc = wl_columnar_relation_empty_source_shape(a);
+        if (rc) goto failed;
+        a->phase = WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD;
+        *done = true;
+        return 0;
+    }
+    if (a->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD) {
+        rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 1);
+        if (rc) goto failed;
+        if (!wl_columnar_relation_empty_source_lease(a)) {
+            rc = EINVAL; goto failed;
+        }
+        if (!wl_columnar_relation_snapshot_equal(a->snapshot,
+            wl_columnar_relation_snapshot(a->descriptor))) {
+            rc = EAGAIN; goto failed;
+        }
+        *done = true;
+        return 0;
+    }
+    rc = EINVAL;
+failed:
+    a->result = rc;
+    return rc;
+}
+
+int
+wl_columnar_relation_empty_source_end(wl_columnar_relation_empty_source_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a) return EINVAL;
+    if (a->phase == WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED) {
+        *done = true; return 0;
+    }
+    if (!wl_columnar_relation_empty_source_thread(a) || !funding || !id
+        || wl_evaluation_control_identity(funding) == a->control_identity
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        id) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 1);
+    if (rc) return rc;
+    a->ending = true;
+    if (a->reader.owner || a->reader.secondary_owner) {
+        bool released = false;
+        return wl_columnar_source_access_reader_release_step(&a->reader,
+                   &released);
+    }
+    if (a->reader.identity || a->reader.thread_valid || a->reader.transferable
+        || a->reader.acquire_stage || a->reader.release_stage) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_RELATION_EMPTY_SOURCE_INIT_WORK);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = a->control;
+    bool retained = a->control_retained;
+    a->control = NULL; a->control_retained = false; a->descriptor = NULL;
+    a->thread_valid = false;
+    a->phase = WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED;
+    if (retained) wl_evaluation_control_release(control);
+    *done = true;
+    return 0;
+}
+
 int
 wl_columnar_relation_scalar_source_init_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, bool *initialized,
