@@ -22,13 +22,16 @@ typedef struct {
     wl_evaluation_control_t *control;
     wl_columnar_memory_governor_ref_t *governor;
     wl_session_t *session, *raw;
-    unsigned width[2], rows[2], kind, events;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    unsigned width[2], rows[2], kind, events, output_width;
     int64_t data[2][8 * 129];
     bool seen[8][8];
 } fixture_t;
 
 static fixture_t *active;
-static unsigned hits[11], target;
+static unsigned hits[15], target;
+static unsigned consumer_ordinal, stop_consumer_ordinal;
+static wl_columnar_filter_stage_t stop_consumer_stage;
 static bool stopped, work_stop;
 static unsigned denial_event, denial_phase;
 static bool sink_allocation_fault;
@@ -63,14 +66,25 @@ capture(const char *name, const int64_t *row, uint32_t width, int diff,
 {
     if (strcmp(name, "output")) return;
     fixture_t *f = userdata;
-    CHECK(width == f->width[0] + f->width[1] && diff == 1);
-    unsigned a = (unsigned)row[1], b = (unsigned)row[f->width[0] + 1];
+    CHECK(width == f->output_width && diff == 1);
+    bool narrow = f->kind == 8 || f->kind == 9;
+    unsigned a = (unsigned)row[narrow ? 0 : 1],
+        b = (unsigned)row[narrow ? 1 : f->width[0] + 1];
+    if (f->kind == 7) {
+        CHECK(a > 0 && !(b % 2)); --a; b /= 2;
+    }
     CHECK(a < 8 && b < 8 && a < b && !f->seen[a][b]);
-    CHECK(row[0] == 1 && row[f->width[0]] == 1);
+    if (narrow) {
+        CHECK(row[0] == a && row[1] == b);
+        f->seen[a][b] = true; ++f->events; return;
+    }
+    int64_t key = f->kind == 11 ? wl_columnar_float_to_bits(1.0) : 1;
+    CHECK(row[0] == key && row[f->width[0]] == key);
     for (unsigned c = 1; c < f->width[0]; ++c)
-        CHECK(row[c] == (int64_t)(100 * (c - 1) + a));
+        CHECK(row[c] == (int64_t)(100 * (c - 1) + a + (f->kind == 7 ? 1 : 0)));
     for (unsigned c = 1; c < f->width[1]; ++c)
-        CHECK(row[f->width[0] + c] == (int64_t)(100 * (c - 1) + b));
+        CHECK(row[f->width[0] + c] ==
+            (int64_t)(100 * (c - 1) + b) * (f->kind == 7 ? 2 : 1));
     f->seen[a][b] = true;
     ++f->events;
 }
@@ -96,25 +110,93 @@ static void
 checkpoint(wl_evaluation_control_t *control, unsigned event,
     uint64_t generation, uint32_t extent, uint64_t producer_work)
 {
-    CHECK(active && control == active->control && event < 11);
+    CHECK(active && control == active->control && event < 15);
     uint64_t id = wl_evaluation_control_active_attempt_id(control);
     CHECK(id && (!attempt || attempt == id));
     attempt = id;
+    wl_col_session_t *session = (wl_col_session_t *)active->session;
+    CHECK(session->cleanup_active);
+    if (!active->frame) active->frame = session->cleanup_active;
+    CHECK(active->frame == session->cleanup_active);
     ++hits[event];
     if (event == denial_event && !peer.governor) reserve_peer();
     if (sink_allocation_fault &&
-        event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED)
+        event == WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK_SCHEMA)
         wl_columnar_relation_test_constructor_fail_allocation = 1;
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK) {
-        CHECK(generation == last_generation + 1 && extent > 0
+        CHECK(generation == last_generation + 1 && extent <= 64
             && producer_work > 0);
         last_generation = generation;
     }
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK)
         CHECK(generation && producer_work);
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED) {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_framed_context(active->frame, session,
+            &ctx));
+        wl_columnar_eval_plan_numeric_attempt_t *r = &ctx->child;
+        const col_rel_t *input = NULL; const wl_plan_op_t *op = NULL;
+        uint64_t gen = 0; bool schema = false;
+        CHECK(!wl_columnar_join_pipeline_test_stream_view(r, &input, &gen,
+            &schema, &op));
+        CHECK(input && (schema ? !gen && !input->nrows : gen == generation));
+        CHECK(wl_columnar_join_pipeline_stream_authorized(r, active->frame,
+            r->join_host, WL_COLUMNAR_JOIN_STREAM_START, op, input, gen,
+            schema));
+        CHECK(!wl_columnar_join_pipeline_stream_authorized(r, active->frame,
+            r->join_host, WL_COLUMNAR_JOIN_STREAM_START, op, input, gen + 1,
+            schema));
+        CHECK(!wl_columnar_join_pipeline_stream_authorized(r, active->frame,
+            r->join_host, WL_COLUMNAR_JOIN_STREAM_START,
+            &r->plan->ops[r->cursor],
+            input, gen, schema));
+        int foreign;
+        CHECK(wl_columnar_eval_stack_stream_dispatch_owned(active->frame, r,
+            &foreign, op, WL_COLUMNAR_JOIN_STREAM_START, true) == EINVAL);
+        eval_stack_t *stack = NULL;
+        CHECK(!wl_columnar_eval_stack_cleanup_stack(active->frame)
+            && !wl_columnar_eval_stack_cleanup_result(active->frame));
+        CHECK(wl_columnar_eval_stack_operator_stack_owned(active->frame,
+            session, &stack, r) == EBUSY && !stack);
+        CHECK(wl_columnar_eval_stack_numeric_unbind(active->frame, session,
+            r) == EBUSY);
+        CHECK(wl_columnar_eval_stack_unary_reset_owned(active->frame,
+            r) == EBUSY);
+        CHECK(wl_columnar_eval_stack_unary_begin_attempt_owned(active->frame,
+            control, id, r) == EBUSY);
+        wl_columnar_eval_plan_numeric_attempt_t copy = *r;
+        CHECK(wl_columnar_eval_stack_stream_enter_owned(active->frame, &copy,
+            r->join_host, input, gen, schema, false) == EBUSY);
+    }
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_RESTORED) {
+        eval_stack_t *stack =
+            wl_columnar_eval_stack_cleanup_stack(active->frame);
+        CHECK(stack && stack->top == 1 && stack->items[0].rel);
+        if (active->kind == 5)
+            CHECK(stack->items[0].owned && !stack->items[0].rel->nrows);
+    }
     if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCER_DONE
-        && active->rows[0] && active->rows[1])
+        && active->rows[0] && active->rows[1] && active->kind != 5)
         CHECK(producer_work);
+    if (event == WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER) {
+        wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_framed_context(active->frame, session,
+            &ctx));
+        wl_columnar_filter_context_t *consumer = NULL;
+        CHECK(!wl_columnar_eval_stack_filter_context_owned(active->frame,
+            &consumer, &ctx->child));
+        if (consumer->stage ==
+            WL_COLUMNAR_FILTER_STAGE_INERT) ++consumer_ordinal;
+        if (stop_consumer_stage
+            && (consumer_ordinal != stop_consumer_ordinal
+            || consumer->stage != stop_consumer_stage)) return;
+        if (stop_consumer_stage == WL_COLUMNAR_FILTER_STAGE_SOURCE)
+            CHECK(consumer->source_initialized);
+        if (stop_consumer_stage == WL_COLUMNAR_FILTER_STAGE_CONTROL)
+            CHECK(consumer->committed);
+        if (stop_consumer_stage == WL_COLUMNAR_FILTER_STAGE_FINISH)
+            CHECK(!consumer->control && !consumer->pin_owned);
+    }
     if (event != target || stopped) return;
     stopped = true;
     if (work_stop) CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
@@ -126,6 +208,8 @@ static void
 observe(fixture_t *f)
 {
     active = f; attempt = last_generation = 0;
+    f->frame = NULL;
+    consumer_ordinal = 0;
     memset(hits, 0, sizeof(hits));
     wl_columnar_join_pipeline_test_numeric_checkpoint = checkpoint;
 }
@@ -137,11 +221,13 @@ init(fixture_t *f, unsigned kind, bool timestamps, unsigned budget_rows)
     f->kind = kind;
     f->width[0] = kind == 1 ? 128 : 2;
     f->width[1] = kind == 1 ? 129 : 2;
-    f->rows[0] = kind == 4 ? 0 : 8;
+    f->rows[0] = kind == 4 || kind == 9 ? 0 : 8;
     f->rows[1] = kind == 3 ? 0 : 8;
+    f->output_width = kind == 8 || kind == 9 ? 2 : f->width[0] + f->width[1];
     char text[32768] = {0}; size_t used = 0;
     for (unsigned s = 0; s < 2; ++s) {
-        add(text, sizeof(text), &used, ".decl %c(k:int64", 'a' + s);
+        add(text, sizeof(text), &used, ".decl %c(k:%s", 'a' + s,
+            kind == 11 ? "float" : "int64");
         for (unsigned c = 1; c < f->width[s]; ++c)
             add(text, sizeof(text), &used, ",p%u:int64", c);
         add(text, sizeof(text), &used, ")\n");
@@ -150,15 +236,27 @@ init(fixture_t *f, unsigned kind, bool timestamps, unsigned budget_rows)
                 f->data[s][r * f->width[s] + c] = c
                     ? 100 * (c - 1) + r + (kind == 2 && !s ? 10 : 0) : 1;
     }
+    if (kind == 11)
+        for (unsigned s = 0; s < 2; ++s)
+            for (unsigned r = 0; r < 8; ++r)
+                f->data[s][r * f->width[s]] = wl_columnar_float_to_bits(1.0);
+    if (kind == 10)
+        for (unsigned r = 0; r < 8; ++r)
+            f->data[0][r * f->width[0] + 1] = -(int64_t)(r + 1);
     add(text, sizeof(text), &used, ".decl output(");
     for (unsigned s = 0; s < 2; ++s)
         for (unsigned c = 0; c < f->width[s]; ++c)
-            add(text, sizeof(text), &used, "%s%c%u:int64",
-                s || c ? "," : "", 'a' + s, c);
+            add(text, sizeof(text), &used, "%s%c%u:%s",
+                s || c ? "," : "", 'a' + s, c,
+                !c && kind == 11 ? "float" : "int64");
     add(text, sizeof(text), &used, ")\noutput(");
     for (unsigned s = 0; s < 2; ++s)
         for (unsigned c = 0; c < f->width[s]; ++c)
-            if (c) add(text, sizeof(text), &used, ",%c%u", 'a' + s, c);
+            if (c && kind == 7) add(text, sizeof(text), &used,
+                    s ? ",b%u * 2" : ",a%u + 1", c);
+            else if (c && kind == 10 && !s) add(text, sizeof(text), &used,
+                    ",a%u / b1", c);
+            else if (c) add(text, sizeof(text), &used, ",%c%u", 'a' + s, c);
             else add(text, sizeof(text), &used, "%sk", s ? "," : "");
     add(text, sizeof(text), &used, ") :- a(k");
     for (unsigned c = 1; c < f->width[0]; ++c)
@@ -167,11 +265,20 @@ init(fixture_t *f, unsigned kind, bool timestamps, unsigned budget_rows)
     for (unsigned c = 1; c < f->width[1]; ++c)
         add(text, sizeof(text), &used, ",b%u", c);
     add(text, sizeof(text), &used, "), a1 < b1.\n");
+    if (kind == 8 || kind == 9)
+        strcpy(text, ".decl a(k:int64,p1:int64)\n.decl b(k:int64,p1:int64)\n"
+            ".decl output(x:int64,y:int64)\noutput(x,y):-a(k,x),b(k,y),x<y.\n");
     wirelog_error_t error;
     f->program = wirelog_parse_string(text, &error);
     CHECK(f->program && !wl_plan_from_program(f->program, &f->plan));
     const wl_plan_relation_t *head = &f->plan->strata[0].relations[0];
+    wl_plan_op_t *ops = (wl_plan_op_t *)head->ops;
     CHECK(head->op_count == 5 && head->ops[1].op == WL_PLAN_OP_JOIN);
+    if (kind == 5) ops[0].delta_mode = WL_DELTA_FORCE_EMPTY;
+    if (kind == 6) {
+        ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+        ops[1].delta_mode = WL_DELTA_FORCE_FULL;
+    }
     CHECK(!wl_evaluation_control_create(0, &f->control));
     wl_columnar_memory_resolution_t resolution = {
         .budget_bytes = UINT64_C(512) << 20,
@@ -214,6 +321,22 @@ init(fixture_t *f, unsigned kind, bool timestamps, unsigned budget_rows)
             }
         }
     }
+    if (kind == 6) {
+        wl_session_t *sessions[] = {f->session, f->raw};
+        for (unsigned i = 0; i < 2; ++i) {
+            col_rel_t *full = session_find_rel((wl_col_session_t *)sessions[i],
+                    "a");
+            col_rel_t *delta = col_rel_new_like("$d$a", full);
+            CHECK(delta);
+            bool denied = false;
+            CHECK(!col_rel_append_rows_atomic(delta,
+                f->data[0] + 2 * f->width[0],
+                1, f->width[0], &denied));
+            if (timestamps &&
+                !delta->timestamps) CHECK(!col_rel_enable_timestamps(delta));
+            CHECK(!session_add_rel((wl_col_session_t *)sessions[i], delta));
+        }
+    }
 }
 
 static void
@@ -236,8 +359,13 @@ verify(fixture_t *f, wl_session_t *session)
     bool saved[8][8]; memcpy(saved, f->seen, sizeof(saved));
     memset(f->seen, 0, sizeof(f->seen)); f->events = 0;
     col_rel_t *out = session_find_rel((wl_col_session_t *)session, "output");
-    unsigned expected = f->kind >= 2 ? 0 : 28;
-    CHECK(out && out->nrows == expected && !out->timestamps);
+    unsigned expected = f->kind == 6 ? 5 : (f->kind < 2 || f->kind == 7 ||
+        f->kind == 8 || f->kind == 11) ? 28 : 0;
+    CHECK(out && out->nrows == expected && out->ncols == f->output_width &&
+        !out->timestamps);
+    if (f->kind == 11) CHECK(out->column_types
+            && out->column_types[0] == WIRELOG_TYPE_FLOAT
+            && out->column_types[2] == WIRELOG_TYPE_FLOAT);
     int64_t row[257];
     for (unsigned r = 0; r < out->nrows; ++r) {
         for (unsigned c = 0; c < out->ncols; ++c) row[c] = out->columns[c][r];
@@ -246,7 +374,8 @@ verify(fixture_t *f, wl_session_t *session)
     CHECK(f->events == expected);
     for (unsigned a = 0; a < 8; ++a)
         for (unsigned b = 0; b < 8; ++b)
-            CHECK(f->seen[a][b] == (expected && a < b));
+            CHECK(f->seen[a][b] == (expected && a < b &&
+                (f->kind != 6 || a == 2)));
     f->events = saved_events; memcpy(f->seen, saved, sizeof(saved));
     for (unsigned s = 0; s < 2; ++s) {
         char name[2] = {(char)('a' + s), 0};
@@ -270,14 +399,28 @@ verify(fixture_t *f, wl_session_t *session)
 static void
 domains(void)
 {
-    for (unsigned kind = 0; kind < 5; ++kind)
+    for (unsigned kind = 0; kind < 12; ++kind)
         for (unsigned ts = 0; ts < 2; ++ts) {
+            if (kind == 10) continue; /* Separate ERANGE qualification. */
             fixture_t f; init(&f, kind, ts, 2); observe(&f);
-            CHECK(!finish(f.session));
+            int rc = finish(f.session);
+            if (rc) fprintf(stderr,
+                    "kind=%u ts=%u rc=%d exchange=%u consumer=%u restored=%u sink=%u ack=%u\n",
+                    kind, ts, rc, hits[11], hits[12], hits[13], hits[3],
+                    hits[5]);
+            CHECK(!rc);
             CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED] == 1
                 && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCER_DONE] == 1);
-            unsigned pairs = kind >= 3 ? 0 : 64;
-            CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK] == pairs
+            unsigned pairs = kind == 6 ? 8 : kind == 3 || kind == 4 ||
+                kind == 5 || kind == 9 ? 0 : 64;
+            unsigned output = kind == 6 ? 5 : kind < 2 || kind == 7 ||
+                kind == 8 || kind == 11 ? 28 : 0;
+            CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED] ==
+                (pairs ? pairs / 2 : 1)
+                && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_RESTORED] ==
+                (pairs ? pairs / 2 : 1)
+                && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] > 0);
+            CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK] == output
                 && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] == pairs / 2);
             verify(&f, f.session);
             CHECK(!finish(f.raw)); verify(&f, f.raw);
@@ -297,10 +440,24 @@ domains(void)
 static void
 recovery(void)
 {
-    for (unsigned event = 1; event <= 10; ++event)
+    static const wl_columnar_filter_stage_t stages[] = {
+        WL_COLUMNAR_FILTER_STAGE_BATCH, WL_COLUMNAR_FILTER_STAGE_SOURCE,
+        WL_COLUMNAR_FILTER_STAGE_DECIDE, WL_COLUMNAR_FILTER_STAGE_CONTROL,
+        WL_COLUMNAR_FILTER_STAGE_FINISH, WL_COLUMNAR_FILTER_STAGE_RESET,
+        WL_COLUMNAR_FILTER_STAGE_DONE
+    };
+    unsigned schema_begin = 14 + 2 * (sizeof(stages) / sizeof(*stages));
+    for (unsigned point = 0; point < schema_begin + 4; ++point)
         for (unsigned work = 0; work < 2; ++work) {
-            fixture_t f; init(&f, 0, true, 2); observe(&f);
-            target = event; stopped = false; work_stop = work;
+            fixture_t f; init(&f, point >= schema_begin ? 5 : 0, true, 2);
+            observe(&f);
+            target = point <
+                14 ? point + 1 : WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER;
+            stop_consumer_stage = point < 14 ||
+                point >= schema_begin ? 0 : stages[(point - 14) / 2];
+            stop_consumer_ordinal = point < 14 ? 0 : 1 + (point - 14) % 2;
+            if (point >= schema_begin) target = 11 + point - schema_begin;
+            stopped = false; work_stop = work;
             if (work) CHECK(!wl_evaluation_control_configure(f.control,
                     UINT64_C(1000000000)));
             int rc = finish(f.session);
@@ -313,11 +470,13 @@ recovery(void)
             CHECK(!wl_evaluation_control_report(f.control, &report)
                 && report.result == rc && report.attempt_id == attempt);
             target = 0;
+            stop_consumer_stage = 0;
             CHECK(!wl_evaluation_control_reset(f.control));
             CHECK(!wl_evaluation_control_configure(f.control, 0));
             observe(&f);
             CHECK(!finish(f.session)); verify(&f, f.session);
-            CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] == 32);
+            CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] ==
+                (f.kind == 5 ? 0 : 32));
             destroy(&f);
         }
 }
@@ -325,9 +484,11 @@ recovery(void)
 static void
 failures(void)
 {
-    for (unsigned fail = 0; fail < 9; ++fail) {
+    for (unsigned fail = 0; fail < 10; ++fail) {
         fixture_t f; init(&f, 0, true, 2); observe(&f);
-        if (fail < 2) wl_columnar_join_test_attempt_fail_allocation = (int)fail;
+        if (fail < 2 ||
+            fail == 9) wl_columnar_join_test_attempt_fail_allocation = fail ==
+                9 ? 2 : (int)fail;
         else wl_columnar_join_batch_test_prepare_fail_allocation = fail - 1;
         int rc = finish(f.session);
         if (rc != ENOMEM) fprintf(stderr, "failure=%u rc=%d bootstrap=%u\n",
@@ -375,6 +536,242 @@ failures(void)
         CHECK(!finish(f.session)); verify(&f, f.session);
         destroy(&f);
     }
+    fixture_t expression; init(&expression, 10, true, 2); observe(&expression);
+    CHECK(finish(expression.session) == ERANGE);
+    CHECK(hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED] > 1
+        && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] > 0
+        && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK] > 0);
+    CHECK(finish(expression.raw) == ERANGE);
+    col_rel_t *head = session_find_rel((wl_col_session_t *)expression.session,
+            "output");
+    CHECK(!head || !head->nrows);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(expression.control, &report)
+        && report.execution_status == ERANGE && report.result == ERANGE);
+    destroy(&expression);
+}
+
+/* Direct composed entry pays one384, direct framed entry pays384+384, and
+ * the facade adds another384. This test isolates the first of these levels. */
+static void
+funding_composed(void)
+{
+    uint64_t measured = 0;
+    for (unsigned trial = 0; trial < 2; ++trial) {
+        fixture_t f; init(&f, 0, true, 2);
+        wl_col_session_t *session = (wl_col_session_t *)f.session;
+        CHECK(!wl_evaluation_control_begin(f.control,
+            f.session->operation_admission));
+        uint64_t original = wl_evaluation_control_active_attempt_id(f.control);
+        wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+        CHECK(!wl_columnar_eval_stack_cleanup_begin_attempt_controlled(session,
+            &frame, f.control, original));
+        wl_columnar_eval_plan_numeric_attempt_t record;
+        wl_columnar_eval_plan_numeric_attempt_init(&record);
+        wl_evaluation_control_t *grants[3] = {0}; int owners[3];
+        for (unsigned i = 0; i < 3; ++i) {
+            CHECK(!wl_evaluation_control_create(0, &grants[i]));
+            CHECK(!wl_evaluation_control_attach(grants[i], &owners[i]));
+        }
+        unsigned turn = 0, refusals = 0, paid = 0;
+        int protocol = 0;
+        bool started = false, acked = false, short_next = true;
+        while (!acked) {
+            CHECK(turn < 100000);
+            unsigned slot = turn++ % 3;
+            wl_evaluation_control_t *grant = grants[slot]; uint64_t work = 0;
+            bool consumer = started &&
+                record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH
+                && !wl_columnar_join_pipeline_numeric_funding_work(&record,
+                    &work) && work == 384;
+            bool underfund = trial && consumer && short_next;
+            CHECK(!wl_evaluation_control_reset(grant));
+            CHECK(!wl_evaluation_control_configure(grant,
+                underfund ? 383 : 384));
+            CHECK(!wl_evaluation_control_begin(grant, &owners[slot]));
+            uint64_t id = wl_evaluation_control_active_attempt_id(grant);
+            int rc;
+            if (!started) {
+                rc =
+                    wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback
+                    (
+                    &record, &f.plan->strata[0].relations[0], 0, 5, frame,
+                    session,
+                    0, f.control, original, grant, id);
+                CHECK(!rc); started = true;
+            } else if (record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING) {
+                rc =
+                    wl_columnar_eval_plan_numeric_composed_consume_result(
+                    &record,
+                    protocol, grant, id);
+                CHECK(!rc);
+            } else if (record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE) {
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(frame);
+                CHECK(stack && stack->top == 1 && stack->items[0].owned);
+                col_rel_t *out = stack->items[0].rel;
+                CHECK(out && out->nrows == 28 && out->ncols == 4);
+                for (unsigned r = 0; r < out->nrows; ++r) {
+                    int64_t row[4];
+                    for (unsigned c = 0; c < 4;
+                        ++c) row[c] = out->columns[c][r];
+                    capture("output", row, 4, 1, &f);
+                }
+                CHECK(f.events == 28);
+                rc = wl_columnar_eval_plan_numeric_composed_attempt_ack(&record,
+                        grant, id);
+                CHECK(!rc); acked = true;
+            } else {
+                rc =
+                    wl_columnar_eval_plan_numeric_composed_attempt_step(&record,
+                        grant, id);
+                if (underfund) {
+                    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+                        && record.phase ==
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH);
+                    CHECK(wl_evaluation_control_active_attempt_id(f.control) ==
+                        original);
+                    ++refusals; short_next = false;
+                } else {
+                    protocol = rc;
+                    CHECK(!rc ||
+                        record.phase ==
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+                    if (consumer) {
+                        ++paid; short_next = true;
+                    }
+                }
+            }
+            (void)wl_evaluation_control_finish(grant, &owners[slot], 0, 0);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(grant, &report));
+            if (underfund) CHECK(!report.consumed);
+            else if (consumer) CHECK(report.consumed == 384);
+        }
+        CHECK(paid > 64 && refusals == (trial ? paid : 0));
+        CHECK(!wl_columnar_eval_stack_cleanup_finish(&frame));
+        CHECK(!wl_evaluation_control_finish(f.control,
+            f.session->operation_admission, 0, 0));
+        wl_evaluation_control_report_t original_report;
+        CHECK(!wl_evaluation_control_report(f.control, &original_report));
+        if (!trial) measured = original_report.consumed;
+        else CHECK(original_report.consumed == measured);
+        for (unsigned i = 0; i < 3; ++i) {
+            CHECK(!wl_evaluation_control_detach(grants[i], &owners[i]));
+            wl_evaluation_control_release(grants[i]);
+        }
+        destroy(&f);
+    }
+}
+
+static uint64_t selected_limit;
+static uint64_t selected_original;
+static unsigned selected_hits, public_refusals, public_paid;
+static bool short_public;
+
+static uint64_t
+public_grant_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t proposed)
+{
+    selected_limit = 0;
+    CHECK(active && session == (wl_col_session_t *)active->session);
+    if (stopped || action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        || !session->cleanup_active) return proposed;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        || ctx->child.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH)
+        return proposed; /* Includes every real pending receipt consume. */
+    uint64_t work = 0;
+    CHECK(!wl_columnar_join_pipeline_numeric_funding_work(&ctx->child, &work));
+    if (work != 384) return proposed;
+    CHECK(wl_columnar_session_controlled_batch_authorized(session,
+        active->control, ctx->attempt_id, ctx->operation_identity));
+    selected_original = ctx->attempt_id;
+    selected_hits = hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER];
+    selected_limit = short_public ? 1151 : 1152;
+    return selected_limit;
+}
+
+static void
+public_grant_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    if (!selected_limit) return;
+    CHECK(active && session == (wl_col_session_t *)active->session
+        && action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_active_attempt_id(grant)
+        && !wl_evaluation_control_report(grant, &report)
+        && report.limit == selected_limit && !report.execution_status);
+    CHECK(wl_evaluation_control_active_attempt_id(active->control) ==
+        selected_original);
+    if (selected_limit == 1151) {
+        CHECK(protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && report.result == protocol && report.consumed == 768
+            && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] == selected_hits);
+        ++public_refusals;
+    } else {
+        CHECK(!protocol && !report.result && report.consumed == 1152
+            && hits[WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER] ==
+            selected_hits + 1);
+        ++public_paid;
+    }
+    short_public = !short_public;
+}
+
+/* Real classifier, facade/root dispatch, and exact previous receipt delivery.
+ * Finished reports prove full facade1152 and its nested root's remaining768;
+ * no active consumed sample or standalone root capability is fabricated. */
+static void
+funding_public(void)
+{
+    uint64_t measured = 0;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        fixture_t f; init(&f, 0, true, 2); observe(&f);
+        target = mode == 2 ? WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER : 0;
+        stopped = false; work_stop = false;
+        public_refusals = public_paid = 0; short_public = true;
+        if (mode) {
+            wl_columnar_session_test_framed_grant_limit = public_grant_limit;
+            wl_columnar_session_test_framed_grant_finished =
+                public_grant_finished;
+        }
+        int rc = finish(f.session);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(f.control, &report));
+        if (mode == 2) {
+            CHECK(stopped && rc == WL_EVALUATION_CONTROL_CANCELLED
+                && public_refusals && public_paid);
+            col_rel_t *head = session_find_rel((wl_col_session_t *)f.session,
+                    "output");
+            CHECK(!head || !head->nrows);
+            target = 0;
+            CHECK(!wl_evaluation_control_reset(f.control));
+            CHECK(!wl_evaluation_control_configure(f.control, 0));
+            observe(&f);
+            CHECK(!finish(f.session));
+        } else {
+            CHECK(!rc && !report.result);
+            if (!mode) measured = report.consumed;
+            else CHECK(public_refusals == public_paid && public_paid > 64
+                    && report.consumed == measured);
+        }
+        verify(&f, f.session);
+        destroy(&f);
+    }
+}
+
+static void
+funding(void)
+{
+    funding_composed(); funding_public();
 }
 
 int
@@ -383,8 +780,9 @@ main(int argc, char **argv)
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "domains"))) domains();
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "recovery"))) recovery();
     if (argc == 1 || (argc == 2 && !strcmp(argv[1], "failures"))) failures();
+    if (argc == 1 || (argc == 2 && !strcmp(argv[1], "funding"))) funding();
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "domains")
         && strcmp(argv[1], "recovery") && strcmp(argv[1],
-        "failures"))) return 2;
+        "failures") && strcmp(argv[1], "funding"))) return 2;
     return 0;
 }

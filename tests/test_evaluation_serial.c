@@ -7403,7 +7403,9 @@ static void
 controlled_batch_pipeline_checkpoint(wl_evaluation_control_t *control,
     unsigned phase, uint64_t generation, uint32_t extent, uint64_t work)
 {
-    if (phase == WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK) {
+    /* A rejected tail may append no sink rows. Its completed candidate batch
+     * still reaches the original-attempt precommit check. */
+    if (phase == WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK) {
         CHECK(generation && !extent && work);
         ++controlled_batch_join_scan_checkpoints;
         wl_evaluation_control_request_cancel(control);
@@ -12299,6 +12301,39 @@ test_scalar_retirement_receipt(void)
     }
 }
 
+/* A request boolean is not the session classifier capability. The same
+ * generated plan remains usable by the ordinary bounded controlled route. */
+static void
+test_entry_streaming_requires_session_authorization(void)
+{
+    static const char text[] =
+        ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+        ".decl output(k:int64,x:int64,k2:int64,y:int64)\n"
+        "output(k,x,k,y) :- a(k,x), b(k,y), x < y.\n";
+    const int64_t left[] = {1, 1, 1, 2}, right[] = {1, 3, 1, 4};
+    const entry_input_t inputs[] = {{"a", left, 2, 2}, {"b", right, 2, 2}};
+    entry_fixture_t f; entry_init_inputs(&f, text, inputs, 2, 0);
+    uint64_t baseline = wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(f.governor));
+    f.session->join_batch_bytes = 64;
+    f.previous.controlled_materialized_batch_fallback = true;
+    CHECK(entry_turn(&f, false, 0) == ENOTSUP);
+    CHECK(f.reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_BOOTSTRAP_RECEIPT
+        && !f.session->cleanup_active && !f.session->cleanup_pending
+        && !session_find_rel(f.session, "output")
+        && baseline == wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(f.governor)));
+    CHECK(!entry_turn(&f, false, 0));
+    CHECK(f.reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL
+        && f.reply.execution_result == ENOTSUP && !f.reply.committed);
+    entry_destroy(&f);
+    entry_init_inputs(&f, text, inputs, 2, 0);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    entry_compare_inputs(&f, text, inputs, 2);
+    entry_destroy(&f);
+}
+
 int
 main(void)
 {
@@ -12310,6 +12345,7 @@ main(void)
      * process exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    test_entry_streaming_requires_session_authorization();
     test_recursive_reachability_plan_manifest();
     test_recursive_two_join_plan_manifest();
     test_controlled_recursive_two_join_step();

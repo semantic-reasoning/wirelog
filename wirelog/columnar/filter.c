@@ -1949,8 +1949,8 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
 {
     if (!status || !op) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, sess, &stack,
-            owner);
+    int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, sess, &stack,
+            owner, op);
     if (rc) return rc;
     wl_columnar_filter_attempt_status_init(status);
     if (!control) {
@@ -3089,8 +3089,8 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
 {
     if (!status || !op) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, sess, &stack,
-            owner);
+    int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, sess, &stack,
+            owner, op);
     if (rc) return rc;
     wl_columnar_filter_attempt_status_init(status);
     if (!control) {

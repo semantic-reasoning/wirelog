@@ -1993,6 +1993,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->controlled_materialized_batch_fallback =
         controlled_materialized_batch_fallback;
     record->join_host = NULL; record->join_host_initialized_bytes = 0;
+    record->join_host_tail_count = 0;
     record->join_host_governor = NULL;
     record->join_host_admitted = record->join_host_committed = false;
     record->join_host_terminal = record->join_host_declined = false;
@@ -2329,7 +2330,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         if (!funding || funding == record->control || !funding_id
             || wl_evaluation_control_active_attempt_id(funding) != funding_id)
             return EINVAL;
-        rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+        uint64_t host_work = 0;
+        rc = wl_columnar_join_pipeline_numeric_funding_work(record, &host_work);
+        if (rc) return rc;
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                host_work);
         if (rc) return rc;
         if (record->abort_requested
             && wl_evaluation_control_active_attempt_id(record->control)
@@ -2593,7 +2598,10 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         if (record->phase ==
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
             && record->child_status.committed) --record->runtime_depth;
-        if (!record->semantic_result) ++record->completed;
+        uint32_t consumed = 1u + record->join_host_tail_count;
+        record->join_host_tail_count = 0;
+        if (!record->semantic_result) record->completed += consumed;
+        if (!record->semantic_result) record->cursor += consumed - 1u;
         record->phase = record->semantic_result ||
             ++record->cursor == record->end
             ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE

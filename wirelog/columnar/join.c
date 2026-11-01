@@ -6376,8 +6376,8 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
     if (!op || !status) return EINVAL;
     if (owner && !control) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
-            owner);
+    int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, session, &stack,
+            owner, op);
     if (rc) return rc;
     if (owner) {
         const wl_columnar_eval_plan_numeric_attempt_t *record = owner;

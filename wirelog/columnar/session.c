@@ -461,6 +461,12 @@ void (*wl_columnar_session_test_observed_preflight_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
 int wl_columnar_session_test_fail_framed_funding_before_stop;
 int wl_columnar_session_test_fail_framed_funding_after_stop;
+uint64_t (*wl_columnar_session_test_framed_grant_limit)(
+    const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
+    uint64_t);
+void (*wl_columnar_session_test_framed_grant_finished)(
+    const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
+    wl_evaluation_control_t *, int);
 int wl_columnar_session_test_exhaust_after_relation;
 unsigned wl_columnar_session_test_preflight_quantum = 64;
 void (*wl_columnar_session_test_recursive_step_checkpoint)(
@@ -8422,7 +8428,7 @@ col_controlled_step_grant_release(wl_columnar_controlled_step_t *step,
 static int
 col_controlled_step_grant_begin(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, wl_evaluation_control_t **out,
-    uint64_t *out_id)
+    uint64_t *out_id, wl_columnar_eval_serial_framed_host_action_t action)
 {
     *out = NULL; *out_id = 0;
 #ifdef WL_SESSION_TEST_HOOKS
@@ -8444,7 +8450,15 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
      * protocol allowances do not change the independent operation debit. */
     uint64_t host_quanta = step->recursive_route || step->general_observed
         ? 8 : 5;
-    int rc = wl_evaluation_control_create(host_quanta * UINT64_C(384),
+    uint64_t limit = host_quanta * UINT64_C(384);
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_framed_grant_limit)
+        limit = wl_columnar_session_test_framed_grant_limit(sess, action,
+                limit);
+#else
+    (void)action;
+#endif
+    int rc = wl_evaluation_control_create(limit,
             &grant);
     if (rc) return EAGAIN;
     rc = wl_evaluation_control_attach(grant, step);
@@ -8484,7 +8498,8 @@ col_controlled_step_host_action(wl_col_session_t *sess,
 {
     wl_evaluation_control_t *grant = NULL;
     uint64_t grant_id = 0;
-    int rc = col_controlled_step_grant_begin(sess, step, &grant, &grant_id);
+    int rc = col_controlled_step_grant_begin(sess, step, &grant, &grant_id,
+            action);
     if (rc) return rc;
     col_controlled_recursive_step_t *recursive = step->recursive;
     bool ordinary_capture = step->general_observed && step->transaction
@@ -8521,6 +8536,11 @@ col_controlled_step_host_action(wl_col_session_t *sess,
             false, &request);
     int finish_rc = wl_evaluation_control_finish(grant, step, 0, 0);
     if (finish_rc && !protocol) protocol = finish_rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_framed_grant_finished)
+        wl_columnar_session_test_framed_grant_finished(sess, action, grant,
+            protocol);
+#endif
 
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
         col_controlled_step_grant_release(step, &grant);

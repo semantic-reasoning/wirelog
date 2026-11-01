@@ -5,6 +5,7 @@
 #define WL_COLUMNAR_JOIN_PIPELINE_H
 
 #include "columnar/internal.h"
+#include "columnar/join_batch.h"
 
 /* First same-frame controlled producer-to-relation destination. Only the
  * authenticated materializing fallback owner may enter these private APIs. */
@@ -13,6 +14,25 @@ int wl_columnar_join_pipeline_numeric_step(
     uint64_t);
 int wl_columnar_join_pipeline_numeric_delta_owned(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, bool *);
+enum {
+    WL_COLUMNAR_JOIN_STREAM_ENTER = 1,
+    WL_COLUMNAR_JOIN_STREAM_START,
+    WL_COLUMNAR_JOIN_STREAM_STEP,
+    WL_COLUMNAR_JOIN_STREAM_ACK,
+    WL_COLUMNAR_JOIN_STREAM_RESTORE
+};
+bool wl_columnar_join_pipeline_stream_authorized(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, const void *, unsigned,
+    const wl_plan_op_t *, const col_rel_t *, uint64_t, bool);
+/* Exact direct consumer payment384 includes this host's dispatch; do not add
+ * another1. Root and facade independently keep their existing384 fees. Other
+ * phases admit1 plus their actual independently funded cleanup actions. */
+int wl_columnar_join_pipeline_numeric_funding_work(
+    const wl_columnar_eval_plan_numeric_attempt_t *, uint64_t *);
+bool wl_columnar_join_pipeline_sink_authorized(const void *,
+    const wl_columnar_join_batch_prepare_t *, const col_rel_t *, uint32_t,
+    uint64_t, const wl_columnar_relation_append_batch_t *,
+    const wl_columnar_relation_scalar_source_t *, uint32_t *);
 #ifdef WL_SESSION_TEST_HOOKS
 enum {
     WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED = 1,
@@ -24,10 +44,16 @@ enum {
     WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_COMMIT,
     WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCER_DONE,
     WL_COLUMNAR_JOIN_PIPELINE_TEST_BOOTSTRAP,
-    WL_COLUMNAR_JOIN_PIPELINE_TEST_KEYS
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_KEYS,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_RESTORED,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK_SCHEMA
 };
 extern void (*wl_columnar_join_pipeline_test_numeric_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t, uint32_t, uint64_t);
+int wl_columnar_join_pipeline_test_stream_view(const void *,
+    const col_rel_t **, uint64_t *, bool *, const wl_plan_op_t **);
 #endif
 
 typedef enum {

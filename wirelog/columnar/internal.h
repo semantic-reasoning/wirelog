@@ -7016,6 +7016,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_lftj_attempt_t lftj;
     void *join_host;
     uint64_t join_host_initialized_bytes;
+    uint32_t join_host_tail_count;
     wl_columnar_memory_reservation_t join_host_credit;
     wl_columnar_memory_governor_ref_t *join_host_governor;
     bool join_host_admitted, join_host_committed;
@@ -7194,6 +7195,25 @@ int wl_columnar_eval_stack_unary_commit_attempt_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
 int wl_columnar_eval_stack_unary_commit_numeric_join_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
+/* Private stream exchange moves only an eval entry, never address-bound
+ * tokens. The parked original remains frame-owned until exact restore.
+ * Consumer scope is serialized and accepts only the host's current tail op;
+ * it grants no raw stack or parent publication access. */
+int wl_columnar_eval_stack_stream_enter_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, const void *,
+    const col_rel_t *, uint64_t, bool, bool);
+int wl_columnar_eval_stack_stream_dispatch_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, const void *,
+    const wl_plan_op_t *, unsigned, bool);
+int wl_columnar_eval_stack_consumer_stack_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    eval_stack_t **, const void *, const wl_plan_op_t *);
+int wl_columnar_eval_stack_stream_restore_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, const void *,
+    eval_entry_t *);
+int wl_columnar_eval_stack_stream_consumer_state_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, const void *,
+    bool *, bool *);
 /* Numeric-owned scalar retirement. Prepare validates the old owned entry
  * reversibly on the original target before commit, retaining writer claims.
  * Funded finish cancels those claims on abort or retires the old entry after
@@ -7658,6 +7678,14 @@ int wl_columnar_session_test_preflight_snapshot(wl_session_t *,
 /* Fail one controlled STEP funding creation before it reaches the host. */
 extern int wl_columnar_session_test_fail_framed_funding_before_stop;
 extern int wl_columnar_session_test_fail_framed_funding_after_stop;
+/* Capacity injection and read-only completed-grant observation only. These
+ * callbacks never dispatch engines or alter classifier/receipt authority. */
+extern uint64_t (*wl_columnar_session_test_framed_grant_limit)(
+    const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
+    uint64_t);
+extern void (*wl_columnar_session_test_framed_grant_finished)(
+    const wl_col_session_t *, wl_columnar_eval_serial_framed_host_action_t,
+    wl_evaluation_control_t *, int);
 extern int wl_columnar_session_test_exhaust_after_relation;
 extern int wl_columnar_session_hash_test_registry_allocation;
 extern int (*wl_columnar_session_hash_test_registry_move)(
