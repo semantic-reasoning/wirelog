@@ -324,7 +324,12 @@ int wl_columnar_join_batch_prepare_abort_step(
 int wl_columnar_join_batch_prepare_sink_commit_ack(
     wl_columnar_join_batch_prepare_t *, col_rel_t *sink, uint32_t base_rows,
     uint64_t generation, const wl_columnar_relation_append_batch_t *,
-    const wl_columnar_relation_scalar_source_t *, uint32_t *committed_extent);
+    const wl_columnar_relation_scalar_source_t *, uint32_t *committed_extent,
+    const void *numeric_owner);
+/* Real DONE without a pending batch; no generation may be invented or ACKed.
+ * The zero-row borrowed scratch remains protected by the prepared owner. */
+int wl_columnar_join_batch_prepare_terminal_schema(
+    wl_columnar_join_batch_prepare_t *, const col_rel_t **);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_join_batch_test_prepare_checkpoint)(
     const wl_columnar_join_batch_prepare_t *);

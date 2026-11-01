@@ -50,8 +50,8 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
 | E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical scalar intersections are qualified in PHYSICAL_METADATA_AUDIT.md |
-| E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → authorized materialized fallback | R, restricted; Q64 charged preflight then F, not raw pipeline; S/F | `test_controlled_batch_join_filter_map_step`, `test_controlled_batch_delta_selectors`, `test_controlled_batch_child_domain_rejection`; G4 |
-| E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; required host producer/pipeline route absent, G4 |
+| E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → prepared producer, controlled per-batch consumers and private relation sink | R, restricted; Q64 preflight, A producer/consumer/sink, same F; intrinsic declines use bounded ordinary JOIN; S/F/B | `evaluation_join_hosts` domains/recovery/failures/funding and existing selector tests; broader policies remain G4 |
+| E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; strict and broader producer/pipeline destinations still required, G4 |
 | E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
@@ -537,3 +537,45 @@ persistent weighted traces, compound/spill representations, other recursive
 domains and #2293's platform/final-SHA acceptance are not inferred from these
 results. These remaining predicates retain their existing issue owners;
 completion of this bundle alone does not close every #2296/#1953 obligation.
+
+
+## Controlled per-batch session consumers (#2297, restricted domain)
+
+`evaluation_join_hosts` witnesses actual prepared producer generations,
+per-batch FILTER/MAP, transformed sink rows and serialized extent/ACK in the
+existing unobserved non-strict five-op STEP shape. It covers64 candidate pairs,
+32 two-row batches,257-lane rows, narrowed projections, arithmetic MAP, actual
+physical source stamps, left-delta and owned forced-empty inputs. Independent
+literal tuples and a control-disabled reference check results and source
+images. Reject-all traversal and terminal no-batch schema are separate cases.
+No output generation is forged for an empty producer.
+
+The original owning entry moves to a frame-owned parked slot while the batch
+is borrowed. Exact host/generation/op scope admits only the current consumer;
+ordinary stack access, owner release, parent publication and cleanup refuse
+while the entry is parked. Actual consumer reset/ACK remain legal. Restore
+precedes producer ACK, and each independently owned transformed relation is
+retired through an actual funded scalar receipt. The final original input is
+validated reversibly under its original target before replacement.
+
+Deterministic cancellation/work-limit cases include consumer source-end,
+private commit, control release, finish, reset and ACK for FILTER and MAP,
+restoration, producer ACK and final private replacement. Empty-schema aborts,
+allocator/admission failures and a late arithmetic ERANGE leave public heads
+unchanged; reset/retry and checked destruction retain their resource contracts.
+The tests assert the original frame/control identity and reject copied owners,
+wrong operations/generations and premature parent access.
+
+Direct composed384/383 and real classifier-authorized session1152/1151 funding
+cases preserve actual previous receipts. The latter's finished reports show
+768 consumed on refusal and1152 on progress, with no consumer action on the
+refused grant. They establish the facade chain and its nested root's remaining
+768 capacity by decomposition of the unchanged384 source fees, not by sampling
+active accounting or inventing standalone root authority. Final original work
+is compared empirically with normal-funding runs; primitive literal-cost
+oracles remain independent. An unauthorized manual batch request remains an
+ENOTSUP test and consumes its genuine bootstrap receipt.
+
+This unit does not qualify other batch plan shapes, SEMI/ANTI hosting, strict
+mode, local/shared output caps, observed/SNAPSHOT wrappers or their successors.
+Those remain mandatory bundle work; E09/C04 and #2297 are not closed here.

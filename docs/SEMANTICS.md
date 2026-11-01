@@ -1410,17 +1410,39 @@ Complete generated SIP/negation bodies and composed MAP/probe chains retain
 terminal CONSOLIDATE semantics, including sorted distinct FLOAT output.
 Public/default/session scheduling remains separate from this interface.
 
-### Controlled STEP materializing batch fallback (#1821)
+### Controlled STEP batch destination (#1821, #2297)
 
 With non-strict `WIRELOG_JOIN_BATCH_BYTES`, controlled initial STEP admits one
-exact `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE` relation when charged
-preflight proves that both AUTO inputs select their full relations. The plan's
-delta modes remain unchanged. This route materializes the complete private
-JOIN result before FILTER and MAP run, then publishes the final candidate at
-the framed registry cutoff. The batch setting authorizes this compatibility
-route; it does not bound its intermediate memory. Strict mode and other
-batch-configured STEP shapes remain unsupported. Its published counter counts
-only candidates that cross the registry cutoff.
+exact `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE` relation. Its charged
+classifier preserves the full/delta/empty selectors described below. Eligible
+JOINs now use a private prepared bounded producer and run the row-local FILTER
+and MAP on each complete batch through the existing controlled consumers. The
+original input is parked in the same frame while the borrowed batch occupies
+its slot, then restored after consumer cleanup and ACK. No nested frame or
+root-authority exception is used. The independent private relation sink copies
+actual transformed rows and schema; only then may the module commit its extent
+and ACK the producer. A producer with no rows uses a separate terminal-schema
+capability, drives the empty consumers once, and never invents a generation or
+ACK. The final candidate publishes at the existing framed registry cutoff.
+
+Named intrinsic producer declines, including an oversized row and a selected
+right delta, retain the ordinary bounded JOIN destination on the original
+attempt. The batch budget bounds producer scratch, not the final relation sink.
+Strict mode, output policies and other batch-configured STEP shapes remain
+separate required qualification. The published counter counts only candidates
+that cross the registry cutoff.
+
+Consumer actions require one actual384 host funding payment. Direct composed
+384/383 tests exercise the admission boundary. The framed root additionally
+pays384, and the facade pays another384: real-session grants1152/1151 prove the
+full chain and its nested root's remaining768/767 capacity. This is not a
+standalone root activation or an active consumed-work sample. Normal session
+grants remain5 or8 payments. Other new host actions use one dispatch unit plus
+the actual delegated cleanup grant. Original work never restarts on a batch
+boundary or a refused host grant. Constructor/compiler internals poll and bill
+the original attempt synchronously; these calls do not promise a hard total
+turn quantum. Physical allocator/free and mandatory cleanup boundaries retain
+their existing cooperative contracts.
 
 For non-batch controlled STEP, the initial plan and registry proof is also
 resumable. A call charges at most 64 plan-proof and scheduler actions combined.

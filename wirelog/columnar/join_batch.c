@@ -15,6 +15,7 @@
  *     admitted capacity stays, as after a failed bulk append in relation.c).
  */
 #include "columnar/join_batch.h"
+#include "columnar/join_pipeline.h"
 
 #include "wirelog/util/log.h"
 
@@ -1699,7 +1700,8 @@ int
 wl_columnar_join_batch_prepare_sink_commit_ack(
     wl_columnar_join_batch_prepare_t *a, col_rel_t *sink, uint32_t base,
     uint64_t generation, const wl_columnar_relation_append_batch_t *writer,
-    const wl_columnar_relation_scalar_source_t *source, uint32_t *extent)
+    const wl_columnar_relation_scalar_source_t *source, uint32_t *extent,
+    const void *owner)
 {
     if (!a || a->identity != a || !a->ready || a->aborting || !sink || !extent
         || !writer || writer->identity != writer || writer->raw.active
@@ -1710,9 +1712,12 @@ wl_columnar_join_batch_prepare_sink_commit_ack(
         || !source->first_result_saved || source->first_result) return EINVAL;
     col_join_batch_producer_t *p = (col_join_batch_producer_t *)
         wl_columnar_continuation_producer_context(a->continuation);
+    uint32_t rows = 0;
+    if (!wl_columnar_join_pipeline_sink_authorized(owner, a, sink, base,
+        generation, writer, source, &rows)) return EINVAL;
     if (!p || p->private_prepare != a || sink == p->batch
-        || sink->storage_owner != sink || sink->ncols != p->batch->ncols
-        || *extent != base || (uint64_t)base + p->batch->nrows != sink->nrows)
+        || sink->storage_owner != sink
+        || *extent != base || (uint64_t)base + rows != sink->nrows)
         return EINVAL;
     if (wl_columnar_source_access_gate_busy(&p->batch->descriptor_access)
         || wl_columnar_source_access_gate_busy(&p->batch->source_access))
@@ -1721,6 +1726,41 @@ wl_columnar_join_batch_prepare_sink_commit_ack(
     if (rc) return rc;
     *extent = sink->nrows;
     col_join_batch_control_ack_validated(a->continuation, generation);
+    return 0;
+}
+
+int
+wl_columnar_join_batch_prepare_terminal_schema(
+    wl_columnar_join_batch_prepare_t *a, const col_rel_t **out)
+{
+    if (!out) return EINVAL;
+    *out = NULL;
+    if (!a || a->identity != a || !a->ready || a->aborting || a->drained)
+        return EINVAL;
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(a->continuation);
+    if (!p) return EINVAL;
+    wl_columnar_continuation_cursor_t cursor = {
+        .input_identity = p->cursor.left_identity,
+        .arrangement_identity = p->cursor.right_identity,
+        .generation = p->cursor.arr_generation,
+        .position = pos_pack(p->cursor.next.lr, p->cursor.next.rr),
+        .sequence = p->cursor.sequence
+    };
+    if (!p || p->private_prepare != a || !controlled_thread_is_owner(p)
+        || p->controlled_busy || p->controlled_ready
+        || (p->controlled_status != COL_JOIN_BATCH_CONTROL_DONE
+        && (p->controlled_status != COL_JOIN_BATCH_CONTROL_PROGRESS
+        || !p->controlled_complete))
+        || p->batch->nrows || !a->left_reader.owner || !a->right_reader.owner
+        || a->left_reader.identity != (uintptr_t)&a->left_reader
+        || a->right_reader.identity != (uintptr_t)&a->right_reader
+        || a->left_reader.secondary_owner != &p->left->descriptor_access
+        || a->right_reader.secondary_owner != &p->right->descriptor_access
+        || !producer_validate(p, &cursor)) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 1);
+    if (rc) return rc;
+    *out = p->batch;
     return 0;
 }
 

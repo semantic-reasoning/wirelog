@@ -6907,7 +6907,7 @@ test_evaluation_join_hosts_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-foreach join_host_case : ['domains', 'recovery', 'failures']
+foreach join_host_case : ['domains', 'recovery', 'failures', 'funding']
   test('evaluation_join_hosts_' + join_host_case,
        test_evaluation_join_hosts_exe, args: [join_host_case],
        suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
