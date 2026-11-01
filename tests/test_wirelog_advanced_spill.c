@@ -734,18 +734,33 @@ static void join_chains(void)
         ".decl result(k:int64,x:int64,y:int64,z:int64)\nresult(k,x,y,z+0) :- a(k,x),b(k,y),c(y,z).\n"
         ".decl scan(k:int64)\nscan(k) :- a(k,x).\n"
         ".decl second(k:int64,x:int64,y:int64)\nsecond(k,x,y+0) :- a(k,x),b(k,y).\n";
-    for (unsigned order = 0; order < 3; order++) {
+    for (unsigned order = 0; order < 4; order++) {
         wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
         wirelog_session_options_v1_t o = configured();
         CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
             &o, &s) == WIRELOG_OK);
+        if (order == 3) {
+            CHECK(wirelog_session_begin_cold_input(s, "a") == WIRELOG_OK);
+            CHECK(wirelog_session_begin_cold_input(s, "b") == WIRELOG_OK);
+            CHECK(wirelog_session_begin_cold_input(s, "c") == WIRELOG_OK);
+        }
         for (int64_t i = 0; i < 8; i++) {
             int64_t a[] = {i, 10+i}, b[] = {i, 100+i}, c[] = {100+i, 1000+i};
-            CHECK(wirelog_session_insert(s, "a", a, 1, 2) == WIRELOG_OK);
-            CHECK(wirelog_session_insert(s, "b", b, 1, 2) == WIRELOG_OK);
-            CHECK(wirelog_session_insert(s, "c", c, 1, 2) == WIRELOG_OK);
+            CHECK((order ==
+                3 ? wirelog_session_append_cold_input :
+                wirelog_session_insert)(s, "a", a, 1, 2) == WIRELOG_OK);
+            CHECK((order ==
+                3 ? wirelog_session_append_cold_input :
+                wirelog_session_insert)(s, "b", b, 1, 2) == WIRELOG_OK);
+            CHECK((order ==
+                3 ? wirelog_session_append_cold_input :
+                wirelog_session_insert)(s, "c", c, 1, 2) == WIRELOG_OK);
         }
-        if (order) {
+        if (order == 3) {
+            CHECK(wirelog_session_finish_cold_input(s, "c") == WIRELOG_OK);
+            CHECK(wirelog_session_finish_cold_input(s, "b") == WIRELOG_OK);
+            CHECK(wirelog_session_finish_cold_input(s, "a") == WIRELOG_OK);
+        } else if (order) {
             const char *names[] = {"a", "b", "c"};
             for (unsigned i = 0; i < 3;
                 i++) CHECK(wirelog_session_seal_input(s,
@@ -1089,6 +1104,106 @@ static void public_scan_join(void)
             }
 }
 
+typedef struct { events_t result; unsigned self; } chunked_join_events_t;
+static void chunked_join_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    chunked_join_events_t *e = context;
+    if (!strcmp(name, "result")) {
+        observe(name, row, cols, &e->result); return;
+    }
+    CHECK(!strcmp(name, "self") && cols == 3 && row[0] >= 0 && row[0] < 4 &&
+        row[1] == row[0]+10 && row[2] == row[1]);
+    unsigned bit = 1u << (unsigned)row[0]; CHECK(!(e->self & bit));
+    e->self |= bit;
+}
+static void chunked_public_joins(void)
+{
+    const char *prefix_query =
+        ".decl a(k:int64,v:int64,g:int64)\n.decl b(k:int64,v:int64)\n"
+        ".decl result(k:int64,x:int64,y:int64)\n"
+        "result(k,x,y) :- a(k,x,g), g = 7, x >= 10, b(k,y).\n";
+    for (unsigned prefix = 0; prefix < 2; prefix++)
+        for (unsigned left = 0; left < 3; left++)
+            for (unsigned right = 0; right < 3; right++)
+                for (unsigned empty = 0; empty < 2; empty++) {
+                    char text[768];
+                    snprintf(text, sizeof(text),
+                        "%s.decl self(k:int64,x:int64,y:int64)\n"
+                        "self(k,x,y+0) :- %s.\n",
+                        prefix ? prefix_query : query,
+                        prefix ? "a(k,x,g),a(k,y,h)" : "a(k,x),a(k,y)");
+                    wirelog_program_t *p = parse(text);
+                    wirelog_session_t *s = NULL;
+                    wirelog_session_options_v1_t options = configured();
+                    CHECK(wirelog_session_create_with_options(p,
+                        WIRELOG_BACKEND_DEFAULT,
+                        1, &options, &s) == WIRELOG_OK);
+                    const char *names[] = {"a", "b"};
+                    unsigned mode[] = {left, right},
+                        count[] = {4, empty ? 0u : 128u},
+                        widths[] = {prefix ? 3u : 2u, 2};
+                    /* All ordinary inserts precede the first sealing/loading action. */
+                    for (unsigned side = 0; side < 2; side++)
+                        if (mode[side] != 2) for (unsigned i = 0;
+                                i < count[side];
+                                i++){
+                                int64_t row[] = {i, i+(side ? 100 : 10), 7};
+                                CHECK(wirelog_session_insert(s, names[side],
+                                    row, 1,
+                                    widths[side]) == WIRELOG_OK);
+                            }
+                    for (unsigned side = 0; side < 2; side++)
+                        if (mode[side] ==
+                            2) CHECK(wirelog_session_begin_cold_input(s,
+                                names[side]) == WIRELOG_OK);
+                    for (unsigned side = 0; side < 2; side++)
+                        if (mode[side] == 1) {
+                            /* A zero-width fresh empty payload cannot be sealed;
+                             * keep that opposite source resident for this case. */
+                            if (count[side]) {
+                                wirelog_error_t error =
+                                    wirelog_session_seal_input(s, names[side]);
+                                if (error) fprintf(stderr,
+                                        "chunked seal prefix=%u left=%u right=%u empty=%u side=%u error=%d\n",
+                                        prefix, left, right, empty, side,
+                                        error);
+                                CHECK(error == WIRELOG_OK);
+                            }
+                        }
+                    for (unsigned side = 0; side < 2;
+                        side++) if (mode[side] == 2) {
+                            for (unsigned first = 0; first < count[side];
+                                first += 3) {
+                                int64_t rows[9]; unsigned n = count[side]-first;
+                                if (n > 3) n = 3;
+                                for (unsigned i = 0; i < n; i++) {
+                                    rows[widths[side]*i] = first+i;
+                                    rows[widths[side]*i+1] = first+i+
+                                        (side ? 100 : 10);
+                                    if (widths[side] ==
+                                        3) rows[widths[side]*i+2] = 7;
+                                }
+                                CHECK(wirelog_session_append_cold_input(s,
+                                    names[side], rows, n,
+                                    widths[side]) == WIRELOG_OK);
+                            }
+                            CHECK(wirelog_session_finish_cold_input(s,
+                                names[side]) == WIRELOG_OK);
+                        }
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        chunked_join_events_t e = {0};
+                        CHECK(wirelog_session_snapshot(s, chunked_join_observe,
+                            &e) == WIRELOG_OK);
+                        CHECK(e.self == 15 &&
+                            e.result.seen == (empty ? 0u : 15u));
+                        CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                    }
+                    wirelog_session_destroy(s); wirelog_program_free(p);
+                    CHECK(!live_files());
+                }
+}
+
 static void chunked_scan_observe(const char *name, const int64_t *row,
     uint32_t cols, void *context)
 {
@@ -1185,7 +1300,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
-    chunked_public_scans();
+    chunked_public_scans(); chunked_public_joins();
     inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();

@@ -6,6 +6,28 @@
 #include "columnar/continuation.h"
 #include "columnar/trace_store.h"
 
+/* Exactly one source is set. Owners remain caller-owned; payload readers are
+ * eager, while snapshot cursors independently retain generations and lazily
+ * acquire one segment. No source is materialized into a full resident relation. */
+typedef struct {
+    wl_columnar_batch_payload_t *payload;
+    wl_columnar_trace_store_snapshot_t *snapshot;
+} wl_columnar_payload_join_source_t;
+
+/* Ordinary heterogeneous projected JOIN, with the same whole-input metadata,
+ * schema/governor and optional reference-intern contract as the existing
+ * projected factories. NULL intern retains the numeric-only restriction.
+ * Checks all +1/zero-coordinate rows before publishing the continuation. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_sources_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_payload_join_source_t left,
+    wl_columnar_payload_join_source_t right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *context, wl_columnar_continuation_t **out);
+
 /* Both owners remain caller-owned. Separate readers pin them (also for self
  * JOIN), so release/demotion is BUSY until active cancellation or destruction.
  * The same governor is required. Inputs must have scalar numeric schemas,

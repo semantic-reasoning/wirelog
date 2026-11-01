@@ -275,7 +275,7 @@ wirelog_session_seal_input(wirelog_session_t *session,
 
 /** Begin explicitly chunked loading of an empty declared numeric EDB.
  * Requires the same serial spill-enabled ordinary mode as seal_input, before
- * evaluation, and currently supports audited MAP/FILTER projection consumers.
+ * evaluation, and supports audited MAP/FILTER scans and single-key equality JOIN consumers.
  * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
  * resident facts first; additional empty inputs may begin and preloaded inputs
  * may be sealed afterward. A failed begin preserves the original input.

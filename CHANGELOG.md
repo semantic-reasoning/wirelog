@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Ordinary session JOINs consume chunked numeric inputs alongside sealed or
+  resident sources through independent bounded readers (#1372).
+
 - Advanced sessions load numeric cold inputs in bounded chunks and finalize
   immutable traces for ordinary MAP/FILTER scans, with retryable admission (#1372).
 

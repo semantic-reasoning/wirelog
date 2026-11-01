@@ -3929,6 +3929,42 @@ static void cold_scan_map_only_right_audit(void)
     rp->ops = saved; rp->op_count = count; destroy(&f);
 }
 
+static void chunked_join_failure(void)
+{
+    fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
+    for (int64_t i = 0; i < 4; i++) {
+        int64_t row[] = {i, 10+i};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+    }
+    CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+    for (int64_t first = 0; first < 128; first += 16) {
+        int64_t rows[32];
+        for (int64_t i = 0; i < 16; i++) {
+            rows[2*i] = first+i; rows[2*i+1] = first+i+100;
+        }
+        CHECK(wl_columnar_session_append_cold_input(f.session, "b", rows, 16,
+            2) == OK);
+    }
+    CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+    wl_columnar_session_cold_relation_t *binding =
+        wl_columnar_session_cold_find(COL_SESSION(f.session), "b");
+    wl_columnar_trace_store_state_t state =
+        wl_columnar_trace_store_snapshot_state(binding->trace_snapshot);
+    /* A late segment read during producer preflight must not emit a prefix. */
+    read_fault = 100;
+    events_t events = {0};
+    CHECK(wl_session_snapshot(f.session, observe,
+        &events) == EIO && !events.count);
+    read_fault = 0;
+    CHECK(wl_session_snapshot(f.session, observe,
+        &events) == 0 && events.count == 4 && events.seen == 15);
+    wl_columnar_trace_store_state_t after =
+        wl_columnar_trace_store_snapshot_state(binding->trace_snapshot);
+    CHECK(state.generation == after.generation && state.rows == after.rows &&
+        state.segments == after.segments);
+    destroy(&f);
+}
+
 static void chunked_internal_observe(const char *name, const int64_t *row,
     uint32_t width, void *context)
 {
@@ -4051,7 +4087,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
-    chunked_internal();
+    chunked_internal(); chunked_join_failure();
     cold_scan_join_key_names();
     cold_scan_map_only_right_audit();
     cold_scan_join_self_missing();
