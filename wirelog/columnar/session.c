@@ -85,6 +85,20 @@ typedef struct {
     wl_columnar_relation_managed_binary_build_t build;
     wl_columnar_managed_candidate_merge_t merge;
     wl_columnar_relation_managed_retirement_t retirement;
+    col_rel_t **retirement_owner;
+    col_rel_t *retirement_target;
+    unsigned retirement_aliases;
+    bool retirement_drained, retirement_busy, retirement_thread_valid,
+        retirement_selected_paid;
+    wl_columnar_controlled_step_t *retirement_step;
+    bool retirement_registered;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t retirement_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD retirement_thread;
+#else
+    pthread_t retirement_thread;
+#endif
     session_rel_registration_t *registration;
     wl_evaluation_control_t *maintenance_control;
     uint64_t maintenance_id;
@@ -164,11 +178,33 @@ typedef struct {
 } wl_columnar_session_observed_head_t;
 
 typedef struct {
+    wl_columnar_relation_scalar_retirement_initializer_t initializer;
+    const void *identity, *parent;
+    wl_columnar_controlled_step_t *step;
+    bool registered;
+    wl_columnar_relation_scalar_retirement_t *receipt;
+    col_rel_t *target;
+    col_rel_t **slot;
+    col_rel_t *replacement;
+    unsigned role;
+    uint32_t index;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, begun, physical_done, cancel_clear, busy;
+} wl_columnar_session_retirement_progress_t;
+
+typedef struct {
     col_rel_t *relation;
     col_relation_snapshot_t snapshot;
     wl_columnar_relation_reader_step_t reader;
     wl_columnar_relation_scalar_retirement_t retirement;
-    bool retire, preserve;
+    wl_columnar_session_retirement_progress_t retirement_progress;
+    bool retire, preserve, retirement_done;
 } wl_columnar_session_observed_original_t;
 
 typedef struct {
@@ -205,6 +241,7 @@ typedef struct {
     size_t delivery;
     uint32_t cleanup_index, dispose_index, missing_count;
     wl_columnar_relation_scalar_retirement_t disposal;
+    wl_columnar_session_retirement_progress_t disposal_progress;
     int child_result;
     uint32_t round_begin, round_end, round, round_index, column, cleanup_round,
         audit_op;
@@ -212,6 +249,7 @@ typedef struct {
     col_rel_t **round_owner;
     bool round_active, round_changed;
     wl_columnar_relation_scalar_retirement_t round_retirement;
+    wl_columnar_session_retirement_progress_t round_progress;
     col_rel_t *append_delta;
     col_relation_snapshot_t append_snapshot;
     bool append_active;
@@ -324,6 +362,33 @@ struct wl_columnar_controlled_step {
     bool published;
     bool observer_cleanup_pending;
     wl_columnar_relation_scalar_retirement_t staging_retirement;
+    wl_columnar_session_retirement_progress_t staging_progress;
+    col_rel_t **staging_registry;
+    bool retirement_busy, staging_found;
+    uint32_t retirement_native_count;
+    bool retirement_native_valid, retirement_work_valid;
+    bool retirement_begin_failure_pending, retirement_begin_final_paid,
+        retirement_begin_busy;
+    int retirement_begin_error, retirement_begin_cleanup_status;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t retirement_native_thread, retirement_begin_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD retirement_native_thread, retirement_begin_thread;
+#else
+    pthread_t retirement_native_thread, retirement_begin_thread;
+#endif
+    uint64_t retirement_work_control;
+    wl_evaluation_control_report_t retirement_work_report;
+    bool staging_cancel_pending, staging_cancel_result_saved,
+        staging_cancel_thread_valid;
+    int staging_cancel_result, staging_cancel_protocol_status;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t staging_cancel_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD staging_cancel_thread;
+#else
+    pthread_t staging_cancel_thread;
+#endif
     col_relation_snapshot_t staging_snapshot;
     wl_evaluation_control_t *staging_maintenance;
     uint64_t staging_maintenance_id;
@@ -331,6 +396,51 @@ struct wl_columnar_controlled_step {
     size_t staging_byte;
     bool staging_ready, staging_done, staging_tail_prepaid;
 };
+
+static bool
+wl_columnar_session_retirement_native_equal(
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->retirement_native_count) return !step->retirement_native_valid;
+    if (!step->retirement_native_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(step->retirement_native_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return step->retirement_native_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(step->retirement_native_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_session_retirement_register(wl_columnar_controlled_step_t *step)
+{
+    if (!step || step->retirement_native_count == UINT32_MAX) return EOVERFLOW;
+    if (!wl_columnar_session_retirement_native_equal(step)) return EINVAL;
+    if (!step->retirement_native_count) {
+#if defined(WL_HAVE_C11_THREADS)
+        step->retirement_native_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+        step->retirement_native_thread = GetCurrentThreadId();
+#else
+        step->retirement_native_thread = pthread_self();
+#endif
+        step->retirement_native_valid = true;
+    }
+    ++step->retirement_native_count;
+    return 0;
+}
+
+/* Nofail fixed suffix after authentic pre-debit registered/native proof. */
+static void
+wl_columnar_session_retirement_unregister(wl_columnar_controlled_step_t *step)
+{
+    --step->retirement_native_count;
+    if (!step->retirement_native_count) step->retirement_native_valid = false;
+}
+
+static int wl_columnar_session_retirement_entry_guard(wl_col_session_t *,
+    wl_columnar_controlled_step_t *);
 
 bool
 wl_columnar_session_observed_bindings_authorized(
@@ -8489,9 +8599,43 @@ static int
 col_controlled_step_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, int result)
 {
+    wl_columnar_session_retirement_progress_t *p = &step->staging_progress;
+    bool uncommitted = !p->identity || !p->begun ||
+        !step->staging_retirement.committed;
+    if (result && result != EAGAIN && !step->published && uncommitted
+        && (p->identity || step->successor_input_reader.owner)) {
+        if (!step->staging_cancel_result_saved) {
+            step->staging_cancel_result = result;
+            step->staging_cancel_result_saved = true;
+            /* Copy genuine origin, never the arbitrary calling thread. */
+            step->staging_cancel_thread = p->identity ? p->owner_thread
+                : step->successor_input_reader.owner_thread;
+            step->staging_cancel_thread_valid = true;
+        }
+        step->staging_cancel_pending = true;
+        return EAGAIN;
+    }
+    /* Snapshot's outer owner still holds admission and drains its transaction.
+    * An ordinary non-WORK finish cannot expose selected native obligations. */
+    if (!step->snapshot_owned && step->retirement_native_count
+        && result != WL_EVALUATION_CONTROL_WORK_LIMIT) return EAGAIN;
+    uint64_t finished_id = step->operation_id;
     int rc = step->snapshot_owned ? result
         : wl_evaluation_control_finish(sess->base.evaluation_control,
             sess->base.operation_admission, result, 0);
+    if (!step->snapshot_owned && step->retirement_native_count
+        && rc == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+        wl_evaluation_control_report_t report;
+        if (!wl_evaluation_control_report(sess->base.evaluation_control,
+            &report)
+            && report.attempt_id == finished_id && report.result == rc
+            && report.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT) {
+            step->retirement_work_report = report;
+            step->retirement_work_control =
+                wl_evaluation_control_identity(sess->base.evaluation_control);
+            step->retirement_work_valid = true;
+        }
+    }
     step->controlled_materialized_batch_fallback = false;
     step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
     step->default_preflight_plan = NULL;
@@ -8514,6 +8658,227 @@ col_controlled_step_finish(wl_col_session_t *sess,
     step->primary_result = 0;
     step->refused = result != 0
         && result != WL_EVALUATION_CONTROL_WORK_LIMIT;
+    return rc;
+}
+
+/* Each parent publishes exact selection before any hook; scalar storage stays
+ * at its original embedded address. This progress owns no relation or ref. */
+static bool
+wl_columnar_session_retirement_thread(
+    const wl_columnar_session_retirement_progress_t *p)
+{
+    if (!p->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(p->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return p->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(p->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_session_retirement_select(wl_columnar_controlled_step_t *step,
+    wl_columnar_session_retirement_progress_t *p, const void *parent,
+    wl_columnar_relation_scalar_retirement_t *receipt, col_rel_t *target,
+    col_rel_t **slot, col_rel_t *replacement, unsigned role, uint32_t index)
+{
+    if (p->busy) return EBUSY;
+    if (p->identity) {
+        return p->identity == p && p->parent == parent && p->receipt == receipt
+               && p->step == step && p->registered &&
+               step->retirement_native_count
+               && p->target == target && p->slot == slot &&
+               p->replacement == replacement
+               && p->role == role && p->index == index
+               && wl_columnar_session_retirement_thread(p) ? 0 : EINVAL;
+    }
+    if (!parent || !receipt || !target || !step) return EINVAL;
+    int registration = wl_columnar_session_retirement_register(step);
+    if (registration) return registration;
+    p->step = step; p->registered = true;
+    p->identity = p; p->parent = parent; p->receipt = receipt;
+    p->target = target; p->slot = slot; p->replacement = replacement;
+    p->role = role; p->index = index;
+#if defined(WL_HAVE_C11_THREADS)
+    p->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    p->owner_thread = GetCurrentThreadId();
+#else
+    p->owner_thread = pthread_self();
+#endif
+    p->thread_valid = true;
+    return 0;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+bool wl_columnar_session_test_staging_stale_funding_once;
+/* Borrowed only for one actual owner STEP; no reference or authority moves. */
+wl_evaluation_control_t *wl_columnar_session_test_staging_end_funding;
+uint64_t wl_columnar_session_test_staging_end_funding_id;
+void (*wl_columnar_session_test_retirement_checkpoint)(
+    wl_evaluation_control_t *, unsigned, unsigned, uint32_t, const col_rel_t *);
+#endif
+static void
+wl_columnar_session_retirement_checkpoint(
+    const wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, unsigned action)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_session_test_retirement_checkpoint)
+        wl_columnar_session_test_retirement_checkpoint(control, p->role, action,
+            p->index, p->physical_done ? NULL : p->target);
+#else
+    (void)p; (void)control; (void)action;
+#endif
+}
+
+static int
+wl_columnar_session_retirement_initialize(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_relation_scalar_retirement_initializer_t *i = &p->initializer;
+    if (p->begun && !i->identity) return 0;
+    int rc;
+    if (!i->identity) {
+        wl_columnar_session_retirement_checkpoint(p, control, 1);
+        rc = wl_columnar_relation_scalar_retirement_init_begin(i, p,
+                p->receipt, p->target, control, id);
+    } else if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE) {
+        if (!p->begun) return EINVAL;
+        wl_columnar_session_retirement_checkpoint(p, control, 4);
+        rc = wl_columnar_relation_scalar_retirement_init_reset(i, p, control,
+                id);
+    } else {
+        bool begun = false;
+        wl_columnar_session_retirement_checkpoint(p, control,
+            i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO ? 2 : 3);
+        rc = wl_columnar_relation_scalar_retirement_init_step(i, p,
+                p->receipt, p->target, control, id, &begun);
+        if (!rc && begun) p->begun = true;
+    }
+    /* Even successful RESET returns before preparing or committing. */
+    return rc ? rc : EAGAIN;
+}
+
+/* Actual scalar123 plus progress<=28 clear units and fixed caller<=100.
+ * Nothing here reads a retired relation, resets a live initializer or cancels
+ * claims. Those obligations completed in earlier separately funded actions. */
+typedef char wl_columnar_session_retirement_clear_bound[
+        (sizeof(wl_columnar_relation_scalar_retirement_t)+7u)/8u
+        +(sizeof(wl_columnar_session_retirement_progress_t)+7u)/8u+100u <=
+        256u ? 1 : -1];
+static int
+wl_columnar_session_retirement_clear(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (p->initializer.identity) return EBUSY;
+    if (!p->registered || !p->step || !p->step->retirement_native_count
+        || !wl_columnar_session_retirement_native_equal(p->step)) return EINVAL;
+    wl_columnar_session_retirement_checkpoint(p, control, 6);
+    int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) return rc;
+    memset(p->receipt, 0, sizeof(*p->receipt));
+    wl_columnar_session_retirement_unregister(p->step);
+    p->registered = false; p->step = NULL;
+    p->identity = p->parent = NULL; p->receipt = NULL; p->target = NULL;
+    p->slot = NULL; p->replacement = NULL; p->role = p->index = 0;
+    p->begun = p->physical_done = p->cancel_clear = p->thread_valid = false;
+    return 0;
+}
+
+static int
+wl_columnar_session_retirement_prepare_body(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (p->physical_done || p->cancel_clear) return EBUSY;
+    int rc = wl_columnar_session_retirement_initialize(p, control, id);
+    if (rc) return rc;
+    wl_columnar_session_retirement_checkpoint(p, control, 8);
+    return wl_columnar_relation_scalar_retirement_prepare(p->receipt, control,
+               id);
+}
+
+static int
+wl_columnar_session_retirement_dispose_body(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (p->physical_done)
+        return wl_columnar_session_retirement_clear(p, control, id);
+    int rc;
+    if (!p->begun || !p->receipt->committed) {
+        rc = wl_columnar_session_retirement_prepare_body(p, control, id);
+        if (rc) return rc;
+        wl_columnar_session_retirement_checkpoint(p, control, 9);
+        rc = wl_columnar_relation_scalar_retirement_commit(p->receipt);
+        return rc ? rc : EAGAIN;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (p->role == 2 && wl_columnar_session_test_observed_transaction_checkpoint
+        && ((const wl_columnar_session_observed_transaction_t *)p->parent)->
+        round > 0){
+        if (p->receipt->phase == 6 && p->receipt->column > 0)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                22, 0, NULL);
+        else if (p->receipt->phase == 13)
+            wl_columnar_session_test_observed_transaction_checkpoint(control,
+                23, 0, NULL);
+    }
+#endif
+    rc = wl_columnar_relation_scalar_retirement_step(p->receipt, control, id);
+    if (rc) return rc;
+    /* No hook/debit between actual physical success and stable slot disposal. */
+    p->physical_done = true;
+    if (p->slot) *p->slot = p->replacement;
+    return EAGAIN;
+}
+
+static int
+wl_columnar_session_retirement_cancel_body(
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (p->physical_done || (p->begun && p->receipt->committed)) return EINVAL;
+    if (p->initializer.identity) {
+        wl_columnar_session_retirement_checkpoint(p, control, 4);
+        int rc =
+            wl_columnar_relation_scalar_retirement_init_reset(&p->initializer,
+                p, control, id);
+        return rc ? rc : EAGAIN;
+    }
+    if (!p->begun || p->cancel_clear)
+        return wl_columnar_session_retirement_clear(p, control, id);
+    wl_columnar_session_retirement_checkpoint(p, control, 5);
+    int rc = wl_columnar_relation_scalar_retirement_release_claims_controlled(
+        p->receipt, control, id);
+    if (rc) return rc;
+    p->cancel_clear = true;
+    return EAGAIN;
+}
+
+/* Containing STEP freeze is authoritative even before initializer BOOT. */
+static int
+wl_columnar_session_retirement_drive(wl_columnar_controlled_step_t *step,
+    wl_columnar_session_retirement_progress_t *p,
+    wl_evaluation_control_t *control, uint64_t id, unsigned action)
+{
+    if (step->retirement_busy || p->busy) return EBUSY;
+    if (!control || !id ||
+        wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
+    if (p->identity != p || !p->parent || !p->receipt || !p->target
+        || p->step != step || !p->registered || !step->retirement_native_count
+        || !wl_columnar_session_retirement_thread(p)) return EINVAL;
+    step->retirement_busy = p->busy = true;
+    int rc = action == 0 ? wl_columnar_session_retirement_prepare_body(p,
+            control, id)
+        : action == 1 ? wl_columnar_session_retirement_dispose_body(p, control,
+            id)
+        : wl_columnar_session_retirement_cancel_body(p, control, id);
+    p->busy = step->retirement_busy = false;
     return rc;
 }
 
@@ -8556,6 +8921,28 @@ col_controlled_step_observed_result(wl_col_session_t *sess,
     return ENOENT;
 }
 
+static int
+wl_columnar_session_staging_maintenance(wl_columnar_controlled_step_t *step)
+{
+    int rc;
+    if (!step->staging_maintenance) {
+        rc = wl_evaluation_control_create(0, &step->staging_maintenance);
+        if (rc) return rc;
+        rc = wl_evaluation_control_attach(step->staging_maintenance, step);
+        if (!rc) rc = wl_evaluation_control_begin(step->staging_maintenance,
+                    step);
+        if (rc) {
+            (void)wl_evaluation_control_detach(step->staging_maintenance, step);
+            wl_evaluation_control_release(step->staging_maintenance);
+            step->staging_maintenance = NULL;
+            return rc;
+        }
+        step->staging_maintenance_id = wl_evaluation_control_active_attempt_id(
+            step->staging_maintenance);
+    }
+    return 0;
+}
+
 /* The removal producer owns one $r$ source at a time. Resolve that exact source
  * under STEP accounting, then retain reversible writer claims until cutoff. */
 static int
@@ -8571,7 +8958,7 @@ col_controlled_step_staging_prepare(wl_col_session_t *sess,
     if (!step->observed_input
         || sess->last_removed_relation != step->observed_input->name)
         return ENOTSUP;
-    while (!step->staging_retirement.storage.identity) {
+    while (!step->staging_found) {
         int rc = wl_evaluation_control_charge_attempt(control,
                 step->operation_id, 1);
         if (rc) return rc;
@@ -8588,38 +8975,39 @@ col_controlled_step_staging_prepare(wl_col_session_t *sess,
             step->staging_slot++; step->staging_byte = 0;
         }else if (actual) step->staging_byte++;
         else {
-            step->staging_snapshot = wl_columnar_relation_snapshot(r);
-            rc = wl_columnar_relation_scalar_retirement_begin(
-                &step->staging_retirement, r);
+            rc = wl_columnar_session_staging_maintenance(step);
             if (rc) return rc;
+            step->staging_snapshot = wl_columnar_relation_snapshot(r);
+            rc = wl_columnar_session_retirement_select(step,
+                    &step->staging_progress,
+                    step, &step->staging_retirement, r, NULL, NULL, 1,
+                    step->staging_slot);
+            if (rc) return rc;
+            step->staging_registry = sess->rels;
+            step->staging_found = true;
+            return EAGAIN;
         }
     }
-    int rc = wl_columnar_relation_scalar_retirement_prepare(
-        &step->staging_retirement, control, step->operation_id);
+    if (step->staging_registry != sess->rels ||
+        step->staging_slot >= sess->nrels
+        || sess->rels[step->staging_slot] !=
+        step->staging_progress.target) return EINVAL;
+    int rc = wl_columnar_session_retirement_drive(step, &step->staging_progress,
+            control, step->operation_id, 0);
     if (rc) return rc;
     if (!wl_columnar_relation_snapshot_equal(step->staging_snapshot,
         wl_columnar_relation_snapshot(
             step->staging_retirement.storage.relation)))
         return EINVAL;
-    if (!step->staging_maintenance) {
-        rc = wl_evaluation_control_create(0, &step->staging_maintenance);
-        if (rc) return rc;
-        rc = wl_evaluation_control_attach(step->staging_maintenance, step);
-        if (!rc) rc = wl_evaluation_control_begin(step->staging_maintenance,
-                    step);
-        if (rc) {
-            (void)wl_evaluation_control_detach(step->staging_maintenance, step);
-            wl_evaluation_control_release(step->staging_maintenance);
-            step->staging_maintenance = NULL;
-            return rc;
-        }
-        step->staging_maintenance_id = wl_evaluation_control_active_attempt_id(
-            step->staging_maintenance);
-    }
+    rc = wl_columnar_session_staging_maintenance(step);
+    if (rc) return rc;
     step->staging_ready = true;
 #ifdef WL_SESSION_TEST_HOOKS
-    if (wl_columnar_session_test_staging_prepared)
+    if (wl_columnar_session_test_staging_prepared) {
+        step->retirement_busy = true;
         wl_columnar_session_test_staging_prepared(control);
+        step->retirement_busy = false;
+    }
 #endif
     return wl_evaluation_control_charge_attempt(control, step->operation_id, 0);
 }
@@ -8634,6 +9022,302 @@ col_controlled_step_staging_end(wl_columnar_controlled_step_t *step)
     step->staging_maintenance = NULL;
 }
 
+static bool
+wl_columnar_session_staging_cancel_thread(
+    const wl_columnar_controlled_step_t *step)
+{
+    if (!step->staging_cancel_thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(step->staging_cancel_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return step->staging_cancel_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(step->staging_cancel_thread, pthread_self()) != 0;
+#endif
+}
+
+/* A foreign STEP preserves generic pending admission without polling or
+ * consuming the stopped original. The native owner alone advances cleanup. */
+static bool
+wl_columnar_session_staging_foreign(const wl_columnar_controlled_step_t *step)
+{
+    if (step->staging_cancel_pending)
+        return !wl_columnar_session_staging_cancel_thread(step);
+    if (step->staging_progress.identity
+        && !wl_columnar_session_retirement_thread(
+            &step->staging_progress)) return true;
+    return step->successor_input_reader.owner
+           && !wl_columnar_source_access_reader_thread_equal(
+        &step->successor_input_reader);
+}
+
+static bool
+wl_columnar_session_retirement_work_proof(wl_col_session_t *sess,
+    const wl_columnar_controlled_step_t *step)
+{
+    wl_evaluation_control_t *control = sess->base.evaluation_control;
+    if (wl_evaluation_control_active_attempt_id(control)
+        || !step->retirement_work_valid
+        || step->retirement_work_control !=
+        wl_evaluation_control_identity(control)) return false;
+    wl_evaluation_control_report_t actual;
+    const wl_evaluation_control_report_t *saved = &step->retirement_work_report;
+    return !wl_evaluation_control_report(control, &actual)
+           && actual.attempt_id == saved->attempt_id
+           && actual.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+           && actual.stop_reason == WL_EVALUATION_CONTROL_WORK_LIMIT
+           && actual.limit == saved->limit && actual.consumed == saved->consumed
+           && actual.execution_status == saved->execution_status
+           && actual.cleanup_status == saved->cleanup_status;
+}
+
+static bool
+wl_columnar_session_retirement_begin_native(
+    const wl_columnar_controlled_step_t *step)
+{
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(step->retirement_begin_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return step->retirement_begin_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(step->retirement_begin_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_session_retirement_entry_guard(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->retirement_begin_busy || step->retirement_busy) return EBUSY;
+    if ((step->retirement_native_count == 0) !=
+        !step->retirement_native_valid) return EINVAL;
+    if (step->retirement_begin_failure_pending) {
+        if (!wl_columnar_session_retirement_work_proof(sess,
+            step)) return EINVAL;
+        return wl_columnar_session_retirement_begin_native(step) ? 0
+            : WL_EVALUATION_CONTROL_WORK_LIMIT;
+    }
+    if (wl_columnar_session_retirement_native_equal(step)
+        && !wl_columnar_session_staging_foreign(step)) return 0;
+    uint64_t active =
+        wl_evaluation_control_active_attempt_id(sess->base.evaluation_control);
+    if (step->operation_active && step->operation_id &&
+        active == step->operation_id) return EAGAIN;
+    if (step->retirement_native_count &&
+        wl_columnar_session_retirement_work_proof(sess, step))
+        return WL_EVALUATION_CONTROL_WORK_LIMIT;
+    return EINVAL; /* No invented stop, allowance, reset or child authority. */
+}
+
+static int
+wl_columnar_session_staging_cancel_drive(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (!step->staging_cancel_pending || !step->operation_active
+        || !step->operation_id || wl_evaluation_control_active_attempt_id(
+            sess->base.evaluation_control) != step->operation_id) return EINVAL;
+    if (wl_columnar_session_staging_foreign(step)) return EAGAIN;
+    if (step->staging_progress.identity) {
+        uint64_t funding_id = step->staging_maintenance_id;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_staging_stale_funding_once) {
+            wl_columnar_session_test_staging_stale_funding_once = false;
+            funding_id ^= UINT64_C(1); /* Genuine rejected live-generation proof. */
+        }
+#endif
+        int rc = wl_columnar_session_retirement_drive(step,
+                &step->staging_progress,
+                step->staging_maintenance, funding_id, 2);
+        if (rc && rc != EAGAIN && rc != EBUSY &&
+            !step->staging_cancel_protocol_status)
+            step->staging_cancel_protocol_status = rc;
+        return EAGAIN;
+    }
+    wl_columnar_source_access_reader_t *reader = &step->successor_input_reader;
+    if (reader->owner) {
+        /* Descriptor authority remains genuine during storage-release stage1;
+         * do not requery the storage gate that was already decremented. */
+        col_rel_t *source = step->observed_input;
+        bool source_proof = source && reader->identity == (uintptr_t)reader
+            && !reader->transferable &&
+            wl_columnar_source_access_reader_thread_equal(reader)
+            && (reader->acquire_stage == 1
+                ? reader->owner == &source->descriptor_access &&
+            !reader->secondary_owner
+                : reader->secondary_owner == &source->descriptor_access)
+            && source->relation_identity == step->successor_input_identity
+            && source->view_generation == step->successor_input_view_generation
+            && source->storage_generation ==
+            step->successor_input_storage_generation;
+        if (!source_proof) {
+            if (!step->staging_cancel_protocol_status) step->
+                staging_cancel_protocol_status = EINVAL;
+            return EAGAIN;
+        }
+        /* END128: genuine one-CAS release validation/load/transition<=64;
+         * exact parent/native/source/funding/busy/status/return<=64. */
+        wl_evaluation_control_t *end_funding = step->staging_maintenance;
+        uint64_t end_id = step->staging_maintenance_id;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_staging_end_funding) {
+            end_funding = wl_columnar_session_test_staging_end_funding;
+            end_id = wl_columnar_session_test_staging_end_funding_id;
+        }
+#endif
+        if (!end_funding || end_funding == sess->base.evaluation_control ||
+            !end_id
+            || wl_evaluation_control_active_attempt_id(end_funding) != end_id) {
+            if (!step->staging_cancel_protocol_status) step->
+                staging_cancel_protocol_status = EINVAL;
+            return EAGAIN;
+        }
+        step->retirement_busy = true;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_retirement_checkpoint)
+            wl_columnar_session_test_retirement_checkpoint(end_funding, 1, 7, 0,
+                source);
+#endif
+        int rc = wl_evaluation_control_charge_attempt(end_funding, end_id, 128);
+        bool done = false;
+        if (!rc) rc = wl_columnar_source_access_reader_release_step(reader,
+                    &done);
+        if (rc && rc != EAGAIN && !step->staging_cancel_protocol_status)
+            step->staging_cancel_protocol_status = rc;
+        step->retirement_busy = false;
+        return EAGAIN; /* Even actual END never appends finalization. */
+    }
+    if (reader->secondary_owner || reader->identity || reader->thread_valid
+        || reader->transferable || reader->acquire_stage ||
+        reader->release_stage){
+        if (!step->staging_cancel_protocol_status) step->
+            staging_cancel_protocol_status = EINVAL;
+        return EAGAIN;
+    }
+    /* A distinct genuine128 finalization turn covers lookup/result/native
+     * suffix and ordinary finish fields. No scalar clear is appended here. */
+    step->retirement_busy = true;
+    int rc = wl_evaluation_control_charge_attempt(step->staging_maintenance,
+            step->staging_maintenance_id, 128);
+    if (rc) {
+        if (!step->staging_cancel_protocol_status) step->
+            staging_cancel_protocol_status = rc;
+        step->retirement_busy = false; return EAGAIN;
+    }
+    /* All obligations are now inert: final cleanup outcome is success.
+     * A recovered refusal remains in the copied protocol-status diagnostic;
+     * passing it as an unresolved cleanup error would override original stop
+     * in wl_evaluation_control_finish and destroy the first-result contract. */
+    int result = step->staging_cancel_result;
+    step->staging_found = step->staging_ready = step->staging_tail_prepaid =
+        false;
+    step->staging_registry = NULL; step->staging_slot = 0;
+    step->staging_byte = 0;
+    step->staging_snapshot = (col_relation_snapshot_t){0};
+    step->staging_cancel_pending = step->staging_cancel_result_saved = false;
+    step->staging_cancel_result = 0; step->staging_cancel_thread_valid = false;
+    col_controlled_step_staging_end(step);
+    rc = col_controlled_step_finish(sess, step, result);
+    step->retirement_busy = false;
+    return rc;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int
+wl_columnar_session_test_staging_status(const wl_col_session_t *sess,
+    bool *pending, bool *selected, unsigned *phase, int *semantic, int *cleanup)
+{
+    if (!sess || !sess->controlled_step || !pending || !selected || !phase ||
+        !semantic || !cleanup)
+        return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    *pending = step->staging_cancel_pending;
+    *selected = step->staging_progress.identity != NULL;
+    *phase = step->staging_progress.initializer.phase;
+    *semantic = step->staging_cancel_result;
+    *cleanup = step->staging_cancel_protocol_status;
+    return 0;
+}
+bool
+wl_columnar_session_test_begin_failure_metadata_token(
+    const wl_col_session_t *sess,
+    const wl_columnar_memory_reservation_t *token)
+{
+    if (!sess || !sess->controlled_step) return false;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    return step->retirement_begin_failure_pending && step->retirement_begin_busy
+           && !step->retirement_busy && !step->retirement_native_count
+           && wl_columnar_session_retirement_begin_native(step)
+           && step->transaction && step->transaction_initialized
+           && token == &step->transaction->metadata_credit;
+}
+
+int
+wl_columnar_session_test_begin_failure_consumed(const wl_col_session_t *sess,
+    const wl_columnar_memory_reservation_t *token, uint64_t *out)
+{
+    if (!wl_columnar_session_test_begin_failure_metadata_token(sess,
+        token)) return EINVAL;
+    const wl_columnar_session_observed_transaction_t *tx =
+        sess->controlled_step->transaction;
+    return wl_evaluation_control_test_active_consumed(tx->maintenance,
+               tx->maintenance_id, out);
+}
+
+int
+wl_columnar_session_test_retirement_view(const wl_col_session_t *sess,
+    uint64_t out[16])
+{
+    if (!sess || !sess->controlled_step || !out) return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    memset(out, 0, 16u * sizeof(*out));
+    out[0] = step->retirement_native_count; out[1] = step->operation_id;
+    out[2] = (uint64_t)step->primary_result;
+    out[7] = step->retirement_work_valid |
+        (step->retirement_begin_failure_pending ? 2u : 0u)
+        | (step->retirement_begin_busy ? 4u : 0u);
+    if (step->transaction && step->transaction_initialized) {
+        const wl_columnar_session_observed_transaction_t *tx =
+            step->transaction;
+        out[3] = tx->phase; out[4] = tx->index;
+        out[5] = tx->rollback | ((uint64_t)step->transaction_discard << 1);
+        out[6] = tx->maintenance_id; out[8] = tx->round_index;
+        out[9] = tx->dispose_index;
+        out[10] = tx->round_progress.physical_done |
+            ((uint64_t)tx->disposal_progress.physical_done << 1);
+        out[11] =
+            tx->disposal_progress.identity ? tx->disposal_progress.role : 0;
+        if (tx->round_progress.begun) out[13] = tx->round_retirement.phase;
+        if (tx->disposal_progress.begun) out[14] = tx->disposal.phase;
+        if (tx->originals && tx->index && tx->index < tx->old_count
+            && tx->originals[tx->index - 1].retirement_progress.begun)
+            out[15] = tx->originals[tx->index - 1].retirement.ready;
+    } else if (step->recursive) {
+        const col_controlled_recursive_step_t *r = step->recursive;
+        out[2] = (uint64_t)r->primary_result; out[3] = r->phase;
+        out[4] = r->retirement_next; out[6] = r->maintenance_id;
+        out[10] = r->retirement_drained;
+        if (r->retirement.identity) {
+            out[12] = r->retirement.phase;
+            out[13] = !r->retirement.relation && !r->retirement_drained;
+        }
+    }
+    return 0;
+}
+
+int
+wl_columnar_session_test_staging_reader_status(const wl_col_session_t *sess,
+    bool *held, unsigned *stage, uint64_t *funding_id)
+{
+    if (!sess || !sess->controlled_step || !held || !stage ||
+        !funding_id) return EINVAL;
+    const wl_columnar_controlled_step_t *step = sess->controlled_step;
+    *held = step->successor_input_reader.owner != NULL;
+    *stage = step->successor_input_reader.release_stage;
+    *funding_id = step->staging_maintenance_id;
+    return 0;
+}
+#endif
+
 static int
 col_controlled_step_staging_finish(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
@@ -8642,7 +9326,8 @@ col_controlled_step_staging_finish(wl_col_session_t *sess,
     if (!step->successor_attempt) {
         step->staging_done = true; return 0;
     }
-    if (step->staging_retirement.storage.identity) {
+    if (step->staging_progress.identity) {
+        if (!step->staging_progress.begun) return EINVAL;
         if (!step->staging_retirement.committed) {
             if (step->staging_slot >= sess->nrels
                 || sess->rels[step->staging_slot]
@@ -8654,13 +9339,19 @@ col_controlled_step_staging_finish(wl_col_session_t *sess,
             session_rel_free_hash(sess);
             sess->last_removed_relation = NULL;
             sess->retraction_seeded = false;
+            return EAGAIN;
         }
-        int rc = wl_columnar_relation_scalar_retirement_step(
-            &step->staging_retirement, step->staging_maintenance,
-            step->staging_maintenance_id);
+        int rc = wl_columnar_session_retirement_drive(step,
+                &step->staging_progress,
+                step->staging_maintenance, step->staging_maintenance_id, 1);
         if (rc) return rc;
+        step->staging_registry = NULL;
         col_controlled_step_staging_end(step);
     }
+    /* Insert successors have no $r$ receipt, but their real native input
+     * reader also required precreated maintenance. Release that owner before
+     * a later successor resets this step's metadata. */
+    col_controlled_step_staging_end(step);
     /* The legacy observed domain has at most four slots after a removal and
      * private candidate. Visits were prepaid before publication. No live slot
      * moves, so the cached input/head proofs remain valid. */
@@ -8958,31 +9649,141 @@ col_controlled_recursive_maintenance_end(
     recursive->maintenance_active = false;
 }
 
-static int
-col_controlled_recursive_retire_managed(
-    col_controlled_recursive_step_t *recursive, col_rel_t **relation)
+/* One raw managed928B clear116 + four real token initializers60 + loop10
+ * + raw fixed fields12 + full selected/native/busy/funding/return<=58.
+ * Unlike scalar begin this raw initializer has no duplicate nested clear. */
+typedef char wl_columnar_session_managed_init_bound[
+        (sizeof(wl_columnar_relation_managed_retirement_t)+7u)/8u
+        +4u*((sizeof(wl_columnar_memory_reservation_t)+7u)/8u+4u)+80u <=
+        256u ? 1 : -1];
+
+static bool
+wl_columnar_session_managed_retirement_thread(
+    const col_controlled_recursive_step_t *r)
 {
-    if (!relation) return EINVAL;
-    if (!*relation) return 0;
-    if (!recursive->retirement.identity) {
-        int rc = wl_columnar_relation_managed_retirement_begin(
-            &recursive->retirement, *relation);
-        return rc == EBUSY ? EAGAIN : rc ? rc : EAGAIN;
+    if (!r->retirement_thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(r->retirement_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return r->retirement_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(r->retirement_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+col_controlled_recursive_retire_managed_body(
+    wl_columnar_controlled_step_t *step,
+    col_controlled_recursive_step_t *r, col_rel_t **owner)
+{
+    if (!r->retirement_owner) {
+        if (!*owner) return 0;
+        int registration = wl_columnar_session_retirement_register(step);
+        if (registration) return registration;
+        r->retirement_step = step; r->retirement_registered = true;
+        r->retirement_owner = owner; r->retirement_target = *owner;
+        r->retirement_aliases = owner == &r->old_working &&
+            *owner == r->working ? 1u : 0u;
+        if (owner == &r->candidate &&
+            *owner == r->copy_destination) r->retirement_aliases |= 2u;
+        if (r->copy_source == *owner) r->retirement_aliases |= 4u;
+#if defined(WL_HAVE_C11_THREADS)
+        r->retirement_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+        r->retirement_thread = GetCurrentThreadId();
+#else
+        r->retirement_thread = pthread_self();
+#endif
+        r->retirement_thread_valid = true;
     }
-    if (recursive->retirement.relation
-        && recursive->retirement.relation != *relation)
-        return EINVAL;
-    int rc = wl_columnar_relation_managed_retirement_step(
-        &recursive->retirement, recursive->maintenance_control,
-        recursive->maintenance_id);
+    if (r->retirement_owner != owner ||
+        !wl_columnar_session_managed_retirement_thread(r)) return EINVAL;
+    int rc;
+    if (!r->retirement_selected_paid) {
+        /* Selection/native/alias proof is its own128 region, so BEGIN's full
+        * fixed wrapper need not share its60-unit envelope with selection. */
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_retirement_checkpoint)
+            wl_columnar_session_test_retirement_checkpoint(
+                r->maintenance_control, 6, 10, 0, r->retirement_target);
+#endif
+        rc = wl_evaluation_control_charge_attempt(r->maintenance_control,
+                r->maintenance_id, 128);
+        if (rc) return rc;
+        r->retirement_selected_paid = true;
+        return EAGAIN;
+    }
+    if (r->retirement_drained) {
+        if (!r->retirement_registered || r->retirement_step != step
+            || !step->retirement_native_count ||
+            !wl_columnar_session_retirement_native_equal(step)) return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_retirement_checkpoint)
+            wl_columnar_session_test_retirement_checkpoint(
+                r->maintenance_control, 6, 6, 0, NULL);
+#endif
+        rc = wl_evaluation_control_charge_attempt(r->maintenance_control,
+                r->maintenance_id, 256);
+        if (rc) return rc;
+        memset(&r->retirement, 0, sizeof(r->retirement));
+        wl_columnar_session_retirement_unregister(step);
+        r->retirement_registered = false; r->retirement_step = NULL;
+        r->retirement_owner = NULL; r->retirement_target = NULL;
+        r->retirement_aliases = 0;
+        r->retirement_drained = r->retirement_thread_valid =
+            r->retirement_selected_paid = false;
+        return 0;
+    }
+    if (!r->retirement.identity) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_retirement_checkpoint)
+            wl_columnar_session_test_retirement_checkpoint(
+                r->maintenance_control, 6, 1, 0, r->retirement_target);
+#endif
+        rc = wl_evaluation_control_charge_attempt(r->maintenance_control,
+                r->maintenance_id, 256);
+        if (!rc) rc =
+                wl_columnar_relation_managed_retirement_begin(&r->retirement,
+                    r->retirement_target);
+        return rc ? rc : EAGAIN;
+    }
+    if (r->retirement.original_relation_address !=
+        (uintptr_t)r->retirement_target) return EINVAL;
+    rc = wl_columnar_relation_managed_retirement_step(&r->retirement,
+            r->maintenance_control, r->maintenance_id);
     if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
     if (rc) return rc;
-    if (recursive->retirement.phase
-        != WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE)
-        return EAGAIN;
-    *relation = NULL;
-    memset(&recursive->retirement, 0, sizeof(recursive->retirement));
-    return 0;
+    if (r->retirement.phase !=
+        WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE) return EAGAIN;
+    /* Pointer bits only. Descriptor may already be gone; no target read. */
+    r->retirement_drained = true; *owner = NULL;
+    if ((r->retirement_aliases & 1u) &&
+        r->working == r->retirement_target) r->working = NULL;
+    if ((r->retirement_aliases & 2u) &&
+        r->copy_destination == r->retirement_target) r->copy_destination = NULL;
+    if ((r->retirement_aliases & 4u) &&
+        r->copy_source == r->retirement_target) r->copy_source = NULL;
+    return EAGAIN;
+}
+
+static int
+col_controlled_recursive_retire_managed(wl_columnar_controlled_step_t *step,
+    col_controlled_recursive_step_t *r, col_rel_t **owner)
+{
+    if (!owner || step->recursive != r || r->identity != (uintptr_t)r
+        || !r->maintenance_control || !r->maintenance_id
+        || wl_evaluation_control_active_attempt_id(r->maintenance_control) !=
+        r->maintenance_id) return EINVAL;
+    if (step->retirement_busy || r->retirement_busy) return EBUSY;
+    if (r->retirement_owner &&
+        (!r->retirement_registered || r->retirement_step != step
+        || !step->retirement_native_count)) return EINVAL;
+    if (r->retirement_owner &&
+        !wl_columnar_session_managed_retirement_thread(r)) return EINVAL;
+    step->retirement_busy = r->retirement_busy = true;
+    int rc = col_controlled_recursive_retire_managed_body(step, r, owner);
+    r->retirement_busy = step->retirement_busy = false;
+    return rc;
 }
 
 static int
@@ -9159,6 +9960,12 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step,
     col_controlled_recursive_step_t *recursive)
 {
+    if (recursive->retirement_owner) {
+        int pending_rc = col_controlled_recursive_retire_managed(step,
+                recursive,
+                recursive->retirement_owner);
+        return pending_rc ? pending_rc : EAGAIN;
+    }
     int rc = col_controlled_recursive_abort_body(sess, step, recursive);
     if (rc) return rc;
     rc = col_controlled_recursive_release_edge(recursive);
@@ -9203,7 +10010,7 @@ col_controlled_recursive_abort_cleanup(wl_col_session_t *sess,
             && *relation == recursive->working;
         bool aliases_copy = slot == 3 && *relation
             && *relation == recursive->copy_destination;
-        rc = col_controlled_recursive_retire_managed(recursive, relation);
+        rc = col_controlled_recursive_retire_managed(step, recursive, relation);
         if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
         if (rc) return rc;
         if (aliases_working) recursive->working = NULL;
@@ -9559,7 +10366,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
         case COL_CONTROLLED_RECURSIVE_RETIRE_OLD_WORKING: {
             bool working_is_old = recursive->old_working
                 && recursive->old_working == recursive->working;
-            rc = col_controlled_recursive_retire_managed(recursive,
+            rc = col_controlled_recursive_retire_managed(step, recursive,
                     &recursive->old_working);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
             if (rc) {
@@ -9571,7 +10378,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             return EAGAIN;
         }
         case COL_CONTROLLED_RECURSIVE_RETIRE_CANDIDATE:
-            rc = col_controlled_recursive_retire_managed(recursive,
+            rc = col_controlled_recursive_retire_managed(step, recursive,
                     &recursive->candidate);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
             if (rc) {
@@ -9584,6 +10391,30 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             recursive->phase = COL_CONTROLLED_RECURSIVE_CHECK_CONVERGENCE;
             continue;
         case COL_CONTROLLED_RECURSIVE_CHECK_CONVERGENCE: {
+            if (recursive->retirement_owner) {
+                if (recursive->retirement_owner !=
+                    &recursive->delta) return EINVAL;
+                /* Preserve original per-existing-leaf convergence payment.
+                 * New selection/BEGIN/terminal-clear are pure maintenance
+                 * actions; no original polling is added to those regions. */
+                if (recursive->retirement.identity &&
+                    !recursive->retirement_drained){
+                    rc = col_controlled_recursive_charge(sess, recursive);
+                    if (rc) {
+                        col_controlled_recursive_fail(recursive, rc);
+                        return EAGAIN;
+                    }
+                }
+                rc = col_controlled_recursive_retire_managed(step, recursive,
+                        &recursive->delta);
+                if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
+                if (rc) {
+                    col_controlled_recursive_fail(recursive, rc); return EAGAIN;
+                }
+                col_controlled_recursive_maintenance_end(recursive);
+                recursive->phase = COL_CONTROLLED_RECURSIVE_DISPOSE_FRONTIER;
+                continue;
+            }
             rc = col_controlled_recursive_charge(sess, recursive);
             if (rc) {
                 col_controlled_recursive_fail(recursive, rc);
@@ -9620,7 +10451,8 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
                 return EAGAIN;
             }
             rc = col_controlled_recursive_maintenance_begin(recursive);
-            if (!rc) rc = col_controlled_recursive_retire_managed(recursive,
+            if (!rc) rc = col_controlled_recursive_retire_managed(step,
+                        recursive,
                         &recursive->delta);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
             if (rc) {
@@ -9632,7 +10464,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             continue;
         }
         case COL_CONTROLLED_RECURSIVE_COPY_FRONTIER:
-            if (recursive->copy_source && !recursive->retirement.identity
+            if (recursive->copy_source && !recursive->retirement_owner
                 && recursive->copy_row < recursive->copy_source->nrows) {
                 rc = col_controlled_recursive_charge(sess, recursive);
                 if (!rc) {
@@ -9654,7 +10486,8 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
             /* Resumed retirement must not read the retired delta alias. */
             recursive->copy_source = NULL;
             rc = col_controlled_recursive_maintenance_begin(recursive);
-            if (!rc) rc = col_controlled_recursive_retire_managed(recursive,
+            if (!rc) rc = col_controlled_recursive_retire_managed(step,
+                        recursive,
                         &recursive->delta);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
             if (!rc) col_controlled_recursive_maintenance_end(recursive);
@@ -9840,7 +10673,7 @@ col_controlled_step_recursive_drive(wl_col_session_t *sess,
         case COL_CONTROLLED_RECURSIVE_RETIRE_FINAL_WORKING:
             if (col_controlled_recursive_maintenance_begin(recursive))
                 return EAGAIN;
-            rc = col_controlled_recursive_retire_managed(recursive,
+            rc = col_controlled_recursive_retire_managed(step, recursive,
                     &recursive->working);
             if (rc == EAGAIN || rc == EBUSY) return EAGAIN;
             if (rc) {
@@ -10013,16 +10846,20 @@ wl_columnar_session_observed_maintenance(
 }
 
 static int
-wl_columnar_session_observed_cancel_claims(
+wl_columnar_session_observed_cancel_claims(wl_columnar_controlled_step_t *step,
     wl_columnar_session_observed_transaction_t *tx)
 {
+    int rc = wl_columnar_session_observed_maintenance(tx);
+    if (rc) return rc;
     if (tx->rollback_index < tx->old_count) {
-        wl_columnar_relation_scalar_retirement_t *r =
-            &tx->originals[tx->rollback_index].retirement;
-        if (r->storage.identity && !r->committed) {
-            int rc = wl_columnar_relation_scalar_retirement_cancel(r);
+        wl_columnar_session_observed_original_t *original =
+            &tx->originals[tx->rollback_index];
+        wl_columnar_session_retirement_progress_t *p =
+            &original->retirement_progress;
+        if (p->identity) {
+            rc = wl_columnar_session_retirement_drive(step, p, tx->maintenance,
+                    tx->maintenance_id, 2);
             if (rc) return rc;
-            memset(r, 0, sizeof(*r));
         }
         tx->rollback_index++;
         return EAGAIN;
@@ -10117,42 +10954,23 @@ wl_columnar_session_recursive_positive_op(const wl_plan_op_t *op)
 }
 
 static int
-wl_columnar_session_recursive_retire(
+wl_columnar_session_recursive_retire(wl_columnar_controlled_step_t *step,
     wl_columnar_session_observed_transaction_t *tx, col_rel_t **owner,
     wl_evaluation_control_t *control, uint64_t id)
 {
-    wl_columnar_relation_scalar_retirement_t *r = &tx->round_retirement;
-    if (!r->storage.identity) {
-        int rc = wl_columnar_relation_scalar_retirement_begin(r, *owner);
-        if (rc) return rc;
-        tx->round_owner = owner;
-    }
-    if (tx->round_owner != owner) return EINVAL;
-#ifdef WL_SESSION_TEST_HOOKS
-    /* Exercise retained ownership after physical disposal has begun, and
-     * after the descriptor is gone but managed credit retirement remains. */
-    if (wl_columnar_session_test_observed_transaction_checkpoint &&
-        r->committed && tx->round > 0) {
-        if (r->phase == 6 && r->column > 0)
-            wl_columnar_session_test_observed_transaction_checkpoint(control,
-                22, 0, NULL);
-        else if (r->phase == 13)
-            wl_columnar_session_test_observed_transaction_checkpoint(control,
-                23, 0, NULL);
-    }
-#endif
-    if (!r->committed) {
-        int rc = wl_columnar_relation_scalar_retirement_prepare(r, control, id);
-        if (rc) return rc;
-        rc = wl_columnar_relation_scalar_retirement_commit(r);
-        if (rc) return rc;
-    }
-    int rc = wl_columnar_relation_scalar_retirement_step(r, control, id);
+    wl_columnar_session_retirement_progress_t *p = &tx->round_progress;
+    if (step->retirement_busy) return EBUSY;
+    if (!p->identity && !*owner) return 0;
+    if (tx->round_owner && tx->round_owner != owner) return EINVAL;
+    tx->round_owner = owner;
+    int rc = wl_columnar_session_retirement_select(step, p, tx,
+            &tx->round_retirement,
+            p->identity ? p->target : *owner, owner, NULL, 2,
+            p->identity ? p->index : tx->round_index);
     if (rc) return rc;
-    *owner = NULL;
-    tx->round_owner = NULL;
-    memset(r, 0, sizeof(*r));
-    return 0;
+    rc = wl_columnar_session_retirement_drive(step, p, control, id, 1);
+    if (!rc) tx->round_owner = NULL;
+    return rc ? rc : EAGAIN;
 }
 
 static int
@@ -10195,9 +11013,17 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         wl_columnar_session_test_observed_transaction_checkpoint(control, 24,
             tx->round, &tx->bindings);
 #endif
+    bool retirement_action = (tx->phase == WL_SESSION_OBSERVED_CLAIMS
+        && tx->index < tx->old_count && tx->originals[tx->index].retire)
+        || (tx->phase == WL_SESSION_RECURSIVE_RETIRE
+        && tx->round_index < tx->round_end && (tx->round_owner
+        || tx->heads[tx->round_index].previous ||
+        tx->heads[tx->round_index].frontier
+        || (!tx->round_changed && tx->heads[tx->round_index].next_frontier)));
     if ((tx->phase < WL_SESSION_OBSERVED_RETIRE
         || tx->phase >= WL_SESSION_RECURSIVE_SEED) &&
-        !(tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active)){
+        !(tx->phase == WL_SESSION_OBSERVED_EVALUATE && tx->child_active)
+        && !retirement_action){
         rc = wl_evaluation_control_charge_attempt(control, step->operation_id,
                 tx->phase == WL_SESSION_OBSERVED_PLAN ? 256 : tx->phase ==
                 WL_SESSION_OBSERVED_ALLOCATE ||
@@ -10988,27 +11814,30 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
     }
     case WL_SESSION_RECURSIVE_RETIRE:
         if (tx->round_index < tx->round_end) {
-            if (tx->heads[tx->round_index].previous) {
-                rc = wl_columnar_session_recursive_retire(tx,
+            if (tx->heads[tx->round_index].previous
+                || tx->round_owner == &tx->heads[tx->round_index].previous) {
+                rc = wl_columnar_session_recursive_retire(step, tx,
                         &tx->heads[tx->round_index].previous, control,
                         step->operation_id);
                 if (rc) return rc;
             }
             wl_columnar_session_observed_head_t *head =
                 &tx->heads[tx->round_index];
-            if (head->frontier) {
-                rc = wl_columnar_session_recursive_retire(tx, &head->frontier,
+            if (head->frontier || tx->round_owner == &head->frontier) {
+                rc = wl_columnar_session_recursive_retire(step, tx,
+                        &head->frontier,
                         control, step->operation_id);
                 if (rc) return rc;
             }
-            if (head->next_frontier) {
+            if (head->next_frontier ||
+                tx->round_owner == &head->next_frontier){
                 if (tx->round_changed) {
                     head->frontier = head->next_frontier;
                     head->next_frontier = NULL;
                     head->frontier_snapshot =
                         wl_columnar_relation_snapshot(head->frontier);
                 } else {
-                    rc = wl_columnar_session_recursive_retire(tx,
+                    rc = wl_columnar_session_recursive_retire(step, tx,
                             &head->next_frontier,
                             control, step->operation_id);
                     if (rc) return rc;
@@ -11141,13 +11970,15 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             wl_columnar_session_observed_original_t *original =
                 &tx->originals[tx->index];
             if (original->retire) {
-                if (!original->retirement.storage.identity) {
-                    rc = wl_columnar_relation_scalar_retirement_begin(
-                        &original->retirement, original->relation);
-                    if (rc) return rc;
-                }
-                rc = wl_columnar_relation_scalar_retirement_prepare(
-                    &original->retirement, control, step->operation_id);
+                rc =
+                    wl_columnar_session_retirement_select(step,
+                        &original->retirement_progress,
+                        original, &original->retirement, original->relation,
+                        &original->relation, NULL, 3, tx->index);
+                if (rc) return rc;
+                rc = wl_columnar_session_retirement_drive(step,
+                        &original->retirement_progress,
+                        control, step->operation_id, 0);
                 if (rc) return rc;
                 if (!wl_columnar_relation_snapshot_equal(original->snapshot,
                     wl_columnar_relation_snapshot(
@@ -11233,13 +12064,13 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         {
             wl_columnar_session_observed_original_t *original =
                 &tx->originals[tx->index];
-            if (original->retire) {
-                rc =
-                    wl_columnar_relation_scalar_retirement_step(
-                    &original->retirement,
-                    tx->maintenance, tx->maintenance_id);
+            if (original->retire && !original->retirement_done) {
+                rc = wl_columnar_session_retirement_drive(step,
+                        &original->retirement_progress,
+                        tx->maintenance, tx->maintenance_id, 1);
                 if (rc) return rc;
-            } else if (original->relation) {
+                original->retirement_done = true;
+            } else if (!original->retire && original->relation) {
                 rc = wl_columnar_relation_reader_step(original->relation,
                         &original->reader, true, tx->maintenance,
                         tx->maintenance_id);
@@ -11248,8 +12079,9 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
             tx->index++; return 0;
         }
     case WL_SESSION_OBSERVED_FINISH:
-        if (tx->append_delta) {
-            rc = wl_columnar_session_recursive_retire(tx, &tx->append_delta,
+        if (tx->append_delta || tx->round_owner == &tx->append_delta) {
+            rc = wl_columnar_session_recursive_retire(step, tx,
+                    &tx->append_delta,
                     tx->maintenance, tx->maintenance_id);
             if (rc) return rc;
             return 0;
@@ -11257,29 +12089,20 @@ wl_columnar_session_observed_action(wl_col_session_t *sess,
         if (tx->index < plan->edb_count) {
             wl_columnar_eval_private_dynamic_binding_t *entry =
                 &tx->entries[tx->index];
-            if (entry->relation != entry->public_relation) {
-                if (!tx->disposal.storage.identity) {
-                    rc =
-                        wl_columnar_relation_scalar_retirement_begin(
-                        &tx->disposal, entry->relation);
-                    if (rc) return rc;
-                }
-                if (!tx->disposal.committed) {
-                    rc =
-                        wl_columnar_relation_scalar_retirement_prepare(
+            if (entry->relation != entry->public_relation ||
+                tx->disposal_progress.identity){
+                wl_columnar_session_retirement_progress_t *p =
+                    &tx->disposal_progress;
+                rc = wl_columnar_session_retirement_select(step, p, tx,
                         &tx->disposal,
-                        tx->maintenance, tx->maintenance_id);
-                    if (rc) return rc;
-                    rc =
-                        wl_columnar_relation_scalar_retirement_commit(
-                        &tx->disposal);
-                    if (rc) return rc;
-                }
-                rc = wl_columnar_relation_scalar_retirement_step(&tx->disposal,
-                        tx->maintenance, tx->maintenance_id);
+                        p->identity ? p->target : entry->relation,
+                        &entry->relation,
+                        entry->public_relation, 4, tx->index);
                 if (rc) return rc;
-                entry->relation = entry->public_relation;
-                memset(&tx->disposal, 0, sizeof(tx->disposal));
+                rc = wl_columnar_session_retirement_drive(step, p,
+                        tx->maintenance,
+                        tx->maintenance_id, 1);
+                if (rc) return rc;
             }
             tx->index++; return 0;
         }
@@ -11306,6 +12129,7 @@ static int
 wl_columnar_session_observed_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
+    if (!wl_columnar_session_retirement_native_equal(step)) return EBUSY;
     if (step->transaction_discard) {
         int rc = wl_columnar_session_observed_dispose(sess, step);
         if (rc) return EAGAIN;
@@ -11349,7 +12173,8 @@ wl_columnar_session_observed_drive(wl_col_session_t *sess,
     wl_columnar_session_observed_transaction_t *tx = step->transaction;
     for (unsigned action = 0; action < 64; ++action) {
         if (tx->rollback) {
-            int cancel_rc = wl_columnar_session_observed_cancel_claims(tx);
+            int cancel_rc = wl_columnar_session_observed_cancel_claims(step,
+                    tx);
             if (cancel_rc) return EAGAIN;
             tx->rollback = false;
             tx->phase = WL_SESSION_OBSERVED_CLAIMS; tx->index = 0;
@@ -11397,6 +12222,7 @@ static int
 wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
+    if (!wl_columnar_session_retirement_native_equal(step)) return EBUSY;
     wl_columnar_session_observed_transaction_t *tx = step->transaction;
     if (!tx) return 0;
     if (!step->transaction_initialized) {
@@ -11421,19 +12247,14 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
                     tx->maintenance_id);
             if (rc) return rc;
         }
-        if (original->retirement.committed) {
-            rc =
-                wl_columnar_relation_scalar_retirement_step(
-                &original->retirement,
-                tx->maintenance, tx->maintenance_id);
+        wl_columnar_session_retirement_progress_t *p =
+            &original->retirement_progress;
+        if (p->identity) {
+            bool committed = p->begun && original->retirement.committed;
+            rc = wl_columnar_session_retirement_drive(step, p, tx->maintenance,
+                    tx->maintenance_id, committed ? 1 : 2);
             if (rc) return rc;
-        }
-        if (original->retirement.storage.identity &&
-            !original->retirement.committed) {
-            rc =
-                wl_columnar_relation_scalar_retirement_cancel(
-                &original->retirement);
-            if (rc) return rc;
+            if (committed) original->retirement_done = true;
         }
         tx->cleanup_index++;
         return EAGAIN;
@@ -11450,26 +12271,27 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     }
     if (tx->phase >= WL_SESSION_OBSERVED_SCHEMA && tx->heads) {
         if (tx->round_owner) {
-            rc = wl_columnar_session_recursive_retire(tx, tx->round_owner,
+            rc = wl_columnar_session_recursive_retire(step, tx, tx->round_owner,
                     tx->maintenance, tx->maintenance_id);
             if (rc) return rc;
         }
         while (tx->cleanup_round < tx->head_count) {
             col_rel_t **owner = &tx->heads[tx->cleanup_round].previous;
             if (*owner) {
-                rc = wl_columnar_session_recursive_retire(tx, owner,
+                rc = wl_columnar_session_recursive_retire(step, tx, owner,
                         tx->maintenance, tx->maintenance_id);
                 if (rc) return rc;
             }
             wl_columnar_session_observed_head_t *head =
                 &tx->heads[tx->cleanup_round];
-            if (head->frontier) {
-                rc = wl_columnar_session_recursive_retire(tx, &head->frontier,
+            if (head->frontier || tx->round_owner == &head->frontier) {
+                rc = wl_columnar_session_recursive_retire(step, tx,
+                        &head->frontier,
                         tx->maintenance, tx->maintenance_id);
                 if (rc) return rc;
             }
             if (head->next_frontier) {
-                rc = wl_columnar_session_recursive_retire(tx,
+                rc = wl_columnar_session_recursive_retire(step, tx,
                         &head->next_frontier,
                         tx->maintenance, tx->maintenance_id);
                 if (rc) return rc;
@@ -11479,10 +12301,15 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
         }
     }
     if (tx->append_delta) {
-        rc = wl_columnar_session_recursive_retire(tx, &tx->append_delta,
+        rc = wl_columnar_session_recursive_retire(step, tx, &tx->append_delta,
                 tx->maintenance, tx->maintenance_id);
         if (rc) return rc;
         return EAGAIN;
+    }
+    if (tx->disposal_progress.identity) {
+        rc = wl_columnar_session_retirement_drive(step, &tx->disposal_progress,
+                tx->maintenance, tx->maintenance_id, 1);
+        return rc ? rc : EAGAIN;
     }
     uint32_t entries = tx->phase < WL_SESSION_OBSERVED_SCHEMA ? 0 : tx->count;
     if (entries > tx->count) entries = tx->count;
@@ -11495,26 +12322,20 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
             : tx->committed ? NULL : tx->heads[i -
                 sess->plan->edb_count].candidate;
         if (r) {
-            if (!tx->disposal.storage.identity) {
-                rc = wl_columnar_relation_scalar_retirement_begin(&tx->disposal,
-                        r);
-                if (rc) return rc;
-            }
-            if (!tx->disposal.committed) {
-                rc =
-                    wl_columnar_relation_scalar_retirement_prepare(
-                    &tx->disposal,
-                    tx->maintenance, tx->maintenance_id);
-                if (rc) return rc;
-                rc =
-                    wl_columnar_relation_scalar_retirement_commit(
-                    &tx->disposal);
-                if (rc) return rc;
-            }
-            rc = wl_columnar_relation_scalar_retirement_step(&tx->disposal,
-                    tx->maintenance, tx->maintenance_id);
+            col_rel_t **slot = i <
+                sess->plan->edb_count ? &tx->entries[i].relation
+                : &tx->heads[i - sess->plan->edb_count].candidate;
+            col_rel_t *replacement = i < sess->plan->edb_count
+                ? tx->entries[i].public_relation : NULL;
+            rc = wl_columnar_session_retirement_select(step,
+                    &tx->disposal_progress,
+                    tx, &tx->disposal, r, slot, replacement,
+                    i < sess->plan->edb_count ? 4 : 5, i);
             if (rc) return rc;
-            memset(&tx->disposal, 0, sizeof(tx->disposal));
+            rc = wl_columnar_session_retirement_drive(step,
+                    &tx->disposal_progress,
+                    tx->maintenance, tx->maintenance_id, 1);
+            if (rc) return rc;
         }
         tx->dispose_index++;
         return EAGAIN;
@@ -11546,25 +12367,111 @@ wl_columnar_session_observed_dispose(wl_col_session_t *sess,
     (void)wl_evaluation_control_finish(tx->maintenance, tx, 0, 0);
     (void)wl_evaluation_control_detach(tx->maintenance, tx);
     wl_evaluation_control_release(tx->maintenance);
+    assert(!step->retirement_native_count);
     free(tx); step->transaction = NULL;
     return 0;
+}
+
+/* Original begin failed before creating an attempt. Use only the existing
+ * transaction maintenance; repeat the actual completed WORK while it drains. */
+static int
+wl_columnar_session_retirement_begin_failure_body(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    wl_columnar_session_observed_transaction_t *tx = step->transaction;
+    if (!tx || !step->transaction_initialized || tx->child_active
+        || sess->cleanup_active) return EINVAL;
+    int rc = wl_columnar_session_observed_maintenance(tx);
+    if (rc) {
+        step->retirement_begin_cleanup_status = rc;
+        return WL_EVALUATION_CONTROL_WORK_LIMIT;
+    }
+    step->retirement_busy = true;
+    /* Prepay the final fixed suffix BEFORE disposal can free maintenance.
+    * Each later turn pays its own bounded proof/wrapper128 separately. */
+    if (!step->retirement_begin_final_paid) {
+        rc = wl_evaluation_control_charge_attempt(tx->maintenance,
+                tx->maintenance_id, 128);
+        if (!rc) step->retirement_begin_final_paid = true;
+    }
+    if (!rc) rc = wl_evaluation_control_charge_attempt(tx->maintenance,
+                tx->maintenance_id, 128);
+    step->retirement_busy = false;
+    if (!rc) rc = wl_columnar_session_observed_dispose(sess, step);
+    if (rc) {
+        if (rc != EAGAIN &&
+            rc != EBUSY) step->retirement_begin_cleanup_status = rc;
+        return WL_EVALUATION_CONTROL_WORK_LIMIT;
+    }
+    /* Actual disposal proved count0 and freed all transaction owners. This
+     * callback-free suffix consumes the genuine earlier128 prepayment. No
+     * access to the freed maintenance handle and no original finish occurs. */
+    assert(!step->transaction && !step->retirement_native_count);
+    int result = step->retirement_begin_error;
+    step->retirement_begin_failure_pending = false;
+    step->retirement_begin_final_paid = false;
+    step->retirement_work_valid = false;
+    step->general_observed = false;
+    step->observed = false;
+    step->refused = true;
+    return result;
+}
+
+/* This outer guard spans even non-scalar metadata callbacks. Actual owned
+ * scalar leaves retain their independent retirement_busy protocol. */
+static int
+wl_columnar_session_retirement_begin_failure_drive(wl_col_session_t *sess,
+    wl_columnar_controlled_step_t *step)
+{
+    if (step->retirement_begin_busy) return EBUSY;
+    if (!step->retirement_begin_failure_pending
+        || !wl_columnar_session_retirement_work_proof(sess,
+        step)) return EINVAL;
+    if (!wl_columnar_session_retirement_begin_native(step))
+        return WL_EVALUATION_CONTROL_WORK_LIMIT;
+    step->retirement_begin_busy = true;
+    int rc = wl_columnar_session_retirement_begin_failure_body(sess, step);
+    step->retirement_begin_busy = false; /* Last store, including after tx free. */
+    return rc;
 }
 
 static int
 col_controlled_step_drive(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step, bool teardown)
 {
+    if (step->retirement_begin_busy || step->retirement_busy) return EBUSY;
+    int owner_guard = wl_columnar_session_retirement_entry_guard(sess, step);
+    if (owner_guard) return owner_guard;
+    if (step->retirement_begin_failure_pending)
+        return wl_columnar_session_retirement_begin_failure_drive(sess, step);
+    if (step->staging_cancel_pending) return
+            wl_columnar_session_staging_cancel_drive(sess, step);
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     const void *owner = sess->base.operation_admission;
     step->default_preflight_call_actions = 0;
     if (!step->operation_active) {
         step->refused = false;
         int rc = wl_evaluation_control_begin(control, owner);
-        if (rc) return rc;
+        if (rc) {
+            wl_columnar_session_observed_transaction_t *tx = step->transaction;
+            if (rc == EOVERFLOW && step->retirement_native_count
+                && step->general_observed && tx && step->transaction_initialized
+                && !tx->committed && !tx->child_active && !sess->cleanup_active
+                && tx->round_owner && tx->round_progress.identity
+                && wl_columnar_session_retirement_work_proof(sess, step)) {
+                step->retirement_begin_error = rc;
+                step->retirement_begin_thread = step->retirement_native_thread;
+                step->retirement_begin_failure_pending = true;
+                return WL_EVALUATION_CONTROL_WORK_LIMIT;
+            }
+            return rc;
+        }
         step->operation_id = wl_evaluation_control_active_attempt_id(control);
         if (!step->operation_id) return EINVAL;
         step->operation_active = true;
+        step->retirement_work_valid = false;
         step->primary_result = 0;
+        step->staging_cancel_protocol_status = 0;
     } else if (wl_evaluation_control_active_attempt_id(control)
         != step->operation_id) {
         return EINVAL;
@@ -11619,7 +12526,9 @@ col_controlled_step_drive(wl_col_session_t *sess,
             || source->storage_generation
             != step->successor_input_storage_generation)
             return col_controlled_step_finish(sess, step, EINVAL);
-        int lease_rc = wl_evaluation_control_charge(control, 1);
+        int lease_rc = wl_columnar_session_staging_maintenance(step);
+        if (lease_rc) return col_controlled_step_finish(sess, step, lease_rc);
+        lease_rc = wl_evaluation_control_charge(control, 1);
         if (lease_rc)
             return col_controlled_step_finish(sess, step, lease_rc);
         lease_rc = col_rel_source_reader_acquire(source,
@@ -11965,7 +12874,20 @@ static int
 col_controlled_step(wl_col_session_t *sess,
     wl_columnar_session_snapshot_payload_t *snapshot)
 {
+    if (sess->controlled_step &&
+        (sess->controlled_step->retirement_begin_busy
+        || sess->controlled_step->retirement_busy)) return EBUSY;
     wl_columnar_controlled_step_t *step = sess->controlled_step;
+    if (step) {
+        int owner_guard = wl_columnar_session_retirement_entry_guard(sess,
+                step);
+        if (owner_guard) return owner_guard;
+    }
+    if (step && step->retirement_begin_failure_pending)
+        return wl_columnar_session_retirement_begin_failure_drive(sess, step);
+    if (step &&
+        step->staging_cancel_pending) return
+            wl_columnar_session_staging_cancel_drive(sess, step);
     if (step && step->snapshot_retry && !snapshot) return EBUSY;
     if (step && snapshot) {
         step->snapshot_owned = true;
@@ -12077,6 +12999,9 @@ col_controlled_step(wl_col_session_t *sess,
 static int
 wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
 {
+    if (sess->controlled_step &&
+        (sess->controlled_step->retirement_begin_busy
+        || sess->controlled_step->retirement_busy)) return EBUSY;
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step) return 0;
     int rc = 0;
@@ -12089,31 +13014,21 @@ wl_columnar_session_controlled_step_drain_for_destroy(wl_col_session_t *sess)
             dispose_rc = wl_columnar_session_observed_dispose(sess, step);
         if (dispose_rc) return dispose_rc == EAGAIN ? EBUSY : dispose_rc;
     }
-    if (step->staging_retirement.storage.identity && !step->staging_done) {
-        if (step->staging_retirement.committed) {
-            int cleanup_rc;
-            do {
-                cleanup_rc = col_controlled_step_staging_finish(sess, step);
-            }while (cleanup_rc == EAGAIN);
-            if (cleanup_rc) return cleanup_rc;
-        } else {
-            int cancel_rc = wl_columnar_relation_scalar_retirement_cancel(
-                &step->staging_retirement);
-            if (cancel_rc) return cancel_rc;
-        }
-    }
+    if (step->retirement_native_count || step->staging_cancel_pending ||
+        step->staging_progress.identity
+        || step->successor_input_reader.owner ||
+        step->successor_input_reader.secondary_owner
+        || step->successor_input_reader.identity ||
+        step->successor_input_reader.thread_valid
+        || step->successor_input_reader.acquire_stage ||
+        step->successor_input_reader.release_stage)
+        return EBUSY;
     col_controlled_step_staging_end(step);
     if (step->successor_candidate_detached && step->successor_candidate) {
         int candidate_rc = col_rel_destroy_checked(step->successor_candidate);
         if (candidate_rc != 0)
             return candidate_rc;
         step->successor_candidate = NULL;
-    }
-    if (step->successor_input_reader.owner) {
-        int reader_rc = col_rel_source_reader_release(
-            &step->successor_input_reader);
-        if (reader_rc != 0)
-            return reader_rc;
     }
     /* The drained host relinquishes its retained baseline before generic
      * observer disposal. No evaluation or publication remains in flight. */
@@ -12135,6 +13050,21 @@ col_session_step(wl_session_t *session)
 {
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->controlled_step &&
+        (sess->controlled_step->retirement_begin_busy
+        || sess->controlled_step->retirement_busy)) return EBUSY;
+    if (sess->controlled_step) {
+        int owner_guard = wl_columnar_session_retirement_entry_guard(sess,
+                sess->controlled_step);
+        if (owner_guard) return owner_guard;
+    }
+    if (sess->controlled_step &&
+        sess->controlled_step->retirement_begin_failure_pending)
+        return wl_columnar_session_retirement_begin_failure_drive(sess,
+                   sess->controlled_step);
+    if (sess->controlled_step && sess->controlled_step->staging_cancel_pending)
+        return wl_columnar_session_staging_cancel_drive(sess,
+                   sess->controlled_step);
     if (wl_columnar_session_cold_pending(sess)) return EBUSY;
     sess->cold_seal_closed = true;
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
@@ -12152,6 +13082,9 @@ col_session_controlled_step_state(const wl_session_t *session)
     if (sess->cleanup_active || sess->cleanup_pending)
         return WL_CONTROLLED_STEP_PENDING;
     if (!step) return WL_CONTROLLED_STEP_IDLE;
+    if (step->staging_cancel_pending || step->retirement_native_count
+        || step->retirement_begin_failure_pending) return
+            WL_CONTROLLED_STEP_PENDING;
     if (step->snapshot_retry && !step->operation_active)
         return WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE;
     if (step->provenance_invalid
@@ -12183,6 +13116,10 @@ static int
 col_session_controlled_mutation_admit(wl_session_t *session, bool insert,
     const char *relation, uint32_t num_rows, uint32_t num_cols)
 {
+    if (COL_SESSION(session)->controlled_step &&
+        (COL_SESSION(session)->controlled_step->retirement_begin_busy
+        || COL_SESSION(
+            session)->controlled_step->retirement_busy)) return EBUSY;
     wl_col_session_t *sess = COL_SESSION(session);
     wl_columnar_controlled_step_t *step = sess->controlled_step;
     if (!step) return EBUSY;
@@ -13453,6 +14390,9 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 {
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (sess->controlled_step &&
+        (sess->controlled_step->retirement_begin_busy
+        || sess->controlled_step->retirement_busy)) return EBUSY;
     if (wl_columnar_session_cold_pending(sess)) return EBUSY;
     sess->cold_seal_closed = true;
     int cold_rc = wl_columnar_session_cold_execution_check(sess);

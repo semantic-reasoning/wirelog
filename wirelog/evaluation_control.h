@@ -88,6 +88,10 @@ uint64_t wl_evaluation_control_active_attempt_id(
 /* Inactive attached owner only; advance the generator without changing report. */
 int wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
     const void *owner, uint64_t value);
+/* Caller holds live control and disjoint out. Fixed copied observation only;
+ * inactive/stale/overlapping output fails without a write or work charge. */
+int wl_evaluation_control_test_active_consumed(wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id, uint64_t *out);
 /* Isolated test process only; seeds the next process-wide control identity. */
 int wl_evaluation_control_test_seed_next_identity(uint64_t value);
 #endif

@@ -966,9 +966,9 @@ The real composed path proves383 consumes wrapper128 while refusing ZERO;
 the real framed path proves767 consumes512 while refusing ZERO and768
 executes it. Successful RELEASE remains outside the new cleanup class.
 
-This caller set does not complete containing session staging, recursive-round,
-original CLAIMS or transaction-disposal initialization. Those remaining
-session.c raw begin/cancel sites require the next separately reviewed unit.
+This caller set alone does not cover containing session staging, recursive-round,
+original CLAIMS or transaction-disposal initialization. The session protocol
+below supplies those distinct ownership and rollback transitions.
 The existing raw LFTJ metadata preflight's bounded-count loop is also retained
 for the final source audit; this initializer change does not certify that
 loop's full caller envelope. Prepared unary publication, registered cache
@@ -985,3 +985,144 @@ witness deterministically failed on the pre-initializer HEAD as well, because
 the full-right host never calls it. Corrected instrumentation retains exact
 stop codes, no publication/output before retry, source snapshot parity and
 exactly one later publication with unchanged literal/raw output comparisons.
+
+### Containing session retirement and native cancellation
+
+Staging removal, recursive-round temporaries, per-original reversible CLAIMS
+and failed/successful private candidate disposal use final-address session
+progress alongside each existing scalar receipt. Selection stores the actual
+parent, exact receipt/target/slot/replacement, role/index and native owner
+before any initializer hook. Staging saves name-scan completion and its found
+registry slot separately from scalar identity. Original/round/disposal indices
+cannot advance until the selected action genuinely completes. Expanded
+transaction/original sizes remain in actual admission and incremental zeroing.
+No session caller invokes raw scalar begin or raw scalar cancel.
+
+Each BOOT/ZERO/BIND/RESET is one actual shared-initializer action. BIND hands
+a genuinely begun receipt to its parent before RESET may fail. Reversible
+rollback obtains real maintenance first and uses distinct release256 then
+scalar/progress clear256. Scalar clear includes123 eight-byte receipt units,
+actual progress bytes and fixed caller/native/slot suffix under a layout
+bound; it does not repeat raw cancel. Scalar commit remains the existing
+single publication/disposal boundary. Physical DONE latches stable progress
+and changes the exact owner slot callback-free, then returns. The next
+clear256 never rereads or steps a freed relation. Per-original completed
+retirement prevents RETIRE/destruction double stepping. Private EDB disposal
+restores its public binding; failed head disposal nulls only its private slot.
+A restored/NULL slot cannot make an outstanding terminal clear disappear.
+
+The adjacent binary recursive managed path has a separate genuine SELECT128,
+then one raw managed BEGIN256, existing managed leaves, and a later CLEAR256.
+BEGIN inventories a single928B clear116, four token initializers60, loop10,
+raw fixed12 and caller/native/funding/return at most58; it does not call scalar
+begin or duplicate the managed clear. SELECT captures exact owner/native and
+working/copy aliases in its own paid action. During destruction and token
+retirement the selected continuation runs before any payload/NULL predicate
+or independent abort disposal. Descriptor free can precede final credits;
+no path rereads its target during that interval. At actual DONE the exact
+owner and captured matching working/copy/typed source aliases become NULL
+without another callback; later clear leaves unrelated/public objects intact.
+Convergence/frontier code recognizes selected retirement before source reads.
+Existing original per-leaf convergence work is preserved; new selection,
+BEGIN, clear and cleanup funding remain actual maintenance work.
+
+An unpublished legacy successor may own a native input reader before any
+staging selection. Real private maintenance therefore exists before that
+reader is acquired. A terminal error with either genuine selected staging
+or this reader latches its first result and keeps the original STEP active.
+STEP returns EAGAIN while its actual native owner performs one cancellation
+or END action. The input reader END pays128 for one real release_step/CAS;
+a combined token needs two successful decrements (contention may need more
+attempts), storage first then descriptor. Stage1 does not revalidate an
+already released storage hold. Owner-NULL is terminal only when every active
+token field is inert. The saved native parent stays authoritative after
+scalar clear until reader END and a distinct FINALIZE128 complete.
+
+Foreign STEP during these selected/pending states returns EAGAIN without
+polling/debiting the original or mutating the continuation. The real active
+ID keeps generic pending admission closed, including after a foreign STEP;
+checked destroy rejects before closing or clearing its caller slot. Only
+after all native owners are inert does FINALIZE report the saved original
+result once. Idle destruction can then run on another externally synchronized
+thread. No native release, mandatory allocation or retry loop is delegated
+to an already-entered void backend destructor. Committed publication uses
+its existing protected physical cleanup and cannot be canceled by this
+uncommitted path. Existing WORK_LIMIT logical retry admission remains intact.
+
+A refused cleanup action keeps its actual owner and copied protocol diagnostic.
+Recovered refusal history remains queryable internally until the next real
+operation. Once every obligation completes, final cleanup outcome is success;
+a historical validator refusal is not passed as an unresolved cleanup error
+that would override the saved original cancellation/work-limit result.
+Original allowance/report ownership is never reset or replayed for cleanup.
+
+Actual tests stop scalar initialization/READY/physical-clear stages in legacy
+removal, multihead original CLAIMS, general positive recursive rounds and
+binary managed retirement. They compare original public/source snapshots,
+literal/raw results, callbacks and final resource owners. Real second-thread
+STEP plus checked destroy attempts run while selected, during cancellation,
+at input release_stage1 and after reader-inert before FINALIZE. They preserve
+live IDs, exact gate counts and copied status, then verify legal foreign idle
+destruction or a genuine retry that reacquires the saved source and publishes
+once. A pre-staging observer allocation failure exercises reader-only cleanup.
+The actual owner STEP also receives genuine127/128 test grants at END:127
+leaves both gates/stage untouched with zero consumed;128 performs exactly one
+decrement. This conditional test funding seam lends no token or disposal
+authority; production cleanup uses its actual private unlimited maintenance.
+Final zero-governor assertions occur after sessions AND the program-owned
+intern table are released, with the external governor held for inspection.
+
+This unit changes retirement initialization, rollback and ownership only.
+Prepared unary publication, registered cache exclusion/pins/insertion, strict
+arrangement/cap/shared operation policies and complete observed/configured
+successor qualification remain required before completing the grouped PR.
+
+Every actual selected scalar/managed continuation also registers with its real
+containing STEP. The count is exclusion provenance; it never supplies READY
+or source authority. The final genuine clear unregisters exactly once.
+Foreign entry is rejected before cold sealing, phase/index changes, original
+polling or cleanup. With an active original it returns same-ID EAGAIN. If a
+real completed WORK_LIMIT retained a selected round, it returns that same
+verified completed report/result while backend admission remains PENDING.
+Legitimate reset/configure changes future allowance without changing this
+completed proof. Only a successful real next begin retires that proof. Once
+all owners drain, idle destruction has no creation-thread restriction.
+
+The actual max-attempt boundary is qualified separately. A retained general
+transaction round can finish real attempt UINT64_MAX with WORK_LIMIT; its
+next real begin then fails EOVERFLOW before creating another attempt. This
+failure retains the captured native origin independently of the selected
+count while actual transaction disposal drains readers and metadata. Each
+native call advances the existing maintenance cleanup only; foreign calls
+repeat the same authenticated past WORK result without advancing it. No
+new original attempt, allowance, callback or completed report is manufactured.
+Each cleanup wrapper pays128; a separate genuine128 finalization prepayment
+occurs before disposal can release its maintenance handle. After count0 AND
+transaction disposal finish, that paid fixed suffix returns the saved actual
+EOVERFLOW. No finish is invoked for the nonexistent new attempt. The original
+MAX-ID report remains intact, and later owner-free begin still fails without
+wrapping. Tests seed only the supported inactive attempt generator toMAX-1,
+then reach these boundaries by genuine execution. They cover count0 with
+metadata still pending, peer rejection, no publication/callback and final
+foreign idle destruction and zero governor balance. The nonmax fixture also
+proves normal new-attempt resume and literal/raw output parity.
+
+Begin-failure disposal also holds a distinct lexical guard across its entire
+maintenance/disposal/finalization call. It remains set while real scalar
+children use their separate per-leaf guard, and while metadata reservation
+FINISH_PREPARING/FINISH_RELEASING callbacks run. Backend STEP and SNAPSHOT
+reject reentry before proof, funding, cold sealing or parent changes. The
+actual MAX fixture reaches both exact metadata-token callbacks after count0,
+then checks direct backend reentry leaves parent indices, token ownership,
+public source, original report, governor observations and actual current
+maintenance consumed unchanged. The test-only counter query copies the live
+counter under its existing mutex; the completed-report API cannot supply that
+observation. No maintenance handle or writable context is returned.
+
+These source regions remain distinct: root read-only exclusion is at most98
+fixed logical operations, BF turn wrapper including its lexical guards at
+most124 within its own128 payment, and the future final fixed suffix at
+most40 within its genuine prepaid128. Existing disposal leaves and allocator,
+control/native runtime and registered cleanup boundaries retain their own
+contracts; none of these inventories claims the entire disposal/STEP is128
+or256. Test-only fixed counter observation has no production tariff or ABI.

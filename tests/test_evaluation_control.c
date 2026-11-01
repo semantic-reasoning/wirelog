@@ -13,6 +13,63 @@
                          } } while (0)
 
 static void
+active_consumed_observation(void)
+{
+    int owner;
+    wl_evaluation_control_t *control = NULL;
+    uint64_t value = UINT64_MAX;
+    CHECK(!wl_evaluation_control_create(3, &control));
+    CHECK(!wl_evaluation_control_attach(control, &owner));
+    CHECK(wl_evaluation_control_test_active_consumed(control, 1,
+        &value) == EINVAL
+        && value == UINT64_MAX);
+    CHECK(!wl_evaluation_control_begin(control, &owner));
+    CHECK(!wl_evaluation_control_charge(control, 1));
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 1,
+        &value) && value == 1);
+    CHECK(!wl_evaluation_control_finish(control, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_begin(control, &owner));
+    CHECK(!wl_evaluation_control_charge(control, 2));
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 2,
+        &value) && value == 2);
+    wl_evaluation_control_report_t prior;
+    CHECK(!wl_evaluation_control_report(control, &prior)
+        && prior.attempt_id == 1 && prior.consumed == 1);
+    value = UINT64_MAX;
+    CHECK(wl_evaluation_control_test_active_consumed(control, 1,
+        &value) == EINVAL && value == UINT64_MAX);
+    CHECK(wl_evaluation_control_test_active_consumed(NULL, 2,
+        &value) == EINVAL && value == UINT64_MAX);
+    CHECK(wl_evaluation_control_test_active_consumed(control, 0,
+        &value) == EINVAL && value == UINT64_MAX);
+    CHECK(wl_evaluation_control_test_active_consumed(control, 2,
+        NULL) == EINVAL);
+    CHECK(wl_evaluation_control_test_active_consumed(control, 2,
+        (uint64_t *)(void *)control) == EINVAL);
+    CHECK(wl_evaluation_control_test_active_consumed(control, 2,
+        (uint64_t *)(uintptr_t)UINTPTR_MAX) == EINVAL);
+    CHECK(wl_evaluation_control_charge(control,
+        2) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 2,
+        &value) && value == 2);
+    CHECK(wl_evaluation_control_charge(control,
+        1) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_test_active_consumed(control, 2,
+        &value) && value == 2);
+    CHECK(!wl_evaluation_control_report(control, &prior)
+        && prior.attempt_id == 1 && prior.consumed == 1);
+    CHECK(wl_evaluation_control_finish(control, &owner, 0,
+        0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    value = UINT64_MAX;
+    CHECK(wl_evaluation_control_test_active_consumed(control, 2,
+        &value) == EINVAL && value == UINT64_MAX);
+    CHECK(!wl_evaluation_control_report(control, &prior)
+        && prior.attempt_id == 2 && prior.consumed == 2);
+    CHECK(!wl_evaluation_control_detach(control, &owner));
+    wl_evaluation_control_release(control);
+}
+
+static void
 boundaries(void)
 {
     int owner, other;
@@ -375,6 +432,7 @@ identity_generation(void)
 int
 main(void)
 {
+    active_consumed_observation();
     boundaries();
     limits_and_errors();
     active_identity();

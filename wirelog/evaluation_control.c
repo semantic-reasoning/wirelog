@@ -240,6 +240,24 @@ wl_evaluation_control_active_attempt_id(const wl_evaluation_control_t *control)
 
 #ifdef WL_SESSION_TEST_HOOKS
 int
+wl_evaluation_control_test_active_consumed(wl_evaluation_control_t *control,
+    uint64_t expected_attempt_id, uint64_t *out)
+{
+    if (!control || !out || !expected_attempt_id) return EINVAL;
+    uintptr_t source = (uintptr_t)control, dest = (uintptr_t)out;
+    if (source > UINTPTR_MAX - sizeof(*control)
+        || dest > UINTPTR_MAX - sizeof(*out)
+        || (dest < source + sizeof(*control)
+        && source < dest + sizeof(*out))) return EINVAL;
+    wl_mutex_lock(&control->mutex);
+    int rc = !control->active || control->attempt_id != expected_attempt_id
+        ? EINVAL : 0;
+    if (!rc) *out = control->consumed;
+    wl_mutex_unlock(&control->mutex);
+    return rc;
+}
+
+int
 wl_evaluation_control_test_seed_attempt_id(wl_evaluation_control_t *control,
     const void *owner, uint64_t value)
 {
