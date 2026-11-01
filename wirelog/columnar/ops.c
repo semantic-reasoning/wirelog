@@ -543,6 +543,127 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     return wl_columnar_ops_cold_scan(plan, stack, sess, plan->op_count - 1);
 }
 
+/* Aggregate prefixes stream physical rows; ordinary scan output floors remain
+ * unchanged. Only a fully constructed private reduction reaches the stack. */
+int
+wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *sess)
+{
+    if (!plan || !plan->ops || !plan->op_count || !stack ||
+        !sess) return EINVAL;
+    wl_columnar_session_cold_relation_t *cold =
+        wl_columnar_session_cold_find(sess, plan->ops[0].relation_name);
+    wl_columnar_eval_plan_cold_aggregate_t decoded;
+    if (!cold || !wl_columnar_eval_plan_cold_aggregate_decode(plan, cold->name,
+        cold->ncols, wl_columnar_session_cold_types(cold),
+        &decoded)) return ENOTSUP;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(decoded.filter_count,
+        sizeof(wl_columnar_eval_plan_cold_predicate_t),
+        &bytes) || bytes > SIZE_MAX)
+        return EOVERFLOW;
+    wl_ops_scratch_t scratch;
+    int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, bytes,
+            sess);
+    if (rc) return rc;
+    wl_columnar_eval_plan_cold_predicate_t *predicates =
+        bytes ? malloc((size_t)bytes) : NULL;
+    wl_columnar_batch_payload_reader_t *reader = NULL;
+    wl_columnar_trace_store_cursor_t *cursor = NULL;
+    col_rel_t *out = NULL;
+    if (bytes && !predicates) {
+        rc = ENOMEM; goto done;
+    }
+    uint32_t width = cold->ncols, next = 0;
+    for (uint32_t i = 1; i < decoded.reduce_index; i++) {
+        const wl_plan_op_t *op = &plan->ops[i];
+        if (op->op == WL_PLAN_OP_MAP) {
+            width = op->project_count; continue;
+        }
+        if (!predicates || next >= decoded.filter_count ||
+            !wl_columnar_eval_plan_cold_predicate_decode(op, width, NULL,
+            &predicates[next]) ||
+            !wl_columnar_eval_plan_cold_column(plan, i, predicates[next].column,
+            cold->ncols, &predicates[next].column)){
+            rc = ENOTSUP; goto done;
+        }
+        next++;
+    }
+    wl_columnar_spill_status_t status = cold->state ==
+        WL_COLUMNAR_COLD_FINISHED ?
+        wl_columnar_trace_store_cursor_acquire(cold->trace_snapshot, &cursor) :
+        wl_columnar_batch_payload_acquire(cold->payload, &reader);
+    if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+    int64_t count = 0;
+    for (uint32_t ordinal = 0; ordinal < cold->nrows; ordinal++) {
+        const uint64_t *lanes;
+        wl_columnar_spill_metadata_t metadata;
+        status = cursor ? wl_columnar_trace_store_cursor_read(cursor, ordinal,
+                NULL, NULL, &lanes, &metadata) :
+            wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL, &lanes,
+                &metadata);
+        if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+        if (metadata.multiplicity != 1 || metadata.iteration ||
+            metadata.stratum || metadata.worker) {
+            rc = ENOTSUP; goto done;
+        }
+        bool keep = true;
+        for (uint32_t i = 0; keep && i < next; i++) {
+            int64_t value;
+            memcpy(&value, &lanes[predicates[i].column], sizeof(value));
+            int64_t literal = predicates[i].literal;
+            switch (predicates[i].comparison) {
+            case WL_PLAN_EXPR_CMP_EQ: keep = value == literal; break;
+            case WL_PLAN_EXPR_CMP_NEQ: keep = value != literal; break;
+            case WL_PLAN_EXPR_CMP_LT: keep = value < literal; break;
+            case WL_PLAN_EXPR_CMP_GT: keep = value > literal; break;
+            case WL_PLAN_EXPR_CMP_LTE: keep = value <= literal; break;
+            case WL_PLAN_EXPR_CMP_GTE: keep = value >= literal; break;
+            default: rc = ENOTSUP; goto done;
+            }
+        }
+        if (keep) count++;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_reduce_fail_output_alloc) {
+        rc = ENOMEM; goto done;
+    }
+#endif
+    rc = wl_columnar_relation_new_named_governed("$reduce", 1, NULL,
+            count ? 1 : 0, false, sess->memory_governor, &out);
+    if (rc) goto done;
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    rc = col_rel_set_column_types(out, &type, 1);
+    if (!rc && count) {
+        bool denied = false;
+        rc = col_rel_append_rows_atomic(out, &count, 1, 1, &denied);
+        if (denied) rc = ENOSPC;
+    }
+    goto done;
+spill_error:
+    switch (status) {
+    case WL_COLUMNAR_SPILL_MEMORY: rc = ENOSPC; break;
+    case WL_COLUMNAR_SPILL_ALLOCATION: rc = ENOMEM; break;
+    case WL_COLUMNAR_SPILL_IO:
+    case WL_COLUMNAR_SPILL_QUOTA:
+    case WL_COLUMNAR_SPILL_CAPACITY: rc = EIO; break;
+    case WL_COLUMNAR_SPILL_OVERFLOW: rc = EOVERFLOW; break;
+    case WL_COLUMNAR_SPILL_BUSY: rc = EBUSY; break;
+    default: rc = ENOTSUP; break;
+    }
+done:
+    wl_columnar_trace_store_cursor_release(cursor);
+    wl_columnar_batch_payload_reader_release(reader);
+    free(predicates); wl_ops_scratch_release(&scratch);
+    if (rc == ENOSPC) sess->memory_budget_denied = true;
+    if (!rc) rc = eval_stack_push(stack, out, true);
+    if (rc && out) {
+        eval_entry_t entry = {.rel = out, .owned = true};
+        return wl_columnar_ops_dispose_entry(stack, &entry, rc);
+    }
+    return rc;
+}
+
 int
 col_op_map(const wl_plan_op_t *op, eval_stack_t *stack, wl_col_session_t *sess)
 {

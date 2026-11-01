@@ -246,6 +246,10 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * not reconstructed compounds. Even numeric INLINE retains its functor table.
  * The program must outlive the session. Intern storage remains resident, and
  * sealing validates IDs even in unprojected STRING lanes.
+ * Direct global COUNT also streams an audited MAP/FILTER prefix without
+ * materializing its source. It counts physical input rows (including duplicates)
+ * and returns no row for empty/all-filtered input, as resident aggregation does.
+ * Reader, predicate and final-result storage still require admission.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
  * wirelog_session_options_v1_t). Multiple loaded inputs may be
@@ -275,7 +279,8 @@ wirelog_session_seal_input(wirelog_session_t *session,
 
 /** Begin explicitly chunked loading of an empty declared scalar/flat INLINE EDB.
  * Requires the same serial spill-enabled ordinary mode as seal_input, before
- * evaluation, and supports audited MAP/FILTER scans and single-key equality JOIN consumers.
+ * evaluation, and supports audited MAP/FILTER scans, single-key equality JOINs
+ * and direct global COUNT consumers.
  * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
  * resident facts first; additional empty inputs may begin and preloaded inputs
  * may be sealed afterward. A failed begin preserves the original input.
