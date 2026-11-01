@@ -345,6 +345,9 @@ struct wl_columnar_eval_stack_cleanup_frame {
     int unary_first_result;
     int unary_cleanup_result;
     bool unary_alias_rejected;
+    bool unary_scalar_mode, unary_scalar_started, unary_scalar_prepared;
+    bool unary_scalar_committed, unary_scalar_for_old;
+    wl_columnar_relation_scalar_retirement_t unary_scalar_retirement;
     wl_columnar_filter_context_t filter;
     const void *numeric_plan_owner;
     wl_columnar_eval_stack_binary_context_t binary;
@@ -1273,6 +1276,11 @@ wl_columnar_eval_stack_unary_commit_attempt_body(
     }
     if (verdict)
         return verdict;
+    if (frame->unary_scalar_mode && frame->unary_snapshot.owned
+        && (!frame->unary_scalar_prepared || !frame->unary_scalar_started
+        || !frame->unary_scalar_retirement.ready
+        || frame->unary_scalar_retirement.storage.relation
+        != frame->unary_snapshot.rel)) return EBUSY;
     eval_entry_t *entry = &frame->stack.items[frame->unary_index];
     wl_columnar_eval_stack_unary_entry_copy(&frame->unary_retired, entry);
     wl_columnar_eval_stack_unary_entry_copy(entry, output);
@@ -1304,6 +1312,7 @@ wl_columnar_eval_stack_unary_finish_body(
 {
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
+    if (frame->unary_scalar_mode) return EBUSY;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_IDLE)
         return EINVAL;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_DONE)
@@ -1343,6 +1352,182 @@ wl_columnar_eval_stack_unary_finish(
                true);
 }
 
+enum {
+    WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK =
+        (sizeof(wl_columnar_relation_scalar_retirement_t) + 7u) / 8u + 64u
+};
+typedef char wl_columnar_eval_stack_scalar_init_bound[
+        WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK <= 256 ? 1 : -1];
+
+static int
+wl_columnar_eval_stack_unary_scalar_authority(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    if (!owner) return EINVAL;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (frame->session->cleanup_active != frame
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT) return EBUSY;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
+    if (rc) return rc;
+    const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
+    if (frame->unary_control != numeric->control
+        || frame->unary_attempt_id != numeric->attempt_id) return EINVAL;
+    rc = wl_columnar_eval_stack_unary_forward(frame);
+    if (rc) return rc;
+    rc = wl_evaluation_control_charge_attempt(numeric->control,
+            numeric->attempt_id, 1);
+    if (rc) return rc;
+    const eval_entry_t *entry = &frame->unary_snapshot;
+    if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || entry->continuation
+        || entry->seg_boundaries || entry->seg_count ||
+        !entry->rel) return ENOTSUP;
+    frame->unary_scalar_mode = true;
+    if (!entry->owned) {
+        frame->unary_scalar_prepared = true; *done = true;
+        return 0;
+    }
+    if (!frame->unary_scalar_started) {
+        rc = wl_evaluation_control_charge_attempt(numeric->control,
+                numeric->attempt_id, WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_relation_scalar_retirement_begin(
+            &frame->unary_scalar_retirement, entry->rel);
+        if (rc) return rc;
+        frame->unary_scalar_started = frame->unary_scalar_for_old = true;
+    }
+    rc = wl_columnar_relation_scalar_retirement_prepare(
+        &frame->unary_scalar_retirement, numeric->control, numeric->attempt_id);
+    if (rc == EAGAIN) return 0;
+    if (rc) return rc;
+    frame->unary_scalar_prepared = true; *done = true;
+    return 0;
+}
+
+int
+wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result,
+    const void *owner, wl_evaluation_control_t *funding, uint64_t funding_id,
+    int *semantic, bool *done)
+{
+    if (!done || !semantic) return EINVAL;
+    *done = false;
+    int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
+    if (rc) return rc;
+    const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
+    if (!funding || funding == numeric->control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+        return EINVAL;
+    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_IDLE) return EINVAL;
+    if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_DONE) {
+        *semantic = wl_columnar_eval_stack_unary_result(frame); *done = true;
+        return 0;
+    }
+    bool first = frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        || frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED;
+    if ((!first && frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED)
+        || (first &&
+        !wl_columnar_eval_stack_unary_thread_valid(frame))) return EINVAL;
+    if (frame->unary_committed && frame->unary_retired.owned
+        && !frame->unary_scalar_prepared) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            first ? 4u * COL_STACK_MAX + 16u : 1u);
+    if (rc) return rc;
+    frame->unary_scalar_mode = true;
+    if (!frame->unary_result_saved) {
+        frame->unary_first_result = initiating_result;
+        frame->unary_result_saved = true;
+    }
+    if (first) {
+        if (!frame->unary_committed)
+            (void)wl_columnar_eval_stack_unary_output_sanitize(frame);
+        wl_columnar_eval_stack_unary_binding_clear(frame);
+        frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
+        *semantic = wl_columnar_eval_stack_unary_result(frame);
+        return 0;
+    }
+    *semantic = wl_columnar_eval_stack_unary_result(frame);
+    if (!frame->unary_committed && frame->unary_scalar_started
+        && frame->unary_scalar_for_old) {
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_relation_scalar_retirement_cancel(
+            &frame->unary_scalar_retirement);
+        if (rc) return rc;
+        frame->unary_scalar_started = frame->unary_scalar_prepared = false;
+        frame->unary_scalar_for_old = false;
+        return 0;
+    }
+    eval_entry_t *entry = frame->unary_committed ? &frame->unary_retired
+        : &frame->unary_output;
+    if (!frame->unary_scalar_started) {
+        if (entry->seg_boundaries || entry->seg_count
+            || entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION ||
+            entry->continuation)
+            return ENOTSUP;
+        if (!entry->owned || !entry->rel) {
+            wl_columnar_eval_stack_unary_entry_clear(entry);
+            frame->unary_cleanup_result = 0;
+            frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
+            *semantic = wl_columnar_eval_stack_unary_result(frame);
+            *done = true;
+            return 0;
+        }
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
+        if (rc) return rc;
+        rc = wl_columnar_relation_scalar_retirement_begin(
+            &frame->unary_scalar_retirement, entry->rel);
+        if (rc) return rc;
+        frame->unary_scalar_started = true;
+    }
+    if (!frame->unary_scalar_committed) {
+        rc = wl_columnar_relation_scalar_retirement_prepare(
+            &frame->unary_scalar_retirement, funding, funding_id);
+        if (rc == EAGAIN) return 0;
+        if (rc) {
+            frame->unary_cleanup_result = rc;
+            *semantic = wl_columnar_eval_stack_unary_result(frame); return rc;
+        }
+        rc = wl_columnar_relation_scalar_retirement_commit(
+            &frame->unary_scalar_retirement);
+        if (rc) return rc;
+        frame->unary_scalar_committed = true;
+        /* Irreversible receipt ownership begins here. Do not read a frame
+         * marker for a relation after the receipt physically frees it. */
+        wl_columnar_eval_stack_unary_entry_clear(entry);
+    }
+    rc = wl_columnar_relation_scalar_retirement_step(
+        &frame->unary_scalar_retirement, funding, funding_id);
+    if (rc == EAGAIN) return 0;
+    if (rc) {
+        frame->unary_cleanup_result = rc;
+        *semantic = wl_columnar_eval_stack_unary_result(frame); return rc;
+    }
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
+    if (rc) return rc;
+    memset(&frame->unary_scalar_retirement, 0,
+        sizeof(frame->unary_scalar_retirement));
+    frame->unary_scalar_started = frame->unary_scalar_committed = false;
+    frame->unary_scalar_for_old = false;
+    frame->unary_cleanup_result = 0;
+    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
+    *semantic = wl_columnar_eval_stack_unary_result(frame); *done = true;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_unary_reset(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
@@ -1361,7 +1546,8 @@ wl_columnar_eval_stack_unary_reset_owned(
         return EINVAL;
     if (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_DONE
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
-        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired))
+        || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
+        || frame->unary_scalar_started || frame->unary_scalar_committed)
         return EBUSY;
     wl_columnar_eval_stack_unary_binding_clear(frame);
     frame->unary_index = 0;
@@ -1371,6 +1557,8 @@ wl_columnar_eval_stack_unary_reset_owned(
     frame->unary_first_result = 0;
     frame->unary_cleanup_result = 0;
     frame->unary_alias_rejected = false;
+    frame->unary_scalar_mode = frame->unary_scalar_prepared = false;
+    frame->unary_scalar_for_old = false;
     frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_IDLE;
     return 0;
 }

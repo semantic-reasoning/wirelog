@@ -6381,9 +6381,198 @@ test_composed_concat_stopped_retirement_retry(void)
     composed_close(&f);
 }
 
+static void
+test_numeric_funded_scalar_finish(void)
+{
+    const uint32_t widths[] = {1, 65, 257};
+    for (unsigned w = 0; w < 3; ++w)
+        for (unsigned owned = 0; owned < 2; ++owned)
+            for (unsigned commit = 0; commit < 2; ++commit) {
+                uint32_t width = widths[w];
+                fixture_t f; fixture_init(&f, width, 3, 0);
+                wl_columnar_memory_governor_ref_t *governor =
+                    join_governor(&f, 16u * 1024u * 1024u);
+                int64_t *codes = malloc((size_t)width * sizeof(*codes));
+                int64_t *values = malloc((size_t)width * sizeof(*values));
+                CHECK(codes && values);
+                for (uint32_t c = 0; c < width; ++c)
+                    codes[c] = WIRELOG_TYPE_INT64;
+                col_rel_t *input = NULL;
+                CHECK(
+                    !
+                    wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled
+                    (
+                        "$old", width, 3, codes, w != 0, governor, &input,
+                        f.operation, f.operation_id));
+                for (unsigned r = 0; r < 3; ++r) {
+                    for (uint32_t c = 0; c < width; ++c) values[c] = r + c;
+                    CHECK(!col_rel_append_row(input, values));
+                }
+                col_rel_destroy(f.input); f.input = input;
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                stack->items[0].rel = input; stack->items[0].owned = owned;
+                uint32_t projection = 0;
+                wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                                   .project_indices = &projection};
+                wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+                fixture_begin(&f, &plan, 0, 1);
+                CHECK(!wl_columnar_eval_stack_unary_begin_attempt_owned(f.frame,
+                    f.operation, f.operation_id, &f.record));
+                col_rel_t **slot = NULL;
+                CHECK(!wl_columnar_eval_stack_unary_output_owned(f.frame, &slot,
+                    &f.record));
+                CHECK(
+                    !
+                    wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled
+                    (
+                        "$new", width, 3, codes, w != 0, governor, slot,
+                        f.operation, f.operation_id));
+                col_rel_t *output = *slot;
+                bool ready = false;
+                for (unsigned turn = 0; !ready; ++turn) {
+                    CHECK(turn < 100000);
+                    CHECK(
+                        !
+                        wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned
+                        (
+                            f.frame, &f.record, &ready));
+                }
+                if (commit) {
+                    bool committed = false;
+                    CHECK(!wl_columnar_eval_stack_unary_commit_attempt_owned(
+                            f.frame, &committed, &f.record) && committed);
+                    CHECK(stack->items[0].rel == output);
+                }
+                int initiating = commit ? 0 : ERANGE;
+                CHECK(wl_evaluation_control_finish(f.operation,
+                    &f.operation_owner, initiating, 0) == initiating);
+                wl_evaluation_control_report_t original, after;
+                CHECK(!wl_evaluation_control_report(f.operation, &original));
+                bool done = true; int semantic = 123;
+                CHECK(wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+                        f.frame, initiating, &f.record, f.operation,
+                        f.operation_id,
+                        &semantic,
+                        &done) == EINVAL && !done && semantic == 123);
+                CHECK(wl_columnar_eval_stack_unary_reset_owned(f.frame,
+                    &f.record) == EBUSY);
+                CHECK(wl_columnar_eval_stack_cleanup_finish(&f.frame) == EBUSY);
+                done = false;
+                for (unsigned turn = 0; !done; ++turn) {
+                    CHECK(turn < 100000);
+                    int funding_owner;
+                    wl_evaluation_control_t *funding = control_new(384,
+                            &funding_owner);
+                    uint64_t id =
+                        wl_evaluation_control_active_attempt_id(funding);
+                    CHECK(
+                        !wl_columnar_eval_stack_unary_finish_scalar_funded_owned
+                        (
+                            f.frame, turn ? EIO : initiating, &f.record,
+                            funding, id, &semantic, &done));
+                    CHECK(semantic == initiating);
+                    CHECK(!wl_evaluation_control_finish(funding, &funding_owner,
+                        0, 0));
+                    wl_evaluation_control_report_t report;
+                    CHECK(!wl_evaluation_control_report(funding, &report)
+                        && report.consumed && report.consumed <= 384);
+                    CHECK(!wl_evaluation_control_detach(funding,
+                        &funding_owner));
+                    wl_evaluation_control_release(funding);
+                }
+                CHECK(!wl_evaluation_control_report(f.operation, &after)
+                    && after.attempt_id == original.attempt_id
+                    && after.consumed == original.consumed
+                    && after.result == original.result);
+                CHECK(stack->items[0].rel == (commit ? output : input));
+                if (!commit) CHECK(input->nrows == 3 &&
+                        input->columns[0][2] == 2);
+                CHECK(!wl_columnar_eval_stack_unary_reset_owned(f.frame,
+                    &f.record));
+                if (owned) f.input = NULL;
+                run(&f); /* Inactive original ID fails closed; cleanup still works. */
+                CHECK(f.record.semantic_result == EINVAL);
+                fixture_close(&f);
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+                free(codes); free(values);
+            }
+}
+
+static void
+test_numeric_funded_scalar_contention(void)
+{
+    fixture_t f; fixture_init(&f, 65, 3, 0);
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    stack->items[0].owned = true;
+    uint32_t projection = 0;
+    wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                       .project_indices = &projection};
+    wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+    fixture_begin(&f, &plan, 0, 1);
+    CHECK(!wl_columnar_eval_stack_unary_begin_attempt_owned(f.frame,
+        f.operation, f.operation_id, &f.record));
+    col_rel_t **slot = NULL;
+    CHECK(!wl_columnar_eval_stack_unary_output_owned(f.frame, &slot,
+        &f.record));
+    *slot = source_new(1, 2);
+    wl_columnar_source_access_reader_t reader = {0};
+    CHECK(!col_rel_source_reader_acquire(*slot, &reader));
+    bool ready = true;
+    CHECK(!wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+            f.frame, &f.record, &ready) && !ready);
+    bool committed = true;
+    CHECK(wl_columnar_eval_stack_unary_commit_attempt_owned(f.frame,
+        &committed, &f.record) == EBUSY && !committed);
+    wl_evaluation_control_request_cancel(f.operation);
+    CHECK(wl_evaluation_control_charge_attempt(f.operation, f.operation_id, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+        WL_EVALUATION_CONTROL_CANCELLED, 0) == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(f.operation, &before));
+    bool done = false, released = false; int semantic = 123;
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 10000);
+        int owner;
+        wl_evaluation_control_t *funding = control_new(turn ? 384 : 1, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        int rc = wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+            f.frame, WL_EVALUATION_CONTROL_CANCELLED, &f.record, funding, id,
+            &semantic, &done);
+        if (!turn) CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && semantic == 123 && !done);
+        else {
+            CHECK(semantic == WL_EVALUATION_CONTROL_CANCELLED);
+            if (rc) {
+                CHECK(rc == EBUSY && !released && !done);
+                CHECK(f.input->nrows == 3 && stack->items[0].rel == f.input);
+                CHECK(!col_rel_source_reader_release(&reader)); released = true;
+            }
+            if (!released && turn >= 5) {
+                CHECK(!done && stack->items[0].rel == f.input
+                    && f.input->nrows == 3);
+                CHECK(!col_rel_source_reader_release(&reader)); released = true;
+            }
+        }
+        CHECK(wl_evaluation_control_finish(funding, &owner, rc, 0) == rc);
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
+    }
+    CHECK(released && !wl_evaluation_control_report(f.operation, &after)
+        && before.consumed == after.consumed && before.result == after.result);
+    CHECK(stack->items[0].rel == f.input && f.input->nrows == 3);
+    CHECK(!wl_columnar_eval_stack_unary_reset_owned(f.frame, &f.record));
+    f.input = NULL; run(&f); fixture_close(&f);
+}
+
 int
 main(void)
 {
+    test_numeric_funded_scalar_finish();
+    test_numeric_funded_scalar_contention();
     test_composed_unary_work_limit_cleanup();
     test_composed_concat_work_limit_cleanup();
     test_composed_concat_stopped_retirement_retry();
