@@ -2077,3 +2077,21 @@ The cache scalar-copy action copies `base_nrows` into its own private,
 unpublished descriptor while retaining a genuine source reader. It never
 advances the canonical input boundary; source END and explicit owned-output
 TAKE precede any containing host publication.
+
+Controlled legacy successor cancellation retains its actual STEP operation
+while native staging claims and the successor input reader are drained with
+independent maintenance funding. Intermediate calls return `EAGAIN` with the
+same active operation ID. The saved terminal result is reported once after
+those owners are inert. A foreign STEP preserves pending admission without
+advancing that native continuation, and checked destruction remains refused
+before backend entry. This does not impose a same-thread restriction on idle
+session destruction after cleanup, or change existing work-limit retry rules.
+
+A completed work-limit result may retain native transaction cleanup. Foreign
+STEP calls preserve pending admission by returning that same verified result;
+reset/configure does not change the completed report. A native retry normally
+begins a new attempt. If that genuine begin fails because attempt IDs are
+exhausted, existing maintenance drains the retained transaction first. Pending
+calls keep the prior work-limit report; after cleanup the native call returns
+`EOVERFLOW` without creating or finishing another attempt. The previous
+completed report is preserved, and idle destruction is then allowed.
