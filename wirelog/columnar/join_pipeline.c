@@ -147,9 +147,7 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE;
     if (sess->join_batch_bytes == 0)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_OFF;
-    /* As for the ordinary producer, a worker run that resolves operands by
-     * input slot is excluded, other worker sessions are not (#2201). */
-    if (sess->tdd_input_run || sess->diff_operators_active)
+    if (sess->diff_operators_active)
         return WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SESSION;
 
     join = &plan->ops[join_index];
@@ -171,7 +169,12 @@ wl_columnar_join_pipeline_preflight(const wl_plan_relation_t *plan,
             continue;
         }
         if (op->op == WL_PLAN_OP_SEMIJOIN || op->op == WL_PLAN_OP_ANTIJOIN) {
-            if (!wl_columnar_join_pipeline_stage_is_consumable(op))
+            /* A probe stage resolves its operand by name, which a worker
+             * run that resolves its operands by input slot need not hold
+             * under that name, so there the tail ends before the stage
+             * (#2201). */
+            if (sess->tdd_input_run
+                || !wl_columnar_join_pipeline_stage_is_consumable(op))
                 break;
             i++;
             continue;
@@ -630,7 +633,7 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     const wl_plan_op_t *last;
     eval_entry_t left_entry;
     col_rel_t *right;
-    wl_columnar_join_selection_t selection;
+    wl_columnar_join_selection_t selection = { 0 };
     col_rel_t *out = NULL;
     wl_columnar_continuation_t *continuation = NULL;
     wl_columnar_source_access_reader_t right_reader = { 0 };
@@ -669,23 +672,43 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         != WL_COLUMNAR_EVAL_ENTRY_RELATION
         || !stack->items[stack->top - 1].rel)
         return EINVAL;
-    /* A missing right relation joins to an empty result in the ordinary
-     * JOIN.  ENOENT from col_join_batch_producer_create below is a
-     * different case, an unavailable arrangement or a right name that does
-     * not pin this relation (#2201), and stays a fallback. */
-    right = session_find_rel(sess, join->right_relation);
+    /* A worker run that resolves its operands by input slot (a TDD bound
+     * run or insert clone) takes the right operand from the slot, as the
+     * ordinary JOIN does there (#2201).  A missing right relation joins to
+     * an empty result in the ordinary JOIN.  ENOENT from
+     * col_join_batch_producer_create below is a different case, an
+     * unavailable arrangement or a right name that does not pin this
+     * relation, and stays a fallback. */
+    if (sess->tdd_input_run) {
+        bool bound_delta = false;
+        rc = wl_columnar_eval_tdd_plan_resolve_input(sess, join, true,
+                &right, &bound_delta);
+        if (rc != 0)
+            return rc;
+        if (right)
+            selection = (wl_columnar_join_selection_t){
+                right, bound_delta, bound_delta && right->nrows == 0
+            };
+    } else {
+        right = session_find_rel(sess, join->right_relation);
+        /* Consume only a JOIN that would read the persistent relation
+         * itself.  A $d$/$r$ delta is declined below, after the key checks
+         * the ordinary JOIN also runs against it. */
+        if (right)
+            selection = wl_columnar_join_select_right(join, sess, right,
+                    stack->items[stack->top - 1].is_delta);
+    }
     if (!right) {
         if (decline)
             *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY;
         return 0;
     }
-    /* Consume only a JOIN that would read the persistent relation itself.
-     * A forced-empty right operand is left to the ordinary JOIN here; a
-     * $d$/$r$ delta is declined below, after the key checks the ordinary
-     * JOIN also runs against it. */
-    selection = wl_columnar_join_select_right(join, sess, right,
-            stack->items[stack->top - 1].is_delta);
-    if (selection.force_empty) {
+    /* A forced-empty right operand is left to the ordinary JOIN here.  So
+     * is an empty right operand in a slot-resolved run, which the ordinary
+     * JOIN joins in one pass without a producer, as it does on any session
+     * (#2201). */
+    if (selection.force_empty
+        || (sess->tdd_input_run && selection.right->nrows == 0)) {
         if (decline)
             *decline = WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY;
         return 0;
@@ -732,8 +755,10 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
     }
     /* Today every substituted right operand also sets used_right_delta;
      * the pointer comparison also declines a future substitution that does
-     * not set it. */
-    if (selection.used_right_delta || selection.right != right) {
+     * not set it.  A slot-resolved run reads a delta in the slot through
+     * the producer's own index, so it does not decline (#2201). */
+    if (!sess->tdd_input_run
+        && (selection.used_right_delta || selection.right != right)) {
         free(lk);
         free(rk);
         if (decline)
@@ -782,17 +807,27 @@ wl_columnar_join_pipeline_try_eval(const wl_plan_relation_t *plan,
         return ENOTSUP;
     }
 
-    /* The producer holds no reader on its inputs.  On a worker the right
-     * operand can be a view of the coordinator's storage, so hold a reader
-     * on it from before the producer pins its arrangement until the
-     * producer is destroyed (#2201), as the ordinary JOIN holds its probe's;
-     * a busy source fails here before any batch is drawn. */
-    rc = col_rel_source_reader_acquire(right, &right_reader);
-    if (rc == 0)
-        rc = col_join_batch_producer_create(sess, join,
+    /* A producer over the session's arrangement holds no reader on its
+     * inputs.  On a worker the right operand can be a view of the
+     * coordinator's storage, so hold a reader on it from before the
+     * producer pins its arrangement until the producer is destroyed
+     * (#2201), as the ordinary JOIN holds its probe's; a busy source fails
+     * here before any batch is drawn.  In a slot-resolved run the producer
+     * builds its own index over the slot's relation and holds its own
+     * reader on it for as long. */
+    if (sess->tdd_input_run) {
+        rc = col_join_batch_producer_create_over(sess, join,
                 stack->items[stack->top - 1].rel,
-                stack->items[stack->top - 1].is_delta, lk, rk,
+                stack->items[stack->top - 1].is_delta, right, lk, rk,
                 join->key_count, sess->join_batch_bytes, &continuation);
+    } else {
+        rc = col_rel_source_reader_acquire(right, &right_reader);
+        if (rc == 0)
+            rc = col_join_batch_producer_create(sess, join,
+                    stack->items[stack->top - 1].rel,
+                    stack->items[stack->top - 1].is_delta, lk, rk,
+                    join->key_count, sess->join_batch_bytes, &continuation);
+    }
     free(lk);
     free(rk);
     if (rc != 0) {

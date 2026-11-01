@@ -5,6 +5,7 @@
  */
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -27,9 +28,9 @@ extern int (*wl_columnar_eval_test_bound_slice_before_release)(
 
 /* A worker copies its coordinator's bounded join knob
  * (WIRELOG_JOIN_BATCH_BYTES and WIRELOG_JOIN_BATCH_STRICT, read when the
- * session is created), and a TDD bound run refuses it with ENOTSUP.  Clear
- * it on each worker these tests create, as the production insertion caller
- * does for its clones (eval_tdd_insert.c, insert_clone_prepare). */
+ * session is created).  Clear it on each worker these tests create, so
+ * that the environment does not decide which JOIN path a test takes;
+ * knob_cases sets it on its own workers. */
 static void
 worker_clear_join_batch(wl_col_session_t *worker)
 {
@@ -201,6 +202,109 @@ run_one(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     return 0;
 }
 
+/* Issue #2201: run instance @si of @manifest over @inputs on a fresh
+ * worker with the bounded join knob @bytes/@strict.  Begin's, or else
+ * finish's, return goes to *@rc; after a run the rows (at most 64) go to
+ * @rows and *@n, and the worker's ordinary bounded runs, fallbacks and
+ * last fallback reason to *@runs, *@fallbacks and *@reason.  A refused
+ * begin must leave the worker free with nothing reserved. */
+static int
+knob_run(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t si,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t count,
+    uint64_t bytes, bool strict, int64_t rows[][2], uint32_t *n,
+    uint32_t *runs, uint32_t *fallbacks, uint8_t *reason, int *rc)
+{
+    wl_col_session_t worker = {0};
+    CHECK(col_worker_session_create(coord, 0, NULL, 0, &worker) == 0);
+    worker.join_batch_bytes = bytes;
+    worker.join_batch_strict = strict;
+    uint64_t before = reserved(&worker);
+    wl_columnar_eval_tdd_run_t run = {0};
+    col_rel_t *out = NULL;
+    *n = 0;
+    *rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, manifest,
+            si, &snapshot_token, &partition_token, 0, 1, inputs, count, &run);
+    if (*rc != 0) {
+        CHECK(!run.worker && !worker.tdd_input_run && !worker.cleanup_active
+            && !worker.cleanup_pending && reserved(&worker) == before);
+    } else {
+        *rc = wl_columnar_eval_tdd_run_bound_slice_finish(&run, &out);
+    }
+    if (*rc == 0) {
+        CHECK(out && out->ncols == 2 && out->nrows <= 64);
+        for (uint32_t i = 0; i < out->nrows; i++) {
+            rows[i][0] = out->columns[0][i];
+            rows[i][1] = out->columns[1][i];
+        }
+        *n = out->nrows;
+    }
+    if (out)
+        CHECK(col_rel_destroy_checked(out) == 0);
+    CHECK(reserved(&worker) == before);
+    *runs = worker.join_batch_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+        + worker.join_batch_runs[COL_JOIN_BATCH_RUN_PIPELINE];
+    CHECK(worker.join_batch_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL] == 0);
+    *fallbacks = worker.join_batch_fallback_count;
+    *reason = worker.join_batch_last_reason;
+    worker.join_batch_bytes = 0;
+    worker.join_batch_strict = false;
+    CHECK(col_worker_session_destroy(&worker) == 0);
+    return 0;
+}
+
+/* @a and @b hold the same rows, as bags. */
+static bool
+same_bag(const int64_t a[][2], uint32_t na, const int64_t b[][2], uint32_t nb)
+{
+    bool used[64] = {false};
+    if (na != nb)
+        return false;
+    for (uint32_t i = 0; i < na; i++) {
+        uint32_t j = 0;
+        while (j < nb && (used[j] || a[i][0] != b[j][0]
+            || a[i][1] != b[j][1]))
+            j++;
+        if (j == nb)
+            return false;
+        used[j] = true;
+    }
+    return true;
+}
+
+/* Issue #2201: an expanded or K1 instance, whose first JOIN feeds another
+ * operator than a relation sink, under the bounded join knob.  Record mode
+ * derives the rows the knob-off run derives, with bounded runs on the
+ * workers and that first JOIN recorded as pipeline-not-consumable; strict
+ * mode refuses the instance with ENOTSUP and leaves the worker free with
+ * nothing reserved. */
+static int
+knob_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
+    const wl_columnar_eval_tdd_plan_manifest_t *manifest, uint32_t si,
+    const wl_columnar_eval_tdd_input_t *inputs, uint32_t count)
+{
+    int64_t off[64][2], on[64][2];
+    uint32_t noff = 0, non = 0, runs = 0, fallbacks = 0;
+    uint8_t reason = 0;
+    int rc = -1;
+    CHECK(knob_run(coord, sp, manifest, si, inputs, count, 0, false, off,
+        &noff, &runs, &fallbacks, &reason, &rc) == 0);
+    CHECK(rc == 0 && runs == 0 && fallbacks == 0);
+    CHECK(knob_run(coord, sp, manifest, si, inputs, count, 224, false, on,
+        &non, &runs, &fallbacks, &reason, &rc) == 0);
+    if (rc != 0 || runs == 0 || fallbacks == 0
+        || reason != COL_JOIN_BATCH_EXCLUDED_PIPELINE)
+        fprintf(stderr, "knob record: rc %d runs %u fallbacks %u reason %u\n",
+            rc, runs, fallbacks, reason);
+    CHECK(rc == 0 && same_bag(on, non, off, noff));
+    CHECK(runs > 0 && fallbacks > 0
+        && reason == COL_JOIN_BATCH_EXCLUDED_PIPELINE);
+    CHECK(knob_run(coord, sp, manifest, si, inputs, count, 224, true, on,
+        &non, &runs, &fallbacks, &reason, &rc) == 0);
+    CHECK(rc == ENOTSUP);
+    return 0;
+}
+
 static wl_columnar_source_access_reader_t held_result;
 static unsigned evaluations, release_calls;
 
@@ -260,6 +364,7 @@ negative_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     uint64_t before = reserved(&worker);
     uint32_t driver = 0;
     while (good[driver].read->kind != WL_COLUMNAR_EVAL_TDD_PLAN_DELTA) driver++;
+    CHECK(knob_cases(coord, sp, manifest, si, good, 4) == 0);
     /* Each case must fail before evaluation and restore all setup ownership. */
     for (uint32_t c = 0; c < 23; c++) {
         memcpy(inputs, good, sizeof(inputs));
@@ -284,8 +389,8 @@ negative_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
         case 14: worker.retraction_seeded = true; break;
         case 15: worker.retraction_right_pass = true; break;
         case 16: worker.delta_seeded = true; break;
-        case 17: worker.join_batch_bytes = 1024; break;
-        case 18: worker.join_batch_strict = true; break;
+        case 17: inputs[1].view_generation++; break;
+        case 18: inputs[1].storage_generation++; break;
         case 19: inputs[0].compound_count++; break;
         case 20: inputs[0].declared_ncols++; break;
         case 21: inputs[0].schema_ok = !inputs[0].schema_ok; break;
@@ -293,12 +398,11 @@ negative_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
         }
         int rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m, si,
                 &snapshot_token, &partition_token, 0, 1, inputs, count, &run);
-        CHECK(rc == (c >= 12 && c <= 18 ? ENOTSUP : EINVAL));
+        CHECK(rc == (c >= 12 && c <= 16 ? ENOTSUP : EINVAL));
         CHECK(!run.worker && !worker.tdd_input_run && !worker.cleanup_active
             && !worker.cleanup_pending && reserved(&worker) == before);
         worker.diff_operators_active = worker.retraction_seeded = false;
         worker.retraction_right_pass = worker.delta_seeded = false;
-        worker.join_batch_bytes = 0; worker.join_batch_strict = false;
     }
     for (uint32_t c = 0; c < 4; c++) {
         wl_columnar_eval_tdd_plan_read_t *read =
@@ -638,7 +742,7 @@ seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
         case 30: input.schema_ok = !input.schema_ok; break;
         case 31: input.declared_ncols++; break;
         case 32: input.name = "wrong"; break;
-        case 33: worker.join_batch_bytes = 1; expected = ENOTSUP; break;
+        case 33: input.compound_count++; break;
         case 34: map->delta_mode = WL_DELTA_FORCE_FULL; expected = ENOTSUP;
             break;
         case 35: input.read = read + 1; break;
@@ -669,7 +773,6 @@ seed_refusals(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
         worker.current_iteration = 0;
         worker.diff_operators_active = worker.delta_seeded = false;
         worker.retraction_seeded = worker.retraction_right_pass = false;
-        worker.join_batch_bytes = 0;
     }
     uint32_t copies = 0;
     for (uint32_t s = 0; s < manifest->slice_count; s++) {
@@ -949,6 +1052,18 @@ k1_cases(wl_col_session_t *coord, const wl_plan_stratum_t *sp)
     CHECK(manifest.alternative_count == 1 && manifest.slice_count == 1
         && manifest.read_count == 4 && manifest.slices[0].start == 5
         && manifest.slices[0].count == 4 && manifest.slices[0].driver == 6);
+    {
+        col_rel_t *full = relation("dereference", edb, 7, 0, 0);
+        col_rel_t *delta = relation("alias-partition", changes, 5, 0, 1);
+        CHECK(full && delta);
+        wl_columnar_eval_tdd_input_t inputs[4];
+        for (unsigned i = 0; i < 4; i++)
+            inputs[i] = capture(&manifest.reads[i], i == 1 ? delta : full, 0,
+                    1);
+        CHECK(knob_cases(coord, sp, &manifest, 0, inputs, 4) == 0);
+        col_rel_destroy(full);
+        col_rel_destroy(delta);
+    }
     const uint32_t widths[] = {1, 2, 8};
     for (unsigned wi = 0; wi < 3; wi++) {
         unsigned coverage[5] = {0};

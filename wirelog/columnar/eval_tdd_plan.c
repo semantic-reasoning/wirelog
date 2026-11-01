@@ -986,8 +986,7 @@ wl_columnar_eval_tdd_plan_prepare_insert(wl_col_session_t *worker,
     if (slice->seed || slice->inactive)
         return EINVAL;
     if (worker->diff_operators_active || worker->retraction_seeded
-        || worker->retraction_right_pass || worker->delta_seeded
-        || worker->join_batch_bytes > 0 || worker->join_batch_strict)
+        || worker->retraction_right_pass || worker->delta_seeded)
         return ENOTSUP;
     if (!slice->count || slice->start >= body->op_count
         || slice->count > body->op_count - slice->start
@@ -1099,8 +1098,7 @@ wl_columnar_eval_tdd_plan_prepare_inputs(wl_col_session_t *worker,
         return EINVAL;
     if ((!k1 && manifest->alternative_count < 2) || slice->inactive
         || worker->diff_operators_active || worker->retraction_seeded
-        || worker->retraction_right_pass || worker->delta_seeded
-        || worker->join_batch_bytes > 0 || worker->join_batch_strict)
+        || worker->retraction_right_pass || worker->delta_seeded)
         return ENOTSUP;
     if (!slice->count || slice->start >= rel->op_count
         || slice->count > rel->op_count - slice->start

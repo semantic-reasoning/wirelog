@@ -1278,16 +1278,18 @@ differential pin or replacement transaction before destroying relations.
 `WIRELOG_JOIN_BATCH_BYTES=N` (strict decimal, default unset = off) makes an
 eligible keyed join run the resumable sub-batch producer in
 `wirelog/columnar/join_batch.c` instead of the one-shot probe loop.
-Eligible means: `key_count > 0`, a persistent primary arrangement on the
-right relation, no right-side delta, no right filter expression, and a
-session that does not resolve the JOIN's operands by input slot.  The runs
-that do are a TDD bound run and an insert clone, which may read a range
-piece or a delta under the relation's name while the producer pins the
-arrangement by name.  A JOIN in one that reached the bounded-mode decision
-would record `worker-session`, but both clear or refuse the knob before
-evaluating (#1382).  Other worker sessions, TDD workers and non-recursive
-workers alike, have been eligible since #2201; where non-recursive workers
-share one output counter, the producer charges it per committed batch.
+Eligible means: `key_count > 0`, no right filter expression, and either a
+persistent primary arrangement on the right relation with no right-side
+delta, or a worker run that resolves the JOIN's operands by input slot.
+The runs that do are a TDD bound run and an insert clone, which may read a
+range piece or a delta under the relation's name.  There the producer
+builds an index of its own over the relation the slot holds
+(`col_join_batch_producer_create_over`) and pins nothing by name, so a
+delta right operand is eligible too (#2201); insert clones still run with
+the knob turned off (below).  Other worker sessions, TDD workers and
+non-recursive workers alike, have also been eligible since #2201; where
+non-recursive workers share one output counter, the producer charges it
+per committed batch.  No JOIN records `worker-session` since #2201.
 Every other shape falls back to the one-shot join; the session records the
 fallback count and last reason and logs one `JOIN` warning per reason.
 The session also counts the bounded runs that complete, per route
@@ -1468,11 +1470,14 @@ strict differential `JOIN -> REDUCE` is not refused as
 `pipeline-not-consumable`; its JOIN follows the differential join's own
 bounded-mode rules below, which refuse its excluded shapes.
 
-- For a keyed JOIN without a right filter that is not materialized, in a
-  session that does not resolve operands by input slot (#2201), the pipeline
-  first applies the JOIN's right-operand selection, a key-column range check
-  and the key-type check, in that order and before looking at what follows
-  the JOIN.  A missing right relation, a forced-empty right operand, or a
+- For a keyed JOIN without a right filter that is not materialized, the
+  pipeline first applies the JOIN's right-operand selection, a key-column
+  range check and the key-type check, in that order and before looking at
+  what follows the JOIN.  In a run that resolves operands by input slot the
+  selected right operand is the relation the slot holds, and the tail ends
+  before a SEMIJOIN or ANTIJOIN stage, which would resolve its operand by
+  name (#2201).  A missing right relation, a forced-empty right operand, an
+  empty right operand in a run that resolves operands by input slot, or a
   key that resolves outside a zero-column input is left to the ordinary
   JOIN, whose result stands in both modes and nothing is recorded; there a
   zero-column input with rows (the left, or a right that remains after the
@@ -1481,7 +1486,9 @@ bounded-mode rules below, which refuse its excluded shapes.
   with rows, an empty zero-column input yields the empty result (#2170,
   #2209).  A FLOAT key paired with a non-FLOAT key is `EINVAL`, as from the
   ordinary JOIN.  A `$d$` or `$r$` right operand records `delta-right`, and
-  strict mode refuses it with `ENOTSUP` before the JOIN runs.
+  strict mode refuses it with `ENOTSUP` before the JOIN runs; a delta the
+  slot holds in a run that resolves operands by input slot is consumed
+  like any other right operand.
 - Otherwise, when the session, the JOIN or the shape of its tail is not
   consumable, what reads the JOIN's output decides.  If the output reaches
   the end of the plan only through CONCAT, CONSOLIDATE, or an EXCHANGE that
@@ -1567,21 +1574,28 @@ Ownership and admission:
   `rows_per_batch = 80`, 1.64x at 100, 1.985x at 65), and which step lands
   last depends on where `rows_per_batch` falls relative to the doubling
   sequence, so budget against twice the scratch payload.  The right relation's
-  arrangement is not part of the bound.  On the non-differential path the plain
-  JOIN operator builds or rebuilds its persistent arrangement before it creates
-  the producer, but the consumed pipeline creates the producer directly, and
-  that create builds a missing or stale arrangement after admitting the
-  descriptor, so a pipeline's create can peak at the descriptor plus that
-  build.  The differential arrangement is described below.  The output
-  relation is a separate account: its own fixed reservations and
-  `P_out(capacity)`, and during each growth `P_out(old) + P_out(new)` plus
-  its own `R`.  The sink asks for `new = max(2 * old, need)` rows, where
-  `need` is at most `old + rows_per_batch`, and retries at exactly `need`
-  when the governor denies the doubling, which was the rule for every
+  arrangement is not part of the bound.  A producer in a run that resolves
+  operands by input slot also holds `I(n)`, the index it builds over the
+  slot's `n`-row right relation: `8 * next_pow2(max(2n, 16))` bytes of bucket
+  heads plus `4 * max(n, 16)` bytes of row chain when `n > 0`
+  (`col_arrangement_owned_bytes`).  It is admitted after `D` and before the
+  build, so `D + I(n)` is held before `S` and `P(64)` are admitted.  The knob
+  does not bound `I(n)`, which grows with the right relation, just as it does
+  not bound the arrangement a producer pins on other sessions (#2201).  On the
+  non-differential path the plain JOIN operator builds or rebuilds its
+  persistent arrangement before it creates the producer, but the consumed
+  pipeline creates the producer directly, and that create builds a missing or
+  stale arrangement after admitting the descriptor, so a pipeline's create can
+  peak at the descriptor plus that build.  The differential arrangement is
+  described below.  The output relation is a separate account: its own fixed
+  reservations and `P_out(capacity)`, and during each growth `P_out(old) +
+  P_out(new)` plus its own `R`.  The sink asks for `new = max(2 * old, need)`
+  rows, where `need` is at most `old + rows_per_batch`, and retries at exactly
+  `need` when the governor denies the doubling, which was the rule for every
   growth before #2173.  After a growth the admitted output capacity is
-  therefore at most twice the rows the output holds; an output that never
-  grew keeps the 64-row capacity it was created with, which can exceed
-  twice its rows.  For a non-differential JOIN into a relation sink, the
+  therefore at most twice the rows the output holds; an output that never grew
+  keeps the 64-row capacity it was created with, which can exceed twice its
+  rows.  For a non-differential JOIN into a relation sink, the
   join's peak is the larger of the producer's growth transient plus the
   output's current footprint and the output's growth transient plus the
   producer's current footprint; on a large result the output's last growth
@@ -1641,7 +1655,8 @@ discard the output relation and release the differential pin exactly once.
 Materialized/cache joins and delta-right, filtered and cross shapes remain
 on their existing one-shot paths until their publication contracts are
 bounded; runs that resolve operands by input slot do not reach the
-differential join, since they refuse or clear differential operators.  Since
+differential join, since they refuse or clear differential operators, and
+the differential producer refuses a call from one with `EINVAL` (#2201).  Since
 #1382 the differential join decides them with the same eligibility check as
 the ordinary join and then excludes materialized joins.  Without strict mode
 each records its reason (`cross-join`, `delta-right`, `filtered-right` or
@@ -1718,12 +1733,11 @@ records `no-arrangement`; under `WIRELOG_JOIN_BATCH_STRICT` both return
 `ENOTSUP`.  The differential bounded path requires a key column, so a
 differential cross join runs as one-shot `$join_diff`; since #1382 it
 records `cross-join` and strict mode refuses it, as on the non-differential
-path.  In a run that resolves operands by input slot either kind of join
-that reaches the JOIN operator's bounded-mode decision records
-`worker-session` instead, and strict mode refuses it there; the bound and
-insert runs that are such runs clear or refuse the knob before evaluating
-(#1382), so session evaluation does not reach that decision with the knob
-set (#2201).  When this paragraph was written (#1370), the knob-on test
+path.  In a run that resolves operands by input slot the ordinary JOIN
+does not use the persistent arrangement: an eligible keyed JOIN with both
+inputs non-empty runs the producer over its own index there, or falls
+back as `row-too-large`, and so does not record `no-arrangement` (#2201).
+When this paragraph was written (#1370), the knob-on test
 suite ran 613 cross joins with at most 6,400 output rows, the ten
 `bench_flowlog` programs one (100 rows), and DOOP 16 before its run stopped
 (10,792 rows in total), and no workload recorded the `no-arrangement`
@@ -1786,7 +1800,9 @@ operator returns; that must change before #1383 publishes batches
 asynchronously.  On a worker the right operand can be a view of the
 coordinator's storage, so the ordinary JOIN drains the producer while its
 primary arrangement probe holds a reader on that operand, and the fused
-pipeline acquires one on it for the drain (#2201).
+pipeline acquires one on it for the drain (#2201).  A producer in a run
+that resolves operands by input slot holds its own reader on the right
+operand from create until destroy or cancel (#2201).
 
 Controlled initial STEP also has a deliberately narrow #1821 compatibility
 route for `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE`. It materializes the
@@ -1829,20 +1845,22 @@ single memory governor; the aggregate working set is therefore up to W
 times the per-producer bound, plus each worker's output relation.  Each
 worker still publishes one relation per JOIN operator, so no worker emits
 more than one payload into the one-payload-per-worker transport; bounded
-exchange is still #1383 after #1373.  The insert route's clones and the
-TDD bound runs still clear or refuse the knob: they resolve the right
-operand by input slot, and running the producer there needs an
-arrangement lease keyed by the slot-resolved relation, or a hash the
-producer builds over it, instead of the lease by name.  Which route a
-given production workload takes depends on its data sizes and is not
-claimed here.
+exchange is still #1383 after #1373.  A TDD bound run reads the knob from
+its worker and runs the producer over the slot's relation (#2201), with
+`I(n)` added to that producer's bound; the insert route's clones still
+clear the knob before evaluating.  The expanded and CSPA K1 bound forms
+are exercised only by unit tests (`test_tdd_occurrence_execution`); in
+the instances that test runs, the first JOIN feeds another JOIN and
+records `pipeline-not-consumable`, so strict mode refuses them.  Which
+route a given production workload takes depends on its data sizes and is
+not claimed here, and no performance claim is made.
 
 The shapes bounded mode excludes record these reasons, and each is refused
 under `WIRELOG_JOIN_BATCH_STRICT`: `cross-join`, `delta-right`,
-`filtered-right`, `worker-session` (a run that resolves operands by input
-slot), `no-arrangement`, `row-too-large`, `pipeline-not-consumable`,
+`filtered-right`, `no-arrangement`, `row-too-large`, `pipeline-not-consumable`,
 `materialized` (differential path; a cached result is copied before the
 decision and is neither recorded nor refused), `lftj` and `insert-route`.
+`worker-session` is no longer recorded since #2201.
 A controlled attempt on the JOIN route of #1821 refuses the knob with
 `ENOTSUP` without recording a reason; the numeric plan driver that
 dispatches it is not yet reached from session evaluation.

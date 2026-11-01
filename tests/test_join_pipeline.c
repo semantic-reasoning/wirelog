@@ -228,12 +228,43 @@ test_conservative_exclusions(void)
         && rejected_index == UINT32_MAX,
         "rejected preflight clears map index");
     ops[1].materialized = false;
+    /* A worker run that resolves its operands by input slot is no
+     * exclusion of its own (#2201); its tail ends before a probe stage,
+     * which would resolve its operand by name.  Elsewhere the same stage
+     * is consumed. */
     sess.tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
     rejected_index = 7;
     CHECK(wl_columnar_join_pipeline_preflight(&plan, 0, &sess, &rejected_index)
-        == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SESSION
-        && rejected_index == UINT32_MAX,
-        "slot-resolved worker run is excluded and clears index");
+        == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE && rejected_index == 2,
+        "slot-resolved worker run is eligible");
+    {
+        wl_plan_op_t probe_ops[] = {
+            ops[0],
+            { .op = WL_PLAN_OP_FILTER,
+              .filter_expr = { predicate, sizeof(predicate) } },
+            { .op = WL_PLAN_OP_SEMIJOIN, .right_relation = "probe",
+              .left_keys = keys, .right_keys = keys, .key_count = 1 },
+        };
+        wl_plan_relation_t probe_plan = { .ops = probe_ops, .op_count = 3 };
+        rejected_index = 7;
+        CHECK(wl_columnar_join_pipeline_preflight(&probe_plan, 0, &sess,
+            &rejected_index) == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE
+            && rejected_index == 1,
+            "slot-resolved tail ends before a probe stage");
+        probe_ops[1] = probe_ops[2];
+        probe_plan.op_count = 2;
+        rejected_index = 7;
+        CHECK(wl_columnar_join_pipeline_preflight(&probe_plan, 0, &sess,
+            &rejected_index) == WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_SHAPE
+            && rejected_index == UINT32_MAX,
+            "slot-resolved JOIN followed by a probe stage is excluded");
+        sess.tdd_input_run = NULL;
+        rejected_index = 7;
+        CHECK(wl_columnar_join_pipeline_preflight(&probe_plan, 0, &sess,
+            &rejected_index) == WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE
+            && rejected_index == 1,
+            "a probe stage is consumed outside slot-resolved runs");
+    }
     sess.tdd_input_run = NULL;
 
     plan.op_count = 2;

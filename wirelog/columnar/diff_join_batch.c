@@ -430,6 +430,12 @@ col_diff_join_batch_producer_create(wl_col_session_t *sess,
         || !op->right_relation || batch_bytes == 0
         || (op->project_count > 0 && !op->project_indices))
         return EINVAL;
+    /* The differential arrangement is found by name, and a worker run that
+     * resolves its operands by input slot need not hold its right operand
+     * under that name; such runs do not activate differential operators,
+     * so a call from one is a caller error (#2201). */
+    if (sess->tdd_input_run)
+        return EINVAL;
     right = session_find_rel(sess, op->right_relation);
     if (!right)
         return ENOENT;
