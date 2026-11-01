@@ -6767,6 +6767,14 @@ int wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *,
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t, wl_columnar_filter_status_t *,
     const void *);
+/* Charged source/key preparation shared by ordinary and prepared JOIN hosts. */
+struct wl_columnar_eval_private_bindings;
+void *wl_columnar_join_attempt_allocate(size_t);
+int wl_columnar_join_attempt_lookup(wl_col_session_t *, const char *, bool,
+    col_rel_t **, wl_evaluation_control_t *, uint64_t,
+    const struct wl_columnar_eval_private_bindings *);
+int wl_columnar_join_attempt_key(const wl_columnar_relation_scalar_source_t *,
+    const char *, uint32_t *, wl_evaluation_control_t *, uint64_t);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_join_test_attempt_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t);
@@ -6863,6 +6871,7 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
@@ -7005,6 +7014,12 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     bool controlled_materialized_batch_fallback;
     const struct wl_columnar_eval_private_bindings *private_bindings;
     wl_columnar_lftj_attempt_t lftj;
+    void *join_host;
+    uint64_t join_host_initialized_bytes;
+    wl_columnar_memory_reservation_t join_host_credit;
+    wl_columnar_memory_governor_ref_t *join_host_governor;
+    bool join_host_admitted, join_host_committed;
+    bool join_host_terminal, join_host_declined;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
 typedef struct {
@@ -7176,6 +7191,8 @@ int wl_columnar_eval_stack_unary_input_owned(
 int wl_columnar_eval_stack_unary_output_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***, const void *);
 int wl_columnar_eval_stack_unary_commit_attempt_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
+int wl_columnar_eval_stack_unary_commit_numeric_join_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
 /* Numeric-owned scalar retirement. Prepare validates the old owned entry
  * reversibly on the original target before commit, retaining writer claims.

@@ -5312,7 +5312,7 @@ wl_columnar_join_attempt_return(wl_evaluation_control_t *control,
     return tail > 0 ? tail : child_result ? child_result : tail;
 }
 
-static void *
+void *
 wl_columnar_join_attempt_allocate(size_t bytes)
 {
 #ifdef WL_SESSION_TEST_HOOKS
@@ -5326,7 +5326,7 @@ wl_columnar_join_attempt_allocate(size_t bytes)
 
 /* Raw lookup's name equality without a lazy hash rebuild or hidden scan.
 * One registry slot and one byte each have their own actual admission. */
-static int
+int
 wl_columnar_join_attempt_lookup(wl_col_session_t *session, const char *name,
     bool delta, col_rel_t **out, wl_evaluation_control_t *control, uint64_t id,
     const wl_columnar_eval_private_bindings_t *private_bindings)
@@ -5464,7 +5464,7 @@ typedef char wl_columnar_join_attempt_new_cells_fit[
 
 /* Exact-name precedence and the documented portable col<N> fallback domain.
  * Every examined registry/name/parser unit has its own original-ID admission. */
-static int
+int
 wl_columnar_join_attempt_key(const wl_columnar_relation_scalar_source_t *source,
     const char *key, uint32_t *out, wl_evaluation_control_t *control,
     uint64_t id)

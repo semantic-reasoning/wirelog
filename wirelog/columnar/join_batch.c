@@ -1696,6 +1696,35 @@ col_join_batch_control_ack_validated(wl_columnar_continuation_t *cont,
 }
 
 int
+wl_columnar_join_batch_prepare_sink_commit_ack(
+    wl_columnar_join_batch_prepare_t *a, col_rel_t *sink, uint32_t base,
+    uint64_t generation, const wl_columnar_relation_append_batch_t *writer,
+    const wl_columnar_relation_scalar_source_t *source, uint32_t *extent)
+{
+    if (!a || a->identity != a || !a->ready || a->aborting || !sink || !extent
+        || !writer || writer->identity != writer || writer->raw.active
+        || writer->phase != WL_COLUMNAR_RELATION_BATCH_ENDED
+        || !writer->result_saved || writer->saved_result || !source
+        || source->identity != source
+        || source->phase != WL_COLUMNAR_RELATION_SCALAR_SOURCE_DRAINED
+        || !source->first_result_saved || source->first_result) return EINVAL;
+    col_join_batch_producer_t *p = (col_join_batch_producer_t *)
+        wl_columnar_continuation_producer_context(a->continuation);
+    if (!p || p->private_prepare != a || sink == p->batch
+        || sink->storage_owner != sink || sink->ncols != p->batch->ncols
+        || *extent != base || (uint64_t)base + p->batch->nrows != sink->nrows)
+        return EINVAL;
+    if (wl_columnar_source_access_gate_busy(&p->batch->descriptor_access)
+        || wl_columnar_source_access_gate_busy(&p->batch->source_access))
+        return EBUSY;
+    int rc = col_join_batch_control_precommit(a->continuation, generation);
+    if (rc) return rc;
+    *extent = sink->nrows;
+    col_join_batch_control_ack_validated(a->continuation, generation);
+    return 0;
+}
+
+int
 col_join_batch_control_discard(wl_columnar_continuation_t **cont)
 {
     if (!cont || !*cont)
