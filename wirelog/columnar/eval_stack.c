@@ -1673,6 +1673,15 @@ wl_columnar_eval_stack_filter_context(
 }
 
 int
+wl_columnar_eval_stack_filter_context_nonstream_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_context_t **out, const void *owner)
+{
+    if (!frame || frame->stream_host) return EBUSY;
+    return wl_columnar_eval_stack_filter_context_owned(frame, out, owner);
+}
+
+int
 wl_columnar_eval_stack_filter_context_owned(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_columnar_filter_context_t **out, const void *owner)
@@ -1996,7 +2005,8 @@ wl_columnar_eval_stack_numeric_source_install(
     if (rc) return rc;
     if (frame->numeric_plan_owner != owner || !owner->source_mode
         || owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL
-        || owner->source_initialized || owner->source_installed
+        || owner->source_initialized || owner->source_bare
+        || owner->source_installed
         || owner->source_empty != owner->source_slot_borrowed)
         return EBUSY;
     col_rel_t *rel = owner->source_empty ? frame->result.rel
@@ -2033,7 +2043,8 @@ wl_columnar_eval_stack_numeric_source_release(
     if (rc) return rc;
     if (frame->numeric_plan_owner != owner || !owner->source_mode
         || owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
-        || owner->source_initialized || owner->source_installed)
+        || owner->source_initialized || owner->source_bare
+        || owner->source_installed)
         return EBUSY;
     /* The result, possibly owned/nonNULL, stays in the original frame.
      * Its later generic disposal is a separate caller action, not an ACK
@@ -3063,7 +3074,8 @@ wl_columnar_eval_stack_composed_source_install(
             owner && owner->source_slot_borrowed, true);
     if (rc) return rc;
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL
-        || owner->source_initialized || owner->source_installed
+        || owner->source_initialized || owner->source_bare
+        || owner->source_installed
         || owner->source_empty != owner->source_slot_borrowed) return EBUSY;
     col_rel_t *rel = owner->source_empty ? frame->result.rel
         : owner->source_selected;
@@ -3097,7 +3109,8 @@ wl_columnar_eval_stack_composed_source_abort_validate(
             true, true);
     if (rc) return rc;
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_ABORT
-        || owner->source_initialized || !owner->source_slot_borrowed)
+        || owner->source_initialized || owner->source_bare
+        || !owner->source_slot_borrowed)
         return EBUSY;
     return 0;
 }
@@ -3144,7 +3157,8 @@ wl_columnar_eval_stack_composed_source_release(
             false, false);
     if (rc) return rc;
     if (owner->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
-        || owner->source_initialized || owner->source_slot_borrowed)
+        || owner->source_initialized || owner->source_bare
+        || owner->source_slot_borrowed)
         return EBUSY;
     frame->numeric_plan_owner = NULL;
     return 0;

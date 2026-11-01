@@ -1583,6 +1583,13 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
     int rc;
     switch (h->phase) {
     case WL_COLUMNAR_JOIN_HOST_LEFT_INIT:
+        /* Routing hint only: ordinary JOIN must authenticate the descriptor.
+         * Normal scalar HOLD cannot acquire a never-inserted EDB. */
+        if (!h->left->ncols) {
+            r->join_host_declined = true;
+            h->phase = WL_COLUMNAR_JOIN_HOST_ABORT;
+            return 0;
+        }
         rc = wl_columnar_relation_scalar_source_init_attempt_controlled(
             &h->left_source, &h->left_initialized, r->control, r->attempt_id);
         if (!rc) h->phase = WL_COLUMNAR_JOIN_HOST_LEFT_HOLD;
@@ -1627,7 +1634,8 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
         }
         /* These are named intrinsic ordinary destinations. No unary claim
          * has started, so the existing bounded child can run after drain. */
-        if (!h->right || h->forced_empty || h->used_delta || !op->key_count
+        if (!h->right || !h->right->ncols || h->forced_empty
+            || h->used_delta || !op->key_count
             || op->materialized || op->right_filter_expr.size
             || (op->project_count && !op->project_indices)) {
             r->join_host_declined = true;

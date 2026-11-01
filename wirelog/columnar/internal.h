@@ -5565,6 +5565,16 @@ typedef struct wl_columnar_expr_attempt_numeric
 int wl_columnar_expr_compile_attempt_controlled(const uint8_t *, uint32_t,
     wl_columnar_memory_governor_ref_t *, wl_columnar_expr_attempt_numeric_t **,
     bool *, wl_evaluation_control_t *, uint64_t);
+/* Zero-row FILTER setup: raw compiler opcode domain (including string
+ * comparisons, excluding HASH/CRC). The owner is cleanup-only: NEVER evaluate
+ * it through the numeric evaluator. Actual source owner must prove zero rows.
+ * SIMPLE classification shares bounded decoding; no schema/lane validation. */
+int wl_columnar_expr_compile_empty_filter_attempt_controlled(const uint8_t *,
+    uint32_t, wl_columnar_memory_governor_ref_t *,
+    wl_columnar_expr_attempt_numeric_t **, bool *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_expr_simple_filter_attempt_controlled(const uint8_t *,
+    uint32_t, bool *, wl_evaluation_control_t *, uint64_t);
 void wl_columnar_expr_attempt_numeric_free(
     wl_columnar_expr_attempt_numeric_t *);
 
@@ -6799,6 +6809,10 @@ typedef struct wl_columnar_filter_context {
     bool join_decision_pending, join_result_is_delta, join_preserve_input;
     uint32_t join_retirement_cursor;
     wl_columnar_relation_scalar_source_t join_right;
+    /* Only owned ordinary JOIN admits authentic unspecialized descriptors.
+     * The tag never grants scalar gather authority. Cleared after real END. */
+    bool source_bare, join_right_bare;
+    wl_columnar_relation_empty_source_t source_empty_reader, join_empty_reader;
     wl_columnar_join_scratch_t join_scratch[WL_COLUMNAR_JOIN_SCRATCH_COUNT];
 } wl_columnar_filter_context_t;
 
@@ -7104,6 +7118,8 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_relation_scalar_source_t source;
     bool source_mode, source_installed, source_empty, source_is_delta;
     bool source_initialized, source_slot_borrowed;
+    bool source_bare;
+    wl_columnar_relation_empty_source_t source_empty_reader;
     /* ABORT is available only for the audited operator closure. Ordinary
     * composed execution retains its wider existing admission surface. */
     bool abort_supported, abort_requested;
@@ -7291,6 +7307,16 @@ int wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *,
     const void *);
 int wl_columnar_filter_op_attempt_step_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *);
+/* Exact owned ordinary JOIN cleanup only. Queries refuse all stream hosts;
+ * actual END uses distinct supplied funding after the parent dispatch1. */
+int wl_columnar_filter_empty_end_pending_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, bool *);
+int wl_columnar_filter_empty_end_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_status_t *,
+    const void *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_filter_context_nonstream_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
     const void *);
 int wl_columnar_filter_op_attempt_ack_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *);

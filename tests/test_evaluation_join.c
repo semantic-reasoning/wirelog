@@ -1378,6 +1378,18 @@ probe_rejections(void)
             eval_entry_t before =
                 wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0];
             run(&f);
+            if (mode == 0) {
+                /* Missing FULL is an exact repush for either existence join. */
+                const eval_entry_t *after =
+                    &wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0];
+                CHECK(!f.status.semantic_result && !f.status.committed);
+                CHECK(after->rel == before.rel && after->owned == before.owned
+                    && after->is_delta == before.is_delta
+                    && after->seg_boundaries == before.seg_boundaries
+                    && after->seg_count == before.seg_count);
+                fixture_close(&f);
+                continue;
+            }
             CHECK(f.status.semantic_result == (mode == 1 ? EINVAL : ENOTSUP));
             CHECK(!f.status.committed && !f.session.memory_budget_denied);
             const eval_entry_t *after =

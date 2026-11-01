@@ -2754,6 +2754,7 @@ wl_columnar_ops_reduce_attempt_start_owned(const wl_plan_op_t *op,
     ctx->program = NULL; ctx->output = NULL; ctx->private_output = NULL;
     ctx->governor = NULL; ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->source_bare = false; ctx->join_right_bare = false;
     ctx->drain_initialized = false; ctx->heap = false; ctx->admitted = false;
     ctx->credit_committed = false; ctx->ref_held = false;
     ctx->unary_started = false; ctx->committed = false;
