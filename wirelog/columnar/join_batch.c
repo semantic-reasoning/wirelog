@@ -204,6 +204,7 @@ typedef struct {
     uint32_t *rk;
     uint32_t kc;
     col_arrangement_pin_t pin;
+    wl_columnar_join_batch_prepare_t *private_prepare;
     wl_columnar_source_access_reader_t runner_left_reader;
     wl_columnar_source_access_reader_t runner_right_reader;
     /* An explicit right relation (#2201): the producer builds and owns its
@@ -400,9 +401,25 @@ controlled_poll(col_join_batch_producer_t *p)
 {
     if (p->controlled_status != COL_JOIN_BATCH_CONTROL_PROGRESS)
         return p->controlled_status;
-    if (!p->arr || !p->pin.active)
+    if (!p->arr || (!p->pin.active && !p->private_prepare))
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_CANCELLED,
                    ECANCELED);
+    if (p->private_prepare && (p->private_prepare->identity
+        != p->private_prepare || !p->private_prepare->ready
+        || p->private_prepare->aborting
+        || p->private_prepare->control != p->controlled_control
+        || p->private_prepare->attempt_id != p->controlled_attempt_id
+        || p->private_prepare->left_reader.identity
+        != (uintptr_t)&p->private_prepare->left_reader
+        || p->private_prepare->right_reader.identity
+        != (uintptr_t)&p->private_prepare->right_reader
+        || !p->private_prepare->left_reader.owner
+        || !p->private_prepare->right_reader.owner
+        || p->private_prepare->left_reader.secondary_owner !=
+        &p->left->descriptor_access
+        || p->private_prepare->right_reader.secondary_owner !=
+        &p->right->descriptor_access))
+        return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT, EINVAL);
     if (wl_evaluation_control_active_attempt_id(p->controlled_control)
         != p->controlled_attempt_id)
         return controlled_stop(p, COL_JOIN_BATCH_CONTROL_STALE_ATTEMPT,
@@ -1021,6 +1038,17 @@ producer_destroy(void *context)
 
     if (!p)
         return;
+    if (p->private_prepare) {
+        /* The stable receipt drains heavy resources before this fixed,
+         * nonreentrant destruction callback. */
+        if (!p->private_prepare->aborting || p->batch || p->arr
+            || p->runner_left_reader.owner || p->runner_right_reader.owner)
+            abort();
+        control = p->controlled_control;
+        free(p);
+        wl_evaluation_control_release(control);
+        return;
+    }
     wl_columnar_memory_reservation_init(&reservation);
     if (p->descriptor_reservation.governor
         && !wl_columnar_memory_reservation_move(&reservation,
@@ -1676,7 +1704,7 @@ col_join_batch_control_discard(wl_columnar_continuation_t **cont)
         wl_columnar_continuation_producer_context(*cont);
     if (!p || !p->controlled_bound || !controlled_thread_is_owner(p)
         || (p->runner_mode && !p->runner_internal)
-        || p->controlled_busy)
+        || p->controlled_busy || p->private_prepare)
         return EBUSY;
     wl_columnar_continuation_destroy(*cont);
     *cont = NULL;
@@ -2443,4 +2471,463 @@ wl_columnar_join_batch_payload_sink_init_with_inline(
     context->inline_schema = true;
     context->inline_columns = columns;
     context->inline_column_count = logical_count;
+}
+
+/* ---- original-attempt owned primary preparation ------------------------- */
+enum {
+    WL_COLUMNAR_JOIN_BATCH_PREP_DESCRIPTOR = 1,
+    WL_COLUMNAR_JOIN_BATCH_PREP_LEFT,
+    WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT,
+    WL_COLUMNAR_JOIN_BATCH_PREP_SHAPE,
+    WL_COLUMNAR_JOIN_BATCH_PREP_KEYS,
+    WL_COLUMNAR_JOIN_BATCH_PREP_COLUMNS,
+    WL_COLUMNAR_JOIN_BATCH_PREP_SIZE,
+    WL_COLUMNAR_JOIN_BATCH_PREP_ALLOC,
+    WL_COLUMNAR_JOIN_BATCH_PREP_HEADS,
+    WL_COLUMNAR_JOIN_BATCH_PREP_INDEX,
+    WL_COLUMNAR_JOIN_BATCH_PREP_SCRATCH,
+    WL_COLUMNAR_JOIN_BATCH_PREP_CONTINUATION,
+    WL_COLUMNAR_JOIN_BATCH_PREP_BIND,
+    WL_COLUMNAR_JOIN_BATCH_PREP_READY
+};
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_join_batch_test_prepare_checkpoint)(
+    const wl_columnar_join_batch_prepare_t *);
+uint32_t wl_columnar_join_batch_test_prepare_fail_allocation;
+#endif
+
+static bool
+wl_columnar_join_batch_prepare_allocation_fails(void)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_join_batch_test_prepare_fail_allocation
+        && !--wl_columnar_join_batch_test_prepare_fail_allocation) return true;
+#endif
+    return false;
+}
+
+static int
+wl_columnar_join_batch_prepare_reserve(wl_columnar_join_batch_prepare_t *a,
+    uint64_t bytes, wl_columnar_memory_reservation_t *credit, bool *admitted)
+{
+    if (!a->governor) return 0;
+    wl_columnar_memory_admission_status_t status;
+    int rc = wl_columnar_memory_governor_reserve_checked_controlled(
+        wl_columnar_memory_governor_ref_get(a->governor), bytes, credit,
+        &status, a->control);
+    if (!rc && status > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+        rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+            : status ==
+            WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+        if (rc == ENOSPC) a->session->memory_budget_denied = true;
+    }
+    if (!rc) *admitted = true;
+    return rc;
+}
+
+int
+wl_columnar_join_batch_prepare_begin(wl_columnar_join_batch_prepare_t *a,
+    wl_col_session_t *session, const wl_plan_op_t *op, const col_rel_t *left,
+    const col_rel_t *right, bool left_is_delta, const uint32_t *lk,
+    const uint32_t *rk, uint32_t kc, uint64_t bytes,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!a || a->identity || !session || !op || !left || !right
+        || !lk || !rk || !kc || !bytes || !control || !id) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 16);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return rc;
+    a->identity = a; a->session = session; a->op = op;
+    a->left = left; a->right = right; a->left_is_delta = left_is_delta;
+    a->input_left_keys = lk; a->input_right_keys = rk;
+    a->key_count = kc; a->batch_bytes = bytes;
+    a->control = control; a->attempt_id = id;
+    a->governor = session->memory_governor ? session->memory_governor
+        : left->memory_governor ? left->memory_governor :
+        right->memory_governor;
+    wl_columnar_memory_governor_ref_retain(a->governor);
+    wl_columnar_memory_reservation_init(&a->descriptor_credit);
+    wl_columnar_memory_reservation_init(&a->arrays_credit);
+    wl_columnar_memory_reservation_init(&a->continuation_credit);
+    a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_DESCRIPTOR;
+    return 0;
+}
+
+static int
+wl_columnar_join_batch_prepare_action(wl_columnar_join_batch_prepare_t *a)
+{
+    col_join_batch_producer_t *p = a->producer;
+    int rc;
+    switch (a->phase) {
+    case WL_COLUMNAR_JOIN_BATCH_PREP_DESCRIPTOR:
+        rc = wl_columnar_join_batch_prepare_reserve(a, sizeof(*p),
+                &a->descriptor_credit, &a->descriptor_admitted);
+        if (rc) return rc;
+        p = wl_columnar_join_batch_prepare_allocation_fails()
+            ? NULL : calloc(1, sizeof(*p));
+        if (!p) return ENOMEM;
+        a->producer = p; p->private_prepare = a;
+        if (a->descriptor_admitted) {
+            if (!wl_columnar_memory_commit(&a->descriptor_credit,
+                p)) return EINVAL;
+            a->descriptor_committed = true;
+        }
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_LEFT;
+        return 0;
+    case WL_COLUMNAR_JOIN_BATCH_PREP_LEFT:
+    case WL_COLUMNAR_JOIN_BATCH_PREP_RIGHT: {
+        bool left = a->phase == WL_COLUMNAR_JOIN_BATCH_PREP_LEFT, held = false;
+        rc = col_rel_source_reader_acquire_step(left ? a->left : a->right,
+                left ? &a->left_reader : &a->right_reader, &held);
+        if (rc == EAGAIN) return 0;
+        if (rc) return rc;
+        if (held) ++a->phase;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_SHAPE: {
+        const col_rel_t *l = a->left, *r = a->right;
+        a->left_snapshot = wl_columnar_relation_snapshot(l);
+        a->right_snapshot = wl_columnar_relation_snapshot(r);
+        if (!wl_columnar_relation_snapshot_valid(a->left_snapshot)
+            || !wl_columnar_relation_snapshot_valid(a->right_snapshot)
+            || l->nrows > l->capacity || r->nrows > r->capacity) return EINVAL;
+        if (l->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE) return ENOTSUP;
+        if (a->op->project_count && !a->op->project_indices) return EINVAL;
+        uint64_t width = a->op->project_count ? a->op->project_count
+            : (uint64_t)l->ncols + r->ncols;
+        if (width > UINT32_MAX) return EOVERFLOW;
+        if (!width) return ENOTSUP;
+        a->output_width = (uint32_t)width;
+        uint64_t row_bytes = width * sizeof(int64_t)
+            + (l->timestamps ? sizeof(col_delta_timestamp_t) : 0);
+        uint64_t rows = a->batch_bytes / row_bytes;
+        if (!rows) return ENOTSUP;
+        a->rows_per_batch = rows > UINT32_MAX ? UINT32_MAX : (uint32_t)rows;
+        a->capacity = a->rows_per_batch < COL_REL_INIT_CAP
+            ? a->rows_per_batch : COL_REL_INIT_CAP;
+        a->arrangement.generation = 1;
+        a->arrangement.nbuckets = r->nrows ? 1 : 16;
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_KEYS;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_KEYS:
+        if (a->cursor < a->key_count) {
+            if (a->input_left_keys[a->cursor] >= a->left->ncols
+                || a->input_right_keys[a->cursor] >=
+                a->right->ncols) return EINVAL;
+            ++a->cursor;
+            return 0;
+        }
+        a->cursor = 0;
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_COLUMNS;
+        return 0;
+    case WL_COLUMNAR_JOIN_BATCH_PREP_COLUMNS: {
+        uint64_t total = (uint64_t)a->left->ncols + a->right->ncols;
+        if (a->cursor < total) {
+            const col_rel_t *rel = a->cursor <
+                a->left->ncols ? a->left : a->right;
+            uint32_t c = a->cursor < a->left->ncols ? a->cursor
+                : a->cursor - a->left->ncols;
+            if (!rel->columns || !rel->columns[c]
+                || (rel->column_types &&
+                (rel->column_types[c] < WIRELOG_TYPE_INT32
+                || rel->column_types[c] > WIRELOG_TYPE_BOOL))) return EINVAL;
+            ++a->cursor;
+            return 0;
+        }
+        a->cursor = 0;
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_SIZE;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_SIZE: {
+        uint32_t *buckets = &a->arrangement.nbuckets;
+        if (*buckets < (uint64_t)a->right->nrows * 2u) {
+            if (*buckets > UINT32_MAX / 2u) return EOVERFLOW;
+            *buckets *= 2u;
+            return 0;
+        }
+        uint64_t parts[] = {(uint64_t)a->key_count * 2u * sizeof(uint32_t),
+                            (uint64_t)*buckets * sizeof(uint64_t),
+                            (uint64_t)a->right->nrows * sizeof(uint32_t),
+                            (uint64_t)a->output_width * sizeof(int64_t),
+                            (uint64_t)(a->right->ncols ? a->right->ncols : 1u)
+                            * sizeof(int64_t)};
+        uint64_t bytes = 0;
+        for (unsigned i = 0; i < 5; ++i)
+            if (parts[i] > SIZE_MAX || !wl_columnar_memory_size_add(bytes,
+                parts[i], &bytes)) return EOVERFLOW;
+        a->allocation_bytes = bytes;
+        rc = wl_columnar_join_batch_prepare_reserve(a, bytes, &a->arrays_credit,
+                &a->arrays_admitted);
+        if (rc) return rc;
+        if (a->arrays_admitted) {
+            if (!wl_columnar_memory_commit(&a->arrays_credit, a)) return EINVAL;
+            a->arrays_committed = true;
+        }
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_ALLOC;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_ALLOC: {
+        uint64_t size;
+        void *allocation;
+        switch (a->cursor) {
+        case 0: size = (uint64_t)a->key_count * 2u * sizeof(uint32_t); break;
+        case 1: size = (uint64_t)a->arrangement.nbuckets * sizeof(uint64_t);
+            break;
+        case 2: size = (uint64_t)a->right->nrows * sizeof(uint32_t); break;
+        case 3: size = (uint64_t)a->output_width * sizeof(int64_t); break;
+        default: size = (uint64_t)(a->right->ncols ? a->right->ncols : 1u)
+                * sizeof(int64_t); break;
+        }
+        allocation =
+            !size ? NULL : wl_columnar_join_batch_prepare_allocation_fails()
+            ? NULL : malloc((size_t)size);
+        if (size && !allocation) return ENOMEM;
+        switch (a->cursor++) {
+        case 0: a->keys = allocation; break;
+        case 1: a->arrangement.ht_head = allocation; break;
+        case 2: a->arrangement.ht_next = allocation; break;
+        case 3: a->types = allocation; break;
+        default: a->key_row = allocation;
+            a->cursor = 0; a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_HEADS;
+            a->arrangement.key_cols = a->keys + a->key_count;
+            a->arrangement.key_count = a->key_count;
+            a->arrangement.ht_cap = a->right->nrows;
+            break;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_HEADS:
+        if (a->cursor < a->key_count) {
+            uint32_t k = a->cursor++;
+            a->keys[k] = a->input_left_keys[k];
+            a->keys[a->key_count + k] = a->input_right_keys[k];
+        } else if ((uint64_t)a->cursor - a->key_count < a->output_width) {
+            uint32_t c = a->cursor++ - a->key_count;
+            uint32_t src = a->op->project_count ? a->op->project_indices[c] : c;
+            const col_rel_t *rel = src < a->left->ncols ? a->left : a->right;
+            uint32_t col = src < a->left->ncols ? src : src - a->left->ncols;
+            a->types[c] = col < rel->ncols && rel->column_types
+                ? rel->column_types[col] : WIRELOG_TYPE_INT64;
+        } else {
+            uint64_t bucket = (uint64_t)a->cursor - a->key_count -
+                a->output_width;
+            if (bucket < a->arrangement.nbuckets) {
+                a->arrangement.ht_head[bucket] = (UINT64_C(1) <<
+                    32) | UINT32_MAX;
+                ++a->cursor;
+            } else {
+                a->cursor = a->row = a->key = a->byte = 0;
+                a->hash = (uint32_t)UINT64_C(14695981039346656037);
+                a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_INDEX;
+            }
+        }
+        return 0;
+    case WL_COLUMNAR_JOIN_BATCH_PREP_INDEX:
+        if (a->row == a->right->nrows) {
+            a->arrangement.indexed_rows = a->right->nrows;
+            a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_SCRATCH;
+        } else if (a->key < a->key_count) {
+            if (!a->byte) {
+                uint32_t col = a->arrangement.key_cols[a->key];
+                a->hash_value = wl_columnar_value_key(a->right, col,
+                        a->right->columns[col][a->row]);
+            }
+            a->hash ^= (uint32_t)(a->hash_value & 255u);
+            a->hash *= 435u; a->hash_value >>= 8;
+            if (++a->byte == 8) {
+                a->byte = 0; ++a->key;
+            }
+        } else {
+            uint32_t bucket = a->hash & (a->arrangement.nbuckets - 1u);
+            a->arrangement.ht_next[a->row] =
+                (uint32_t)a->arrangement.ht_head[bucket];
+            a->arrangement.ht_head[bucket] = (UINT64_C(1) << 32) | a->row;
+            ++a->row; a->key = a->byte = 0;
+            a->hash = (uint32_t)UINT64_C(14695981039346656037);
+        }
+        return 0;
+    case WL_COLUMNAR_JOIN_BATCH_PREP_SCRATCH:
+        rc =
+            wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled
+            (
+            "$join_batch", a->output_width, a->capacity, a->types,
+            a->left->timestamps != NULL, a->governor, &p->batch,
+            a->control, a->attempt_id);
+        if (rc) return wl_columnar_join_budget_denial(a->session, NULL, rc);
+        p->sess = a->session; p->op = a->op; p->left = a->left;
+        p->right = a->right;
+        p->lk = a->keys; p->rk = a->keys + a->key_count; p->kc = a->key_count;
+        p->key_row_storage.key_row = a->key_row;
+        p->arr = &a->arrangement; p->rows_per_batch = a->rows_per_batch;
+        p->cursor.next.rr = UINT32_MAX;
+        p->cursor.left_identity = a->left->relation_identity;
+        p->cursor.left_view_gen = a->left->view_generation;
+        p->cursor.left_storage_gen = a->left->storage_generation;
+        p->cursor.right_identity = a->right->relation_identity;
+        p->cursor.right_view_gen = a->right->view_generation;
+        p->cursor.right_storage_gen = a->right->storage_generation;
+        p->cursor.arr_generation = a->arrangement.generation;
+        p->cursor.arr_indexed_rows = a->right->nrows;
+        p->cursor.left_is_delta = a->left_is_delta;
+        p->cursor.timestamps = a->left->timestamps != NULL;
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_CONTINUATION;
+        return 0;
+    case WL_COLUMNAR_JOIN_BATCH_PREP_CONTINUATION: {
+        rc = wl_columnar_join_batch_prepare_reserve(a,
+                wl_columnar_continuation_allocation_bytes(),
+                &a->continuation_credit, &a->continuation_admitted);
+        if (rc) return rc;
+        wl_columnar_continuation_producer_t producer = {0};
+        producer.context = p; producer.produce = producer_produce;
+        producer.validate = producer_validate;
+        producer.destroy = producer_destroy;
+        producer.cancel = producer_cancel;
+        wl_columnar_continuation_cursor_t initial = {0};
+        initial.input_identity = a->left->relation_identity;
+        initial.arrangement_identity = a->right->relation_identity;
+        initial.generation = a->arrangement.generation;
+        initial.position = pos_pack(0, UINT32_MAX);
+        a->continuation = wl_columnar_join_batch_prepare_allocation_fails()
+            ? NULL : wl_columnar_continuation_create(&producer, &initial);
+        if (!a->continuation) return ENOMEM;
+        if (a->continuation_admitted) {
+            if (!wl_columnar_memory_commit(&a->continuation_credit,
+                a->continuation)) return EINVAL;
+            a->continuation_committed = true;
+        }
+        a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_BIND;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_BATCH_PREP_BIND:
+        rc = col_join_batch_control_bind(a->continuation, a->control,
+                a->attempt_id);
+        if (rc) return rc;
+        a->ready = true; a->phase = WL_COLUMNAR_JOIN_BATCH_PREP_READY;
+        return 0;
+    default: return EINVAL;
+    }
+}
+
+int
+wl_columnar_join_batch_prepare_step(wl_columnar_join_batch_prepare_t *a,
+    uint64_t max_work, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a || a->aborting || a->drained || !max_work)
+        return EINVAL;
+    if (a->result) return a->result;
+    if (a->ready) {
+        *done = true; return 0;
+    }
+    if (max_work > WL_EVALUATION_CONTROL_QUANTUM) return EINVAL;
+    for (uint64_t n = 0; n < max_work; ++n) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_join_batch_test_prepare_checkpoint)
+            wl_columnar_join_batch_test_prepare_checkpoint(a);
+#endif
+        int rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id,
+                1);
+        if (!rc && a->phase > WL_COLUMNAR_JOIN_BATCH_PREP_SHAPE
+            && (!wl_columnar_relation_snapshot_equal(a->left_snapshot,
+            wl_columnar_relation_snapshot(a->left))
+            || !wl_columnar_relation_snapshot_equal(a->right_snapshot,
+            wl_columnar_relation_snapshot(a->right)))) rc = EAGAIN;
+        if (!rc) rc = wl_columnar_join_batch_prepare_action(a);
+        if (!rc) rc = wl_evaluation_control_charge_attempt(a->control,
+                    a->attempt_id, 0);
+        if (rc) {
+            a->result = rc; return rc;
+        }
+        if (a->ready) {
+            *done = true; return 0;
+        }
+    }
+    return 0;
+}
+
+int
+wl_columnar_join_batch_prepare_abort_step(wl_columnar_join_batch_prepare_t *a,
+    wl_evaluation_control_t *funding, uint64_t funding_id, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a || !funding ||
+        funding == a->control) return EINVAL;
+    if (a->drained) {
+        *done = true; return 0;
+    }
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+    if (rc) return rc;
+    a->aborting = true;
+    col_join_batch_producer_t *p = a->producer;
+    if (p && p->batch) {
+        if (!a->retirement_started) {
+            rc = wl_columnar_relation_scalar_retirement_begin(&a->retirement,
+                    p->batch);
+            if (rc) return rc;
+            a->retirement_started = true;
+        }
+        if (!a->retirement_committed) {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
+                    funding, funding_id);
+            if (rc == EAGAIN) return 0;
+            if (rc) return rc;
+            rc = wl_columnar_relation_scalar_retirement_commit(&a->retirement);
+            if (rc) return rc;
+            a->retirement_committed = true;
+        }
+        rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
+                funding, funding_id);
+        if (rc == EAGAIN) return 0;
+        if (rc) return rc;
+        p->batch = NULL;
+        return 0;
+    }
+    if (a->left_reader.owner || a->right_reader.owner) {
+        bool released = false;
+        rc = wl_columnar_source_access_reader_release_step(a->left_reader.owner
+                ? &a->left_reader : &a->right_reader, &released);
+        return rc;
+    }
+    if (p) {
+        p->arr = NULL;
+        /* Fresh-exclusive before bind, producer-claimed afterward: neither
+         * state permits generic publish or deferred/reentrant destruction.
+         * All heavy resources were drained before the fixed callback. */
+        if (a->continuation) {
+            wl_columnar_continuation_destroy(a->continuation);
+            a->continuation = NULL;
+        } else producer_destroy(p);
+        a->producer = NULL;
+        return 0;
+    }
+#define WL_COLUMNAR_JOIN_BATCH_PREP_FREE(field) \
+        if (a->field) { free(a->field); a->field = NULL; return 0; }
+    WL_COLUMNAR_JOIN_BATCH_PREP_FREE(arrangement.ht_head)
+    WL_COLUMNAR_JOIN_BATCH_PREP_FREE(arrangement.ht_next)
+    WL_COLUMNAR_JOIN_BATCH_PREP_FREE(keys)
+    WL_COLUMNAR_JOIN_BATCH_PREP_FREE(types)
+    WL_COLUMNAR_JOIN_BATCH_PREP_FREE(key_row)
+#undef WL_COLUMNAR_JOIN_BATCH_PREP_FREE
+#define WL_COLUMNAR_JOIN_BATCH_PREP_CREDIT(name) \
+        if (a->name ## _admitted) { \
+            bool released = false; \
+            rc = wl_columnar_memory_reservation_finish_step(&a->name ## _credit, \
+                    !a->name ## _committed, &released); \
+            if (!rc && released) a->name ## _admitted = false; \
+            return rc; \
+        }
+    WL_COLUMNAR_JOIN_BATCH_PREP_CREDIT(continuation)
+    WL_COLUMNAR_JOIN_BATCH_PREP_CREDIT(arrays)
+    WL_COLUMNAR_JOIN_BATCH_PREP_CREDIT(descriptor)
+#undef WL_COLUMNAR_JOIN_BATCH_PREP_CREDIT
+    wl_columnar_memory_governor_ref_release(a->governor); a->governor = NULL;
+    wl_evaluation_control_release(a->control); a->control = NULL;
+    a->ready = false; a->drained = true; *done = true;
+    return 0;
 }

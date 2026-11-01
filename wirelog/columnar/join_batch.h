@@ -267,6 +267,62 @@ col_join_batch_runner_advance(wl_columnar_continuation_t **runner,
 int
 col_join_batch_runner_discard(wl_columnar_continuation_t **runner);
 
+/* Stable caller-owned preparation receipt. Sources, op and all referenced op
+ * metadata (including projection indices) remain live and immutable until
+ * drained producer teardown. Input resolved-key arrays are borrowed only
+ * through READY or abort; preparation copies their entries. After READY
+ * the receipt continues owning the producer and source leases: destroy it only
+ * through abort_step after consumers have released every batch reader. Never
+ * copy/reset a live receipt or destroy its borrowed continuation directly.
+ * Local steps spend at most max_work unit actions, except the explicitly
+ * nested controlled constructor/governor calls, which retain their own polling
+ * contract. This is a polling bound, not a total per-call work bound. */
+typedef struct wl_columnar_join_batch_prepare {
+    const struct wl_columnar_join_batch_prepare *identity;
+    wl_col_session_t *session;
+    const wl_plan_op_t *op;
+    const col_rel_t *left, *right;
+    const uint32_t *input_left_keys, *input_right_keys;
+    uint32_t key_count, output_width, rows_per_batch, capacity;
+    uint64_t batch_bytes, allocation_bytes;
+    bool left_is_delta, ready, aborting, drained;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_source_access_reader_t left_reader, right_reader;
+    col_relation_snapshot_t left_snapshot, right_snapshot;
+    col_arrangement_t arrangement;
+    uint32_t *keys;
+    int64_t *types, *key_row;
+    void *producer;
+    wl_columnar_continuation_t *continuation;
+    wl_columnar_memory_reservation_t descriptor_credit, arrays_credit,
+        continuation_credit;
+    bool descriptor_admitted, arrays_admitted, continuation_admitted;
+    bool descriptor_committed, arrays_committed, continuation_committed;
+    wl_columnar_relation_scalar_retirement_t retirement;
+    bool retirement_started, retirement_committed;
+    uint32_t phase, row, key, byte, hash;
+    uint64_t cursor;
+    uint64_t hash_value;
+    int result;
+} wl_columnar_join_batch_prepare_t;
+
+int wl_columnar_join_batch_prepare_begin(wl_columnar_join_batch_prepare_t *,
+    wl_col_session_t *, const wl_plan_op_t *, const col_rel_t *,
+    const col_rel_t *, bool, const uint32_t *, const uint32_t *, uint32_t,
+    uint64_t, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_join_batch_prepare_step(wl_columnar_join_batch_prepare_t *,
+    uint64_t max_work, bool *done);
+int wl_columnar_join_batch_prepare_abort_step(
+    wl_columnar_join_batch_prepare_t *,
+    wl_evaluation_control_t *funding, uint64_t funding_id, bool *done);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_join_batch_test_prepare_checkpoint)(
+    const wl_columnar_join_batch_prepare_t *);
+extern uint32_t wl_columnar_join_batch_test_prepare_fail_allocation;
+#endif
+
 /* Synchronous all-or-nothing sink that appends each committed batch to a
  * heap-owned relation admitted under the session governor.  The relation's
  * retained token owns every visible output byte; the sink holds no token. */

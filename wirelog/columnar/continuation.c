@@ -37,6 +37,12 @@ dispose_pending(wl_columnar_continuation_t *continuation, bool committed)
         &batch, committed);
 }
 
+uint64_t
+wl_columnar_continuation_allocation_bytes(void)
+{
+    return sizeof(wl_columnar_continuation_t);
+}
+
 static void
 retire_producer(wl_columnar_continuation_t *continuation)
 {
