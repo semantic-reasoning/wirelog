@@ -5514,3 +5514,29 @@ and resident intern storage remain separate from aggregate attempt state.
 Expressions, FLOAT/AVG, recursive/signed/control aggregation and aggregate-over-
 JOIN remain ineligible. High distinct-group cardinality can still exhaust the
 resident index/result budget.
+
+
+### Composite numeric cold JOIN keys (#1372 follow-up)
+
+Explicit sealed and chunked numeric inputs support two or more INT64 equality
+pairs through the existing ordinary bounded JOIN producer. Every pair must
+match; hash collisions only select candidates. Reordered and repeated key
+positions are valid. The constructor copies its two key vectors into one
+separately admitted O(key count) allocation, so caller arrays need not survive
+construction. One-key factories retain their existing hashing and ordering;
+automatic all-resident spill selection and weighted factories stay single-key.
+
+The capped bucket/link index still covers a bounded right-row window. No
+full-input tuple index or per-row hash cache is introduced. Source readers,
+key metadata, batches, resident prefixes and results remain governed floors.
+An intermediate that exceeds the configured encoded-row cap is refused; a
+small source does not waive this real row-width requirement. STRING and INLINE
+sources remain excluded from this new numeric route, including empty inputs
+and projected-away reference lanes.
+
+The admission audit and execution share resolved key positions, including
+virtual col<N> names on fresh declarations and chunked bindings. Composite
+rules permit the audited direct MAP/narrow INT64 FILTER prefix and suffix,
+including later JOINs. Computed MAP tails retain their previous behavior for
+all-one-key rules only. Source retirement occurs only after complete consumer
+validation; invalid later keys and unsupported consumers preserve their owners.

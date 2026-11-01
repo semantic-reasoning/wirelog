@@ -259,9 +259,12 @@ INT64 column with one integer literal (`=`, `!=`, `<`, `>`, `<=`, `>=`), with th
 column on the left. Other predicates and arbitrary cold expressions remain
 unsupported. An initial `VARIABLE → JOIN` may instead consume a cold left
 source, including two sealed sources or the same binding on both sides.
-Each JOIN uses one matching INT64 or STRING equality key. Chained JOINs continue from an admitted
-resident intermediate; FILTER/MAP before the first cold JOIN, multi-key/cross/
-theta JOINs, other key types and right filters remain unsupported. An eligible direct/filtered projection alone is sufficient; a
+A JOIN uses a matching INT64 or STRING equality key, or multiple INT64 key
+pairs over numeric inputs. Composite rules require direct MAPs and narrow
+INT64 FILTERs throughout their audited suffix. Chained JOINs continue from an
+admitted resident intermediate; audited direct MAP/FILTER prefixes may precede
+the first JOIN. Cross/theta JOINs, other key types and right filters remain
+unsupported. An eligible direct/filtered projection alone is sufficient; a
 JOIN consumer is not required. Reads
 use independent bounded pins; projected output and consolidation remain resident.
 Output capacity is admitted for the full source row count even if no row passes.

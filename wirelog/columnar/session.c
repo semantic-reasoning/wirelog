@@ -837,8 +837,7 @@ wl_columnar_session_cold_scan_rule(const wl_col_session_t *s,
  * immutable plan may access them through bounded JOIN/projection readers. */
 static bool
 wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
-    uint32_t ncols, const char *const *names,
-    const wirelog_column_type_t *types)
+    uint32_t ncols, const wirelog_column_type_t *types)
 {
     const wl_plan_t *plan = sess->plan;
     if (!plan || !name || !ncols || !plan->strata) return false;
@@ -863,6 +862,13 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     false);
             bool aggregate = wl_columnar_session_cold_scan_rule(sess, rp, true);
             bool scan_join = wl_columnar_join_cold_scan_prefix(sess, rp, NULL);
+            bool composite = false;
+            for (uint32_t j = 0; j < rp->op_count; j++)
+                composite |= rp->ops[j].op == WL_PLAN_OP_JOIN &&
+                    rp->ops[j].key_count > 1;
+            bool composite_prefix = composite &&
+                wl_columnar_join_cold_prefix(sess, rp);
+            if (composite && !composite_prefix && !scan_join) return false;
             uint32_t scan_end = 1;
             while (scan_end < rp->op_count &&
                 (rp->ops[scan_end].op == WL_PLAN_OP_MAP ||
@@ -888,7 +894,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     (op->op != WL_PLAN_OP_VARIABLE &&
                     op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
                     op->op != WL_PLAN_OP_CONSOLIDATE &&
-                    !((projection || scan_join || aggregate) &&
+                    !((projection || scan_join || aggregate ||
+                    composite_prefix) &&
                     op->op == WL_PLAN_OP_FILTER) &&
                     !(aggregate && op->op == WL_PLAN_OP_REDUCE)) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
@@ -900,15 +907,20 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     name) != 0)
                     continue;
                 if (op->op != WL_PLAN_OP_JOIN ||
-                    op->key_count != 1 ||
+                    !op->key_count ||
                     op->right_filter_expr.size ||
                     (op->project_count && !op->project_indices)) return false;
-                int key = wl_columnar_relation_schema_column_index(ncols,
-                        names, op->right_keys ? op->right_keys[0] : NULL);
-                /* The resident JOIN also falls back to column zero. */
-                if (key < 0) key = 0;
-                if (types && types[key] != WIRELOG_TYPE_INT64 &&
-                    types[key] != WIRELOG_TYPE_STRING) return false;
+                if (op->key_count > 1 &&
+                    (!op->left_keys || !op->right_keys)) return false;
+                for (uint32_t k = 0; k < op->key_count; k++) {
+                    if (op->key_count > 1 &&
+                        (!op->left_keys[k] || !op->right_keys[k])) return false;
+                    uint32_t key = wl_columnar_join_cold_source_key(sess, name,
+                            op->right_keys ? op->right_keys[k] : NULL);
+                    if (key >= ncols) return false;
+                    if (types && types[key] != WIRELOG_TYPE_INT64 &&
+                        types[key] != WIRELOG_TYPE_STRING) return false;
+                }
                 if (oi == 1 && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
                     !wl_columnar_join_cold_prefix(sess, rp)) return false;
                 consumer = true;
@@ -948,7 +960,7 @@ wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
                 !wl_columnar_session_cold_uses_intern(c,
                 s->intern)) return ENOTSUP;
         if (!wl_columnar_session_cold_plan(s, c->name, c->ncols,
-            (const char *const *)c->col_names, types)) return ENOTSUP;
+            types)) return ENOTSUP;
     }
     return 0;
 }
@@ -1016,7 +1028,7 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
     if (r->memory_governor != s->memory_governor ||
         !wl_columnar_batch_payload_can_take(r) || r->timestamps ||
         !wl_columnar_session_cold_plan(s, name, r->ncols,
-        (const char *const *)r->col_names, r->column_types))
+        r->column_types))
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
         return WL_COLUMNAR_SPILL_OVERFLOW;
@@ -1148,7 +1160,7 @@ wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
         !wl_columnar_batch_payload_can_take(r) ||
         !wl_columnar_session_cold_source_schema(s, name, r, NULL, &schema) ||
         !wl_columnar_session_cold_plan(s, name, width,
-        (const char *const *)r->col_names, types))
+        types))
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     bool references = schema != NULL;
     for (uint32_t i = 0; i < width; i++) {
@@ -1244,7 +1256,7 @@ wl_columnar_session_cold_loader(wl_session_t *session, const char *name)
         !wl_columnar_session_cold_mode(s) ||
         wl_columnar_session_cold_execution_check(s) ||
         !wl_columnar_session_cold_plan(s, name, c->ncols,
-        (const char *const *)c->col_names, c->trace_types)) return NULL;
+        c->trace_types)) return NULL;
     return c;
 }
 

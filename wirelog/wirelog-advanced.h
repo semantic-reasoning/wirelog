@@ -233,7 +233,9 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * resident and admitted; the prefix reserves full source-row capacity even
  * when no row passes. FILTER-only prefixes preserve names/INLINE layout; MAP
  * scalarizes fields. Both sides may be sealed, including a self-JOIN.
- * No multi-key, cross/theta JOIN, other key types, right filter, timestamps, whole compound
+ * Numeric inputs also support multiple INT64 equality key pairs; every MAP
+ * in a composite-key rule must be a direct projection. Key metadata is governed.
+ * No cross/theta JOIN, other key types, right filter, timestamps, whole compound
  * values, SIDE/nested layouts,
  * opaque/materialized rewrites, worker/control/delta modes or delta callback.
  * JOINs and standalone direct/filtered projections accept STRING lanes from
@@ -282,7 +284,8 @@ wirelog_session_seal_input(wirelog_session_t *session,
 
 /** Begin explicitly chunked loading of an empty declared scalar/flat INLINE EDB.
  * Requires the same serial spill-enabled ordinary mode as seal_input, before
- * evaluation, and supports audited MAP/FILTER scans, single-key equality JOINs
+ * evaluation, and supports audited MAP/FILTER scans, equality JOINs (including
+ * composite INT64 keys on numeric inputs)
  * and direct global/grouped COUNT or INT64 SUM/MIN/MAX consumers.
  * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
  * resident facts first; additional empty inputs may begin and preloaded inputs

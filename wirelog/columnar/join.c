@@ -1501,6 +1501,7 @@ typedef struct {
     const wl_intern_t *intern;
     const wl_plan_edb_schema_t *schema;
     bool schema_valid;
+    bool virtual_auto;
 } wl_columnar_join_source_t;
 
 static wl_columnar_join_source_t
@@ -1514,6 +1515,9 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
         src.width = src.cold->ncols;
         src.names = (const char *const *)src.cold->col_names;
         src.types = wl_columnar_session_cold_types(src.cold);
+        src.virtual_auto = !src.names && src.width && src.types &&
+            (src.cold->state == WL_COLUMNAR_COLD_LOADING ||
+            src.cold->state == WL_COLUMNAR_COLD_FINISHED);
     } else {
         /* Read-only lookup also serves seal preflight; never build a hash. */
         if (!resident && name)
@@ -1526,9 +1530,11 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
             src.width = resident->ncols;
             src.names = (const char *const *)resident->col_names;
             src.types = resident->column_types;
-            if (!src.width && !resident->nrows)
+            if (!src.width && !resident->nrows) {
                 src.types = wl_columnar_session_cold_declared_types(s,
                         name ? name : resident->name, &src.width);
+                src.virtual_auto = !src.names && src.width && src.types;
+            }
         }
     }
     src.schema_valid = wl_columnar_session_cold_source_schema(s,
@@ -1538,12 +1544,40 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
 }
 
 static uint32_t
+wl_columnar_join_auto_key(uint32_t width, const char *name)
+{
+    /* MAP/JOIN outputs have ordinary auto-generated col<N> names. Match
+     * their lookup fallback without constructing a synthetic relation. */
+    if (name && !strncmp(name, "col", 3)) {
+        char *endptr;
+        long column = strtol(name + 3, &endptr, 10);
+        /* Keep the ordinary schema resolver's narrowing and signed return
+         * semantics, including oversized numeric spellings on LP64. */
+        if (!*endptr && column >= 0 && (uint32_t)column < width) {
+            int key = (int)column;
+            return key < 0 ? 0 : (uint32_t)key;
+        }
+    }
+    return 0;
+}
+
+static uint32_t
 wl_columnar_join_source_key(const wl_columnar_join_source_t *src,
     const char *name)
 {
+    if (src->virtual_auto) return wl_columnar_join_auto_key(src->width, name);
     int key = wl_columnar_relation_schema_column_index(src->width, src->names,
             name);
     return key < 0 ? 0 : (uint32_t)key;
+}
+
+uint32_t
+wl_columnar_join_cold_source_key(const wl_col_session_t *s,
+    const char *relation, const char *key)
+{
+    wl_columnar_join_source_t source = wl_columnar_join_source(s, relation,
+            NULL);
+    return wl_columnar_join_source_key(&source, key);
 }
 
 static bool
@@ -1575,7 +1609,7 @@ wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
 }
 
 static bool
-wl_columnar_join_cold_shape(const wl_plan_op_t *op,
+wl_columnar_join_cold_single_shape(const wl_plan_op_t *op,
     const wl_columnar_join_source_t *left,
     const wl_columnar_join_source_t *right)
 {
@@ -1609,6 +1643,56 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     if (joined > UINT32_MAX) return false;
     for (uint32_t i = 0; i < op->project_count; i++)
         if (op->project_indices[i] >= joined) return false;
+    return true;
+}
+
+static bool
+wl_columnar_join_cold_key_names(const wl_plan_op_t *op)
+{
+    if (!op->key_count) return false;
+    if (op->key_count == 1) return true;
+    if (!op->left_keys || !op->right_keys) return false;
+    for (uint32_t k = 0; k < op->key_count; k++)
+        if (!op->left_keys[k] || !op->right_keys[k]) return false;
+    return true;
+}
+
+static bool
+wl_columnar_join_cold_shape(const wl_plan_op_t *op,
+    const wl_columnar_join_source_t *left,
+    const wl_columnar_join_source_t *right)
+{
+    if (op->key_count == 1) return wl_columnar_join_cold_single_shape(op, left,
+                   right);
+    if (!left->schema_valid || !right->schema_valid ||
+        op->op != WL_PLAN_OP_JOIN || !wl_columnar_join_cold_key_names(op) ||
+        op->opaque_data || op->materialized || op->right_filter_expr.size ||
+        op->right_filter_expr.data || !op->right_relation ||
+        (op->project_count && !op->project_indices) ||
+        (op->delta_mode != WL_DELTA_AUTO &&
+        op->delta_mode != WL_DELTA_FORCE_FULL) ||
+        wl_columnar_join_source_references(left) ||
+        wl_columnar_join_source_references(right))
+        return false;
+    bool have_left = left->cold || left->resident,
+        have_right = right->cold || right->resident;
+    for (uint32_t k = 0; k < op->key_count; k++) {
+        uint32_t lk = wl_columnar_join_source_key(left, op->left_keys[k]);
+        uint32_t rk = wl_columnar_join_source_key(right, op->right_keys[k]);
+        if (have_left && !wl_columnar_join_source_valid(left, lk)) return false;
+        if (have_right && !wl_columnar_join_source_valid(right,
+            rk)) return false;
+        if ((have_left && left->types &&
+            left->types[lk] != WIRELOG_TYPE_INT64) ||
+            (have_right && right->types &&
+            right->types[rk] != WIRELOG_TYPE_INT64)) return false;
+    }
+    if (have_left && have_right) {
+        uint64_t width = (uint64_t)left->width + right->width;
+        if (width > UINT32_MAX) return false;
+        for (uint32_t i = 0; i < op->project_count; i++)
+            if (op->project_indices[i] >= width) return false;
+    }
     return true;
 }
 
@@ -1682,39 +1766,25 @@ wl_columnar_join_scan_key(const wl_col_session_t *s,
                 rp->ops[0].relation_name, NULL);
         return wl_columnar_join_source_key(&source, name);
     }
-    /* MAP/JOIN outputs have ordinary auto-generated col<N> names. Match
-     * their lookup fallback without constructing a synthetic relation. */
-    if (name && !strncmp(name, "col", 3)) {
-        char *endptr;
-        long column = strtol(name + 3, &endptr, 10);
-        /* Keep the ordinary schema resolver's narrowing and signed return
-         * semantics, including oversized numeric spellings on LP64. */
-        if (!*endptr && column >= 0 && (uint32_t)column < width) {
-            int key = (int)column;
-            return key < 0 ? 0 : (uint32_t)key;
-        }
-    }
-    return 0;
+    return wl_columnar_join_auto_key(width, name);
 }
 
-bool
-wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp, uint32_t *join_index)
+static bool
+wl_columnar_join_cold_suffix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t first)
 {
-    if (!s || !rp || !rp->ops || rp->op_count < 4 ||
-        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
-        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
-    uint32_t first = 1;
-    while (first < rp->op_count && (rp->ops[first].op == WL_PLAN_OP_MAP ||
-        rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
-    if (first < 2 || first >= rp->op_count ||
-        rp->ops[first].op != WL_PLAN_OP_JOIN) return false;
     wl_columnar_join_source_t source = wl_columnar_join_source(s,
             rp->ops[0].relation_name, NULL);
     if (!source.schema_valid || !source.width ||
         (!source.cold && !source.resident) ||
-        !wl_columnar_eval_plan_cold_scan_decode(rp, rp->ops[0].relation_name,
-        source.width, source.types, first, NULL)) return false;
+        (first > 1 && !wl_columnar_eval_plan_cold_scan_decode(rp,
+        rp->ops[0].relation_name,
+        source.width, source.types, first, NULL))) return false;
+    bool composite = false;
+    for (uint32_t i = first; i < rp->op_count; i++)
+        composite |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            rp->ops[i].key_count > 1;
+    if (composite && wl_columnar_join_source_references(&source)) return false;
     for (uint32_t c = 0; c < source.width; c++) {
         wirelog_column_type_t type =
             source.types ? source.types[c] : WIRELOG_TYPE_INT64;
@@ -1754,29 +1824,52 @@ wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
                 predicate.column, &type) || type != WIRELOG_TYPE_INT64)
                 return false;
         } else if (op->op == WL_PLAN_OP_JOIN) {
-            if (op->key_count != 1 || !op->right_relation ||
+            if (!wl_columnar_join_cold_key_names(op) || !op->right_relation ||
                 (op->project_count && !op->project_indices)) return false;
-            uint32_t key = wl_columnar_join_scan_key(s, rp, i, width,
-                    op->left_keys ? op->left_keys[0] : NULL);
-            wirelog_column_type_t type;
-            if (!wl_columnar_join_scan_type(s, rp, i, key, &type) ||
-                (type != WIRELOG_TYPE_INT64 &&
-                type != WIRELOG_TYPE_STRING)) return false;
             wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
                     op->right_relation, NULL);
-            if (!rhs.schema_valid) return false;
-            if (!rhs.cold && !rhs.resident) continue;
-            uint32_t right_key = wl_columnar_join_source_key(&rhs,
-                    op->right_keys ? op->right_keys[0] : NULL);
-            if (!wl_columnar_join_source_valid(&rhs, right_key) ||
-                type !=
-                (rhs.types ? rhs.types[right_key] : WIRELOG_TYPE_INT64) ||
-                (uint64_t)width + rhs.width > UINT32_MAX) return false;
+            if (!rhs.schema_valid ||
+                (composite &&
+                wl_columnar_join_source_references(&rhs))) return false;
+            bool present = rhs.cold || rhs.resident;
+            for (uint32_t k = 0; k < op->key_count; k++) {
+                uint32_t key = wl_columnar_join_scan_key(s, rp, i, width,
+                        op->left_keys ? op->left_keys[k] : NULL);
+                wirelog_column_type_t type;
+                if (!wl_columnar_join_scan_type(s, rp, i, key, &type) ||
+                    (type != WIRELOG_TYPE_INT64 &&
+                    (composite || type != WIRELOG_TYPE_STRING))) return false;
+                if (!present) continue;
+                uint32_t right_key = wl_columnar_join_source_key(&rhs,
+                        op->right_keys ? op->right_keys[k] : NULL);
+                if (!wl_columnar_join_source_valid(&rhs, right_key) ||
+                    type !=
+                    (rhs.types ? rhs.types[right_key] :
+                    WIRELOG_TYPE_INT64)) return false;
+            }
+            if (!present) continue;
+            if ((uint64_t)width + rhs.width > UINT32_MAX) return false;
             for (uint32_t c = 0; c < op->project_count; c++)
                 if (op->project_indices[c] >= width + rhs.width) return false;
         } else if (op->op != WL_PLAN_OP_CONSOLIDATE || i != rp->op_count - 1 ||
             op->right_relation) return false;
     }
+    return true;
+}
+
+bool
+wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t *join_index)
+{
+    if (!s || !rp || !rp->ops || rp->op_count < 4 ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+    uint32_t first = 1;
+    while (first < rp->op_count && (rp->ops[first].op == WL_PLAN_OP_MAP ||
+        rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
+    if (first < 2 || first >= rp->op_count ||
+        rp->ops[first].op != WL_PLAN_OP_JOIN) return false;
+    if (!wl_columnar_join_cold_suffix(s, rp, first)) return false;
     if (join_index) *join_index = first;
     return true;
 }
@@ -1790,6 +1883,17 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
     if (!rp || !rp->ops || rp->op_count < 3 ||
         rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
         rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+    bool composite = false;
+    for (uint32_t i = 0; i < rp->op_count; i++)
+        composite |= rp->ops[i].op == WL_PLAN_OP_JOIN &&
+            rp->ops[i].key_count > 1;
+    if (composite) {
+        const wl_plan_op_t *variable = &rp->ops[0];
+        if (!s || rp->ops[1].op != WL_PLAN_OP_JOIN || variable->opaque_data ||
+            variable->materialized || (variable->delta_mode != WL_DELTA_AUTO &&
+            variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
+        return wl_columnar_join_cold_suffix(s, rp, 1);
+    }
     for (uint32_t i = 0; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->opaque_data || op->materialized ||
@@ -1891,6 +1995,20 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     if (!rc) rc = col_rel_set_column_types(out, types, width);
     free(types);
     if (!wl_columnar_memory_rollback(&type_token)) abort();
+    wl_columnar_join_key_scratch_t key_scratch;
+    memset(&key_scratch, 0, sizeof(key_scratch));
+    uint32_t *left_keys = NULL, *right_keys = NULL;
+    if (!rc && op->key_count > 1) {
+        rc = wl_columnar_join_key_scratch_alloc(sess, sources[0].resident,
+                sources[1].resident, op->key_count, &key_scratch);
+        left_keys = key_scratch.left_keys; right_keys = key_scratch.right_keys;
+        for (uint32_t k = 0; !rc && k < op->key_count; k++) {
+            left_keys[k] = wl_columnar_join_source_key(&sources[0],
+                    op->left_keys[k]);
+            right_keys[k] = wl_columnar_join_source_key(&sources[1],
+                    op->right_keys[k]);
+        }
+    }
     if (rc || missing_right) goto done;
     sess->spill_join_selected_count++;
     for (unsigned i = 0; i < 2; i++) {
@@ -1955,12 +2073,20 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         rc = wl_columnar_join_spill_error(sess, status);
         if (rc) goto done;
     }
-    wl_columnar_spill_status_t status =
+    wl_columnar_spill_status_t status = op->key_count > 1 ?
+        wl_columnar_payload_join_create_sources_keys_projected_bounded(
+        sess->memory_governor, descriptors[0], descriptors[1], left_keys,
+        right_keys,
+        op->key_count, op->project_indices, op->project_count,
+        sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
+        NULL, NULL, NULL, &cont) :
         wl_columnar_payload_join_create_sources_projected_bounded(
         sess->memory_governor, descriptors[0], descriptors[1], lk, rk,
         op->project_indices, op->project_count,
         sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
         sess->intern, NULL, NULL, &cont);
+    wl_columnar_join_key_scratch_free(&key_scratch, &left_keys);
+    wl_columnar_join_key_scratch_free(&key_scratch, &right_keys);
 #ifdef WL_TEST_JOIN_CACHE_HOOK
     if (wl_columnar_join_test_spill_producer_result)
         wl_columnar_join_test_spill_producer_result(status);
@@ -1968,6 +2094,8 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     rc = wl_columnar_join_spill_error(sess, status);
     if (!rc) rc = wl_columnar_join_spill_drain(sess, cont, out);
 done:
+    wl_columnar_join_key_scratch_free(&key_scratch, &left_keys);
+    wl_columnar_join_key_scratch_free(&key_scratch, &right_keys);
     /* Even self-JOIN drops two reader pins before any temporary owner. The
      * persistent owner is borrowed on each side and is never released here. */
     wl_columnar_continuation_destroy(cont);

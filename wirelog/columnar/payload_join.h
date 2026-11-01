@@ -28,6 +28,26 @@ wl_columnar_payload_join_create_sources_projected_bounded(
     const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
     void *context, wl_columnar_continuation_t **out);
 
+/* Ordinary numeric tuple equality through the same bounded window engine.
+ * Positive count and non-NULL, in-range key vectors are required; every pair
+ * is INT64. This initial entry refuses STRING/INLINE input provenance and
+ * requires intern == NULL, including empty and projected-away inputs.
+ * The producer copies both vectors into separately governed O(key_count)
+ * metadata before returning. Caller arrays may then be changed/freed.
+ * Index caps retain their bucket/link meaning; key metadata and reader/output
+ * floors are additional. Hash/equality work grows with key_count. Legacy
+ * one-key factories keep inline keys and their original contracts. */
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_sources_keys_projected_bounded(
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_payload_join_source_t left,
+    wl_columnar_payload_join_source_t right,
+    const uint32_t *left_keys, const uint32_t *right_keys, uint32_t key_count,
+    const uint32_t *projection, uint32_t project_count,
+    uint64_t batch_bytes, uint64_t index_bytes, const wl_intern_t *intern,
+    wl_columnar_spill_cancel_fn cancel, void *context,
+    wl_columnar_continuation_t **out);
+
 /* Both owners remain caller-owned. Separate readers pin them (also for self
  * JOIN), so release/demotion is BUSY until active cancellation or destruction.
  * The same governor is required. Inputs must have scalar numeric schemas,
