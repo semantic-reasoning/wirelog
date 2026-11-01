@@ -3951,13 +3951,14 @@ static void chunked_retain(col_rel_t *chunk)
         chunk->ncols == WL_TEST_COLD_WIDTH);
     chunked_retained[chunked_retained_count++] = chunk;
 }
-static void chunked_causal_budget(bool aggregate)
+static void chunked_causal_budget(unsigned workload)
 {
+    bool aggregate = workload == 1, composite = workload == 2;
     const uint64_t budget = WL_TEST_COLD_BUDGET, usable = budget-budget/20;
     const uint64_t chunk_bytes = (uint64_t)WL_TEST_COLD_CHUNK*
         WL_TEST_COLD_WIDTH*8;
     CHECK((uint64_t)WL_TEST_COLD_ROWS*WL_TEST_COLD_WIDTH*8 > budget);
-    char *text = wl_test_cold_query(aggregate ? 2 : 0);
+    char *text = wl_test_cold_query(aggregate ? 2 : composite ? 3 : 0);
     int64_t *rows = malloc((size_t)chunk_bytes); CHECK(rows);
     for (unsigned retain = 0; retain < 2; retain++) {
         budget_peak = 0;
@@ -3967,9 +3968,15 @@ static void chunked_causal_budget(bool aggregate)
         wl_col_session_t *s = COL_SESSION(f.session);
         s->spill_join_index_bytes = 4096; s->spill_join_batch_bytes = 16384;
         if (!aggregate) for (int64_t i = 0; i < 4; i++) {
-                int64_t row[] = {i, 10+i};
-                CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+                int64_t row[] = {7, i, 10+i};
+                CHECK(wl_session_insert(f.session, "a", composite ? row : row+1,
+                    1, composite ? 3 : 2) == 0);
             }
+        if (composite) {
+            wl_plan_relation_t *rp = join_body(&f, "result");
+            CHECK(rp->op_count == 3 && rp->ops[1].op == WL_PLAN_OP_JOIN &&
+                rp->ops[1].key_count == 2);
+        }
         uint64_t base = reserved(&f);
         CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
         wl_columnar_session_test_retained_cold_chunk =
@@ -3977,7 +3984,8 @@ static void chunked_causal_budget(bool aggregate)
         unsigned first = 0;
         wl_columnar_spill_status_t status = OK;
         for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
-            if (aggregate) wl_test_cold_group_rows(rows, first);
+            if (composite) wl_test_cold_composite_rows(rows, first);
+            else if (aggregate) wl_test_cold_group_rows(rows, first);
             else wl_test_cold_rows(rows, first); uint64_t before = reserved(&f);
             status = wl_columnar_session_append_cold_input(f.session, "b", rows,
                     WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH);
@@ -4005,7 +4013,8 @@ static void chunked_causal_budget(bool aggregate)
         unsigned refused_at = first;
         /* Releasing the actual retained chunks permits retry under the SAME limit. */
         for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
-            if (aggregate) wl_test_cold_group_rows(rows, first);
+            if (composite) wl_test_cold_composite_rows(rows, first);
+            else if (aggregate) wl_test_cold_group_rows(rows, first);
             else wl_test_cold_rows(rows, first);
             CHECK(wl_columnar_session_append_cold_input(f.session, "b", rows,
                 WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH) == OK);
@@ -4056,13 +4065,14 @@ static void chunked_causal_budget(bool aggregate)
             CHECK(wl_session_snapshot(f.session, observe,
                 &e) == 0 && e.seen == 15 && e.count == 4);
         }
+        if (composite) CHECK(s->spill_join_selected_count > 0);
         CHECK(budget_peak <= usable);
         uint64_t owner, nodes, directory_bytes, cursor;
         CHECK(wl_columnar_trace_store_floor(WL_TEST_COLD_WIDTH, state.segments,
             &owner, &nodes, &directory_bytes, &cursor) == OK);
         printf(
-            "chunked aggregate=%u budget=%llu usable=%llu retain=%u refused_at=%u retained_source_bytes=%llu base=%llu loaded=%llu peak=%llu disk=%llu segments=%u owner=%llu nodes=%llu directory=%llu cursor=%llu host_chunk=%llu\n",
-            aggregate, (unsigned long long)budget, (unsigned long long)usable,
+            "chunked workload=%u budget=%llu usable=%llu retain=%u refused_at=%u retained_source_bytes=%llu base=%llu loaded=%llu peak=%llu disk=%llu segments=%u owner=%llu nodes=%llu directory=%llu cursor=%llu host_chunk=%llu\n",
+            workload, (unsigned long long)budget, (unsigned long long)usable,
             retain,
             refused_at, (unsigned long long)retained_bytes,
             (unsigned long long)base, (unsigned long long)loaded,
@@ -4837,6 +4847,128 @@ static void composite_numeric_prefix(void)
     }
 }
 
+static void composite_reference_failures(void)
+{
+    fixture_t f =
+        fixture(
+        ".decl a(k:int64,s:symbol,x:int64)\n.decl b(s:symbol,k:int64,y:int64)\n.decl result(x:int64,y:int64,s:symbol)\nresult(x,y,s) :- a(k,s,x),b(s,k,y).\n",
+        4*1024*1024, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    int64_t ids[] = {wl_intern_put(s->intern, ""),
+                     wl_intern_put(s->intern, "alpha"),
+                     wl_intern_put(s->intern, "한글")};
+    for (int64_t i = 0; i < 3; i++) {
+        int64_t row[] = {7, ids[i], i};
+        CHECK(wl_session_insert(f.session, "a", row, 1, 3) == 0);
+    }
+    CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+    for (int64_t i = 0; i < 9; i++) {
+        int64_t row[] = {ids[i%3], 7, 100+i};
+        CHECK(wl_columnar_session_append_cold_input(f.session, "b", row, 1,
+            3) == OK);
+    }
+    CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+    wl_plan_relation_t *rp = join_body(&f, "result");
+    CHECK(rp->op_count == 3 && rp->ops[1].key_count == 2);
+    /* begin removed b from the resident registry and invalidated its hash.
+     * Build the ordinary resident-name lookup before measuring attempt cleanup. */
+    CHECK(session_find_rel(s, "a"));
+    const unsigned faults[] = {1, 10, 50};
+    eval_stack_t stack; eval_stack_init(&stack);
+    for (unsigned fidx = 0; fidx < 3; fidx++) {
+        uint64_t before = reserved(&f); read_fault = faults[fidx];
+        int rc = col_eval_relation_plan(rp, &stack, s);
+        if (rc != EIO || read_fault || reserved(&f) != before) fprintf(stderr,
+                "reference fault=%u remaining=%u rc=%d reserved=%llu before=%llu\n",
+                faults[fidx], read_fault, rc, (unsigned long long)reserved(&f),
+                (unsigned long long)before);
+        CHECK(rc == EIO && !stack.top && !read_fault && reserved(&f) == before);
+        CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+        eval_entry_t out = eval_stack_pop(&stack);
+        CHECK(out.rel && out.rel->nrows == 9 && out.rel->ncols == 3 &&
+            out.rel->column_types[2] == WIRELOG_TYPE_STRING);
+        unsigned seen = 0;
+        for (unsigned i = 0; i < 9; i++) {
+            int64_t right = out.rel->columns[1][i]-100;
+            CHECK(right >= 0 && right < 9 &&
+                out.rel->columns[0][i] == right%3 &&
+                out.rel->columns[2][i] == ids[right%3] &&
+                !(seen & (1u << right)));
+            seen |= 1u << right;
+        }
+        CHECK(seen == 511 && eval_stack_dispose_entry(&stack,
+            &out) == 0 && reserved(&f) == before);
+    }
+    destroy(&f);
+}
+
+static void composite_reference_chains(void)
+{
+    for (unsigned prefix = 0; prefix < 3; prefix++) {
+        fixture_t f =
+            fixture_options(
+            ".decl a(p:pair(int64,symbol) inline,x:int64)\n.decl b(s:symbol,k:int64,y:int64)\n.decl c(s:symbol,k:int64,z:int64)\n.decl result(x:int64,y:int64,z:int64,s:symbol)\nresult(x,y,z,s) :- a(pair(k,s),x),b(s,k,y),c(s,k,z).\n",
+            4*1024*1024, 4*1024*1024, 1024*1024, 128);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        int64_t ids[] = {wl_intern_put(s->intern, ""),
+                         wl_intern_put(s->intern, "alpha"),
+                         wl_intern_put(s->intern, "한글")};
+        for (int64_t i = 0; i < 3; i++) {
+            int64_t a[] = {7, ids[i], 10+i}, c[] = {ids[i], 7, 1000+i};
+            CHECK(wl_session_insert(f.session, "a", a, 1,
+                3) == 0 && wl_session_insert(f.session, "c", c, 1, 3) == 0);
+        }
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        const wl_plan_op_t *saved = rp->ops; uint32_t count = rp->op_count;
+        CHECK(count == 4 && saved[1].key_count == 2 && saved[2].key_count == 2);
+        uint32_t identity[] = {0, 1, 2};
+        uint8_t predicate[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '2',
+                               WL_PLAN_EXPR_CONST_INT, 11, 0, 0, 0, 0, 0, 0, 0,
+                               WL_PLAN_EXPR_CMP_GTE};
+        wl_plan_op_t ops[6] = {saved[0], {0}, {0}, {0}, {0}, {0}};
+        unsigned next = 1;
+        if (prefix) ops[next++] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                                 .project_count = 3,
+                                                 .project_indices = identity};
+        if (prefix == 2) ops[next++] = (wl_plan_op_t){.op = WL_PLAN_OP_FILTER,
+                                                      .filter_expr =
+                                                      {.data = predicate,
+                                                       .size =
+                                                           sizeof(predicate)}};
+        for (unsigned i = 1; i < count; i++) ops[next++] = saved[i];
+        rp->ops = ops; rp->op_count = next;
+        CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
+        CHECK(wl_columnar_session_seal_input(f.session, "c", NULL, NULL) == OK);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        for (int64_t i = 0; i < 3; i++) {
+            int64_t row[] = {ids[i], 7, 100+i};
+            CHECK(wl_columnar_session_append_cold_input(f.session, "b", row, 1,
+                3) == OK);
+        }
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        eval_stack_t stack; eval_stack_init(&stack);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+            eval_entry_t out = eval_stack_pop(&stack);
+            CHECK(out.rel && out.rel->ncols == 4 &&
+                out.rel->nrows == (prefix == 2 ? 2u : 3u) &&
+                out.rel->column_types[3] == WIRELOG_TYPE_STRING);
+            unsigned seen = 0;
+            for (unsigned row = 0; row < out.rel->nrows; row++) {
+                int64_t i = out.rel->columns[0][row]-10;
+                CHECK(i >= (prefix == 2 ? 1 : 0) && i < 3 &&
+                    !(seen & (1u << i)));
+                CHECK(out.rel->columns[1][row] == 100+i &&
+                    out.rel->columns[2][row] == 1000+i &&
+                    out.rel->columns[3][row] == ids[i]); seen |= 1u << i;
+            }
+            CHECK(seen == (prefix == 2 ? 6u : 7u) &&
+                eval_stack_dispose_entry(&stack, &out) == 0);
+        }
+        rp->ops = saved; rp->op_count = count; destroy(&f);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -4846,6 +4978,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    composite_reference_failures(); composite_reference_chains();
     cold_virtual_key_names(); composite_numeric_admission();
     composite_computed_tail_refused();
     composite_numeric_chains(); composite_numeric_prefix();
@@ -4855,7 +4988,7 @@ int main(void)
     cold_many_groups_floor();
     chunked_internal(); chunked_join_failure();
     chunked_reference_failures(); chunked_causal_budget(false);
-    chunked_causal_budget(true);
+    chunked_causal_budget(true); chunked_causal_budget(2);
     cold_scan_join_key_names();
     cold_scan_map_only_right_audit();
     cold_scan_join_self_missing();

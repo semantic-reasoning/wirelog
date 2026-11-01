@@ -28,7 +28,11 @@ static char *wl_test_cold_query(int scan)
     for (unsigned i = 0; i < WL_TEST_COLD_WIDTH; i++)
         wl_test_cold_text(&cursor, &remaining, "%sc%u:int64", i ? "," : "", i);
     wl_test_cold_text(&cursor, &remaining, ")\n");
-    if (scan == 2) {
+    if (scan == 3) {
+        wl_test_cold_text(&cursor, &remaining,
+            ".decl a(g:int64,k:int64,v:int64)\n.decl result(k:int64,x:int64,y:int64)\n"
+            "result(k,x,y) :- a(g,k,x),b(");
+    } else if (scan == 2) {
         wl_test_cold_text(&cursor, &remaining,
             ".decl result(k:int64,n:int64)\nresult(k,sum(v)) :- b(");
     } else if (scan) {
@@ -44,7 +48,9 @@ static char *wl_test_cold_query(int scan)
             ".decl a(k:int64,v:int64)\n.decl result(k:int64,x:int64,y:int64)\n"
             "result(k,x,y+0) :- a(k,x),b(");
     for (unsigned i = 0; i < WL_TEST_COLD_WIDTH; i++) {
-        if (scan == 1) wl_test_cold_text(&cursor, &remaining, "%sc%u",
+        if (scan == 3 && i < 3) wl_test_cold_text(&cursor, &remaining,
+                "%s", i == 0 ? "g" : i == 1 ? ",k" : ",y");
+        else if (scan == 1) wl_test_cold_text(&cursor, &remaining, "%sc%u",
                 i ? "," : "",
                 i);
         else if (i < 2) wl_test_cold_text(&cursor, &remaining, "%s",
@@ -59,6 +65,15 @@ static void wl_test_cold_rows(int64_t *rows, unsigned first)
     for (unsigned i = 0; i < WL_TEST_COLD_CHUNK; i++)
         for (unsigned c = 0; c < WL_TEST_COLD_WIDTH; c++)
             rows[(size_t)i*WL_TEST_COLD_WIDTH+c] = first+i+(c ? 100 : 0);
+}
+/* Constant first key deliberately leaves all selectivity to the second key. */
+static void wl_test_cold_composite_rows(int64_t *rows, unsigned first)
+{
+    wl_test_cold_rows(rows, first);
+    for (unsigned i = 0; i < WL_TEST_COLD_CHUNK; i++) {
+        rows[(size_t)i*WL_TEST_COLD_WIDTH] = 7;
+        rows[(size_t)i*WL_TEST_COLD_WIDTH+1] = first+i;
+    }
 }
 /* The SUM workload uses four fixed groups with 320 MiB of physical input. */
 static void wl_test_cold_group_rows(int64_t *rows, unsigned first)

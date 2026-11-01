@@ -259,8 +259,10 @@ INT64 column with one integer literal (`=`, `!=`, `<`, `>`, `<=`, `>=`), with th
 column on the left. Other predicates and arbitrary cold expressions remain
 unsupported. An initial `VARIABLE → JOIN` may instead consume a cold left
 source, including two sealed sources or the same binding on both sides.
-A JOIN uses a matching INT64 or STRING equality key, or multiple INT64 key
-pairs over numeric inputs. Composite rules require direct MAPs and narrow
+A JOIN uses one or more matching INT64/STRING equality key pairs, including
+mixed tuples and scalar fields of flat INLINE inputs. Every corresponding pair
+must have the same physical type, with the originating intern capability for
+reference-bearing inputs. Composite rules require direct MAPs and narrow
 INT64 FILTERs throughout their audited suffix. Chained JOINs continue from an
 admitted resident intermediate; audited direct MAP/FILTER prefixes may precede
 the first JOIN. Cross/theta JOINs, other key types and right filters remain
