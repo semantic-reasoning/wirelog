@@ -29,6 +29,13 @@ option(
 )
 
 option(
+  'examples',
+  type: 'boolean',
+  value: true,
+  description: 'Build the examples/ demo executables and their golden-output tests. Disable (-Dexamples=false) to skip them, e.g. on sanitizer legs where re-compiling every demo under instrumentation is expensive and the example suites are already covered by the non-sanitized build legs.'
+)
+
+option(
   'enable_fuzz',
   type: 'boolean',
   value: false,

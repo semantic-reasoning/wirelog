@@ -378,12 +378,15 @@ jobs:
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with sanitizers
         run: >
           meson setup builddir
           -Db_sanitize=address,undefined
           -Db_lundef=false
           -Dtests=true
+          -Dexamples=false
           --buildtype=debug
         env:
           CC: ${{ matrix.cc }}
@@ -448,6 +451,8 @@ jobs:
           fi
 
       # Force POSIX pthreads for TSan (C11 threads.h is uninstrumented)
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with TSan
         run: >
           meson setup builddir-tsan
@@ -455,6 +460,7 @@ jobs:
           -Db_lundef=false
           -Dthreads=posix
           -Dtests=true
+          -Dexamples=false
           --buildtype=debug
         env:
           CC: ${{ matrix.cc }}

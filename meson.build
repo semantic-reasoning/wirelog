@@ -130,6 +130,7 @@ endif
 ipc_option = get_option('ipc')
 threads_option = get_option('threads')
 tests_option = get_option('tests')
+examples_option = get_option('examples')
 docs_option = get_option('documentation')
 # crc32_variant_option already defined earlier before compiler settings
 
@@ -613,7 +614,11 @@ endif
 #Examples
 #== == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == ==
 
-if not mobile_cross
+# Gated on the `examples` option (-Dexamples, default true).  CI sanitizer
+# legs pass -Dexamples=false: each demo re-compiles the full wirelog_sources
+# under instrumentation, and the example suites are already covered by the
+# non-sanitized build legs.
+if examples_option and not mobile_cross
   # 04, 05 and 06 are golden-diff tests over wirelog_cli rather than their
   # own executables; they run the committed .dl programs in a temporary tree.
   subdir('examples/04-hash-functions')
@@ -663,5 +668,6 @@ message('  Embedded mode: @0@'.format(is_embedded))
 message('  IPC support: ' + ipc_option)
 message('  Threading: ' + threads_option)
 message('  Tests: @0@'.format(tests_option))
+message('  Examples: @0@'.format(examples_option))
 message('')
 message('Git Hooks: optional transactional Uncrustify hook setup attempted')

@@ -72,12 +72,15 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure ASan/UBSan
         run: >
           meson setup builddir-san
           -Db_sanitize=address,undefined
           -Db_lundef=false
           -Dtests=true
+          -Dexamples=false
           --buildtype=debug
         env:
           CC: ${{ matrix.cc }}
@@ -151,6 +154,8 @@ jobs:
       - name: Set up Meson 1.12.0
         uses: ./.github/actions/setup-meson
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure TSan
         run: |
           meson setup builddir-tsan \
@@ -158,6 +163,7 @@ jobs:
             -Db_lundef=false \
             -Dthreads=posix \
             -Dtests=true \
+            -Dexamples=false \
             --buildtype=debug
         env:
           CC: ${{ matrix.cc }}
