@@ -10,6 +10,7 @@
 #include "io/io_adapter.h"
 #include "wirelog/wirelog-parser.h"
 #include "test_tmpdir.h"
+#include "test_cold_input_fixture.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,7 +64,8 @@ static uint64_t reserved(fixture_t *f)
     return wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
                    f->governor));
 }
-static fixture_t fixture(const char *text, uint64_t budget, uint64_t quota)
+static fixture_t fixture_options(const char *text, uint64_t budget,
+    uint64_t usable, uint64_t quota, uint64_t row_bytes)
 {
     fixture_t f = {0};
     wirelog_error_t error;
@@ -74,7 +76,7 @@ static fixture_t fixture(const char *text, uint64_t budget, uint64_t quota)
     if (plan_rc) fprintf(stderr, "plan error %d: %s\n", plan_rc, text);
     CHECK(plan_rc == 0);
     wl_columnar_memory_resolution_t resolution = {
-        .budget_bytes = budget, .usable_bytes = budget,
+        .budget_bytes = budget, .usable_bytes = usable,
         .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
         .source = WL_COLUMNAR_MEMORY_SOURCE_ENV, .status = WL_COLUMNAR_MEMORY_OK
     };
@@ -85,7 +87,7 @@ static fixture_t fixture(const char *text, uint64_t budget, uint64_t quota)
     options.memory_governor = f.governor;
     options.spill_directory = test_tmpdir();
     options.spill_quota_bytes = quota;
-    options.spill_max_row_bytes = 64;
+    options.spill_max_row_bytes = row_bytes;
     options.spill_join_batch_bytes = 96;
     options.spill_join_index_bytes = sizeof(wl_columnar_memory_reservation_t) +
         16;
@@ -93,6 +95,10 @@ static fixture_t fixture(const char *text, uint64_t budget, uint64_t quota)
         &options, &f.session) == 0);
     CHECK(wl_session_load_facts(f.session, f.program) == 0);
     return f;
+}
+static fixture_t fixture(const char *text, uint64_t budget, uint64_t quota)
+{
+    return fixture_options(text, budget, budget, quota, 64);
 }
 static fixture_t populated(void)
 {
@@ -2721,6 +2727,8 @@ static void inline_projection_failures(void)
             wl_columnar_spill_store_bytes(s->spill_store) == disk);
         s->intern = intern; if (foreign) wl_intern_free(foreign);
         source->columns[2][8] = saved; allocation_fault = write_fault = 0;
+        CHECK(wl_columnar_session_begin_cold_input(f.session,
+            "a") == WL_COLUMNAR_SPILL_UNSUPPORTED);
         CHECK(wl_columnar_session_seal_input(f.session, "a", NULL, NULL) == OK);
         const wl_plan_relation_t *rp = join_body(&f, "result");
         eval_stack_t stack; eval_stack_init(&stack); before = reserved(&f);
@@ -3929,6 +3937,193 @@ static void cold_scan_map_only_right_audit(void)
     rp->ops = saved; rp->op_count = count; destroy(&f);
 }
 
+extern void (*wl_columnar_session_test_retained_cold_chunk)(col_rel_t *);
+static col_rel_t *chunked_retained[WL_TEST_COLD_ROWS/WL_TEST_COLD_CHUNK];
+static unsigned chunked_retained_count;
+static void chunked_retain(col_rel_t *chunk)
+{
+    CHECK(chunked_retained_count < WL_TEST_COLD_ROWS/WL_TEST_COLD_CHUNK);
+    CHECK(chunk->nrows == WL_TEST_COLD_CHUNK &&
+        chunk->ncols == WL_TEST_COLD_WIDTH);
+    chunked_retained[chunked_retained_count++] = chunk;
+}
+static void chunked_causal_budget(void)
+{
+    const uint64_t budget = WL_TEST_COLD_BUDGET, usable = budget-budget/20;
+    const uint64_t chunk_bytes = (uint64_t)WL_TEST_COLD_CHUNK*
+        WL_TEST_COLD_WIDTH*8;
+    CHECK((uint64_t)WL_TEST_COLD_ROWS*WL_TEST_COLD_WIDTH*8 > budget);
+    char *text = wl_test_cold_query(0);
+    int64_t *rows = malloc((size_t)chunk_bytes); CHECK(rows);
+    for (unsigned retain = 0; retain < 2; retain++) {
+        budget_peak = 0;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        fixture_t f = fixture_options(text, budget, usable,
+                UINT64_C(512)*1024*1024, WL_TEST_COLD_WIDTH*8+24);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        s->spill_join_index_bytes = 4096; s->spill_join_batch_bytes = 16384;
+        for (int64_t i = 0; i < 4; i++) {
+            int64_t row[] = {i, 10+i};
+            CHECK(wl_session_insert(f.session, "a", row, 1, 2) == 0);
+        }
+        uint64_t base = reserved(&f);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        wl_columnar_session_test_retained_cold_chunk =
+            retain ? chunked_retain : NULL;
+        unsigned first = 0;
+        wl_columnar_spill_status_t status = OK;
+        for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
+            wl_test_cold_rows(rows, first); uint64_t before = reserved(&f);
+            status = wl_columnar_session_append_cold_input(f.session, "b", rows,
+                    WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH);
+            if (status != OK) break;
+            uint64_t delta = reserved(&f)-before;
+            CHECK(retain ? delta >= chunk_bytes : delta < chunk_bytes);
+        }
+        wl_columnar_session_test_retained_cold_chunk = NULL;
+        uint64_t retained_bytes = 0;
+        if (retain) {
+            CHECK(status == WL_COLUMNAR_SPILL_MEMORY &&
+                first < WL_TEST_COLD_ROWS && chunked_retained_count);
+            for (unsigned i = 0; i < chunked_retained_count; i++) {
+                uint64_t bytes = 0;
+                CHECK(col_rel_retained_live_bytes(chunked_retained[i], &bytes));
+                retained_bytes += bytes;
+                CHECK(col_rel_destroy_checked(chunked_retained[i]) == 0);
+                chunked_retained[i] = NULL;
+            }
+            CHECK(retained_bytes >=
+                (uint64_t)chunked_retained_count*chunk_bytes);
+            chunked_retained_count = 0;
+            CHECK(!f.session->input_load_failed);
+        } else CHECK(status == OK && first == WL_TEST_COLD_ROWS);
+        unsigned refused_at = first;
+        /* Releasing the actual retained chunks permits retry under the SAME limit. */
+        for (; first < WL_TEST_COLD_ROWS; first += WL_TEST_COLD_CHUNK) {
+            wl_test_cold_rows(rows, first);
+            CHECK(wl_columnar_session_append_cold_input(f.session, "b", rows,
+                WL_TEST_COLD_CHUNK, WL_TEST_COLD_WIDTH) == OK);
+        }
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        wl_columnar_session_cold_relation_t *c =
+            wl_columnar_session_cold_find(s, "b");
+        wl_columnar_trace_store_state_t state =
+            wl_columnar_trace_store_snapshot_state(c->trace_snapshot);
+        CHECK(state.rows == WL_TEST_COLD_ROWS &&
+            state.segments == WL_TEST_COLD_ROWS/WL_TEST_COLD_CHUNK);
+        uint64_t loaded = reserved(&f),
+            disk = wl_columnar_spill_store_bytes(s->spill_store);
+        events_t e = {0};
+        CHECK(wl_session_snapshot(f.session, observe,
+            &e) == 0 && e.seen == 15 && e.count == 4);
+        CHECK(budget_peak <= usable);
+        uint64_t owner, nodes, directory_bytes, cursor;
+        CHECK(wl_columnar_trace_store_floor(WL_TEST_COLD_WIDTH, state.segments,
+            &owner, &nodes, &directory_bytes, &cursor) == OK);
+        printf(
+            "chunked budget=%llu usable=%llu retain=%u refused_at=%u retained_source_bytes=%llu base=%llu loaded=%llu peak=%llu disk=%llu segments=%u owner=%llu nodes=%llu directory=%llu cursor=%llu host_chunk=%llu\n",
+            (unsigned long long)budget, (unsigned long long)usable, retain,
+            refused_at, (unsigned long long)retained_bytes,
+            (unsigned long long)base, (unsigned long long)loaded,
+            (unsigned long long)budget_peak, (unsigned long long)disk,
+            state.segments, (unsigned long long)owner,
+            (unsigned long long)nodes, (unsigned long long)directory_bytes,
+            (unsigned long long)cursor, (unsigned long long)chunk_bytes);
+        wl_columnar_memory_governor_test_admitted = NULL; destroy(&f);
+    }
+    free(rows); free(text);
+}
+
+static void chunked_reference_failures(void)
+{
+    const char *texts[] = {
+        ".decl a(k:int64,s:symbol,u:symbol)\n.decl result(s:symbol,k:int64)\nresult(s,k) :- a(k,s,u).\n",
+        ".decl a(p:pair(int64,symbol) inline,u:symbol)\n.decl result(s:symbol,k:int64)\nresult(s,k) :- a(pair(k,s),u).\n",
+        ".decl a(p:pair(int64,int64) inline)\n.decl result(v:int64,k:int64)\nresult(v,k) :- a(pair(k,v)).\n"
+    };
+    for (unsigned kind = 0; kind < 3; kind++) {
+        fixture_t f = fixture(texts[kind], 4*1024*1024, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        int64_t id = wl_intern_put(s->intern, "kept"); CHECK(id >= 0);
+        col_rel_t *original = session_find_rel(s, "a");
+        wl_columnar_source_access_reader_t pin = {0};
+        CHECK(col_rel_source_reader_acquire(original, &pin) == 0);
+        uint64_t pinned = reserved(&f);
+        CHECK(wl_columnar_session_begin_cold_input(f.session,
+            "a") == WL_COLUMNAR_SPILL_BUSY);
+        CHECK(session_find_rel(s,
+            "a") == original && !f.session->input_sealed &&
+            reserved(&f) == pinned);
+        CHECK(col_rel_source_reader_release(&pin) == 0);
+        if (kind) {
+            uint32_t edb = 0;
+            while (strcmp(f.plan->edb_relations[edb], "a")) edb++;
+            wl_plan_edb_schema_t *schema =
+                (wl_plan_edb_schema_t *)&f.plan->edb_schemas[edb];
+            wirelog_column_t *column = (wirelog_column_t *)&schema->columns[0];
+            wirelog_column_t saved = *column;
+            uint64_t baseline = reserved(&f);
+            for (unsigned bad = 0; bad < 4; bad++) {
+                if (!bad) column->compound_functor_id = UINT32_MAX;
+                if (bad == 1) column->compound_arity++;
+                if (bad ==
+                    2) original->compound_kind = WIRELOG_COMPOUND_KIND_SIDE;
+                if (bad == 3) schema->has_unsupported_inline_cold_use = true;
+                CHECK(wl_columnar_session_begin_cold_input(f.session,
+                    "a") == WL_COLUMNAR_SPILL_UNSUPPORTED);
+                CHECK(reserved(&f) == baseline && session_find_rel(s,
+                    "a") == original && !s->cold_relation);
+                *column = saved;
+                original->compound_kind = WIRELOG_COMPOUND_KIND_INLINE;
+                schema->has_unsupported_inline_cold_use = false;
+            }
+        }
+        uint64_t before = reserved(&f);
+        wl_columnar_memory_reservation_t pressure;
+        wl_columnar_memory_reservation_init(&pressure);
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+                f.governor), 4*1024*1024-before, &pressure));
+        CHECK(wl_columnar_session_begin_cold_input(f.session,
+            "a") == WL_COLUMNAR_SPILL_MEMORY && !s->cold_relation &&
+            !f.session->input_sealed);
+        CHECK(wl_columnar_memory_rollback(&pressure) && reserved(&f) == before);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") == OK);
+        wl_columnar_session_cold_relation_t *c =
+            wl_columnar_session_cold_find(s, "a");
+        CHECK(wl_columnar_trace_store_uses_intern(c->loading_trace, s->intern));
+        uint32_t logical = 99;
+        const wirelog_column_t *columns =
+            wl_columnar_trace_store_inline_schema(c->loading_trace, &logical);
+        CHECK(kind ? columns && logical == (kind == 2 ? 1u : 2u) : !columns &&
+            !logical);
+        int64_t row[] = {1, kind == 2 ? 11 : id, id};
+        uint32_t width = kind == 2 ? 2u : 3u;
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", row, 1,
+            width) == OK);
+        before = reserved(&f);
+        uint64_t spilled = wl_columnar_spill_store_bytes(s->spill_store);
+        write_fault = 3;
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", row, 1,
+            width) == WL_COLUMNAR_SPILL_IO);
+        write_fault = 0;
+        CHECK(reserved(&f) == before && c->nrows == 1 &&
+            wl_columnar_spill_store_bytes(s->spill_store) == spilled);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", row, 1,
+            width) == OK);
+        before = reserved(&f);
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+                f.governor), 4*1024*1024-before, &pressure));
+        CHECK(wl_columnar_session_finish_cold_input(f.session,
+            "a") == WL_COLUMNAR_SPILL_MEMORY);
+        CHECK(wl_columnar_memory_rollback(&pressure) &&
+            reserved(&f) == before && c->state == WL_COLUMNAR_COLD_LOADING);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "a") == OK);
+        CHECK(wl_columnar_trace_store_snapshot_uses_intern(c->trace_snapshot,
+            s->intern));
+        CHECK(wl_session_step(f.session) == 0); destroy(&f);
+    }
+}
+
 static void chunked_join_failure(void)
 {
     fixture_t f = fixture(query, 4*1024*1024, 1024*1024);
@@ -4088,6 +4283,7 @@ int main(void)
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     chunked_internal(); chunked_join_failure();
+    chunked_reference_failures(); chunked_causal_budget();
     cold_scan_join_key_names();
     cold_scan_map_only_right_audit();
     cold_scan_join_self_missing();

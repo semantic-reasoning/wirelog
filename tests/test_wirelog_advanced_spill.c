@@ -7,6 +7,7 @@
 #endif
 #include "wirelog/wirelog-advanced.h"
 #include "test_tmpdir.h"
+#include "test_cold_input_fixture.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -1204,6 +1205,153 @@ static void chunked_public_joins(void)
                 }
 }
 
+typedef struct { uint64_t ids[3]; unsigned seen[2];} chunked_reference_events_t;
+static void chunked_reference_observe(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    chunked_reference_events_t *e = context;
+    unsigned side = !strcmp(name, "result") ? 0u : 1u;
+    CHECK(!side || !strcmp(name, "scan"));
+    CHECK(diff == 1 && row->logical_ncols == (side ? 2u : 3u) &&
+        row->physical_nlanes == row->logical_ncols);
+    CHECK(row->types[0] == WIRELOG_TYPE_INT64 &&
+        row->types[1] == WIRELOG_TYPE_STRING &&
+        row->physical_types[1] == WIRELOG_TYPE_STRING);
+    unsigned k = (unsigned)row->lanes[0];
+    CHECK(k < 3 && row->lanes[1] == e->ids[k]);
+    if (!side) CHECK(row->types[2] == WIRELOG_TYPE_INT64 &&
+            row->lanes[2] == 100+k);
+    unsigned bit = 1u << k; CHECK(!(e->seen[side] & bit)); e->seen[side] |= bit;
+}
+static void chunked_public_references(void)
+{
+    for (unsigned inlined = 0; inlined < 2; inlined++)
+        for (unsigned mode = 0; mode < 3; mode++)
+            for (unsigned empty = 0; empty < 2; empty++) {
+                char text[1024];
+                snprintf(text, sizeof(text), ".decl seed(s:symbol,k:int64)\n"
+                    "seed(\"\",0).\nseed(\"alpha\",1).\nseed(\"한글\",2).\nseed(\"unused\",3).\n"
+                    "%s\n.decl b(s:symbol,v:int64)\n"
+                    ".decl result(k:int64,s:symbol,v:int64)\n.decl scan(k:int64,s:symbol)\n"
+                    "result(k,s,v+0) :- %s,b(s,v).\nscan(k,s) :- %s.\n",
+                    inlined ? ".decl a(p:pair(int64,symbol) inline,u:symbol)" :
+                    ".decl a(k:int64,s:symbol,u:symbol)",
+                    inlined ? "a(pair(k,s),u)" : "a(k,s,u)",
+                    inlined ? "a(pair(k,s),u)" : "a(k,s,u)");
+                wirelog_program_t *p = parse(text); wirelog_session_t *s = NULL;
+                wirelog_session_options_v1_t options = configured();
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &options, &s) == WIRELOG_OK);
+                int64_t *facts = NULL; uint32_t rows = 0, cols = 0;
+                CHECK(wirelog_program_get_facts(p, "seed", &facts, &rows,
+                    &cols) == 0 && rows == 4 && cols == 2);
+                int64_t ids[4];
+                for (unsigned i = 0; i < 4; i++) {
+                    CHECK(facts[2*i+1] >= 0 && facts[2*i+1] < 4);
+                    ids[facts[2*i+1]] = facts[2*i];
+                }
+                free(facts);
+                if (mode != 2) for (int64_t i = 0; i < 3; i++) {
+                        int64_t row[] = {ids[i], 100+i};
+                        CHECK(wirelog_session_insert(s, "b", row, 1,
+                            2) == WIRELOG_OK);
+                    }
+                CHECK(wirelog_session_begin_cold_input(s, "a") == WIRELOG_OK);
+                if (mode == 1) CHECK(wirelog_session_seal_input(s,
+                        "b") == WIRELOG_OK);
+                if (mode == 2) CHECK(wirelog_session_begin_cold_input(s,
+                        "b") == WIRELOG_OK);
+                for (int64_t i = 0; i < 3; i++) {
+                    int64_t row[] = {i, ids[i], ids[3]},
+                        bad[] = {i, ids[i], INT64_MAX};
+                    CHECK(wirelog_session_append_cold_input(s, "a", bad, 1,
+                        3) == WIRELOG_ERR_EXEC);
+                    if (!empty) CHECK(wirelog_session_append_cold_input(s, "a",
+                            row, 1, 3) == WIRELOG_OK);
+                    if (i == 1 &&
+                        !empty) CHECK(wirelog_session_append_cold_input(s, "a",
+                            row, 1, 3) == WIRELOG_OK);
+                    if (mode == 2) {
+                        int64_t right[] = {ids[i], 100+i};
+                        CHECK(wirelog_session_append_cold_input(s, "b", right,
+                            1, 2) == WIRELOG_OK);
+                    }
+                }
+                if (mode == 2) CHECK(wirelog_session_finish_cold_input(s,
+                        "b") == WIRELOG_OK);
+                CHECK(wirelog_session_finish_cold_input(s, "a") == WIRELOG_OK);
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    chunked_reference_events_t e = {{(uint64_t)ids[0],
+                                                     (uint64_t)ids[1],
+                                                     (uint64_t)ids[2]}, {0}};
+                    CHECK(wirelog_session_snapshot_typed(s,
+                        chunked_reference_observe, &e) == WIRELOG_OK);
+                    CHECK(e.seen[0] == (empty ? 0u : 7u) &&
+                        e.seen[1] == (empty ? 0u : 7u));
+                    CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                }
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(!live_files());
+            }
+}
+
+static void chunked_public_budget(void)
+{
+    /* One reused 2 MiB caller buffer, not a hidden full host-side input. */
+    const unsigned total = WL_TEST_COLD_ROWS, chunk = WL_TEST_COLD_CHUNK;
+    int64_t *rows = malloc((size_t)chunk*WL_TEST_COLD_WIDTH*sizeof(*rows));
+    CHECK(rows);
+    environment("WIRELOG_MEMORY_BUDGET", "268435456");
+    for (unsigned mode = 0; mode < 3; mode++) {
+        char *text = wl_test_cold_query(mode == 2);
+        wirelog_program_t *p = parse(text); free(text);
+        wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t options = configured();
+        options.spill_quota_bytes = UINT64_C(512)*1024*1024;
+        options.spill_max_row_bytes = WL_TEST_COLD_WIDTH*8+24;
+        options.spill_join_index_bytes = 4096;
+        options.spill_join_batch_bytes = 16384;
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT, 1,
+            &options, &s) == WIRELOG_OK);
+        if (mode != 2) for (int64_t i = 0; i < 4; i++) {
+                int64_t row[] = {i, 10+i};
+                CHECK(wirelog_session_insert(s, "a", row, 1, 2) == WIRELOG_OK);
+            }
+        if (mode != 1) CHECK(wirelog_session_begin_cold_input(s,
+                "b") == WIRELOG_OK);
+        wirelog_error_t error = WIRELOG_OK; unsigned admitted = 0;
+        for (unsigned first = 0; first < total && error == WIRELOG_OK;
+            first += chunk) {
+            wl_test_cold_rows(rows, first);
+            error = mode == 1 ? wirelog_session_insert(s, "b", rows, chunk,
+                    WL_TEST_COLD_WIDTH) :
+                wirelog_session_append_cold_input(s, "b", rows, chunk,
+                    WL_TEST_COLD_WIDTH);
+            if (error == WIRELOG_OK) admitted += chunk;
+        }
+        printf(
+            "public chunked budget=268435456 mode=%u admitted_rows=%u total_rows=%u status=%d\n",
+            mode, admitted, total, (int)error);
+        if (mode == 1) CHECK(error == WIRELOG_ERR_MEMORY_BUDGET);
+        else {
+            CHECK(error == WIRELOG_OK);
+            CHECK(wirelog_session_finish_cold_input(s, "b") == WIRELOG_OK);
+            if (mode == 2) {
+                unsigned calls = 0;
+                CHECK(wirelog_session_snapshot(s, count_event,
+                    &calls) == WIRELOG_ERR_MEMORY_BUDGET && !calls);
+            } else {
+                events_t e = {0};
+                CHECK(wirelog_session_snapshot(s, observe,
+                    &e) == WIRELOG_OK && e.count == 4 && e.seen == 15);
+            }
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(!live_files());
+    }
+    free(rows);
+}
+
 static void chunked_scan_observe(const char *name, const int64_t *row,
     uint32_t cols, void *context)
 {
@@ -1301,6 +1449,7 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     chunked_public_scans(); chunked_public_joins();
+    chunked_public_references(); chunked_public_budget();
     inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();

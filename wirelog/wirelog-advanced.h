@@ -273,13 +273,18 @@ WIRELOG_API wirelog_error_t
 wirelog_session_seal_input(wirelog_session_t *session,
     const char *relation);
 
-/** Begin explicitly chunked loading of an empty declared numeric EDB.
+/** Begin explicitly chunked loading of an empty declared scalar/flat INLINE EDB.
  * Requires the same serial spill-enabled ordinary mode as seal_input, before
  * evaluation, and supports audited MAP/FILTER scans and single-key equality JOIN consumers.
  * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
  * resident facts first; additional empty inputs may begin and preloaded inputs
  * may be sealed afterward. A failed begin preserves the original input.
  * Calls are synchronous and externally serialized. Program outlives session.
+ * STRING physical lanes must contain IDs from this session's program intern;
+ * flat INLINE uses its exact declared functor/layout. Whole compounds, SIDE and
+ * nested values are unsupported. Every STRING lane is validated, including
+ * unused fields, but coincident foreign IDs cannot establish provenance: the
+ * caller must supply IDs from this program. Intern strings remain resident.
  * Errors have the same classification as seal_input.
  */
 WIRELOG_API wirelog_error_t

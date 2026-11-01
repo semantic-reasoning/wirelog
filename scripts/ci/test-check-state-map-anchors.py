@@ -397,10 +397,10 @@ def main() -> int:
         row_edit("a symbol defined only under tests/ fails",
                  "`session_note_inserted_input`, `col_controlled_step_staging_finish`,"
                  " `wl_columnar_session_observed_action`,"
-                 " `wl_columnar_session_seal_join_input` | `col_eval_stratum_tdd_recursive`",
+                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input` | `col_eval_stratum_tdd_recursive`",
                  "`expect`, `col_controlled_step_staging_finish`,"
                  " `wl_columnar_session_observed_action`,"
-                 " `wl_columnar_session_seal_join_input` | `col_eval_stratum_tdd_recursive`")
+                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input` | `col_eval_stratum_tdd_recursive`")
 
         # The attribution check, read column: a function that exists, is
         # uniquely defined, and never touches the field beside it.
@@ -408,11 +408,11 @@ def main() -> int:
                  "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
                  " `session_note_inserted_input`, `session_snapshot_insert`,"
-                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` |",
+                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input`, `wl_columnar_session_observed_action` |",
                  "| `arr_build_full`, `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`,"
                  " `col_session_step_impl`, `session_note_inserted_input`,"
-                 " `session_snapshot_insert`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` |")
+                 " `session_snapshot_insert`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input`, `wl_columnar_session_observed_action` |")
 
         # The same for the write column, so `writes()` is not free to be
         # `return True` at this level either.
@@ -529,10 +529,10 @@ def main() -> int:
                  "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
                  " `session_note_inserted_input`, `session_snapshot_insert`,"
-                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` |",
+                 " `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input`, `wl_columnar_session_observed_action` |",
                  "| `col_eval_stratum_tdd_recursive`,"
                  " `col_session_snapshot_impl`, `col_session_step_impl`,"
-                 " `session_note_inserted_input`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_observed_action` |")
+                 " `session_note_inserted_input`, `wl_columnar_session_seal_join_input`, `wl_columnar_session_begin_cold_input`, `wl_columnar_session_observed_action` |")
 
         # An anchor ADDED rather than substituted is caught only by the
         # unresolvable-symbol branch, because completeness still sees every real

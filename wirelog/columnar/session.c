@@ -648,6 +648,10 @@ wl_columnar_session_cold_uses_intern(
     const wl_columnar_session_cold_relation_t *c,
     const wl_intern_t *intern)
 {
+    if (c->state ==
+        WL_COLUMNAR_COLD_LOADING) return wl_columnar_trace_store_uses_intern(
+            c->loading_trace, intern);
+
     return c->state == WL_COLUMNAR_COLD_PAYLOAD ?
            wl_columnar_batch_payload_uses_intern(c->payload, intern) :
            wl_columnar_trace_store_snapshot_uses_intern(c->trace_snapshot,
@@ -659,6 +663,10 @@ wl_columnar_session_cold_inline_schema(
     const wl_columnar_session_cold_relation_t *c,
     uint32_t *count)
 {
+    if (c->state ==
+        WL_COLUMNAR_COLD_LOADING) return wl_columnar_trace_store_inline_schema(
+            c->loading_trace, count);
+
     return c->state == WL_COLUMNAR_COLD_PAYLOAD ?
            wl_columnar_batch_payload_inline_schema(c->payload, count) :
            wl_columnar_trace_store_snapshot_inline_schema(c->trace_snapshot,
@@ -707,9 +715,12 @@ wl_columnar_session_cold_source_schema(const wl_col_session_t *s,
                 !strcmp(s->plan->edb_relations[i], name)) {
                 schema = &s->plan->edb_schemas[i]; break;
             }
+    const wl_columnar_session_cold_relation_t *cold = !r && !payload ?
+        wl_columnar_session_cold_find(s, name) : NULL;
     uint32_t logical = 0;
     const wirelog_column_t *stored = payload ?
-        wl_columnar_batch_payload_inline_schema(payload, &logical) : NULL;
+        wl_columnar_batch_payload_inline_schema(payload, &logical) :
+        cold ? wl_columnar_session_cold_inline_schema(cold, &logical) : NULL;
     bool actual_inline = stored ||
         (r && (r->compound_kind != WIRELOG_COMPOUND_KIND_NONE ||
         r->compound_count || r->compound_arity_map || r->compound_arity_len ||
@@ -719,15 +730,17 @@ wl_columnar_session_cold_source_schema(const wl_col_session_t *s,
         !schema->column_count) return !actual_inline;
     if (schema->has_unsupported_inline_cold_use || !s->intern ||
         !s->plan || s->intern != s->plan->intern ||
-        (!r && !payload)) return false;
-    uint32_t width = r ? r->ncols : 0;
+        (!r && !payload && !cold)) return false;
+    uint32_t width = r ? r->ncols : cold ? cold->ncols : 0;
     const wirelog_column_type_t *types = r ? r->column_types :
+        cold ? wl_columnar_session_cold_types(cold) :
         wl_columnar_batch_payload_schema(payload, &width, NULL);
     if (wl_columnar_spill_validate_inline_schema(types, width, schema->columns,
         schema->column_count) != WL_COLUMNAR_SPILL_OK) return false;
-    if (payload && (!stored || logical != schema->column_count ||
-        !wl_columnar_batch_payload_uses_intern(payload,
-        s->intern))) return false;
+    if ((payload || cold) && (!stored || logical != schema->column_count ||
+        !(cold ? wl_columnar_session_cold_uses_intern(cold, s->intern) :
+        wl_columnar_batch_payload_uses_intern(payload,
+        s->intern)))) return false;
     if (r && (r->compound_kind != WIRELOG_COMPOUND_KIND_INLINE ||
         !r->compound_arity_map ||
         r->compound_arity_len != schema->column_count)) return false;
@@ -1118,7 +1131,7 @@ wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     uint32_t slot = 0;
     while (slot < s->nrels && (!s->rels[slot] ||
-        strcmp(s->rels[slot]->name, name))) slot++;
+        strcmp(s->rels[slot]->name, name) != 0)) slot++;
     if (slot == s->nrels) return WL_COLUMNAR_SPILL_INVALID;
     col_rel_t *r = s->rels[slot];
     uint32_t width = r->ncols;
@@ -1130,13 +1143,17 @@ wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
         r->memory_governor != s->memory_governor ||
         !wl_columnar_batch_payload_can_take(r) ||
         !wl_columnar_session_cold_source_schema(s, name, r, NULL, &schema) ||
-        schema || !wl_columnar_session_cold_plan(s, name, width,
+        !wl_columnar_session_cold_plan(s, name, width,
         (const char *const *)r->col_names, types))
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
-    for (uint32_t i = 0; i < width; i++)
-        if (types[i] < WIRELOG_TYPE_INT32 || types[i] > WIRELOG_TYPE_BOOL ||
-            types[i] ==
-            WIRELOG_TYPE_STRING) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    bool references = schema != NULL;
+    for (uint32_t i = 0; i < width; i++) {
+        if (types[i] < WIRELOG_TYPE_INT32 || types[i] > WIRELOG_TYPE_BOOL)
+            return WL_COLUMNAR_SPILL_UNSUPPORTED;
+        references |= types[i] == WIRELOG_TYPE_STRING;
+    }
+    if (references && (!s->intern || s->intern != s->plan->intern))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
     if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
         return WL_COLUMNAR_SPILL_OVERFLOW;
     uint64_t bytes = sizeof(wl_columnar_session_cold_relation_t) +
@@ -1186,8 +1203,13 @@ wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
     c->cold_storage_generation = r->storage_generation + 1;
     bool inserted_name = s->last_inserted_relation &&
         !strcmp(s->last_inserted_relation, name);
-    wl_columnar_spill_status_t status = wl_columnar_trace_store_create(
-        s->memory_governor, types, width, &c->loading_trace);
+    wl_columnar_spill_status_t status = references ?
+        wl_columnar_trace_store_create_reference(s->memory_governor, types,
+            width,
+            schema ? schema->columns : NULL, schema ? schema->column_count : 0,
+            s->intern, &c->loading_trace) :
+        wl_columnar_trace_store_create(s->memory_governor, types, width,
+            &c->loading_trace);
     if (status == WL_COLUMNAR_SPILL_OK) {
         int retired = col_rel_destroy_checked(r);
         if (retired) status = retired == EBUSY ? WL_COLUMNAR_SPILL_BUSY :
@@ -1222,6 +1244,14 @@ wl_columnar_session_cold_loader(wl_session_t *session, const char *name)
     return c;
 }
 
+static int wl_columnar_session_inline_schema(col_rel_t *r,
+    const wl_plan_t *plan, uint32_t edb);
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test-only causal control transfers actual retained chunks to the test owner.
+ * The hook runs after a successful capture; production always uses take. */
+void (*wl_columnar_session_test_retained_cold_chunk)(col_rel_t *);
+#endif
+
 wl_columnar_spill_status_t
 wl_columnar_session_append_cold_input(wl_session_t *session, const char *name,
     const int64_t *rows, uint32_t count, uint32_t width)
@@ -1236,19 +1266,57 @@ wl_columnar_session_append_cold_input(wl_session_t *session, const char *name,
         !wl_columnar_memory_size_mul(bytes, sizeof(*rows), &bytes) ||
         bytes > SIZE_MAX) return WL_COLUMNAR_SPILL_OVERFLOW;
     if (!count) return WL_COLUMNAR_SPILL_OK;
+    wl_columnar_trace_store_state_t state =
+        wl_columnar_trace_store_state(c->loading_trace);
+    if (state.generation == UINT64_MAX || state.segments == UINT32_MAX)
+        return WL_COLUMNAR_SPILL_OVERFLOW;
     wl_col_session_t *s = COL_SESSION(session);
+    const wl_plan_edb_schema_t *schema;
+    if (!wl_columnar_session_cold_source_schema(s, name, NULL, NULL, &schema))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    bool references = wl_columnar_session_cold_uses_intern(c, s->intern);
     col_rel_t *chunk = NULL;
     int rc = wl_columnar_relation_new_named_governed(name, width, NULL,
             count, false, s->memory_governor, &chunk);
     if (!rc) rc = col_rel_set_column_types(chunk, c->trace_types, width);
+    if (!rc && schema) {
+        for (uint32_t i = 0; i < s->plan->edb_count; i++)
+            if (&s->plan->edb_schemas[i] == schema) {
+                rc = wl_columnar_session_inline_schema(chunk, s->plan, i);
+                break;
+            }
+    }
     bool denied = false;
     if (!rc) rc = col_rel_append_rows_atomic(chunk, rows, count, width,
                 &denied);
     wl_columnar_spill_status_t status = (denied ||
         rc == ENOSPC) ? WL_COLUMNAR_SPILL_MEMORY :
         rc == ENOMEM ? WL_COLUMNAR_SPILL_ALLOCATION : rc ?
-        WL_COLUMNAR_SPILL_INVALID : wl_columnar_trace_store_append_take(
-        c->loading_trace, &chunk, s->spill_store, NULL, NULL);
+        WL_COLUMNAR_SPILL_INVALID : WL_COLUMNAR_SPILL_OK;
+    if (status == WL_COLUMNAR_SPILL_OK) {
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_session_test_retained_cold_chunk) {
+            status =
+                references ? wl_columnar_trace_store_append_capture_reference(
+                c->loading_trace, chunk, schema ? schema->columns : NULL,
+                schema ? schema->column_count : 0, s->intern,
+                WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, s->spill_store, NULL, NULL) :
+                wl_columnar_trace_store_append_capture(c->loading_trace, chunk,
+                    WL_COLUMNAR_BATCH_PAYLOAD_SPILLED, s->spill_store, NULL,
+                    NULL);
+            if (status == WL_COLUMNAR_SPILL_OK) {
+                wl_columnar_session_test_retained_cold_chunk(chunk);
+                chunk = NULL;
+            }
+        } else
+#endif
+        status = references ? wl_columnar_trace_store_append_take_reference(
+            c->loading_trace, &chunk, schema ? schema->columns : NULL,
+            schema ? schema->column_count : 0, s->intern, s->spill_store, NULL,
+            NULL) :
+            wl_columnar_trace_store_append_take(c->loading_trace, &chunk,
+                s->spill_store, NULL, NULL);
+    }
     if (chunk && col_rel_destroy_checked(chunk)) abort();
     if (status == WL_COLUMNAR_SPILL_OK) c->nrows += count;
     return status;

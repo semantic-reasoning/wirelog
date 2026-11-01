@@ -5413,23 +5413,63 @@ whole compound reconstruction, SIDE or nested-handle ownership is introduced.
 ### Chunked immutable session inputs
 
 `wirelog_session_begin_cold_input`, `wirelog_session_append_cold_input` and
-`wirelog_session_finish_cold_input` load an initially empty declared numeric EDB
-without first retaining its complete rows. This route supports ordinary MAP/FILTER scans and audited single-key equality
-JOINs, including scan prefixes, left/right/both/self and chained consumers.
-Finished traces, existing sealed payloads and resident opposite inputs share the
-bounded JOIN engine; trace inputs are never materialized as a full resident
-relation. Each side independently pins its reader, including self JOINs. Populate other resident inputs before beginning: successful
-begin freezes ordinary mutation, while additional empty loaders and preloaded
-payload sealing remain available. Evaluation refuses pending loaders without
-closing their finish/retry window. Session destruction releases incomplete loads.
+`wirelog_session_finish_cold_input` load an initially empty declared scalar or
+flat INLINE EDB without first retaining its complete rows. This route supports
+ordinary MAP/FILTER scans and audited single-key equality JOINs, including scan
+prefixes, left/right/both/self and chained consumers. Finished traces, existing
+sealed payloads and resident opposite inputs share the bounded JOIN engine;
+trace inputs are never materialized as a full resident relation. Each side
+independently pins its reader, including self JOINs. Populate other resident
+inputs before beginning: successful begin freezes ordinary mutation, while
+additional empty loaders and preloaded payload sealing remain available.
+Evaluation refuses pending loaders without closing their finish/retry window.
+Session destruction releases incomplete loads.
+
+STRING lanes must originate in the session program's intern table. Every lane,
+including unused fields, is validated; coincident foreign integers cannot prove
+provenance, so originating IDs remain the caller's responsibility. Flat INLINE
+loads preserve the exact declaration and functor capability, even if all child
+lanes are numeric. Whole-compound, SIDE and nested uses are refused before
+publication. Program lifetime still extends beyond session destruction. Intern
+strings stay resident: spilling row lanes does not reclaim their table.
+Read-only owner queries let pending loaders audit their retained declaration
+without admitting a snapshot directory or exposing unfinalized rows.
 
 Each append borrows one host buffer, admits a governed temporary relation and
 spills/transfers it into one immutable segment. The host buffer is outside the
-governor and is not retained. Owner, per-segment nodes, transition scratch and
-the final O(segments) snapshot directory remain real floors. Append failures keep
-the prior prefix; finish admits the directory before publication and is retryable.
-The scan output still reserves full input-row capacity, including rejecting
-filters: bounded ingestion does not imply arbitrary-budget scan completion.
+governor and is not retained. Owner, per-segment nodes, transition scratch,
+reference declarations/intern storage and the final O(segments) snapshot directory
+remain real floors. Append failures keep the prior prefix; finish admits the
+directory before publication and is retryable. The scan output still reserves
+full input-row capacity at its projected width, including rejecting filters:
+bounded ingestion does not imply arbitrary-budget scan completion.
 Legacy `seal_input` retains single-payload storage and reader costs, with only
 the fixed shared cold-binding descriptor increasing for explicit trace state
 (168 to 200 bytes on the measured 64-bit build, +32 bytes per binding).
+
+The public causal fixture uses the existing minimum 256 MiB configured budget
+(255,013,684 usable bytes after policy headroom), 40,960 rows of 1,024 INT64 lanes,
+and 256-row chunks. Raw source lanes total 320 MiB, exceeding the configured
+budget. One reused 2 MiB caller buffer is explicitly outside the governor. A
+16 KiB JOIN batch and 4 KiB index cap admit the real wide intermediate row; the
+encoded spill-row cap is 8,216 bytes, including 24 bytes of metadata. The JOIN
+returns four exact tuples. All-resident insertion of the same data under the
+same budget refuses admission; the chunked public load/finish/JOIN completes.
+A full-width scan of the same loaded data separately refuses its output floor.
+No test lowers the public policy minimum or changes a live governor limit.
+
+The matching internal causal control retains actual governed source chunks
+instead of transferring them. On the measured 64-bit build it refuses at 13,568
+loaded rows while holding 112,017,408 bytes of source storage. Releasing those
+chunks permits append retry and the same JOIN completion under the unchanged
+limit. The transfer path peaks at 138,410,604 governed bytes, including session
+creation (134,692,940 bytes before beginning), loading, readers and final output;
+finished input ownership uses 136,089,444 bytes. These are platform measurements,
+not portable ceiling assertions. The 160 segments occupy 337,187,840 spill bytes;
+the separately reported trace floors are 4,304 owner bytes, 20,480 node bytes,
+1,400 directory bytes and 112 bytes per cursor, with binding/payload/schema,
+reader, intern and output ownership additional. Cleanup returns all reservations.
+Reference tests independently exercise admission and write failures, invalid
+unused STRING lanes, declaration/functor mismatch, pending/finalized pins and
+retry without losing the prefix. Broader mutable/differential session routing,
+logical time, SIDE/nested consumers and scheduling remain outside this group.
