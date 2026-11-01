@@ -317,6 +317,14 @@ int wl_columnar_join_batch_prepare_step(wl_columnar_join_batch_prepare_t *,
 int wl_columnar_join_batch_prepare_abort_step(
     wl_columnar_join_batch_prepare_t *,
     wl_evaluation_control_t *funding, uint64_t funding_id, bool *done);
+/* End both real sink/source protocols before this serialized private commit.
+ * The disjoint owner extent tracks committed rows; failures discard the whole
+ * private sink. After the final precommit poll, extent publication and private
+ * ACK contain no callback, allocation, poll or fallible helper. */
+int wl_columnar_join_batch_prepare_sink_commit_ack(
+    wl_columnar_join_batch_prepare_t *, col_rel_t *sink, uint32_t base_rows,
+    uint64_t generation, const wl_columnar_relation_append_batch_t *,
+    const wl_columnar_relation_scalar_source_t *, uint32_t *committed_extent);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_join_batch_test_prepare_checkpoint)(
     const wl_columnar_join_batch_prepare_t *);

@@ -6899,6 +6899,20 @@ foreach differential_case : [
        suite: ['unit', 'tsan', 'evaluation_differential'], timeout: 60)
 endforeach
 
+# #2297: real session batch producer and private destination.
+test_evaluation_join_hosts_exe = executable(
+  'test_evaluation_join_hosts', files('test_evaluation_join_hosts.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach join_host_case : ['domains', 'recovery', 'failures']
+  test('evaluation_join_hosts_' + join_host_case,
+       test_evaluation_join_hosts_exe, args: [join_host_case],
+       suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+endforeach
+
 # #2298: real generated LFTJ session admission, metadata and recovery.
 test_evaluation_lftj_hosts_exe = executable(
   'test_evaluation_lftj_hosts', files('test_evaluation_lftj_hosts.c'),

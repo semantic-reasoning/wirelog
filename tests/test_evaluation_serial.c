@@ -4,6 +4,7 @@
 #include "../wirelog/thread.h"
 /* #1821 real backend fresh-head result bridge and retained ownership. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_pipeline.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/intern.h"
 #include "../wirelog/wirelog.h"
@@ -7399,6 +7400,17 @@ controlled_batch_join_checkpoint(wl_evaluation_control_t *control,
 }
 
 static void
+controlled_batch_pipeline_checkpoint(wl_evaluation_control_t *control,
+    unsigned phase, uint64_t generation, uint32_t extent, uint64_t work)
+{
+    if (phase == WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK) {
+        CHECK(generation && !extent && work);
+        ++controlled_batch_join_scan_checkpoints;
+        wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void
 test_controlled_batch_delta_selectors(void)
 {
     static const char source[] =
@@ -7512,12 +7524,16 @@ test_controlled_batch_delta_selectors(void)
             controlled_batch_join_scan_checkpoints = 0;
             wl_columnar_join_test_attempt_checkpoint =
                 controlled_batch_join_checkpoint;
+            wl_columnar_join_pipeline_test_numeric_checkpoint =
+                controlled_batch_pipeline_checkpoint;
         }
         int rc = ci == 15
             ? controlled_batch_run_to_terminal(base, control)
             : wl_session_step(base);
-        if (ci == 15)
+        if (ci == 15) {
             wl_columnar_join_test_attempt_checkpoint = NULL;
+            wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+        }
         if (cases[ci].reject) {
             CHECK(rc == ENOTSUP);
             CHECK(!wl_evaluation_control_active_attempt_id(control)

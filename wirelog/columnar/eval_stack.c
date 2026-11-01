@@ -7,6 +7,7 @@
  */
 
 #include "columnar/internal.h"
+#include "columnar/join_pipeline.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -1164,6 +1165,24 @@ wl_columnar_eval_stack_unary_commit_attempt_owned(
     if (authority) return authority;
     return wl_columnar_eval_stack_unary_commit_attempt_body(frame, committed,
                false);
+}
+
+int
+wl_columnar_eval_stack_unary_commit_numeric_join_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, bool *committed,
+    const void *owner)
+{
+    if (committed) *committed = false;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    bool delta = false;
+    rc = wl_columnar_join_pipeline_numeric_delta_owned(owner, frame, &delta);
+    if (rc) return rc;
+    const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
+    if (delta != (!numeric->plan->ops[numeric->cursor].project_count
+        && frame->unary_snapshot.is_delta)) return EINVAL;
+    return wl_columnar_eval_stack_unary_commit_attempt_body(frame, committed,
+               delta);
 }
 
 int

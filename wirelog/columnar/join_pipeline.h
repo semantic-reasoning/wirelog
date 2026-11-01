@@ -6,6 +6,30 @@
 
 #include "columnar/internal.h"
 
+/* First same-frame controlled producer-to-relation destination. Only the
+ * authenticated materializing fallback owner may enter these private APIs. */
+int wl_columnar_join_pipeline_numeric_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_join_pipeline_numeric_delta_owned(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED = 1,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCE,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_ACK,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_ACK,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_BEFORE_COMMIT,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_AFTER_COMMIT,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_PRODUCER_DONE,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_BOOTSTRAP,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_KEYS
+};
+extern void (*wl_columnar_join_pipeline_test_numeric_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t, uint32_t, uint64_t);
+#endif
+
 typedef enum {
     WL_COLUMNAR_JOIN_PIPELINE_ELIGIBLE = 0,
     WL_COLUMNAR_JOIN_PIPELINE_EXCLUDED_OFF,

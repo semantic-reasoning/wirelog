@@ -1992,6 +1992,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->composed_mode = true;
     record->controlled_materialized_batch_fallback =
         controlled_materialized_batch_fallback;
+    record->join_host = NULL; record->join_host_initialized_bytes = 0;
+    record->join_host_governor = NULL;
+    record->join_host_admitted = record->join_host_committed = false;
+    record->join_host_terminal = record->join_host_declined = false;
+    wl_columnar_memory_reservation_init(&record->join_host_credit);
     record->preflight_depth = initial_depth;
     record->runtime_depth = initial_depth;
     record->phase = initial_depth ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS
@@ -2314,6 +2319,27 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
 {
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
+    if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && (record->join_host || record->join_host_admitted
+        || record->join_host_governor)) {
+        if (!record->semantic_result) record->semantic_result = EINVAL;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH;
+    }
+    if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH) {
+        if (!funding || funding == record->control || !funding_id
+            || wl_evaluation_control_active_attempt_id(funding) != funding_id)
+            return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+        if (rc) return rc;
+        if (record->abort_requested
+            && wl_evaluation_control_active_attempt_id(record->control)
+            == record->attempt_id)
+            wl_evaluation_control_request_cancel(record->control);
+        record->pending_action = record->phase;
+        record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        return wl_columnar_join_pipeline_numeric_step(record, funding,
+                   funding_id);
+    }
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
@@ -2456,6 +2482,12 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD;
             return 0;
         }
+        if (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
+            && record->controlled_materialized_batch_fallback
+            && !record->join_host_declined) {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH;
+            return 0;
+        }
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
         switch (record->plan->ops[record->cursor].op) {
@@ -2553,6 +2585,11 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
                    funding, funding_id, record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE:
+        if (record->join_host || record->join_host_admitted
+            || record->join_host_governor) return EBUSY;
+        record->join_host_declined = false;
+        record->join_host_terminal = record->join_host_committed = false;
+        record->join_host_initialized_bytes = 0;
         if (record->phase ==
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
             && record->child_status.committed) --record->runtime_depth;
@@ -2655,6 +2692,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
 {
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
+    if (record->join_host || record->join_host_admitted
+        || record->join_host_governor) return EBUSY;
     switch (record->phase) {
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_FULL:
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_DELTA:
@@ -2761,6 +2800,19 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
         return 0;
     }
     if (record->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH) {
+        if (record->child_status.progress != WL_COLUMNAR_FILTER_PROGRESS_DONE) {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH;
+        } else if (record->join_host_declined) {
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY;
+        } else {
+            if (!record->semantic_result)
+                record->semantic_result = record->child_status.semantic_result;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE;
+        }
+        return 0;
+    }
+    if (record->pending_action ==
         WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK) {
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ADVANCE;
         return 0;
@@ -2812,7 +2864,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_status(
     status->protocol_result = record->protocol_result;
     status->retained = record->protocol_result != 0
         || ((record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
-        || record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD)
+        || record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_CHILD
+        || record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH)
         && record->child_status.progress ==
         WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
     return 0;
@@ -2854,7 +2907,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
-        || !record->control) return EBUSY;
+        || !record->control || record->join_host || record->join_host_admitted
+        || record->join_host_governor) return EBUSY;
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
@@ -2870,6 +2924,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->composed_mode = false; record->preflight_depth = 0;
     record->runtime_depth = 0;
     record->controlled_materialized_batch_fallback = false;
+    record->join_host_terminal = record->join_host_declined = false;
     record->private_bindings = NULL;
     record->abort_supported = false; record->abort_requested = false;
     memset(&record->lftj, 0, sizeof(record->lftj));
