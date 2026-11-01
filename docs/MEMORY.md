@@ -5490,5 +5490,13 @@ cardinality; trace node/directory and intern costs remain additional. Read,
 admission, allocation or stack-publication failure destroys private ownership
 and leaves the immutable source reusable. Only complete results enter the
 evaluator stack. Existing projection/JOIN prefix output floors are unchanged.
-Grouped COUNT, other aggregate functions, expressions, recursive/signed/control
-aggregation and aggregate-over-JOIN are not admitted by this initial increment.
+Grouped COUNT accepts direct INT64/STRING scalar keys, including scalar fields
+of validated flat INLINE input. A private hash index starts with eight buckets
+and doubles before exceeding half occupancy. Collision lookup compares every
+key lane. Index reservations cover old and new storage together during rehash;
+private result growth is admitted separately. Row ordinals survive output
+relocation. With fixed groups, attempt state does not grow with input rows.
+Group cardinality still has a resident index/result floor; refusal discards the
+whole private attempt and preserves the immutable source for retry.
+Other aggregate functions, expressions, recursive/signed/control aggregation
+and aggregate-over-JOIN remain ineligible.

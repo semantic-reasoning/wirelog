@@ -4390,6 +4390,74 @@ static void cold_global_internal(void)
     CHECK(eval_stack_dispose_entry(&stack, &e) == 0); destroy(&f);
 }
 
+static void cold_group_internal(void)
+{
+    uint64_t extra[2] = {0};
+    for (unsigned mode = 0; mode < 2; mode++) {
+        fixture_t f =
+            fixture(
+            ".decl b(k:int64,v:int64)\n.decl result(k:int64,n:int64)\nresult(k,count(v)) :- b(k,v).\n",
+            4*1024*1024, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        int64_t chunk[128];
+        for (unsigned i = 0; i < 64; i++) {
+            chunk[2*i] = i; chunk[2*i+1] = 1;
+        }
+        unsigned chunks = mode ? 8 : 1;
+        for (unsigned i = 0; i < chunks;
+            i++) CHECK(wl_columnar_session_append_cold_input(f.session, "b",
+                chunk, 64, 2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        const wl_plan_relation_t *rp = cold_aggregate_plan(&f);
+        eval_stack_t stack; eval_stack_init(&stack);
+        uint64_t before = reserved(&f);
+        read_fault = 5;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == EIO);
+        CHECK(!stack.top && reserved(&f) == before);
+        budget_peak = before;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == 0);
+        wl_columnar_memory_governor_test_admitted = NULL;
+        extra[mode] = budget_peak-before;
+        eval_entry_t e = eval_stack_pop(&stack);
+        CHECK(e.rel->nrows == 64);
+        for (unsigned i = 0; i < 64;
+            i++) CHECK(e.rel->columns[0][i] == (int64_t)i &&
+                e.rel->columns[1][i] == (int64_t)chunks);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(f.governor);
+        uint64_t limit = atomic_load_explicit(&g->usable_bytes,
+                memory_order_acquire);
+        /* Exercise every reservation boundary, including simultaneous old/new
+         * bucket admission and private output growth. Each refusal is retryable. */
+        unsigned refused = 0;
+        for (uint64_t allowance = 0; allowance < extra[mode];
+            allowance += 128) {
+            atomic_store_explicit(&g->usable_bytes, before+allowance,
+                memory_order_release);
+            int rc = wl_columnar_ops_cold_aggregate(rp, &stack, s);
+            if (!rc) {
+                e = eval_stack_pop(&stack);
+                CHECK(eval_stack_dispose_entry(&stack, &e) == 0);
+            }else {
+                CHECK(rc == ENOSPC); refused++;
+            }
+            CHECK(!stack.top && reserved(&f) == before);
+        }
+        CHECK(refused > 4);
+        atomic_store_explicit(&g->usable_bytes, limit, memory_order_release);
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == 0);
+        e = eval_stack_pop(&stack); CHECK(e.rel->nrows == 64);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        destroy(&f);
+    }
+    CHECK(extra[0] > 0 && extra[0] == extra[1]);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -4400,6 +4468,7 @@ int main(void)
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
     cold_global_internal();
+    cold_group_internal();
     chunked_internal(); chunked_join_failure();
     chunked_reference_failures(); chunked_causal_budget();
     cold_scan_join_key_names();

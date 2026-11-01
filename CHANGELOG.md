@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Cold COUNT groups direct INT64/STRING keys with governed index growth and
+  retryable private-output failure (#1372 follow-up).
+
 - Immutable cold inputs stream global COUNT through audited direct MAP/FILTER
   prefixes without reconstructing a resident source (#1372 follow-up).
 
