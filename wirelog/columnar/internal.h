@@ -7177,6 +7177,20 @@ int wl_columnar_eval_stack_unary_output_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, col_rel_t ***, const void *);
 int wl_columnar_eval_stack_unary_commit_attempt_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, bool *, const void *);
+/* Numeric-owned scalar retirement. Prepare validates the old owned entry
+ * reversibly on the original target before commit, retaining writer claims.
+ * Funded finish cancels those claims on abort or retires the old entry after
+ * commit, using only a distinct supplied cleanup attempt. Never copy a live
+ * frame/receipt. done=false retains exact authority; funding refusal or a
+ * foreign reader may be retried. Generic finish/reset cannot bypass it.
+ * Provisional output and any owned old input must be private scalar heap
+ * relations without segment metadata. Borrowed input is never destroyed. */
+int wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, bool *done);
+int wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, int initiating_result,
+    const void *, wl_evaluation_control_t *, uint64_t funding_id,
+    int *semantic_result, bool *done);
 int wl_columnar_eval_stack_filter_context_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t **,
     const void *);
