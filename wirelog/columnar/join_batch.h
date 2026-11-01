@@ -301,7 +301,16 @@ typedef struct wl_columnar_join_batch_prepare {
     bool descriptor_admitted, arrays_admitted, continuation_admitted;
     bool descriptor_committed, arrays_committed, continuation_committed;
     wl_columnar_relation_scalar_retirement_t retirement;
-    bool retirement_started, retirement_committed;
+    wl_columnar_relation_scalar_retirement_initializer_t retirement_initializer;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t prepare_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD prepare_thread;
+#else
+    pthread_t prepare_thread;
+#endif
+    bool prepare_thread_valid, cleanup_busy;
+    bool retirement_started, retirement_committed, retirement_drained;
     uint32_t phase, row, key, byte, hash;
     uint64_t cursor;
     uint64_t hash_value;

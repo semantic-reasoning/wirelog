@@ -8132,9 +8132,355 @@ test_anti_host_budget(void)
     CHECK(anti_host_budget_case(measured, measured) == measured);
 }
 
+static fixture_t *scalar_init_fixture;
+static unsigned scalar_init_stop_api, scalar_init_seen[5],
+    scalar_init_reentries;
+static void scalar_init_frame_checkpoint(
+    wl_columnar_relation_scalar_retirement_initializer_t *i,
+    wl_evaluation_control_t *control, unsigned api)
+{
+    fixture_t *f = scalar_init_fixture;
+    CHECK(f && i->busy && api >= 1 && api <= 4);
+    ++scalar_init_seen[api];
+    bool ready = true, done = true, committed = true; int semantic = 123;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = f->frame;
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    CHECK(wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(frame,
+        &f->record, &ready) == EBUSY && ready);
+    CHECK(wl_columnar_eval_stack_unary_finish_scalar_funded_owned(frame, EIO,
+        &f->record, control, id, &semantic,
+        &done) == EBUSY && done && semantic == 123);
+    CHECK(wl_columnar_eval_stack_unary_commit_attempt_owned(frame, &committed,
+        &f->record) == EBUSY && !committed);
+    col_rel_t **slot = (col_rel_t **)(uintptr_t)1;
+    CHECK(wl_columnar_eval_stack_unary_output_owned(frame, &slot,
+        &f->record) == EBUSY
+        && slot == (col_rel_t **)(uintptr_t)1);
+    CHECK(wl_columnar_eval_stack_unary_begin_attempt_owned(frame, f->operation,
+        f->operation_id, &f->record) == EBUSY);
+    CHECK(wl_columnar_eval_stack_unary_reset_owned(frame, &f->record) == EBUSY);
+    CHECK(!wl_columnar_eval_stack_cleanup_stack(frame)
+        && !wl_columnar_eval_stack_cleanup_result(frame));
+    eval_stack_t *stack = (eval_stack_t *)(uintptr_t)1;
+    CHECK(wl_columnar_eval_stack_operator_stack_owned(frame, &f->session,
+        &stack,
+        &f->record) == EBUSY && stack == (eval_stack_t *)(uintptr_t)1);
+    CHECK(!wl_columnar_eval_stack_numeric_owner(frame, &f->record));
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY &&
+        f->frame == frame);
+    ++scalar_init_reentries;
+    if (control == f->operation && scalar_init_stop_api == api) {
+        scalar_init_stop_api = 0; wl_evaluation_control_request_cancel(control);
+    }
+}
+
+static void test_scalar_initialization_frame_stops(void)
+{
+    for (unsigned stop = 1; stop <= 5; ++stop) {
+        fixture_t f; fixture_init(&f, 3, 3, 0);
+        wl_columnar_memory_governor_ref_t *g = join_governor(&f, 1u << 24);
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        stack->items[0].owned = true;
+        col_rel_t *original = f.input;
+        col_relation_snapshot_t snapshot =
+            wl_columnar_relation_snapshot(original);
+        uint32_t projection = 0;
+        wl_plan_op_t op = {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                           .project_indices = &projection};
+        wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+        fixture_begin(&f, &plan, 0, 1);
+        CHECK(!wl_columnar_eval_stack_unary_begin_attempt_owned(f.frame,
+            f.operation, f.operation_id, &f.record));
+        col_rel_t **slot = NULL;
+        CHECK(!wl_columnar_eval_stack_unary_output_owned(f.frame, &slot,
+            &f.record));
+        CHECK(!wl_columnar_relation_new_auto_governed_attempt_controlled(
+                "private abort", 3,
+                4, g, slot, f.operation, f.operation_id));
+        CHECK(*slot &&
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        scalar_init_fixture = &f; scalar_init_stop_api = stop <= 4 ? stop : 0;
+        scalar_init_reentries = 0;
+        memset(scalar_init_seen, 0, sizeof(scalar_init_seen));
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+            scalar_init_frame_checkpoint;
+        int rc = 0; bool ready = false;
+        for (unsigned turn = 0; !ready && !rc; ++turn) {
+            CHECK(turn < 1000);
+            rc =
+                wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+                f.frame, &f.record, &ready);
+        }
+        if (stop == 5) {
+            CHECK(!rc && ready);
+            wl_evaluation_control_request_cancel(f.operation);
+            CHECK(wl_evaluation_control_charge_attempt(f.operation,
+                f.operation_id, 0) == WL_EVALUATION_CONTROL_CANCELLED);
+        } else CHECK(rc == WL_EVALUATION_CONTROL_CANCELLED && !ready &&
+                !scalar_init_stop_api);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            WL_EVALUATION_CONTROL_CANCELLED,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_evaluation_control_report_t before, after;
+        CHECK(!wl_evaluation_control_report(f.operation, &before));
+        bool done = false; int semantic = 123; unsigned refused = 0;
+        for (unsigned turn = 0; !done; ++turn) {
+            CHECK(turn < 10000); int fund_owner = 0;
+            /* Empirical whole-parent probes; primitive fee literals are tested
+             * independently in evaluation_physical_retirement. */
+            uint64_t limit = turn % 2 ? 384 : 1;
+            wl_evaluation_control_t *fund = control_new(limit, &fund_owner);
+            uint64_t id = wl_evaluation_control_active_attempt_id(fund);
+            rc =
+                wl_columnar_eval_stack_unary_finish_scalar_funded_owned(f.frame,
+                    WL_EVALUATION_CONTROL_CANCELLED, &f.record, fund, id,
+                    &semantic, &done);
+            CHECK(!rc ||
+                (limit == 1 && rc == WL_EVALUATION_CONTROL_WORK_LIMIT));
+            if (rc) ++refused;
+            CHECK(semantic == (turn ? WL_EVALUATION_CONTROL_CANCELLED : 123));
+            CHECK(wl_evaluation_control_finish(fund, &fund_owner, rc, 0) == rc);
+            wl_evaluation_control_report_t report;
+            CHECK(!wl_evaluation_control_report(fund,
+                &report) && report.consumed <= limit);
+            CHECK(!wl_evaluation_control_detach(fund, &fund_owner));
+            wl_evaluation_control_release(fund);
+            CHECK(!wl_evaluation_control_report(f.operation, &after)
+                && before.attempt_id == after.attempt_id &&
+                before.consumed == after.consumed
+                && before.result == after.result);
+            CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+                wl_columnar_relation_snapshot(original))
+                && original->columns[2][2] == 4);
+        }
+        CHECK(refused && scalar_init_reentries && scalar_init_seen[1] &&
+            scalar_init_seen[2]
+            && scalar_init_seen[3] && scalar_init_seen[4]);
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
+        scalar_init_fixture = NULL;
+        CHECK(stack->items[0].rel == original && stack->items[0].owned);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        CHECK(!wl_columnar_eval_stack_unary_reset_owned(f.frame, &f.record));
+        f.input = NULL;
+        run(&f); CHECK(f.record.semantic_result == EINVAL); fixture_close(&f);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
+static int scalar_lftj_turn(fixture_t *f, bool direct, uint64_t limit,
+    uint64_t *work)
+{
+    int owner = 0;
+    wl_evaluation_control_t *fund = control_new(limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(fund);
+    int rc =
+        direct ? wl_columnar_eval_plan_numeric_composed_cleanup_lftj(&f->record,
+            fund, id)
+        : wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record, fund,
+            id);
+    CHECK(wl_evaluation_control_finish(fund, &owner, rc, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(fund, &report));
+    *work = report.consumed;
+    CHECK(!wl_evaluation_control_detach(fund, &owner));
+    wl_evaluation_control_release(fund);
+    return rc;
+}
+
+static fixture_t *scalar_lftj_fixture;
+static unsigned scalar_lftj_reentry_count;
+static void scalar_lftj_checkpoint(
+    wl_columnar_relation_scalar_retirement_initializer_t *i,
+    wl_evaluation_control_t *fund, unsigned api)
+{
+    fixture_t *f = scalar_lftj_fixture;
+    CHECK(f && i == &f->record.lftj.retirement_initializer);
+    (void)api;
+    wl_columnar_lftj_attempt_t *a = &f->record.lftj;
+    bool done = true;
+    uint64_t id = wl_evaluation_control_active_attempt_id(fund);
+    CHECK(wl_columnar_ops_lftj_attempt_abort(a, &done, fund,
+        id) == EBUSY && done);
+    CHECK(wl_columnar_ops_lftj_attempt_step(a, &done, fund,
+        id) == EBUSY && done);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record, fund,
+        id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_cleanup_lftj(&f->record, fund,
+        id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_consume_result(&f->record, 0,
+        fund, id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_abort_request(&f->record, fund,
+        id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f->record, fund,
+        id) == EBUSY);
+    ++scalar_lftj_reentry_count;
+}
+
+static void test_lftj_scalar_cleanup_grants(void)
+{
+    for (unsigned direct = 0; direct < 2; ++direct) {
+        fixture_t f; wl_plan_relation_t body; wl_plan_op_t op;
+        wl_plan_op_lftj_t metadata; char *names[] = {"a", "b", "c"};
+        uint32_t keys[] = {0, 0, 0}; col_rel_t *relations[3];
+        const double values[] = {1, 10, 2, 20};
+        for (unsigned n = 0; n < 3;
+            ++n) relations[n] = composed_source(names[n], 2, values, 2, false);
+        metadata = (wl_plan_op_lftj_t){.k = 3, .rel_names = names,
+                                       .key_cols = keys};
+        op = (wl_plan_op_t){.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata};
+        body = (wl_plan_relation_t){.ops = &op, .op_count = 1};
+        composed_fixture(&f, source_new(2, 0), 0);
+        wl_columnar_memory_governor_ref_t *g = composed_governor(&f);
+        uint64_t base_reserved =
+            wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g));
+        wl_mem_ledger_alloc(&f.session.mem_ledger, WL_MEM_SUBSYS_TEMPORARY, 37);
+        composed_begin(&f, &body, relations, 3, 0);
+        for (unsigned turn = 0; !f.record.lftj.output_owned; ++turn) {
+            CHECK(turn < 100000); composed_action(&f);
+        }
+        wl_columnar_lftj_attempt_t *a = &f.record.lftj;
+        CHECK(a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN && a->output
+            && !a->writer_active && !a->output->mem_ledger);
+        col_rel_t *target = a->output;
+        col_relation_snapshot_t source[3];
+        for (unsigned n = 0; n < 3;
+            ++n) source[n] = wl_columnar_relation_snapshot(relations[n]);
+        CHECK(!composed_abort_request(&f, 384));
+        uint64_t work = 0;
+        /* Direct request genuinely authenticates the terminal stop once. */
+        CHECK(!scalar_lftj_turn(&f, true, 384, &work) && work == 256
+            && a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE &&
+            f.record.lftj_cleanup_authorized);
+        CHECK(wl_evaluation_control_finish(f.operation, &f.operation_owner,
+            WL_EVALUATION_CONTROL_CANCELLED,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_evaluation_control_report_t before, after;
+        CHECK(!wl_evaluation_control_report(f.operation, &before));
+        memset(&a->retirement, 0xa5, sizeof(a->retirement)); /* Genuinely inert; no scalar claim. */
+        scalar_lftj_fixture = &f; scalar_lftj_reentry_count = 0;
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+            scalar_lftj_checkpoint;
+        CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 256
+            && a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO);
+        unsigned char historic[sizeof(a->retirement)];
+        memcpy(historic, &a->retirement, sizeof(historic));
+        CHECK(scalar_lftj_turn(&f, direct != 0, 383,
+            &work) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && work == 128 && !memcmp(historic, &a->retirement,
+            sizeof(historic))
+            && a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO);
+        /* General child stepping returns an exact pending receipt on refusal. */
+        if (!direct) {
+            CHECK(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING);
+            CHECK(!wl_columnar_eval_plan_numeric_composed_consume_result(
+                    &f.record,
+                    WL_EVALUATION_CONTROL_WORK_LIMIT, f.funding, f.funding_id));
+        }
+        CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 384
+            && a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_BIND);
+        CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 320
+            && a->retirement_started &&
+            a->retirement.storage.relation == target);
+        CHECK(scalar_lftj_turn(&f, direct != 0, 255,
+            &work) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && work == 128 && a->retirement_started &&
+            a->retirement_initializer.identity);
+        if (!direct) CHECK(
+                !wl_columnar_eval_plan_numeric_composed_consume_result(
+                    &f.record,
+                    WL_EVALUATION_CONTROL_WORK_LIMIT, f.funding, f.funding_id));
+        CHECK(!scalar_lftj_turn(&f, direct != 0, 384, &work) && work == 256
+            && !a->retirement_initializer.identity && a->retirement_started);
+        bool saw_commit = false, saw_drained = false;
+        for (unsigned turn = 0;
+            f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+            ++turn) {
+            CHECK(turn < 10000);
+            bool scalar = a->output_owned || a->retirement_started ||
+                a->retirement_drained;
+            CHECK(!scalar_lftj_turn(&f, direct != 0, scalar ? 384 : 386,
+                &work));
+            CHECK(work <= (scalar ? 384u : 386u));
+            if (a->retirement_committed) {
+                saw_commit = true; CHECK(!a->output && !a->output_owned);
+            }
+            if (a->retirement_drained) saw_drained = true;
+            CHECK(!wl_evaluation_control_report(f.operation, &after)
+                && before.consumed == after.consumed &&
+                before.attempt_id == after.attempt_id
+                && before.result == after.result);
+        }
+        CHECK(saw_commit && saw_drained && scalar_lftj_reentry_count >= 4
+            && !a->retirement_started && !a->output);
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
+        scalar_lftj_fixture = NULL;
+        CHECK(wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)) == base_reserved);
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&f.session.mem_ledger, &ledger);
+        CHECK(ledger.subsys_bytes[WL_MEM_SUBSYS_TEMPORARY] == 37);
+        for (unsigned n = 0; n < 3;
+            ++n) CHECK(wl_columnar_relation_snapshot_equal(source[n],
+                wl_columnar_relation_snapshot(relations[n])));
+        composed_close(&f);
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                g)));
+        wl_columnar_memory_governor_ref_release(g);
+        for (unsigned n = 0; n < 3; ++n) col_rel_destroy(relations[n]);
+    }
+}
+
+static void test_lftj_success_retains_funding_class(void)
+{
+    fixture_t f;
+    char *names[] = {"a", "b", "c"};
+    uint32_t keys[] = {0, 0, 0};
+    const double values[] = {1, 10, 2, 20};
+    col_rel_t *relations[3];
+    for (unsigned n = 0; n < 3; ++n)
+        relations[n] = composed_source(names[n], 2, values, 2, false);
+    wl_plan_op_lftj_t metadata = {.k = 3, .rel_names = names, .key_cols = keys};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata};
+    wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+    composed_fixture(&f, source_new(2, 0), 0);
+    composed_begin(&f, &body, relations, 3, 0);
+    for (unsigned turn = 0;
+        f.record.lftj.phase != WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        || f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD;
+        ++turn) {
+        CHECK(turn < 100000); composed_action(&f);
+    }
+    CHECK(f.record.lftj.output_owned && f.record.lftj.output
+        && !f.record.lftj.semantic_result && !f.record.semantic_result);
+    col_rel_t *output = f.record.lftj.output;
+    uint64_t work = 0;
+    CHECK(scalar_lftj_turn(&f, true, 383,
+        &work) == WL_EVALUATION_CONTROL_WORK_LIMIT && !work);
+    CHECK(scalar_lftj_turn(&f, true, 384, &work) == EBUSY && work == 384);
+    CHECK(!f.record.lftj_cleanup_authorized && !f.record.lftj.semantic_result
+        && !f.record.semantic_result && f.record.lftj.output == output
+        && f.record.lftj.output_owned &&
+        !f.record.lftj.retirement_initializer.identity);
+    composed_run(&f);
+    CHECK(!f.record.semantic_result && f.record.lftj.registered);
+    composed_close(&f);
+    for (unsigned n = 0; n < 3; ++n) col_rel_destroy(relations[n]);
+}
+
 int
 main(void)
 {
+    test_scalar_initialization_frame_stops();
+    test_lftj_scalar_cleanup_grants();
+    test_lftj_success_retains_funding_class();
     test_lftj_schema_continuations();
     test_lftj_source_order_stops(); test_lftj_source_order();
     test_anti_reentry();

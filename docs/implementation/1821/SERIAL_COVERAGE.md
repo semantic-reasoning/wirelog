@@ -912,3 +912,76 @@ this is physical-owner evidence and does not implement cache debt transfer.
 The later registered pin/exclusion/insertion owner and strict/cap/shared and
 general observed/configured-successor qualification are still required for
 the grouped PR's completion.
+
+### Selected JOIN/LFTJ scalar-retirement initialization
+
+Actual frame-owned unary retirement, JOIN shape/transformed/sink retirement,
+prepared batch abort and failed LFTJ output retirement use an additive
+parent-bound initializer. The old raw scalar/managed begin, prepare, cancel
+and step APIs keep their source and literal primitive tariffs. The previous
+host formula187 did not cover scalar984B plus nested managed928B clearing;
+these controlled callers no longer invoke that duplicate-clear sequence.
+
+The actual parent selects its exact relation, scalar address and ownership
+role before the first hook. BOOT128 records final-address/native identity;
+ZERO256 clears scalar storage once; BIND192 establishes managed identity,
+relation/address/phase and invokes all four genuine reservation initializers.
+BIND latches the parent's begun flag immediately. RESET128 acknowledges only
+the small initializer; its refusal retains the genuine begun receipt. No
+prepare, commit or physical retirement is appended to these four actions.
+The ZERO inventory includes123 eight-byte clear units and at most128 fixed
+caller/helper units. BIND includes four token clears/initializers60, loop10,
+managed fields10 and fixed caller/helper96. Compile-time layout guards keep
+both within their declared regions. These are source inventories, distinct
+from the runtime grants used to demonstrate composition.
+
+Cancellation of old input preserves its relation/debt. Before BIND no writer
+claim exists; after BIND a separately paid256 validates/releases the actual
+two-writer round, invalidates ready and latches cancel-clear before return.
+A later256 clears scalar storage. Private output remains with its parent
+until genuine scalar commit transfers disposal responsibility. Physical DONE
+latches a drained state and returns; another256 clears terminal storage
+without dereferencing the freed target or repeating physical retirement.
+Parent busy/selection flags prevent reentrant mutation, retarget or cleanup.
+
+Failed composed LFTJ output retirement has an authenticated narrow funding
+class: direct wrapper128 plus one actual initializer/retirement action.
+ZERO256 and terminal clear256 therefore progress with384. Entering RELEASE
+is a separate128 transition, and BOOT/BIND/RESET consume their own real fees.
+The class checks actual final-address/native frame/session/numeric owner,
+original control/ID, failed disposition and retained output/receipt state.
+Successful RELEASE and input-only cleanup retain their old384 wrapper and
+up to386 whole-child cleanup costs. A fresh explicit cleanup request still
+requires a genuine sticky original stop; a retained authorized failed
+continuation survives original finish without polling that ended attempt.
+The framed root keeps its separate384; root plus ZERO is768, never384.
+
+Tests compare genuine initialized fields/token identities with raw begin;
+exercise poisoned inert bytes and BOOT127/128, ZERO255/256, BIND191/192,
+RESET127/128, actual READY cancellation and physical-DONE-before-clear;
+reject copy/thread/target/reentry misuse; and preserve source snapshots,
+ledger canaries, governor balances and finished-original reports. Actual
+prepared batch abort retries every initialization phase with short grants.
+The real composed path proves383 consumes wrapper128 while refusing ZERO;
+the real framed path proves767 consumes512 while refusing ZERO and768
+executes it. Successful RELEASE remains outside the new cleanup class.
+
+This caller set does not complete containing session staging, recursive-round,
+original CLAIMS or transaction-disposal initialization. Those remaining
+session.c raw begin/cancel sites require the next separately reviewed unit.
+The existing raw LFTJ metadata preflight's bounded-count loop is also retained
+for the final source audit; this initializer change does not certify that
+loop's full caller envelope. Prepared unary publication, registered cache
+ownership/exclusion/insertion, strict/cap/shared policy and observed/configured
+successor qualification remain prerequisites for the completed grouped PR.
+
+The selector matrix retains all375 cases and two distinct stop routes. The
+AUTO full-right case witnesses actual prepare self/control/session/op and
+left-delta/full-right pointers, then checks payload/snapshot images only after
+both genuine combined readers and valid snapshots exist. Cancellation fires
+at actual host PREPARED. The forced-right-delta case keeps ordinary JOIN phase7
+and its actual used-delta progress1 work stop. The obsolete common phase7
+witness deterministically failed on the pre-initializer HEAD as well, because
+the full-right host never calls it. Corrected instrumentation retains exact
+stop codes, no publication/output before retry, source snapshot parity and
+exactly one later publication with unchanged literal/raw output comparisons.

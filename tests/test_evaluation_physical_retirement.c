@@ -1,6 +1,7 @@
 /* Timestamp retirement owns physical storage and charged ledger bytes
  * independently. Deferred ledger accounting must not fabricate a refund. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/thread.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -290,8 +291,227 @@ static void malformed(void)
         wl_columnar_memory_governor_ref_release(g);
     }
 }
+/* Actual caller owns each relation/receipt. This progress object confers no
+ * ownership/READY by itself; the parent freezes its target before BOOT. */
+typedef wl_columnar_relation_scalar_retirement_initializer_t initializer_t;
+typedef wl_columnar_relation_scalar_retirement_t scalar_t;
+static const void *init_parent;
+static scalar_t *init_scalar;
+static col_rel_t *init_relation;
+static unsigned init_hooks[5];
+
+static wl_evaluation_control_t *init_control(uint64_t limit)
+{
+    wl_evaluation_control_t *c = NULL;
+    CHECK(!wl_evaluation_control_create(limit, &c));
+    CHECK(!wl_evaluation_control_attach(c, &owner)); restart(c, limit);
+    return c;
+}
+static uint64_t init_control_close(wl_evaluation_control_t *c, int rc)
+{
+    CHECK(wl_evaluation_control_finish(c, &owner, rc > 0 ? rc : 0, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(c, &report));
+    CHECK(!wl_evaluation_control_detach(c, &owner));
+    wl_evaluation_control_release(c);
+    return report.consumed;
+}
+static int init_turn(initializer_t *i, const void *parent, scalar_t *s,
+    col_rel_t *r, unsigned api, uint64_t limit, uint64_t *consumed)
+{
+    wl_evaluation_control_t *c = init_control(limit);
+    uint64_t id = wl_evaluation_control_active_attempt_id(c); bool done = false;
+    int rc = api == 1 ? wl_columnar_relation_scalar_retirement_init_begin(i,
+            parent, s, r, c, id)
+        : api == 2 ? wl_columnar_relation_scalar_retirement_init_step(i, parent,
+            s, r, c, id, &done)
+        : api == 3 ? wl_columnar_relation_scalar_retirement_init_reset(i,
+            parent, c, id)
+        : wl_columnar_relation_scalar_retirement_release_claims_controlled(s, c,
+            id);
+    uint64_t work = init_control_close(c, rc);
+    if (consumed) *consumed = work;
+    return rc;
+}
+static void init_reentry(initializer_t *i, wl_evaluation_control_t *c,
+    unsigned api)
+{
+    CHECK(api >= 1 && api <= 4 && i->busy); ++init_hooks[api];
+    initializer_t before = *i; bool done = true;
+    uint64_t id = wl_evaluation_control_active_attempt_id(c);
+    CHECK(wl_columnar_relation_scalar_retirement_init_begin(i, init_parent,
+        init_scalar, init_relation, c, id) == EBUSY);
+    CHECK(wl_columnar_relation_scalar_retirement_init_step(i, init_parent,
+        init_scalar, init_relation, c, id, &done) == EBUSY && done);
+    CHECK(wl_columnar_relation_scalar_retirement_init_reset(i, init_parent, c,
+        id) == EBUSY);
+    CHECK(i->identity == before.identity && i->parent == before.parent
+        && i->retirement == before.retirement && i->relation == before.relation
+        && i->phase == before.phase && i->busy);
+}
+static void init_fields_equal(const scalar_t *a, const scalar_t *b)
+{
+    CHECK(a->storage.identity == (uintptr_t)&a->storage
+        && b->storage.identity == (uintptr_t)&b->storage);
+    CHECK(a->storage.relation == b->storage.relation
+        && a->storage.original_relation_address ==
+        b->storage.original_relation_address
+        && a->storage.phase == b->storage.phase &&
+        !a->storage.gate_round.identity
+        && !a->storage.governor_ref && !a->storage.governor);
+    CHECK(!a->ledger && !a->ledger_bytes && !a->ledger_timestamp_bytes &&
+        !a->timestamp_bytes
+        && !a->owned_columns && !a->column && !a->prior_column && !a->phase &&
+        !a->ready && !a->committed);
+    for (unsigned n = 0; n < 4; ++n) {
+        CHECK(a->storage.tokens[n].identity == &a->storage.tokens[n]
+            && b->storage.tokens[n].identity == &b->storage.tokens[n]);
+        CHECK(!a->storage.tokens[n].bytes && !a->storage.tokens[n].governor
+            && !a->storage.token_bytes[n] && !a->storage.token_owner_bits[n]
+            && !a->storage.receipt_started[n] && !a->storage.token_empty[n]);
+        CHECK(atomic_load_explicit(&a->storage.tokens[n].state,
+            memory_order_relaxed)
+            == atomic_load_explicit(&b->storage.tokens[n].state,
+            memory_order_relaxed));
+        CHECK(!atomic_load_explicit(&a->storage.tokens[n].owner_bits,
+            memory_order_relaxed));
+    }
+}
+
+typedef struct { initializer_t *i; scalar_t *s; col_rel_t *r;
+                 const void *parent; wl_evaluation_control_t *c;
+} init_foreign_t;
+static void *init_foreign(void *arg)
+{
+    init_foreign_t *f = arg; bool done = true;
+    uint64_t id = wl_evaluation_control_active_attempt_id(f->c);
+    CHECK(wl_columnar_relation_scalar_retirement_init_step(f->i, f->parent,
+        f->s, f->r, f->c, id, &done) == EINVAL && done);
+    CHECK(wl_columnar_relation_scalar_retirement_init_reset(f->i, f->parent,
+        f->c, id) == EINVAL);
+    return NULL;
+}
+
+static void bounded_initializer(void)
+{
+    for (unsigned governed = 0; governed < 2; ++governed) {
+        wl_columnar_memory_resolution_t resolution =
+        {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+         .usable_bytes =
+             WL_COLUMNAR_MEMORY_MIN_BUDGET,
+         .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+        wl_columnar_memory_governor_ref_t *g =
+            governed ? wl_columnar_memory_governor_ref_create(&resolution) :
+            NULL;
+        CHECK(!governed || g);
+        col_rel_t *r = NULL;
+        if (g) CHECK(!wl_columnar_relation_new_auto_governed("bounded init", 3,
+                4, false, g, &r));
+        else r = col_rel_new_auto("bounded init", 3);
+        CHECK(r); int64_t row[] = {7, 8, 9}; CHECK(!col_rel_append_row(r, row));
+        wl_mem_ledger_t ledger; wl_mem_ledger_init(&ledger, 0);
+        wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_TEMPORARY, 37);
+        r->mem_ledger = &ledger;
+        wl_mem_ledger_alloc(&ledger, WL_MEM_SUBSYS_RELATION,
+            col_rel_owned_ledger_bytes(r));
+        uint64_t baseline_reserved = reserved(g),
+            baseline_ledger = ledger_bytes(&ledger);
+        col_relation_snapshot_t snapshot = wl_columnar_relation_snapshot(r);
+        initializer_t i = {0}; scalar_t s, reference = {0}; int parent = 0;
+        memset(&s, 0xa5, sizeof(s)); /* Inert historic bytes; never inspected before ZERO. */
+        init_parent = &parent; init_scalar = &s; init_relation = r;
+        memset(init_hooks, 0, sizeof(init_hooks));
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+            init_reentry;
+        uint64_t consumed;
+        CHECK(init_turn(&i, &parent, &s, r, 1, 127,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && !i.identity);
+        CHECK(!init_turn(&i, &parent, &s, r, 1, 128,
+            &consumed) && consumed == 128
+            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO);
+        initializer_t copied = i;
+        CHECK(init_turn(&copied, &parent, &s, r, 2, 384,
+            &consumed) == EINVAL && !consumed);
+        wl_evaluation_control_t *foreign_fund = init_control(384);
+        init_foreign_t foreign = {&i, &s, r, &parent, foreign_fund};
+        wl_thread_t thread;
+        CHECK(!wl_thread_create(&thread, init_foreign,
+            &foreign) && !wl_thread_join(&thread));
+        CHECK(!init_control_close(foreign_fund, 0));
+        col_rel_t *other = col_rel_new_auto("wrong target", 1); CHECK(other);
+        CHECK(init_turn(&i, &parent, &s, other, 2, 384,
+            &consumed) == EINVAL && !consumed);
+        col_rel_destroy(other);
+        CHECK(init_turn(&i, &parent, &s, r, 2, 255,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO);
+        CHECK(!init_turn(&i, &parent, &s, r, 2, 256,
+            &consumed) && consumed == 256
+            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND &&
+            !s.storage.identity);
+        CHECK(init_turn(&i, &parent, &s, r, 2, 191,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && !s.storage.identity);
+        CHECK(!init_turn(&i, &parent, &s, r, 2, 192,
+            &consumed) && consumed == 192
+            && i.phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE);
+        bool parent_begun = true; /* Actual handoff survives reset refusal. */
+        CHECK(init_turn(&i, &parent, &s, r, 3, 127,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && parent_begun &&
+            s.storage.identity == (uintptr_t)&s.storage);
+        CHECK(!init_turn(&i, &parent, &s, r, 3, 128,
+            &consumed) && consumed == 128 && !i.identity);
+        CHECK(!wl_columnar_relation_scalar_retirement_begin(&reference, r));
+        init_fields_equal(&s, &reference);
+        CHECK(!wl_columnar_relation_scalar_retirement_cancel(&reference)); /* Raw comparison fixture only. */
+        CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+            wl_columnar_relation_snapshot(r))
+            && reserved(g) == baseline_reserved &&
+            ledger_bytes(&ledger) == baseline_ledger);
+        for (unsigned api = 1; api <= 4; ++api) CHECK(init_hooks[api]);
+        wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
+        wl_evaluation_control_t *c = init_control(0);
+        uint64_t id = wl_evaluation_control_active_attempt_id(c);
+        int rc; do {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&s, c, id);
+        } while (rc == EAGAIN);
+        CHECK(!rc && s.ready && !s.committed);
+        CHECK(init_turn(&i, &parent, &s, r, 4, 255,
+            &consumed) == WL_EVALUATION_CONTROL_WORK_LIMIT
+            && !consumed && s.ready && s.storage.gate_round.identity);
+        CHECK(!init_turn(&i, &parent, &s, r, 4, 256,
+            &consumed) && consumed == 256
+            && !s.ready && !s.storage.gate_round.identity);
+        CHECK(wl_columnar_relation_scalar_retirement_commit(&s) == EINVAL);
+        CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+            wl_columnar_relation_snapshot(r))
+            && reserved(g) == baseline_reserved &&
+            ledger_bytes(&ledger) == baseline_ledger);
+        CHECK(!wl_evaluation_control_charge_attempt(c, id, 256));
+        memset(&s, 0, sizeof(s));
+        /* A fresh actual initialization of the same exclusively owned target. */
+        CHECK(!init_turn(&i, &parent, &s, r, 1, 128, NULL));
+        CHECK(!init_turn(&i, &parent, &s, r, 2, 256, NULL));
+        CHECK(!init_turn(&i, &parent, &s, r, 2, 192, NULL));
+        CHECK(!init_turn(&i, &parent, &s, r, 3, 128, NULL));
+        do {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&s, c, id);
+        } while (rc == EAGAIN);
+        CHECK(!rc && !wl_columnar_relation_scalar_retirement_commit(&s));
+        do {
+            rc = wl_columnar_relation_scalar_retirement_step(&s, c, id);
+        } while (rc == EAGAIN);
+        CHECK(!rc && !s.storage.relation && reserved(g) == 0 &&
+            ledger_bytes(&ledger) == 37);
+        init_control_close(c, 0); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 int main(void)
 {
+    bounded_initializer();
     const uint32_t widths[] = {0, 1, 3, 257};
     for (unsigned w = 0; w < 4; ++w)for (unsigned governed = 0; governed < 2;
             ++governed)

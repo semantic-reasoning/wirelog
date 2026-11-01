@@ -4524,6 +4524,207 @@ wl_columnar_relation_scalar_retirement_begin(
     return wl_columnar_relation_managed_retirement_begin(&s->storage, relation);
 }
 
+/* Parent-bound additive initialization: fixed BOOT128, one whole-scalar
+ * ZERO256, then BIND192 with real four token initializers, and RESET128.
+ * BOOT's read-only address/inert protocol refusal is <=128, including three
+ * overflow-safe overlap checks. Paid meaningful binding/native/parent tail64
+ * fits128. ZERO: actual984B clear123 + helper/parent guard/phase/tail<=128
+ * =251. BIND: token4*(88B clear11+guard/identity/atomic/return4)=60,
+ * loop10+managed fields/return10+helper/parent caller96=176<=192. RESET's
+ * native/identity/funding/pointer-clear/parent tail<=112. All callbacks and
+ * control internals keep established boundaries; no optimizer-elided clear.
+ * Unlike raw scalar_begin, this sibling does not clear managed storage twice.
+ * Existing raw primitive APIs/fees and unit18 copy initialization stay exact. */
+typedef char wl_columnar_relation_scalar_init_layout_bound[
+        ((sizeof(wl_columnar_relation_scalar_retirement_t)+7u)/8u+128u <= 256u
+        && 4u*((sizeof(wl_columnar_memory_reservation_t)+7u)/8u+4u)+116u <=
+        192u)
+        ? 1 : -1];
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_scalar_retirement_init_test_checkpoint)(
+    wl_columnar_relation_scalar_retirement_initializer_t *,
+    wl_evaluation_control_t *, unsigned);
+#define WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, c, api) do { \
+            if (wl_columnar_relation_scalar_retirement_init_test_checkpoint) \
+            wl_columnar_relation_scalar_retirement_init_test_checkpoint(i, c, \
+                api); \
+} while (0)
+#else
+#define WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, c, api) ((void)0)
+#endif
+
+static bool
+wl_columnar_relation_scalar_init_overlap(const void *a, size_t an,
+    const void *b, size_t bn)
+{
+    if (!a || !b || !an || !bn) return false;
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    if (an-1 > UINTPTR_MAX-x || bn-1 > UINTPTR_MAX-y) return true;
+    return x <= y+bn-1 && y <= x+an-1;
+}
+
+static bool
+wl_columnar_relation_scalar_init_thread(
+    const wl_columnar_relation_scalar_retirement_initializer_t *i)
+{
+    if (!i->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(i->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return i->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(i->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_relation_scalar_init_enter(
+    wl_columnar_relation_scalar_retirement_initializer_t *i, const void *parent)
+{
+    if (!i) return EINVAL;
+    if (i->busy) return EBUSY;
+    if (i->identity != i || !parent || i->parent != parent
+        || !i->retirement || !i->relation
+        || !wl_columnar_relation_scalar_init_thread(i)) return EINVAL;
+    i->busy = true; return 0;
+}
+
+static int
+wl_columnar_relation_scalar_init_leave(
+    wl_columnar_relation_scalar_retirement_initializer_t *i, int rc)
+{
+    i->busy = false; return rc;
+}
+
+int
+wl_columnar_relation_scalar_retirement_init_begin(
+    wl_columnar_relation_scalar_retirement_initializer_t *i, const void *parent,
+    wl_columnar_relation_scalar_retirement_t *s, col_rel_t *relation,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!i) return EINVAL;
+    if (i->busy) return EBUSY;
+    if (i->identity && i->identity != i) return EINVAL;
+    if (i->identity || i->parent || i->retirement || i->relation ||
+        i->thread_valid
+        || i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_INERT) return EBUSY;
+    if (!parent || !s || !relation || !control || !id
+        || wl_columnar_relation_scalar_init_overlap(i, sizeof(*i), s,
+        sizeof(*s))
+        || wl_columnar_relation_scalar_init_overlap(i, sizeof(*i), relation,
+        sizeof(*relation))
+        || wl_columnar_relation_scalar_init_overlap(s, sizeof(*s), relation,
+        sizeof(*relation)))
+        return EINVAL;
+    i->busy = true;
+    WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, control, 1);
+    int rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return wl_columnar_relation_scalar_init_leave(i, rc);
+    i->identity = i; i->parent = parent; i->retirement = s;
+    i->relation = relation;
+#if defined(WL_HAVE_C11_THREADS)
+    i->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    i->owner_thread = GetCurrentThreadId();
+#else
+    i->owner_thread = pthread_self();
+#endif
+    i->thread_valid = true; i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO;
+    return wl_columnar_relation_scalar_init_leave(i, 0);
+}
+
+int
+wl_columnar_relation_scalar_retirement_init_step(
+    wl_columnar_relation_scalar_retirement_initializer_t *i, const void *parent,
+    wl_columnar_relation_scalar_retirement_t *s, col_rel_t *relation,
+    wl_evaluation_control_t *control, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_relation_scalar_init_enter(i, parent);
+    if (rc) return rc;
+    if (!done || !control || !id || i->retirement != s ||
+        i->relation != relation
+        || wl_columnar_relation_scalar_init_overlap(i, sizeof(*i), done,
+        sizeof(*done))
+        || wl_columnar_relation_scalar_init_overlap(s, sizeof(*s), done,
+        sizeof(*done)))
+        return wl_columnar_relation_scalar_init_leave(i, EINVAL);
+    if (i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        && i->phase != WL_COLUMNAR_RELATION_SCALAR_INIT_BIND)
+        return wl_columnar_relation_scalar_init_leave(i, EBUSY);
+    *done = false;
+    bool zero = i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO;
+    WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, control, zero ? 2 : 3);
+    rc = wl_evaluation_control_charge_attempt(control, id, zero ? 256 : 192);
+    if (rc) return wl_columnar_relation_scalar_init_leave(i, rc);
+    if (zero) {
+        /* Parent's authentic no-live-receipt state authorizes historic bytes;
+         * no indeterminate scalar identity is examined before this real clear. */
+        memset(s, 0, sizeof(*s));
+        i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_BIND;
+    } else {
+        s->storage.identity = (uintptr_t)&s->storage;
+        s->storage.relation = relation;
+        s->storage.original_relation_address = (uintptr_t)relation;
+        s->storage.phase =
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_ACQUIRE_WRITERS;
+        for (unsigned token = 0; token < 4; ++token)
+            wl_columnar_memory_reservation_init(&s->storage.tokens[token]);
+        i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_DONE; *done = true;
+    }
+    return wl_columnar_relation_scalar_init_leave(i, 0);
+}
+
+int
+wl_columnar_relation_scalar_retirement_init_reset(
+    wl_columnar_relation_scalar_retirement_initializer_t *i, const void *parent,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_relation_scalar_init_enter(i, parent);
+    if (rc) return rc;
+    if (!control || !id || i->phase < WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        || i->phase > WL_COLUMNAR_RELATION_SCALAR_INIT_DONE)
+        return wl_columnar_relation_scalar_init_leave(i, EINVAL);
+    WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK(i, control, 4);
+    rc = wl_evaluation_control_charge_attempt(control, id, 128);
+    if (rc) return wl_columnar_relation_scalar_init_leave(i, rc);
+    /* Parent already acknowledges DONE, or abandons a pre-BIND state with no
+     * claims. No target relation or scalar storage is dereferenced here. */
+    i->identity = NULL; i->parent = NULL; i->retirement = NULL;
+    i->relation = NULL;
+    i->thread_valid = false; i->phase = WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
+    return wl_columnar_relation_scalar_init_leave(i, 0);
+}
+
+/* Exact two-writer scalar round proof + release (including its fixedMAX4
+ * clear) + parent/native/funding caller <240 logical units, paid256. Whole
+ * scalar clear123 is a different later action. Failed proof releases nothing. */
+int
+wl_columnar_relation_scalar_retirement_release_claims_controlled(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || s->committed)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 256);
+    if (rc) return rc;
+    if (s->storage.gate_round.identity) {
+        rc =
+            wl_columnar_relation_managed_gate_round_validate(
+            &s->storage.gate_round,
+            s->storage.relation);
+        if (rc) return rc;
+        rc =
+            wl_columnar_source_access_gate_round_release(
+            &s->storage.gate_round);
+        if (rc) return rc;
+    }
+    /* Caller latches CANCEL_CLEAR without any intervening callback. No stale
+     * READY bit can authorize scalar_commit while the later clear is pending. */
+    s->ready = false;
+    return 0;
+}
+#undef WL_COLUMNAR_RELATION_SCALAR_INIT_HOOK
+
 int
 wl_columnar_relation_scalar_retirement_prepare(
     wl_columnar_relation_scalar_retirement_t *s,

@@ -2071,6 +2071,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->protocol_result = 0;
     record->source_mode = true; record->source_installed = false;
     record->abort_supported = true; record->abort_requested = false;
+    record->composed_busy = record->lftj_cleanup_authorized = false;
     record->source_empty = false; record->source_is_delta = false;
     record->source_initialized = false; record->source_slot_borrowed = false;
     record->source_bare = false;
@@ -2404,8 +2405,60 @@ wl_columnar_eval_plan_composed_source_consume(
     }
 }
 
-int
-wl_columnar_eval_plan_numeric_composed_attempt_step(
+/* Authentic failed-output continuation only. Success RELEASE and ordinary
+ * input/scratch cleanup retain their old384 wrapper. The128 wrapper includes
+ * native/context/classifier<=64, stop/funding/dispatch<=40 and caller20; leaf
+ * ZERO/clear256 then fits actual384. No heap relation is dereferenced here. */
+static int
+wl_columnar_eval_plan_lftj_retirement_fund(wl_evaluation_control_t *funding,
+    uint64_t id, const wl_evaluation_control_t *control)
+{
+    if (!funding || !id || wl_evaluation_control_identity(funding) ==
+        wl_evaluation_control_identity(control)
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        id) return EINVAL;
+    return wl_evaluation_control_charge_attempt(funding, id, 128);
+}
+
+static int
+wl_columnar_eval_plan_lftj_retirement_class(
+    const wl_columnar_eval_plan_numeric_attempt_t *r, bool *retiring)
+{
+    *retiring = false;
+    if ((r->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD
+        && r->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
+        || !r->lftj.identity) return 0;
+    const wl_columnar_lftj_attempt_t *a = &r->lftj;
+    if (a->identity != a || a->numeric_owner != r || a->frame != r->frame
+        || a->session != r->session || a->control != r->control
+        || a->attempt_id != r->attempt_id || !a->thread_valid) return EINVAL;
+    if (a->busy) return EBUSY;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(a->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (a->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(a->owner_thread, pthread_self())) return EINVAL;
+#endif
+    const wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &a->retirement_initializer;
+    if (i->identity && (i->identity != i || i->parent != a
+        || i->retirement != &a->retirement ||
+        i->relation != a->output)) return EINVAL;
+    if (a->retirement_started &&
+        (a->retirement.storage.identity != (uintptr_t)&a->retirement.storage
+        || a->retirement.committed != a->retirement_committed)) return EINVAL;
+    if (a->retirement_drained && !a->retirement_started) return EINVAL;
+    if (a->output_owned && !a->output) return EINVAL;
+    bool failed = a->semantic_result || r->semantic_result ||
+        r->abort_requested;
+    *retiring = failed && (a->output_owned || a->retirement_started
+        || a->retirement_drained || i->identity);
+    return 0;
+}
+
+static int
+wl_columnar_eval_plan_numeric_composed_attempt_step_body(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
@@ -2460,10 +2513,19 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         return wl_columnar_eval_plan_composed_source_step(record, funding,
                    funding_id);
     }
-    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+    bool scalar_cleanup = false;
+    rc = wl_columnar_eval_plan_lftj_retirement_class(record, &scalar_cleanup);
+    if (rc) return rc;
+    rc = scalar_cleanup ? wl_columnar_eval_plan_lftj_retirement_fund(funding,
+            funding_id, record->control)
+        : wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
-    if (record->abort_requested) {
+    bool retained_lftj = record->lftj.identity == &record->lftj
+        && (record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        || record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE)
+        && record->lftj.semantic_result;
+    if (record->abort_requested && !retained_lftj) {
         if (wl_evaluation_control_active_attempt_id(record->control)
             != record->attempt_id) return EINVAL;
         wl_evaluation_control_request_cancel(record->control);
@@ -2764,8 +2826,8 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     }
 }
 
-int
-wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+static int
+wl_columnar_eval_plan_numeric_composed_cleanup_lftj_body(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
@@ -2775,20 +2837,32 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
         && record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE)
         || !record->lftj.identity || record->lftj.identity != &record->lftj)
         return EBUSY;
-    rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
+    bool scalar_cleanup = false;
+    rc = wl_columnar_eval_plan_lftj_retirement_class(record, &scalar_cleanup);
+    if (rc) return rc;
+    rc = scalar_cleanup ? wl_columnar_eval_plan_lftj_retirement_fund(funding,
+            funding_id, record->control)
+        : wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
 
     /* Cleanup is authorized only by a terminal stop on the original
      * operation. A zero-work probe observes that sticky disposition without
      * spending or resetting its exhausted allowance. */
-    rc = wl_evaluation_control_charge_attempt(record->control,
-            record->attempt_id, 0);
-    if (rc != WL_EVALUATION_CONTROL_CANCELLED
-        && rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
-        return rc ? rc : EBUSY;
-    if (!record->semantic_result) record->semantic_result = rc;
-    if (!record->lftj.semantic_result) record->lftj.semantic_result = rc;
+    bool authorized = record->lftj_cleanup_authorized
+        && (record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        || record->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE)
+        && record->lftj.semantic_result;
+    if (!authorized) {
+        rc = wl_evaluation_control_charge_attempt(record->control,
+                record->attempt_id, 0);
+        if (rc != WL_EVALUATION_CONTROL_CANCELLED &&
+            rc != WL_EVALUATION_CONTROL_WORK_LIMIT)
+            return rc ? rc : EBUSY;
+        record->lftj_cleanup_authorized = true;
+        if (!record->semantic_result) record->semantic_result = rc;
+        if (!record->lftj.semantic_result) record->lftj.semantic_result = rc;
+    }
 
     bool done = false;
     rc = wl_columnar_ops_lftj_attempt_abort(&record->lftj, &done,
@@ -2915,6 +2989,7 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
+    if (record && record->composed_busy) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
@@ -3010,6 +3085,7 @@ wl_columnar_eval_plan_numeric_composed_abort_request(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
+    if (record && record->composed_busy) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     /* Closure is finalized by the bounded preflight before any child owner
@@ -3038,6 +3114,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
+    if (record && record->composed_busy) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
@@ -3062,8 +3139,37 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->join_host_terminal = record->join_host_declined = false;
     record->private_bindings = NULL;
     record->abort_supported = false; record->abort_requested = false;
+    record->composed_busy = record->lftj_cleanup_authorized = false;
     memset(&record->lftj, 0, sizeof(record->lftj));
     record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
     wl_evaluation_control_release(control);
     return 0;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_attempt_step(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if (record->composed_busy) return EBUSY;
+    record->composed_busy = true;
+    rc = wl_columnar_eval_plan_numeric_composed_attempt_step_body(record,
+            funding, funding_id);
+    record->composed_busy = false; return rc;
+}
+
+int
+wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_columnar_eval_plan_composed_validate(record);
+    if (rc) return rc;
+    if (record->composed_busy) return EBUSY;
+    record->composed_busy = true;
+    rc = wl_columnar_eval_plan_numeric_composed_cleanup_lftj_body(record,
+            funding, funding_id);
+    record->composed_busy = false; return rc;
 }
