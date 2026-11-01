@@ -5414,8 +5414,11 @@ whole compound reconstruction, SIDE or nested-handle ownership is introduced.
 
 `wirelog_session_begin_cold_input`, `wirelog_session_append_cold_input` and
 `wirelog_session_finish_cold_input` load an initially empty declared numeric EDB
-without first retaining its complete rows. This route currently supports ordinary
-MAP/FILTER scans. Populate other resident inputs before beginning: successful
+without first retaining its complete rows. This route supports ordinary MAP/FILTER scans and audited single-key equality
+JOINs, including scan prefixes, left/right/both/self and chained consumers.
+Finished traces, existing sealed payloads and resident opposite inputs share the
+bounded JOIN engine; trace inputs are never materialized as a full resident
+relation. Each side independently pins its reader, including self JOINs. Populate other resident inputs before beginning: successful
 begin freezes ordinary mutation, while additional empty loaders and preloaded
 payload sealing remain available. Evaluation refuses pending loaders without
 closing their finish/retry window. Session destruction releases incomplete loads.

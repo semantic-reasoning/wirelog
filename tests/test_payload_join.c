@@ -1642,6 +1642,60 @@ static void trace_combinations(void)
                 wl_columnar_memory_governor_ref_release(g);
             }
 }
+static void heterogeneous_sources(void)
+{
+    for (unsigned direction = 0; direction < 4; direction++) {
+        wl_columnar_memory_governor_ref_t *g = governor(1 << 22);
+        wl_columnar_spill_store_t *store;
+        CHECK(wl_columnar_spill_store_open(test_tmpdir(), g, 1 << 22, 1024,
+            &store) == OK);
+        col_rel_t *l = source(17, 3), *r = source(23, 3);
+        wl_columnar_trace_store_t *lt = segmented(g, store, l, 5, 2),
+            *rt = segmented(g, store, r, 7, 2);
+        wl_columnar_trace_store_snapshot_t *ls = snapshot(lt),
+            *rs = snapshot(rt);
+        wl_columnar_batch_payload_t *lp = capture(g, store, l, 1),
+            *rp = capture(g, store, r, 1);
+        wl_columnar_payload_join_source_t left = direction & 1 ?
+            (wl_columnar_payload_join_source_t){.snapshot = ls} :
+        (wl_columnar_payload_join_source_t){.payload = lp};
+        wl_columnar_payload_join_source_t right = direction & 2 ?
+            (wl_columnar_payload_join_source_t){.snapshot = rs} :
+        (wl_columnar_payload_join_source_t){.payload = rp};
+        uint64_t baseline = reserved(g);
+        wl_columnar_continuation_t *join = NULL;
+        wl_columnar_payload_join_source_t bad[] = {{0},
+                                                   {.payload = lp,
+                                                    .snapshot = ls}};
+        for (unsigned i = 0; i < 2; i++) {
+            CHECK(wl_columnar_payload_join_create_sources_projected_bounded(g,
+                bad[i], right, 0, 0, NULL, 0, 96, index_cap(3), NULL, NULL,
+                NULL, &join) == WL_COLUMNAR_SPILL_INVALID && !join);
+            CHECK(wl_columnar_payload_join_create_sources_projected_bounded(g,
+                left, bad[i], 0, 0, NULL, 0, 96, index_cap(3), NULL, NULL, NULL,
+                &join) == WL_COLUMNAR_SPILL_INVALID && !join);
+            CHECK(reserved(g) == baseline);
+        }
+        CHECK(wl_columnar_payload_join_create_sources_projected_bounded(g,
+            left, right, 0, 0, NULL, 0, 96, index_cap(3), NULL, NULL, NULL,
+            &join) == OK);
+        sink_t state; wl_columnar_continuation_sink_t sink;
+        sink_init(&state, &sink, g);
+        bool seen[17*23] = {false};
+        drain(join, &state, &sink, 17, 23, 3, 3, seen);
+        wl_columnar_continuation_destroy(join);
+        CHECK(reserved(g) == baseline);
+        CHECK(wl_columnar_batch_payload_release(lp) == OK &&
+            wl_columnar_batch_payload_release(rp) == OK);
+        wl_columnar_trace_store_snapshot_release(ls);
+        wl_columnar_trace_store_snapshot_release(rs);
+        wl_columnar_trace_store_retire(lt); wl_columnar_trace_store_retire(rt);
+        col_rel_destroy(l); col_rel_destroy(r);
+        wl_columnar_spill_store_retire(store);
+        CHECK(!reserved(g)); wl_columnar_memory_governor_ref_release(g);
+    }
+}
+
 static void trace_failures(void)
 {
     wl_columnar_memory_governor_ref_t *g = governor(1 << 22);
@@ -3139,7 +3193,8 @@ int main(void)
     trace_generations(); trace_signed_errors();
     CHECK(trace_causal_budget(128, false) == trace_causal_budget(512, false));
     trace_causal_budget(512, true);
-    trace_combinations(); trace_failures(); trace_limits();
+    trace_combinations(); heterogeneous_sources(); trace_failures();
+    trace_limits();
     reference_joins(false); reference_joins(true);
     projected();
     combinations(); failures(); budget(false); budget(true); misses();

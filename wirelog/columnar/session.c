@@ -1106,31 +1106,6 @@ wl_columnar_session_seal_input(wl_session_t *session, const char *name,
     return wl_columnar_session_seal_join_input(session, name, cancel, context);
 }
 
-/* The initial loader supports standalone scalar projections. Existing payload
- * JOIN consumers elsewhere in the plan retain their established behavior. */
-static bool
-wl_columnar_session_cold_loading_plan(const wl_col_session_t *s,
-    const char *name, uint32_t width, const char *const *names,
-    const wirelog_column_type_t *types)
-{
-    if (!wl_columnar_session_cold_plan(s, name, width, names,
-        types)) return false;
-    for (uint32_t si = 0; si < s->plan->stratum_count; si++) {
-        const wl_plan_stratum_t *sp = &s->plan->strata[si];
-        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
-            const wl_plan_relation_t *rp = &sp->relations[ri];
-            for (uint32_t oi = 0; oi < rp->op_count; oi++) {
-                const wl_plan_op_t *op = &rp->ops[oi];
-                if ((op->right_relation && !strcmp(op->right_relation, name)) ||
-                    (op->relation_name && !strcmp(op->relation_name, name) &&
-                    !wl_columnar_eval_plan_cold_projection(rp, name, width,
-                    types))) return false;
-            }
-        }
-    }
-    return true;
-}
-
 wl_columnar_spill_status_t
 wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
 {
@@ -1155,7 +1130,7 @@ wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
         r->memory_governor != s->memory_governor ||
         !wl_columnar_batch_payload_can_take(r) ||
         !wl_columnar_session_cold_source_schema(s, name, r, NULL, &schema) ||
-        schema || !wl_columnar_session_cold_loading_plan(s, name, width,
+        schema || !wl_columnar_session_cold_plan(s, name, width,
         (const char *const *)r->col_names, types))
         return WL_COLUMNAR_SPILL_UNSUPPORTED;
     for (uint32_t i = 0; i < width; i++)
@@ -1242,7 +1217,7 @@ wl_columnar_session_cold_loader(wl_session_t *session, const char *name)
         s->has_evaluated || s->base.input_load_failed ||
         !wl_columnar_session_cold_mode(s) ||
         wl_columnar_session_cold_execution_check(s) ||
-        !wl_columnar_session_cold_loading_plan(s, name, c->ncols,
+        !wl_columnar_session_cold_plan(s, name, c->ncols,
         (const char *const *)c->col_names, c->trace_types)) return NULL;
     return c;
 }

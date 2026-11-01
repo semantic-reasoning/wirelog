@@ -8,12 +8,6 @@
 #define WL_COLUMNAR_PAYLOAD_JOIN_END UINT32_MAX
 #define WL_COLUMNAR_PAYLOAD_JOIN_QUANTUM 256u
 
-/* A single payload keeps its eager reader/capability for the producer lifetime.
- * A trace cursor independently pins its snapshot and opens one segment lazily. */
-typedef struct {
-    wl_columnar_batch_payload_t *payload;
-    wl_columnar_trace_store_snapshot_t *snapshot;
-} wl_columnar_payload_join_source_t;
 typedef struct {
     wl_columnar_batch_payload_reader_t *payload;
     wl_columnar_trace_store_cursor_t *trace;
@@ -388,7 +382,9 @@ wl_columnar_payload_join_create_impl(wl_columnar_memory_governor_ref_t *g,
 {
     if (!out) return WL_COLUMNAR_SPILL_INVALID;
     *out = NULL;
-    if (!g || !wl_columnar_payload_join_source_governor(left, g)
+    if (!g || (left.payload != NULL) == (left.snapshot != NULL) ||
+        (right.payload != NULL) == (right.snapshot != NULL) ||
+        !wl_columnar_payload_join_source_governor(left, g)
         || !wl_columnar_payload_join_source_governor(right,
         g)) return WL_COLUMNAR_SPILL_INVALID;
     uint32_t lc, lr, rc, rr;
@@ -608,6 +604,22 @@ wl_columnar_payload_join_create_projected_bounded(
                (wl_columnar_payload_join_source_t){.payload = right}, left_key,
                right_key, batch_bytes, cancel, cancel_context, out, false,
                true, index_bytes, projection, project_count, NULL);
+}
+
+wl_columnar_spill_status_t
+wl_columnar_payload_join_create_sources_projected_bounded(
+    wl_columnar_memory_governor_ref_t *g,
+    wl_columnar_payload_join_source_t left,
+    wl_columnar_payload_join_source_t right,
+    uint32_t left_key, uint32_t right_key, const uint32_t *projection,
+    uint32_t project_count, uint64_t batch_bytes, uint64_t index_bytes,
+    const wl_intern_t *intern, wl_columnar_spill_cancel_fn cancel,
+    void *context, wl_columnar_continuation_t **out)
+{
+    return wl_columnar_payload_join_create_impl(g, left, right, left_key,
+               right_key, batch_bytes, cancel, context, out, false, true,
+               index_bytes,
+               projection, project_count, intern);
 }
 
 wl_columnar_spill_status_t

@@ -1526,6 +1526,9 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
             src.width = resident->ncols;
             src.names = (const char *const *)resident->col_names;
             src.types = resident->column_types;
+            if (!src.width && !resident->nrows)
+                src.types = wl_columnar_session_cold_declared_types(s,
+                        name ? name : resident->name, &src.width);
         }
     }
     src.schema_valid = wl_columnar_session_cold_source_schema(s,
@@ -1872,6 +1875,7 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     wirelog_column_type_t *types = malloc((size_t)type_bytes);
     col_rel_t *out = NULL;
     wl_columnar_batch_payload_t *inputs[2] = {NULL, NULL};
+    wl_columnar_payload_join_source_t descriptors[2] = {{0}, {0}};
     bool owned[2] = {false, false};
     wl_columnar_continuation_t *cont = NULL;
     if (!types) rc = ENOMEM;
@@ -1891,10 +1895,32 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     sess->spill_join_selected_count++;
     for (unsigned i = 0; i < 2; i++) {
         if (sources[i].cold) {
-            inputs[i] = sources[i].cold->payload;
+            descriptors[i].payload = sources[i].cold->payload;
+            descriptors[i].snapshot = sources[i].cold->trace_snapshot;
             continue;
         }
         wl_columnar_spill_status_t status;
+        if (!sources[i].resident->ncols && !sources[i].resident->nrows) {
+            /* A fresh empty numeric EDB carries only its declaration. Give
+             * capture an actual governed empty source, never a fake relation. */
+            col_rel_t *empty = NULL;
+            rc = wl_columnar_relation_new_named_governed("$empty",
+                    sources[i].width,
+                    NULL, 0, false, sess->memory_governor, &empty);
+            if (!rc) rc = col_rel_set_column_types(empty, sources[i].types,
+                        sources[i].width);
+            status = rc == ENOSPC ? WL_COLUMNAR_SPILL_MEMORY :
+                rc == ENOMEM ? WL_COLUMNAR_SPILL_ALLOCATION : rc ?
+                WL_COLUMNAR_SPILL_INVALID : wl_columnar_batch_payload_take(
+                sess->memory_governor, sess->spill_store, &empty, NULL, NULL,
+                &inputs[i]);
+            if (empty && col_rel_destroy_checked(empty)) abort();
+            owned[i] = inputs[i] != NULL;
+            descriptors[i].payload = inputs[i];
+            rc = wl_columnar_join_spill_error(sess, status);
+            if (rc) goto done;
+            continue;
+        }
         bool transfer = i == 0 && left->owned &&
             wl_columnar_batch_payload_can_take(left->rel);
         if (transfer && !wl_columnar_join_source_references(&sources[i]))
@@ -1925,12 +1951,13 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
             }
         }
         owned[i] = inputs[i] != NULL;
+        descriptors[i].payload = inputs[i];
         rc = wl_columnar_join_spill_error(sess, status);
         if (rc) goto done;
     }
     wl_columnar_spill_status_t status =
-        wl_columnar_payload_join_create_reference_projected_bounded(
-        sess->memory_governor, inputs[0], inputs[1], lk, rk,
+        wl_columnar_payload_join_create_sources_projected_bounded(
+        sess->memory_governor, descriptors[0], descriptors[1], lk, rk,
         op->project_indices, op->project_count,
         sess->spill_join_batch_bytes, sess->spill_join_index_bytes,
         sess->intern, NULL, NULL, &cont);
