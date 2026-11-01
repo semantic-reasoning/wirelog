@@ -671,12 +671,15 @@ jobs:
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with sanitizers
         run: >
           meson setup builddir-san
           -Db_sanitize=address,undefined
           -Db_lundef=false
           -Dtests=true
+          -Dexamples=false
           --buildtype=debugoptimized
         env:
           CC: sccache ${{ matrix.cc }}
@@ -745,6 +748,8 @@ jobs:
             sudo apt-get install -y clang
           fi
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with TSan
         run: |
           meson setup builddir-tsan \
@@ -752,6 +757,7 @@ jobs:
             -Db_lundef=false \
             -Dthreads=posix \
             -Dtests=true \
+            -Dexamples=false \
             --buildtype=debug
         env:
           CC: sccache ${{ matrix.cc }}
@@ -810,6 +816,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y meson ninja-build libmbedtls-dev
 
+      # -Dexamples=false: skip the examples/ demos under sanitizers (each re-compiles the
+      # full wirelog_sources instrumented); they are already covered by the non-sanitized legs.
       - name: Configure with TSan (native threads)
         run: |
           meson setup builddir-tsan-native \
@@ -817,6 +825,7 @@ jobs:
             -Db_lundef=false \
             -Dthreads=native \
             -Dtests=true \
+            -Dexamples=false \
             --buildtype=debug
         env:
           CC: sccache gcc

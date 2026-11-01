@@ -1089,6 +1089,17 @@ test('ci_pr_sccache_stats_daemon', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sccache-stats-daemon.py'],
      suite: 'abi')
 
+# Sanitizer legs must not build the examples/ demos: each one re-compiles the
+# full wirelog_sources under instrumentation, and the example suites (golden
+# diff + demo smoke) are already covered by the non-sanitized build legs.  The
+# sanitizer `meson setup` blocks therefore pass -Dexamples=false (the
+# `examples` meson option, default true); plain legs must keep examples on.
+# Bidirectional structural guard, same convention as
+# test-ci-pr-sccache-stats-daemon.py.
+test('ci_pr_sanitizer_examples_disabled', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sanitizer-examples.py'],
+     suite: 'abi')
+
 # Issue #1728: every runtime POSIX TSan leg runs `meson test -t 3`, and the
 # tsan-native compile smoke deliberately does not.  The multiplier only helps
 # if no workflow drifts, so pin the literal command text and keep the number
