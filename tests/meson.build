@@ -1077,6 +1077,18 @@ test('ci_pr_build_timeout_contract', py3,
      args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-build-timeouts.py'],
      suite: 'abi')
 
+# sccache v0.19.0 keeps ALL cache statistics in an auto-spawned in-memory
+# daemon that exits after a 600s idle timeout; the sanitizer legs run a
+# ~20-minute test phase after their last compile, so the daemon is dead when
+# the sccache-action post step runs `--show-stats` and it reports the
+# all-zero summary `0% - 0 hits, 0 misses, 0 errors` instead of the real hit
+# rate.  SCCACHE_IDLE_TIMEOUT=0 disables idle shutdown, so the sanitizer
+# legs' real hit rate is reported (inert in the plain build legs, which do
+# not invoke sccache).
+test('ci_pr_sccache_stats_daemon', py3,
+     args: [meson.project_source_root() / 'scripts/ci/test-ci-pr-sccache-stats-daemon.py'],
+     suite: 'abi')
+
 # Issue #1728: every runtime POSIX TSan leg runs `meson test -t 3`, and the
 # tsan-native compile smoke deliberately does not.  The multiplier only helps
 # if no workflow drifts, so pin the literal command text and keep the number

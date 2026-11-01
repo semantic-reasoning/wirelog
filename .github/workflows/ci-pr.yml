@@ -33,8 +33,19 @@ permissions:
 #     vs a 0.507s cache hit).  See issue #1571 for the full evidence.
 # SCCACHE_GHA_ENABLED only takes effect where sccache is actually invoked,
 # i.e. the sanitizer legs; it is inert in the plain build legs.
+# SCCACHE_IDLE_TIMEOUT=0 keeps the sccache daemon alive for the whole job.
+#   sccache v0.19.0 auto-spawns an in-memory daemon (127.0.0.1:4226) that
+#   holds ALL cache statistics; the daemon exits after its 600s idle
+#   timeout (DEFAULT_IDLE_TIMEOUT in server.rs).  The sanitizer legs run a
+#   ~20-minute test phase after their last compile, so by the time the
+#   sccache-action post step runs `sccache --show-stats` the daemon is
+#   gone and `--show-stats` (which connects to the daemon) reports the
+#   all-zero summary: `0% - 0 hits, 0 misses, 0 errors`.  Setting the
+#   timeout to 0 disables idle shutdown entirely, so the sanitizer legs'
+#   REAL hit rate is reported.  Inert in the plain build legs (no sccache).
 env:
   SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_IDLE_TIMEOUT: "0"
 
 jobs:
   # ==========================================================================
