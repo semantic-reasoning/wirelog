@@ -16137,6 +16137,87 @@ wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
     return rc;
 }
 
+/* Typed stamped private scratch for controlled JOIN preparation. Keep the
+ * established noTS entry above unchanged: its nested refusal intervals and
+ * literal tariffs are independently qualified. */
+int
+wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled(
+    const char *name, uint32_t ncols, uint32_t initial_capacity,
+    const int64_t *type_codes, bool timestamps,
+    wl_columnar_memory_governor_ref_t *governor,
+    col_rel_t **out, wl_evaluation_control_t *control, uint64_t attempt_id)
+{
+    /* Only this fixed output normalization is a bootstrap exception.
+     * The exclusive writable slot must contain no live owned result. */
+    if (out)
+        *out = NULL;
+    int rc = wl_columnar_relation_constructor_attempt_charge(control,
+            attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc)
+        return rc;
+    bool valid = out && name && (!ncols || type_codes);
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_ENTRY_WORK);
+    if (rc > 0 || valid) {
+        if (rc)
+            return rc;
+    } else
+        return EINVAL;
+    for (uint32_t c = 0; c < ncols; ++c) {
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id,
+                WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (rc) return rc;
+        bool scalar = type_codes[c] >= WIRELOG_TYPE_INT32 &&
+            type_codes[c] <= WIRELOG_TYPE_BOOL;
+        int tail = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+        if (tail > 0 || scalar) {
+            if (tail) return tail;
+        } else return EINVAL;
+    }
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    wl_columnar_relation_constructor_recipe_t recipe;
+    recipe.names = NULL;
+    recipe.types = NULL;
+    recipe.type_codes = type_codes;
+    recipe.has_graph_column = false;
+    recipe.graph_col_idx = 0;
+    recipe.declared_ncols = 0;
+    recipe.view_generation = 2u + (type_codes != NULL);
+    recipe.storage_generation = 1;
+    col_rel_t *local = NULL;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_PREPARE_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, attempt_id,
+            WL_COLUMNAR_RELATION_AUTO_ATTEMPT_BUILD_CALL_WORK);
+    if (rc)
+        return rc;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name, ncols,
+            initial_capacity, timestamps, governor, &recipe, &local,
+            control, attempt_id);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_charge(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        rc = wl_columnar_relation_constructor_attempt_tail(control,
+                attempt_id, WL_COLUMNAR_RELATION_AUTO_ATTEMPT_EXTERNAL_WORK);
+    if (!rc)
+        *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0)
+        abort();
+    return rc;
+}
+
 int
 wl_columnar_relation_new_auto_governed_attempt_controlled(
     const char *name, uint32_t ncols, uint32_t initial_capacity,

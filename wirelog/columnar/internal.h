@@ -4404,6 +4404,15 @@ int wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
     const char *, uint32_t, uint32_t, const int64_t *,
     wl_columnar_memory_governor_ref_t *, col_rel_t **,
     wl_evaluation_control_t *, uint64_t);
+/* Same private original-attempt contract with explicit timestamp storage.
+ * Stamps start zero, including spare rows. Synchronous construction polls
+ * and charges the original target throughout; this is not a per-call work
+ * quantum. A host imposing a hard turn allowance must use a resumable owner
+ * rather than count this nested constructor as one unit of that allowance. */
+int wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled(
+    const char *, uint32_t, uint32_t, const int64_t *, bool,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
 int wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     wl_columnar_relation_append_batch_t *, const int64_t *,
     wl_evaluation_control_t *, uint64_t);
