@@ -273,6 +273,43 @@ WIRELOG_API wirelog_error_t
 wirelog_session_seal_input(wirelog_session_t *session,
     const char *relation);
 
+/** Begin explicitly chunked loading of an empty declared numeric EDB.
+ * Requires the same serial spill-enabled ordinary mode as seal_input, before
+ * evaluation, and currently supports audited MAP/FILTER projection consumers.
+ * Successful begin freezes ordinary fact/compound mutation sessionwide. Load
+ * resident facts first; additional empty inputs may begin and preloaded inputs
+ * may be sealed afterward. A failed begin preserves the original input.
+ * Calls are synchronous and externally serialized. Program outlives session.
+ * Errors have the same classification as seal_input.
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_begin_cold_input(wirelog_session_t *session,
+    const char *relation);
+
+/** Append borrowed row-major physical lanes to a loading input. The buffer is
+ * copied synchronously and never retained. num_cols must match its declaration;
+ * data may be NULL only for zero rows (a validated no-op). A successful append
+ * spills one segment and releases its temporary governed rows; a failed append
+ * preserves the previous prefix and permits retry. Chunk transitions, per-segment
+ * metadata and caller-owned buffers are additional to the finished reader floor.
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_append_cold_input(wirelog_session_t *session,
+    const char *relation,
+    const int64_t *data, uint32_t num_rows, uint32_t num_cols);
+
+/** Finalize a loading input, admitting its O(segments) immutable directory.
+ * Failure preserves the loading prefix for append/finish retry. Success forbids
+ * further append and reuses the snapshot until session destruction. STEP and
+ * either SNAPSHOT refuse unfinished inputs without closing this loading window.
+ * Scan output still reserves full source-row capacity, even for rejecting FILTERs;
+ * successful bounded loading does not promise every evaluation fits the budget.
+ * Destroy also releases unfinished inputs. There is no abort or mutation API.
+ */
+WIRELOG_API wirelog_error_t
+wirelog_session_finish_cold_input(wirelog_session_t *session,
+    const char *relation);
+
 /** Compatibility spelling of wirelog_session_seal_input, with identical
  * eligibility, errors and lifetime. A JOIN consumer is not required. */
 WIRELOG_API wirelog_error_t

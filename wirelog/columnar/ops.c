@@ -35,6 +35,7 @@
 #include "columnar/internal.h"
 #include "columnar/join_batch.h"
 #include "columnar/batch_payload.h"
+#include "columnar/trace_store.h"
 #include "columnar/lftj.h"
 #include "wirelog/util/log.h"
 
@@ -369,13 +370,12 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
     if (!sess || !stack || !cold ||
         wl_columnar_session_cold_execution_check(sess) ||
         !wl_columnar_eval_plan_cold_scan_decode(plan,
-        cold->name, cold->ncols, wl_columnar_batch_payload_schema(
-            cold->payload, NULL, NULL),
+        cold->name, cold->ncols, wl_columnar_session_cold_types(cold),
         end, &decoded)) return ENOTSUP;
     uint32_t width = decoded.map ? decoded.map->project_count : cold->ncols;
     uint32_t logical_count = 0;
     const wirelog_column_t *logical = decoded.map ? NULL :
-        wl_columnar_batch_payload_inline_schema(cold->payload, &logical_count);
+        wl_columnar_session_cold_inline_schema(cold, &logical_count);
     if (logical_count && !logical) return ENOTSUP;
     uint64_t bytes, predicate_bytes, layout_bytes;
     if (!wl_columnar_memory_size_mul(width,
@@ -402,6 +402,7 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
             sizeof(*layout)) : NULL;
     col_rel_t *out = NULL;
     wl_columnar_batch_payload_reader_t *reader = NULL;
+    wl_columnar_trace_store_cursor_t *cursor = NULL;
     col_rel_append_batch_t batch = {0};
     bool appending = false;
     if (!row || !types || !indices || (logical_count && !layout) ||
@@ -409,7 +410,7 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
         rc = ENOMEM; goto done;
     }
     const wirelog_column_type_t *schema =
-        wl_columnar_batch_payload_schema(cold->payload, NULL, NULL);
+        wl_columnar_session_cold_types(cold);
     uint32_t stage_width = cold->ncols, next_predicate = 0;
     for (uint32_t i = 1; i < end; i++) {
         if (plan->ops[i].op == WL_PLAN_OP_MAP) {
@@ -462,6 +463,8 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
         if (rc) goto done;
     }
     wl_columnar_spill_status_t status =
+        cold->state == WL_COLUMNAR_COLD_FINISHED ?
+        wl_columnar_trace_store_cursor_acquire(cold->trace_snapshot, &cursor) :
         wl_columnar_batch_payload_acquire(cold->payload, &reader);
     if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
     rc = col_rel_append_batch_begin(&batch, out);
@@ -470,9 +473,15 @@ wl_columnar_ops_cold_scan(const wl_plan_relation_t *plan,
     for (uint32_t ordinal = 0; ordinal < cold->nrows; ordinal++) {
         const uint64_t *lanes = NULL;
         wl_columnar_spill_metadata_t metadata;
-        status = wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL,
+        status = cursor ? wl_columnar_trace_store_cursor_read(cursor, ordinal,
+                NULL, NULL, &lanes, &metadata) :
+            wl_columnar_batch_payload_read(reader, ordinal, NULL, NULL,
                 &lanes, &metadata);
         if (status != WL_COLUMNAR_SPILL_OK) goto spill_error;
+        if (metadata.multiplicity != 1 || metadata.iteration ||
+            metadata.stratum || metadata.worker) {
+            rc = ENOTSUP; goto done;
+        }
         bool keep = true;
         for (uint32_t i = 0; keep && i < decoded.filter_count; i++) {
             int64_t value;
@@ -513,6 +522,7 @@ done:
         int ended = col_rel_append_batch_end(&batch, false);
         if (ended) rc = ended;
     }
+    wl_columnar_trace_store_cursor_release(cursor);
     wl_columnar_batch_payload_reader_release(reader);
     free(layout); free(indices); free(predicates); free(types); free(row);
     wl_ops_scratch_release(&scratch);

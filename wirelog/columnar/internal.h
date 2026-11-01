@@ -2365,6 +2365,11 @@ typedef struct wl_columnar_session_cold_relation {
     col_rel_t *retained_source;
     wl_columnar_memory_reservation_t reservation;
     struct wl_columnar_batch_payload *payload;
+    struct wl_columnar_trace_store *loading_trace;
+    struct wl_columnar_trace_store_snapshot *trace_snapshot;
+    wirelog_column_type_t *trace_types;
+    enum { WL_COLUMNAR_COLD_PAYLOAD, WL_COLUMNAR_COLD_LOADING,
+           WL_COLUMNAR_COLD_FINISHED } state;
     col_relation_snapshot_t source_snapshot;
     uint64_t cold_storage_generation;
     uint32_t ncols, nrows;
@@ -4977,6 +4982,22 @@ wl_columnar_spill_status_t wl_columnar_session_seal_join_input(
 wl_columnar_session_cold_relation_t *wl_columnar_session_cold_find(
     const wl_col_session_t *session, const char *name);
 int wl_columnar_session_cold_execution_check(const wl_col_session_t *session);
+const wirelog_column_type_t *wl_columnar_session_cold_types(
+    const wl_columnar_session_cold_relation_t *cold);
+bool wl_columnar_session_cold_uses_intern(
+    const wl_columnar_session_cold_relation_t *cold, const wl_intern_t *intern);
+const wirelog_column_t *wl_columnar_session_cold_inline_schema(
+    const wl_columnar_session_cold_relation_t *cold, uint32_t *count);
+const wirelog_column_type_t *wl_columnar_session_cold_declared_types(
+    const wl_col_session_t *session, const char *name, uint32_t *width);
+wl_columnar_spill_status_t wl_columnar_session_begin_cold_input(
+    wl_session_t *session, const char *name);
+wl_columnar_spill_status_t wl_columnar_session_append_cold_input(
+    wl_session_t *session, const char *name, const int64_t *rows,
+    uint32_t count, uint32_t width);
+wl_columnar_spill_status_t wl_columnar_session_finish_cold_input(
+    wl_session_t *session, const char *name);
+
 /* Read-only source/declaration provenance; returns NULL schema for scalars. */
 bool wl_columnar_session_cold_source_schema(const wl_col_session_t *session,
     const char *name, const col_rel_t *resident,

@@ -560,14 +560,9 @@ wirelog_session_create_with_options(wirelog_program_t *program,
                supplied.snapshot, &normalized, out);
 }
 
-wirelog_error_t
-wirelog_session_seal_input(wirelog_session_t *session,
-    const char *relation)
+static wirelog_error_t
+wl_advanced_cold_status(wl_columnar_spill_status_t status)
 {
-    if (!session || !relation) return WIRELOG_ERR_EXEC;
-    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
-    wl_columnar_spill_status_t status = wl_columnar_session_seal_input(
-        session->inner, relation, NULL, NULL);
     switch (status) {
     case WL_COLUMNAR_SPILL_OK: return WIRELOG_OK;
     case WL_COLUMNAR_SPILL_MEMORY: return WIRELOG_ERR_MEMORY_BUDGET;
@@ -577,6 +572,48 @@ wirelog_session_seal_input(wirelog_session_t *session,
     case WL_COLUMNAR_SPILL_IO: return WIRELOG_ERR_IO;
     default: return WIRELOG_ERR_EXEC;
     }
+}
+
+wirelog_error_t
+wirelog_session_begin_cold_input(wirelog_session_t *session,
+    const char *relation)
+{
+    if (!session || !relation) return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
+    return wl_advanced_cold_status(wl_columnar_session_begin_cold_input(
+                   session->inner, relation));
+}
+
+wirelog_error_t
+wirelog_session_append_cold_input(wirelog_session_t *session,
+    const char *relation,
+    const int64_t *data, uint32_t num_rows, uint32_t num_cols)
+{
+    if (!session || !relation) return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
+    return wl_advanced_cold_status(wl_columnar_session_append_cold_input(
+                   session->inner, relation, data, num_rows, num_cols));
+}
+
+wirelog_error_t
+wirelog_session_finish_cold_input(wirelog_session_t *session,
+    const char *relation)
+{
+    if (!session || !relation) return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
+    return wl_advanced_cold_status(wl_columnar_session_finish_cold_input(
+                   session->inner, relation));
+}
+
+wirelog_error_t
+wirelog_session_seal_input(wirelog_session_t *session,
+    const char *relation)
+{
+    if (!session || !relation) return WIRELOG_ERR_EXEC;
+    wl_columnar_session_budget_denial_clear(COL_SESSION(session->inner));
+    wl_columnar_spill_status_t status = wl_columnar_session_seal_input(
+        session->inner, relation, NULL, NULL);
+    return wl_advanced_cold_status(status);
 }
 
 wirelog_error_t

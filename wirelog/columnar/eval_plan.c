@@ -569,8 +569,8 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                            join_index);
             }
             if (!wl_columnar_eval_plan_cold_projection(rplan, cold->name,
-                cold->ncols, wl_columnar_batch_payload_schema(
-                    cold->payload, NULL, NULL))) return ENOTSUP;
+                cold->ncols,
+                wl_columnar_session_cold_types(cold))) return ENOTSUP;
             int rc = wl_columnar_ops_cold_projection(rplan, stack, sess);
             return rc ? rc : col_op_consolidate(stack, sess);
         }

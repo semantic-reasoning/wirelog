@@ -5409,3 +5409,24 @@ retained-source controls prove projection and one/two-owner JOIN reclamation.
 Intern/declaration storage, resident output and intermediate floors remain.
 The program must still outlive public sessions; no public lifetime shortcut,
 whole compound reconstruction, SIDE or nested-handle ownership is introduced.
+
+### Chunked immutable session inputs
+
+`wirelog_session_begin_cold_input`, `wirelog_session_append_cold_input` and
+`wirelog_session_finish_cold_input` load an initially empty declared numeric EDB
+without first retaining its complete rows. This route currently supports ordinary
+MAP/FILTER scans. Populate other resident inputs before beginning: successful
+begin freezes ordinary mutation, while additional empty loaders and preloaded
+payload sealing remain available. Evaluation refuses pending loaders without
+closing their finish/retry window. Session destruction releases incomplete loads.
+
+Each append borrows one host buffer, admits a governed temporary relation and
+spills/transfers it into one immutable segment. The host buffer is outside the
+governor and is not retained. Owner, per-segment nodes, transition scratch and
+the final O(segments) snapshot directory remain real floors. Append failures keep
+the prior prefix; finish admits the directory before publication and is retryable.
+The scan output still reserves full input-row capacity, including rejecting
+filters: bounded ingestion does not imply arbitrary-budget scan completion.
+Legacy `seal_input` retains single-payload storage and reader costs, with only
+the fixed shared cold-binding descriptor increasing for explicit trace state
+(168 to 200 bytes on the measured 64-bit build, +32 bytes per binding).

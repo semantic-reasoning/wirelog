@@ -2,6 +2,7 @@
 #define WL_TEST_RELATION_RESIZE_HOOK 1
 #include "columnar/internal.h"
 #include "columnar/batch_payload.h"
+#include "columnar/trace_store.h"
 #include "columnar/columnar_nanoarrow.h"
 #include "exec_plan_gen.h"
 #include "session.h"
@@ -3928,6 +3929,119 @@ static void cold_scan_map_only_right_audit(void)
     rp->ops = saved; rp->op_count = count; destroy(&f);
 }
 
+static void chunked_internal_observe(const char *name, const int64_t *row,
+    uint32_t width, void *context)
+{
+    unsigned *seen = context;
+    CHECK(!strcmp(name, "result") && width == 2 && row[1] >= 1 && row[1] <= 3 &&
+        row[0] == row[1] + 10);
+    unsigned bit = 1u << (unsigned)row[1]; CHECK(!(*seen & bit)); *seen |= bit;
+}
+
+static void chunked_internal(void)
+{
+    const char *text = ".decl a(k:int64,v:int64)\n"
+        ".decl b(k:int64,v:int64)\n"
+        ".decl result(v:int64,k:int64)\n.decl second(v:int64,k:int64)\n"
+        "result(v,k) :- a(k,v).\nsecond(v,k) :- b(k,v).\n";
+    const uint64_t budget = 4*1024*1024;
+    int64_t rows[] = {1, 11, 2, 12, 3, 13};
+    /* These physical types are supported by internal declarations; the parser
+     * deliberately does not expose BOOL/UINT spellings. No dummy insert. */
+    const wirelog_column_type_t scalar_types[] = {
+        WIRELOG_TYPE_BOOL, WIRELOG_TYPE_UINT32, WIRELOG_TYPE_UINT64
+    };
+    for (unsigned type = 0; type < 3; type++) {
+        fixture_t f = fixture(text, budget, 1024*1024);
+        for (uint32_t i = 0; i < f.plan->edb_count; i++)
+            ((wirelog_column_type_t *)f.plan->edb_column_types[i])[0] =
+                scalar_types[type];
+        CHECK(session_find_rel(COL_SESSION(f.session), "a")->ncols == 0);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") == OK);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", rows, 1,
+            2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "a") == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        CHECK(wl_session_step(f.session) == 0);
+        destroy(&f);
+    }
+    for (unsigned fault = 0; fault < 5; fault++) {
+        fixture_t f = fixture(text, budget, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        col_rel_t *original = session_find_rel(s, "a");
+        uint64_t before = reserved(&f);
+        wl_columnar_memory_reservation_t pressure;
+        wl_columnar_memory_reservation_init(&pressure);
+        CHECK(wl_columnar_memory_reserve(wl_columnar_memory_governor_ref_get(
+                f.governor), budget-before, &pressure));
+        CHECK(wl_columnar_session_begin_cold_input(f.session,
+            "a") == WL_COLUMNAR_SPILL_MEMORY);
+        CHECK(session_find_rel(s, "a") == original && !s->cold_relation &&
+            !f.session->input_sealed && original->nrows == 0);
+        CHECK(wl_columnar_memory_rollback(&pressure));
+        CHECK(reserved(&f) == before);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "a") == OK);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        CHECK(wl_session_step(f.session) != 0 && !s->cold_seal_closed);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", rows, 1,
+            2) == OK);
+        wl_columnar_session_cold_relation_t *c =
+            wl_columnar_session_cold_find(s, "a");
+        wl_columnar_trace_store_state_t old =
+            wl_columnar_trace_store_state(c->loading_trace);
+        uint64_t loaded = reserved(&f),
+            spilled = wl_columnar_spill_store_bytes(s->spill_store);
+        if (fault == 0) write_fault = 2;
+        if (fault == 1) allocation_fault = 1;
+        if (fault >= 2) CHECK(wl_columnar_memory_reserve(
+                    wl_columnar_memory_governor_ref_get(f.governor),
+                    budget-loaded, &pressure));
+        wl_columnar_spill_status_t status = fault == 3 ?
+            wl_columnar_session_finish_cold_input(f.session, "a") :
+            wl_columnar_session_append_cold_input(f.session, "a", rows+2, 2, 2);
+        CHECK(status == (fault == 0 ? WL_COLUMNAR_SPILL_IO : fault == 1 ?
+            WL_COLUMNAR_SPILL_ALLOCATION : WL_COLUMNAR_SPILL_MEMORY));
+        if (fault >= 2) CHECK(wl_columnar_memory_rollback(&pressure));
+        write_fault = allocation_fault = 0;
+        wl_columnar_trace_store_state_t now =
+            wl_columnar_trace_store_state(c->loading_trace);
+        CHECK(now.rows == old.rows && now.segments == old.segments &&
+            now.generation == old.generation);
+        CHECK(c->state == WL_COLUMNAR_COLD_LOADING && c->nrows == 1 &&
+            !c->trace_snapshot);
+        CHECK(reserved(&f) == loaded &&
+            wl_columnar_spill_store_bytes(s->spill_store) == spilled);
+        CHECK(wl_columnar_session_append_cold_input(f.session, "a", rows+2, 2,
+            2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "a") == OK);
+        CHECK(wl_session_step(f.session) != 0 && !s->cold_seal_closed);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        wl_columnar_trace_store_cursor_t *cursor = NULL;
+        CHECK(wl_columnar_trace_store_cursor_acquire(c->trace_snapshot,
+            &cursor) == OK);
+        for (uint32_t i = 0; i < 3; i++) {
+            const uint64_t *lanes = NULL; wl_columnar_spill_metadata_t metadata;
+            CHECK(wl_columnar_trace_store_cursor_read(cursor, i, NULL, NULL,
+                &lanes, &metadata) == OK);
+            CHECK(lanes[0] == (uint64_t)rows[2*i] &&
+                lanes[1] == (uint64_t)rows[2*i+1]);
+            CHECK(metadata.multiplicity == 1 && !metadata.iteration &&
+                !metadata.stratum && !metadata.worker);
+        }
+        wl_columnar_trace_store_cursor_release(cursor);
+        unsigned seen = 0;
+        read_fault = 5;
+        CHECK(wl_session_snapshot(f.session, chunked_internal_observe,
+            &seen) == EIO);
+        CHECK(!seen); read_fault = 0;
+        CHECK(wl_session_snapshot(f.session, chunked_internal_observe,
+            &seen) == 0 && seen == 14);
+        CHECK(wl_session_step(f.session) == 0);
+        destroy(&f);
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -3937,6 +4051,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    chunked_internal();
     cold_scan_join_key_names();
     cold_scan_map_only_right_audit();
     cold_scan_join_self_missing();

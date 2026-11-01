@@ -11,6 +11,7 @@
 #include "columnar/compound_side.h"
 #include "columnar/internal.h"
 #include "columnar/batch_payload.h"
+#include "columnar/trace_store.h"
 #include "columnar/columnar_nanoarrow.h"
 #include "columnar/join_batch.h"
 #include "wirelog/util/log.h"
@@ -634,6 +635,61 @@ wl_columnar_session_cold_find(const wl_col_session_t *s, const char *name)
     return NULL;
 }
 
+const wirelog_column_type_t *
+wl_columnar_session_cold_types(const wl_columnar_session_cold_relation_t *c)
+{
+    return c->state == WL_COLUMNAR_COLD_PAYLOAD ?
+           wl_columnar_batch_payload_schema(c->payload, NULL,
+               NULL) : c->trace_types;
+}
+
+bool
+wl_columnar_session_cold_uses_intern(
+    const wl_columnar_session_cold_relation_t *c,
+    const wl_intern_t *intern)
+{
+    return c->state == WL_COLUMNAR_COLD_PAYLOAD ?
+           wl_columnar_batch_payload_uses_intern(c->payload, intern) :
+           wl_columnar_trace_store_snapshot_uses_intern(c->trace_snapshot,
+               intern);
+}
+
+const wirelog_column_t *
+wl_columnar_session_cold_inline_schema(
+    const wl_columnar_session_cold_relation_t *c,
+    uint32_t *count)
+{
+    return c->state == WL_COLUMNAR_COLD_PAYLOAD ?
+           wl_columnar_batch_payload_inline_schema(c->payload, count) :
+           wl_columnar_trace_store_snapshot_inline_schema(c->trace_snapshot,
+               count);
+}
+
+const wirelog_column_type_t *
+wl_columnar_session_cold_declared_types(const wl_col_session_t *s,
+    const char *name, uint32_t *width)
+{
+    *width = 0;
+    if (!s->plan || !name) return NULL;
+    for (uint32_t i = 0; i < s->plan->edb_count; i++)
+        if (s->plan->edb_relations && s->plan->edb_relations[i] &&
+            !strcmp(name, s->plan->edb_relations[i]) &&
+            s->plan->edb_column_types && s->plan->edb_column_type_counts) {
+            *width = s->plan->edb_column_type_counts[i];
+            return s->plan->edb_column_types[i];
+        }
+    return NULL;
+}
+
+static bool
+wl_columnar_session_cold_pending(const wl_col_session_t *s)
+{
+    for (const wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
+        c = c->next)
+        if (c->state == WL_COLUMNAR_COLD_LOADING) return true;
+    return false;
+}
+
 /* Read-only declaration/source audit shared by seal preflight and consumers.
  * Numeric scalar legacy plans need no declaration record. INLINE requires both
  * original-use provenance and the real initialized layout, never guessed IDs. */
@@ -736,7 +792,7 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
         if (!wl_columnar_session_cold_source_schema(s, name, NULL, c->payload,
             &schema)) return false;
         width = c->ncols;
-        types = wl_columnar_batch_payload_schema(c->payload, NULL, NULL);
+        types = wl_columnar_session_cold_types(c);
     } else {
         const col_rel_t *r = NULL;
         for (uint32_t i = 0; i < s->nrels; i++)
@@ -744,9 +800,11 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
                 r = s->rels[i]; break;
             }
         const wl_plan_edb_schema_t *schema;
-        if (!r || !r->ncols || !wl_columnar_session_cold_source_schema(s, name,
+        if (!r || !wl_columnar_session_cold_source_schema(s, name,
             r, NULL, &schema)) return false;
         width = r->ncols; types = r->column_types;
+        if (!width) types = wl_columnar_session_cold_declared_types(s, name,
+                    &width);
         for (uint32_t i = 0; types && i < width; i++)
             if (types[i] != WIRELOG_TYPE_INT32 &&
                 types[i] != WIRELOG_TYPE_INT64 &&
@@ -864,14 +922,13 @@ wl_columnar_session_cold_execution_check(const wl_col_session_t *s)
     if (!wl_columnar_session_cold_mode(s)) return ENOTSUP;
     for (const wl_columnar_session_cold_relation_t *c = s->cold_relation; c;
         c = c->next) {
-        const wirelog_column_type_t *types = wl_columnar_batch_payload_schema(
-            c->payload, NULL, NULL);
+        const wirelog_column_type_t *types = wl_columnar_session_cold_types(c);
         const wl_plan_edb_schema_t *schema;
         if (!wl_columnar_session_cold_source_schema(s, c->name, NULL,
             c->payload, &schema)) return ENOTSUP;
         for (uint32_t i = 0; i < c->ncols; i++)
             if (types[i] == WIRELOG_TYPE_STRING &&
-                !wl_columnar_batch_payload_uses_intern(c->payload,
+                !wl_columnar_session_cold_uses_intern(c,
                 s->intern)) return ENOTSUP;
         if (!wl_columnar_session_cold_plan(s, c->name, c->ncols,
             (const char *const *)c->col_names, types)) return ENOTSUP;
@@ -885,11 +942,31 @@ wl_columnar_session_cold_free(wl_columnar_session_cold_relation_t *c)
     if (!c) return;
     if (c->payload && wl_columnar_batch_payload_release(c->payload) !=
         WL_COLUMNAR_SPILL_OK) abort(); /* No synchronous reader may escape. */
+    wl_columnar_trace_store_snapshot_release(c->trace_snapshot);
+    wl_columnar_trace_store_retire(c->loading_trace);
     wl_columnar_memory_reservation_t token;
     wl_columnar_memory_reservation_init(&token);
     if (!wl_columnar_memory_reservation_move(&token, &c->reservation)) abort();
     free(c);
     if (!wl_columnar_memory_release(&token)) abort();
+}
+
+static bool
+wl_columnar_session_cold_busy(const wl_col_session_t *s, const char *name)
+{
+    return s->base.input_load_failed || wl_columnar_session_cold_find(s,
+               name) ||
+           s->cold_seal_closed ||
+           s->has_evaluated ||
+           s->plain_step_completion_pending || s->uncommitted_strata_done ||
+           s->cleanup_active || s->cleanup_pending || s->source_leases ||
+           s->deferred_relations || s->retained_eval_entries ||
+           s->tdd_workers || s->tdd_owner_lifetime || s->controlled_step ||
+           s->arr_count || s->darr_count || s->diff_arr_count ||
+           s->diff_txn_count ||
+           s->sarr_count || s->filt_arr_count || s->filt_cache_count ||
+           s->mat_cache.count || s->last_removed_relation;
+
 }
 
 wl_columnar_spill_status_t
@@ -905,17 +982,7 @@ wl_columnar_session_seal_join_input(wl_session_t *session, const char *name,
         wl_columnar_session_test_cold_owner != s)
         return WL_COLUMNAR_SPILL_BUSY;
 #endif
-    if (s->base.input_load_failed || wl_columnar_session_cold_find(s, name) ||
-        s->cold_seal_closed ||
-        s->has_evaluated ||
-        s->plain_step_completion_pending || s->uncommitted_strata_done ||
-        s->cleanup_active || s->cleanup_pending || s->source_leases ||
-        s->deferred_relations || s->retained_eval_entries ||
-        s->tdd_workers || s->tdd_owner_lifetime || s->controlled_step ||
-        s->arr_count || s->darr_count || s->diff_arr_count ||
-        s->diff_txn_count ||
-        s->sarr_count || s->filt_arr_count || s->filt_cache_count ||
-        s->mat_cache.count || s->last_removed_relation)
+    if (wl_columnar_session_cold_busy(s, name))
         return WL_COLUMNAR_SPILL_BUSY;
     if (!wl_columnar_session_cold_mode(s) ||
         wl_columnar_session_cold_execution_check(s))
@@ -1037,6 +1104,197 @@ wl_columnar_session_seal_input(wl_session_t *session, const char *name,
     wl_columnar_spill_cancel_fn cancel, void *context)
 {
     return wl_columnar_session_seal_join_input(session, name, cancel, context);
+}
+
+/* The initial loader supports standalone scalar projections. Existing payload
+ * JOIN consumers elsewhere in the plan retain their established behavior. */
+static bool
+wl_columnar_session_cold_loading_plan(const wl_col_session_t *s,
+    const char *name, uint32_t width, const char *const *names,
+    const wirelog_column_type_t *types)
+{
+    if (!wl_columnar_session_cold_plan(s, name, width, names,
+        types)) return false;
+    for (uint32_t si = 0; si < s->plan->stratum_count; si++) {
+        const wl_plan_stratum_t *sp = &s->plan->strata[si];
+        for (uint32_t ri = 0; ri < sp->relation_count; ri++) {
+            const wl_plan_relation_t *rp = &sp->relations[ri];
+            for (uint32_t oi = 0; oi < rp->op_count; oi++) {
+                const wl_plan_op_t *op = &rp->ops[oi];
+                if ((op->right_relation && !strcmp(op->right_relation, name)) ||
+                    (op->relation_name && !strcmp(op->relation_name, name) &&
+                    !wl_columnar_eval_plan_cold_projection(rp, name, width,
+                    types))) return false;
+            }
+        }
+    }
+    return true;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_session_begin_cold_input(wl_session_t *session, const char *name)
+{
+    if (!session || session->backend != wl_backend_columnar() || !name)
+        return WL_COLUMNAR_SPILL_INVALID;
+    wl_col_session_t *s = COL_SESSION(session);
+    if (wl_columnar_session_cold_busy(s, name)) return WL_COLUMNAR_SPILL_BUSY;
+    if (!wl_columnar_session_cold_mode(s) ||
+        wl_columnar_session_cold_execution_check(s))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    uint32_t slot = 0;
+    while (slot < s->nrels && (!s->rels[slot] ||
+        strcmp(s->rels[slot]->name, name))) slot++;
+    if (slot == s->nrels) return WL_COLUMNAR_SPILL_INVALID;
+    col_rel_t *r = s->rels[slot];
+    uint32_t width = r->ncols;
+    const wirelog_column_type_t *types = r->column_types;
+    if (!width) types = wl_columnar_session_cold_declared_types(s, name,
+                &width);
+    const wl_plan_edb_schema_t *schema;
+    if (r->nrows || !width || !types || r->timestamps || r->has_graph_column ||
+        r->memory_governor != s->memory_governor ||
+        !wl_columnar_batch_payload_can_take(r) ||
+        !wl_columnar_session_cold_source_schema(s, name, r, NULL, &schema) ||
+        schema || !wl_columnar_session_cold_loading_plan(s, name, width,
+        (const char *const *)r->col_names, types))
+        return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    for (uint32_t i = 0; i < width; i++)
+        if (types[i] < WIRELOG_TYPE_INT32 || types[i] > WIRELOG_TYPE_BOOL ||
+            types[i] ==
+            WIRELOG_TYPE_STRING) return WL_COLUMNAR_SPILL_UNSUPPORTED;
+    if (r->storage_generation >= WL_COLUMNAR_REL_GENERATION_INVALID - 1u)
+        return WL_COLUMNAR_SPILL_OVERFLOW;
+    uint64_t bytes = sizeof(wl_columnar_session_cold_relation_t) +
+        (uint64_t)width * sizeof(*types) +
+        (r->col_names ? (uint64_t)width * sizeof(char *) : 0);
+    for (uint32_t i = 0; r->col_names && i < width; i++)
+        if (r->col_names[i] && !wl_columnar_memory_size_add(bytes,
+            strlen(r->col_names[i]) + 1,
+            &bytes)) return WL_COLUMNAR_SPILL_OVERFLOW;
+    if (!wl_columnar_memory_size_add(bytes, strlen(name) + 1, &bytes) ||
+        bytes > SIZE_MAX) return WL_COLUMNAR_SPILL_OVERFLOW;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_reservation_init(&token);
+    wl_columnar_memory_admission_status_t admission =
+        wl_columnar_memory_reserve_checked(wl_columnar_memory_governor_ref_get(
+                s->memory_governor), bytes, &token);
+    if (admission > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
+        return admission == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ?
+               WL_COLUMNAR_SPILL_MEMORY : WL_COLUMNAR_SPILL_OVERFLOW;
+    wl_columnar_session_cold_relation_t *c = calloc(1, (size_t)bytes);
+    if (!c) {
+        if (!wl_columnar_memory_rollback(&token)) abort();
+        return WL_COLUMNAR_SPILL_ALLOCATION;
+    }
+    wl_columnar_memory_reservation_init(&c->reservation);
+    if (!wl_columnar_memory_reservation_move(&c->reservation, &token) ||
+        !wl_columnar_memory_commit(&c->reservation, c)) abort();
+    c->state = WL_COLUMNAR_COLD_LOADING;
+    c->ncols = width;
+    char *cursor = (char *)(c + 1);
+    if (r->col_names) {
+        c->col_names = (char **)cursor;
+        cursor += (size_t)width * sizeof(char *);
+    }
+    c->trace_types = (wirelog_column_type_t *)cursor;
+    memcpy(c->trace_types, types, (size_t)width * sizeof(*types));
+    c->name = (char *)(c->trace_types + width);
+    memcpy(c->name, name, strlen(name) + 1);
+    cursor = c->name + strlen(name) + 1;
+    for (uint32_t i = 0; r->col_names && i < width; i++) {
+        if (!r->col_names[i]) continue;
+        c->col_names[i] = cursor;
+        memcpy(cursor, r->col_names[i], strlen(r->col_names[i]) + 1);
+        cursor += strlen(r->col_names[i]) + 1;
+    }
+    c->source_snapshot = wl_columnar_relation_snapshot(r);
+    c->cold_storage_generation = r->storage_generation + 1;
+    bool inserted_name = s->last_inserted_relation &&
+        !strcmp(s->last_inserted_relation, name);
+    wl_columnar_spill_status_t status = wl_columnar_trace_store_create(
+        s->memory_governor, types, width, &c->loading_trace);
+    if (status == WL_COLUMNAR_SPILL_OK) {
+        int retired = col_rel_destroy_checked(r);
+        if (retired) status = retired == EBUSY ? WL_COLUMNAR_SPILL_BUSY :
+                WL_COLUMNAR_SPILL_INVALID;
+    }
+    if (status != WL_COLUMNAR_SPILL_OK) {
+        wl_columnar_session_cold_free(c); return status;
+    }
+    s->rels[slot] = NULL;
+    session_rel_free_hash(s);
+    if (inserted_name) s->last_inserted_relation = c->name;
+    c->next = s->cold_relation;
+    s->cold_relation = c;
+    s->base.input_sealed = true;
+    return WL_COLUMNAR_SPILL_OK;
+}
+
+static wl_columnar_session_cold_relation_t *
+wl_columnar_session_cold_loader(wl_session_t *session, const char *name)
+{
+    if (!session || session->backend != wl_backend_columnar() || !name)
+        return NULL;
+    wl_col_session_t *s = COL_SESSION(session);
+    wl_columnar_session_cold_relation_t *c = wl_columnar_session_cold_find(s,
+            name);
+    if (!c || c->state != WL_COLUMNAR_COLD_LOADING || s->cold_seal_closed ||
+        s->has_evaluated || s->base.input_load_failed ||
+        !wl_columnar_session_cold_mode(s) ||
+        wl_columnar_session_cold_execution_check(s) ||
+        !wl_columnar_session_cold_loading_plan(s, name, c->ncols,
+        (const char *const *)c->col_names, c->trace_types)) return NULL;
+    return c;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_session_append_cold_input(wl_session_t *session, const char *name,
+    const int64_t *rows, uint32_t count, uint32_t width)
+{
+    wl_columnar_session_cold_relation_t *c =
+        wl_columnar_session_cold_loader(session, name);
+    if (!c || width != c->ncols || (count && !rows))
+        return WL_COLUMNAR_SPILL_INVALID;
+    uint64_t bytes;
+    if (count > UINT32_MAX - c->nrows ||
+        !wl_columnar_memory_size_mul(count, width, &bytes) ||
+        !wl_columnar_memory_size_mul(bytes, sizeof(*rows), &bytes) ||
+        bytes > SIZE_MAX) return WL_COLUMNAR_SPILL_OVERFLOW;
+    if (!count) return WL_COLUMNAR_SPILL_OK;
+    wl_col_session_t *s = COL_SESSION(session);
+    col_rel_t *chunk = NULL;
+    int rc = wl_columnar_relation_new_named_governed(name, width, NULL,
+            count, false, s->memory_governor, &chunk);
+    if (!rc) rc = col_rel_set_column_types(chunk, c->trace_types, width);
+    bool denied = false;
+    if (!rc) rc = col_rel_append_rows_atomic(chunk, rows, count, width,
+                &denied);
+    wl_columnar_spill_status_t status = (denied ||
+        rc == ENOSPC) ? WL_COLUMNAR_SPILL_MEMORY :
+        rc == ENOMEM ? WL_COLUMNAR_SPILL_ALLOCATION : rc ?
+        WL_COLUMNAR_SPILL_INVALID : wl_columnar_trace_store_append_take(
+        c->loading_trace, &chunk, s->spill_store, NULL, NULL);
+    if (chunk && col_rel_destroy_checked(chunk)) abort();
+    if (status == WL_COLUMNAR_SPILL_OK) c->nrows += count;
+    return status;
+}
+
+wl_columnar_spill_status_t
+wl_columnar_session_finish_cold_input(wl_session_t *session, const char *name)
+{
+    wl_columnar_session_cold_relation_t *c =
+        wl_columnar_session_cold_loader(session, name);
+    if (!c) return WL_COLUMNAR_SPILL_INVALID;
+    wl_columnar_trace_store_snapshot_t *snapshot = NULL;
+    wl_columnar_spill_status_t status =
+        wl_columnar_trace_store_snapshot_acquire(
+        c->loading_trace, &snapshot);
+    if (status != WL_COLUMNAR_SPILL_OK) return status;
+    c->trace_snapshot = snapshot;
+    c->state = WL_COLUMNAR_COLD_FINISHED;
+    wl_columnar_trace_store_retire(c->loading_trace);
+    c->loading_trace = NULL;
+    return WL_COLUMNAR_SPILL_OK;
 }
 
 static uint32_t
@@ -11838,6 +12096,7 @@ col_session_step(wl_session_t *session)
 {
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (wl_columnar_session_cold_pending(sess)) return EBUSY;
     sess->cold_seal_closed = true;
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
     if (cold_rc != 0) return cold_rc;
@@ -13144,6 +13403,7 @@ col_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 {
     if (!session) return EINVAL;
     wl_col_session_t *sess = COL_SESSION(session);
+    if (wl_columnar_session_cold_pending(sess)) return EBUSY;
     sess->cold_seal_closed = true;
     int cold_rc = wl_columnar_session_cold_execution_check(sess);
     if (cold_rc != 0) return cold_rc;

@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Advanced sessions load numeric cold inputs in bounded chunks and finalize
+  immutable traces for ordinary MAP/FILTER scans, with retryable admission (#1372).
+
 - Signed reference trace/trace and delta/trace JOINs preserve STRING/INLINE
   generations and checked weighted contributions; paired budget tests distinguish
   reclaimed row storage from irreducible intern/output ownership floors (#1372).
