@@ -11,9 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+static char case_context[128] = "startup";
+static unsigned mutation_cycles;
+
 #define CHECK(x) do { if (!(x)) { \
-                          fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
-                              #x); abort(); \
+                          fprintf(stderr, "%s:%d: %s [%s]\n", __FILE__, \
+                              __LINE__, #x, case_context); abort(); \
                       } } while (0)
 
 static int
@@ -93,8 +96,8 @@ stop_selected_batch(wl_evaluation_control_t *control, unsigned phase,
     else wl_evaluation_control_request_cancel(control);
 }
 
-static void
-test_batch_selectors(void)
+static unsigned
+test_batch_selectors(unsigned lm)
 {
     static const char source[] =
         ".decl a(k:int64,x:int64)\n"
@@ -114,110 +117,120 @@ test_batch_selectors(void)
                                           WL_DELTA_FORCE_EMPTY_AFTER_SEED};
     const wl_delta_mode_t right_modes[] = {WL_DELTA_AUTO, WL_DELTA_FORCE_FULL,
                                            WL_DELTA_FORCE_DELTA};
-    for (unsigned lm = 0; lm < 5; ++lm)
-        for (unsigned rm = 0; rm < 3; ++rm)
-            for (unsigned ld = 0; ld < 5; ++ld)
-                for (unsigned rd = 0; rd < 5; ++rd) {
-                    wirelog_error_t error;
-                    wirelog_program_t *program = wirelog_parse_string(source,
-                            &error);
-                    wl_plan_t *plan = NULL;
-                    CHECK(program && !wl_plan_from_program(program, &plan));
-                    CHECK(plan->stratum_count == 1
-                        && plan->strata[0].relation_count == 1);
-                    wl_plan_relation_t *output =
-                        (wl_plan_relation_t *)&plan->strata[0].relations[0];
-                    CHECK(output->op_count == 5);
-                    wl_plan_op_t *ops = (wl_plan_op_t *)output->ops;
-                    CHECK(ops[0].op == WL_PLAN_OP_VARIABLE
-                        && ops[1].op == WL_PLAN_OP_JOIN);
-                    ops[0].delta_mode = left_modes[lm];
-                    ops[1].delta_mode = right_modes[rm];
-                    wl_evaluation_control_t *control = NULL;
-                    CHECK(!wl_evaluation_control_create(UINT64_C(1000000),
-                        &control));
-                    wl_session_options_t options;
-                    wl_session_options_init(&options);
-                    options.evaluation_control = control;
-                    wl_session_t *controlled = NULL, *reference = NULL;
-                    CHECK(!wl_session_create_with_options(wl_backend_columnar(),
-                        plan, 1, &options, &controlled));
-                    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
-                        &reference));
-                    ((wl_col_session_t *)controlled)->join_batch_bytes = 224;
-                    wl_session_t *sessions[] = {controlled, reference};
-                    for (unsigned s = 0; s < 2; ++s) {
-                        CHECK(!wl_session_insert(sessions[s], "a", left_full,
-                            2, 2));
-                        CHECK(!wl_session_insert(sessions[s], "b", right_full,
-                            2, 2));
-                        if (ld) add_delta(sessions[s], "$d$a", "a",
-                                left_delta[ld], sizes[ld]);
-                        if (rd) add_delta(sessions[s], "$d$b", "b",
-                                right_delta[rd], sizes[rd]);
-                    }
-                    bool left_is_delta = sizes[ld] &&
-                        (lm == 2 || ((lm == 0 || lm == 4) && sizes[ld] < 2));
-                    bool right_is_delta = sizes[rd] &&
-                        (rm == 2 || (rm == 0 && !left_is_delta
-                        && sizes[rd] < 2));
-                    const int64_t *left = left_is_delta
+    unsigned completed = 0;
+    CHECK(lm < 5);
+    for (unsigned rm = 0; rm < 3; ++rm)
+        for (unsigned ld = 0; ld < 5; ++ld)
+            for (unsigned rd = 0; rd < 5; ++rd) {
+                snprintf(case_context, sizeof(case_context),
+                    "selectors lm=%u rm=%u ld=%u rd=%u", lm, rm, ld, rd);
+                if (!ld && !rd) {
+                    fprintf(stderr, "BEGIN %s completed=%u\n",
+                        case_context, completed);
+                    fflush(stderr);
+                }
+                wirelog_error_t error;
+                wirelog_program_t *program = wirelog_parse_string(source,
+                        &error);
+                wl_plan_t *plan = NULL;
+                CHECK(program && !wl_plan_from_program(program, &plan));
+                CHECK(plan->stratum_count == 1
+                    && plan->strata[0].relation_count == 1);
+                wl_plan_relation_t *output =
+                    (wl_plan_relation_t *)&plan->strata[0].relations[0];
+                CHECK(output->op_count == 5);
+                wl_plan_op_t *ops = (wl_plan_op_t *)output->ops;
+                CHECK(ops[0].op == WL_PLAN_OP_VARIABLE
+                    && ops[1].op == WL_PLAN_OP_JOIN);
+                ops[0].delta_mode = left_modes[lm];
+                ops[1].delta_mode = right_modes[rm];
+                wl_evaluation_control_t *control = NULL;
+                CHECK(!wl_evaluation_control_create(UINT64_C(1000000),
+                    &control));
+                wl_session_options_t options;
+                wl_session_options_init(&options);
+                options.evaluation_control = control;
+                wl_session_t *controlled = NULL, *reference = NULL;
+                CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                    plan, 1, &options, &controlled));
+                CHECK(!wl_session_create(wl_backend_columnar(), plan, 1,
+                    &reference));
+                ((wl_col_session_t *)controlled)->join_batch_bytes = 224;
+                wl_session_t *sessions[] = {controlled, reference};
+                for (unsigned s = 0; s < 2; ++s) {
+                    CHECK(!wl_session_insert(sessions[s], "a", left_full,
+                        2, 2));
+                    CHECK(!wl_session_insert(sessions[s], "b", right_full,
+                        2, 2));
+                    if (ld) add_delta(sessions[s], "$d$a", "a",
+                            left_delta[ld], sizes[ld]);
+                    if (rd) add_delta(sessions[s], "$d$b", "b",
+                            right_delta[rd], sizes[rd]);
+                }
+                bool left_is_delta = sizes[ld] &&
+                    (lm == 2 || ((lm == 0 || lm == 4) && sizes[ld] < 2));
+                bool right_is_delta = sizes[rd] &&
+                    (rm == 2 || (rm == 0 && !left_is_delta
+                    && sizes[rd] < 2));
+                const int64_t *left = left_is_delta
                         ? left_delta[ld] : left_full;
-                    const int64_t *right = right_is_delta
+                const int64_t *right = right_is_delta
                         ? right_delta[rd] : right_full;
-                    unsigned left_count = lm == 3 ? 0
+                unsigned left_count = lm == 3 ? 0
                         : left_is_delta ? sizes[ld] : 2;
-                    unsigned right_count = right_is_delta ? sizes[rd] : 2;
-                    tuple_t expected[16]; unsigned count = 0;
-                    for (unsigned l = 0; l < left_count; ++l)
-                        for (unsigned r = 0; r < right_count; ++r)
-                            if (left[2 * l] == right[2 * r]
-                                && left[2 * l + 1] < right[2 * r + 1]) {
-                                tuple_t row = {{left[2 * l], left[2 * l + 1],
-                                                right[2 * r],
-                                                right[2 * r + 1]}};
-                                expected[count++] = row;
-                            }
-                    qsort(expected, count, sizeof(*expected), tuple_order);
-                    CHECK(!finish_step(reference));
-                    check_output(reference, expected, count);
-                    if (lm == 0 && (rm == 0 || rm == 2) && ld == 2 && rd == 2) {
-                        col_rel_t *input = session_find_rel(
-                            (wl_col_session_t *)controlled, "a");
-                        col_relation_snapshot_t before =
-                            wl_columnar_relation_snapshot(input);
-                        batch_stop_work = rm == 2; batch_stop_hit = false;
-                        wl_columnar_join_test_attempt_checkpoint =
-                            stop_selected_batch;
-                        int stopped = finish_step(controlled);
-                        wl_columnar_join_test_attempt_checkpoint = NULL;
-                        CHECK(stopped == (batch_stop_work
+                unsigned right_count = right_is_delta ? sizes[rd] : 2;
+                tuple_t expected[16]; unsigned count = 0;
+                for (unsigned l = 0; l < left_count; ++l)
+                    for (unsigned r = 0; r < right_count; ++r)
+                        if (left[2 * l] == right[2 * r]
+                            && left[2 * l + 1] < right[2 * r + 1]) {
+                            tuple_t row = {{left[2 * l], left[2 * l + 1],
+                                            right[2 * r],
+                                            right[2 * r + 1]}};
+                            expected[count++] = row;
+                        }
+                qsort(expected, count, sizeof(*expected), tuple_order);
+                CHECK(!finish_step(reference));
+                check_output(reference, expected, count);
+                if (lm == 0 && (rm == 0 || rm == 2) && ld == 2 && rd == 2) {
+                    col_rel_t *input = session_find_rel(
+                        (wl_col_session_t *)controlled, "a");
+                    col_relation_snapshot_t before =
+                        wl_columnar_relation_snapshot(input);
+                    batch_stop_work = rm == 2; batch_stop_hit = false;
+                    wl_columnar_join_test_attempt_checkpoint =
+                        stop_selected_batch;
+                    int stopped = finish_step(controlled);
+                    wl_columnar_join_test_attempt_checkpoint = NULL;
+                    CHECK(stopped == (batch_stop_work
                             ? WL_EVALUATION_CONTROL_WORK_LIMIT
                             : WL_EVALUATION_CONTROL_CANCELLED));
-                        CHECK(batch_stop_hit &&
-                            batch_selected_delta == (rm == 2));
-                        CHECK(!session_find_rel((wl_col_session_t *)controlled,
-                            "output"));
-                        CHECK(!((wl_col_session_t *)controlled)
-                            ->controlled_materialized_batch_published_count);
-                        CHECK(wl_columnar_relation_snapshot_equal(before,
-                            wl_columnar_relation_snapshot(input)));
-                        CHECK(!wl_evaluation_control_active_attempt_id(
-                                control));
-                        CHECK(!wl_evaluation_control_reset(control));
-                        CHECK(!wl_evaluation_control_configure(control,
-                            UINT64_C(1000000)));
-                    }
-                    CHECK(!finish_step(controlled));
-                    check_output(controlled, expected, count);
-                    CHECK(((wl_col_session_t *)controlled)
-                        ->controlled_materialized_batch_published_count == 1);
-                    CHECK(!wl_evaluation_control_active_attempt_id(control));
-                    CHECK(!wl_session_try_destroy(&controlled));
-                    wl_session_destroy(reference);
-                    wl_evaluation_control_release(control);
-                    wl_plan_free(plan); wirelog_program_free(program);
+                    CHECK(batch_stop_hit &&
+                        batch_selected_delta == (rm == 2));
+                    CHECK(!session_find_rel((wl_col_session_t *)controlled,
+                        "output"));
+                    CHECK(!((wl_col_session_t *)controlled)
+                        ->controlled_materialized_batch_published_count);
+                    CHECK(wl_columnar_relation_snapshot_equal(before,
+                        wl_columnar_relation_snapshot(input)));
+                    CHECK(!wl_evaluation_control_active_attempt_id(
+                            control));
+                    CHECK(!wl_evaluation_control_reset(control));
+                    CHECK(!wl_evaluation_control_configure(control,
+                        UINT64_C(1000000)));
                 }
+                CHECK(!finish_step(controlled));
+                check_output(controlled, expected, count);
+                CHECK(((wl_col_session_t *)controlled)
+                    ->controlled_materialized_batch_published_count == 1);
+                CHECK(!wl_evaluation_control_active_attempt_id(control));
+                CHECK(!wl_session_try_destroy(&controlled));
+                wl_session_destroy(reference);
+                wl_evaluation_control_release(control);
+                wl_plan_free(plan); wirelog_program_free(program);
+                ++completed;
+            }
+    return completed;
 }
 
 typedef struct {
@@ -297,14 +310,16 @@ check_path(wl_session_t *base, const int64_t *edges, unsigned edge_count)
     check_capture(&actual, &expected);
 }
 
-static void
+static unsigned
 test_recursive_removal_successor(void)
 {
     const char *source =
         ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
         "path(x,y) :- edge(x,y).\n"
         "path(x,z) :- path(x,y), edge(y,z).\n";
+    unsigned completed = 0;
     for (unsigned mode = 0; mode < 5; ++mode) {
+        snprintf(case_context, sizeof(case_context), "successor mode=%u", mode);
         wirelog_error_t error;
         wirelog_program_t *program = wirelog_parse_string(source, &error);
         wl_plan_t *plan = NULL;
@@ -399,7 +414,9 @@ test_recursive_removal_successor(void)
         CHECK(!wl_columnar_memory_reserved(
                 wl_columnar_memory_governor_ref_get(governor)));
         wl_columnar_memory_governor_ref_release(governor);
+        ++completed;
     }
+    return completed;
 }
 
 extern void (*wl_columnar_session_test_observed_transaction_checkpoint)(
@@ -423,7 +440,7 @@ mutation_checkpoint(wl_evaluation_control_t *control, unsigned phase,
     if (phase == 44) ++append_reads;
 }
 
-static void
+static unsigned
 test_generated_differential_mutations(void)
 {
     const char *source =
@@ -432,8 +449,11 @@ test_generated_differential_mutations(void)
         ".decl output(x:int64)\n"
         "base(x) :- l(x), r(x,y).\n"
         "output(x) :- base(x), !mask(x).\n";
+    unsigned completed = 0;
     for (unsigned observed = 0; observed < 2; ++observed)
         for (unsigned snapshot = 0; snapshot < 2; ++snapshot) {
+            snprintf(case_context, sizeof(case_context),
+                "mutations observed=%u snapshot=%u", observed, snapshot);
             wirelog_error_t error;
             wirelog_program_t *program = wirelog_parse_string(source, &error);
             wl_plan_t *plan = NULL;
@@ -465,6 +485,9 @@ test_generated_differential_mutations(void)
                     1, 1));
             }
             for (unsigned cycle = 0; cycle < 9; ++cycle) {
+                snprintf(case_context, sizeof(case_context),
+                    "mutations observed=%u snapshot=%u cycle=%u", observed,
+                    snapshot, cycle);
                 actual_events.count = reference_events.count = 0;
                 for (unsigned s = 0; s < 2; ++s) {
                     const int64_t one = 1, two = 2, three = 3, absent = 88;
@@ -545,12 +568,15 @@ test_generated_differential_mutations(void)
                 if (cycle) CHECK(
                         !((wl_col_session_t *)session)->pending_input_change
                         && !((wl_col_session_t *)session)->last_removed_relation);
+                ++mutation_cycles;
             }
             CHECK(!wl_session_try_destroy(&session));
             wl_session_destroy(reference);
             wl_evaluation_control_release(control);
             wl_plan_free(plan); wirelog_program_free(program);
+            ++completed;
         }
+    return completed;
 }
 
 static unsigned recovery_phase;
@@ -584,7 +610,7 @@ stop_join(wl_evaluation_control_t *control, unsigned phase, uint64_t progress)
     request_recovery_stop(control);
 }
 
-static void
+static unsigned
 test_recursive_removal_recovery(void)
 {
     const char *source =
@@ -592,8 +618,12 @@ test_recursive_removal_recovery(void)
         "path(x,y) :- edge(x,y).\n"
         "path(x,z) :- path(x,y), edge(y,z).\n";
     const unsigned phases[] = {3, 6, 8, 13, 14, 15, 28, 29, 0};
+    unsigned completed = 0;
     for (unsigned trial = 0; trial < 9; ++trial)
         for (unsigned work = 0; work < 2; ++work) {
+            snprintf(case_context, sizeof(case_context),
+                "recovery trial=%u phase=%u work=%u", trial, phases[trial],
+                work);
             wirelog_error_t error;
             wirelog_program_t *program = wirelog_parse_string(source, &error);
             wl_plan_t *plan = NULL;
@@ -709,16 +739,64 @@ test_recursive_removal_recovery(void)
             CHECK(!wl_columnar_memory_reserved(
                     wl_columnar_memory_governor_ref_get(governor)));
             wl_columnar_memory_governor_ref_release(governor);
+            ++completed;
         }
+    return completed;
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
-    test_batch_selectors();
-    test_recursive_removal_successor();
-    test_generated_differential_mutations();
-    test_recursive_removal_recovery();
-    puts("evaluation differential tests passed");
+    /* Five disjoint selector shards retain all 5*3*5*5 combinations. Each
+     * lifecycle family keeps its complete mutation/retry transaction. */
+    static const struct {
+        const char *name;
+        unsigned selector_mode;
+        unsigned (*run)(void);
+        unsigned expected;
+        unsigned expected_cycles;
+    } cases[] = {
+        {"selectors-auto", 0, NULL, 75, 0},
+        {"selectors-full", 1, NULL, 75, 0},
+        {"selectors-delta", 2, NULL, 75, 0},
+        {"selectors-empty", 3, NULL, 75, 0},
+        {"selectors-empty-after-seed", 4, NULL, 75, 0},
+        {"recursive-successor", 0, test_recursive_removal_successor, 5, 0},
+        {"generated-mutations", 0, test_generated_differential_mutations, 4,
+         36},
+        {"recursive-recovery", 0, test_recursive_removal_recovery, 18, 0},
+    };
+    unsigned count = (unsigned)(sizeof(cases) / sizeof(cases[0]));
+    unsigned first = 0, last = count;
+    if (argc != 1) {
+        if (argc != 2) goto usage;
+        for (first = 0; first < count; ++first)
+            if (!strcmp(argv[1], cases[first].name)) break;
+        if (first == count) goto usage;
+        last = first + 1;
+    }
+    unsigned total = 0;
+    for (unsigned i = first; i < last; ++i) {
+        snprintf(case_context, sizeof(case_context), "%s", cases[i].name);
+        printf("BEGIN %s\n", cases[i].name);
+        fflush(stdout);
+        mutation_cycles = 0;
+        unsigned completed = cases[i].run ? cases[i].run()
+            : test_batch_selectors(cases[i].selector_mode);
+        CHECK(completed == cases[i].expected);
+        CHECK(mutation_cycles == cases[i].expected_cycles);
+        printf("PASS %s cases=%u cycles=%u\n", cases[i].name, completed,
+            mutation_cycles);
+        fflush(stdout);
+        total += completed;
+    }
+    printf("evaluation differential tests passed: groups=%u cases=%u\n",
+        last - first, total);
     return 0;
+
+usage:
+    fprintf(stderr, "usage: %s [case]\nvalid cases:\n", argv[0]);
+    for (unsigned i = 0; i < count; ++i)
+        fprintf(stderr, "  %s\n", cases[i].name);
+    return EXIT_FAILURE;
 }

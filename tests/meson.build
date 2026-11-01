@@ -6678,8 +6678,18 @@ test_evaluation_differential_exe = executable(
   c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
   link_with: [testlib_prod],
 )
-test('evaluation_differential', test_evaluation_differential_exe,
-     suite: ['unit', 'tsan'], timeout: 60)
+# Keep every selector combination, but give independent qualifications their
+# own watchdog and diagnostics. Select the entire set with
+# `meson test --suite evaluation_differential` (including sanitizer builds).
+foreach differential_case : [
+  'selectors-auto', 'selectors-full', 'selectors-delta', 'selectors-empty',
+  'selectors-empty-after-seed', 'recursive-successor', 'generated-mutations',
+  'recursive-recovery',
+]
+  test('evaluation_differential_' + differential_case,
+       test_evaluation_differential_exe, args: [differential_case],
+       suite: ['unit', 'tsan', 'evaluation_differential'], timeout: 60)
+endforeach
 
 # #2296/#1953: actual physical timestamps and signed multiplicity transport.
 test_evaluation_physical_exe = executable(
