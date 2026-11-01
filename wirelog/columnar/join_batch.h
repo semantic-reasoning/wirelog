@@ -16,8 +16,10 @@
  * stack), LFTJ, cross joins, ephemeral hash fallback, K-Fusion and
  * multiworker transport are outside this unit; see docs/MEMORY.md "Bounded
  * join sub-batches".  The producer runs on calling and worker sessions,
- * one per session at a time, but not in a worker run that resolves its
- * operands by input slot (#2201).
+ * one per session at a time.  In a worker run that resolves its operands
+ * by input slot (a TDD bound run or insert clone) it runs over an index of
+ * its own on the slot's relation, col_join_batch_producer_create_over, as
+ * the registry there need not hold that relation under its name (#2201).
  */
 #ifndef WL_COLUMNAR_JOIN_BATCH_H
 #define WL_COLUMNAR_JOIN_BATCH_H
@@ -37,7 +39,7 @@ typedef enum {
     COL_JOIN_BATCH_EXCLUDED_CROSS = 2,          /* key_count == 0 */
     COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT = 3,    /* right side is a delta */
     COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT = 4, /* right filter expression */
-    COL_JOIN_BATCH_EXCLUDED_WORKER = 5,         /* slot-resolved worker run */
+    COL_JOIN_BATCH_EXCLUDED_WORKER = 5,         /* not returned since #2201 */
     COL_JOIN_BATCH_EXCLUDED_NO_ARRANGEMENT = 6, /* no persistent arrangement */
     COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE = 7,  /* batch budget < one row */
     COL_JOIN_BATCH_EXCLUDED_PIPELINE = 8,       /* downstream not consumable */
@@ -198,7 +200,9 @@ typedef struct {
 
 /* Bind the prepared producer to one active operation attempt and transfer
  * exclusive stepping ownership from generic continuation publication.
- * The bound API is serialized on the thread that calls bind. */
+ * The bound API is serialized on the thread that calls bind.  A producer
+ * created by col_join_batch_producer_create_over is refused with ENOTSUP
+ * (#2201). */
 int
 col_join_batch_control_bind(wl_columnar_continuation_t *cont,
     wl_evaluation_control_t *control, uint64_t attempt_id);

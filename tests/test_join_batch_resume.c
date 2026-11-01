@@ -3865,17 +3865,21 @@ test_eligibility_ordering(void)
         == COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
     ok = ok && col_join_batch_eligibility(sess, 1, false, false)
         == COL_JOIN_BATCH_ELIGIBLE;
-    /* A run that resolves its operands by input slot takes precedence over
-     * every keyed/cross and right-shape exclusion. */
+    /* A run that resolves its operands by input slot reads a delta right
+     * operand through the producer's own index, so delta-right is not an
+     * exclusion there; cross and filtered-right still are, and the run is
+     * never excluded as a worker (#2201). */
     sess->tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
     ok = ok && col_join_batch_eligibility(sess, 0, false, false)
-        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
     ok = ok && col_join_batch_eligibility(sess, 0, true, true)
-        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+        == COL_JOIN_BATCH_EXCLUDED_CROSS;
     ok = ok && col_join_batch_eligibility(sess, 1, true, true)
-        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+        == COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
+    ok = ok && col_join_batch_eligibility(sess, 1, true, false)
+        == COL_JOIN_BATCH_ELIGIBLE;
     ok = ok && col_join_batch_eligibility(sess, 1, false, false)
-        == COL_JOIN_BATCH_EXCLUDED_WORKER;
+        == COL_JOIN_BATCH_ELIGIBLE;
     sess->tdd_input_run = NULL;
     sess->coordinator = NULL;
     /* Cross joins are checked before either right-side exclusion. */
@@ -5444,6 +5448,91 @@ test_owned_index_failures_release(void)
         FAIL("a create failure kept a reservation, reader or continuation");
 }
 
+/* #2201: controlled stepping polls the registry pin, which a producer
+ * over its own index does not hold, so binding one is refused with
+ * ENOTSUP; the producer is left unbound and still runs to the oracle. */
+static void
+test_owned_index_refuses_control(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2, 1 };
+    col_rel_t *slot = NULL;
+    wl_columnar_continuation_t *cont = NULL;
+    wl_evaluation_control_t *control = NULL;
+    int control_owner = 0;
+    bool ok;
+
+    TEST("owned-index producer refuses controlled stepping");
+    ok = fixture_init(&f, 1u << 24, keys, 4, 3, 4);
+    slot = ok ? make_slot_right() : NULL;
+    ok = ok && slot
+        && col_join_batch_producer_create_over(f.sess, &f.op, f.left, false,
+            slot, KEY0, KEY0, 1, 3u * 32u, &cont) == 0
+        && wl_evaluation_control_create(10000, &control) == 0
+        && wl_evaluation_control_attach(control, &control_owner) == 0
+        && wl_evaluation_control_begin(control, &control_owner) == 0;
+    ok = ok && col_join_batch_control_bind(cont, control,
+            wl_evaluation_control_active_attempt_id(control)) == ENOTSUP;
+    ok = ok && col_join_batch_run_to_relation(cont, f.sess, f.out) == 0
+        && nested_loop_equal(f.left, slot, f.out);
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    if (control) {
+        if (wl_evaluation_control_active_attempt_id(control))
+            (void)wl_evaluation_control_finish(control, &control_owner, 0, 0);
+        if (!wl_evaluation_control_active_attempt_id(control)) {
+            (void)wl_evaluation_control_detach(control, &control_owner);
+            wl_evaluation_control_release(control);
+        }
+    }
+    ok = ok && no_reader_holds(slot);
+    col_rel_destroy(slot);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("an owned-index producer was bound to a control");
+}
+
+/* #2201: the differential producer finds its arrangement by name, so a
+ * call from a worker run that resolves its operands by input slot is
+ * refused with EINVAL before anything is reserved or pinned. */
+static void
+test_diff_producer_refuses_slot_run(void)
+{
+    fixture_t f;
+    const int64_t keys[] = { 0, 1, 2, 1 };
+    wl_columnar_continuation_t *cont = NULL;
+    uint64_t baseline;
+    bool ok;
+
+    TEST("differential producer refuses a slot-resolved run");
+    ok = fixture_init(&f, 1u << 24, keys, 4, 3, 4);
+    if (!ok) {
+        FAIL("fixture");
+        fixture_fini(&f);
+        return;
+    }
+    baseline = reserved_of(f.sess);
+    f.sess->tdd_input_run = (wl_columnar_eval_tdd_run_t *)1;
+    ok = col_diff_join_batch_producer_create(f.sess, &f.op, f.left, false,
+            KEY0, KEY0, 1, 4096, &cont) == EINVAL && cont == NULL;
+    f.sess->tdd_input_run = NULL;
+    for (uint32_t i = 0; ok && i < f.sess->arr_count; i++)
+        ok = f.sess->arr_entries[i].pin_count == 0;
+    ok = ok && reserved_of(f.sess) == baseline;
+    /* The same call outside a slot-resolved run creates the producer. */
+    ok = ok && col_diff_join_batch_producer_create(f.sess, &f.op, f.left,
+            false, KEY0, KEY0, 1, 4096, &cont) == 0 && cont != NULL;
+    if (cont)
+        wl_columnar_continuation_destroy(cont);
+    fixture_fini(&f);
+    if (ok)
+        PASS();
+    else
+        FAIL("the differential producer ran in a slot-resolved run");
+}
+
 /* #2201: cancel returns the index, its reservation and the reader before
  * destroy, and destroy after cancel releases nothing twice. */
 static void
@@ -5563,7 +5652,9 @@ test_join_batch_eligibility_order(void)
         || col_join_batch_eligibility(&session, 0, true, true)
         != COL_JOIN_BATCH_EXCLUDED_CROSS
         || col_join_batch_eligibility(&slot_run, 1, true, true)
-        != COL_JOIN_BATCH_EXCLUDED_WORKER
+        != COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT
+        || col_join_batch_eligibility(&slot_run, 1, true, false)
+        != COL_JOIN_BATCH_ELIGIBLE
         || col_join_batch_eligibility(&worker, 1, false, false)
         != COL_JOIN_BATCH_ELIGIBLE
         || col_join_batch_eligibility(&session, 1, true, true)
@@ -7579,6 +7670,8 @@ main(void)
     test_owned_index_empty_right();
     test_owned_index_failures_release();
     test_owned_index_cancel_releases();
+    test_owned_index_refuses_control();
+    test_diff_producer_refuses_slot_run();
     test_operator_delta_and_filter_fallbacks();
     test_stale_by_arrangement_rebuild();
     test_sink_prepare_resize_failure();

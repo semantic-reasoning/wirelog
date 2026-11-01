@@ -23,6 +23,7 @@
 
 #include "../wirelog/backend.h"
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
 #include "../wirelog/passes/jpp.h"
@@ -49,18 +50,33 @@ static int tests_failed = 0;
         } while (0)
 
 static int snapshot_token;
+/* What the last instance run_round ran and failed returned. */
+static int last_rc;
 
 /* A worker copies its coordinator's bounded join knob
  * (WIRELOG_JOIN_BATCH_BYTES and WIRELOG_JOIN_BATCH_STRICT, read when the
- * session is created), and a TDD bound run refuses it with ENOTSUP.  Clear
- * it on each worker these tests create, as the production insertion caller
- * does for its clones (eval_tdd_insert.c, insert_clone_prepare). */
+ * session is created).  Clear it on each worker these tests create, so
+ * that the environment does not decide which JOIN path a test takes; the
+ * tests of the knob set it afterwards. */
 static void
 worker_clear_join_batch(wl_col_session_t *worker)
 {
     worker->join_batch_bytes = 0;
     worker->join_batch_strict = false;
 }
+
+/* The bounded join knob run_instance gives each worker it creates, and
+ * what those workers recorded: bounded runs by route and fallbacks
+ * (#2201). */
+static uint64_t knob_bytes;
+static bool knob_strict;
+static uint32_t knob_runs[3];
+static uint32_t knob_fallbacks;
+static uint8_t knob_reason;
+
+/* A FULL read of override_name binds override_rel when it is set. */
+static const char *override_name;
+static col_rel_t *override_rel;
 static char message[256];
 
 #define MAX_COLS 4
@@ -227,6 +243,9 @@ run_instance(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
             &m->reads[slice->read_start + r];
         col_rel_t *rel = read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_DELTA && delta
             ? delta : session_find_rel(coord, read->relation_name);
+        if (read->kind == WL_COLUMNAR_EVAL_TDD_PLAN_FULL && override_name
+            && strcmp(read->relation_name, override_name) == 0)
+            rel = override_rel;
         if (!rel)
             return ENOENT;
         inputs[r] = capture(read, rel);
@@ -236,12 +255,19 @@ run_instance(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
     if (rc != 0)
         return rc;
     worker_clear_join_batch(&worker);
+    worker.join_batch_bytes = knob_bytes;
+    worker.join_batch_strict = knob_strict;
     memset(&run, 0, sizeof(run));
     rc = wl_columnar_eval_tdd_run_bound_slice_begin(&worker, sp, m,
             slice_index, &snapshot_token, NULL, 0, 1, inputs,
             slice->read_count, &run);
     if (rc == 0)
         rc = wl_columnar_eval_tdd_run_bound_slice_finish(&run, &result);
+    for (uint32_t r = 0; r < 3; r++)
+        knob_runs[r] += worker.join_batch_runs[r];
+    knob_fallbacks += worker.join_batch_fallback_count;
+    if (worker.join_batch_fallback_count)
+        knob_reason = worker.join_batch_last_reason;
     if (rc == 0 && result && out) {
         out->ncols = result->ncols;
         out->timestamped |= result->timestamps != NULL;
@@ -277,6 +303,7 @@ run_round(fixture_t *f, const char *head, const char *changed,
     for (uint32_t s = 0; s < m.slice_count; s++) {
         int rc = run_instance(coord, &f->plan->strata[si], &m, s, delta, out);
         if (rc != 0) {
+            last_rc = rc;
             snprintf(message, sizeof(message), "%s instance %u: rc %d", head,
                 s, rc);
             wl_columnar_eval_tdd_plan_bindings_free(&m);
@@ -673,9 +700,9 @@ try_begin(wl_col_session_t *coord, const wl_plan_stratum_t *sp,
 }
 
 /* Inputs that do not match the instance are refused before the run takes
- * anything, and so is a worker whose differential operators are active or
- * that asks for bounded join batching (join_batch_bytes or
- * join_batch_strict). */
+ * anything, and so is a worker whose differential operators are active.  A
+ * worker that asks for bounded join batching (join_batch_bytes or
+ * join_batch_strict) runs (#2201). */
 static void
 test_refused_inputs(void)
 {
@@ -689,7 +716,7 @@ test_refused_inputs(void)
     bool clean = false;
     bool have_manifest = false;
 
-    BEGIN("mismatched inputs, differential and batching workers are refused");
+    BEGIN("mismatched inputs and differential workers are refused");
     CHECK(fixture_open(&f,
         ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
         ".decl t(x: int64, y: int64)\n"
@@ -742,16 +769,17 @@ test_refused_inputs(void)
         FAIL("an active differential worker was not refused cleanly");
         goto done;
     }
-    /* A bound run does not batch its joins: a worker that asks for the
-     * bounded join knob, or only for its strict mode, is refused. */
+    /* A bound run batches its joins under the knob (#2201): a worker that
+     * asks for it, or only for its strict mode, which without a byte
+     * budget batches nothing, runs. */
     if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token,
-        WORKER_JOIN_BATCH_BYTES, &clean) != ENOTSUP || !clean) {
-        FAIL("a worker with join_batch_bytes set was not refused cleanly");
+        WORKER_JOIN_BATCH_BYTES, &clean) != 0) {
+        FAIL("a worker with join_batch_bytes set did not run");
         goto done;
     }
     if (try_begin(coord, sp, &m, 0, inputs, 2, &snapshot_token,
-        WORKER_JOIN_BATCH_STRICT, &clean) != ENOTSUP || !clean) {
-        FAIL("a worker with join_batch_strict set was not refused cleanly");
+        WORKER_JOIN_BATCH_STRICT, &clean) != 0) {
+        FAIL("a worker with join_batch_strict set did not run");
         goto done;
     }
     tests_passed++;
@@ -1010,6 +1038,332 @@ done:
     fixture_close(&f);
 }
 
+/* Run @head's round 0 with @changed under the knob @bytes/@strict.  With
+ * @want_rc zero the rows must equal @want; without the knob no JOIN may run
+ * bounded; with it the workers must have recorded bounded runs on the
+ * ordinary route when @ordinary is set and on the pipeline route when
+ * @pipeline is, none on the differential route, and, when @reason is zero,
+ * no fallback, else at least one with @reason last (#2201).  A nonzero
+ * @want_rc is what an instance must fail with instead. */
+static const char *
+knob_round(fixture_t *f, const char *head, const char *changed,
+    col_rel_t *delta, uint64_t bytes, bool strict, bool ordinary,
+    bool pipeline, uint8_t reason, int want_rc,
+    const int64_t (*want)[MAX_COLS], uint32_t nwant, uint32_t ncols)
+{
+    rows_t got;
+    const char *why;
+
+    knob_bytes = bytes;
+    knob_strict = strict;
+    memset(knob_runs, 0, sizeof(knob_runs));
+    knob_fallbacks = 0;
+    knob_reason = 0;
+    last_rc = 0;
+    why = run_round(f, head, changed, delta, &got);
+    knob_bytes = 0;
+    knob_strict = false;
+    if (want_rc != 0) {
+        if (last_rc == want_rc)
+            return NULL;
+        snprintf(message, sizeof(message), "rc %d, want %d", last_rc,
+            want_rc);
+        return message;
+    }
+    if (why)
+        return why;
+    why = same_rows(&got, want, nwant, ncols);
+    if (why)
+        return why;
+    if (bytes == 0)
+        return knob_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+               + knob_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 0
+               ? NULL : "a run without the knob ran bounded";
+    if ((ordinary && knob_runs[COL_JOIN_BATCH_RUN_ORDINARY] == 0)
+        || (pipeline && knob_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 0)
+        || knob_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL] != 0
+        || (reason == 0 && knob_fallbacks != 0)
+        || (reason != 0 && (knob_fallbacks == 0 || knob_reason != reason))) {
+        snprintf(message, sizeof(message),
+            "runs ordinary %u pipeline %u differential %u, %u fallbacks, "
+            "last reason %u",
+            knob_runs[COL_JOIN_BATCH_RUN_ORDINARY],
+            knob_runs[COL_JOIN_BATCH_RUN_PIPELINE],
+            knob_runs[COL_JOIN_BATCH_RUN_DIFFERENTIAL], knob_fallbacks,
+            knob_reason);
+        return message;
+    }
+    return NULL;
+}
+
+/* e, f and g for the three-atom chain: (7, 6) is the new row of e and
+ * (6, 3) of f. */
+static const data_t EFG[] = {
+    { "e", 2, 3, { { 1, 2 }, { 5, 6 }, { 7, 6 } } },
+    { "f", 2, 4, { { 2, 3 }, { 2, 20 }, { 6, 4 }, { 6, 3 } } },
+    { "g", 2, 4, { { 3, 30 }, { 4, 40 }, { 1, 10 }, { 2, 20 } } },
+};
+static const char CHAIN3[] =
+    ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
+    ".decl g(x: int64, y: int64)\n.decl r(x: int64, v: int64)\n"
+    "r(x, v) :- e(x, y), f(y, w), g(w, v).\n";
+
+/* Issue #2201: a bound run's JOINs run the bounded producer under the
+ * knob, with the rows the one-shot JOIN derives.  A JOIN followed by a
+ * MAP that ends the instance runs on the pipeline route, with the right
+ * operand FULL and with it the driven delta, and strict mode refuses
+ * none.  In a three-atom chain the first JOIN feeds the second: it runs on
+ * the ordinary route, with a FULL right operand and with the driven delta,
+ * and is recorded as pipeline-not-consumable, which strict mode refuses
+ * with ENOTSUP. */
+static void
+test_bound_runs_batch_joins(void)
+{
+    static const data_t chain[] = {
+        { "e", 2, 3, { { 1, 2 }, { 2, 3 }, { 3, 4 } } },
+    };
+    static const data_t added = { "e", 2, 1, { { 2, 3 } } };
+    static const int64_t self_want[][MAX_COLS] = { { 2, 4 }, { 1, 3 } };
+    static const int64_t by_e[][MAX_COLS] = { { 7, 5 }, { 7, 4 } };
+    static const int64_t by_f[][MAX_COLS] = { { 5, 4 }, { 7, 4 } };
+    /* e(7, 6) reaches g(4, 40) and g(3, 30); f(6, 3) is reached from
+     * e(5, 6) and e(7, 6) and reaches g(3, 30). */
+    static const int64_t chain_e[][MAX_COLS] = { { 7, 40 }, { 7, 30 } };
+    static const int64_t chain_f[][MAX_COLS] = { { 5, 30 }, { 7, 30 } };
+    static const uint64_t bytes[] = { 0, 224, 224 };
+    static const bool strict[] = { false, false, true };
+    const uint8_t pipe = COL_JOIN_BATCH_EXCLUDED_PIPELINE;
+    fixture_t f;
+    col_rel_t *de = NULL, *df = NULL;
+
+    BEGIN("bound runs batch their joins under the knob");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl m(x: int64, z: int64)\n"
+        "m(x, z) :- e(x, y), e(y, z).\n", false, chain, 1));
+    de = delta_of(COL_SESSION(f.session), "e", &added);
+    if (!de) {
+        FAIL("delta");
+        goto done;
+    }
+    for (uint32_t k = 0; k < 3; k++)
+        CHECK(knob_round(&f, "m", "e", de, bytes[k], strict[k], false, true,
+            0, 0, self_want, 2, 2));
+    col_rel_destroy(de);
+    de = NULL;
+    fixture_close(&f);
+
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
+        ".decl t(x: int64, y: int64)\n"
+        "t(x, w + 1) :- e(x, y), f(y, w), w < 10.\n", false, EF, 2));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    df = delta_of(COL_SESSION(f.session), "f", &NEW_F);
+    if (!de || !df) {
+        FAIL("delta");
+        goto done;
+    }
+    for (uint32_t k = 0; k < 3; k++) {
+        CHECK(knob_round(&f, "t", "e", de, bytes[k], strict[k], false, true,
+            0, 0, by_e, 2, 2));
+        CHECK(knob_round(&f, "t", "f", df, bytes[k], strict[k], false, true,
+            0, 0, by_f, 2, 2));
+    }
+    col_rel_destroy(de);
+    col_rel_destroy(df);
+    de = df = NULL;
+    fixture_close(&f);
+
+    CHECK(fixture_open(&f, CHAIN3, false, EFG, 3));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    df = delta_of(COL_SESSION(f.session), "f", &NEW_F);
+    if (!de || !df) {
+        FAIL("delta");
+        goto done;
+    }
+    for (uint32_t k = 0; k < 2; k++) {
+        CHECK(knob_round(&f, "r", "e", de, bytes[k], false, true, true,
+            pipe, 0, chain_e, 2, 2));
+        CHECK(knob_round(&f, "r", "f", df, bytes[k], false, true, true,
+            pipe, 0, chain_f, 2, 2));
+    }
+    CHECK(knob_round(&f, "r", "e", de, 224, true, false, false, 0, ENOTSUP,
+        NULL, 0, 0));
+    CHECK(knob_round(&f, "r", "f", df, 224, true, false, false, 0, ENOTSUP,
+        NULL, 0, 0));
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    col_rel_destroy(de);
+    col_rel_destroy(df);
+    fixture_close(&f);
+}
+
+/* Issue #2201: the bounded producer of a bound run reads the relation the
+ * input slot holds, not the session relation of that name.  The FULL read
+ * of f is bound to a private relation named f whose rows the session's f
+ * does not have; on the pipeline route (a JOIN followed by a MAP) and on
+ * the ordinary route (the first JOIN of a three-atom chain) the rows
+ * derive from the private relation, with and without the knob. */
+static void
+test_bound_join_reads_slot_not_name(void)
+{
+    static const data_t private_f = { "f", 2, 2, { { 6, 1 }, { 6, 2 } } };
+    /* e(7, 6) joins the private f(6, 1) and f(6, 2), not the session's
+     * f(6, 4) and f(6, 3); in the chain those reach g(1, 10) and
+     * g(2, 20). */
+    static const int64_t joined[][MAX_COLS] = { { 7, 1 }, { 7, 2 } };
+    static const int64_t chained[][MAX_COLS] = { { 7, 10 }, { 7, 20 } };
+    static const uint64_t bytes[] = { 0, 224, 224 };
+    static const bool strict[] = { false, false, true };
+    fixture_t f;
+    col_rel_t *de = NULL, *pf = NULL;
+
+    BEGIN("bound join reads the slot's relation, not the name's");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
+        ".decl j(x: int64, w: int64)\n"
+        "j(x, w) :- e(x, y), f(y, w).\n", false, EF, 2));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    pf = delta_of(COL_SESSION(f.session), "f", &private_f);
+    if (!de || !pf) {
+        FAIL("relations");
+        goto done;
+    }
+    override_name = "f";
+    override_rel = pf;
+    for (uint32_t k = 0; k < 3; k++)
+        CHECK(knob_round(&f, "j", "e", de, bytes[k], strict[k], false, true,
+            0, 0, joined, 2, 2));
+    override_name = NULL;
+    override_rel = NULL;
+    col_rel_destroy(de);
+    de = NULL;
+    col_rel_destroy(pf);
+    pf = NULL;
+    fixture_close(&f);
+
+    CHECK(fixture_open(&f, CHAIN3, false, EFG, 3));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    pf = delta_of(COL_SESSION(f.session), "f", &private_f);
+    if (!de || !pf) {
+        FAIL("relations");
+        goto done;
+    }
+    override_name = "f";
+    override_rel = pf;
+    for (uint32_t k = 0; k < 2; k++)
+        CHECK(knob_round(&f, "r", "e", de, bytes[k], false, true, true,
+            COL_JOIN_BATCH_EXCLUDED_PIPELINE, 0, chained, 2, 2));
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    override_name = NULL;
+    override_rel = NULL;
+    col_rel_destroy(de);
+    col_rel_destroy(pf);
+    fixture_close(&f);
+}
+
+/* Issue #2201: an empty FULL right operand in a bound run is left to the
+ * ordinary JOIN, which joins it in one pass without a producer, on the
+ * pipeline's tail as on any session: no bounded run, no fallback, and an
+ * empty result in record and strict mode. */
+static void
+test_bound_join_empty_right(void)
+{
+    static const data_t no_rows = { "f", 2, 0, { { 0 } } };
+    static const bool strict[] = { false, true };
+    fixture_t f;
+    rows_t got;
+    col_rel_t *de = NULL, *pf = NULL;
+
+    BEGIN("bound join over an empty right operand runs one-shot");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
+        ".decl t(x: int64, y: int64)\n"
+        "t(x, w + 1) :- e(x, y), f(y, w), w < 10.\n", false, EF, 2));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    pf = delta_of(COL_SESSION(f.session), "f", &no_rows);
+    if (!de || !pf || pf->nrows != 0) {
+        FAIL("relations");
+        goto done;
+    }
+    override_name = "f";
+    override_rel = pf;
+    for (uint32_t k = 0; k < 2; k++) {
+        knob_bytes = 224;
+        knob_strict = strict[k];
+        memset(knob_runs, 0, sizeof(knob_runs));
+        knob_fallbacks = 0;
+        const char *why = run_round(&f, "t", "e", de, &got);
+        knob_bytes = 0;
+        knob_strict = false;
+        CHECK(why);
+        CHECK(got.count == 0 ? NULL : "rows from an empty right operand");
+        CHECK(knob_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+            + knob_runs[COL_JOIN_BATCH_RUN_PIPELINE] == 0
+            && knob_fallbacks == 0
+            ? NULL : "an empty right operand ran bounded or fell back");
+    }
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    override_name = NULL;
+    override_rel = NULL;
+    col_rel_destroy(de);
+    col_rel_destroy(pf);
+    fixture_close(&f);
+}
+
+/* Issue #2201: a batch budget below one output row is a fallback in a
+ * bound run as on any session.  Without strict mode the JOIN runs one-shot
+ * with the knob-off rows and records row-too-large last, on the pipeline's
+ * tail and on the first JOIN of a three-atom chain alike; strict mode
+ * refuses the instance with ENOTSUP. */
+static void
+test_bound_join_row_too_large(void)
+{
+    static const int64_t by_e[][MAX_COLS] = { { 7, 5 }, { 7, 4 } };
+    static const int64_t chain_e[][MAX_COLS] = { { 7, 40 }, { 7, 30 } };
+    const uint8_t row = COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE;
+    fixture_t f;
+    col_rel_t *de = NULL;
+
+    BEGIN("bound join with a sub-row batch budget falls back");
+    CHECK(fixture_open(&f,
+        ".decl e(x: int64, y: int64)\n.decl f(x: int64, y: int64)\n"
+        ".decl t(x: int64, y: int64)\n"
+        "t(x, w + 1) :- e(x, y), f(y, w), w < 10.\n", false, EF, 2));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    if (!de) {
+        FAIL("delta");
+        goto done;
+    }
+    CHECK(knob_round(&f, "t", "e", de, 8, false, false, false, row, 0,
+        by_e, 2, 2));
+    CHECK(knob_round(&f, "t", "e", de, 8, true, false, false, 0, ENOTSUP,
+        NULL, 0, 0));
+    col_rel_destroy(de);
+    de = NULL;
+    fixture_close(&f);
+
+    CHECK(fixture_open(&f, CHAIN3, false, EFG, 3));
+    de = delta_of(COL_SESSION(f.session), "e", &NEW_E);
+    if (!de) {
+        FAIL("delta");
+        goto done;
+    }
+    CHECK(knob_round(&f, "r", "e", de, 8, false, false, false, row, 0,
+        chain_e, 2, 2));
+    CHECK(knob_round(&f, "r", "e", de, 8, true, false, false, 0, ENOTSUP,
+        NULL, 0, 0));
+    tests_passed++;
+    printf(" ... PASS\n");
+done:
+    col_rel_destroy(de);
+    fixture_close(&f);
+}
+
 int
 main(void)
 {
@@ -1023,6 +1377,10 @@ main(void)
     test_refused_inputs();
     test_leading_ranges();
     test_range_refusals();
+    test_bound_runs_batch_joins();
+    test_bound_join_reads_slot_not_name();
+    test_bound_join_empty_right();
+    test_bound_join_row_too_large();
     printf("%d run, %d passed, %d failed\n", tests_run, tests_passed,
         tests_failed);
     return tests_failed ? 1 : 0;

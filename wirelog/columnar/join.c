@@ -2391,6 +2391,61 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
      * verdict stands. */
     if (bounded && (right->nrows == 0 || left->nrows == 0))
         bounded = false;
+    /* A worker run that resolves its operands by input slot (a TDD bound
+     * run or insert clone) runs the producer over an index it builds on
+     * the slot's relation (#2201): the registry there need not hold @right
+     * under its name.  The block returns before the probe setup below, so
+     * no ephemeral hash is built beside that index.  A create ENOTSUP (one
+     * output row does not fit the batch budget) outside strict mode is
+     * recorded as row-too-large and falls through to the one-shot join. */
+    if (bounded && sess->tdd_input_run) {
+        wl_columnar_continuation_t *cont = NULL;
+        col_rel_t *bounded_out = NULL;
+        int bounded_rc = wl_columnar_join_new_output(sess, left, right,
+                "$join", ocols, COL_REL_INIT_CAP, false, true, &bounded_out);
+        if (bounded_rc == 0)
+            bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
+                    col_join_set_output_types(bounded_out, left, right, op));
+        if (bounded_rc == 0) {
+            bounded_rc = col_join_batch_producer_create_over(sess, op, left,
+                    left_e.is_delta, right, lk, rk, kc,
+                    sess->join_batch_bytes, &cont);
+            if (bounded_rc == ENOTSUP && !sess->join_batch_strict)
+                col_join_batch_record_fallback(sess,
+                    COL_JOIN_BATCH_EXCLUDED_ROW_TOO_LARGE);
+        }
+        if (bounded_rc == 0) {
+            bounded_rc = wl_columnar_join_budget_denial(sess, bounded_out,
+                    col_join_batch_run_to_relation(cont, sess, bounded_out));
+            wl_columnar_continuation_destroy(cont);
+        }
+        if (bounded_rc == 0) {
+            col_join_batch_record_run(sess, COL_JOIN_BATCH_RUN_ORDINARY);
+            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+#ifdef WL_PROFILE
+            if (bounded_out->nrows == 0)
+                sess->profile.join_empty_out++;
+            sess->profile.join_compute_ns += now_ns() - _t0_join;
+#endif
+            /* As the one-shot join publishes its result below. */
+            return wl_columnar_join_publish_after_left(stack, &left_e,
+                       bounded_out, projected_join ? false
+                       : (left_e.is_delta || used_right_delta));
+        }
+        if (bounded_out)
+            col_rel_destroy(bounded_out);
+        if (bounded_rc != ENOTSUP || sess->join_batch_strict) {
+            wl_columnar_join_key_scratch_free(&key_scratch, &lk);
+            wl_columnar_join_key_scratch_free(&key_scratch, &rk);
+            if (right_filtered)
+                col_rel_destroy(right_filtered);
+            return wl_columnar_join_dispose_left(stack, &left_e, bounded_rc);
+        }
+        bounded = false;
+    }
     /* Governed outputs and materialized results outlive the current
      * delta-pool reset, so both require heap-owned relation descriptors. */
     col_rel_t *out = NULL;

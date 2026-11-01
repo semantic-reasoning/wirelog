@@ -300,10 +300,10 @@ normal_eval:
                  * sink (end of plan, CONCAT, CONSOLIDATE, or an EXCHANGE
                  * across more than one worker) has the outcome a final
                  * JOIN would have, and one read by another operator is
-                 * recorded as pipeline-not-consumable.  TDD bound runs
-                 * refuse WIRELOG_JOIN_BATCH_BYTES, so the plan slices they
-                 * evaluate, whose end is not a rule's end, do not get
-                 * here. */
+                 * recorded as pipeline-not-consumable.  A TDD bound run
+                 * evaluates a slice of a rule's plan whose ops end where
+                 * the slice ends, so a JOIN ending the slice reaches a
+                 * relation sink here too (#2201). */
                 if (pipeline_rc == 0) {
                     if (decline == WL_COLUMNAR_JOIN_PIPELINE_DECLINE_ORDINARY)
                         goto ordinary_join;

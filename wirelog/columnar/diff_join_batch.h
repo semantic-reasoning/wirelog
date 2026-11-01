@@ -11,7 +11,8 @@
 /* Create a resumable producer over a fully indexed persistent differential
  * arrangement.  The arrangement is incrementally indexed and committed
  * before the producer is returned; the producer then holds a generation pin
- * for its entire continuation lifetime. */
+ * for its entire continuation lifetime.  EINVAL in a worker run that
+ * resolves its operands by input slot (#2201). */
 int
 col_diff_join_batch_producer_create(wl_col_session_t *sess,
     const wl_plan_op_t *op, const col_rel_t *left, bool left_is_delta,

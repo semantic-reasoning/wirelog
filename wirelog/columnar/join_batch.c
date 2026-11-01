@@ -57,16 +57,16 @@ col_join_batch_eligibility(const wl_col_session_t *sess, uint32_t key_count,
 {
     if (!sess || sess->join_batch_bytes == 0)
         return COL_JOIN_BATCH_EXCLUDED_OFF;
-    /* A worker run that resolves its JOIN operands by input slot (a TDD
-     * bound run or insert clone) may read a range piece or delta under
-     * the relation's name, which the producer, pinning by name, would not
-     * see (#2201).  Other worker sessions resolve by name and are no
-     * exclusion of their own. */
-    if (sess->tdd_input_run)
-        return COL_JOIN_BATCH_EXCLUDED_WORKER;
     if (key_count == 0)
         return COL_JOIN_BATCH_EXCLUDED_CROSS;
-    if (used_right_delta)
+    /* A worker run that resolves its JOIN operands by input slot (a TDD
+     * bound run or insert clone) runs the producer over an index it builds
+     * on the slot's relation (col_join_batch_producer_create_over), so a
+     * delta in the slot is read as any other relation (#2201).  Elsewhere
+     * the producer pins the arrangement of the relation by name, which a
+     * delta right operand is not.  COL_JOIN_BATCH_EXCLUDED_WORKER is no
+     * longer returned. */
+    if (used_right_delta && !sess->tdd_input_run)
         return COL_JOIN_BATCH_EXCLUDED_DELTA_RIGHT;
     if (has_right_filter)
         return COL_JOIN_BATCH_EXCLUDED_FILTERED_RIGHT;
@@ -311,9 +311,10 @@ producer_validate(void *context,
         || c->left_storage_gen == UINT64_MAX
         || c->right_storage_gen == UINT64_MAX)
         return false;
-    /* The arrangement is pinned and the registry defers any rebuild under
-     * the lease, so a changed epoch or indexed extent means the index was
-     * replaced outside this lease; both stay load-bearing. */
+    /* The arrangement is pinned, and the registry defers any rebuild under
+     * the lease, or it is owned by this producer and never rebuilt, so a
+     * changed epoch or indexed extent means the index was replaced outside
+     * this producer; both stay load-bearing. */
     if (cursor->generation != p->arr->generation
         || c->arr_generation != p->arr->generation
         || c->arr_indexed_rows != p->arr->indexed_rows)
@@ -1221,6 +1222,11 @@ col_join_batch_control_bind(wl_columnar_continuation_t *cont,
 
     if (!p || !p->batch || !control || !attempt_id)
         return EINVAL;
+    /* Controlled stepping polls the registry pin, which a producer over
+     * its own index (col_join_batch_producer_create_over) does not hold
+     * (#2201). */
+    if (p->arr == &p->own_arr)
+        return ENOTSUP;
     /* The controlled tariff admits one native INT64 key (eight canonical
      * hash bytes) and no more than 64 output lanes. */
     if (p->kc != 1 || p->batch->ncols == 0 || p->batch->ncols > 64

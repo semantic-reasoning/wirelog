@@ -299,8 +299,11 @@ the initial positive phase, iteration zero, with worker 0 of 1 and a NULL
 partition. Complete operator and expression payloads must match the generated
 forms. The bound VARIABLE path bypasses ordinary later-iteration empty-seed
 selection, so other seed phases, alternatives and forms remain explicitly
-refused. Inactive slices, other K=1 forms, retractions/diff operators, batch pipelines,
-right filters and unsupported operators also refuse before evaluation.
+refused. Inactive slices, other K=1 forms, retractions/diff operators, right
+filters and unsupported operators also refuse before evaluation. Since #2201 a
+worker's bounded join knob (`WIRELOG_JOIN_BATCH_BYTES`) is not refused: an
+eligible JOIN that a bound run evaluates runs the bounded producer over an
+index of its own on the relation its right slot holds.
 The caller must schedule each seed once; the helper does not enforce once-only
 execution across calls. Its outputs are raw tuple bags preserving duplicates,
 without UNION consolidation. Existing conservative TDD admission and SCC
@@ -330,12 +333,13 @@ output is a raw bag, as for the other forms: the caller consolidates the
 union of instance outputs. The
 operators it refuses are the ones the binder already refuses, so every
 instance the binder lists can begin on a worker in a plain state: a worker
-with retraction or delta seeding, differential operators or a batch pipeline
-active is refused before evaluation, and so is a run the memory governor
-denies. `wl_columnar_eval_tdd_insert_stratum()` runs the instances on one
-worker clone with those session flags cleared, since a clone copies them
-from the coordinator; a session's bounded join batching, strict mode
-included, is therefore off for these runs.  With `WIRELOG_JOIN_BATCH_BYTES`
+with retraction or delta seeding or differential operators active is refused
+before evaluation, and so is a run the memory governor denies; a worker with
+the bounded join knob set is not refused since #2201.
+`wl_columnar_eval_tdd_insert_stratum()` runs the instances on one worker
+clone with those session flags cleared, since a clone copies them from the
+coordinator, and it also clears the clone's bounded join batching, strict
+mode included, so that is off for these runs.  With `WIRELOG_JOIN_BATCH_BYTES`
 set and without strict mode, a snapshot that attempts this route through a
 stratum with a JOIN records the `insert-route` fallback; under
 `WIRELOG_JOIN_BATCH_STRICT` the route is refused, recording nothing, before
