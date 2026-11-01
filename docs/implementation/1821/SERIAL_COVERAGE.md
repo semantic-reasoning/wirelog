@@ -634,3 +634,60 @@ original reports, and normal insertion/scalar reading after drain. This is a
 source primitive foundation; VARIABLE/JOIN/probe/LFTJ destination integration
 for unspecialized empty EDBs remains outstanding until exercised through the
 real session hosts.
+
+
+### Borrowed no-insert VARIABLE and ordinary JOIN (#2297)
+
+Normal FULL/AUTO VARIABLE now acquires the authentic empty-source reader and
+installs the exact borrowed descriptor after actual END. Direct numeric and
+composed fixtures assert physical width0, `schema_ok=false`, unchanged Arrow
+state and future graph metadata; declaration width never becomes a physical
+column. Forced-empty constructors retain their existing admission boundary.
+
+Ordinary owned JOIN has a separate authenticated metadata view for these
+sources. Left-empty, right-empty and both-empty fixtures compare raw results,
+projection/default types, output ownership/delta and FLOAT mismatch errors.
+The producer host uses a zero-width routing hint before normal scalar HOLD;
+the ordinary destination independently proves the empty constructor image.
+`evaluation_join_hosts_domains` also runs genuine compiler/session no-insert
+inputs with batch0 and configured64. It exercises first insertion into those
+same descriptors after completion and an admitted ordinary dirty successor.
+Configured dirty batch admission is still separate policy work; that successor
+witness deliberately disables batching and does not qualify that policy.
+
+Numeric and composed source END and owned non-stream JOIN reader END receive
+the actual independent funding before the generic HOST384 debit. They pay
+dispatch1 plus the reader's real release/final-clear charges; pending receipt
+consumption and normal cleanup retain HOST384. Zero-success intermediate
+release and CAS retry do not authorize install/commit/ACK. Tests cover a
+refused dispatcher, dispatched funding refusal, partial descriptor acquisition,
+cancellation/work stop, malformed source shape, protected schema/destruction,
+completed-report preservation and first insertion after drain. The new query
+refuses a real active stream frame; no stream cleanup authority is introduced.
+
+A stale standalone missing-right probe rejection is corrected to the existing
+exact-repush semantics and checks that the original entry is unchanged. This
+unit does not qualify forced-empty bare selectors, present-empty standalone
+SEMI/ANTI, LFTJ physical-zero keys, strict/cache/output-cap/shared-count policy
+or observed STEP/SNAPSHOT and configured batch successors. Those remain
+required in this grouped PR before either issue can be closed.
+
+Zero-row right FILTERs still validate size/data and the real new-like graph
+recipe before key/type/output work. SIMPLE recognition shares the metered
+instruction decoder and exact raw grammar. NON-simple setup uses the raw
+compiler opcode domain: STRING comparisons really compile, HASH/CRC and
+malformed/unsupported programs take the unevaluated fallback. Its compiled
+owner is stored only for real PROGRAM cleanup and is never passed to numeric
+evaluation. Existing nonempty numeric compilation keeps its prior domain.
+Tests distinguish these paths with actual allocation/checkpoint witnesses,
+including maximal VAR digits, invalid/truncated forms, NULL data, graph
+recipe errors, FLOAT mismatch, missing/forced-empty bypass, original stops
+and actual compiler ENOMEM/ENOSPC with source/program credit recovery.
+The bounded path omits optional empty filtered-table/cache materialization;
+it governs every allocation it actually attempts and does not claim identical
+cache-specific memory thresholds to raw execution.
+
+The same session-host empty-input matrix additionally runs an explicitly
+modified right-FILTER plan with batch0/configured64, then first insertion and
+ordinary dirty execution. This edited-plan witness is separate from its
+unchanged compiler-generated base plan.

@@ -135,6 +135,9 @@ checkpoint(wl_evaluation_control_t *control, unsigned event,
         CHECK(!wl_columnar_eval_stack_framed_context(active->frame, session,
             &ctx));
         wl_columnar_eval_plan_numeric_attempt_t *r = &ctx->child;
+        bool empty_cleanup = true;
+        CHECK(wl_columnar_filter_empty_end_pending_owned(active->frame, r,
+            &empty_cleanup) == EBUSY && !empty_cleanup);
         const col_rel_t *input = NULL; const wl_plan_op_t *op = NULL;
         uint64_t gen = 0; bool schema = false;
         CHECK(!wl_columnar_join_pipeline_test_stream_view(r, &input, &gen,
@@ -394,11 +397,116 @@ verify(fixture_t *f, wl_session_t *session)
     }
 }
 
+static void
+never_inserted_domains(void)
+{
+    static const char text[] =
+        ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+        ".decl output(x:int64,y:int64)\noutput(x,y) :- a(k,x), b(k,y).\n";
+    for (unsigned filtered = 0; filtered < 2; ++filtered)
+        for (unsigned empty = 1; empty < 4; ++empty)
+            for (unsigned batch = 0; batch < 2; ++batch) {
+                fixture_t f = {0};
+                wirelog_error_t error;
+                f.program = wirelog_parse_string(text, &error);
+                CHECK(f.program && !wl_plan_from_program(f.program, &f.plan));
+                if (filtered) {
+                    /* Explicit internal-plan variant on the real session host;
+                     * the base program above is compiler-generated unchanged. */
+                    const uint8_t predicate[] = {WL_PLAN_EXPR_VAR, 4, 0,
+                                                 'c', 'o', 'l', '1',
+                                                 WL_PLAN_EXPR_CONST_INT, 23, 0,
+                                                 0, 0, 0, 0, 0, 0,
+                                                 WL_PLAN_EXPR_CMP_EQ};
+                    wl_plan_op_t *join = NULL;
+                    for (uint32_t i = 0;
+                        i < f.plan->strata[0].relations[0].op_count; ++i) {
+                        wl_plan_op_t *op = &((wl_plan_op_t *)
+                            f.plan->strata[0].relations[0].ops)[i];
+                        if (op->op == WL_PLAN_OP_JOIN) join = op;
+                    }
+                    CHECK(join && !join->right_filter_expr.data
+                        && !join->right_filter_expr.size);
+                    join->right_filter_expr.data = malloc(sizeof(predicate));
+                    CHECK(join->right_filter_expr.data);
+                    memcpy(join->right_filter_expr.data, predicate,
+                        sizeof(predicate));
+                    join->right_filter_expr.size = sizeof(predicate);
+                }
+                CHECK(!wl_evaluation_control_create(0, &f.control));
+                wl_columnar_memory_resolution_t resolution = {
+                    .budget_bytes = 1u << 24, .usable_bytes = 1u << 24,
+                        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                };
+                f.governor =
+                    wl_columnar_memory_governor_ref_create(&resolution);
+                CHECK(f.governor);
+                wl_session_options_t options; wl_session_options_init(&options);
+                options.evaluation_control = f.control;
+                options.memory_governor = f.governor;
+                CHECK(!wl_session_create_with_options(wl_backend_columnar(),
+                    f.plan, 1, &options, &f.session));
+                CHECK(!wl_session_create(wl_backend_columnar(), f.plan, 1,
+                    &f.raw));
+                wl_session_t *sessions[] = {f.session, f.raw};
+                int64_t rows[][2] = {{7, 19}, {7, 23}};
+                for (unsigned i = 0; i < 2; ++i) {
+                    ((wl_col_session_t *)sessions[i])->join_batch_bytes =
+                        batch ? 64 : 0;
+                    for (unsigned side = 0; side < 2; ++side) {
+                        char name[] = {(char)('a' + side), 0};
+                        if (!(empty & (1u << side))) CHECK(!wl_session_insert(
+                                    sessions[i], name, rows[side], 1, 2));
+                        else {
+                            const col_rel_t *rel = session_find_rel(
+                                (wl_col_session_t *)sessions[i], name);
+                            CHECK(rel && !rel->schema_ok && !rel->ncols
+                                && !rel->nrows && rel->storage_owner == rel);
+                        }
+                    }
+                    int result = finish(sessions[i]);
+                    if (result) fprintf(stderr,
+                            "bare session side=%u batch=%u i=%u result=%d\n",
+                            empty, batch, i, result);
+                    CHECK(!result);
+                }
+                const col_rel_t *out = session_find_rel(
+                    (wl_col_session_t *)f.session, "output");
+                const col_rel_t *raw = session_find_rel(
+                    (wl_col_session_t *)f.raw, "output");
+                CHECK(out && raw && !out->nrows && !raw->nrows
+                    && out->ncols == 2 && raw->ncols == 2 && !out->timestamps);
+                for (unsigned c = 0; c < 2; ++c) CHECK(out->column_types[c]
+                        == raw->column_types[c]);
+                /* Terminal ACK releases the original descriptors: first insertion
+                 * into the same never-inserted relation and a dirty successor work. */
+                for (unsigned i = 0; i < 2; ++i) {
+                    for (unsigned side = 0; side < 2; ++side) {
+                        char name[] = {(char)('a' + side), 0};
+                        if (empty & (1u << side)) CHECK(!wl_session_insert(
+                                    sessions[i], name, rows[side], 1, 2));
+                    }
+                    /* Dirty batch admission remains a separate policy unit.
+                     * This witness checks descriptor release with its admitted
+                     * ordinary successor after the configured fresh empty run. */
+                    ((wl_col_session_t *)sessions[i])->join_batch_bytes = 0;
+                    CHECK(!finish(sessions[i]));
+                    const col_rel_t *head = session_find_rel(
+                        (wl_col_session_t *)sessions[i], "output");
+                    CHECK(head && head->nrows == 1 && head->ncols == 2
+                        && head->columns[0][0] == 19 &&
+                        head->columns[1][0] == 23);
+                }
+                destroy(&f);
+            }
+}
+
 /* This first destination preserves the existing unobserved STEP admission.
 * Observed/SNAPSHOT and strict/capped streaming are separate host units. */
 static void
 domains(void)
 {
+    never_inserted_domains();
     for (unsigned kind = 0; kind < 12; ++kind)
         for (unsigned ts = 0; ts < 2; ++ts) {
             if (kind == 10) continue; /* Separate ERANGE qualification. */

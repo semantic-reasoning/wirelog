@@ -1926,7 +1926,13 @@ wl_columnar_expr_test_attempt_numeric_instruction_size(void)
  * these actual forward intervals; no blanket168+whole-caller sum. Root output
  * initialization/initial guard/refused-first-debit are bounded bootstrap
  * exceptions and may run with consumed0. Mandatory disposal has no control
- * poll and is not a promised latency bound. */
+ * poll and is not a promised latency bound.
+ * Raw zero-row FILTER setup adds fixed mode/tag routing (at most12 scalar
+ * steps): DECODE176+12=188 and BYTE195+12=207 remain within224. Existing
+ * numeric wrappers select the unchanged opcode domain and tariffs. SIMPLE
+ * recognition reuses these paid byte/digit regions for at most3 instructions;
+ * its separate SETUP224 pays the fixed grammar/position decisions. Raw-only
+ * comparison programs are cleanup owners, never numeric evaluator inputs. */
 enum {
     WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK = 128,
     WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK = 224,
@@ -2028,7 +2034,7 @@ static int
 wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
     uint32_t *pos,
     expr_instr_t *out, unsigned pass, wl_evaluation_control_t *control,
-    uint64_t attempt_id)
+    uint64_t attempt_id, bool raw_empty_setup)
 {
     int rc = wl_columnar_expr_attempt_charge(control, attempt_id,
             WL_COLUMNAR_EXPR_ATTEMPT_DECODE_WORK);
@@ -2039,6 +2045,9 @@ wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
             control, attempt_id);
     if (rc)
         return rc;
+    if (raw_empty_setup && (out->op == WL_PLAN_EXPR_ARITH_HASH
+        || out->op == WL_PLAN_EXPR_ARITH_CRC32_ETH
+        || out->op == WL_PLAN_EXPR_ARITH_CRC32_CAST)) return ENOTSUP;
     switch ((wl_plan_expr_tag_t)out->op) {
     case WL_PLAN_EXPR_VAR:
     case WL_PLAN_EXPR_VAR_FLOAT: {
@@ -2093,6 +2102,11 @@ wl_columnar_expr_attempt_decode(const uint8_t *buf, uint32_t size,
         out->larg = value ? 1 : 0;
         break;
     }
+    case WL_PLAN_EXPR_CMP_STR_EQ: case WL_PLAN_EXPR_CMP_STR_NEQ:
+    case WL_PLAN_EXPR_CMP_STR_LT: case WL_PLAN_EXPR_CMP_STR_GT:
+    case WL_PLAN_EXPR_CMP_STR_LTE: case WL_PLAN_EXPR_CMP_STR_GTE:
+        if (!raw_empty_setup) return ENOTSUP;
+        break;
     case WL_PLAN_EXPR_ARITH_ADD: case WL_PLAN_EXPR_ARITH_SUB:
     case WL_PLAN_EXPR_ARITH_MUL: case WL_PLAN_EXPR_ARITH_DIV:
     case WL_PLAN_EXPR_ARITH_MOD: case WL_PLAN_EXPR_ARITH_SHL:
@@ -2147,11 +2161,11 @@ wl_columnar_expr_attempt_numeric_free(wl_columnar_expr_attempt_numeric_t *owner)
         wl_columnar_memory_governor_ref_release(saved_ref);
 }
 
-int
-wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
+static int
+wl_columnar_expr_compile_attempt_mode(const uint8_t *buf, uint32_t size,
     wl_columnar_memory_governor_ref_t *governor,
     wl_columnar_expr_attempt_numeric_t **out, bool *supported,
-    wl_evaluation_control_t *control, uint64_t attempt_id)
+    wl_evaluation_control_t *control, uint64_t attempt_id, bool raw_empty_setup)
 {
     if (!out || !supported)
         return EINVAL;
@@ -2179,7 +2193,7 @@ wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
         if (rc)
             return rc;
         rc = wl_columnar_expr_attempt_decode(buf, size, &pos, &instruction,
-                1, control, attempt_id);
+                1, control, attempt_id, raw_empty_setup);
         if (rc) {
             if (rc != ENOTSUP)
                 return rc;
@@ -2297,7 +2311,7 @@ wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
         if (rc)
             goto fail;
         rc = wl_columnar_expr_attempt_decode(buf, size, &pos, &instruction,
-                2, control, attempt_id);
+                2, control, attempt_id, raw_empty_setup);
         if (rc)
             goto fail;
         rc = wl_columnar_expr_attempt_charge(control, attempt_id,
@@ -2364,6 +2378,69 @@ fail:
     if (rc == ENOTSUP)
         return wl_columnar_expr_attempt_charge(control, attempt_id, 0);
     return rc;
+}
+
+int
+wl_columnar_expr_compile_attempt_controlled(const uint8_t *buf, uint32_t size,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_attempt_numeric_t **out, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_expr_compile_attempt_mode(buf, size, governor, out,
+               supported, control, id, false);
+}
+
+/* Raw FILTER setup only, never numeric evaluation. STRING comparisons need
+ * real compilation even without rows; HASH/CRC use raw interpreter fallback
+ * and must not allocate a compiled program in this mode. */
+int
+wl_columnar_expr_compile_empty_filter_attempt_controlled(const uint8_t *buf,
+    uint32_t size, wl_columnar_memory_governor_ref_t *governor,
+    wl_columnar_expr_attempt_numeric_t **out, bool *supported,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    return wl_columnar_expr_compile_attempt_mode(buf, size, governor, out,
+               supported, control, id, true);
+}
+
+/* Same grammar as filter_is_simple_cmp, without allocation or row/schema
+ * checks. Each of at most three decoded instructions uses the existing paid
+ * byte chunks and digit regions, including malformed/non-simple inputs. */
+int
+wl_columnar_expr_simple_filter_attempt_controlled(const uint8_t *buf,
+    uint32_t size, bool *simple, wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!simple) return EINVAL;
+    *simple = false;
+    int rc = wl_columnar_expr_attempt_charge(control, id,
+            WL_COLUMNAR_EXPR_ATTEMPT_ENTRY_WORK);
+    if (rc) return rc;
+    if (!buf || !size) return !buf && size ? EINVAL : 0;
+    uint32_t pos = 0;
+    expr_instr_t instruction;
+    for (unsigned part = 0; part < 3; ++part) {
+        rc = wl_columnar_expr_attempt_decode(buf, size, &pos, &instruction,
+                1, control, id, false);
+        if (rc) return rc == ENOTSUP
+                ? wl_columnar_expr_attempt_charge(control, id, 0) : rc;
+        rc = wl_columnar_expr_attempt_charge(control, id,
+                WL_COLUMNAR_EXPR_ATTEMPT_SETUP_WORK);
+        if (rc) return rc;
+        bool accepted = part == 0 ? instruction.op == WL_PLAN_EXPR_VAR
+            : part == 1 ? instruction.op == WL_PLAN_EXPR_VAR
+            || instruction.op == WL_PLAN_EXPR_CONST_INT
+            : instruction.op == WL_PLAN_EXPR_CMP_EQ
+            || instruction.op == WL_PLAN_EXPR_CMP_NEQ
+            || instruction.op == WL_PLAN_EXPR_CMP_LT
+            || instruction.op == WL_PLAN_EXPR_CMP_GT
+            || instruction.op == WL_PLAN_EXPR_CMP_LTE
+            || instruction.op == WL_PLAN_EXPR_CMP_GTE;
+        rc = wl_columnar_expr_attempt_tail(control, id, 24, part);
+        if (rc) return rc;
+        if (!accepted) return 0;
+    }
+    *simple = pos == size;
+    return wl_columnar_expr_attempt_charge(control, id, 0);
 }
 
 /* Fixed schema lookup: the producer was resolved during paid compilation.

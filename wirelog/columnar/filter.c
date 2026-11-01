@@ -1966,6 +1966,7 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->source_bare = false; ctx->join_right_bare = false;
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -2453,6 +2454,7 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->source_bare = false; ctx->join_right_bare = false;
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -3106,6 +3108,7 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     ctx->governor = NULL;
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
+    ctx->source_bare = false; ctx->join_right_bare = false;
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -3541,6 +3544,95 @@ wl_columnar_filter_attempt_context_valid(
     return ctx->busy ? EBUSY : 0;
 }
 
+static int
+wl_columnar_filter_empty_end_context(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    wl_columnar_filter_context_t **out,
+    wl_columnar_relation_empty_source_t **source)
+{
+    if (!owner || !out || !source) return EINVAL;
+    *source = NULL;
+    const wl_columnar_eval_plan_numeric_attempt_t *r = owner;
+    int rc = wl_columnar_eval_stack_filter_context_nonstream_owned(frame, out,
+            owner);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = *out;
+    rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
+    if (rc) return rc;
+    bool child = r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        || ((r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        || r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        && (r->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || r->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD));
+    if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE
+        && ctx->join_right_bare && ctx->join_right_initialized)
+        *source = &ctx->join_empty_reader;
+    else if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_SOURCE
+        && ctx->source_bare && ctx->source_initialized)
+        *source = &ctx->source_empty_reader;
+    if (*source) {
+        if (!child || r->session != ctx->session || r->control != ctx->control
+            || r->attempt_id != ctx->attempt_id) return EINVAL;
+        const wl_columnar_relation_empty_source_t *a = *source;
+        if (!ctx->join_decision_pending || !ctx->pin_owned
+            || r->cursor >= r->end
+            || r->plan->ops[r->cursor].op != WL_PLAN_OP_JOIN
+            || a->identity != a || a->phase ==
+            WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
+            || a->attempt_id != ctx->attempt_id
+            || a->control_identity !=
+            wl_evaluation_control_identity(ctx->control)) return EINVAL;
+    }
+    return 0;
+}
+
+int
+wl_columnar_filter_empty_end_pending_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    bool *pending)
+{
+    if (!pending) return EINVAL;
+    *pending = false;
+    wl_columnar_filter_context_t *ctx = NULL;
+    wl_columnar_relation_empty_source_t *source = NULL;
+    int rc = wl_columnar_filter_empty_end_context(frame, owner, &ctx, &source);
+    if (!rc) *pending = source != NULL;
+    return rc;
+}
+
+int
+wl_columnar_filter_empty_end_step_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_columnar_filter_status_t *status, const void *owner,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!status) return EINVAL;
+    wl_columnar_filter_context_t *ctx = NULL;
+    wl_columnar_relation_empty_source_t *source = NULL;
+    int rc = wl_columnar_filter_empty_end_context(frame, owner, &ctx, &source);
+    if (rc) return rc;
+    if (!source) return EBUSY;
+    ctx->busy = true;
+    bool done = false;
+    rc = wl_columnar_relation_empty_source_end(source, funding, id, &done);
+    if (!rc && done) {
+        if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE) {
+            ctx->join_right_initialized = false; ctx->join_right_bare = false;
+            ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_PHYSICAL;
+        } else {
+            ctx->source_initialized = false; ctx->source_bare = false;
+            ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE;
+        }
+    }
+    ctx->busy = false;
+    wl_columnar_filter_attempt_status(ctx, status, done
+        ? WL_COLUMNAR_FILTER_PROGRESS_YIELD
+        : WL_COLUMNAR_FILTER_PROGRESS_RETAINED);
+    return rc == EAGAIN ? 0 : rc;
+}
+
 int
 wl_columnar_filter_op_attempt_step(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
@@ -3648,6 +3740,9 @@ wl_columnar_filter_op_attempt_step_owned(
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE;
         break;
     case WL_COLUMNAR_FILTER_STAGE_JOIN_RIGHT_SOURCE:
+        if (ctx->join_right_bare) {
+            rc = EBUSY; goto protocol_error;
+        }
         if (ctx->join_right_initialized) {
             (void)wl_columnar_relation_scalar_source_end(&ctx->join_right,
                 ctx->execution_result);
@@ -3785,6 +3880,9 @@ wl_columnar_filter_op_attempt_step_owned(
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_SOURCE;
         break;
     case WL_COLUMNAR_FILTER_STAGE_SOURCE:
+        if (ctx->source_bare) {
+            rc = EBUSY; goto protocol_error;
+        }
         if (ctx->source_initialized) {
             (void)wl_columnar_relation_scalar_source_end(&ctx->source,
                 ctx->execution_result);
@@ -3907,7 +4005,8 @@ wl_columnar_filter_op_attempt_ack_owned(
     rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) return rc;
     if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
-        || ctx->unary_started || ctx->source_initialized ||
+        || ctx->unary_started || ctx->source_bare || ctx->join_right_bare
+        || ctx->source_initialized ||
         ctx->batch_initialized || ctx->join_initialized
         || ctx->join_decision_pending || ctx->join_result_is_delta
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
