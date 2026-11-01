@@ -795,9 +795,8 @@ A separate schema-context defect was exposed during this qualification: raw
 LFTJ constructs default-INT64 intermediate output while the private controlled
 output carries captured FLOAT/STRING types. A real admitted internal composed
 FLOAT-empty LFTJ followed by FLOAT JOIN returns raw EINVAL versus controlled
-success. This is not normalized away as nullable INT64 representation. A
-separate causal schema/consumer correction and full continuation evidence are
-required next in this same PR before publication or issue closure. The strict,
+success. This is not normalized away as nullable INT64 representation. The
+following separate causal schema correction records its resolution. The strict,
 cache, cap/shared accounting and observed/successor policies also remain open.
 
 Framed reader-contention and partial-abort fixtures now wait on the actual
@@ -810,3 +809,56 @@ The raw reference's actual sorted-arrangement cache is released through its
 normal API before referenced sources are destroyed. The first failed expanded
 validation (that test wait assumption and a raw-fixture sorted-cache leak) is
 preserved separately and does not approve this corrected candidate.
+
+### LFTJ default output schema and continuation parity (#2298)
+
+Controlled LFTJ now uses the existing auto operator constructor for its private
+output, matching raw NULL column_types, default INT64 Arrow fields, generated
+names, declared/graph metadata and no timestamps. Input key types still govern
+actual FLOAT ordering/canonicalization and STRING-code comparisons. A later
+plain projection inherits raw default types; a typed expression derives its
+result type from its actual opcode. Captured source types no longer leak into
+following JOIN/SEMI/ANTI compatibility decisions. No raw engine or compiler
+behavior changed. The already charged source-type scratch pass remains in
+place as private work and does not determine published output schema.
+
+The constructor retains its actual ENTRY128, PREPARE128, BUILD_CALL128 and
+EXTERNAL128 envelopes; builder byte/column/allocation regions still charge
+individually. OUTPUT_CREATE's fixed suffix fits the established external caller
+room. Total work is not asserted identical to the formerly typed constructor,
+and primitive fees remain unchanged. Initial capacity uses actual pre-counted
+rows as a bounded allocation alternative, not a promise of identical raw
+cache/resource thresholds. Lexical partial outputs are destroyed on error;
+only successful construction installs the owned LFTJ output slot.
+
+The original admitted FLOAT-empty LFTJ→FLOAT JOIN red fixture now matches raw
+EINVAL; nonempty FLOAT JOIN/SEMI/ANTI also match raw errors and preserve source
+images with no public output. Internal complete-plan comparisons include empty
+and duplicate nonempty INT64/FLOAT/STRING-code inputs, raw direct output schema
+and physical row bits, ordinary/probe successors, plain projected MAP and
+nonempty opcode-directed FLOAT addition followed by consolidation. Only
+NULL=>INT64 representation is normalized in generic continuation comparison;
+FLOAT/STRING are never declared equivalent to raw default metadata. The direct
+LFTJ oracle additionally requires actual NULL types and matching Arrow format.
+
+Natural compiler-selected wide/nonleading/duplicate session fixtures now check
+final head names, effective types, Arrow formats, declared/graph metadata and
+content in actually admitted plain/callback STEP and SNAPSHOT cases. Their
+FLOAT head obtains its type through the real generated continuation, rather
+than leaked LFTJ source metadata. They do not qualify still-guarded modes.
+
+Existing output allocation and admission failure/retry tests now also stop
+after actual constructor credit commit and immediately after successful
+untyped output construction. Original cancellation/work exhaustion produces
+no event or head, preserves source snapshots, drains real owners and recovers
+governor credit; retained prepared host images keep mutation protected until
+reset/retry or checked destruction. Type-sensitive consumer errors likewise
+retain only private cleanup-owned prefix state. Strict/cache/local/shared and
+general observed/SNAPSHOT/configured-successor policy completion remains
+required later in the same grouped PR.
+
+STRING-code continuation controls distinguish exact type policy from bit
+identity: default-INT64 LFTJ output does not equal a STRING-typed right key,
+while an INT64-typed right carrying the same codes is a positive match. Both
+ordinary/probe results and independent literal cardinalities cover these
+negative/positive pairs; no output is not treated as proof of code loss.

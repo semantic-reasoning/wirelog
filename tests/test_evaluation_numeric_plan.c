@@ -7625,6 +7625,175 @@ anti_reentry_committed(const eval_entry_t *retired, const eval_entry_t *entry)
 }
 
 static bool lftj_order_postcheck;
+
+static void
+lftj_same_effective_relation(const col_rel_t *actual, const col_rel_t *raw)
+{
+    CHECK(actual && raw && actual->ncols == raw->ncols &&
+        actual->nrows == raw->nrows
+        && actual->schema_ok == raw->schema_ok &&
+        actual->declared_ncols == raw->declared_ncols
+        && actual->has_graph_column == raw->has_graph_column
+        && actual->graph_col_idx == raw->graph_col_idx
+        && !actual->timestamps && !raw->timestamps);
+    for (uint32_t c = 0; c < actual->ncols; ++c) {
+        CHECK(!strcmp(actual->col_names[c], raw->col_names[c]));
+        CHECK((actual->column_types ? actual->column_types[c] :
+            WIRELOG_TYPE_INT64)
+            == (raw->column_types ? raw->column_types[c] : WIRELOG_TYPE_INT64));
+        if (actual->schema_ok)
+            CHECK(!strcmp(actual->schema.children[c]->format,
+                raw->schema.children[c]->format));
+        for (uint32_t r = 0; r < actual->nrows; ++r)
+            CHECK(actual->columns[c][r] == raw->columns[c][r]);
+    }
+}
+
+/* Internal admitted whole plans, including the original FLOAT-empty red.
+ * Input type facts drive LFTJ keys; only expression opcodes may establish a
+ * typed successor result from its raw default-auto intermediate schema. */
+static void
+test_lftj_schema_continuations(void)
+{
+    static const wirelog_column_type_t types[] = {
+        WIRELOG_TYPE_INT64, WIRELOG_TYPE_FLOAT, WIRELOG_TYPE_STRING
+    };
+    const char *join_keys[] = {"col0"}; uint32_t projection = 0;
+    uint8_t add[17] = {WL_PLAN_EXPR_VAR_FLOAT, 4, 0, 'c', 'o', 'l', '0',
+                       WL_PLAN_EXPR_CONST_FLOAT};
+    int64_t one = wl_columnar_float_to_bits(1.0);
+    memcpy(add+8, &one, 8); add[16] = WL_PLAN_EXPR_ARITH_FLOAT_ADD;
+    wl_plan_expr_buffer_t expression = {add, sizeof(add)};
+    for (unsigned domain = 0; domain < 4; ++domain)
+        for (unsigned empty = 0; empty < 2; ++empty)
+            for (unsigned context = 0; context < 6; ++context) {
+                if (context == 5 && domain != 1) continue;
+                fixture_t f; col_rel_t *relations[4];
+                char *names[] = {"a", "b", "c", "d"};
+                uint32_t keys[] = {0, 0, 0};
+                col_relation_snapshot_t before[4];
+                for (unsigned i = 0; i < 4; ++i) {
+                    relations[i] = source_new(1, 0);
+                    CHECK(!wl_columnar_relation_rename_checked(relations[i],
+                        names[i]));
+                    wirelog_column_type_t type = domain == 3
+                        ? (i == 3 ? WIRELOG_TYPE_INT64 : WIRELOG_TYPE_STRING)
+                        : types[domain];
+                    CHECK(!col_rel_set_column_types(relations[i], &type, 1));
+                    if (!empty) for (unsigned r = 0; r < 3; ++r) {
+                            int64_t row = domain ==
+                                1 ? wl_columnar_float_to_bits(r ? 2.5 : 1.5)
+                            : (r ? 20 : 10);
+                            CHECK(!col_rel_append_row(relations[i], &row));
+                        }
+                    before[i] = wl_columnar_relation_snapshot(relations[i]);
+                }
+                wl_plan_op_lftj_t metadata = {.k = 3, .rel_names = names,
+                                              .key_cols = keys};
+                wl_plan_op_t ops[3] = {{.op = WL_PLAN_OP_LFTJ,
+                                        .opaque_data = &metadata}};
+                uint32_t count = 1;
+                if (context >= 1 && context <= 3) {
+                    ops[count++] = (wl_plan_op_t){
+                        .op = context == 1 ? WL_PLAN_OP_JOIN : context ==
+                            2 ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN,
+                        .right_relation = "d", .key_count = 1,
+                        .left_keys = join_keys, .right_keys = join_keys
+                    };
+                } else if (context == 4) {
+                    ops[count++] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                                  .project_count = 1,
+                                                  .project_indices =
+                                                      &projection};
+                } else if (context == 5) {
+                    ops[count++] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                                  .project_count = 1,
+                                                  .map_exprs = &expression,
+                                                  .map_expr_count = 1};
+                }
+                if (context) ops[count++] =
+                        (wl_plan_op_t){.op = WL_PLAN_OP_CONSOLIDATE};
+                wl_plan_relation_t body = {.ops = ops, .op_count = count};
+                wl_col_session_t raw = {0}; raw.rels = relations; raw.nrels = 4;
+                eval_stack_t expected = {0};
+                int raw_rc = col_op_lftj(&ops[0], &expected, &raw);
+                CHECK(!raw_rc && !expected.items[0].rel->column_types);
+                for (uint32_t i = 1; !raw_rc && i < count; ++i) {
+                    switch (ops[i].op) {
+                    case WL_PLAN_OP_JOIN: raw_rc = col_op_join(&ops[i],
+                                &expected, &raw); break;
+                    case WL_PLAN_OP_SEMIJOIN: raw_rc = col_op_semijoin(&ops[i],
+                                &expected, &raw); break;
+                    case WL_PLAN_OP_ANTIJOIN: raw_rc = col_op_antijoin(&ops[i],
+                                &expected, &raw); break;
+                    case WL_PLAN_OP_MAP: raw_rc = col_op_map(&ops[i], &expected,
+                                &raw); break;
+                    case WL_PLAN_OP_CONSOLIDATE: raw_rc =
+                            col_op_consolidate(&expected, &raw); break;
+                    default: CHECK(false);
+                    }
+                }
+                CHECK(raw_rc == (domain == 1 && context >= 1 &&
+                    context <= 3 ? EINVAL : 0));
+                composed_fixture(&f, source_new(1, 0), 0);
+                f.session.base.evaluation_control = f.operation;
+                f.session.rels = relations; f.session.nrels = 4;
+                f.session.rel_cap = 4;
+                CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(
+                        &f.record, &body,
+                        0, count, f.frame, &f.session, 0, f.operation,
+                        f.operation_id, f.funding, f.funding_id));
+                composed_run(&f);
+                CHECK(f.record.semantic_result == raw_rc &&
+                    !session_find_rel(&f.session, "output"));
+                eval_stack_t *actual =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                if (!raw_rc) {
+                    CHECK(actual->top == 1 && expected.top == 1 &&
+                        actual->items[0].owned);
+                    lftj_same_effective_relation(actual->items[0].rel,
+                        expected.items[0].rel);
+                    if (!context) {
+                        col_rel_t *out = actual->items[0].rel;
+                        CHECK(!out->column_types &&
+                            out->nrows == (empty ? 0u : 9u));
+                        for (uint32_t r = 0; r < out->nrows; ++r)
+                            for (uint32_t c = 0; c < out->ncols; ++c)
+                                CHECK(out->columns[c][r] == (domain == 1
+                                        ? wl_columnar_float_to_bits(r ? 2.5 :
+                                    1.5) : (r ? 20 : 10)));
+                    } else {
+                        /* Equality also checks exact STRING versus INT64
+                         * types. Domain3 supplies the matching default-INT64
+                         * right canary for the same STRING-code LFTJ output. */
+                        uint32_t rows = empty ? 0 : context == 3
+                            ? (domain == 2 ? 2 : 0)
+                            : domain == 2 && context <= 2 ? 0 : 2;
+                        CHECK(actual->items[0].rel->nrows == rows);
+                    }
+                    if (context == 5) {
+                        col_rel_t *out = actual->items[0].rel;
+                        CHECK(out->column_types &&
+                            out->column_types[0] == WIRELOG_TYPE_FLOAT);
+                        CHECK(out->nrows == (empty ? 0u : 2u));
+                        if (!empty) CHECK(out->columns[0][0] ==
+                                wl_columnar_float_to_bits(2.5)
+                                && out->columns[0][1] ==
+                                wl_columnar_float_to_bits(3.5));
+                    }
+                } else CHECK(f.record.completed == 1 && actual->top == 1
+                        && actual->items[0].owned &&
+                        !actual->items[0].rel->column_types);
+                for (unsigned i = 0; i < 4; ++i)
+                    CHECK(wl_columnar_relation_snapshot_equal(before[i],
+                        wl_columnar_relation_snapshot(relations[i])));
+                session_rel_free_hash(&f.session);
+                composed_close(&f); CHECK(!eval_stack_drain(&expected));
+                empty_filter_raw_drain(&raw);
+                col_session_free_sorted_arrangements(&raw);
+                for (unsigned i = 0; i < 4; ++i) col_rel_destroy(relations[i]);
+            }
+}
 static void
 lftj_order_checkpoint(wl_evaluation_control_t *control,
     const wl_columnar_lftj_attempt_t *a)
@@ -7716,18 +7885,17 @@ test_lftj_source_order(void)
                 && out->graph_col_idx == reference->graph_col_idx
                 && out->sorted_nrows == reference->sorted_nrows
                 && out->run_count == reference->run_count);
+            CHECK(!out->column_types && !reference->column_types
+                && out->schema_ok == reference->schema_ok);
             for (uint32_t c = 0; c < out->ncols; ++c) {
                 CHECK(!strcmp(out->col_names[c], reference->col_names[c]));
                 wirelog_column_type_t effective = out->column_types
                     ? out->column_types[c] : WIRELOG_TYPE_INT64;
-                /* FLOAT/STRING here prove actual private source preparation,
-                 * not raw intermediate schema parity. Its demonstrated JOIN
-                 * continuation mismatch requires the next causal schema unit. */
-                if (mode == 8 || mode == 9)
-                    CHECK(effective ==
-                        (mode == 8 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_STRING));
-                else CHECK(effective == (reference->column_types
+                CHECK(effective == (reference->column_types
                         ? reference->column_types[c] : WIRELOG_TYPE_INT64));
+                if (out->schema_ok)
+                    CHECK(!strcmp(out->schema.children[c]->format,
+                        reference->schema.children[c]->format));
             }
         }
         composed_close(&f); CHECK(!eval_stack_drain(&expected));
@@ -7967,6 +8135,7 @@ test_anti_host_budget(void)
 int
 main(void)
 {
+    test_lftj_schema_continuations();
     test_lftj_source_order_stops(); test_lftj_source_order();
     test_anti_reentry();
     test_anti_host_budget(); test_anti_cutoff_refusals();

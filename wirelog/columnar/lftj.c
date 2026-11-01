@@ -1528,9 +1528,12 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
     case WL_COLUMNAR_LFTJ_ATTEMPT_JOIN:
         return wl_columnar_lftj_attempt_join(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_CREATE:
-        rc = wl_columnar_relation_new_typed_codes_operator_attempt_controlled(
+        /* Raw LFTJ publishes the default auto schema, not its source types.
+         * Typed keys still govern input sorting/seek; consumers derive their
+         * own expression types from this same raw intermediate contract. */
+        rc = wl_columnar_relation_new_auto_operator_attempt_controlled(
             "$lftj", a->total_columns, (uint32_t)a->output_rows,
-            a->output_types, a->session->memory_governor, &a->output,
+            a->session->memory_governor, &a->output,
             a->control, a->attempt_id);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         a->output_owned = true;
