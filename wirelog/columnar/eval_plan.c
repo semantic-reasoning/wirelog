@@ -560,8 +560,10 @@ wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
         rp->ops[end + 1].op != WL_PLAN_OP_CONSOLIDATE ||
         reduce->op != WL_PLAN_OP_REDUCE ||
         reduce->agg_fn != WIRELOG_AGG_COUNT ||
-        reduce->group_by_count || reduce->group_by_indices ||
-        reduce->aggregate_index ||
+        reduce->group_by_count == UINT32_MAX ||
+        (reduce->group_by_count && !reduce->group_by_indices) ||
+        (!reduce->group_by_count && reduce->group_by_indices) ||
+        reduce->aggregate_index > reduce->group_by_count ||
         reduce->agg_result_type != WL_PLAN_AGG_OPERAND_SCALAR)
         return false;
     wl_columnar_eval_plan_cold_aggregate_t decoded = {.reduce_index = end};
@@ -597,6 +599,13 @@ wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
                 (types && types[source] != WIRELOG_TYPE_INT64)) return false;
             decoded.filter_count++;
         } else return false;
+    }
+    for (uint32_t i = 0; i < reduce->group_by_count; i++) {
+        uint32_t source, column = reduce->group_by_indices[i];
+        if (column >= width || !wl_columnar_eval_plan_cold_column(rp, end,
+            column, ncols,
+            &source) || (types && types[source] != WIRELOG_TYPE_INT64 &&
+            types[source] != WIRELOG_TYPE_STRING)) return false;
     }
     const wl_plan_expr_buffer_t *expr = &reduce->agg_expr;
     if (expr->data || expr->size) {

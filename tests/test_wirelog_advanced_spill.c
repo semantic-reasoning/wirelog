@@ -1511,6 +1511,112 @@ static void cold_global_counts(void)
         }
 }
 
+typedef struct { unsigned count, position; int64_t rows[128][3];
+} cold_group_result_t;
+static void cold_group_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    if (strcmp(name, "result")) return;
+    cold_group_result_t *r = context;
+    CHECK(cols == 3 && r->count < 128);
+    memcpy(r->rows[r->count++], row, 3*sizeof(*row));
+}
+static void cold_group_typed(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    if (strcmp(name, "result")) return;
+    CHECK(diff == 1 && row->logical_ncols == 3 && row->physical_nlanes == 3);
+    int64_t values[3]; memcpy(values, row->lanes, sizeof(values));
+    cold_group_observe(name, values, 3, context);
+}
+static int cold_group_compare(const void *left, const void *right)
+{
+    const int64_t *a = left, *b = right;
+    for (unsigned i = 0; i < 3;
+        i++) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+static void cold_group_counts(void)
+{
+    for (unsigned position = 0; position < 3; position++)
+        for (unsigned inlined = 0; inlined < 2; inlined++)
+            for (unsigned empty = 0; empty < 2; empty++) {
+                cold_group_result_t oracle = {0};
+                for (unsigned mode = 0; mode < 3; mode++) {
+                    char text[1024];
+                    snprintf(text, sizeof(text),
+                        ".decl seed(s:symbol,k:int64)\n"
+                        "seed(\"zeta\",0).\nseed(\"alpha\",1).\n"
+                        "%s\n.decl result(%s)\nresult(%s) :- %s,v>=0.\n",
+                        inlined ?
+                        ".decl a(p:pair(int64,symbol) inline,v:int64)" :
+                        ".decl a(k:int64,s:symbol,v:int64)",
+                        position == 0 ? "n:int64,k:int64,s:symbol" : position ==
+                        1 ? "k:int64,n:int64,s:symbol" :
+                        "k:int64,s:symbol,n:int64",
+                        position == 0 ? "count(v),k,s" : position ==
+                        1 ? "k,count(v),s" : "k,s,count(v)",
+                        inlined ? "a(pair(k,s),v)" : "a(k,s,v)");
+                    wirelog_program_t *p = parse(text);
+                    wirelog_session_t *session = NULL;
+                    wirelog_session_options_v1_t options = configured();
+                    CHECK(wirelog_session_create_with_options(p,
+                        WIRELOG_BACKEND_DEFAULT, 1, &options,
+                        &session) == WIRELOG_OK);
+                    int64_t *facts = NULL, ids[2]; uint32_t rows = 0, cols = 0;
+                    CHECK(wirelog_program_get_facts(p, "seed", &facts, &rows,
+                        &cols) == 0 && rows == 2 && cols == 2);
+                    for (unsigned i = 0; i < 2;
+                        i++) ids[facts[2*i+1]] = facts[2*i];
+                    free(facts);
+                    if (mode ==
+                        2) CHECK(wirelog_session_begin_cold_input(session,
+                            "a") == WIRELOG_OK);
+                    for (unsigned repeat = 0; repeat < 3; repeat++) {
+                        int64_t chunk[96*3];
+                        for (unsigned i = 0; i < 96; i++) {
+                            chunk[3*i] = i%32; chunk[3*i+1] = ids[(i/32)%2];
+                            chunk[3*i+2] = empty ? -1 : 1;
+                        }
+                        CHECK((mode ==
+                            2 ? wirelog_session_append_cold_input(session, "a",
+                            chunk, 96, 3) : wirelog_session_insert(session, "a",
+                            chunk, 96, 3)) == WIRELOG_OK);
+                    }
+                    if (mode == 1) CHECK(wirelog_session_seal_input(session,
+                            "a") == WIRELOG_OK);
+                    if (mode ==
+                        2) CHECK(wirelog_session_finish_cold_input(session,
+                            "a") == WIRELOG_OK);
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        cold_group_result_t result = {0}, typed = {0};
+                        CHECK(wirelog_session_step(session) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot(session,
+                            cold_group_observe, &result) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot_typed(session,
+                            cold_group_typed, &typed) == WIRELOG_OK);
+                        qsort(result.rows, result.count, sizeof(result.rows[0]),
+                            cold_group_compare);
+                        qsort(typed.rows, typed.count, sizeof(typed.rows[0]),
+                            cold_group_compare);
+                        CHECK(result.count == typed.count &&
+                            !memcmp(result.rows, typed.rows,
+                            sizeof(result.rows)));
+                        if (!mode) oracle = result;
+                        CHECK(result.count == oracle.count &&
+                            !memcmp(result.rows, oracle.rows,
+                            sizeof(result.rows)));
+                        CHECK(result.count == (empty ? 0u : 64u));
+                        for (unsigned i = 0; i < result.count;
+                            i++) CHECK(result.rows[i][position] == 3 ||
+                                result.rows[i][position] == 6);
+                    }
+                    wirelog_session_destroy(session); wirelog_program_free(p);
+                    CHECK(!live_files());
+                }
+            }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1530,6 +1636,7 @@ int main(void)
     CHECK(mkdtemp(directory));
 #endif
     cold_global_counts();
+    cold_group_counts();
     chunked_public_scans(); chunked_public_joins();
     chunked_public_references(); chunked_public_budget();
     inline_public_projections(); inline_public_joins();

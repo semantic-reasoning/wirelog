@@ -543,6 +543,42 @@ wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     return wl_columnar_ops_cold_scan(plan, stack, sess, plan->op_count - 1);
 }
 
+typedef struct {
+    uint64_t hash;
+    uint32_t row;
+} wl_columnar_ops_cold_group_t;
+
+/* Two stationary reservation tokens admit old+new during rehash. Tokens are
+ * never copied; row ordinals remain valid when private output storage grows. */
+static int
+wl_columnar_ops_cold_group_grow(wl_col_session_t *sess,
+    wl_columnar_ops_cold_group_t **groups, uint32_t *capacity,
+    wl_ops_scratch_t reservations[2], unsigned *active)
+{
+    if (*capacity > UINT32_MAX / 2) return EOVERFLOW;
+    uint32_t next_capacity = *capacity ? *capacity * 2 : 8;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(next_capacity, sizeof(**groups), &bytes) ||
+        bytes > SIZE_MAX) return EOVERFLOW;
+    unsigned next = *active ^ 1u;
+    int rc = wl_ops_scratch_reserve(&reservations[next], sess->memory_governor,
+            bytes, sess);
+    if (rc) return rc;
+    wl_columnar_ops_cold_group_t *grown = calloc(next_capacity, sizeof(*grown));
+    if (!grown) {
+        wl_ops_scratch_release(&reservations[next]); return ENOMEM;
+    }
+    for (uint32_t i = 0; i < *capacity; i++) {
+        if (!(*groups)[i].hash) continue;
+        uint32_t slot = (uint32_t)(*groups)[i].hash & (next_capacity - 1);
+        while (grown[slot].hash) slot = (slot + 1) & (next_capacity - 1);
+        grown[slot] = (*groups)[i];
+    }
+    free(*groups); wl_ops_scratch_release(&reservations[*active]);
+    *groups = grown; *capacity = next_capacity; *active = next;
+    return 0;
+}
+
 /* Aggregate prefixes stream physical rows; ordinary scan output floors remain
  * unchanged. Only a fully constructed private reduction reaches the stack. */
 int
@@ -557,13 +593,23 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     if (!cold || !wl_columnar_eval_plan_cold_aggregate_decode(plan, cold->name,
         cold->ncols, wl_columnar_session_cold_types(cold),
         &decoded)) return ENOTSUP;
-    uint64_t bytes;
+    const wl_plan_op_t *reduce = &plan->ops[decoded.reduce_index];
+    uint32_t group_count = reduce->group_by_count,
+        output_cols = group_count + 1;
+    uint32_t aggregate_index = reduce->aggregate_index;
+    uint64_t bytes, group_bytes = 0;
     if (!wl_columnar_memory_size_mul(decoded.filter_count,
         sizeof(wl_columnar_eval_plan_cold_predicate_t),
         &bytes) || bytes > SIZE_MAX)
         return EOVERFLOW;
+    if (group_count && (!wl_columnar_memory_size_mul(output_cols,
+        sizeof(int64_t) + sizeof(wirelog_column_type_t) + sizeof(uint32_t),
+        &group_bytes) || group_bytes > SIZE_MAX)) return EOVERFLOW;
+    uint64_t admitted;
+    if (!wl_columnar_memory_size_add(bytes, group_bytes,
+        &admitted)) return EOVERFLOW;
     wl_ops_scratch_t scratch;
-    int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, bytes,
+    int rc = wl_ops_scratch_reserve(&scratch, sess->memory_governor, admitted,
             sess);
     if (rc) return rc;
     wl_columnar_eval_plan_cold_predicate_t *predicates =
@@ -571,6 +617,21 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     wl_columnar_batch_payload_reader_t *reader = NULL;
     wl_columnar_trace_store_cursor_t *cursor = NULL;
     col_rel_t *out = NULL;
+    wl_columnar_ops_cold_group_t *groups = NULL;
+    wl_ops_scratch_t group_reservations[2];
+    memset(group_reservations, 0, sizeof(group_reservations));
+    unsigned active_group = 0;
+    uint32_t capacity = 0;
+    int64_t *tuple = group_count ? malloc((size_t)output_cols *
+            sizeof(*tuple)) : NULL;
+    uint32_t *indices = group_count ? malloc((size_t)output_cols *
+            sizeof(*indices)) : NULL;
+    wirelog_column_type_t *types = group_count ? malloc((size_t)output_cols *
+            sizeof(*types)) : NULL;
+    col_rel_append_batch_t batch = {0}; bool appending = false;
+    if (group_count && (!tuple || !indices || !types)) {
+        rc = ENOMEM; goto done;
+    }
     if (bytes && !predicates) {
         rc = ENOMEM; goto done;
     }
@@ -588,6 +649,30 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
             rc = ENOTSUP; goto done;
         }
         next++;
+    }
+    if (group_count) {
+        const wirelog_column_type_t *schema =
+            wl_columnar_session_cold_types(cold);
+        for (uint32_t i = 0; i < group_count; i++) {
+            if (!wl_columnar_eval_plan_cold_column(plan, decoded.reduce_index,
+                reduce->group_by_indices[i], cold->ncols, &indices[i])) {
+                rc = ENOTSUP; goto done;
+            }
+            uint32_t output = i >= aggregate_index ? i + 1 : i;
+            types[output] = schema ? schema[indices[i]] : WIRELOG_TYPE_INT64;
+        }
+        types[aggregate_index] = WIRELOG_TYPE_INT64;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_ops_test_reduce_fail_output_alloc) {
+            rc = ENOMEM; goto done;
+        }
+#endif
+        rc = wl_columnar_relation_new_named_governed("$reduce", output_cols,
+                NULL, 0, false, sess->memory_governor, &out);
+        if (!rc) rc = col_rel_set_column_types(out, types, output_cols);
+        if (!rc) rc = col_rel_append_batch_begin(&batch, out);
+        if (rc) goto done;
+        appending = true;
     }
     wl_columnar_spill_status_t status = cold->state ==
         WL_COLUMNAR_COLD_FINISHED ?
@@ -622,8 +707,51 @@ wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
             default: rc = ENOTSUP; goto done;
             }
         }
-        if (keep) count++;
+        if (!keep) continue;
+        if (!group_count) {
+            count++; continue;
+        }
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (uint32_t i = 0; i < group_count; i++) {
+            uint32_t output = i >= aggregate_index ? i + 1 : i;
+            memcpy(&tuple[output], &lanes[indices[i]], sizeof(*tuple));
+            hash ^= (uint64_t)tuple[output]; hash *= UINT64_C(1099511628211);
+        }
+        if (!hash) hash = 1;
+        uint32_t slot = capacity ? (uint32_t)hash & (capacity - 1) : 0;
+        bool found = false;
+        for (uint32_t probe = 0; probe < capacity && groups[slot].hash;
+            probe++) {
+            bool match = groups[slot].hash == hash;
+            for (uint32_t i = 0; match && i < group_count; i++) {
+                uint32_t output = i >= aggregate_index ? i + 1 : i;
+                match = tuple[output] == out->columns[output][groups[slot].row];
+            }
+            if (match) {
+                found = true; break;
+            }
+            slot = (slot + 1) & (capacity - 1);
+        }
+        if (found) {
+            uint32_t row = groups[slot].row;
+            rc = col_rel_append_batch_set(&batch, row, aggregate_index,
+                    out->columns[aggregate_index][row] + 1);
+        } else {
+            if (!capacity || out->nrows >= capacity / 2) {
+                rc = wl_columnar_ops_cold_group_grow(sess, &groups, &capacity,
+                        group_reservations, &active_group);
+                if (rc) goto done;
+                slot = (uint32_t)hash & (capacity - 1);
+                while (groups[slot].hash) slot = (slot + 1) & (capacity - 1);
+            }
+            tuple[aggregate_index] = 1;
+            uint32_t row = out->nrows;
+            rc = col_rel_append_batch_row(&batch, tuple);
+            if (!rc) groups[slot] = (wl_columnar_ops_cold_group_t){hash, row};
+        }
+        if (rc) goto done;
     }
+    if (group_count) goto done;
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_ops_test_reduce_fail_output_alloc) {
         rc = ENOMEM; goto done;
@@ -652,6 +780,15 @@ spill_error:
     default: rc = ENOTSUP; break;
     }
 done:
+    if (rc == ENOMEM && out && out->memory_budget_denial_pending) rc = ENOSPC;
+    if (appending) {
+        int ended = col_rel_append_batch_end(&batch, rc == 0);
+        if (ended) rc = ended;
+    }
+    free(groups);
+    wl_ops_scratch_release(&group_reservations[0]);
+    wl_ops_scratch_release(&group_reservations[1]);
+    free(tuple); free(indices); free(types);
     wl_columnar_trace_store_cursor_release(cursor);
     wl_columnar_batch_payload_reader_release(reader);
     free(predicates); wl_ops_scratch_release(&scratch);
