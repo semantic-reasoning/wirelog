@@ -1925,6 +1925,102 @@ typedef struct col_mat_cache {
     bool reclaimer_owner_alive;
 } col_mat_cache_t;
 
+/* Pin-free cache recipe primitive. Caller owns zero-initialized, final-address
+ * storage and immutable source/op backing through funded END and ACK. Sources
+ * use real combined descriptor/storage leases; no cached result is borrowed.
+ * Original control is retained until ACK, which needs distinct real funding
+ * even after that original attempt has finished/reset. Query is a fixed copied
+ * DONE report, never a cache hit/pin capability or an engine-progress action. */
+typedef enum {
+    WL_COLUMNAR_CACHE_DIGEST_INERT,
+    WL_COLUMNAR_CACHE_DIGEST_ACQUIRE,
+    WL_COLUMNAR_CACHE_DIGEST_VALIDATE,
+    WL_COLUMNAR_CACHE_DIGEST_CELL,
+    WL_COLUMNAR_CACHE_DIGEST_ROWS,
+    WL_COLUMNAR_CACHE_DIGEST_COLUMNS,
+    WL_COLUMNAR_CACHE_DIGEST_SIGNATURE_FIELD,
+    WL_COLUMNAR_CACHE_DIGEST_SIGNATURE_BYTE,
+    WL_COLUMNAR_CACHE_DIGEST_KEY,
+    WL_COLUMNAR_CACHE_DIGEST_SEPARATOR,
+    WL_COLUMNAR_CACHE_DIGEST_FILTER,
+    WL_COLUMNAR_CACHE_DIGEST_FINAL_LEFT,
+    WL_COLUMNAR_CACHE_DIGEST_FINAL_RIGHT,
+    WL_COLUMNAR_CACHE_DIGEST_LATCH,
+    WL_COLUMNAR_CACHE_DIGEST_READY,
+    WL_COLUMNAR_CACHE_DIGEST_END,
+    WL_COLUMNAR_CACHE_DIGEST_END_CLEAR,
+    WL_COLUMNAR_CACHE_DIGEST_END_RESET,
+    WL_COLUMNAR_CACHE_DIGEST_DONE
+} wl_columnar_cache_digest_phase_t;
+
+typedef struct {
+    uint64_t left_hash, right_hash, signature;
+    col_relation_snapshot_t left_snapshot, right_snapshot;
+    uint64_t control_identity, attempt_id;
+} wl_columnar_cache_digest_result_t;
+
+typedef struct {
+    const col_rel_t *relation;
+    wl_columnar_source_access_reader_t reader;
+    col_relation_snapshot_t snapshot;
+    uint32_t rows, width;
+    bool held;
+} wl_columnar_cache_digest_source_t;
+
+typedef struct wl_columnar_cache_digest_attempt {
+    struct wl_columnar_cache_digest_attempt *identity;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy, control_ref, result_saved;
+    wl_columnar_cache_digest_phase_t phase;
+    wl_columnar_cache_digest_source_t source[2];
+    const wl_plan_op_t *op;
+    const char *const *left_keys, *const *right_keys;
+    const uint8_t *filter;
+    uint32_t kind, key_count, filter_size;
+    unsigned char path;
+    uint64_t hash[2], signature;
+    uint32_t side, row, column, key, key_side, filter_byte, release_side;
+    size_t name_byte;
+    unsigned char native[8];
+    unsigned native_count, native_byte, field;
+    int semantic_result;
+    wl_columnar_cache_digest_result_t result;
+} wl_columnar_cache_digest_attempt_t;
+
+int wl_columnar_cache_digest_begin(wl_columnar_cache_digest_attempt_t *a,
+    const col_rel_t *left, const col_rel_t *right, const wl_plan_op_t *op,
+    bool diff_path, wl_evaluation_control_t *control, uint64_t attempt_id);
+int wl_columnar_cache_digest_step(wl_columnar_cache_digest_attempt_t *a,
+    bool *ready);
+int wl_columnar_cache_digest_finish(wl_columnar_cache_digest_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t funding_id, bool *done);
+int wl_columnar_cache_digest_abort(wl_columnar_cache_digest_attempt_t *a,
+    int initiating_result, wl_evaluation_control_t *funding,
+    uint64_t funding_id, bool *done);
+int wl_columnar_cache_digest_query(const wl_columnar_cache_digest_attempt_t *a,
+    wl_columnar_cache_digest_result_t *result, int *semantic_result);
+int wl_columnar_cache_digest_ack(wl_columnar_cache_digest_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t funding_id);
+#ifdef WL_SESSION_TEST_HOOKS
+enum {
+    WL_COLUMNAR_CACHE_DIGEST_TEST_BEGIN = 1,
+    WL_COLUMNAR_CACHE_DIGEST_TEST_STEP,
+    WL_COLUMNAR_CACHE_DIGEST_TEST_FINISH,
+    WL_COLUMNAR_CACHE_DIGEST_TEST_ABORT,
+    WL_COLUMNAR_CACHE_DIGEST_TEST_ACK
+};
+extern void (*wl_columnar_cache_digest_test_checkpoint)(
+    wl_columnar_cache_digest_attempt_t *, wl_evaluation_control_t *, unsigned);
+#endif
+
 /* ======================================================================== */
 /* Operator Profiling (WL_PROFILE)                                         */
 /* ======================================================================== */

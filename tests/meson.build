@@ -2920,6 +2920,18 @@ test_mat_cache_lifetime_exe = executable(
 
 test('mat_cache_lifetime', test_mat_cache_lifetime_exe)
 
+test_cache_digest_exe = executable(
+  'test_cache_digest', files('test_cache_digest.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach cache_digest_case : ['domains', 'failures', 'authority']
+  test('cache_digest_' + cache_digest_case, test_cache_digest_exe,
+       args: [cache_digest_case], suite: ['unit', 'tsan', 'cache_digest'], timeout: 60)
+endforeach
+
 # ============================================================================
 # K-way Merge CONSOLIDATE Tests (US-002 TDD RED Phase)
 # ============================================================================
