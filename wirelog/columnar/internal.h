@@ -6747,7 +6747,7 @@ typedef struct wl_columnar_filter_context {
     /* Fixed original JOIN ownership, inactive for FILTER/MAP. join_initialized
      * remains true until B2/right/readers and all scratch records are drained. */
     bool join_initialized, join_right_initialized;
-    bool join_decision_pending, join_result_is_delta;
+    bool join_decision_pending, join_result_is_delta, join_preserve_input;
     uint32_t join_retirement_cursor;
     wl_columnar_relation_scalar_source_t join_right;
     wl_columnar_join_scratch_t join_scratch[WL_COLUMNAR_JOIN_SCRATCH_COUNT];

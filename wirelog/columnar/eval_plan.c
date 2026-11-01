@@ -1935,19 +1935,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         if (!session->join_batch_bytes || session->join_batch_strict
             || session->join_output_limit
             || begin != 0 || end != plan->op_count || initial_depth != 0
-            || plan->op_count != 5
-            || plan->ops[0].op != WL_PLAN_OP_VARIABLE
-            || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[0])
-            || plan->ops[1].op != WL_PLAN_OP_JOIN
-            || !wl_columnar_eval_plan_scalar_selector_supported(&plan->ops[1])
-            || plan->ops[2].op != WL_PLAN_OP_FILTER
-            || !plan->ops[2].filter_expr.data
-            || !plan->ops[2].filter_expr.size
-            || plan->ops[3].op != WL_PLAN_OP_MAP
-            || plan->ops[4].op != WL_PLAN_OP_CONSOLIDATE
-            || plan->ops[1].materialized || !plan->ops[1].right_relation
-            || !plan->ops[1].key_count || !plan->ops[1].left_keys
-            || !plan->ops[1].right_keys)
+            )
             return ENOTSUP;
     }
     if (session->current_iteration || session->retraction_seeded
@@ -2379,6 +2367,14 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
         rc = wl_columnar_eval_plan_numeric_forward(record);
         if (!rc) {
             wl_plan_op_type_t kind = record->plan->ops[record->cursor].op;
+            if (record->controlled_materialized_batch_fallback
+                && (kind == WL_PLAN_OP_VARIABLE || kind == WL_PLAN_OP_JOIN)
+                && !wl_columnar_eval_plan_scalar_selector_supported(
+                    &record->plan->ops[record->cursor])) {
+                record->semantic_result = ENOTSUP;
+                record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+                return 0;
+            }
             if (kind != WL_PLAN_OP_VARIABLE && kind != WL_PLAN_OP_FILTER
                 && kind != WL_PLAN_OP_MAP
                 && !(kind == WL_PLAN_OP_JOIN

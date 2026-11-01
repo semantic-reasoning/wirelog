@@ -3800,7 +3800,8 @@ wl_columnar_filter_op_attempt_step_owned(
         if (!ctx->pin_owned || !ctx->join_decision_pending) {
             rc = EINVAL; goto protocol_error;
         }
-        if (!ctx->execution_result && ctx->unary_started) {
+        if (!ctx->execution_result && ctx->unary_started
+            && !ctx->join_preserve_input) {
             rc = wl_columnar_filter_attempt_charge(ctx->control,
                     ctx->attempt_id, 0);
             if (!rc)
@@ -3812,6 +3813,7 @@ wl_columnar_filter_op_attempt_step_owned(
             ctx->semantic_result = rc;
         }
         ctx->join_result_is_delta = false;
+        ctx->join_preserve_input = false;
         ctx->join_decision_pending = false;
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_CONTROL;
         break;

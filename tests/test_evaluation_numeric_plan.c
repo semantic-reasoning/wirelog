@@ -3432,6 +3432,19 @@ test_probe_plan_failures(void)
                 }
                 engine_dispatch(&f); ++f.witnesses;
                 wl_columnar_join_test_attempt_fail_allocation = -1;
+                if (!fault) {
+                    /* The missing-right probe is an exact no-op, including
+                     * the owned entry and delta image, before the next op. */
+                    join_until_ready(&f, target + 1);
+                    join_snapshot_check(&f, &snapshot);
+                    run(&f);
+                    CHECK(!f.record.semantic_result && f.record.completed == 5);
+                    join_raw_parity(&f, &plan, true);
+                    col_rel_destroy(snapshot.contents);
+                    fixture_close(&f);
+                    col_rel_destroy(right); col_rel_destroy(third);
+                    continue;
+                }
                 run(&f); wl_columnar_join_test_attempt_checkpoint = NULL;
                 const int errors[] = {ENOTSUP, ENOMEM,
                                       WL_EVALUATION_CONTROL_CANCELLED, EINVAL,
@@ -6172,15 +6185,27 @@ test_composed_controlled_batch_fallback_owner(void)
     f.session.join_batch_bytes = 224;
     wl_plan_op_t rejected_ops[5];
     memcpy(rejected_ops, body->ops, sizeof(rejected_ops));
-    /* DELTA is an admitted scalar selector; unknown modes still refuse
-     * before allocating an authenticated fallback owner. */
+    /* General plan admission validates each selector in its charged
+     * preflight before any child or source installation. */
     rejected_ops[0].delta_mode = (wl_delta_mode_t)99;
     wl_plan_relation_t rejected_body = *body;
     rejected_body.ops = rejected_ops;
-    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
-            &f.record, &rejected_body, 0, rejected_body.op_count, f.frame,
-            &f.session, 0, f.operation, f.operation_id, f.funding, f.funding_id)
-        == ENOTSUP);
+    fixture_t rejected;
+    composed_fixture(&rejected, composed_source("a", 2, left_values, 4, false),
+        0);
+    col_rel_t *rejected_registry[] = {rejected.input, right};
+    rejected.session.rels = rejected_registry;
+    rejected.session.nrels = rejected.session.rel_cap = 2;
+    rejected.session.join_batch_bytes = 224;
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
+            &rejected.record, &rejected_body, 0, rejected_body.op_count,
+            rejected.frame, &rejected.session, 0, rejected.operation,
+            rejected.operation_id, rejected.funding, rejected.funding_id));
+    composed_run(&rejected);
+    CHECK(rejected.record.semantic_result == ENOTSUP
+        && !rejected.record.completed && !rejected.record.source_installed
+        && !rejected.record.source_initialized && !rejected.record.join_host);
+    composed_close(&rejected);
     CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
             &f.record, body, 0, body->op_count, f.frame,
             &f.session, 0,

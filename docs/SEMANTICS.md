@@ -1412,11 +1412,13 @@ Public/default/session scheduling remains separate from this interface.
 
 ### Controlled STEP batch destination (#1821, #2297)
 
-With non-strict `WIRELOG_JOIN_BATCH_BYTES`, controlled initial STEP admits one
-exact `VARIABLE → JOIN → FILTER → MAP → CONSOLIDATE` relation. Its charged
-classifier preserves the full/delta/empty selectors described below. Eligible
-JOINs now use a private prepared bounded producer and run the row-local FILTER
-and MAP on each complete batch through the existing controlled consumers. The
+With non-strict `WIRELOG_JOIN_BATCH_BYTES`, controlled initial unobserved STEP
+uses the same charged plan proof and relation scheduler as the ordinary route.
+The former five-op restriction is removed; individual operator destinations
+retain their admission guards and full/delta/empty selectors. Eligible JOINs
+use a private prepared bounded producer and run row-local FILTER, MAP and
+qualified FULL-source SEMIJOIN/ANTIJOIN stages on each complete batch through
+the existing controlled consumers. The
 original input is parked in the same frame while the borrowed batch occupies
 its slot, then restored after consumer cleanup and ACK. No nested frame or
 root-authority exception is used. The independent private relation sink copies
@@ -1428,9 +1430,22 @@ ACK. The final candidate publishes at the existing framed registry cutoff.
 Named intrinsic producer declines, including an oversized row and a selected
 right delta, retain the ordinary bounded JOIN destination on the original
 attempt. The batch budget bounds producer scratch, not the final relation sink.
-Strict mode, output policies and other batch-configured STEP shapes remain
-separate required qualification. The published counter counts only candidates
+Strict mode, output policies, observed/SNAPSHOT hosts and other operator
+policies remain separate required qualification. The published counter counts only candidates
 that cross the registry cutoff.
+
+Before creating a producer, a probe prefix is qualified against real empty
+schema templates. JOIN/SEMI retain generated projected names and types; ANTI
+clones names, graph metadata and declared width without timestamps. This
+preparation builds no probe index. Each stage holds its exact FULL right image
+through consumer ACK; a delta or older public shadow cannot replace it. Missing
+right sources, NULL keys, out-of-range keys or incompatible FLOAT key classes
+truncate the prefix before that stage. Allocation/admission errors remain
+errors. The excluded operator then runs once on the whole materialized prefix;
+both standalone missing-right existence joins preserve the original entry,
+including its projection-independent ownership and delta/timestamp metadata.
+Schema END and template retirement use distinct cleanup funding and retain
+completed output ownership across stops. No template is a fake pending batch.
 
 Consumer actions require one actual384 host funding payment. Direct composed
 384/383 tests exercise the admission boundary. The framed root additionally
@@ -1444,8 +1459,7 @@ the original attempt synchronously; these calls do not promise a hard total
 turn quantum. Physical allocator/free and mandatory cleanup boundaries retain
 their existing cooperative contracts.
 
-For non-batch controlled STEP, the initial plan and registry proof is also
-resumable. A call charges at most 64 plan-proof and scheduler actions combined.
+For controlled STEP, the initial plan and registry proof is resumable. A call charges at most 64 plan-proof and scheduler actions combined.
 Each action advances a bounded cursor, processing at most one plan descriptor,
 registry slot, relation-name byte, or empty-stratum skip. When the bound is
 reached, STEP returns `EAGAIN` with the same attempt and cursors, and continues
@@ -1454,7 +1468,9 @@ cannot hide an unbounded string comparison. The proof checks
 supported nonrecursive plan operators and confirms that registry heads match
 the already committed relation prefix before evaluation starts. A terminal
 stop discards the proof; a fresh attempt starts it again while preserving
-already committed output. The established batch proof remains separate.
+already committed output. Batch and ordinary destinations share this proof;
+protected publication may grow the registry while the same attempt schedules
+the next relation.
 
 This enables the bounded preflight for supported serial nonrecursive STEP
 plans. Recursive, delta-observer, differential, multiworker/TDD, strict-batch,
