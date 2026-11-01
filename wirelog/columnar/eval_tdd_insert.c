@@ -314,12 +314,10 @@ insert_split_get(wl_col_session_t *sess, insert_split_t *splits,
 
 /* Clear on @worker the session states the bound runner refuses -- they
  * choose operands by name, and a clone copies them from the coordinator.
- * Also turn off, for these runs, the bounded join batching a session may
- * have asked for, strict mode included, which the bound runner accepts
- * since #2201; session_snapshot_insert records that as the insert-route
- * fallback, or refuses the route in strict mode, before any clone exists
- * (#1382).  A round with more than one task tells extension calls so,
- * which refuses a callback not declared thread-safe. */
+ * The clone keeps the coordinator's bounded join batching, strict mode
+ * included: its JOINs run the producer over the relation each right slot
+ * holds (#2201).  A round with more than one task tells extension calls
+ * so, which refuses a callback not declared thread-safe. */
 static void
 insert_clone_prepare(wl_col_session_t *worker, uint32_t tasks)
 {
@@ -327,8 +325,6 @@ insert_clone_prepare(wl_col_session_t *worker, uint32_t tasks)
     worker->retraction_seeded = false;
     worker->retraction_right_pass = false;
     worker->diff_operators_active = false;
-    worker->join_batch_bytes = 0;
-    worker->join_batch_strict = false;
     worker->callback_active_workers = tasks ? tasks : 1;
     worker->callback_parallel_execution = tasks > 1;
     worker->extension_expr_status = 0;

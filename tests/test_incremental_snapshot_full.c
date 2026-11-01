@@ -316,13 +316,13 @@ done:
     }
 }
 
-/* #1382: the insert route runs a reached stratum's joins on a worker clone
- * with bounded join batching turned off.  With WIRELOG_JOIN_BATCH_BYTES set
- * it records insert-route on the session; under WIRELOG_JOIN_BATCH_STRICT it
- * refuses before changing anything, and the snapshot is re-evaluated in full
- * instead.  Either way the rows are exact.  A reached stratum without a
- * JOIN records nothing.  @strict selects the mode; the knobs are read when
- * the session is created. */
+/* #1382, #2201: the insert route runs a reached stratum's joins on worker
+ * clones that keep the session's bounded join batching.  With
+ * WIRELOG_JOIN_BATCH_BYTES set, with or without WIRELOG_JOIN_BATCH_STRICT,
+ * the snapshot takes the route, records nothing, and its rows are exact;
+ * a keyed join runs bounded on the clones, whose teardown folds the runs
+ * into the session.  A reached stratum without a JOIN runs none.  @strict
+ * selects the mode; the knobs are read when the session is created. */
 static void
 run_join_batch_case(bool join, bool strict, uint32_t workers)
 {
@@ -341,11 +341,9 @@ run_join_batch_case(bool join, bool strict, uint32_t workers)
     wl_session_t *s = NULL;
     const char *why = NULL;
     uint32_t route0;
-    uint8_t want_reason = 0;
+    uint32_t runs;
 
-    c.route = !(join && strict);
-    if (join && !strict)
-        want_reason = COL_JOIN_BATCH_EXCLUDED_INSERT_ROUTE;
+    c.route = true;
     tests_run++;
     printf("  [%d] bounded mode, %s, %s (%u worker%s)", tests_run,
         join ? "join" : "no join", strict ? "strict" : "recorded", workers,
@@ -369,6 +367,8 @@ run_join_batch_case(bool join, bool strict, uint32_t workers)
     /* Only the incremental snapshot below is under test. */
     COL_SESSION(s)->join_batch_fallback_count = 0;
     COL_SESSION(s)->join_batch_last_reason = 0;
+    memset(COL_SESSION(s)->join_batch_worker_runs, 0,
+        sizeof(COL_SESSION(s)->join_batch_worker_runs));
     route0 = wl_columnar_session_test_insert_route_taken;
     if (add(s, &c, 9, true) != 0) {
         why = "incremental insert";
@@ -377,11 +377,16 @@ run_join_batch_case(bool join, bool strict, uint32_t workers)
     if ((why = expect(s, &c, "snapshot")) != NULL
         || (why = expect_route(&c, route0, "snapshot")) != NULL)
         goto done;
-    if (COL_SESSION(s)->join_batch_last_reason != want_reason
-        || (want_reason && !COL_SESSION(s)->join_batch_fallback_count)) {
-        snprintf(message, sizeof(message), "reason %u count %u, want %u",
+    runs = COL_SESSION(s)->join_batch_worker_runs[COL_JOIN_BATCH_RUN_ORDINARY]
+        + COL_SESSION(s)->join_batch_worker_runs[COL_JOIN_BATCH_RUN_PIPELINE];
+    if (COL_SESSION(s)->join_batch_fallback_count != 0
+        || COL_SESSION(s)->join_batch_worker_runs[
+            COL_JOIN_BATCH_RUN_DIFFERENTIAL] != 0
+        || (join ? runs == 0 : runs != 0)) {
+        snprintf(message, sizeof(message),
+            "reason %u count %u, clone runs %u",
             (unsigned)COL_SESSION(s)->join_batch_last_reason,
-            COL_SESSION(s)->join_batch_fallback_count, (unsigned)want_reason);
+            COL_SESSION(s)->join_batch_fallback_count, runs);
         why = message;
     }
 done:

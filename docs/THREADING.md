@@ -1893,17 +1893,22 @@ storage. In a TDD bound run, which resolves operands by input slot, the
 producer takes no pin: it builds and owns a private index over the relation
 the slot holds, which can be a relation of the coordinator that other
 workers read at the same time, and reads that relation under the run's slot
-reader and a reader of its own. Besides the process-wide `WL_LOG` sink,
-whose thresholds are fixed at `wl_log_init()` and whose emit uses stdio (see
-`wirelog/util/log.h`; section 10.4 covers fork), the cross-thread state a
-producer reaches includes the session's memory governor, the source-access
-gates of the relations it reads (on a worker these can be views of the
-coordinator's storage, which the ordinary JOIN reads under its arrangement
-probe's reader, the pipeline under a reader it acquires for the drain, and a
-producer over a private index under its own reader), and, on non-recursive
-workers, the atomic output counter they share. The counts reach the
-coordinator only through the teardown fold, on the coordinator's thread.
-This adds no atomic operation and no row to the atomics audit.
+reader and a reader of its own. The insert route runs such runs on several
+worker clones at once, so their producers can build indexes over the same
+coordinator relation concurrently; each index is private to its producer,
+and each producer's own reader keeps writers off the shared relation while
+it reads. Besides the process-wide `WL_LOG` sink, whose thresholds are fixed
+at `wl_log_init()` and whose emit uses stdio (see `wirelog/util/log.h`;
+section 10.4 covers fork), the cross-thread state a producer reaches
+includes the session's memory governor, the source-access gates of the
+relations it reads (on a worker these can be views of the coordinator's
+storage, which the ordinary JOIN reads under its arrangement probe's reader,
+the pipeline under a reader it acquires for the drain, and a producer over a
+private index under its own reader), and, on non-recursive workers, the
+atomic output counter they share. The counts reach the coordinator only
+through the teardown fold, on the coordinator's thread, which for
+insert-route clones happens when the stratum's clones are destroyed. This
+adds no atomic operation and no row to the atomics audit.
 
 ### Controlled ordinary JOIN confinement
 
