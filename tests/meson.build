@@ -6879,6 +6879,20 @@ foreach differential_case : [
        suite: ['unit', 'tsan', 'evaluation_differential'], timeout: 60)
 endforeach
 
+# #2298: real generated LFTJ session admission, metadata and recovery.
+test_evaluation_lftj_hosts_exe = executable(
+  'test_evaluation_lftj_hosts', files('test_evaluation_lftj_hosts.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach lftj_host_case : ['domains', 'recovery', 'failures']
+  test('evaluation_lftj_hosts_' + lftj_host_case,
+       test_evaluation_lftj_hosts_exe, args: [lftj_host_case],
+       suite: ['unit', 'tsan', 'evaluation_lftj_hosts'], timeout: 60)
+endforeach
+
 # #2296/#1953: actual physical timestamps and signed multiplicity transport.
 test_evaluation_physical_exe = executable(
   'test_evaluation_physical', files('test_evaluation_physical.c'),

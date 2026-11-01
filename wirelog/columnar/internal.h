@@ -6863,7 +6863,6 @@ typedef enum {
  * input and merge cursors are explicit so no framed host action copies or
  * sorts an entire relation.  LFTJ reads named relations and pushes one result;
  * it does not consume runtime stack entries. */
-#define WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS 64u
 typedef enum {
     WL_COLUMNAR_LFTJ_ATTEMPT_INERT,
     WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE,
@@ -6871,6 +6870,7 @@ typedef enum {
     WL_COLUMNAR_LFTJ_ATTEMPT_SIZE,
     WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC_PRECHARGE,
     WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC,
+    WL_COLUMNAR_LFTJ_ATTEMPT_SCHEMA,
     WL_COLUMNAR_LFTJ_ATTEMPT_COPY,
     WL_COLUMNAR_LFTJ_ATTEMPT_SORT,
     WL_COLUMNAR_LFTJ_ATTEMPT_JOIN,
@@ -6922,6 +6922,7 @@ typedef struct wl_columnar_lftj_attempt {
     wl_col_session_t *session;
     col_rel_t **registry;
     uint32_t registry_count;
+    const struct wl_columnar_eval_private_bindings *private_bindings;
     uint32_t cleanup_cursor;
     uint8_t cleanup_input_stage;
     wl_evaluation_control_t *control;
@@ -6935,7 +6936,7 @@ typedef struct wl_columnar_lftj_attempt {
     bool scratch_size_initialized;
     uint64_t allocation_work_total, allocation_work_charged;
     uint32_t binary_offset[WL_LFTJ_MAX_K];
-    int64_t output_types[WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS];
+    int64_t *output_types;
     int64_t *row;
     uint64_t scratch_bytes, output_rows, output_written;
     wl_columnar_memory_reservation_t scratch_reservation;
@@ -6948,7 +6949,14 @@ typedef struct wl_columnar_lftj_attempt {
     uint32_t range_index, product_depth, fill_input, fill_col;
     int64_t fill_key;
     bool writer_active, output_owned, registered;
+    wl_columnar_relation_scalar_retirement_t retirement;
+    bool retirement_started, retirement_committed;
 } wl_columnar_lftj_attempt_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_lftj_test_attempt_checkpoint)(
+    wl_evaluation_control_t *, const wl_columnar_lftj_attempt_t *);
+#endif
 
 typedef struct wl_columnar_eval_plan_numeric_attempt {
     struct wl_columnar_eval_plan_numeric_attempt *identity;

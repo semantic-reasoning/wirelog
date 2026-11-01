@@ -7660,6 +7660,7 @@ col_controlled_step_controlled_op(const wl_plan_op_t *op)
     case WL_PLAN_OP_CONCAT:
     case WL_PLAN_OP_CONSOLIDATE:
     case WL_PLAN_OP_SEMIJOIN:
+    case WL_PLAN_OP_LFTJ:
         return true;
     default:
         return false;
