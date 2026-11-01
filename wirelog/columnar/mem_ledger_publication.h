@@ -89,4 +89,81 @@ extern void (*wl_columnar_mem_ledger_publication_test_checkpoint)(
     unsigned);
 #endif
 
+/* Additive finite transfer owner; existing max2 publication remains exact.
+ * Zero initialize stable final-address storage. Caller owns actual ledgers
+ * through terminal ACK. Control is genuinely retained after bootstrap payments.
+ * Requests are immutable through preparation, copied on success and disjoint
+ * from record, actual ledgers and control. Record/ledgers/control are likewise
+ * disjoint. Complete opaque-control range validation is caller-owned; runtime
+ * checks use only its known base address. Ledger identities alone coalesce,
+ * never accounting events. Successful work864+192*count is cumulative, each
+ * actual debit<=192; no entire-prepare256 claim.
+ * HELD through apply/release is an immediate externally serialized callback-free
+ * interval. No raw ledger accounting/control finish/reset may run in it.
+ * Nofail leaves require this original sealed capability; misuse is outside
+ * their contract. Checked cancel/ACK work after original completion/reset. */
+typedef enum {
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_INERT,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CANCEL_ONLY,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_READY,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HELD,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLIED,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CONSUMED
+} wl_columnar_mem_ledger_publication_transfer_phase_t;
+
+typedef struct {
+    wl_mem_ledger_t *ledger;
+    wl_columnar_mem_ledger_publication_request_t event;
+} wl_columnar_mem_ledger_publication_transfer_request_t;
+
+typedef struct wl_columnar_mem_ledger_publication_transfer_prepared {
+    struct wl_columnar_mem_ledger_publication_transfer_prepared *identity;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy, control_ref, acquisition_started, sealed;
+    wl_columnar_mem_ledger_publication_transfer_phase_t phase;
+    wl_columnar_mem_ledger_publication_transfer_request_t requests[3];
+    wl_mem_ledger_t *ledgers[2];
+    unsigned count, unique_count, held_mask;
+    uint64_t prepaid_acquire, prepaid_apply, prepaid_release, prepaid_ack;
+    int semantic_result;
+} wl_columnar_mem_ledger_publication_transfer_prepared_t;
+
+typedef struct {
+    wl_columnar_mem_ledger_publication_transfer_phase_t phase;
+    unsigned count, unique_count, held_mask;
+    uint64_t control_identity, attempt_id;
+    int semantic_result;
+} wl_columnar_mem_ledger_publication_transfer_status_t;
+
+int wl_columnar_mem_ledger_publication_transfer_prepare_controlled(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *,
+    const wl_columnar_mem_ledger_publication_transfer_request_t *, unsigned,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_mem_ledger_publication_transfer_acquire_pair(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *);
+void wl_columnar_mem_ledger_publication_transfer_apply_prepared_nofail(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *);
+void wl_columnar_mem_ledger_publication_transfer_release_prepared_nofail(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *);
+int wl_columnar_mem_ledger_publication_transfer_cancel(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *);
+int wl_columnar_mem_ledger_publication_transfer_ack(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *);
+int wl_columnar_mem_ledger_publication_transfer_query(
+    const wl_columnar_mem_ledger_publication_transfer_prepared_t *,
+    wl_columnar_mem_ledger_publication_transfer_status_t *);
+#ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
+extern void (*wl_columnar_mem_ledger_publication_transfer_test_checkpoint)(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *,
+    wl_evaluation_control_t *, unsigned);
+#endif
+
 #endif /* WL_COLUMNAR_MEM_LEDGER_PUBLICATION_H */

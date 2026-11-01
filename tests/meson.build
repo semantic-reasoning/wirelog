@@ -6730,6 +6730,24 @@ test_evaluation_output_materialization_exe = executable(
 test('evaluation_output_materialization', test_evaluation_output_materialization_exe,
      suite: ['unit', 'tsan'], timeout: 60)
 
+# Finite three-event/two-ledger sibling; old max2 target remains unchanged.
+test_mem_ledger_transfer_exe = executable(
+  'test_mem_ledger_transfer',
+  files('test_mem_ledger_transfer.c',
+        '../wirelog/columnar/mem_ledger_publication.c',
+        '../wirelog/columnar/mem_ledger.c',
+        '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c'),
+  thread_src,
+  c_args: ['-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep], install: false,
+)
+foreach transfer_case : ['domains', 'failures', 'authority']
+  test('mem_ledger_transfer_' + transfer_case, test_mem_ledger_transfer_exe,
+       args: [transfer_case], suite: ['unit', 'tsan', 'mem_ledger_transfer'], timeout: 60)
+endforeach
+
 # Production numeric plan continuation, with a source-unique hook archive.
 test_evaluation_numeric_plan_exe = executable(
   'test_evaluation_numeric_plan', files('test_evaluation_numeric_plan.c'),

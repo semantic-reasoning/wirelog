@@ -330,3 +330,381 @@ wl_columnar_mem_ledger_publication_cancel(
     prepared->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_CONSUMED;
     return 0;
 }
+
+/* Finite sibling for three ordered events on at most two actual ledgers.
+ * Future capacities are actually paid before READY; none is a fake counter.
+ * Existing max2 publication record, tariffs and source bodies stay unchanged.
+ * The acquire pair never invokes a hook while any writer gate is held.
+ * Logical source envelopes (control/instrumentation internals excluded):
+ * INIT192: meaningful record/native/ref setup<=88, fixed argument/charge
+ * continuation/refusal/initialization loops<=64, count0 sort/tail<=24 =>176.
+ * COPY192 per requested slot: validation7+coalesce12+four-field copy/count5,
+ * loop/error/leave/saved-attempt/caller<=50, canonical sort<=12 =>86.
+ * ACQUIRE192: origin/credit guards24+saved attempt/zero16+three slot checks45
+ * +canonical checks22+twoCAS/rollback/state40+caller24 =>171.
+ * APPLY192: three ordered(event33+dispatch15)=144+phase/credit/caller24=168.
+ * RELEASE96: two gate groups24+checked cancel/common40+terminal24=88;
+ * failed second-gate rollback spends12, subsequent no-gate cancel<=64 of84.
+ * ACK192: explicit3slot/twoledger/meaningful field clear<=80+origin/ref/caller
+ * <=80 =>160. No bulk opaque clear or hook occurs under held ledger gates.
+ * Actual success is864+192*count through separate positive debits<=192;
+ * total call work is not256. Initial immutable address guards are the fixed
+ * read-only protocol-bootstrap refusal boundary inventoried at entry. */
+enum {
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_INIT_WORK = 192,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_COPY_WORK = 192,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACQUIRE_WORK = 192,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLY_WORK = 192,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_RELEASE_WORK = 96,
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACK_WORK = 192
+};
+#ifdef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS
+void (*wl_columnar_mem_ledger_publication_transfer_test_checkpoint)(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *,
+    wl_evaluation_control_t *, unsigned);
+#define WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK(p, c, phase) do { \
+            if (wl_columnar_mem_ledger_publication_transfer_test_checkpoint) \
+            wl_columnar_mem_ledger_publication_transfer_test_checkpoint(p, c, \
+                phase); \
+} while (0)
+#else
+#define WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK(p, c, phase) ((void)0)
+#endif
+
+static bool
+wl_columnar_mem_ledger_publication_transfer_overlap(const void *a, size_t an,
+    const void *b, size_t bn)
+{
+    if (!a || !b || !an || !bn) return false;
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    if (an - 1 > UINTPTR_MAX - x || bn - 1 > UINTPTR_MAX - y) return true;
+    return x <= y + bn - 1 && y <= x + an - 1;
+}
+
+static bool
+wl_columnar_mem_ledger_publication_transfer_origin(
+    const wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    if (!p || p->identity != p || !p->control_ref || !p->control ||
+        !p->thread_valid)
+        return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(p->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return p->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(p->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static int
+wl_columnar_mem_ledger_publication_transfer_enter(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    if (!p) return EINVAL;
+    if (p->busy) return EBUSY;
+    if (!wl_columnar_mem_ledger_publication_transfer_origin(p)) return EINVAL;
+    p->busy = true; return 0;
+}
+
+static int
+wl_columnar_mem_ledger_publication_transfer_leave(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p, int rc)
+{
+    p->busy = false; return rc;
+}
+
+static int
+wl_columnar_mem_ledger_publication_transfer_error(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p, int rc)
+{
+    if (!p->semantic_result) p->semantic_result = rc;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CANCEL_ONLY;
+    return wl_columnar_mem_ledger_publication_transfer_leave(p, rc);
+}
+
+static void
+wl_columnar_mem_ledger_publication_transfer_unlock(wl_mem_ledger_t *ledger)
+{
+#ifdef _MSC_VER
+    (void)atomic_exchange_explicit(&ledger->writer_gate, 0,
+        memory_order_release);
+#else
+    atomic_store_explicit(&ledger->writer_gate, 0, memory_order_release);
+#endif
+}
+
+int
+wl_columnar_mem_ledger_publication_transfer_prepare_controlled(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p,
+    const wl_columnar_mem_ledger_publication_transfer_request_t *requests,
+    unsigned count, wl_evaluation_control_t *control, uint64_t id)
+{
+    /* Fixed read-only safety bootstrap, <=240 source operations including
+     * seven overlap calls<=140, loop/overflow/inert/origin checks<=80 and
+     * known-control-base checks<=20. No mutation/hook/debit/retain, no target
+     * ledger contents and no semantic request work in this refusal boundary.
+     * Opaque control allocation size is unknown; full disjointness remains
+     * the caller's contract. Base checks deliberately claim nothing stronger. */
+    if (!p || !control || !id || count > 3 ||
+        (count && !requests)) return EINVAL;
+    uintptr_t record_base = (uintptr_t)p, request_base = (uintptr_t)requests;
+    size_t request_bytes = count * sizeof(*requests);
+    if (sizeof(*p)-1 > UINTPTR_MAX-record_base
+        || (request_bytes &&
+        request_bytes-1 > UINTPTR_MAX-request_base)) return EINVAL;
+    if (p->busy) return EBUSY;
+    if (p->identity && p->identity != p) return EINVAL;
+    if (p->identity || p->control || p->control_ref || p->thread_valid
+        || p->held_mask || p->sealed
+        || p->phase !=
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_INERT) return EBUSY;
+    if (wl_columnar_mem_ledger_publication_transfer_overlap(p, sizeof(*p),
+        requests, request_bytes))
+        return EINVAL;
+    uintptr_t control_base = (uintptr_t)control;
+    if ((control_base >= record_base &&
+        control_base <= record_base+sizeof(*p)-1)
+        || (request_bytes && control_base >= request_base &&
+        control_base <= request_base+request_bytes-1))
+        return EINVAL;
+    for (unsigned i = 0; i < count; ++i) {
+        if (wl_columnar_mem_ledger_publication_transfer_overlap(p, sizeof(*p),
+            requests[i].ledger,
+            sizeof(wl_mem_ledger_t))
+            || wl_columnar_mem_ledger_publication_transfer_overlap(requests,
+            request_bytes,
+            requests[i].ledger, sizeof(wl_mem_ledger_t))) return EINVAL;
+    }
+    uint64_t control_identity = wl_evaluation_control_identity(control);
+    p->busy = true;
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK(p, control, 1);
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_INIT_WORK);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_leave(p, rc);
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_RELEASE_WORK);
+    if (!rc) rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACK_WORK);
+    if (!rc && (wl_evaluation_control_identity(control) != control_identity
+        || wl_evaluation_control_active_attempt_id(control) != id)) rc = EINVAL;
+    if (!rc) rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_leave(p, rc);
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_leave(p, rc);
+    p->identity = p; p->control = control; p->control_ref = true;
+    p->control_identity = control_identity; p->attempt_id = id;
+#if defined(WL_HAVE_C11_THREADS)
+    p->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    p->owner_thread = GetCurrentThreadId();
+#else
+    p->owner_thread = pthread_self();
+#endif
+    p->thread_valid = true; p->acquisition_started = false; p->sealed = false;
+    p->count = 0; p->unique_count = 0; p->held_mask = 0;
+    p->prepaid_acquire = p->prepaid_apply = 0;
+    p->prepaid_release =
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_RELEASE_WORK;
+    p->prepaid_ack = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACK_WORK;
+    p->semantic_result = 0;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CANCEL_ONLY;
+    p->ledgers[0] = p->ledgers[1] = NULL;
+    for (unsigned i = 0; i < 3; ++i)
+        p->requests[i] =
+            (wl_columnar_mem_ledger_publication_transfer_request_t){0};
+    for (unsigned i = 0; i < count; ++i) {
+        rc = wl_evaluation_control_charge_attempt(control, id,
+                WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_COPY_WORK);
+        if (rc) return wl_columnar_mem_ledger_publication_transfer_error(p, rc);
+        if (!requests[i].ledger ||
+            !wl_columnar_mem_ledger_publication_request_valid(
+                &requests[i].event))
+            return wl_columnar_mem_ledger_publication_transfer_error(p, EINVAL);
+        if (requests[i].ledger != p->ledgers[0] &&
+            requests[i].ledger != p->ledgers[1]){
+            if (p->unique_count ==
+                2) return wl_columnar_mem_ledger_publication_transfer_error(p,
+                           EINVAL);
+            p->ledgers[p->unique_count++] = requests[i].ledger;
+        }
+        p->requests[i] = requests[i]; p->count++;
+    }
+    if (p->unique_count == 2 &&
+        (uintptr_t)p->ledgers[0] > (uintptr_t)p->ledgers[1]){
+        wl_mem_ledger_t *swap = p->ledgers[0]; p->ledgers[0] = p->ledgers[1];
+        p->ledgers[1] = swap;
+    }
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK(p, control, 2);
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLY_WORK);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_error(p, rc);
+    p->prepaid_apply = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLY_WORK;
+    rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACQUIRE_WORK);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_error(p, rc);
+    p->prepaid_acquire =
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACQUIRE_WORK;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_READY;
+    return wl_columnar_mem_ledger_publication_transfer_leave(p, 0);
+}
+
+int
+wl_columnar_mem_ledger_publication_transfer_acquire_pair(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    int rc = wl_columnar_mem_ledger_publication_transfer_enter(p);
+    if (rc) return rc;
+    if (p->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_READY ||
+        p->acquisition_started
+        || p->prepaid_acquire !=
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACQUIRE_WORK
+        || p->prepaid_apply !=
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLY_WORK
+        || p->prepaid_release !=
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_RELEASE_WORK
+        || p->prepaid_ack !=
+        WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACK_WORK)
+        return wl_columnar_mem_ledger_publication_transfer_leave(p, EBUSY);
+    p->acquisition_started = true; p->prepaid_acquire = 0;
+    WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK(p, p->control, 3);
+    if (wl_evaluation_control_identity(p->control) != p->control_identity
+        || wl_evaluation_control_active_attempt_id(p->control) != p->attempt_id)
+        return wl_columnar_mem_ledger_publication_transfer_error(p, EINVAL);
+    rc = wl_evaluation_control_charge_attempt(p->control, p->attempt_id, 0);
+    if (rc) return wl_columnar_mem_ledger_publication_transfer_error(p, rc);
+    if (p->count > 3 || p->unique_count > 2 || p->unique_count > p->count
+        || p->held_mask || p->sealed
+        || (!p->unique_count && (p->ledgers[0] || p->ledgers[1]))
+        || (p->unique_count == 1 && p->ledgers[1])
+        || (p->unique_count && !p->ledgers[0])
+        || (p->unique_count == 2 && (!p->ledgers[1]
+        || (uintptr_t)p->ledgers[0] >= (uintptr_t)p->ledgers[1])))
+        return wl_columnar_mem_ledger_publication_transfer_error(p, EINVAL);
+    for (unsigned i = 0; i < p->count; ++i)
+        if (!wl_columnar_mem_ledger_publication_request_valid(
+                &p->requests[i].event)
+            || !p->requests[i].ledger
+            || (p->requests[i].ledger != p->ledgers[0] &&
+            p->requests[i].ledger != p->ledgers[1]))
+            return wl_columnar_mem_ledger_publication_transfer_error(p, EINVAL);
+
+
+    /* SEALED: no call below can poll, charge, hook, allocate, log or wait.
+     * A failed gate1 releases gate0 immediately, before ordinary error return. */
+    uint64_t expected = 0;
+    if (p->unique_count &&
+        !wl_columnar_mem_ledger_publication_strong(p->ledgers[0], &expected))
+        return wl_columnar_mem_ledger_publication_transfer_error(p, EAGAIN);
+    if (p->unique_count) p->held_mask = 1;
+    if (p->unique_count == 2) {
+        expected = 0;
+        if (!wl_columnar_mem_ledger_publication_strong(p->ledgers[1],
+            &expected)){
+            wl_columnar_mem_ledger_publication_transfer_unlock(p->ledgers[0]);
+            p->held_mask = 0; p->prepaid_release -= 12;
+            return wl_columnar_mem_ledger_publication_transfer_error(p, EAGAIN);
+        }
+        p->held_mask = 3;
+    }
+    p->sealed = true;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HELD;
+    return wl_columnar_mem_ledger_publication_transfer_leave(p, 0);
+}
+
+void
+wl_columnar_mem_ledger_publication_transfer_apply_prepared_nofail(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    /* Valid original sealed HELD capability only, immediate no-hook interval. */
+    p->busy = true;
+    for (unsigned i = 0; i < p->count; ++i)
+        wl_columnar_mem_ledger_event_locked(p->requests[i].ledger,
+            p->requests[i].event.subsystem, p->requests[i].event.bytes,
+            p->requests[i].event.kind ==
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ALLOC);
+    p->prepaid_apply = 0;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_APPLIED;
+    p->busy = false;
+}
+
+void
+wl_columnar_mem_ledger_publication_transfer_release_prepared_nofail(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    p->busy = true;
+    if (p->held_mask &
+        2) wl_columnar_mem_ledger_publication_transfer_unlock(p->ledgers[1]);
+    if (p->held_mask &
+        1) wl_columnar_mem_ledger_publication_transfer_unlock(p->ledgers[0]);
+    p->held_mask = 0; p->sealed = false; p->prepaid_release = 0;
+    p->prepaid_acquire = p->prepaid_apply = 0;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CONSUMED;
+    p->busy = false;
+}
+
+int
+wl_columnar_mem_ledger_publication_transfer_cancel(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    int rc = wl_columnar_mem_ledger_publication_transfer_enter(p);
+    if (rc) return rc;
+    if ((p->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_READY
+        && p->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CANCEL_ONLY
+        && p->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HELD)
+        || p->prepaid_release < 64)
+        return wl_columnar_mem_ledger_publication_transfer_leave(p, EBUSY);
+    wl_columnar_mem_ledger_publication_transfer_release_prepared_nofail(p);
+    return 0;
+}
+
+int
+wl_columnar_mem_ledger_publication_transfer_ack(
+    wl_columnar_mem_ledger_publication_transfer_prepared_t *p)
+{
+    int rc = wl_columnar_mem_ledger_publication_transfer_enter(p);
+    if (rc) return rc;
+    if (p->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_CONSUMED ||
+        p->held_mask
+        || p->sealed ||
+        p->prepaid_ack != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_ACK_WORK)
+        return wl_columnar_mem_ledger_publication_transfer_leave(p, EBUSY);
+    wl_evaluation_control_t *owned = p->control;
+    for (unsigned i = 0; i < 3; ++i)
+        p->requests[i] =
+            (wl_columnar_mem_ledger_publication_transfer_request_t){0};
+    p->ledgers[0] = p->ledgers[1] = NULL; p->count = p->unique_count = 0;
+    p->prepaid_acquire = p->prepaid_apply = p->prepaid_release =
+        p->prepaid_ack = 0;
+    p->identity = NULL; p->control = NULL; p->control_ref = false;
+    p->control_identity = p->attempt_id = 0;
+    p->thread_valid = p->acquisition_started = false; p->semantic_result = 0;
+    p->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_INERT;
+    wl_evaluation_control_release(owned);
+    return wl_columnar_mem_ledger_publication_transfer_leave(p, 0);
+}
+
+int
+wl_columnar_mem_ledger_publication_transfer_query(
+    const wl_columnar_mem_ledger_publication_transfer_prepared_t *p,
+    wl_columnar_mem_ledger_publication_transfer_status_t *status)
+{
+    if (!p) return EINVAL;
+    if (p->busy) return EBUSY;
+    if (!wl_columnar_mem_ledger_publication_transfer_origin(p)) return EINVAL;
+    if (!status || wl_columnar_mem_ledger_publication_transfer_overlap(p,
+        sizeof(*p), status, sizeof(*status))
+        || wl_columnar_mem_ledger_publication_transfer_overlap(status,
+        sizeof(*status), p->ledgers[0], sizeof(wl_mem_ledger_t))
+        || wl_columnar_mem_ledger_publication_transfer_overlap(status,
+        sizeof(*status), p->ledgers[1], sizeof(wl_mem_ledger_t))
+        || wl_columnar_mem_ledger_publication_transfer_overlap(status,
+        sizeof(*status), p->control, 1))
+        return EINVAL;
+    *status = (wl_columnar_mem_ledger_publication_transfer_status_t){
+        p->phase, p->count, p->unique_count, p->held_mask,
+        p->control_identity, p->attempt_id, p->semantic_result
+    };
+    return 0;
+}
+#undef WL_COLUMNAR_MEM_LEDGER_PUBLICATION_TRANSFER_HOOK
