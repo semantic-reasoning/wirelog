@@ -1393,7 +1393,7 @@ wl_columnar_eval_plan_numeric_source_select(
 static int
 wl_columnar_eval_plan_source_init(wl_columnar_eval_plan_numeric_attempt_t *r)
 {
-    r->source_bare = !r->source_empty && !r->source_selected->schema_ok
+    r->source_bare = !r->source_selected->schema_ok
         && !r->source_selected->ncols && !r->source_selected->nrows;
     if (!r->source_bare)
         return wl_columnar_relation_scalar_source_init_attempt_controlled(
@@ -1416,6 +1416,22 @@ wl_columnar_eval_plan_source_hold(wl_columnar_eval_plan_numeric_attempt_t *r)
     bool done = false;
     return wl_columnar_relation_empty_source_step(&r->source_empty_reader,
                &done);
+}
+
+static int
+wl_columnar_eval_plan_source_new(wl_columnar_eval_plan_numeric_attempt_t *r)
+{
+    const char *name = r->source_is_delta ? "$empty_delta" : "$empty_skip";
+    wl_columnar_memory_governor_ref_t *governor = r->session->memory_governor
+        ? r->session->memory_governor : r->source_selected->memory_governor;
+    if (r->source_bare)
+        return
+            wl_columnar_relation_empty_source_new_like_operator_attempt_controlled
+            (
+            &r->source_empty_reader, name, governor, r->source_output);
+    return
+        wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
+        &r->source, name, governor, r->source_output);
 }
 
 static bool
@@ -1528,15 +1544,7 @@ wl_columnar_eval_plan_numeric_source_step(
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
-        return
-            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
-            (
-            &record->source,
-            record->source_is_delta ? "$empty_delta" : "$empty_skip",
-            record->session->memory_governor
-                   ? record->session->memory_governor
-                   : record->source_selected->memory_governor,
-            record->source_output);
+        return wl_columnar_eval_plan_source_new(record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING;
@@ -2309,14 +2317,7 @@ wl_columnar_eval_plan_composed_source_step(
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
-        return
-            wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
-            (
-            &record->source,
-            record->source_is_delta ? "$empty_delta" : "$empty_skip",
-            record->session->memory_governor ? record->session->memory_governor
-                : record->source_selected->memory_governor,
-            record->source_output);
+        return wl_columnar_eval_plan_source_new(record);
     case WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END:
         record->pending_action = record->phase;
         record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;

@@ -691,3 +691,29 @@ The same session-host empty-input matrix additionally runs an explicitly
 modified right-FILTER plan with batch0/configured64, then first insertion and
 ordinary dirty execution. This edited-plan witness is separate from its
 unchanged compiler-generated base plan.
+
+
+### Forced empty VARIABLE materialization (#2297)
+
+The genuine empty-source record now also reaches the existing forced-selector
+SLOT/NEW/END protocol. Its new-like sibling revalidates actual HELD authority,
+constructs an owned initialized physical-width0 relation and preserves the raw
+declared metadata without fabricating a scalar HELD record or physical lane.
+A future graph column at width0 produces the raw clone EINVAL; normal FULL/AUTO
+borrowing still preserves that original descriptor. Existing initialized
+physical graph cloning remains on the unchanged scalar recipe/fee path.
+
+Direct numeric and composed fixtures compare raw VARIABLE metadata, exact
+borrow-versus-owned identity and delta flags for FORCE_EMPTY, seeded missing
+FORCE_DELTA, and the actually admitted iteration0 FORCE_EMPTY_AFTER_SEED AUTO
+behavior. The latter is not claimed as the outbound-only recursive skip.
+Tests cover genuine bare versus initialized graph sources, private output
+allocation/admission failure, stops after real constructor credit commit and
+before install, actual independently funded source drainage, zero publication
+on failure and complete governor recovery after ACK. Primitive copy/native
+thread checks also reject unauthorized calls to the new constructor sibling.
+
+These are internal selector fixtures, not a claim that the compiler emits every
+selector on the current public default route. Present-empty SEMI/ANTI, LFTJ
+qualification and the remaining strict/cache/cap/shared/observed/successor
+policies still follow in the same grouped PR.

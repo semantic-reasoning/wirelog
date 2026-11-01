@@ -61,7 +61,7 @@ typedef struct {
     wl_columnar_relation_empty_source_t *source;
     wl_evaluation_control_t *funding;
     uint64_t id;
-    int step_result, end_result;
+    int step_result, end_result, clone_result;
 } thread_case_t;
 
 #if defined(WL_HAVE_C11_THREADS)
@@ -81,6 +81,11 @@ wrong_thread(void *arg)
     c->end_result = wl_columnar_relation_empty_source_end(c->source,
             c->funding, c->id, &done);
     CHECK(!done);
+    col_rel_t *clone = NULL;
+    c->clone_result =
+        wl_columnar_relation_empty_source_new_like_operator_attempt_controlled(
+        c->source, "$empty_skip", NULL, &clone);
+    CHECK(!clone);
 #if defined(WL_HAVE_C11_THREADS) || defined(_WIN32) || defined(_WIN64)
     return 0;
 #else
@@ -110,7 +115,8 @@ check_thread(wl_columnar_relation_empty_source_t *a)
     CHECK(!pthread_create(&thread, NULL, wrong_thread, &c));
     CHECK(!pthread_join(thread, NULL));
 #endif
-    CHECK(c.step_result == EINVAL && c.end_result == EINVAL);
+    CHECK(c.step_result == EINVAL && c.end_result == EINVAL
+        && c.clone_result == EINVAL);
     CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
     wl_evaluation_control_report_t report;
     CHECK(!wl_evaluation_control_report(funding, &report) && !report.consumed);
@@ -194,6 +200,16 @@ run(unsigned point, bool work, unsigned invalid)
         CHECK(a.reader.owner == &r->source_access
             && a.reader.secondary_owner == &r->descriptor_access);
         check_thread(&a);
+        col_rel_t *clone = NULL;
+        wl_columnar_relation_empty_source_t copy = a;
+        CHECK(
+            wl_columnar_relation_empty_source_new_like_operator_attempt_controlled
+            (
+                &copy, "$empty_skip", governor, &clone) == EINVAL && !clone);
+        CHECK(
+            wl_columnar_relation_empty_source_new_like_operator_attempt_controlled
+            (
+                &a, "$empty_skip", governor, &clone) == EINVAL && !clone);
         const int64_t values[] = {1, 2, 3};
         CHECK(col_rel_append_row(r, values) == EBUSY);
         CHECK(col_rel_set_schema(r, 3, NULL) == EBUSY);
