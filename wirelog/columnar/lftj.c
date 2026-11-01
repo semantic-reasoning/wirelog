@@ -536,6 +536,10 @@ wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
     return 0;
 }
 
+typedef char wl_columnar_lftj_attempt_prefix_bound[
+        (offsetof(wl_columnar_lftj_attempt_t,
+        retirement)+7u)/8u+112u <= 256u ? 1 : -1];
+
 int
 wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     const wl_plan_op_t *op, wl_columnar_eval_stack_cleanup_frame_t *frame,
@@ -554,7 +558,30 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     }
     if (bindings && session->nrels > UINT32_MAX - bindings->count)
         return EOVERFLOW;
-    memset(attempt, 0, sizeof(*attempt));
+    /* Actual context prefix only: the large retirement is intentionally
+     * historic until its later parent-authorized ZERO. Prefix clear141 plus
+     * fixed metadata/token/native/initializer/caller<=112 fits256. */
+    rc = wl_evaluation_control_charge_attempt(control, attempt_id, 256);
+    if (rc) return rc;
+    memset(attempt, 0, offsetof(wl_columnar_lftj_attempt_t, retirement));
+    attempt->retirement_initializer.identity = NULL;
+    attempt->retirement_initializer.parent = NULL;
+    attempt->retirement_initializer.retirement = NULL;
+    attempt->retirement_initializer.relation = NULL;
+    attempt->retirement_initializer.thread_valid = false;
+    attempt->retirement_initializer.busy = false;
+    attempt->retirement_initializer.phase =
+        WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
+    attempt->retirement_started = attempt->retirement_committed =
+        attempt->retirement_drained = false;
+    attempt->busy = false; attempt->thread_valid = true;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
     attempt->identity = attempt;
     attempt->metadata = op->opaque_data;
     attempt->frame = frame;
@@ -1377,17 +1404,38 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         }
         return 0;
     }
-    if (a->output_owned && a->semantic_result) {
-        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
-                funding_id);
-        if (rc) return rc;
-        if (!a->retirement_started) {
-            rc = wl_columnar_relation_scalar_retirement_begin(&a->retirement,
-                    a->output);
+    if (a->semantic_result && (a->output_owned || a->retirement_started
+        || a->retirement_drained || a->retirement_initializer.identity)) {
+        int rc;
+        wl_columnar_relation_scalar_retirement_initializer_t *i =
+            &a->retirement_initializer;
+        if (a->retirement_drained) {
+            rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
             if (rc) return rc;
-            a->retirement_started = true;
+            memset(&a->retirement, 0, sizeof(a->retirement));
+            a->retirement_started = a->retirement_committed =
+                a->retirement_drained = false;
             return 0;
         }
+        if (!a->retirement_started || i->identity) {
+            if (!a->output_owned || !a->output) return EINVAL;
+            if (!i->identity)
+                return wl_columnar_relation_scalar_retirement_init_begin(i, a,
+                           &a->retirement, a->output, funding, funding_id);
+            if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE) {
+                if (!a->retirement_started) return EINVAL;
+                return wl_columnar_relation_scalar_retirement_init_reset(i, a,
+                           funding, funding_id);
+            }
+            bool begun = false;
+            rc = wl_columnar_relation_scalar_retirement_init_step(i, a,
+                    &a->retirement,
+                    a->output, funding, funding_id, &begun);
+            if (!rc && begun) a->retirement_started = true;
+            return rc;
+        }
+        rc = wl_columnar_lftj_attempt_cleanup_charge(funding, funding_id);
+        if (rc) return rc;
         if (!a->retirement_committed) {
             rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
                     funding, funding_id);
@@ -1396,14 +1444,14 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
             rc = wl_columnar_relation_scalar_retirement_commit(&a->retirement);
             if (rc) return rc;
             a->retirement_committed = true;
+            a->output = NULL; a->output_owned = false;
+            return 0;
         }
         rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
                 funding, funding_id);
         if (rc == EAGAIN) return 0;
-        if (rc) return rc;
-        a->output = NULL;
-        a->output_owned = false;
-        return 0;
+        if (!rc) a->retirement_drained = true;
+        return rc;
     }
     for (uint32_t i = a->cleanup_cursor; a->inputs && i < a->input_count; i++) {
         wl_columnar_lftj_input_attempt_t *in = &a->inputs[i];
@@ -1487,8 +1535,9 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
     return 0;
 }
 
-int
-wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
+static int
+wl_columnar_ops_lftj_attempt_step_body(wl_columnar_lftj_attempt_t *a,
+    bool *done,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!done) return EINVAL;
@@ -1567,8 +1616,9 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
     return wl_columnar_lftj_attempt_fail(a, EINVAL);
 }
 
-int
-wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done,
+static int
+wl_columnar_ops_lftj_attempt_abort_body(wl_columnar_lftj_attempt_t *a,
+    bool *done,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
     if (!done) return EINVAL;
@@ -1584,12 +1634,62 @@ wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done,
     if (funding == a->control)
         return EINVAL;
     if (a->phase != WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE) {
-        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
-                funding_id);
+        bool output_abort = a->output_owned || a->retirement_started
+            || a->retirement_drained || a->retirement_initializer.identity;
+        int rc = output_abort
+            ? wl_evaluation_control_charge_attempt(funding, funding_id, 128)
+            : wl_columnar_lftj_attempt_cleanup_charge(funding, funding_id);
         if (rc) return rc;
+        if (output_abort) {
+            if (!a->semantic_result) a->semantic_result =
+                    WL_EVALUATION_CONTROL_CANCELLED;
+            a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE;
+            return 0; /* Transition is separate from any bulk action. */
+        }
     }
     if (!a->semantic_result)
         a->semantic_result = WL_EVALUATION_CONTROL_CANCELLED;
     a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE;
     return wl_columnar_lftj_attempt_release(a, done, funding, funding_id);
+}
+
+int
+wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!a || a->identity != a || !a->thread_valid) return EINVAL;
+    if (a->busy) return EBUSY;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(a->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (a->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(a->owner_thread, pthread_self())) return EINVAL;
+#endif
+    a->busy = true;
+    int rc = wl_columnar_ops_lftj_attempt_step_body(a, done, funding,
+            funding_id);
+    a->busy = false; return rc;
+}
+
+int
+wl_columnar_ops_lftj_attempt_abort(wl_columnar_lftj_attempt_t *a, bool *done,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!a || !a->identity)
+        return wl_columnar_ops_lftj_attempt_abort_body(a, done, funding,
+                   funding_id);
+    if (a->identity != a || !a->thread_valid) return EINVAL;
+    if (a->busy) return EBUSY;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(a->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (a->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(a->owner_thread, pthread_self())) return EINVAL;
+#endif
+    a->busy = true;
+    int rc = wl_columnar_ops_lftj_attempt_abort_body(a, done, funding,
+            funding_id);
+    a->busy = false; return rc;
 }

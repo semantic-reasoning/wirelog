@@ -12402,6 +12402,63 @@ test_entry_streaming_requires_session_authorization(void)
     entry_destroy(&f);
 }
 
+/* Exercise the real root384 + child128 + ZERO256 composition. */
+static void
+test_framed_lftj_retirement_funding(void)
+{
+    fixture_t f;
+    fixture_init(&f, 1, 4, false, true, 0);
+    char *names[] = {"a", "b", "c"};
+    uint32_t keys[] = {0, 0, 0}, projection = 0;
+    wl_plan_op_lftj_t metadata = {.k = 3, .rel_names = names, .key_cols = keys};
+    wl_plan_op_t ops[] = {{.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata},
+                          {.op = WL_PLAN_OP_MAP, .project_count = 1,
+                           .project_indices = &projection},
+                          {.op = WL_PLAN_OP_CONSOLIDATE}};
+    wl_plan_relation_t plan = {.name = "output", .ops = ops, .op_count = 3};
+    begin(&f, &plan);
+    for (unsigned n = 0; !f.ctx->child.lftj.output_owned; ++n) {
+        CHECK(n < 100000); turn(&f);
+    }
+    wl_evaluation_control_request_cancel(f.operation);
+    wl_columnar_lftj_attempt_t *a = &f.ctx->child.lftj;
+    for (unsigned n = 0;
+        a->retirement_initializer.phase != WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        || f.ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        || f.ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        ++n) {
+        CHECK(n < 100000); turn(&f);
+    }
+    unsigned char historic[sizeof(a->retirement)];
+    memcpy(historic, &a->retirement, sizeof(historic));
+    grant_t *g = grant_begin(&f, 767);
+    int rc = host_step(&f, g, false);
+    CHECK(rc == WL_EVALUATION_CONTROL_WORK_LIMIT && g->finish_status == rc);
+    f.protocol = rc;
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(g->control,
+        &report) && report.consumed == 512
+        && a->retirement_initializer.phase ==
+        WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO
+        && !memcmp(historic, &a->retirement, sizeof(historic)));
+    for (unsigned n = 0; f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        || f.ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+        ++n) {
+        CHECK(n < 16); turn(&f);
+    }
+    g = grant_begin(&f, 768);
+    CHECK(!host_step(&f, g, false) && !g->finish_status);
+    f.protocol = 0;
+    CHECK(!wl_evaluation_control_report(g->control,
+        &report) && report.consumed == 768
+        && a->retirement_initializer.phase ==
+        WL_COLUMNAR_RELATION_SCALAR_INIT_BIND);
+    run(&f);
+    CHECK(f.ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE
+        && close_frame(&f) == WL_EVALUATION_CONTROL_CANCELLED);
+    fixture_destroy(&f);
+}
+
 int
 main(void)
 {
@@ -12413,6 +12470,7 @@ main(void)
      * process exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    test_framed_lftj_retirement_funding();
     test_entry_streaming_requires_session_authorization();
     test_recursive_reachability_plan_manifest();
     test_recursive_two_join_plan_manifest();

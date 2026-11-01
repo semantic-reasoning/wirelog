@@ -383,6 +383,19 @@ controlled_thread_is_owner(const col_join_batch_producer_t *p)
 #endif
 }
 
+static bool
+wl_columnar_join_batch_prepare_thread(const wl_columnar_join_batch_prepare_t *a)
+{
+    if (!a->prepare_thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->prepare_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->prepare_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->prepare_thread, pthread_self()) != 0;
+#endif
+}
+
 static col_join_batch_control_status_t
 controlled_stop(col_join_batch_producer_t *p,
     col_join_batch_control_status_t status, int execution_status)
@@ -2609,6 +2622,14 @@ wl_columnar_join_batch_prepare_begin(wl_columnar_join_batch_prepare_t *a,
     rc = wl_evaluation_control_retain(control);
     if (rc) return rc;
     a->identity = a; a->session = session; a->op = op;
+#if defined(WL_HAVE_C11_THREADS)
+    a->prepare_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->prepare_thread = GetCurrentThreadId();
+#else
+    a->prepare_thread = pthread_self();
+#endif
+    a->prepare_thread_valid = true; a->cleanup_busy = false;
     a->left = left; a->right = right; a->left_is_delta = left_is_delta;
     a->input_left_keys = lk; a->input_right_keys = rk;
     a->key_count = kc; a->batch_bytes = bytes;
@@ -2887,8 +2908,9 @@ wl_columnar_join_batch_prepare_step(wl_columnar_join_batch_prepare_t *a,
 {
     if (!done) return EINVAL;
     *done = false;
-    if (!a || a->identity != a || a->aborting || a->drained || !max_work)
-        return EINVAL;
+    if (!a || a->identity != a || !wl_columnar_join_batch_prepare_thread(a)
+        || a->aborting || a->drained || !max_work) return EINVAL;
+    if (a->cleanup_busy) return EBUSY;
     if (a->result) return a->result;
     if (a->ready) {
         *done = true; return 0;
@@ -2919,28 +2941,50 @@ wl_columnar_join_batch_prepare_step(wl_columnar_join_batch_prepare_t *a,
     return 0;
 }
 
-int
-wl_columnar_join_batch_prepare_abort_step(wl_columnar_join_batch_prepare_t *a,
+static int
+wl_columnar_join_batch_prepare_abort_body(wl_columnar_join_batch_prepare_t *a,
     wl_evaluation_control_t *funding, uint64_t funding_id, bool *done)
 {
-    if (!done) return EINVAL;
     *done = false;
-    if (!a || a->identity != a || !funding ||
-        funding == a->control) return EINVAL;
     if (a->drained) {
         *done = true; return 0;
     }
-    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
-    if (rc) return rc;
-    a->aborting = true;
+    a->aborting = true; /* Actual producer/frame freeze precedes BOOT hooks. */
     col_join_batch_producer_t *p = a->producer;
-    if (p && p->batch) {
-        if (!a->retirement_started) {
-            rc = wl_columnar_relation_scalar_retirement_begin(&a->retirement,
-                    p->batch);
+    wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &a->retirement_initializer;
+    int rc;
+    if (p &&
+        (p->batch || a->retirement_started || a->retirement_drained ||
+        i->identity)){
+        if (a->retirement_drained) {
+            rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
             if (rc) return rc;
-            a->retirement_started = true;
+            memset(&a->retirement, 0, sizeof(a->retirement));
+            a->retirement_started = a->retirement_committed =
+                a->retirement_drained = false;
+            return 0;
         }
+        if (!a->retirement_started || i->identity) {
+            if (!p->batch) return EINVAL;
+            if (!i->identity)
+                return wl_columnar_relation_scalar_retirement_init_begin(i, a,
+                           &a->retirement,
+                           p->batch, funding, funding_id);
+            if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE) {
+                if (!a->retirement_started) return EINVAL;
+                return wl_columnar_relation_scalar_retirement_init_reset(i, a,
+                           funding, funding_id);
+            }
+            bool begun = false;
+            rc = wl_columnar_relation_scalar_retirement_init_step(i, a,
+                    &a->retirement,
+                    p->batch, funding, funding_id, &begun);
+            if (!rc && begun) a->retirement_started = true;
+            return rc;
+        }
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+        if (rc) return rc;
         if (!a->retirement_committed) {
             rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
                     funding, funding_id);
@@ -2948,15 +2992,17 @@ wl_columnar_join_batch_prepare_abort_step(wl_columnar_join_batch_prepare_t *a,
             if (rc) return rc;
             rc = wl_columnar_relation_scalar_retirement_commit(&a->retirement);
             if (rc) return rc;
-            a->retirement_committed = true;
+            a->retirement_committed = true; p->batch = NULL;
+            return 0;
         }
         rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
                 funding, funding_id);
         if (rc == EAGAIN) return 0;
-        if (rc) return rc;
-        p->batch = NULL;
-        return 0;
+        if (!rc) a->retirement_drained = true;
+        return rc;
     }
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+    if (rc) return rc;
     if (a->left_reader.owner || a->right_reader.owner) {
         bool released = false;
         rc = wl_columnar_source_access_reader_release_step(a->left_reader.owner
@@ -2999,4 +3045,20 @@ wl_columnar_join_batch_prepare_abort_step(wl_columnar_join_batch_prepare_t *a,
     wl_evaluation_control_release(a->control); a->control = NULL;
     a->ready = false; a->drained = true; *done = true;
     return 0;
+}
+
+int
+wl_columnar_join_batch_prepare_abort_step(wl_columnar_join_batch_prepare_t *a,
+    wl_evaluation_control_t *funding, uint64_t funding_id, bool *done)
+{
+    if (!done || !a || a->identity != a ||
+        !wl_columnar_join_batch_prepare_thread(a)
+        || !funding || funding == a->control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        funding_id) return EINVAL;
+    if (a->cleanup_busy) return EBUSY;
+    a->cleanup_busy = true;
+    int rc = wl_columnar_join_batch_prepare_abort_body(a, funding, funding_id,
+            done);
+    a->cleanup_busy = false; return rc;
 }

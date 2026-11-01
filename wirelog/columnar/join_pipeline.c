@@ -1181,6 +1181,9 @@ typedef struct {
     wl_columnar_memory_reservation_t row_credit;
     bool row_admitted, row_committed;
     wl_columnar_relation_scalar_retirement_t retirement;
+    wl_columnar_relation_scalar_retirement_initializer_t retirement_initializer;
+    eval_entry_t *retirement_entry;
+    bool busy;
     bool retirement_started, retirement_committed, retirement_drained;
     bool retiring_output;
     eval_entry_t retiring_entry;
@@ -2193,52 +2196,58 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
     }
 }
 
-enum {
-    WL_COLUMNAR_JOIN_HOST_RETIRE_INIT_WORK =
-        (sizeof(wl_columnar_relation_scalar_retirement_t) + 7u) / 8u + 64u
-};
-typedef char wl_columnar_join_host_retire_work_fits_t[
-        WL_COLUMNAR_JOIN_HOST_RETIRE_INIT_WORK <=
-        WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
-
 static int
 wl_columnar_join_host_retire(wl_columnar_join_host_t *h, eval_entry_t *entry,
     wl_evaluation_control_t *funding, uint64_t id, bool output, bool *done)
 {
     *done = false;
     int rc;
-    if (!h->retirement_started && (!entry->owned || !entry->rel)) {
+    wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &h->retirement_initializer;
+    if (i->busy) return EBUSY;
+    if (!h->retirement_entry && !h->retirement_started &&
+        (!entry->owned || !entry->rel)){
         rc = wl_evaluation_control_charge_attempt(funding, id, 128);
         if (rc) return rc;
-        memset(entry, 0, sizeof(*entry)); *done = true;
-        return 0;
+        memset(entry, 0, sizeof(*entry)); *done = true; return 0;
     }
-    if (!h->retirement_started) {
-        if (entry->rel->memory_budget_denial_pending) {
-            rc = wl_evaluation_control_charge_attempt(funding, id, 1);
-            if (rc) return rc;
-            h->parent->session->memory_budget_denied = true;
-            entry->rel->memory_budget_denial_pending = false;
-            return 0;
-        }
-        rc = wl_evaluation_control_charge_attempt(funding, id,
-                WL_COLUMNAR_JOIN_HOST_RETIRE_INIT_WORK);
-        if (rc) return rc;
-        rc = wl_columnar_relation_scalar_retirement_begin(&h->retirement,
-                entry->rel);
-        if (rc) return rc;
-        h->retirement_started = true; h->retiring_output = output;
+    if (!h->retirement_entry) {
+        h->retirement_entry = entry; h->retiring_output = output;
     }
-    if (h->retiring_output != output) return EINVAL;
+    if (h->retirement_entry != entry ||
+        h->retiring_output != output) return EINVAL;
     if (h->retirement_drained) {
-        rc = wl_evaluation_control_charge_attempt(funding, id,
-                WL_COLUMNAR_JOIN_HOST_RETIRE_INIT_WORK);
+        rc = wl_evaluation_control_charge_attempt(funding, id, 256);
         if (rc) return rc;
         memset(&h->retirement, 0, sizeof(h->retirement));
-        h->retirement_started = h->retirement_committed = false;
-        h->retirement_drained = false; h->retiring_output = false;
-        *done = true;
+        h->retirement_started = h->retirement_committed =
+            h->retirement_drained = false;
+        h->retiring_output = false; h->retirement_entry = NULL; *done = true;
         return 0;
+    }
+    if (!h->retirement_started || i->identity) {
+        if (!entry->owned || !entry->rel) return EINVAL;
+        if (!i->identity) {
+            if (entry->rel->memory_budget_denial_pending) {
+                rc = wl_evaluation_control_charge_attempt(funding, id, 1);
+                if (rc) return rc;
+                h->parent->session->memory_budget_denied = true;
+                entry->rel->memory_budget_denial_pending = false; return 0;
+            }
+            return wl_columnar_relation_scalar_retirement_init_begin(i, h,
+                       &h->retirement, entry->rel, funding, id);
+        }
+        if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE) {
+            if (!h->retirement_started) return EINVAL;
+            return wl_columnar_relation_scalar_retirement_init_reset(i, h,
+                       funding, id);
+        }
+        bool begun = false;
+        rc = wl_columnar_relation_scalar_retirement_init_step(i, h,
+                &h->retirement,
+                entry->rel, funding, id, &begun);
+        if (!rc && begun) h->retirement_started = true;
+        return rc;
     }
     if (!h->retirement_committed) {
         rc = wl_columnar_relation_scalar_retirement_prepare(&h->retirement,
@@ -2247,8 +2256,7 @@ wl_columnar_join_host_retire(wl_columnar_join_host_t *h, eval_entry_t *entry,
         if (rc) return rc;
         rc = wl_columnar_relation_scalar_retirement_commit(&h->retirement);
         if (rc) return rc;
-        memset(entry, 0, sizeof(*entry));
-        h->retirement_committed = true;
+        memset(entry, 0, sizeof(*entry)); h->retirement_committed = true;
         return 0;
     }
     rc = wl_columnar_relation_scalar_retirement_step(&h->retirement, funding,
@@ -2264,7 +2272,7 @@ wl_columnar_join_host_shape_retire(wl_columnar_join_host_t *h,
 {
     int rc = wl_columnar_join_host_retire(h, &h->shape_old, funding, id,
             false, done);
-    h->shape_retiring = h->retirement_started;
+    h->shape_retiring = h->retirement_entry != NULL;
     return rc;
 }
 
@@ -2564,8 +2572,8 @@ wl_columnar_join_pipeline_numeric_delta_owned(const void *owner,
     return 0;
 }
 
-int
-wl_columnar_join_pipeline_numeric_step(
+static int
+wl_columnar_join_pipeline_numeric_step_body(
     wl_columnar_eval_plan_numeric_attempt_t *r,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
@@ -2654,4 +2662,27 @@ wl_columnar_join_pipeline_numeric_step(
     }
     r->child_status.progress = WL_COLUMNAR_FILTER_PROGRESS_RETAINED;
     return wl_columnar_join_host_cleanup(h, funding, funding_id);
+}
+
+/* Lexical parent exclusion spans initializer and inherited governor/retirement
+ * hooks. Read-only host authentication remains available to its own driver. */
+int
+wl_columnar_join_pipeline_numeric_step(
+    wl_columnar_eval_plan_numeric_attempt_t *r,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!r || !wl_columnar_eval_plan_numeric_owner_valid(r,
+        r->frame)) return EINVAL;
+    wl_columnar_join_host_t *h = NULL;
+    if (r->join_host &&
+        r->join_host_initialized_bytes > sizeof(wl_columnar_join_host_t)) {
+        h = r->join_host;
+        if (h->identity != h || h->parent != r) return EINVAL;
+        if (h->busy) return EBUSY;
+        h->busy = true;
+    }
+    int rc = wl_columnar_join_pipeline_numeric_step_body(r, funding,
+            funding_id);
+    if (h && r->join_host == h) h->busy = false;
+    return rc;
 }

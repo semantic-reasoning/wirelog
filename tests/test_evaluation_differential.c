@@ -1,6 +1,8 @@
 /* Scalar selector contracts use internal plans; lifecycle tests below use
  * unchanged compiler plans. Neither fixture injects an active raw evaluator. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
+#include "../wirelog/columnar/join_pipeline.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/session.h"
 #include "../wirelog/session_options.h"
@@ -84,16 +86,69 @@ check_output(wl_session_t *base, const tuple_t *expected, unsigned count)
  * metadata, not an injected session->delta_seeded/current_iteration state. */
 static bool batch_stop_work, batch_stop_hit, batch_selected_delta;
 
+static wl_evaluation_control_t *batch_stop_control;
+static wl_col_session_t *batch_stop_session;
+static const wl_plan_op_t *batch_stop_op;
+static const col_rel_t *batch_stop_left, *batch_stop_right, *batch_stop_delta;
+static col_relation_snapshot_t batch_stop_left_image, batch_stop_right_image;
+static bool batch_prepare_seen;
+static unsigned batch_stop_count;
+
+static void
+selected_batch_witness(const wl_columnar_join_batch_prepare_t *a)
+{
+    CHECK(!batch_stop_work && a && a->identity == a &&
+        a->session == batch_stop_session
+        && a->control == batch_stop_control && a->op == batch_stop_op
+        && a->op->delta_mode == WL_DELTA_AUTO && a->left_is_delta
+        && a->left == batch_stop_left && a->right == batch_stop_right
+        && a->right != batch_stop_delta && a->attempt_id
+        && a->attempt_id ==
+        wl_evaluation_control_active_attempt_id(batch_stop_control));
+    if (!a->left_reader.owner || !a->right_reader.owner
+        || a->left_reader.acquire_stage || a->right_reader.acquire_stage
+        || !wl_columnar_relation_snapshot_valid(a->left_snapshot)
+        || !wl_columnar_relation_snapshot_valid(a->right_snapshot)) return;
+    CHECK(a->left_reader.identity == (uintptr_t)&a->left_reader
+        && a->right_reader.identity == (uintptr_t)&a->right_reader
+        && a->left_reader.secondary_owner == &a->left->descriptor_access
+        && a->right_reader.secondary_owner == &a->right->descriptor_access
+        && a->left->nrows == 1 && a->right->nrows == 2
+        && batch_stop_delta->nrows == 1
+        && a->left->columns[1][0] == 2 && a->right->columns[1][0] == 5
+        && a->right->columns[1][1] == 6 && batch_stop_delta->columns[1][0] == 6
+        && wl_columnar_relation_snapshot_equal(batch_stop_left_image,
+        wl_columnar_relation_snapshot(a->left))
+        && wl_columnar_relation_snapshot_equal(batch_stop_right_image,
+        wl_columnar_relation_snapshot(a->right)));
+    batch_prepare_seen = true;
+}
+
+static void
+stop_prepared_host(wl_evaluation_control_t *control, unsigned event,
+    uint64_t generation, uint32_t extent, uint64_t work)
+{
+    (void)generation; (void)extent; (void)work;
+    if (batch_stop_work || batch_stop_hit ||
+        event != WL_COLUMNAR_JOIN_PIPELINE_TEST_PREPARED)
+        return;
+    CHECK(control == batch_stop_control && batch_prepare_seen);
+    batch_stop_hit = true; ++batch_stop_count;
+    /* Selection is witnessed by actual prepared pointers, not event arguments. */
+    batch_selected_delta = batch_stop_right == batch_stop_delta;
+    wl_evaluation_control_request_cancel(control);
+}
+
 static void
 stop_selected_batch(wl_evaluation_control_t *control, unsigned phase,
     uint64_t progress)
 {
-    if (phase != 7 || batch_stop_hit) return;
-    batch_stop_hit = true; batch_selected_delta = progress != 0;
-    if (batch_stop_work)
-        CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
-            == WL_EVALUATION_CONTROL_WORK_LIMIT);
-    else wl_evaluation_control_request_cancel(control);
+    if (!batch_stop_work || phase != 7 || batch_stop_hit) return;
+    CHECK(control == batch_stop_control && progress == 1);
+    batch_stop_hit = true; ++batch_stop_count;
+    batch_selected_delta = progress != 0;
+    CHECK(wl_evaluation_control_charge(control, UINT64_MAX)
+        == WL_EVALUATION_CONTROL_WORK_LIMIT);
 }
 
 static unsigned
@@ -198,15 +253,46 @@ test_batch_selectors(unsigned lm)
                     col_relation_snapshot_t before =
                         wl_columnar_relation_snapshot(input);
                     batch_stop_work = rm == 2; batch_stop_hit = false;
-                    wl_columnar_join_test_attempt_checkpoint =
-                        stop_selected_batch;
+                    batch_stop_count = 0; batch_prepare_seen = false;
+                    batch_stop_control = control;
+                    batch_stop_session = (wl_col_session_t *)controlled;
+                    batch_stop_op = &ops[1];
+                    batch_stop_left = session_find_rel(batch_stop_session,
+                            "$d$a");
+                    batch_stop_right = session_find_rel(batch_stop_session,
+                            "b");
+                    batch_stop_delta = session_find_rel(batch_stop_session,
+                            "$d$b");
+                    CHECK(batch_stop_left && batch_stop_right &&
+                        batch_stop_delta
+                        && batch_stop_right != batch_stop_delta);
+                    batch_stop_left_image =
+                        wl_columnar_relation_snapshot(batch_stop_left);
+                    batch_stop_right_image =
+                        wl_columnar_relation_snapshot(batch_stop_right);
+                    if (batch_stop_work)
+                        wl_columnar_join_test_attempt_checkpoint =
+                            stop_selected_batch;
+                    else {
+                        wl_columnar_join_batch_test_prepare_checkpoint =
+                            selected_batch_witness;
+                        wl_columnar_join_pipeline_test_numeric_checkpoint =
+                            stop_prepared_host;
+                    }
                     int stopped = finish_step(controlled);
                     wl_columnar_join_test_attempt_checkpoint = NULL;
+                    wl_columnar_join_batch_test_prepare_checkpoint = NULL;
+                    wl_columnar_join_pipeline_test_numeric_checkpoint = NULL;
+                    batch_stop_control = NULL; batch_stop_session = NULL;
+                    batch_stop_op = NULL;
+                    batch_stop_left = batch_stop_right = batch_stop_delta =
+                        NULL;
                     CHECK(stopped == (batch_stop_work
                             ? WL_EVALUATION_CONTROL_WORK_LIMIT
                             : WL_EVALUATION_CONTROL_CANCELLED));
-                    CHECK(batch_stop_hit &&
-                        batch_selected_delta == (rm == 2));
+                    CHECK(batch_stop_hit && batch_stop_count == 1
+                        && batch_selected_delta == (rm == 2)
+                        && batch_prepare_seen == (rm == 0));
                     CHECK(!session_find_rel((wl_col_session_t *)controlled,
                         "output"));
                     CHECK(!((wl_col_session_t *)controlled)

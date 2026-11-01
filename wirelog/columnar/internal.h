@@ -880,6 +880,57 @@ int wl_columnar_relation_scalar_retirement_step(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
     uint64_t);
 
+/* Additive metered scalar initialization. Actual parent owns target lifetime,
+ * scalar storage and original control ref, freezes selection before BOOT hooks,
+ * and proves no live scalar receipt is overwritten. This initializer owns no
+ * relation/ref/gate; DONE means genuinely BEGUN, never READY. Parent latches
+ * begun ownership immediately at BIND, before separately funded RESET. */
+typedef enum {
+    WL_COLUMNAR_RELATION_SCALAR_INIT_INERT,
+    WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO,
+    WL_COLUMNAR_RELATION_SCALAR_INIT_BIND,
+    WL_COLUMNAR_RELATION_SCALAR_INIT_DONE
+} wl_columnar_relation_scalar_retirement_init_phase_t;
+typedef struct wl_columnar_relation_scalar_retirement_initializer {
+    struct wl_columnar_relation_scalar_retirement_initializer *identity;
+    const void *parent;
+    wl_columnar_relation_scalar_retirement_t *retirement;
+    col_rel_t *relation;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy;
+    wl_columnar_relation_scalar_retirement_init_phase_t phase;
+} wl_columnar_relation_scalar_retirement_initializer_t;
+int wl_columnar_relation_scalar_retirement_init_begin(
+    wl_columnar_relation_scalar_retirement_initializer_t *, const void *,
+    wl_columnar_relation_scalar_retirement_t *, col_rel_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_relation_scalar_retirement_init_step(
+    wl_columnar_relation_scalar_retirement_initializer_t *, const void *,
+    wl_columnar_relation_scalar_retirement_t *, col_rel_t *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+/* RESET drops only initializer progress. Parent already acknowledges a DONE
+ * begun receipt, or abandons pre-BIND initialization with no writer claims. */
+int wl_columnar_relation_scalar_retirement_init_reset(
+    wl_columnar_relation_scalar_retirement_initializer_t *, const void *,
+    wl_evaluation_control_t *, uint64_t);
+/* Parent authenticates uncommitted receipt lifetime/native ownership. Release
+ * its genuine writer claims only, invalidate READY, then parent enters CLEAR.
+ * Scalar storage is cleared later with separate actual funding. */
+int wl_columnar_relation_scalar_retirement_release_claims_controlled(
+    wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
+    uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_scalar_retirement_init_test_checkpoint)(
+    wl_columnar_relation_scalar_retirement_initializer_t *,
+    wl_evaluation_control_t *, unsigned);
+#endif
+
 /* One-funded-action-at-a-time builder for a private, unnamed binary INT64
  * relation. On a terminal allocation failure, relation retains all partial
  * ownership so it can be passed to managed_retirement_begin(). */
@@ -7325,7 +7376,16 @@ typedef struct wl_columnar_lftj_attempt {
     int64_t fill_key;
     bool writer_active, output_owned, registered;
     wl_columnar_relation_scalar_retirement_t retirement;
-    bool retirement_started, retirement_committed;
+    wl_columnar_relation_scalar_retirement_initializer_t retirement_initializer;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy;
+    bool retirement_started, retirement_committed, retirement_drained;
 } wl_columnar_lftj_attempt_t;
 
 #ifdef WL_SESSION_TEST_HOOKS
@@ -7373,6 +7433,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     bool controlled_materialized_batch_fallback;
     const struct wl_columnar_eval_private_bindings *private_bindings;
     wl_columnar_lftj_attempt_t lftj;
+    bool composed_busy, lftj_cleanup_authorized;
     void *join_host;
     uint64_t join_host_initialized_bytes;
     uint32_t join_host_tail_count;

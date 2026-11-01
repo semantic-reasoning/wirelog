@@ -349,6 +349,10 @@ struct wl_columnar_eval_stack_cleanup_frame {
     bool unary_scalar_mode, unary_scalar_started, unary_scalar_prepared;
     bool unary_scalar_committed, unary_scalar_for_old;
     wl_columnar_relation_scalar_retirement_t unary_scalar_retirement;
+    wl_columnar_relation_scalar_retirement_initializer_t
+        unary_scalar_initializer;
+    col_rel_t *unary_scalar_init_target;
+    bool unary_scalar_cancel_clear, unary_scalar_drained, unary_scalar_busy;
     wl_columnar_filter_context_t filter;
     const void *numeric_plan_owner;
     const void *stream_host;
@@ -976,6 +980,9 @@ wl_columnar_eval_stack_unary_begin_attempt_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame,
     wl_evaluation_control_t *control, uint64_t attempt_id)
 {
+    if (frame->unary_scalar_busy || frame->unary_scalar_init_target
+        || frame->unary_scalar_cancel_clear ||
+        frame->unary_scalar_drained) return EBUSY;
     int rc = wl_columnar_eval_stack_attempt_charge(control, attempt_id,
             WL_COLUMNAR_EVAL_STACK_UNARY_BEGIN_ENTRY_WORK);
     if (rc)
@@ -1085,6 +1092,9 @@ wl_columnar_eval_stack_unary_output_owned(
     if (authority) return authority;
     if (!out_slot)
         return EINVAL;
+    if (frame->unary_scalar_busy || frame->unary_scalar_init_target ||
+        frame->unary_scalar_cancel_clear
+        || frame->unary_scalar_drained) return EBUSY;
     int rc = wl_columnar_eval_stack_unary_forward(frame);
     if (rc)
         return rc;
@@ -1386,6 +1396,9 @@ wl_columnar_eval_stack_unary_commit_attempt_body(
     if (!committed)
         return EINVAL;
     *committed = false;
+    if (frame->unary_scalar_busy || frame->unary_scalar_init_target ||
+        frame->unary_scalar_cancel_clear
+        || frame->unary_scalar_drained) return EBUSY;
     int rc = wl_columnar_eval_stack_unary_forward(frame);
     if (rc)
         return rc;
@@ -1534,13 +1547,9 @@ wl_columnar_eval_stack_unary_finish(
                true);
 }
 
-enum {
-    WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK =
-        (sizeof(wl_columnar_relation_scalar_retirement_t) + 7u) / 8u + 64u
-};
-typedef char wl_columnar_eval_stack_scalar_init_bound[
-        WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK <= 256 ? 1 : -1];
-
+/* Each whole-scalar clear is its own actual256 action. Initialization uses
+ * the separately paid parent-bound BOOT/ZERO/BIND/RESET sibling; raw scalar
+ * primitive source/tariffs remain unchanged. No old187 double-clear credit. */
 static int
 wl_columnar_eval_stack_unary_scalar_authority(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
@@ -1553,8 +1562,41 @@ wl_columnar_eval_stack_unary_scalar_authority(
     return 0;
 }
 
-int
-wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+static int
+wl_columnar_eval_stack_unary_scalar_initialize(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, col_rel_t *target,
+    bool for_old, wl_evaluation_control_t *control, uint64_t id)
+{
+    wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &frame->unary_scalar_initializer;
+    if (i->busy) return EBUSY;
+    if (!frame->unary_scalar_init_target) {
+        if (!target || frame->unary_scalar_started) return EINVAL;
+        frame->unary_scalar_init_target = target;
+        frame->unary_scalar_for_old = for_old;
+    }
+    if (frame->unary_scalar_init_target != target
+        || frame->unary_scalar_for_old != for_old) return EINVAL;
+    if (!i->identity)
+        return wl_columnar_relation_scalar_retirement_init_begin(i, frame,
+                   &frame->unary_scalar_retirement, target, control, id);
+    if (i->phase == WL_COLUMNAR_RELATION_SCALAR_INIT_DONE) {
+        if (!frame->unary_scalar_started) return EINVAL;
+        int rc = wl_columnar_relation_scalar_retirement_init_reset(i, frame,
+                control, id);
+        if (!rc) frame->unary_scalar_init_target = NULL;
+        return rc;
+    }
+    bool begun = false;
+    int rc = wl_columnar_relation_scalar_retirement_init_step(i, frame,
+            &frame->unary_scalar_retirement, target, control, id, &begun);
+    /* Actual begun handoff precedes any future RESET hook/refusal. */
+    if (!rc && begun) frame->unary_scalar_started = true;
+    return rc;
+}
+
+static int
+wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
     bool *done)
 {
@@ -1562,13 +1604,12 @@ wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
     *done = false;
     int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
     if (rc) return rc;
+    if (frame->unary_scalar_initializer.busy || frame->unary_scalar_cancel_clear
+        || frame->unary_scalar_drained) return EBUSY;
     const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
     if (frame->unary_control != numeric->control
         || frame->unary_attempt_id != numeric->attempt_id) return EINVAL;
     rc = wl_columnar_eval_stack_unary_forward(frame);
-    if (rc) return rc;
-    rc = wl_evaluation_control_charge_attempt(numeric->control,
-            numeric->attempt_id, 1);
     if (rc) return rc;
     const eval_entry_t *entry = &frame->unary_snapshot;
     if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || entry->continuation
@@ -1576,18 +1617,18 @@ wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
         !entry->rel) return ENOTSUP;
     frame->unary_scalar_mode = true;
     if (!entry->owned) {
+        rc = wl_evaluation_control_charge_attempt(numeric->control,
+                numeric->attempt_id, 1);
+        if (rc) return rc;
         frame->unary_scalar_prepared = true; *done = true;
         return 0;
     }
-    if (!frame->unary_scalar_started) {
-        rc = wl_evaluation_control_charge_attempt(numeric->control,
-                numeric->attempt_id, WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
-        if (rc) return rc;
-        rc = wl_columnar_relation_scalar_retirement_begin(
-            &frame->unary_scalar_retirement, entry->rel);
-        if (rc) return rc;
-        frame->unary_scalar_started = frame->unary_scalar_for_old = true;
-    }
+    if (!frame->unary_scalar_started || frame->unary_scalar_init_target)
+        return wl_columnar_eval_stack_unary_scalar_initialize(frame, entry->rel,
+                   true, numeric->control, numeric->attempt_id);
+    rc = wl_evaluation_control_charge_attempt(numeric->control,
+            numeric->attempt_id, 1);
+    if (rc) return rc;
     rc = wl_columnar_relation_scalar_retirement_prepare(
         &frame->unary_scalar_retirement, numeric->control, numeric->attempt_id);
     if (rc == EAGAIN) return 0;
@@ -1596,8 +1637,8 @@ wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
     return 0;
 }
 
-int
-wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+static int
+wl_columnar_eval_stack_unary_finish_scalar_funded_owned_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result,
     const void *owner, wl_evaluation_control_t *funding, uint64_t funding_id,
     int *semantic, bool *done)
@@ -1606,10 +1647,11 @@ wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
     *done = false;
     int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
     if (rc) return rc;
+    if (frame->unary_scalar_initializer.busy) return EBUSY;
     const wl_columnar_eval_plan_numeric_attempt_t *numeric = owner;
     if (!funding || funding == numeric->control || !funding_id
-        || wl_evaluation_control_active_attempt_id(funding) != funding_id)
-        return EINVAL;
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        funding_id) return EINVAL;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_IDLE) return EINVAL;
     if (frame->unary_phase == WL_COLUMNAR_EVAL_STACK_UNARY_DONE) {
         *semantic = wl_columnar_eval_stack_unary_result(frame); *done = true;
@@ -1622,91 +1664,117 @@ wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
         !wl_columnar_eval_stack_unary_thread_valid(frame))) return EINVAL;
     if (frame->unary_committed && frame->unary_retired.owned
         && !frame->unary_scalar_prepared) return EINVAL;
-    rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-            first ? 4u * COL_STACK_MAX + 16u : 1u);
-    if (rc) return rc;
-    frame->unary_scalar_mode = true;
-    if (!frame->unary_result_saved) {
-        frame->unary_first_result = initiating_result;
-        frame->unary_result_saved = true;
-    }
     if (first) {
-        if (!frame->unary_committed)
-            (void)wl_columnar_eval_stack_unary_output_sanitize(frame);
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                4u*COL_STACK_MAX+16u);
+        if (rc) return rc;
+        frame->unary_scalar_mode = true;
+        if (!frame->unary_result_saved) {
+            frame->unary_first_result = initiating_result;
+            frame->unary_result_saved = true;
+        }
+        if (!frame->unary_committed) (void)
+            wl_columnar_eval_stack_unary_output_sanitize(frame);
         wl_columnar_eval_stack_unary_binding_clear(frame);
         frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
-        *semantic = wl_columnar_eval_stack_unary_result(frame);
-        return 0;
+        *semantic = wl_columnar_eval_stack_unary_result(frame); return 0;
     }
     *semantic = wl_columnar_eval_stack_unary_result(frame);
-    if (!frame->unary_committed && frame->unary_scalar_started
-        && frame->unary_scalar_for_old) {
-        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-                WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
+    wl_columnar_relation_scalar_retirement_initializer_t *i =
+        &frame->unary_scalar_initializer;
+    if (!frame->unary_committed && frame->unary_scalar_for_old) {
+        if (frame->unary_scalar_init_target) {
+            /* Pre-BIND cancellation owns no writer. A DONE receipt was already
+             * handed to started and must survive its separate RESET action. */
+            if (i->identity) rc =
+                    wl_columnar_relation_scalar_retirement_init_reset(i, frame,
+                        funding, funding_id);
+            else rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                        128);
+            if (rc) return rc;
+            frame->unary_scalar_init_target = NULL;
+            if (!frame->unary_scalar_started) frame->unary_scalar_for_old =
+                    false;
+            return 0;
+        }
+        if (frame->unary_scalar_cancel_clear) {
+            rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
+            if (rc) return rc;
+            memset(&frame->unary_scalar_retirement, 0,
+                sizeof(frame->unary_scalar_retirement));
+            frame->unary_scalar_started = frame->unary_scalar_prepared = false;
+            frame->unary_scalar_for_old = frame->unary_scalar_cancel_clear =
+                false;
+            return 0;
+        }
+        if (!frame->unary_scalar_started) return EINVAL;
+        rc = wl_columnar_relation_scalar_retirement_release_claims_controlled(
+            &frame->unary_scalar_retirement, funding, funding_id);
         if (rc) return rc;
-        rc = wl_columnar_relation_scalar_retirement_cancel(
-            &frame->unary_scalar_retirement);
-        if (rc) return rc;
-        frame->unary_scalar_started = frame->unary_scalar_prepared = false;
-        frame->unary_scalar_for_old = false;
+        /* No hook separates released claims/invalid READY from CANCEL_CLEAR. */
+        frame->unary_scalar_cancel_clear = true;
+        frame->unary_scalar_prepared = false;
         return 0;
     }
-    eval_entry_t *entry = frame->unary_committed ? &frame->unary_retired
-        : &frame->unary_output;
-    if (!frame->unary_scalar_started) {
-        if (entry->seg_boundaries || entry->seg_count
-            || entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION ||
-            entry->continuation)
-            return ENOTSUP;
+    if (frame->unary_scalar_drained) {
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id, 256);
+        if (rc) return rc;
+        memset(&frame->unary_scalar_retirement, 0,
+            sizeof(frame->unary_scalar_retirement));
+        frame->unary_scalar_started = frame->unary_scalar_committed = false;
+        frame->unary_scalar_for_old = frame->unary_scalar_drained = false;
+        frame->unary_cleanup_result = 0;
+        frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
+        *semantic = wl_columnar_eval_stack_unary_result(frame); *done = true;
+        return 0;
+    }
+    eval_entry_t *entry =
+        frame->unary_committed ? &frame->unary_retired : &frame->unary_output;
+    if (!frame->unary_scalar_started || frame->unary_scalar_init_target) {
+        if (entry->seg_boundaries || entry->seg_count ||
+            entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+            || entry->continuation) return ENOTSUP;
         if (!entry->owned || !entry->rel) {
+            if (frame->unary_scalar_init_target) return EINVAL;
+            rc = wl_evaluation_control_charge_attempt(funding, funding_id, 128);
+            if (rc) return rc;
             wl_columnar_eval_stack_unary_entry_clear(entry);
             frame->unary_cleanup_result = 0;
             frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
             *semantic = wl_columnar_eval_stack_unary_result(frame);
-            *done = true;
-            return 0;
+            *done = true; return 0;
         }
-        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-                WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
-        if (rc) return rc;
-        rc = wl_columnar_relation_scalar_retirement_begin(
-            &frame->unary_scalar_retirement, entry->rel);
-        if (rc) return rc;
-        frame->unary_scalar_started = true;
+        return wl_columnar_eval_stack_unary_scalar_initialize(frame, entry->rel,
+                   false, funding, funding_id);
     }
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, 1);
+    if (rc) return rc;
     if (!frame->unary_scalar_committed) {
-        rc = wl_columnar_relation_scalar_retirement_prepare(
+        rc =
+            wl_columnar_relation_scalar_retirement_prepare(
             &frame->unary_scalar_retirement, funding, funding_id);
         if (rc == EAGAIN) return 0;
         if (rc) {
             frame->unary_cleanup_result = rc;
             *semantic = wl_columnar_eval_stack_unary_result(frame); return rc;
         }
-        rc = wl_columnar_relation_scalar_retirement_commit(
+        rc =
+            wl_columnar_relation_scalar_retirement_commit(
             &frame->unary_scalar_retirement);
         if (rc) return rc;
         frame->unary_scalar_committed = true;
-        /* Irreversible receipt ownership begins here. Do not read a frame
-         * marker for a relation after the receipt physically frees it. */
         wl_columnar_eval_stack_unary_entry_clear(entry);
+        return 0;
     }
-    rc = wl_columnar_relation_scalar_retirement_step(
+    rc =
+        wl_columnar_relation_scalar_retirement_step(
         &frame->unary_scalar_retirement, funding, funding_id);
     if (rc == EAGAIN) return 0;
     if (rc) {
         frame->unary_cleanup_result = rc;
         *semantic = wl_columnar_eval_stack_unary_result(frame); return rc;
     }
-    rc = wl_evaluation_control_charge_attempt(funding, funding_id,
-            WL_COLUMNAR_EVAL_STACK_SCALAR_INIT_WORK);
-    if (rc) return rc;
-    memset(&frame->unary_scalar_retirement, 0,
-        sizeof(frame->unary_scalar_retirement));
-    frame->unary_scalar_started = frame->unary_scalar_committed = false;
-    frame->unary_scalar_for_old = false;
-    frame->unary_cleanup_result = 0;
-    frame->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
-    *semantic = wl_columnar_eval_stack_unary_result(frame); *done = true;
+    frame->unary_scalar_drained = true; frame->unary_cleanup_result = 0;
     return 0;
 }
 
@@ -1723,7 +1791,8 @@ wl_columnar_eval_stack_unary_reset_owned(
 {
     if (!wl_columnar_eval_stack_unary_frame_valid(frame))
         return EINVAL;
-    if (frame->filter.join_metadata_busy) return EBUSY;
+    if (frame->filter.join_metadata_busy ||
+        frame->unary_scalar_busy) return EBUSY;
     if (frame->numeric_plan_owner != owner) return EBUSY;
     if (owner && !wl_columnar_eval_plan_numeric_owner_valid(owner, frame))
         return EINVAL;
@@ -1734,7 +1803,10 @@ wl_columnar_eval_stack_unary_reset_owned(
     if (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_DONE
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_output)
         || !wl_columnar_eval_stack_unary_entry_inert(&frame->unary_retired)
-        || frame->unary_scalar_started || frame->unary_scalar_committed)
+        || frame->unary_scalar_started || frame->unary_scalar_committed
+        || frame->unary_scalar_init_target ||
+        frame->unary_scalar_initializer.identity
+        || frame->unary_scalar_cancel_clear || frame->unary_scalar_drained)
         return EBUSY;
     wl_columnar_eval_stack_unary_binding_clear(frame);
     frame->unary_index = 0;
@@ -1861,6 +1933,7 @@ wl_columnar_eval_stack_operator_stack_body(
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *sess,
     eval_stack_t **out, const void *owner, bool consumer)
 {
+    if (frame && frame->unary_scalar_busy) return EBUSY;
     int authority = wl_columnar_eval_stack_numeric_owner(frame, owner);
     if (authority) return authority;
     if (frame->stream_host && !consumer) return EBUSY;
@@ -2210,14 +2283,20 @@ eval_stack_t *
 wl_columnar_eval_stack_cleanup_stack(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    return frame && !frame->stream_host ? &frame->stack : NULL;
+    return frame && !frame->stream_host && !frame->unary_scalar_busy &&
+           !frame->unary_scalar_init_target
+           && !frame->unary_scalar_cancel_clear &&
+           !frame->unary_scalar_drained ? &frame->stack : NULL;
 }
 
 eval_entry_t *
 wl_columnar_eval_stack_cleanup_result(
     wl_columnar_eval_stack_cleanup_frame_t *frame)
 {
-    return frame && !frame->stream_host ? &frame->result : NULL;
+    return frame && !frame->stream_host && !frame->unary_scalar_busy &&
+           !frame->unary_scalar_init_target
+           && !frame->unary_scalar_cancel_clear &&
+           !frame->unary_scalar_drained ? &frame->result : NULL;
 }
 
 static void
@@ -3514,4 +3593,34 @@ wl_columnar_eval_stack_framed_close_ready(
 {
     return ctx && ctx->close_proven && ctx->phase ==
            WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE ? 0 : EBUSY;
+}
+
+int
+wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    bool *done)
+{
+    int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
+    if (rc) return rc;
+    if (frame->unary_scalar_busy) return EBUSY;
+    frame->unary_scalar_busy = true;
+    rc =
+        wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned_body(frame,
+            owner, done);
+    frame->unary_scalar_busy = false; return rc;
+}
+
+int
+wl_columnar_eval_stack_unary_finish_scalar_funded_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, int initiating_result,
+    const void *owner, wl_evaluation_control_t *funding, uint64_t funding_id,
+    int *semantic, bool *done)
+{
+    int rc = wl_columnar_eval_stack_unary_scalar_authority(frame, owner);
+    if (rc) return rc;
+    if (frame->unary_scalar_busy) return EBUSY;
+    frame->unary_scalar_busy = true;
+    rc = wl_columnar_eval_stack_unary_finish_scalar_funded_owned_body(frame,
+            initiating_result, owner, funding, funding_id, semantic, done);
+    frame->unary_scalar_busy = false; return rc;
 }

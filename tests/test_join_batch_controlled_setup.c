@@ -309,28 +309,86 @@ prepare_source(fixture_t *f, const char *name, uint32_t width, bool stamped,
     return rel;
 }
 
+static wl_columnar_join_batch_prepare_t *retirement_parent;
+static unsigned retirement_callbacks[5];
+
+static void
+prepare_retirement_checkpoint(
+    wl_columnar_relation_scalar_retirement_initializer_t *i,
+    wl_evaluation_control_t *funding, unsigned api)
+{
+    wl_columnar_join_batch_prepare_t *a = retirement_parent;
+    CHECK(a && i == &a->retirement_initializer && a->cleanup_busy && a->aborting
+        && api >= 1 && api <= 4);
+    ++retirement_callbacks[api];
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    bool done = true;
+    CHECK(wl_columnar_join_batch_prepare_abort_step(a, funding, id,
+        &done) == EBUSY && done);
+    CHECK(wl_columnar_join_batch_prepare_abort_step(a, a->control,
+        a->attempt_id,
+        &done) == EINVAL && done);
+    CHECK(wl_columnar_join_batch_prepare_step(a, 1, &done) == EINVAL && !done);
+    wl_columnar_join_batch_prepare_t copied = *a;
+    done = true;
+    CHECK(wl_columnar_join_batch_prepare_abort_step(&copied, funding, id,
+        &done) == EINVAL && done);
+}
+
 static void
 prepare_drain(wl_columnar_join_batch_prepare_t *a)
 {
     int owner;
     wl_evaluation_control_t *funding = NULL;
-    CHECK(!wl_evaluation_control_create(0, &funding));
-    CHECK(!wl_evaluation_control_attach(funding, &owner));
-    CHECK(!wl_evaluation_control_begin(funding, &owner));
-    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
-    bool done = false;
-    CHECK(wl_columnar_join_batch_prepare_abort_step(a, funding, id + 1,
-        &done) == EINVAL && !done && !a->aborting);
+    bool done = false, tried[4] = {false};
+    retirement_parent = a;
+    memset(retirement_callbacks, 0, sizeof(retirement_callbacks));
+    wl_columnar_relation_scalar_retirement_init_test_checkpoint =
+        prepare_retirement_checkpoint;
     for (unsigned turn = 0; !done; ++turn) {
         CHECK(turn < 100000);
-        CHECK(!wl_columnar_join_batch_prepare_abort_step(a, funding, id,
-            &done));
+        unsigned phase = a->retirement_initializer.phase;
+        bool short_grant = phase && !tried[phase];
+        uint64_t limit = 384;
+        if (short_grant) {
+            tried[phase] = true;
+            limit = phase == WL_COLUMNAR_RELATION_SCALAR_INIT_ZERO ? 255
+                : phase == WL_COLUMNAR_RELATION_SCALAR_INIT_BIND ? 191 : 127;
+        }
+        CHECK(!wl_evaluation_control_create(limit, &funding));
+        CHECK(!wl_evaluation_control_attach(funding, &owner));
+        CHECK(!wl_evaluation_control_begin(funding, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        if (!turn) CHECK(wl_columnar_join_batch_prepare_abort_step(a, funding,
+                id + 1,
+                &done) == EINVAL && !done && !a->aborting);
+        unsigned char historic[sizeof(a->retirement)];
+        memcpy(historic, &a->retirement, sizeof(historic));
+        bool begun = a->retirement_started;
+        int rc = wl_columnar_join_batch_prepare_abort_step(a, funding, id,
+                &done);
+        CHECK(rc == (short_grant ? WL_EVALUATION_CONTROL_WORK_LIMIT : 0));
+        if (short_grant) CHECK(!done && a->retirement_initializer.phase == phase
+                && a->retirement_started == begun
+                && !memcmp(historic, &a->retirement, sizeof(historic)));
+        if (a->retirement_initializer.phase ==
+            WL_COLUMNAR_RELATION_SCALAR_INIT_DONE)
+            CHECK(a->retirement_started && a->retirement.storage.relation
+                == a->retirement_initializer.relation);
+        CHECK(wl_evaluation_control_finish(funding, &owner, rc, 0) == rc);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(funding, &report)
+            && report.consumed <= limit && (!short_grant || !report.consumed));
+        CHECK(!wl_evaluation_control_detach(funding, &owner));
+        wl_evaluation_control_release(funding);
     }
+    wl_columnar_relation_scalar_retirement_init_test_checkpoint = NULL;
+    retirement_parent = NULL;
+    if (retirement_callbacks[1]) CHECK(retirement_callbacks[2] &&
+            retirement_callbacks[3]
+            && retirement_callbacks[4] && tried[1] && tried[2] && tried[3]);
     CHECK(a->drained && !a->producer && !a->continuation
         && !a->left_reader.owner && !a->right_reader.owner);
-    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
-    CHECK(!wl_evaluation_control_detach(funding, &owner));
-    wl_evaluation_control_release(funding);
 }
 
 static wl_columnar_continuation_status_t
