@@ -1967,6 +1967,10 @@ wl_columnar_filter_op_attempt_start_owned(const wl_plan_op_t *op,
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
     ctx->source_bare = false; ctx->join_right_bare = false;
+    ctx->join_metadata_busy = false;
+    ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_REPLACE;
+    ctx->join_operation = NULL;
+    ctx->join_input_snapshot = (col_relation_snapshot_t){0};
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -2455,6 +2459,10 @@ wl_columnar_filter_consolidate_attempt_start_owned(const wl_plan_op_t *op,
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
     ctx->source_bare = false; ctx->join_right_bare = false;
+    ctx->join_metadata_busy = false;
+    ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_REPLACE;
+    ctx->join_operation = NULL;
+    ctx->join_input_snapshot = (col_relation_snapshot_t){0};
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -3109,6 +3117,10 @@ wl_columnar_filter_map_attempt_start_owned(const wl_plan_op_t *op,
     ctx->values = ctx->inline_values;
     ctx->source_initialized = false; ctx->batch_initialized = false;
     ctx->source_bare = false; ctx->join_right_bare = false;
+    ctx->join_metadata_busy = false;
+    ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_REPLACE;
+    ctx->join_operation = NULL;
+    ctx->join_input_snapshot = (col_relation_snapshot_t){0};
     ctx->drain_initialized = false;
     ctx->heap = false; ctx->admitted = false; ctx->credit_committed = false;
     ctx->ref_held = false; ctx->unary_started = false;
@@ -3578,7 +3590,10 @@ wl_columnar_filter_empty_end_context(
         const wl_columnar_relation_empty_source_t *a = *source;
         if (!ctx->join_decision_pending || !ctx->pin_owned
             || r->cursor >= r->end
-            || r->plan->ops[r->cursor].op != WL_PLAN_OP_JOIN
+            || (r->plan->ops[r->cursor].op != WL_PLAN_OP_JOIN
+            && r->plan->ops[r->cursor].op != WL_PLAN_OP_SEMIJOIN
+            && r->plan->ops[r->cursor].op != WL_PLAN_OP_ANTIJOIN)
+            || ctx->join_operation != &r->plan->ops[r->cursor]
             || a->identity != a || a->phase ==
             WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
             || a->attempt_id != ctx->attempt_id
@@ -3899,19 +3914,29 @@ wl_columnar_filter_op_attempt_step_owned(
             rc = EINVAL; goto protocol_error;
         }
         if (!ctx->execution_result && ctx->unary_started
-            && !ctx->join_preserve_input) {
+            && ctx->join_disposition !=
+            WL_COLUMNAR_JOIN_DISPOSITION_MISSING_EXACT) {
             rc = wl_columnar_filter_attempt_charge(ctx->control,
                     ctx->attempt_id, 0);
-            if (!rc)
-                rc =
-                    wl_columnar_eval_stack_unary_commit_join_attempt_context_owned
-                    (
-                    frame, ctx, &ctx->committed, owner);
+            if (!rc) {
+                if (ctx->join_disposition ==
+                    WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL)
+                    rc =
+                        wl_columnar_eval_stack_unary_commit_anti_keep_all_context_owned
+                        (
+                        frame, ctx, &ctx->committed, owner);
+                else rc =
+                        wl_columnar_eval_stack_unary_commit_join_attempt_context_owned
+                        (
+                        frame, ctx, &ctx->committed, owner);
+            }
             ctx->execution_result = rc;
             ctx->semantic_result = rc;
         }
         ctx->join_result_is_delta = false;
-        ctx->join_preserve_input = false;
+        ctx->join_disposition = WL_COLUMNAR_JOIN_DISPOSITION_REPLACE;
+        ctx->join_operation = NULL;
+        ctx->join_input_snapshot = (col_relation_snapshot_t){0};
         ctx->join_decision_pending = false;
         ctx->stage = WL_COLUMNAR_FILTER_STAGE_CONTROL;
         break;
@@ -4001,14 +4026,19 @@ wl_columnar_filter_op_attempt_ack_owned(
     int rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
     if (ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT)
-        return 0;
+        return ctx->join_metadata_busy ? EBUSY : 0;
     rc = wl_columnar_filter_attempt_context_valid(frame, ctx);
     if (rc) return rc;
-    if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE || ctx->pin_owned
+    if (ctx->stage != WL_COLUMNAR_FILTER_STAGE_DONE ||
+        ctx->join_metadata_busy || ctx->pin_owned
         || ctx->unary_started || ctx->source_bare || ctx->join_right_bare
         || ctx->source_initialized ||
         ctx->batch_initialized || ctx->join_initialized
         || ctx->join_decision_pending || ctx->join_result_is_delta
+        || ctx->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_REPLACE
+        || ctx->join_operation || ctx->join_input_snapshot.relation_identity
+        || ctx->join_input_snapshot.view_generation ||
+        ctx->join_input_snapshot.storage_generation
         || ctx->heap || ctx->admitted || ctx->ref_held || ctx->program ||
         ctx->output || ctx->private_output || ctx->table.programs
         || ctx->table.initialized_slots || ctx->table.retirement_cursor

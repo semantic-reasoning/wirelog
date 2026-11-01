@@ -6777,6 +6777,12 @@ extern void (*wl_columnar_merge_test_concat_checkpoint)(
 extern int wl_columnar_merge_test_concat_fail_allocation;
 #endif
 
+typedef enum {
+    WL_COLUMNAR_JOIN_DISPOSITION_REPLACE,
+    WL_COLUMNAR_JOIN_DISPOSITION_MISSING_EXACT,
+    WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL
+} wl_columnar_join_disposition_t;
+
 typedef struct wl_columnar_filter_context {
     struct wl_columnar_filter_context *identity;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
@@ -6814,7 +6820,10 @@ typedef struct wl_columnar_filter_context {
     /* Fixed original JOIN ownership, inactive for FILTER/MAP. join_initialized
      * remains true until B2/right/readers and all scratch records are drained. */
     bool join_initialized, join_right_initialized;
-    bool join_decision_pending, join_result_is_delta, join_preserve_input;
+    bool join_decision_pending, join_result_is_delta, join_metadata_busy;
+    wl_columnar_join_disposition_t join_disposition;
+    const wl_plan_op_t *join_operation;
+    col_relation_snapshot_t join_input_snapshot;
     uint32_t join_retirement_cursor;
     wl_columnar_relation_scalar_source_t join_right;
     /* Only owned ordinary JOIN admits authentic unspecialized descriptors.
@@ -6840,6 +6849,16 @@ int wl_columnar_eval_stack_unary_begin_attempt_context_owned(
 int wl_columnar_eval_stack_unary_commit_join_attempt_context_owned(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t *,
     bool *, const void *);
+/* Exact ordinary ANTI identity cutoff: moves only CONCAT segment ownership
+ * into the frame retirement slot, clears live segments/delta and preserves
+ * the relation/owned flag. All readers/temporary owners must have drained. */
+int wl_columnar_eval_stack_unary_commit_anti_keep_all_context_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_columnar_filter_context_t *,
+    bool *, const void *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_stack_test_anti_metadata_committed)(
+    const eval_entry_t *, const eval_entry_t *);
+#endif
 /* Meaningful-field initializer: new or proven ENDED/inert storage only,
  * never a live/retained/DRAINING batch. No live authority may be erased. */
 void wl_columnar_filter_attempt_batch_init(

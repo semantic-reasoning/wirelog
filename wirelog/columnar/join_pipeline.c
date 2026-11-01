@@ -1780,7 +1780,9 @@ wl_columnar_join_host_forward(wl_columnar_join_host_t *h)
                 stage_op->right_relation, false, &stage->right, r->control,
                 r->attempt_id, h->bindings);
         if (rc) return rc;
-        if (!stage->right) {
+        /* Routing hint only. A zero physical width cannot enter this
+         * streamed probe; its later ordinary owner authenticates metadata. */
+        if (!stage->right || !stage->right->ncols) {
             h->tail_end = h->stage_cursor - 1u;
             h->streaming = h->tail_end > r->cursor;
             h->phase = WL_COLUMNAR_JOIN_HOST_SHAPE_FINAL;
