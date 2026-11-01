@@ -233,6 +233,7 @@ typedef struct {
     bool controlled_busy;
     bool controlled_ready;
     bool controlled_complete;
+    bool controlled_general;
     col_join_batch_control_status_t controlled_status;
     int controlled_execution_status;
     uint64_t controlled_work_ordinal;
@@ -253,6 +254,10 @@ typedef struct {
     uint32_t controlled_chain_row;
     uint32_t controlled_key_column;
     uint32_t controlled_batch_rows;
+    uint32_t controlled_column;
+    uint32_t controlled_hash;
+    uint32_t controlled_hash_byte;
+    uint64_t controlled_hash_value;
     col_join_batch_pos_t controlled_next;
     col_join_batch_pos_t controlled_ready_next;
     bool runner_mode;
@@ -276,9 +281,25 @@ typedef struct {
         COL_JOIN_BATCH_HASH,
         COL_JOIN_BATCH_MATCH,
         COL_JOIN_BATCH_WRITE,
-        COL_JOIN_BATCH_ADVANCE
+        COL_JOIN_BATCH_ADVANCE,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_KEYS,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_OUTPUT,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_SCAN,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_KEY,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_HASH_BYTE,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_BUCKET,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_MATCH,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_WRITE,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_STAMP,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_COMPLETE,
+        WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE
     } controlled_phase;
 } col_join_batch_producer_t;
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_join_batch_test_control_checkpoint)(
+    wl_evaluation_control_t *, unsigned, uint64_t, const col_rel_t *);
+#endif
 
 static uint64_t
 pos_pack(uint32_t lr, uint32_t rr)
@@ -454,6 +475,215 @@ controlled_make_ready(col_join_batch_producer_t *p, bool complete)
     p->controlled_ready_next = p->controlled_next;
     p->batch->nrows = p->controlled_batch_rows;
     return COL_JOIN_BATCH_CONTROL_BATCH_READY;
+}
+
+static col_join_batch_control_status_t
+wl_columnar_join_batch_controlled_general_step(col_join_batch_producer_t *p,
+    uint64_t max_work)
+{
+    uint64_t turn_work = 0;
+    const uint32_t capacity = p->batch->capacity < p->rows_per_batch
+        ? p->batch->capacity : p->rows_per_batch;
+    if (p->controlled_status != COL_JOIN_BATCH_CONTROL_PROGRESS)
+        return p->controlled_status;
+    if (p->controlled_ready) return COL_JOIN_BATCH_CONTROL_BATCH_READY;
+    if (p->controlled_complete) return COL_JOIN_BATCH_CONTROL_DONE;
+    if (!capacity) return controlled_stop(p,
+                   COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, ENOTSUP);
+    /* Every general action has the literal tariff1. No key count or row
+     * width becomes an indivisible grant. Native stepping below is unchanged. */
+    while (turn_work < max_work) {
+        col_join_batch_control_status_t status = controlled_poll(p);
+        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS) return status;
+        if (p->controlled_phase == WL_COLUMNAR_JOIN_BATCH_GENERAL_SCAN
+            && p->controlled_left_row == p->left->nrows) {
+            if (p->controlled_batch_rows) return controlled_make_ready(p, true);
+            p->controlled_complete = true;
+            return COL_JOIN_BATCH_CONTROL_DONE;
+        }
+        status = controlled_charge(p, 1, &turn_work, max_work);
+        if (status != COL_JOIN_BATCH_CONTROL_PROGRESS) return status;
+        p->controlled_required_work = 0;
+        switch (p->controlled_phase) {
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_KEYS:
+            if (p->controlled_key_column == p->kc) {
+                p->controlled_column = 0;
+                p->controlled_phase =
+                    WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_OUTPUT;
+                break;
+            } else {
+                uint32_t k = p->controlled_key_column;
+                if (p->lk[k] >= p->left->ncols || p->rk[k] >= p->right->ncols)
+                    return controlled_stop(p,
+                               COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+                wirelog_column_type_t lt = p->left->column_types
+                    ? p->left->column_types[p->lk[k]] : WIRELOG_TYPE_INT64;
+                wirelog_column_type_t rt = p->right->column_types
+                    ? p->right->column_types[p->rk[k]] : WIRELOG_TYPE_INT64;
+                if (lt < WIRELOG_TYPE_INT32 || lt > WIRELOG_TYPE_BOOL
+                    || rt < WIRELOG_TYPE_INT32 || rt > WIRELOG_TYPE_BOOL)
+                    return controlled_stop(p,
+                               COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+                ++p->controlled_key_column;
+                break;
+            }
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_OUTPUT:
+            if (p->controlled_column == p->batch->ncols) {
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_SCAN;
+                break;
+            }
+            if ((p->op->project_count && !p->op->project_indices)
+                || p->batch->ncols != (p->op->project_count
+                ? (uint64_t)p->op->project_count
+                : (uint64_t)p->left->ncols + p->right->ncols))
+                return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            if (!p->batch->columns || !p->batch->columns[p->controlled_column]
+                || p->batch->col_shared
+                || (p->batch->column_types
+                && (p->batch->column_types[p->controlled_column] <
+                WIRELOG_TYPE_INT32
+                || p->batch->column_types[p->controlled_column] >
+                WIRELOG_TYPE_BOOL)))
+                return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            ++p->controlled_column;
+            break;
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_SCAN:
+            p->controlled_key_column = 0;
+            p->controlled_hash = (uint32_t)UINT64_C(14695981039346656037);
+            p->controlled_next.lr = p->controlled_left_row;
+            p->controlled_next.rr = UINT32_MAX;
+            p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_KEY;
+            break;
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_KEY: {
+            uint32_t k = p->controlled_key_column;
+            int64_t bits = p->left->columns[p->lk[k]][p->controlled_left_row];
+            p->controlled_hash_value = wl_columnar_value_key(p->right,
+                    p->rk[k], bits);
+            p->controlled_hash_byte = 0;
+            p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_HASH_BYTE;
+            break;
+        }
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_HASH_BYTE:
+            p->controlled_hash ^= (uint32_t)(p->controlled_hash_value & 255u);
+            p->controlled_hash *= 435u;
+            p->controlled_hash_value >>= 8;
+            if (++p->controlled_hash_byte == 8)
+                p->controlled_phase = ++p->controlled_key_column == p->kc
+                    ? WL_COLUMNAR_JOIN_BATCH_GENERAL_BUCKET :
+                    WL_COLUMNAR_JOIN_BATCH_GENERAL_KEY;
+            break;
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_BUCKET: {
+            if (!p->right->nrows) {
+                p->controlled_right_row = UINT32_MAX;
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE;
+                break;
+            }
+            if (!p->arr->nbuckets ||
+                (p->arr->nbuckets & (p->arr->nbuckets - 1u))
+                || !p->arr->ht_head)
+                return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            uint64_t head = p->arr->ht_head[p->controlled_hash &
+                    (p->arr->nbuckets - 1u)];
+            p->controlled_right_row = (uint32_t)(head >> 32) ==
+                p->arr->generation
+                ? (uint32_t)head : UINT32_MAX;
+            p->controlled_key_column = 0;
+            p->controlled_phase = p->controlled_right_row == UINT32_MAX
+                ? WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE :
+                WL_COLUMNAR_JOIN_BATCH_GENERAL_MATCH;
+            break;
+        }
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_MATCH: {
+            uint32_t k = p->controlled_key_column, rr = p->controlled_right_row;
+            if (rr >= p->right->nrows || rr >= p->arr->ht_cap)
+                return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            if (!wl_columnar_value_equal(p->left, p->lk[k],
+                p->left->columns[p->lk[k]][p->controlled_left_row],
+                p->right, p->rk[k], p->right->columns[p->rk[k]][rr])) {
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE;
+            } else if (++p->controlled_key_column == p->kc) {
+                p->controlled_column = 0;
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_WRITE;
+            }
+            break;
+        }
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_WRITE: {
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_join_batch_test_control_checkpoint)
+                wl_columnar_join_batch_test_control_checkpoint(
+                    p->controlled_control, 1, p->controlled_column, p->batch);
+            status = controlled_poll(p);
+            if (status != COL_JOIN_BATCH_CONTROL_PROGRESS) return status;
+#endif
+            if (p->controlled_batch_rows >= capacity)
+                return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+            uint32_t column = p->controlled_column;
+            uint32_t src = p->op->project_count ? p->op->project_indices[column]
+                : column;
+            int64_t value = src < p->left->ncols
+                ? p->left->columns[src][p->controlled_left_row]
+                : src - p->left->ncols < p->right->ncols
+                ? p->right->columns[src -
+                    p->left->ncols][p->controlled_right_row]
+                : 0;
+            int rc = col_rel_set_raw(p->batch, p->controlled_batch_rows, column,
+                    value);
+            if (rc) return controlled_stop(p,
+                           COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, rc);
+            if (++p->controlled_column == p->batch->ncols) {
+                p->controlled_column = 0;
+                p->controlled_phase = p->batch->timestamps
+                    ? WL_COLUMNAR_JOIN_BATCH_GENERAL_STAMP :
+                    WL_COLUMNAR_JOIN_BATCH_GENERAL_COMPLETE;
+            }
+            break;
+        }
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_STAMP:
+            ((unsigned char *)&p->batch->timestamps[p->controlled_batch_rows])
+            [p->controlled_column++] = 0;
+            if (p->controlled_column == sizeof(col_delta_timestamp_t))
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_COMPLETE;
+            break;
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_COMPLETE:
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_join_batch_test_control_checkpoint)
+                wl_columnar_join_batch_test_control_checkpoint(
+                    p->controlled_control, 2, p->controlled_batch_rows,
+                    p->batch);
+            status = controlled_poll(p);
+            if (status != COL_JOIN_BATCH_CONTROL_PROGRESS) return status;
+#endif
+            p->batch->nrows = ++p->controlled_batch_rows;
+            p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE;
+            break;
+        case WL_COLUMNAR_JOIN_BATCH_GENERAL_ADVANCE:
+            if (p->controlled_right_row != UINT32_MAX)
+                p->controlled_right_row = col_arrangement_find_next(p->arr,
+                        p->controlled_right_row);
+            if (p->controlled_right_row == UINT32_MAX) {
+                ++p->controlled_left_row;
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_SCAN;
+            } else {
+                p->controlled_key_column = 0;
+                p->controlled_phase = WL_COLUMNAR_JOIN_BATCH_GENERAL_MATCH;
+            }
+            p->controlled_next.lr = p->controlled_left_row;
+            p->controlled_next.rr = p->controlled_right_row;
+            if (p->controlled_batch_rows == capacity)
+                return controlled_make_ready(p,
+                           p->controlled_left_row == p->left->nrows);
+            break;
+        default:
+            return controlled_stop(p,
+                       COL_JOIN_BATCH_CONTROL_EXECUTION_ERROR, EINVAL);
+        }
+    }
+    return controlled_poll(p);
 }
 
 static col_join_batch_control_status_t
@@ -1233,18 +1463,11 @@ col_join_batch_control_bind(wl_columnar_continuation_t *cont,
 
     if (!p || !p->batch || !control || !attempt_id)
         return EINVAL;
-    /* Controlled stepping polls the registry pin, which a producer over
-     * its own index (col_join_batch_producer_create_over) does not hold
-     * (#2201). */
+    /* A raw create_over producer owns an index without controlled registry
+     * or private preparation authority (#2201). */
     if (p->arr == &p->own_arr)
         return ENOTSUP;
-    /* The controlled tariff admits one native INT64 key (eight canonical
-     * hash bytes) and no more than 64 output lanes. */
-    if (p->kc != 1 || p->batch->ncols == 0 || p->batch->ncols > 64
-        || (p->left->column_types
-        && p->left->column_types[p->lk[0]] != WIRELOG_TYPE_INT64)
-        || (p->right->column_types
-        && p->right->column_types[p->rk[0]] != WIRELOG_TYPE_INT64))
+    if (!p->kc || !p->batch->ncols)
         return ENOTSUP;
     if (p->controlled_bound || p->cursor.sequence != 0
         || p->controlled_ready || p->controlled_batch_rows != 0)
@@ -1264,7 +1487,17 @@ col_join_batch_control_bind(wl_columnar_continuation_t *cont,
     p->controlled_right_row = p->cursor.next.rr;
     p->controlled_right_row = p->cursor.next.rr;
     p->controlled_next = p->cursor.next;
-    p->controlled_phase = COL_JOIN_BATCH_SCAN_LEFT;
+    /* Preserve the exact historical native tariff. Other scalar shapes
+     * validate incrementally and hash/compare/copy one key-byte/cell at a time. */
+    p->controlled_general = !(p->kc == 1 && p->batch->ncols <= 64
+        && p->lk[0] < p->left->ncols && p->rk[0] < p->right->ncols
+        && (!p->left->column_types
+        || p->left->column_types[p->lk[0]] == WIRELOG_TYPE_INT64)
+        && (!p->right->column_types
+        || p->right->column_types[p->rk[0]] == WIRELOG_TYPE_INT64));
+    p->controlled_phase = p->controlled_general
+        ? WL_COLUMNAR_JOIN_BATCH_GENERAL_VALIDATE_KEYS :
+        COL_JOIN_BATCH_SCAN_LEFT;
     p->controlled_status = COL_JOIN_BATCH_CONTROL_PROGRESS;
 #if defined(WL_HAVE_C11_THREADS)
     p->controlled_thread = thrd_current();
@@ -1313,7 +1546,9 @@ col_join_batch_control_step(wl_columnar_continuation_t *cont,
         return result->status;
     }
     p->controlled_busy = true;
-    col_join_batch_control_status_t status = controlled_step(p, max_work);
+    col_join_batch_control_status_t status = p->controlled_general
+        ? wl_columnar_join_batch_controlled_general_step(p,
+            max_work) : controlled_step(p, max_work);
     p->controlled_busy = false;
     result->status = status;
     result->execution_status = p->controlled_execution_status;
