@@ -17014,6 +17014,577 @@ wl_columnar_relation_source_like_operator_build(const char *name,
     return rc;
 }
 
+/* Pin-free materialized-original copy. One fixed action per step, except the
+ * existing operator constructor whose individual original-attempt regions are
+ * independently metered. Its successful output slot is the owning record, so
+ * no later original stop can lose a fully constructed private descriptor.
+ * INIT256 initializes ~55 meaningful scalar fields, never the large retirement
+ * receipt. Each cell/run/END/TAKE/ACK128 includes fixed native/busy/funding
+ * scaffolding (<80), pointer/cursor work (<32), and ordinary return (<16).
+ * Source/final validation192 includes one actual lease/snapshot validation.
+ * Fixed owner validation192 is separate from each column192. No sized loop
+ * hides in these actions. Lazy retirement ZERO and BEGIN each pay256 in
+ * distinct calls; prepare/step wrappers pay192 beyond inherited leaf debits.
+ * Existing allocator/standard Arrow/free/token logical exceptions are inherited
+ * solely by those existing leaves, never by a new raw deep-copy/destructor. */
+enum {
+    WL_COLUMNAR_RELATION_CACHE_COPY_INIT_WORK = 256,
+    WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK = 128,
+    WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK = 192,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK = 256,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK = 256
+};
+/* ZERO: scalar clear123 + common/native/funding/refusal/phase <=128 =251.
+ * BEGIN: managed clear116 +4*(token clear11+NULL guard1+identity1+atomic1+
+ * return1)=60 +loop10 +managed guards/stores/return10 +copy wrapper58 =254.
+ * Wrapper58: enter/native12, output/busy guards4, done/dispatch8, hook/funding
+ * validity8, selector/branch8, phase/leave/return12, abort-result bookkeeping6.
+ * Control/test callback bodies retain their established exclusions. Neither
+ * bulk clear is optimizer-elided in this source proof. Layout guards preserve
+ * these expanded bounds on other supported ABIs as well. */
+typedef char wl_columnar_relation_cache_copy_retirement_init_bound[
+        ((sizeof(wl_columnar_relation_scalar_retirement_t) + 7u) / 8u + 128u <=
+        256u
+        && (sizeof(wl_columnar_relation_managed_retirement_t) + 7u) / 8u
+        + 4u * ((sizeof(wl_columnar_memory_reservation_t) + 7u) / 8u + 4u)
+        + 78u <= 256u) ? 1 : -1];
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_relation_cache_scalar_copy_test_checkpoint)(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, unsigned);
+#define WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, c, api) do { \
+            if (wl_columnar_relation_cache_scalar_copy_test_checkpoint) \
+            wl_columnar_relation_cache_scalar_copy_test_checkpoint(a, c, api); \
+} while (0)
+#else
+#define WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, c, api) ((void)0)
+#endif
+
+static bool
+wl_columnar_relation_cache_copy_thread(
+    const wl_columnar_relation_cache_scalar_copy_attempt_t *a)
+{
+    if (!a->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+static bool
+wl_columnar_relation_cache_copy_reader_inert(
+    const wl_columnar_source_access_reader_t *r)
+{
+    return !r->owner && !r->secondary_owner && !r->identity
+           && !r->thread_valid && !r->transferable && !r->acquire_stage
+           && !r->release_stage;
+}
+
+static bool
+wl_columnar_relation_cache_copy_overlap(const void *a, size_t an,
+    const void *b, size_t bn)
+{
+    if (!a || !b || !an || !bn) return false;
+    uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+    if (an - 1 > UINTPTR_MAX - x || bn - 1 > UINTPTR_MAX - y) return true;
+    return x <= y + bn - 1 && y <= x + an - 1;
+}
+
+static int
+wl_columnar_relation_cache_copy_enter(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a)
+{
+    if (!a) return EINVAL;
+    if (a->busy) return EBUSY;
+    if (a->identity != a || !a->control_ref || !a->control
+        || !wl_columnar_relation_cache_copy_thread(a)) return EINVAL;
+    a->busy = true;
+    return 0;
+}
+
+static int
+wl_columnar_relation_cache_copy_leave(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a, int rc)
+{
+    a->busy = false;
+    return rc;
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_begin(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    const col_rel_t *source,
+    wl_columnar_memory_governor_ref_t *governor,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!a) return EINVAL;
+    if (a->busy) return EBUSY;
+    if (a->identity && a->identity != a) return EINVAL;
+    if (a->identity || a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_INERT
+        || a->control_ref || a->control || a->thread_valid || a->source
+        || a->output || a->held || a->retirement_started
+        || !wl_columnar_relation_cache_copy_reader_inert(
+            &a->reader)) return EBUSY;
+    if (!source || !control || !id) return EINVAL;
+    a->busy = true;
+    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, control, 1);
+    if (wl_evaluation_control_active_attempt_id(control) != id)
+        return wl_columnar_relation_cache_copy_leave(a, EINVAL);
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_RELATION_CACHE_COPY_INIT_WORK);
+    if (rc) return wl_columnar_relation_cache_copy_leave(a, rc);
+    rc = wl_evaluation_control_retain(control);
+    if (rc) return wl_columnar_relation_cache_copy_leave(a, rc);
+    a->identity = a; a->control = control; a->control_ref = true;
+    a->control_identity = wl_evaluation_control_identity(control);
+    a->attempt_id = id;
+#if defined(WL_HAVE_C11_THREADS)
+    a->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->owner_thread = GetCurrentThreadId();
+#else
+    a->owner_thread = pthread_self();
+#endif
+    a->thread_valid = true; a->result_saved = false; a->discarding = false;
+    a->source = source; a->governor = governor;
+    a->reader.owner = NULL; a->reader.secondary_owner = NULL;
+    a->reader.identity = 0; a->reader.thread_valid = false;
+    a->reader.transferable = false;
+    a->reader.acquire_stage = a->reader.release_stage = 0;
+    a->snapshot = (col_relation_snapshot_t){0};
+    a->held = false; a->run_valid = true; a->retirement_started = false;
+    a->output = NULL; a->width = a->rows = a->capacity = 0;
+    a->column = a->row = a->run = a->previous_end = 0;
+    a->semantic_result = 0; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE;
+    return wl_columnar_relation_cache_copy_leave(a, 0);
+}
+
+static int
+wl_columnar_relation_cache_copy_source_valid(
+    const wl_columnar_relation_cache_scalar_copy_attempt_t *a)
+{
+    const wl_columnar_source_access_reader_t *r = &a->reader;
+    if (!a->held || !a->source || r->identity != (uintptr_t)r
+        || r->acquire_stage || r->release_stage || r->transferable
+        || !wl_columnar_source_access_reader_thread_equal(r)
+        || r->secondary_owner != &a->source->descriptor_access
+        || !wl_columnar_relation_snapshot_equal(a->snapshot,
+        wl_columnar_relation_snapshot(a->source))) return EINVAL;
+    col_rel_t *owner = NULL;
+    int rc = col_rel_storage_owner_resolve(a->source, &owner);
+    if (rc) return rc;
+    if (r->owner != &owner->source_access) return EINVAL;
+    uint64_t d = atomic_load_explicit(&r->secondary_owner->state,
+            memory_order_acquire);
+    uint64_t v = atomic_load_explicit(&r->owner->state, memory_order_acquire);
+    return !d || d == WL_COLUMNAR_SOURCE_ACCESS_WRITER
+           || !v || v == WL_COLUMNAR_SOURCE_ACCESS_WRITER ? EINVAL : 0;
+}
+
+static int
+wl_columnar_relation_cache_copy_action(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a)
+{
+    const col_rel_t *s = a->source;
+    col_rel_t *output = a->output;
+    switch (a->phase) {
+    case WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE: {
+        bool held = false;
+        int rc = col_rel_source_reader_acquire_step(s, &a->reader, &held);
+        if (rc == EAGAIN) return 0;
+        if (rc) return rc;
+        if (held) {
+            a->held = true;
+            a->snapshot = wl_columnar_relation_snapshot(s);
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE;
+        }
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE: {
+        int rc = wl_columnar_relation_cache_copy_source_valid(a);
+        if (rc) return rc;
+        if (s->nrows > s->capacity
+            || (s->ncols && s->capacity && !s->columns)) return EINVAL;
+        a->width = s->ncols; a->rows = s->nrows; a->capacity = s->capacity;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_OWNER;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_OWNER: {
+        struct ArrowSchema expected;
+        ArrowSchemaInit(&expected);
+        /* Standard JOIN originals are named canonical heap/noTS descriptors.
+        * Live alias borrowers are deliberately NOT a read-only exclusion. */
+        if (!s->name || s->pool_owned || s->arena_owned || s->col_shared
+            || s->storage_owner != s || s->timestamps || s->timestamp_capacity
+            || s->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || s->compound_count || s->compound_arity_map ||
+            s->compound_arity_len
+            || s->inline_physical_offset || s->retract_backup_columns
+            || s->retract_backup_timestamps || s->deferred_relation_next
+            || s->deferred_relation_session || !s->schema_ok
+            || s->schema.release != expected.release || s->schema.dictionary
+            || s->schema.private_data || s->schema.n_children != s->ncols
+            || (s->ncols && (!s->schema.children || !s->col_names)))
+            return ENOTSUP;
+        if (!a->governor) a->governor = s->memory_governor;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_COLUMN;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_COLUMN: {
+        if (a->column == a->width) {
+            a->column = 0; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_BUILD;
+            return 0;
+        }
+        uint32_t c = a->column;
+        struct ArrowSchema expected;
+        ArrowSchemaInit(&expected);
+        const struct ArrowSchema *child = s->schema.children[c];
+        if ((a->rows && (!s->columns || !s->columns[c]))
+            || (s->column_types && (s->column_types[c] < WIRELOG_TYPE_INT32
+            || s->column_types[c] > WIRELOG_TYPE_BOOL))
+            || !child || child->n_children || child->dictionary
+            || child->private_data || child->release != expected.release)
+            return ENOTSUP;
+        a->column++;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_BUILD: {
+        /* This recipe is authenticated by this actual combined reader and its
+         * completed bounded metadata validation. No forged scalar HELD record.
+         * Constructor exclusively owns output until this record's funded TAKE.
+         * Every governor hook sees no published mutable output pointer. */
+        wl_columnar_relation_constructor_recipe_t recipe = {
+            .names = (const char *const *)s->col_names,
+            .types = s->column_types, .type_codes = NULL,
+            .has_graph_column = s->has_graph_column,
+            .graph_col_idx = s->graph_col_idx,
+            .declared_ncols = s->declared_ncols,
+            .view_generation = 2u + (s->column_types != NULL),
+            .storage_generation = 1
+        };
+        int rc = wl_columnar_relation_constructor_attempt_build_operator(
+            s->name, a->width, a->capacity, false, a->governor, &recipe,
+            &a->output, a->control, a->attempt_id);
+        if (rc) return rc;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_CELL;
+        return 0;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_CELL:
+        if (a->column == a->width || !a->rows) {
+            a->run_valid = s->run_count <= COL_MAX_RUNS;
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RUN_VALIDATE; return 0;
+        }
+        a->output->columns[a->column][a->row] = s->columns[a->column][a->row];
+        if (++a->row == a->rows) {
+            a->row = 0; a->column++;
+        }
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RUN_VALIDATE:
+        if (!a->run_valid || a->run == s->run_count) {
+            if (s->run_count &&
+                a->previous_end != a->rows) a->run_valid = false;
+            a->run = 0; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RUN_COPY;
+            return 0;
+        }
+        if (s->run_ends[a->run] <= a->previous_end
+            || s->run_ends[a->run] > a->rows) a->run_valid = false;
+        a->previous_end = s->run_ends[a->run++];
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RUN_COPY:
+        if (!a->run_valid || a->run == COL_MAX_RUNS) {
+            a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_METADATA; return 0;
+        }
+        a->output->run_ends[a->run] = s->run_ends[a->run]; a->run++;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_METADATA:
+        a->output->nrows = a->rows;
+        output->base_nrows = s->base_nrows;
+        a->output->sorted_nrows = a->run_valid && s->sorted_nrows <= a->rows
+            ? s->sorted_nrows : 0;
+        a->output->run_count = a->run_valid ? s->run_count : 0;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_FINAL;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_FINAL: {
+        int rc = wl_columnar_relation_cache_copy_source_valid(a);
+        if (!rc) a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_LATCH;
+        return rc;
+    }
+    case WL_COLUMNAR_RELATION_CACHE_COPY_LATCH:
+        a->result_saved = true; a->semantic_result = 0;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_READY;
+        return 0;
+    default: return EINVAL;
+    }
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_step(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a, bool *ready)
+{
+    int rc = wl_columnar_relation_cache_copy_enter(a);
+    if (rc) return rc;
+    if (!ready || wl_columnar_relation_cache_copy_overlap(a, sizeof(*a), ready,
+        sizeof(*ready))) return wl_columnar_relation_cache_copy_leave(a,
+                   EINVAL);
+    if (a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE
+        || a->phase >= WL_COLUMNAR_RELATION_CACHE_COPY_READY)
+        return wl_columnar_relation_cache_copy_leave(a, EBUSY);
+    if (wl_evaluation_control_active_attempt_id(a->control) != a->attempt_id)
+        return wl_columnar_relation_cache_copy_leave(a, EINVAL);
+    *ready = false;
+    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, a->control, 2);
+    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_OWNER
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_COLUMN
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_BUILD
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_FINAL
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK :
+        WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK;
+    rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, work);
+    if (!rc) rc = wl_columnar_relation_cache_copy_action(a);
+    if (rc) {
+        if (!a->result_saved) {
+            a->result_saved = true; a->semantic_result = rc;
+        }
+        a->discarding = true; a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
+    } else *ready = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_READY;
+    return wl_columnar_relation_cache_copy_leave(a, rc);
+}
+
+static int
+wl_columnar_relation_cache_copy_fund(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, uint64_t work)
+{
+    if (!funding || !id
+        || wl_evaluation_control_identity(funding) == a->control_identity
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        id) return EINVAL;
+    return wl_evaluation_control_charge_attempt(funding, id, work);
+}
+
+static int
+wl_columnar_relation_cache_copy_end(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    int initiating, bool aborting, wl_evaluation_control_t *funding,
+    uint64_t id, bool *done)
+{
+    if (!done || wl_columnar_relation_cache_copy_overlap(a, sizeof(*a), done,
+        sizeof(*done))) return EINVAL;
+    if (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
+        || (!aborting &&
+        a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT)) {
+        *done = true; return 0;
+    }
+    if ((!aborting && a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_READY)
+        || (aborting && !initiating)) return EBUSY;
+    *done = false;
+    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, funding, aborting ? 4 : 3);
+    uint64_t work = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO_WORK
+        : a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN_WORK
+        : (a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE
+        || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP)
+        ? WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE_WORK :
+        WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK;
+    int rc = wl_columnar_relation_cache_copy_fund(a, funding, id, work);
+    if (rc) return rc;
+    if (aborting) {
+        a->discarding = true;
+        if (!a->result_saved) {
+            a->semantic_result = initiating; a->result_saved = true;
+        }
+    }
+    if (a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_END) {
+        if (!a->result_saved) {
+            a->semantic_result = 0; a->result_saved = true;
+        }
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END;
+        return 0;
+    }
+    switch (a->phase) {
+    case WL_COLUMNAR_RELATION_CACHE_COPY_END:
+        if (a->reader.owner) {
+            bool released = false;
+            rc = wl_columnar_source_access_reader_release_step(&a->reader,
+                    &released);
+            if (rc) return rc;
+            if (!released) return 0;
+            a->held = false;
+        } else if (!wl_columnar_relation_cache_copy_reader_inert(&a->reader) ||
+            a->held)
+            return EINVAL;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_END_CLEAR;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_END_CLEAR:
+        if (a->held ||
+            !wl_columnar_relation_cache_copy_reader_inert(
+                &a->reader)) return EINVAL;
+        a->source = NULL; a->governor = NULL;
+        if (a->discarding) a->phase =
+                a->output ? WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO
+                : WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED;
+        else a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT;
+        *done = a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
+            || a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT:
+        /* Parent abort may discard a successful untaken clone while retaining
+        * the first saved result (including zero). No original poll occurs. */
+        if (!a->discarding || !a->output) return EINVAL;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO:
+        if (!a->output || a->retirement_started) return EINVAL;
+        /* Historic inert receipt bytes may be poisoned; do not inspect them
+         * before this actual paid clear. No live retirement is overwritten. */
+        memset(&a->retirement, 0, sizeof(a->retirement));
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN:
+        if (!a->output || a->retirement_started) return EINVAL;
+        rc = wl_columnar_relation_managed_retirement_begin(
+            &a->retirement.storage, a->output);
+        if (rc) return rc;
+        a->retirement_started = true;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE:
+        rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
+                funding, id);
+        if (rc == EAGAIN) return 0;
+        if (rc) return rc;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_COMMIT;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_COMMIT:
+        rc = wl_columnar_relation_scalar_retirement_commit(&a->retirement);
+        if (rc) return rc;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP;
+        return 0;
+    case WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP:
+        rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
+                funding, id);
+        if (rc == EAGAIN) return 0;
+        if (rc) return rc;
+        a->output = NULL; a->retirement_started = false;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED; *done = true;
+        return 0;
+    default: return EINVAL;
+    }
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_finish(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_relation_cache_copy_enter(a);
+    if (rc) return rc;
+    rc = wl_columnar_relation_cache_copy_end(a, 0, false, funding, id, done);
+    return wl_columnar_relation_cache_copy_leave(a, rc);
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_abort(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a, int initiating,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    int rc = wl_columnar_relation_cache_copy_enter(a);
+    if (rc) return rc;
+    rc = wl_columnar_relation_cache_copy_end(a, initiating, true, funding, id,
+            done);
+    return wl_columnar_relation_cache_copy_leave(a, rc);
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_take(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, col_rel_t **out)
+{
+    int rc = wl_columnar_relation_cache_copy_enter(a);
+    if (rc) return rc;
+    if (!out || wl_columnar_relation_cache_copy_overlap(a, sizeof(*a),
+        (const void *)out,
+        sizeof(*out)))
+        return wl_columnar_relation_cache_copy_leave(a, EINVAL);
+    if (*out || a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT ||
+        !a->output
+        || a->discarding || a->semantic_result || !a->result_saved || a->held
+        || a->source ||
+        !wl_columnar_relation_cache_copy_reader_inert(&a->reader))
+        return wl_columnar_relation_cache_copy_leave(a, EBUSY);
+    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, funding, 5);
+    rc = wl_columnar_relation_cache_copy_fund(a, funding, id,
+            WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK);
+    if (!rc) {
+        *out = a->output; a->output = NULL;
+        a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN;
+    }
+    return wl_columnar_relation_cache_copy_leave(a, rc);
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_query(
+    const wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_columnar_relation_cache_scalar_copy_result_t *result)
+{
+    if (!a) return EINVAL;
+    if (a->busy) return EBUSY;
+    if (a->identity != a || !a->control_ref ||
+        !wl_columnar_relation_cache_copy_thread(a))
+        return EINVAL;
+    if (a->phase < WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT || a->held ||
+        a->source
+        || !a->result_saved ||
+        !wl_columnar_relation_cache_copy_reader_inert(&a->reader))
+        return EBUSY;
+    if (!result || wl_columnar_relation_cache_copy_overlap(a, sizeof(*a),
+        result, sizeof(*result)))
+        return EINVAL;
+    *result = (wl_columnar_relation_cache_scalar_copy_result_t){
+        a->width, a->rows, a->capacity, a->control_identity, a->attempt_id,
+        a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN,
+        a->phase == WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED,
+        a->semantic_result
+    };
+    return 0;
+}
+
+int
+wl_columnar_relation_cache_scalar_copy_ack(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_relation_cache_copy_enter(a);
+    if (rc) return rc;
+    if ((a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN
+        && a->phase != WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED) || a->output
+        || a->retirement_started || a->held || a->source || !a->result_saved
+        || !wl_columnar_relation_cache_copy_reader_inert(&a->reader))
+        return wl_columnar_relation_cache_copy_leave(a, EBUSY);
+    WL_COLUMNAR_RELATION_CACHE_COPY_HOOK(a, funding, 6);
+    rc = wl_columnar_relation_cache_copy_fund(a, funding, id,
+            WL_COLUMNAR_RELATION_CACHE_COPY_ACTION_WORK);
+    if (rc) return wl_columnar_relation_cache_copy_leave(a, rc);
+    wl_evaluation_control_t *owned = a->control;
+    a->identity = NULL; a->control = NULL; a->control_ref = false;
+    a->control_identity = a->attempt_id = 0; a->thread_valid = false;
+    a->result_saved = a->discarding = false; a->semantic_result = 0;
+    a->width = a->rows = a->capacity = 0;
+    a->column = a->row = a->run = a->previous_end = 0;
+    a->snapshot = (col_relation_snapshot_t){0};
+    a->phase = WL_COLUMNAR_RELATION_CACHE_COPY_INERT;
+    wl_evaluation_control_release(owned);
+    return wl_columnar_relation_cache_copy_leave(a, 0);
+}
+#undef WL_COLUMNAR_RELATION_CACHE_COPY_HOOK
+
 /* Original held source pair is reused; only the private builder differs.
  * Output remains lexical/private until install and checked publication. */
 int

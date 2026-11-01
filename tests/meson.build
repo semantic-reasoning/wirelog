@@ -2932,6 +2932,18 @@ foreach cache_digest_case : ['domains', 'failures', 'authority']
        args: [cache_digest_case], suite: ['unit', 'tsan', 'cache_digest'], timeout: 60)
 endforeach
 
+test_cache_scalar_copy_exe = executable(
+  'test_cache_scalar_copy', files('test_cache_scalar_copy.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+foreach cache_copy_case : ['domains', 'failures', 'authority']
+  test('cache_scalar_copy_' + cache_copy_case, test_cache_scalar_copy_exe,
+       args: [cache_copy_case], suite: ['unit', 'tsan', 'cache_scalar_copy'], timeout: 60)
+endforeach
+
 # ============================================================================
 # K-way Merge CONSOLIDATE Tests (US-002 TDD RED Phase)
 # ============================================================================
