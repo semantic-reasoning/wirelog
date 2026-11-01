@@ -16409,6 +16409,18 @@ wl_columnar_relation_scalar_source_check(
 }
 
 int
+wl_columnar_relation_scalar_source_validate_attempt_controlled(
+    const wl_columnar_relation_scalar_source_t *source,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    int rc = wl_columnar_relation_scalar_source_check(source,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_HELD);
+    if (rc) return rc;
+    if (source->control != control || source->attempt_id != id) return EINVAL;
+    return wl_evaluation_control_charge_attempt(control, id, 0);
+}
+
+int
 wl_columnar_relation_scalar_source_end(
     wl_columnar_relation_scalar_source_t *source, int initiating_result)
 {

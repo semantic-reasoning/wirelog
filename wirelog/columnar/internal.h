@@ -4477,6 +4477,9 @@ int wl_columnar_relation_scalar_source_init_attempt_controlled(
 int wl_columnar_relation_scalar_source_begin_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, const col_rel_t *relation,
     bool preserve_timestamps);
+int wl_columnar_relation_scalar_source_validate_attempt_controlled(
+    const wl_columnar_relation_scalar_source_t *, wl_evaluation_control_t *,
+    uint64_t);
 /* Disjoint exclusive scalar outputs publish only after a successful tail. */
 int wl_columnar_relation_scalar_source_shape_attempt_controlled(
     wl_columnar_relation_scalar_source_t *source, uint32_t *width,
@@ -4507,6 +4510,62 @@ wl_columnar_relation_scalar_source_new_like_typed_operator_attempt_controlled(
     wl_columnar_relation_scalar_source_t *, const char *,
     wl_columnar_memory_governor_ref_t *, const wirelog_column_type_t *,
     col_rel_t **);
+/* Empty JOIN/probe schema preparation only: no rows or probe index. Sources
+* and immutable operator/name metadata remain held at original addresses
+* through forward completion. ANTI requires a no-TS held source and clones
+* its names/graph/declared width; JOIN/SEMI use generated projected names.
+* The exclusive output slot is disjoint from the owner/source records and
+* all borrowed metadata. It owns any constructed result, including a stop
+* after construction. END never destroys that result or dereferences sources;
+* the caller ends source leases before retiring an old template. Stable zero
+* or proven-drained record only; no token/reader may move with a live record.
+* Constructors are internally metered synchronous regions, not a total-call
+* max_work promise. END uses distinct actual funding after original stop. */
+typedef enum {
+    WL_COLUMNAR_JOIN_SCHEMA_ALLOCATE,
+    WL_COLUMNAR_JOIN_SCHEMA_COLUMNS,
+    WL_COLUMNAR_JOIN_SCHEMA_CONSTRUCT,
+    WL_COLUMNAR_JOIN_SCHEMA_READY
+} wl_columnar_join_schema_phase_t;
+typedef struct wl_columnar_join_schema_attempt {
+    struct wl_columnar_join_schema_attempt *identity;
+    const wl_plan_op_t *op;
+    wl_columnar_relation_scalar_source_t *left, *right;
+    const char *name;
+    col_rel_t **output_slot;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id, control_identity;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, control_retained;
+    wl_columnar_memory_governor_ref_t *governor;
+    wl_columnar_memory_reservation_t codes_credit;
+    int64_t *codes;
+    uint64_t bytes;
+    uint32_t width, column;
+    wl_columnar_join_schema_phase_t phase;
+    bool codes_admitted, codes_committed, governor_retained;
+    bool ready, ending, drained, output_transferred;
+    int result;
+} wl_columnar_join_schema_attempt_t;
+int wl_columnar_join_schema_attempt_begin(wl_columnar_join_schema_attempt_t *,
+    const wl_plan_op_t *, wl_columnar_relation_scalar_source_t *,
+    wl_columnar_relation_scalar_source_t *, const char *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_join_schema_attempt_step(wl_columnar_join_schema_attempt_t *,
+    uint32_t max_work, bool *);
+int wl_columnar_join_schema_attempt_end(wl_columnar_join_schema_attempt_t *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_join_test_schema_checkpoint)(
+    const wl_columnar_join_schema_attempt_t *);
+#endif
 /* Original controlled HELD batch, same original control/ID, private self-owned
  * destination distinct from descriptor/owner, matching width, stable values.
  * Preserve selected TS fields and signed multiplicity exactly; noTS performs

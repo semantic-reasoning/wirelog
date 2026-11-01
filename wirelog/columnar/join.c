@@ -578,6 +578,19 @@ col_join_output_width(const col_rel_t *left, const col_rel_t *right,
         ? op->project_count : left->ncols + right->ncols;
 }
 
+static wirelog_column_type_t
+wl_columnar_join_type_lane(uint32_t source, uint32_t left_width,
+    const wirelog_column_type_t *left_types, uint32_t right_width,
+    const wirelog_column_type_t *right_types)
+{
+    if (source < left_width)
+        return left_types ? left_types[source] : WIRELOG_TYPE_INT64;
+    if (source - left_width < right_width)
+        return right_types ? right_types[source -
+                   left_width] : WIRELOG_TYPE_INT64;
+    return WIRELOG_TYPE_INT64;
+}
+
 int
 col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     const col_rel_t *right, const wl_plan_op_t *op)
@@ -590,18 +603,8 @@ col_join_set_output_types(col_rel_t *out, const col_rel_t *left,
     for (uint32_t c = 0; c < width; c++) {
         uint32_t source = (op && op->project_count > 0
             && op->project_indices) ? op->project_indices[c] : c;
-        if (source < left->ncols) {
-            types[c] = left->column_types
-                ? left->column_types[source] : WIRELOG_TYPE_INT64;
-        } else if (source - left->ncols < right->ncols) {
-            uint32_t source_col = source - left->ncols;
-            types[c] = right->column_types
-                ? right->column_types[source_col] : WIRELOG_TYPE_INT64;
-        } else {
-            /* Keep the existing invalid-projection value semantics while
-             * avoiding an out-of-bounds read from the source schema. */
-            types[c] = WIRELOG_TYPE_INT64;
-        }
+        types[c] = wl_columnar_join_type_lane(source, left->ncols,
+                left->column_types, right->ncols, right->column_types);
     }
     int rc = col_rel_set_column_types(out, types, width);
     free(types);
@@ -621,12 +624,259 @@ col_join_set_left_output_types(col_rel_t *out, const col_rel_t *left,
     for (uint32_t c = 0; c < width; c++) {
         uint32_t source = op && op->project_count > 0
             ? op->project_indices[c] : c;
-        types[c] = source < left->ncols && left->column_types
-            ? left->column_types[source] : WIRELOG_TYPE_INT64;
+        types[c] = wl_columnar_join_type_lane(source, left->ncols,
+                left->column_types, 0, NULL);
     }
     int rc = col_rel_set_column_types(out, types, width);
     free(types);
     return rc;
+}
+
+enum {
+    WL_COLUMNAR_JOIN_SCHEMA_INIT_WORK =
+        (sizeof(wl_columnar_join_schema_attempt_t) + 7u) / 8u + 64u
+};
+typedef char wl_columnar_join_schema_init_fits_t[
+        WL_COLUMNAR_JOIN_SCHEMA_INIT_WORK <=
+        WL_EVALUATION_CONTROL_QUANTUM ? 1 : -1];
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_join_test_schema_checkpoint)(
+    const wl_columnar_join_schema_attempt_t *);
+#endif
+
+static bool
+wl_columnar_join_schema_thread(const wl_columnar_join_schema_attempt_t *a)
+{
+    if (!a->thread_valid) return false;
+#if defined(WL_HAVE_C11_THREADS)
+    return thrd_equal(a->owner_thread, thrd_current()) != 0;
+#elif defined(_WIN32) || defined(_WIN64)
+    return a->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(a->owner_thread, pthread_self()) != 0;
+#endif
+}
+
+int
+wl_columnar_join_schema_attempt_begin(wl_columnar_join_schema_attempt_t *a,
+    const wl_plan_op_t *op, wl_columnar_relation_scalar_source_t *left,
+    wl_columnar_relation_scalar_source_t *right, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!a || !op || !left || !name || !out || *out || !control || !id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id,
+            WL_COLUMNAR_JOIN_SCHEMA_INIT_WORK);
+    if (rc) return rc;
+    if (a->identity && (a->identity != a || !a->drained)) return EBUSY;
+    rc = wl_columnar_relation_scalar_source_validate_attempt_controlled(left,
+            control, id);
+    if (rc) return rc;
+    bool join = op->op == WL_PLAN_OP_JOIN;
+    bool semi = op->op == WL_PLAN_OP_SEMIJOIN;
+    bool anti = op->op == WL_PLAN_OP_ANTIJOIN;
+    if (!join && !semi && !anti) return EINVAL;
+    if (join) {
+        rc =
+            wl_columnar_relation_scalar_source_validate_attempt_controlled(
+            right,
+            control, id);
+        if (rc) return rc;
+    }
+    if (anti && left->preserve_timestamps) return EINVAL;
+    if (semi && op->project_count && !op->project_indices) return EINVAL;
+    uint64_t width = anti ? left->width : op->project_count
+        && op->project_indices ? op->project_count
+        : (uint64_t)left->width + (join ? right->width : 0u);
+    if (width > UINT32_MAX) return EOVERFLOW;
+    memset(a, 0, sizeof(*a));
+    a->identity = a; a->op = op; a->left = left; a->right = right;
+    a->name = name; a->output_slot = out; a->width = (uint32_t)width;
+    a->attempt_id = id;
+    a->control_identity = wl_evaluation_control_identity(control);
+#if defined(WL_HAVE_C11_THREADS)
+    a->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    a->owner_thread = GetCurrentThreadId();
+#else
+    a->owner_thread = pthread_self();
+#endif
+    a->thread_valid = true;
+    wl_columnar_memory_reservation_init(&a->codes_credit);
+    rc = wl_evaluation_control_retain(control);
+    if (rc) {
+        a->result = rc; return rc;
+    }
+    a->control = control; a->control_retained = true;
+    a->governor = governor;
+    wl_columnar_memory_governor_ref_retain(governor);
+    a->governor_retained = governor != NULL;
+    a->phase = anti ? WL_COLUMNAR_JOIN_SCHEMA_CONSTRUCT
+        : WL_COLUMNAR_JOIN_SCHEMA_ALLOCATE;
+    return 0;
+}
+
+int
+wl_columnar_join_schema_attempt_step(wl_columnar_join_schema_attempt_t *a,
+    uint32_t max_work, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a || !wl_columnar_join_schema_thread(a)
+        || a->ending || a->drained || !max_work ||
+        max_work > 256) return EINVAL;
+    if (a->result) return a->result;
+    int rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 0);
+    if (rc) {
+        a->result = rc; return rc;
+    }
+    rc = wl_columnar_relation_scalar_source_validate_attempt_controlled(a->left,
+            a->control, a->attempt_id);
+    if (!rc && a->op->op == WL_PLAN_OP_JOIN)
+        rc =
+            wl_columnar_relation_scalar_source_validate_attempt_controlled(
+            a->right,
+            a->control, a->attempt_id);
+    if (rc) {
+        a->result = rc; return rc;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_join_test_schema_checkpoint)
+        wl_columnar_join_test_schema_checkpoint(a);
+#endif
+    rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id, 1);
+    if (rc) goto failed;
+    switch (a->phase) {
+    case WL_COLUMNAR_JOIN_SCHEMA_ALLOCATE:
+        if (!wl_columnar_memory_size_mul(a->width, sizeof(int64_t), &a->bytes)
+            || a->bytes > SIZE_MAX) {
+            rc = EOVERFLOW; break;
+        }
+        if (a->bytes && a->governor) {
+            wl_columnar_memory_admission_status_t status;
+            rc = wl_columnar_memory_governor_reserve_checked_controlled(
+                wl_columnar_memory_governor_ref_get(a->governor), a->bytes,
+                &a->codes_credit, &status, a->control);
+            if (rc) break;
+            if (status > WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY) {
+                rc = status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED ? ENOSPC
+                    : status ==
+                    WL_COLUMNAR_MEMORY_ADMISSION_OVERFLOW ? EOVERFLOW : ENOMEM;
+                break;
+            }
+            a->codes_admitted = true;
+        }
+        if (a->bytes) {
+            a->codes = wl_columnar_join_attempt_allocate((size_t)a->bytes);
+            if (!a->codes) {
+                rc = ENOMEM; break;
+            }
+            if (a->codes_admitted) {
+                if (!wl_columnar_memory_commit(&a->codes_credit, a)) {
+                    rc = EINVAL; break;
+                }
+                a->codes_committed = true;
+            }
+        }
+        a->phase = WL_COLUMNAR_JOIN_SCHEMA_COLUMNS;
+        return 0;
+    case WL_COLUMNAR_JOIN_SCHEMA_COLUMNS:
+        for (uint32_t work = 0; work < max_work && a->column < a->width;
+            ++work) {
+            rc = wl_evaluation_control_charge_attempt(a->control, a->attempt_id,
+                    1);
+            if (rc) break;
+            uint32_t c = a->column;
+            uint32_t source = a->op->project_count && a->op->project_indices
+                ? a->op->project_indices[c] : c;
+            bool join = a->op->op == WL_PLAN_OP_JOIN;
+            a->codes[c] = wl_columnar_join_type_lane(source, a->left->width,
+                    a->left->types, join ? a->right->width : 0,
+                    join ? a->right->types : NULL);
+            ++a->column;
+        }
+        if (rc) break;
+        if (a->column == a->width) a->phase = WL_COLUMNAR_JOIN_SCHEMA_CONSTRUCT;
+        return 0;
+    case WL_COLUMNAR_JOIN_SCHEMA_CONSTRUCT: {
+        wl_evaluation_control_t *control = a->control;
+        uint64_t id = a->attempt_id;
+        col_rel_t **out = a->output_slot;
+        if (a->op->op == WL_PLAN_OP_ANTIJOIN)
+            rc =
+                wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled
+                (
+                a->left, a->name, a->governor, out);
+        else rc =
+                wl_columnar_relation_new_typed_codes_operator_attempt_controlled
+                (
+                a->name, a->width, COL_REL_INIT_CAP, a->codes, a->governor,
+                out, control, id);
+        int guard = wl_evaluation_control_charge_attempt(control, id, 0);
+        /* Mandatory discovery of the exclusive output owner after a late
+         * stop. No output descriptor is read and END never disposes it. */
+        a->output_transferred = *out != NULL;
+        if (!rc) rc = guard;
+        if (rc) break;
+        a->ready = true; a->phase = WL_COLUMNAR_JOIN_SCHEMA_READY;
+        *done = true;
+        return 0;
+    }
+    case WL_COLUMNAR_JOIN_SCHEMA_READY:
+        *done = true;
+        return 0;
+    default: rc = EINVAL; break;
+    }
+failed:
+    a->result = rc;
+    return rc;
+}
+
+int
+wl_columnar_join_schema_attempt_end(wl_columnar_join_schema_attempt_t *a,
+    wl_evaluation_control_t *funding, uint64_t id, bool *done)
+{
+    if (!done) return EINVAL;
+    *done = false;
+    if (!a || a->identity != a) return EINVAL;
+    if (a->drained) {
+        *done = true; return 0;
+    }
+    if (!wl_columnar_join_schema_thread(a) || !funding
+        || wl_evaluation_control_identity(funding) == a->control_identity
+        || wl_evaluation_control_active_attempt_id(funding) != id || !id)
+        return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(funding, id, 1);
+    if (rc) return rc;
+    a->ending = true;
+    if (a->codes) {
+        free(a->codes); a->codes = NULL; return 0;
+    }
+    if (a->codes_admitted) {
+        bool released = false;
+        rc = wl_columnar_memory_reservation_finish_step(&a->codes_credit,
+                !a->codes_committed, &released);
+        if (!rc && released) a->codes_admitted = false;
+        return rc;
+    }
+    if (a->governor_retained) {
+        wl_columnar_memory_governor_ref_release(a->governor);
+        a->governor_retained = false; a->governor = NULL;
+        return 0;
+    }
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            WL_COLUMNAR_JOIN_SCHEMA_INIT_WORK);
+    if (rc) return rc;
+    wl_evaluation_control_t *control = a->control;
+    bool retained = a->control_retained;
+    a->control = NULL; a->control_retained = false;
+    a->left = a->right = NULL; a->op = NULL; a->output_slot = NULL;
+    a->name = NULL; a->drained = true; a->thread_valid = false;
+    if (retained) wl_evaluation_control_release(control);
+    *done = true;
+    return 0;
 }
 
 bool
