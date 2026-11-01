@@ -1513,8 +1513,7 @@ wl_columnar_join_source(const wl_col_session_t *s, const char *name,
     if (src.cold) {
         src.width = src.cold->ncols;
         src.names = (const char *const *)src.cold->col_names;
-        src.types = wl_columnar_batch_payload_schema(src.cold->payload, NULL,
-                NULL);
+        src.types = wl_columnar_session_cold_types(src.cold);
     } else {
         /* Read-only lookup also serves seal preflight; never build a hash. */
         if (!resident && name)
@@ -1566,7 +1565,7 @@ wl_columnar_join_source_valid(const wl_columnar_join_source_t *src,
         type = src->types[c];
         if (type < WIRELOG_TYPE_INT32 || type > WIRELOG_TYPE_BOOL) return false;
         if (type == WIRELOG_TYPE_STRING && (!src->intern || (src->cold &&
-            !wl_columnar_batch_payload_uses_intern(src->cold->payload,
+            !wl_columnar_session_cold_uses_intern(src->cold,
             src->intern)))) return false;
     }
     return true;
@@ -1718,8 +1717,8 @@ wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
             source.types ? source.types[c] : WIRELOG_TYPE_INT64;
         if (type < WIRELOG_TYPE_INT32 || type > WIRELOG_TYPE_BOOL ||
             (type == WIRELOG_TYPE_STRING && (!source.intern ||
-            (source.cold && !wl_columnar_batch_payload_uses_intern(
-                source.cold->payload, source.intern))))) return false;
+            (source.cold && !wl_columnar_session_cold_uses_intern(
+                source.cold, source.intern))))) return false;
     }
     for (uint32_t i = first; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];

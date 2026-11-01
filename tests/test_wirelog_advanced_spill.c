@@ -1089,6 +1089,84 @@ static void public_scan_join(void)
             }
 }
 
+static void chunked_scan_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    unsigned *bits = context;
+    CHECK(!strcmp(name, "result") && cols == 2);
+    CHECK(row[0] >= 1 && row[0] <= 3 && row[1] == row[0] + 10);
+    unsigned bit = 1u << (unsigned)row[0];
+    CHECK(!(*bits & bit)); *bits |= bit;
+}
+
+static void chunked_pending_typed(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    (void)name; (void)row; (void)diff; (*(unsigned *)context)++;
+}
+
+static void chunked_public_scans(void)
+{
+    const char *text = ".decl a(k:int64,v:int64)\n"
+        ".decl result(k:int64,v:int64)\nresult(k,v) :- a(k,v), k > 0.\n";
+    for (unsigned mode = 0; mode < 4; mode++) {
+        wirelog_program_t *p = parse(text);
+        wirelog_session_t *s = NULL;
+        wirelog_session_options_v1_t options = configured();
+        CHECK(wirelog_session_create_with_options(p, WIRELOG_BACKEND_DEFAULT,
+            1, &options, &s) == WIRELOG_OK);
+        int64_t rows[] = {0, 10, 1, 11, 2, 12, 1, 11, 3, 13};
+        if (mode == 3) {
+            CHECK(wirelog_session_insert(s, "a", rows, 5, 2) == WIRELOG_OK);
+            CHECK(wirelog_session_begin_cold_input(s, "a") == WIRELOG_ERR_EXEC);
+        } else {
+            CHECK(wirelog_session_begin_cold_input(s, "a") == WIRELOG_OK);
+            CHECK(wirelog_session_begin_cold_input(s, "a") == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_insert(s, "a", rows, 1,
+                2) == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_append_cold_input(s, "a", NULL, 0,
+                2) == WIRELOG_OK);
+            CHECK(wirelog_session_append_cold_input(s, "a", rows, 1,
+                1) == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_append_cold_input(s, "a", NULL, 1,
+                2) == WIRELOG_ERR_EXEC);
+            unsigned calls = 0;
+            CHECK(wirelog_session_step(s) == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_snapshot(s, count_event,
+                &calls) == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_snapshot_typed(s, chunked_pending_typed,
+                &calls) == WIRELOG_ERR_EXEC);
+            CHECK(!calls);
+            if (!mode) {
+                CHECK(wirelog_session_append_cold_input(s, "a", rows, 2,
+                    2) == WIRELOG_OK);
+                CHECK(wirelog_session_append_cold_input(s, "a", rows+4, 3,
+                    2) == WIRELOG_OK);
+            }
+            if (mode == 2) { /* Incomplete owner destruction. */
+                CHECK(wirelog_session_append_cold_input(s, "a", rows, 5,
+                    2) == WIRELOG_OK);
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(!live_files()); continue;
+            }
+            CHECK(wirelog_session_finish_cold_input(s, "a") == WIRELOG_OK);
+            CHECK(wirelog_session_finish_cold_input(s,
+                "a") == WIRELOG_ERR_EXEC);
+            CHECK(wirelog_session_append_cold_input(s, "a", rows, 1,
+                2) == WIRELOG_ERR_EXEC);
+        }
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            unsigned bits = 0;
+            CHECK(wirelog_session_snapshot(s, chunked_scan_observe,
+                &bits) == WIRELOG_OK);
+            CHECK(bits == (mode == 1 ? 0u : 14u));
+            CHECK(wirelog_session_step(s) == WIRELOG_OK);
+        }
+        wirelog_session_destroy(s); wirelog_program_free(p);
+        CHECK(!live_files());
+    }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1107,6 +1185,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    chunked_public_scans();
     inline_public_projections(); inline_public_joins();
     reference_public_joins();
     reference_public_projections();
