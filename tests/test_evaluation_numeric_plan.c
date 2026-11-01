@@ -5044,6 +5044,105 @@ cancel_after_terminal_exchange(wl_evaluation_control_t *control,
     wl_evaluation_control_request_cancel(control);
 }
 
+/* The compiler currently emits LFTJ only for EDB chains. Exercise the
+ * authenticated internal binding contract directly: a private image must
+ * shadow a different public image even when empty or stale. */
+static void
+test_composed_lftj_private_shadow(void)
+{
+    static const double private_values[] = {1, 3};
+    static const double public_values[] = {2};
+    static const double other_values[] = {1, 2, 3};
+    for (unsigned mode = 0; mode < 3; ++mode)
+        for (unsigned governed = 0; governed < 2; ++governed) {
+            char *names[] = {"a", "b", "c"};
+            uint32_t keys[] = {0, 0, 0};
+            wl_plan_op_lftj_t metadata = {.k = 3, .rel_names = names,
+                                          .key_cols = keys};
+            wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ,
+                               .opaque_data = &metadata};
+            wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+            col_rel_t *private_a = composed_source("private-a", 1,
+                    private_values, mode == 1 ? 0 : 2, false);
+            free(private_a->name); private_a->name = NULL;
+            col_rel_t *registry[] = {
+                composed_source("a", 1, public_values, 1, false),
+                composed_source("b", 1, other_values, 3, false),
+                composed_source("c", 1, other_values, 3, false)
+            };
+            col_relation_snapshot_t snapshots[3];
+            for (unsigned i = 0; i < 3; ++i)
+                snapshots[i] = wl_columnar_relation_snapshot(registry[i]);
+
+            /* Establish that accidentally selecting the public source would
+             * return the distinguishable tuple (2,2,2), including empty mode. */
+            wl_col_session_t raw = {0};
+            wl_mem_ledger_init(&raw.mem_ledger, 0);
+            raw.rels = registry; raw.nrels = raw.rel_cap = 3;
+            eval_stack_t raw_stack = {0};
+            CHECK(!col_eval_relation_plan(&body, &raw_stack, &raw));
+            CHECK(raw_stack.top == 1 && raw_stack.items[0].rel->nrows == 1);
+            for (unsigned c = 0; c < 3; ++c)
+                CHECK(raw_stack.items[0].rel->columns[c][0] == 2);
+            CHECK(!eval_stack_drain(&raw_stack));
+            col_session_free_sorted_arrangements(&raw);
+            session_rel_free_hash(&raw);
+
+            fixture_t f; composed_fixture(&f, private_a, 0);
+            wl_columnar_memory_governor_ref_t *governor = governed
+                ? composed_governor(&f) : NULL;
+            f.session.base.evaluation_control = f.operation;
+            f.session.rels = registry; f.session.nrels = f.session.rel_cap = 3;
+            const char *binding_names[] = {"a"};
+            col_rel_t *binding_relations[] = {private_a};
+            wl_columnar_eval_private_bindings_t bindings = {0};
+            CHECK(!wl_columnar_eval_private_bindings_begin(&bindings,
+                &f.session, &body, f.operation, f.operation_id,
+                binding_names, binding_relations, 1));
+            if (mode == 2) {
+                /* Real mutation after binding capture invalidates its source
+                 * snapshot. Neither lookup nor admission may use the public
+                 * head to repair that stale authority. */
+                int64_t value = 99;
+                CHECK(!col_rel_append_row(private_a, &value));
+                const char *name = NULL;
+                col_rel_t *relation = NULL;
+                CHECK(wl_columnar_eval_private_binding_get(&bindings, 0,
+                    &name, &relation) == EINVAL);
+            }
+            int begin =
+                wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &f.record, &body, 0, 1, f.frame, &f.session, 0,
+                f.operation, f.operation_id, f.funding, f.funding_id,
+                &bindings);
+            CHECK(begin == (mode == 2 ? EINVAL : 0));
+            if (!begin) composed_run(&f);
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(!f.record.semantic_result);
+            if (mode == 2) CHECK(!stack->top);
+            else {
+                CHECK(stack->top == 1 && stack->items[0].rel->ncols == 3
+                    && stack->items[0].rel->nrows == (mode == 1 ? 0u : 2u));
+                for (uint32_t row = 0; row < stack->items[0].rel->nrows; ++row)
+                    for (unsigned c = 0; c < 3; ++c)
+                        CHECK(stack->items[0].rel->columns[c][row]
+                            == (int64_t)private_values[row]);
+            }
+            for (unsigned i = 0; i < 3; ++i)
+                CHECK(wl_columnar_relation_snapshot_equal(snapshots[i],
+                    wl_columnar_relation_snapshot(registry[i])));
+            CHECK(session_find_rel(&f.session, "a") == registry[0]);
+            session_rel_free_hash(&f.session);
+            composed_close(&f);
+            for (unsigned i = 0; i < 3; ++i) col_rel_destroy(registry[i]);
+            if (governor) {
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+        }
+}
+
 static void
 composed_close(fixture_t *f)
 {
@@ -6289,6 +6388,7 @@ main(void)
     test_composed_concat_work_limit_cleanup();
     test_composed_concat_stopped_retirement_retry();
     test_composed_private_input_binding();
+    test_composed_lftj_private_shadow();
     test_composed_recursive_terminal_exchange();
     test_composed_lftj_stopped_cleanup();
     test_composed_source_stopped_cleanup();
