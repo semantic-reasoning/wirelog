@@ -6979,3 +6979,14 @@ test_evaluation_join_probes_exe = executable(
 )
 test('evaluation_join_probes', test_evaluation_join_probes_exe,
      suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)
+
+# #2297: authentic unspecialized empty descriptors retain both source gates.
+test_relation_empty_source_exe = executable(
+  'test_relation_empty_source', files('test_relation_empty_source.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('relation_empty_source', test_relation_empty_source_exe,
+     suite: ['unit', 'tsan'], timeout: 60)

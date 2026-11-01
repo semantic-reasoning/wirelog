@@ -4416,6 +4416,55 @@ int wl_columnar_relation_new_typed_codes_stamped_operator_attempt_controlled(
 int wl_columnar_relation_append_batch_numeric_row_operator_controlled(
     wl_columnar_relation_append_batch_t *, const int64_t *,
     wl_evaluation_control_t *, uint64_t);
+/* Authentic unspecialized empty descriptor, distinct from a scalar HELD
+ * source. Stable zero or proven-drained record, disjoint from descriptor and
+ * borrowed metadata. Actual descriptor and canonical-owner readers precede
+ * empty-shape inspection; no declared lane is synthesized and no row gather
+ * is authorized. Original descriptor/control/ID/native thread remain fixed.
+ * END drains one real reader-release action under distinct actual funding,
+ * using captured gate pointers without polling the stopped original target
+ * or reading descriptor payload/schema. Descriptor storage stays alive until END completes. Serialize calls;
+ * callbacks may request a stop but must not reenter this owner. */
+typedef enum {
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_INERT,
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_ACQUIRE,
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_VALIDATE,
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD,
+    WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
+} wl_columnar_relation_empty_source_phase_t;
+typedef struct wl_columnar_relation_empty_source {
+    struct wl_columnar_relation_empty_source *identity;
+    const col_rel_t *descriptor;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id, control_identity;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, control_retained, ending;
+    wl_columnar_source_access_reader_t reader;
+    col_relation_snapshot_t snapshot;
+    uint32_t declared_ncols, graph_col_idx;
+    bool has_graph_column;
+    wl_columnar_relation_empty_source_phase_t phase;
+    int result;
+} wl_columnar_relation_empty_source_t;
+int wl_columnar_relation_empty_source_begin(
+    wl_columnar_relation_empty_source_t *, const col_rel_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_relation_empty_source_step(
+    wl_columnar_relation_empty_source_t *, bool *);
+int wl_columnar_relation_empty_source_end(
+    wl_columnar_relation_empty_source_t *, wl_evaluation_control_t *, uint64_t,
+    bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_test_empty_source_checkpoint)(
+    const wl_columnar_relation_empty_source_t *);
+#endif
+
 /* Original protected scalar source, opt-in nonNULL-control only. Never copy
  * or move an initialized live record; serialize all access and do not invoke
  * begin/end/init reentrantly from child callbacks. Caller keeps descriptor,
