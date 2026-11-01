@@ -2021,6 +2021,100 @@ extern void (*wl_columnar_cache_digest_test_checkpoint)(
     wl_columnar_cache_digest_attempt_t *, wl_evaluation_control_t *, unsigned);
 #endif
 
+/* Pin-free copy of a constructor-reachable scalar cache original. Caller
+ * owns source lifetime (readers alone cannot borrow an unpinned cache result).
+ * Source must be a named canonical standard-schema heap result without stamps
+ * or compounds; live aliases of that canonical source are permitted. Output
+ * stays constructor-private until funded TAKE; query never transfers it.
+ * Explicit governor lifetime is caller-owned through source END; a constructed
+ * output retains its own governor ref. Zero initialize final-address storage.
+ * Original control ref lasts through funded ACK.
+ * Independent cleanup may continue after original finish/reset/cancellation. */
+typedef enum {
+    WL_COLUMNAR_RELATION_CACHE_COPY_INERT,
+    WL_COLUMNAR_RELATION_CACHE_COPY_ACQUIRE,
+    WL_COLUMNAR_RELATION_CACHE_COPY_VALIDATE,
+    WL_COLUMNAR_RELATION_CACHE_COPY_OWNER,
+    WL_COLUMNAR_RELATION_CACHE_COPY_COLUMN,
+    WL_COLUMNAR_RELATION_CACHE_COPY_BUILD,
+    WL_COLUMNAR_RELATION_CACHE_COPY_CELL,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RUN_VALIDATE,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RUN_COPY,
+    WL_COLUMNAR_RELATION_CACHE_COPY_METADATA,
+    WL_COLUMNAR_RELATION_CACHE_COPY_FINAL,
+    WL_COLUMNAR_RELATION_CACHE_COPY_LATCH,
+    WL_COLUMNAR_RELATION_CACHE_COPY_READY,
+    WL_COLUMNAR_RELATION_CACHE_COPY_END,
+    WL_COLUMNAR_RELATION_CACHE_COPY_END_CLEAR,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_ZERO,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_BEGIN,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_PREPARE,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_COMMIT,
+    WL_COLUMNAR_RELATION_CACHE_COPY_RETIRE_STEP,
+    WL_COLUMNAR_RELATION_CACHE_COPY_READY_OUTPUT,
+    WL_COLUMNAR_RELATION_CACHE_COPY_TAKEN,
+    WL_COLUMNAR_RELATION_CACHE_COPY_DISCARDED
+} wl_columnar_relation_cache_scalar_copy_phase_t;
+
+typedef struct wl_columnar_relation_cache_scalar_copy_attempt {
+    struct wl_columnar_relation_cache_scalar_copy_attempt *identity;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, attempt_id;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    bool thread_valid, busy, control_ref, result_saved, discarding;
+    wl_columnar_relation_cache_scalar_copy_phase_t phase;
+    const col_rel_t *source;
+    wl_columnar_source_access_reader_t reader;
+    col_relation_snapshot_t snapshot;
+    bool held, run_valid, retirement_started;
+    wl_columnar_memory_governor_ref_t *governor;
+    col_rel_t *output;
+    uint32_t width, rows, capacity, column, row, run, previous_end;
+    int semantic_result;
+    /* Lazy initialization is separately funded; ACK leaves only inert historic
+     * bytes here. No terminal retirement pointer is dereferenced on reuse. */
+    wl_columnar_relation_scalar_retirement_t retirement;
+} wl_columnar_relation_cache_scalar_copy_attempt_t;
+
+typedef struct {
+    uint32_t width, rows, capacity;
+    uint64_t control_identity, attempt_id;
+    bool taken, discarded;
+    int semantic_result;
+} wl_columnar_relation_cache_scalar_copy_result_t;
+
+int wl_columnar_relation_cache_scalar_copy_begin(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *, const col_rel_t *,
+    wl_columnar_memory_governor_ref_t *, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_relation_cache_scalar_copy_step(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *, bool *);
+int wl_columnar_relation_cache_scalar_copy_finish(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, uint64_t, bool *);
+int wl_columnar_relation_cache_scalar_copy_abort(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *, int,
+    wl_evaluation_control_t *, uint64_t, bool *);
+int wl_columnar_relation_cache_scalar_copy_take(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, uint64_t, col_rel_t **);
+int wl_columnar_relation_cache_scalar_copy_query(
+    const wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_columnar_relation_cache_scalar_copy_result_t *);
+int wl_columnar_relation_cache_scalar_copy_ack(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_relation_cache_scalar_copy_test_checkpoint)(
+    wl_columnar_relation_cache_scalar_copy_attempt_t *,
+    wl_evaluation_control_t *, unsigned);
+#endif
+
 /* ======================================================================== */
 /* Operator Profiling (WL_PROFILE)                                         */
 /* ======================================================================== */

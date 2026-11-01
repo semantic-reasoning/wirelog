@@ -862,3 +862,53 @@ identity: default-INT64 LFTJ output does not equal a STRING-typed right key,
 while an INT64-typed right carrying the same codes is a positive match. Both
 ordinary/probe results and independent literal cardinalities cover these
 negative/positive pairs; no output is not treated as proof of code loss.
+
+### Pin-free standard cache-original copy and owned-output abort
+
+The internal cache-scalar-copy attempt clones the standard named canonical
+heap/no-timestamp schema produced by actual ordinary and differential
+materialized JOIN. It acquires genuine incremental descriptor/storage readers;
+canonical sources with live alias borrowers remain readable. Source lifetime
+is still the caller's responsibility: these readers cannot substitute for an
+unpinned cache result's missing owner. No cache lookup, pin, statistic, victim
+transfer, insertion or public policy admission is added by this primitive.
+
+The held recipe reaches the existing metered operator constructor with the
+source's actual capacity, names/types and declared/graph fields. The private
+output has constructor-issued exclusive ownership until funded TAKE. Each
+physical 64-bit cell is copied directly, including FLOAT bit patterns and
+STRING codes; typed append is not used. Base rows and valid sorted/run
+metadata match raw governed deep copy, including unused run slots; invalid
+run metadata is normalized to zero. Fresh descriptor identity is independent.
+Only copied status/shape is queryable. A separate real128 grant transfers the
+completed output after source END. ACK rejects an untaken owned output.
+
+Late forward failure retains any created output at the original attempt
+address. Independently funded END releases actual source tokens, then abort
+lazily initializes the existing scalar-retirement owner with separate real256
+ZERO and BEGIN grants. ZERO clears the scalar receipt; BEGIN runs the actual
+managed initializer including its nested clear and all four token initializers.
+Their source inventories include both real bulk clears and caller work;
+existing primitive tariffs remain unchanged. Prepare, commit, physical and token/ledger
+retirement use actual cleanup funding, preserving the first semantic result.
+The wrapper pays192 in addition to inherited prepare/step charges. TAKE and
+ACK each require their own128, independent of the completed/stopped original.
+No raw deep-copy or raw destroy is hidden under a nominal fixed copy fee.
+
+Tests compare raw deep copy and literal metadata/cells for empty/nullary,
+wide257 and grown-capacity sources, native types, FLOAT raw bits, run metadata
+and live canonical aliases. Actual raw ordinary/differential materialized
+originals remain standard even when inputs carry timestamps, graph or SIDE
+compound metadata. Direct TS/compound inputs are explicitly outside this leaf,
+not evidence of completed natural cache policy. Cancellation/work exhaustion
+at forward phases, constructor allocation/admission/credit stops, partial
+reader drainage, insufficient cleanup grants, reentry/copy/thread misuse,
+output transfer and ACKed reuse exercise complete ownership recovery.
+
+Separate direct scalar-retirement controls keep caller-owned external CACHE
+debt through physical DONE, or exercise retained RELATION debt with no cache
+ledger. Unrelated CACHE/RELATION/TIMESTAMP canaries prove subsystem separation;
+this is physical-owner evidence and does not implement cache debt transfer.
+The later registered pin/exclusion/insertion owner and strict/cap/shared and
+general observed/configured-successor qualification are still required for
+the grouped PR's completion.
