@@ -4460,6 +4460,14 @@ int wl_columnar_relation_empty_source_step(
 int wl_columnar_relation_empty_source_end(
     wl_columnar_relation_empty_source_t *, wl_evaluation_control_t *, uint64_t,
     bool *);
+/* Private forced-empty clone from real HELD original metadata, live through
+ * return. Output slot is exclusive/disjoint and initially NULL. Fresh owned
+ * initialized physical width0; declared metadata supplies no lanes. Future
+ * graph declarations reject with raw new-like EINVAL. Construction polls the
+ * original attempt; retained source END uses separate actual funding. */
+int wl_columnar_relation_empty_source_new_like_operator_attempt_controlled(
+    wl_columnar_relation_empty_source_t *, const char *,
+    wl_columnar_memory_governor_ref_t *, col_rel_t **);
 #ifdef WL_SESSION_TEST_HOOKS
 extern void (*wl_columnar_relation_test_empty_source_checkpoint)(
     const wl_columnar_relation_empty_source_t *);

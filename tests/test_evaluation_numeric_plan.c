@@ -7162,9 +7162,167 @@ test_empty_filter_compiler_resources(void)
     }
 }
 
+static void
+test_forced_bare_selectors(void)
+{
+    for (unsigned composed = 0; composed < 2; ++composed)
+        for (unsigned selector = 0; selector < 3; ++selector)
+            for (unsigned state = 0; state < 3; ++state) {
+                fixture_t f; source_fixture(&f, 2, 0, 0);
+                if (state < 2) {
+                    col_rel_destroy(f.input); f.input = bare_source("input");
+                }
+                if (state) {
+                    f.input->has_graph_column = true;
+                    f.input->graph_col_idx = 1;
+                }
+                const wl_delta_mode_t modes[] = {WL_DELTA_FORCE_EMPTY,
+                                                 WL_DELTA_FORCE_DELTA,
+                                                 WL_DELTA_FORCE_EMPTY_AFTER_SEED};
+                f.session.delta_seeded = selector == 1;
+                wl_plan_op_t ops[] = {
+                    {.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                     .delta_mode = modes[selector]},
+                    {.op = WL_PLAN_OP_JOIN, .right_relation = "absent"}
+                };
+                wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+                col_rel_t *registry[] = {f.input};
+                wl_col_session_t raw = {0}; raw.rels = registry; raw.nrels = 1;
+                raw.delta_seeded = f.session.delta_seeded;
+                eval_stack_t raw_stack = {0};
+                int expected = col_op_variable(&ops[0], &raw_stack, &raw);
+                CHECK(expected == (state == 1 && selector < 2 ? EINVAL : 0));
+                if (composed) composed_begin(&f, &plan, registry, 1, 0);
+                else source_begin(&f, &plan, registry, 1);
+                if (!expected) {
+                    if (composed) {
+                        composed_until_phase(&f,
+                            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_INSTALL);
+                        composed_action(&f);
+                    } else {
+                        until_phase(&f,
+                            WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_INSTALL);
+                        engine_dispatch(&f); ++f.witnesses;
+                    }
+                    eval_stack_t *stack =
+                        wl_columnar_eval_stack_cleanup_stack(f.frame);
+                    CHECK(stack->top == 1 && raw_stack.top == 1);
+                    const eval_entry_t *entry = &stack->items[0];
+                    same_relation(entry->rel, raw_stack.items[0].rel);
+                    CHECK(entry->owned == (selector < 2)
+                        && entry->is_delta == (selector == 1));
+                    if (selector < 2) CHECK(entry->rel != f.input
+                            && entry->rel->schema_ok &&
+                            entry->rel->schema.release);
+                    else CHECK(entry->rel == f.input);
+                    if (state < 2) CHECK(!f.input->schema_ok &&
+                            !f.input->schema.release
+                            && !f.input->ncols && f.input->declared_ncols == 2
+                            && !f.record.source_initialized &&
+                            !f.record.source_bare
+                            && f.record.source_empty_reader.phase ==
+                            WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED);
+                }
+                CHECK(!eval_stack_drain(&raw_stack));
+                session_rel_free_hash(&raw);
+                if (composed) {
+                    composed_run(&f);
+                    CHECK(f.record.semantic_result == expected);
+                    composed_close(&f);
+                } else {
+                    run(&f); CHECK(f.record.semantic_result == expected);
+                    fixture_close(&f);
+                }
+            }
+}
+
+static bool forced_constructor_stopped, forced_constructor_work;
+static void
+forced_constructor_stop(wl_evaluation_control_t *control, unsigned phase)
+{
+    if (forced_constructor_stopped || phase) return;
+    forced_constructor_stopped = true;
+    if (forced_constructor_work) CHECK(wl_evaluation_control_charge(control,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
+static void
+test_forced_bare_failures(void)
+{
+    for (unsigned composed = 0; composed < 2; ++composed)
+        for (unsigned fault = 0; fault < 5; ++fault) {
+            fixture_t f; source_fixture(&f, 2, 0, fault == 3 ? 1000000 : 0);
+            col_rel_destroy(f.input); f.input = bare_source("input");
+            wl_columnar_memory_governor_ref_t *ref = f.input->memory_governor;
+            wl_columnar_memory_governor_ref_retain(ref);
+            wl_columnar_memory_governor_t *gov =
+                wl_columnar_memory_governor_ref_get(ref);
+            col_relation_snapshot_t snapshot =
+                wl_columnar_relation_snapshot(f.input);
+            wl_plan_op_t ops[] = {
+                {.op = WL_PLAN_OP_VARIABLE, .relation_name = "input",
+                 .delta_mode = WL_DELTA_FORCE_EMPTY},
+                {.op = WL_PLAN_OP_JOIN, .right_relation = "absent"}
+            };
+            wl_plan_relation_t plan = {.ops = ops, .op_count = 2};
+            col_rel_t *registry[] = {f.input};
+            if (composed) {
+                composed_begin(&f, &plan, registry, 1, 0);
+                composed_until_phase(&f,
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_NEW);
+            } else {
+                source_begin(&f, &plan, registry, 1);
+                until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_NEW);
+            }
+            CHECK(f.record.source_bare && f.record.source_initialized);
+            wl_columnar_memory_reservation_t peer;
+            wl_columnar_memory_reservation_init(&peer);
+            uint64_t baseline = wl_columnar_memory_reserved(gov);
+            if (fault ==
+                0) wl_columnar_relation_test_constructor_fail_allocation = 1;
+            if (fault == 1) CHECK(wl_columnar_memory_reserve(gov,
+                    (1u<<20)-baseline-1, &peer));
+            forced_constructor_stopped = false;
+            forced_constructor_work = fault == 3;
+            if (fault == 2 || fault == 3)
+                wl_columnar_relation_test_constructor_committed =
+                    forced_constructor_stop;
+            if (fault == 4) {
+                if (composed) composed_until_phase(&f,
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_SOURCE_END);
+                else until_phase(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_SOURCE_END);
+                CHECK(f.record.source_output && *f.record.source_output);
+                wl_evaluation_control_request_cancel(f.operation);
+            }
+            if (composed) composed_run(&f); else run(&f);
+            wl_columnar_relation_test_constructor_committed = NULL;
+            wl_columnar_relation_test_constructor_fail_allocation = 0;
+            const int errors[] = {ENOMEM, ENOSPC,
+                                  WL_EVALUATION_CONTROL_CANCELLED,
+                                  WL_EVALUATION_CONTROL_WORK_LIMIT,
+                                  WL_EVALUATION_CONTROL_CANCELLED};
+            CHECK(f.record.semantic_result == errors[fault]
+                && !f.record.source_installed && !f.record.source_initialized
+                && !f.record.source_bare
+                && f.record.source_empty_reader.phase ==
+                WL_COLUMNAR_RELATION_EMPTY_SOURCE_DRAINED
+                && !wl_columnar_eval_stack_cleanup_stack(f.frame)->top);
+            CHECK(f.session.memory_budget_denied == (fault == 1));
+            if (fault == 2 || fault == 3) CHECK(forced_constructor_stopped);
+            CHECK(wl_columnar_relation_snapshot_equal(snapshot,
+                wl_columnar_relation_snapshot(f.input)));
+            if (fault == 1) CHECK(wl_columnar_memory_rollback(&peer));
+            if (composed) composed_close(&f); else fixture_close(&f);
+            CHECK(!wl_columnar_memory_reserved(gov));
+            wl_columnar_memory_governor_ref_release(ref);
+        }
+}
+
 int
 main(void)
 {
+    test_forced_bare_selectors(); test_forced_bare_failures();
     test_empty_right_filter_setup(); test_empty_filter_compiler_resources();
     test_bare_source_borrow(); test_bare_ordinary_join();
     test_bare_source_cleanup_funding();

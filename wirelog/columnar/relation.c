@@ -16987,6 +16987,33 @@ wl_columnar_relation_scalar_source_new_like_attempt_controlled(
     return rc;
 }
 
+/* Shared private builder suffix; existing scalar fees/hooks remain exact. */
+static int
+wl_columnar_relation_source_like_operator_build(const char *name,
+    uint32_t width, bool ts, wl_columnar_memory_governor_ref_t *governor,
+    const wl_columnar_relation_constructor_recipe_t *recipe, col_rel_t **out,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    col_rel_t *local = NULL;
+    int rc;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_relation_constructor_attempt_build_operator(name,
+            width,
+            COL_REL_INIT_CAP, ts, governor, recipe, &local, control, id);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
+    if (!rc) *out = local;
+    else if (local && col_rel_destroy_checked(local) != 0) abort();
+    return rc;
+}
+
 /* Original held source pair is reused; only the private builder differs.
  * Output remains lexical/private until install and checked publication. */
 int
@@ -17021,26 +17048,51 @@ wl_columnar_relation_scalar_source_new_like_operator_attempt_controlled(
     recipe.view_generation = 2u + (source->types != NULL);
     bool ts = source->preserve_timestamps && source->timestamps;
     recipe.storage_generation = 1u + ts;
-    col_rel_t *local = NULL;
     rc = wl_columnar_relation_constructor_attempt_tail(control, id,
             WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
     if (rc) return rc;
+    return wl_columnar_relation_source_like_operator_build(name, source->width,
+               ts, governor, &recipe, out, control, id);
+}
+
+/* This sibling authorizes a recipe from the actual empty lease, never from a
+* fabricated scalar HELD. Normal borrowing does not call this constructor. */
+int
+wl_columnar_relation_empty_source_new_like_operator_attempt_controlled(
+    wl_columnar_relation_empty_source_t *source, const char *name,
+    wl_columnar_memory_governor_ref_t *governor, col_rel_t **out)
+{
+    if (!source || source->identity != source || !name || !out || *out
+        || source->phase != WL_COLUMNAR_RELATION_EMPTY_SOURCE_HELD
+        || source->ending) return EINVAL;
+    bool held = false;
+    int rc = wl_columnar_relation_empty_source_step(source, &held);
+    if (rc || !held) return rc ? rc : EBUSY;
+    wl_evaluation_control_t *control = source->control;
+    uint64_t id = source->attempt_id;
     rc = wl_columnar_relation_constructor_attempt_charge(control, id,
-            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
     if (rc) return rc;
+    /* Raw new-like cannot clone a future graph lane at physical width0. */
+    bool valid = !source->has_graph_column;
     rc = wl_columnar_relation_constructor_attempt_tail(control, id,
-            WL_COLUMNAR_RELATION_SCALAR_SOURCE_BUILD_CALL_WORK);
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_LIKE_WORK);
     if (rc) return rc;
-    rc = wl_columnar_relation_constructor_attempt_build_operator(name,
-            source->width,
-            COL_REL_INIT_CAP, ts, governor, &recipe, &local, control, id);
-    if (!rc) rc = wl_columnar_relation_constructor_attempt_charge(control, id,
-                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
-    if (!rc) rc = wl_columnar_relation_constructor_attempt_tail(control, id,
-                WL_COLUMNAR_RELATION_SCALAR_SOURCE_EXTERNAL_WORK);
-    if (!rc) *out = local;
-    else if (local && col_rel_destroy_checked(local) != 0) abort();
-    return rc;
+    if (!valid) return EINVAL;
+    rc = wl_columnar_relation_constructor_attempt_charge(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    wl_columnar_relation_constructor_recipe_t recipe = {
+        .names = NULL, .types = NULL, .type_codes = NULL,
+        .has_graph_column = false, .graph_col_idx = source->graph_col_idx,
+        .declared_ncols = source->declared_ncols,
+        .view_generation = 2, .storage_generation = 1
+    };
+    rc = wl_columnar_relation_constructor_attempt_tail(control, id,
+            WL_COLUMNAR_RELATION_SCALAR_SOURCE_RECIPE_WORK);
+    if (rc) return rc;
+    return wl_columnar_relation_source_like_operator_build(name, 0, false,
+               governor, &recipe, out, control, id);
 }
 
 /* Additive operator byte/row path: explicit twins keep legacy B1/B2 source,
