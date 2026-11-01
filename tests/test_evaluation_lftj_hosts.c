@@ -337,6 +337,33 @@ head_capture(wl_session_t *base)
 }
 
 static void
+head_schema_equal(const fixture_t *f)
+{
+    const col_rel_t *actual = session_find_rel((wl_col_session_t *)f->session,
+            "output");
+    const col_rel_t *raw = session_find_rel((wl_col_session_t *)f->raw,
+            "output");
+    CHECK(actual && raw && actual->ncols == 4 && raw->ncols == 4
+        && actual->schema_ok && raw->schema_ok
+        && actual->declared_ncols == raw->declared_ncols
+        && actual->has_graph_column == raw->has_graph_column
+        && actual->graph_col_idx == raw->graph_col_idx
+        && actual->column_types && raw->column_types
+        && actual->schema.n_children == raw->schema.n_children);
+    for (unsigned c = 0; c < 4; ++c) {
+        char name[16]; snprintf(name, sizeof(name), "col%u", c);
+        wirelog_column_type_t expected = !c &&
+            f->floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+        CHECK(!strcmp(actual->col_names[c], name) && !strcmp(raw->col_names[c],
+            name)
+            && actual->column_types[c] == expected &&
+            raw->column_types[c] == expected
+            && !strcmp(actual->schema.children[c]->format,
+            raw->schema.children[c]->format));
+    }
+}
+
+static void
 test_session_domains(void)
 {
     for (unsigned wide = 0; wide < 2; ++wide)
@@ -367,6 +394,7 @@ test_session_domains(void)
                         if (snapshot) equal(&captured, &expected);
                         if (observed) equal(&f.events, &expected);
                         CHECK(!finish_step(f.raw));
+                        head_schema_equal(&f);
                         actual = head_capture(f.raw);
                         equal(&actual, &expected);
                         CHECK(!((wl_col_session_t *)f.session)->sarr_count);
@@ -461,6 +489,9 @@ stop_checkpoint(wl_evaluation_control_t *control,
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_COPY
         && (!a->inputs || !a->inputs[0].copy_cell)) return;
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_SCHEMA && !a->fill_col) return;
+    if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN)
+        CHECK(a->output && a->output_owned && !a->output->column_types
+            && !a->output->timestamps && !a->registered);
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_SORT
         && !a->inputs[0].sort_run && !a->inputs[0].sort_copying) return;
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_JOIN
@@ -483,6 +514,7 @@ test_stops(void)
         WL_COLUMNAR_LFTJ_ATTEMPT_SCHEMA, WL_COLUMNAR_LFTJ_ATTEMPT_COPY,
         WL_COLUMNAR_LFTJ_ATTEMPT_SORT, WL_COLUMNAR_LFTJ_ATTEMPT_JOIN,
         WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_CREATE,
+        WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_BEGIN,
         WL_COLUMNAR_LFTJ_ATTEMPT_OUTPUT_END,
         WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
     };
@@ -671,6 +703,19 @@ test_private_authority(void)
     fixture_destroy(&f);
 }
 
+static bool failure_credit_hit;
+static void
+fail_output_credit(wl_evaluation_control_t *control, unsigned phase)
+{
+    if (!failure_hit || failure_credit_hit || phase) return;
+    CHECK(stopping && control == stopping->control && failure_kind >= 3);
+    failure_credit_hit = true;
+    if (failure_kind == 4)
+        CHECK(wl_evaluation_control_charge(control,
+            UINT64_MAX) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(control);
+}
+
 static void
 fail_output(wl_evaluation_control_t *control,
     const wl_columnar_lftj_attempt_t *a)
@@ -686,32 +731,51 @@ fail_output(wl_evaluation_control_t *control,
                 memory_order_acquire) - wl_columnar_memory_reserved(g);
         CHECK(wl_columnar_memory_reserve_checked(g, available, &peer)
             == WL_COLUMNAR_MEMORY_ADMISSION_OK);
-    } else wl_columnar_relation_test_constructor_fail_allocation = 1;
+    } else if (failure_kind == 0 || failure_kind == 2)
+        wl_columnar_relation_test_constructor_fail_allocation = 1;
     if (failure_kind == 2) wl_evaluation_control_request_cancel(control);
 }
 
 static void
 test_output_failures(void)
 {
-    for (unsigned kind = 0; kind < 3; ++kind) {
+    for (unsigned kind = 0; kind < 5; ++kind) {
         fixture_t f;
         fixture_init(&f, true, false, true, true, false);
+        if (kind == 4) CHECK(!wl_evaluation_control_configure(f.control,
+                UINT64_C(1000000000)));
+        source_image_t before[3];
+        for (unsigned s = 0; s < 3; ++s) before[s] = image(f.session, s);
         uint64_t reserved = wl_columnar_memory_reserved(
             wl_columnar_memory_governor_ref_get(f.governor));
         wl_columnar_memory_reservation_init(&peer);
-        stopping = &f; failure_kind = kind; failure_hit = false;
+        stopping = &f; failure_kind = kind;
+        failure_hit = failure_credit_hit = false;
         wl_columnar_lftj_test_attempt_checkpoint = fail_output;
+        wl_columnar_relation_test_constructor_committed = kind >=
+            3 ? fail_output_credit : NULL;
         int rc = finish_step(f.session);
         wl_columnar_lftj_test_attempt_checkpoint = NULL; stopping = NULL;
+        wl_columnar_relation_test_constructor_committed = NULL;
         wl_columnar_relation_test_constructor_fail_allocation = 0;
         if (peer.governor) CHECK(wl_columnar_memory_rollback(&peer));
         CHECK(failure_hit && rc == (kind == 0 ? ENOMEM : kind == 1 ? ENOSPC
-            : WL_EVALUATION_CONTROL_CANCELLED));
+            : kind ==
+            4 ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED));
+        CHECK(failure_credit_hit == (kind >= 3));
+        for (unsigned s = 0; s < 3;
+            ++s) unchanged(f.session, s, &before[s], true);
         CHECK(!f.events.count &&
             !session_find_rel((wl_col_session_t *)f.session,
             "output"));
-        CHECK(wl_columnar_memory_reserved(
-                wl_columnar_memory_governor_ref_get(f.governor)) == reserved);
+        uint64_t after_reserved = wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(f.governor));
+        CHECK(kind == 4 ? after_reserved >= reserved : after_reserved ==
+            reserved);
+        if (after_reserved > reserved)
+            CHECK(wl_session_insert(f.session, "a", f.data[0], 1,
+                f.widths[0]) == EBUSY);
         CHECK(!wl_evaluation_control_reset(f.control));
         CHECK(!finish_step(f.session));
         capture_t expected = oracle(&f), actual = head_capture(f.session);
