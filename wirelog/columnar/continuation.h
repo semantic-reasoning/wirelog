@@ -13,6 +13,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Exact opaque descriptor allocation for an external governed owner. */
+uint64_t wl_columnar_continuation_allocation_bytes(void);
+
 typedef enum {
     WL_COLUMNAR_CONTINUATION_OK = 0,
     WL_COLUMNAR_CONTINUATION_DONE,

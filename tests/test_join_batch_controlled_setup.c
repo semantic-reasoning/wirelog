@@ -1,5 +1,6 @@
 /* Controlled typed/stamped scratch prerequisite for session JOIN batches. */
 #include "../wirelog/columnar/internal.h"
+#include "../wirelog/columnar/join_batch.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -256,10 +257,274 @@ test_failures(void)
     fixture_end(&f, 0);
 }
 
+static unsigned prepare_stop_phase;
+static bool prepare_work_stop;
+static unsigned prepare_denial_phase;
+static wl_columnar_memory_reservation_t *prepare_peer;
+
+static void
+prepare_stop(const wl_columnar_join_batch_prepare_t *a)
+{
+    if (a->phase == prepare_denial_phase && !prepare_peer->governor) {
+        uint64_t available = 16u * 1024u * 1024u
+            - wl_columnar_memory_reserved(
+            wl_columnar_memory_governor_ref_get(a->governor));
+        CHECK(available > 1 && wl_columnar_memory_reserve(
+                wl_columnar_memory_governor_ref_get(a->governor), available - 1,
+                prepare_peer));
+    }
+    if (a->phase != prepare_stop_phase) return;
+    if (prepare_work_stop)
+        CHECK(wl_evaluation_control_charge_attempt(a->control, a->attempt_id,
+            UINT64_C(1000000000)) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(a->control);
+}
+
+static col_rel_t *
+prepare_source(fixture_t *f, const char *name, uint32_t width, bool stamped,
+    bool floating, bool right)
+{
+    col_rel_t *rel = NULL;
+    CHECK(!wl_columnar_relation_new_auto_governed(name, width, 3, stamped,
+        f->governor, &rel));
+    wirelog_column_type_t *types = malloc((size_t)width * sizeof(*types));
+    int64_t *values = malloc((size_t)width * sizeof(*values));
+    CHECK(types && values);
+    for (uint32_t c = 0; c < width; ++c)
+        types[c] = c == 0 && floating ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+    CHECK(!col_rel_set_column_types(rel, types, width));
+    for (uint32_t row = 0; row < 3; ++row) {
+        int64_t key = right ? (row < 2 ? 1 : 3) : (row == 1 ? 2 : 1);
+        for (uint32_t c = 0; c < width; ++c)
+            values[c] = c == 0 ? floating
+                ? wl_columnar_float_to_bits((double)(key - 1)) : key
+                : (int64_t)c + key * 10;
+        CHECK(!col_rel_append_row(rel, values));
+        if (stamped) rel->timestamps[row] = (col_delta_timestamp_t){
+                .iteration = row + 7, .stratum = 3, .worker = 9,
+                .multiplicity = -2
+            };
+    }
+    free(types); free(values);
+    return rel;
+}
+
+static void
+prepare_drain(wl_columnar_join_batch_prepare_t *a)
+{
+    int owner;
+    wl_evaluation_control_t *funding = NULL;
+    CHECK(!wl_evaluation_control_create(0, &funding));
+    CHECK(!wl_evaluation_control_attach(funding, &owner));
+    CHECK(!wl_evaluation_control_begin(funding, &owner));
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    bool done = false;
+    CHECK(wl_columnar_join_batch_prepare_abort_step(a, funding, id + 1,
+        &done) == EINVAL && !done && !a->aborting);
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 100000);
+        CHECK(!wl_columnar_join_batch_prepare_abort_step(a, funding, id,
+            &done));
+    }
+    CHECK(a->drained && !a->producer && !a->continuation
+        && !a->left_reader.owner && !a->right_reader.owner);
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+}
+
+static wl_columnar_continuation_status_t
+unexpected_batch(void *context, const wl_columnar_continuation_batch_t *batch)
+{
+    (void)context; (void)batch; abort();
+}
+
+static wl_columnar_continuation_status_t
+unexpected_reserve(void *context, uint64_t bytes, uint32_t rows)
+{
+    (void)context; (void)bytes; (void)rows; abort();
+}
+
+static wl_columnar_continuation_status_t
+unexpected_commit(void *context, bool *committed)
+{
+    (void)context; (void)committed; abort();
+}
+
+static void
+unexpected_abort(void *context)
+{
+    (void)context; abort();
+}
+
+/* The input has four literal equal-key pairs. Check every payload lane,
+ * native and general producers, real private tagged heads and one-row batches.
+ * No raw constructor or persistent arrangement is used for preparation. */
+static void
+test_prepared_primary(unsigned shape, bool stamped, unsigned stop,
+    bool work_stop, uint32_t fail_allocation)
+{
+    fixture_t f; fixture_begin(&f, 16u * 1024u * 1024u,
+        work_stop ? UINT64_C(1000000000) : 0);
+    uint32_t left_width = shape == 3 ? 128 : shape == 1 ? 2 : 1;
+    uint32_t right_width = shape == 3 ? 129 : shape == 1 ? 2 : 1;
+    bool floating = shape == 2;
+    col_rel_t *left = prepare_source(&f, "left", left_width, stamped, floating,
+            false);
+    col_rel_t *right = prepare_source(&f, "right", right_width, false, floating,
+            true);
+    if (shape == 4) {
+        right->nrows = 0; wl_columnar_relation_touch_view(right);
+    }
+    if (shape == 5) {
+        left->nrows = 0; wl_columnar_relation_touch_view(left);
+    }
+    uint64_t baseline = reserved(&f);
+    col_relation_snapshot_t left_snapshot = wl_columnar_relation_snapshot(left);
+    col_relation_snapshot_t right_snapshot =
+        wl_columnar_relation_snapshot(right);
+    wl_col_session_t session = {0};
+    wl_mem_ledger_init(&session.mem_ledger, 0);
+    session.memory_governor = f.governor;
+    session.base.evaluation_control = f.control;
+    uint32_t keys[] = {0, 1};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN, .right_relation = "right"};
+    uint32_t kc = shape == 1 ? 2 : 1;
+    op.key_count = kc;
+    wl_columnar_join_batch_prepare_t a = {0};
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer); prepare_peer = &peer;
+    uint64_t bytes = ((uint64_t)left_width + right_width) * sizeof(int64_t)
+        + (stamped ? sizeof(col_delta_timestamp_t) : 0);
+    CHECK(!wl_columnar_join_batch_prepare_begin(&a, &session, &op, left, right,
+        stamped, keys, keys, kc, bytes, f.control, f.id));
+    bool invalid_done = true;
+    CHECK(wl_columnar_join_batch_prepare_step(&a, 0, &invalid_done) == EINVAL
+        && !invalid_done && !a.result);
+    CHECK(wl_columnar_join_batch_prepare_step(&a, 257, &invalid_done) == EINVAL
+        && !invalid_done && !a.result);
+    prepare_stop_phase = stop; prepare_work_stop = work_stop;
+    wl_columnar_join_batch_test_prepare_checkpoint = stop ||
+        prepare_denial_phase
+        ? prepare_stop : NULL;
+    wl_columnar_join_batch_test_prepare_fail_allocation = fail_allocation;
+    bool done = false;
+    int rc = 0;
+    for (unsigned turn = 0; !done && !rc; ++turn) {
+        CHECK(turn < 100000);
+        rc = wl_columnar_join_batch_prepare_step(&a, 1, &done);
+    }
+    wl_columnar_join_batch_test_prepare_checkpoint = NULL;
+    if (stop) CHECK(rc == (work_stop ? WL_EVALUATION_CONTROL_WORK_LIMIT
+                                  : WL_EVALUATION_CONTROL_CANCELLED));
+    else if (fail_allocation) CHECK(rc == ENOMEM);
+    else if (prepare_denial_phase) CHECK(rc == ENOSPC &&
+            session.memory_budget_denied);
+    else CHECK(!rc && done && a.ready && a.continuation);
+    wl_columnar_join_batch_test_prepare_fail_allocation = 0;
+    CHECK(!session.arr_count && !session.arr_entries);
+    if (!rc) {
+        wl_columnar_continuation_sink_t sink = {
+            .begin = unexpected_batch, .reserve = unexpected_reserve,
+            .append = unexpected_batch, .commit = unexpected_commit,
+            .abort = unexpected_abort
+        };
+        CHECK(wl_columnar_continuation_publish(a.continuation, &sink)
+            == WL_COLUMNAR_CONTINUATION_INVALID);
+        CHECK(a.left_reader.identity == (uintptr_t)&a.left_reader
+            && a.right_reader.identity == (uintptr_t)&a.right_reader);
+        CHECK(col_join_batch_control_discard(&a.continuation) == EBUSY
+            && a.continuation);
+        int64_t *values = calloc(left_width, sizeof(*values)); CHECK(values);
+        CHECK(col_rel_append_row(left, values) == EBUSY); free(values);
+        CHECK(a.arrangement.generation == 1
+            && a.arrangement.indexed_rows == right->nrows
+            && a.arrangement.ht_cap == right->nrows);
+        if (right->nrows)
+            CHECK(a.arrangement.ht_next[1] == 0
+                && a.arrangement.ht_next[0] == UINT32_MAX);
+        uint32_t rows = 0, batches = 0;
+        for (unsigned turn = 0; ; ++turn) {
+            CHECK(turn < 100000);
+            col_join_batch_control_result_t result;
+            col_join_batch_control_status_t status =
+                col_join_batch_control_step(
+                a.continuation, 256, &result);
+            if (status == COL_JOIN_BATCH_CONTROL_DONE) break;
+            if (status == COL_JOIN_BATCH_CONTROL_PROGRESS) continue;
+            CHECK(status == COL_JOIN_BATCH_CONTROL_BATCH_READY);
+            const col_rel_t *batch = NULL; uint64_t generation = 0;
+            CHECK(!col_join_batch_control_peek(a.continuation, &batch,
+                &generation));
+            CHECK(batch && batch->nrows == 1 && generation == ++batches);
+            for (uint32_t c = 0; c < batch->ncols; ++c) {
+                uint32_t src = c < left_width ? c : c - left_width;
+                int64_t expected = src ? (int64_t)src + 10
+                    : floating ? wl_columnar_float_to_bits(0) : 1;
+                CHECK(batch->columns[c][0] == expected);
+            }
+            if (stamped) {
+                CHECK(batch->timestamps && !batch->timestamps[0].iteration
+                    && !batch->timestamps[0].stratum &&
+                    !batch->timestamps[0].worker
+                    && !batch->timestamps[0]._reserved
+                    && !batch->timestamps[0].multiplicity);
+            }
+            ++rows;
+            CHECK(!col_join_batch_control_precommit(a.continuation,
+                generation));
+            CHECK(!col_join_batch_control_ack(a.continuation, generation));
+        }
+        CHECK(rows == (shape >= 4 ? 0u : 4u) && batches == rows);
+    }
+    CHECK(wl_evaluation_control_finish(f.control, &f.owner, rc, 0) == rc);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(f.control, &before));
+    prepare_drain(&a);
+    CHECK(!wl_evaluation_control_report(f.control, &after)
+        && before.attempt_id == after.attempt_id
+        && before.consumed == after.consumed && before.result == after.result
+        && before.stop_reason == after.stop_reason && !after.cleanup_status);
+    CHECK(reserved(&f) == baseline + peer.bytes && !session.arr_count);
+    if (peer.governor) CHECK(wl_columnar_memory_rollback(&peer));
+    CHECK(reserved(&f) == baseline); prepare_peer = NULL;
+    CHECK(wl_columnar_relation_snapshot_equal(left_snapshot,
+        wl_columnar_relation_snapshot(left)));
+    CHECK(wl_columnar_relation_snapshot_equal(right_snapshot,
+        wl_columnar_relation_snapshot(right)));
+    if (stamped)
+        for (uint32_t r = 0; r < 3; ++r)
+            CHECK(left->timestamps[r].iteration == r + 7
+                && left->timestamps[r].multiplicity == -2);
+    CHECK(!col_rel_destroy_checked(left) && !col_rel_destroy_checked(right));
+    fixture_end(&f, rc);
+}
+
+static void
+test_preparation(void)
+{
+    for (unsigned shape = 0; shape < 6; ++shape)
+        for (unsigned stamped = 0; stamped < 2; ++stamped)
+            test_prepared_primary(shape, stamped, 0, false, 0);
+    /* Every actual setup phase is observed before cancellation/work denial. */
+    for (unsigned phase = 1; phase <= 13; ++phase)
+        for (unsigned work = 0; work < 2; ++work)
+            test_prepared_primary(3, true, phase, work, 0);
+    for (uint32_t allocation = 1; allocation <= 7; ++allocation)
+        test_prepared_primary(1, true, 0, false, allocation);
+    const unsigned denial_phases[] = {1, 7, 11, 12};
+    for (unsigned i = 0; i < 4; ++i) {
+        prepare_denial_phase = denial_phases[i];
+        test_prepared_primary(3, true, 0, false, 0);
+    }
+    prepare_denial_phase = 0;
+}
+
 int
 main(void)
 {
     test_domains();
     test_failures();
+    test_preparation();
     return 0;
 }
