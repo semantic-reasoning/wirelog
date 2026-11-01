@@ -753,3 +753,60 @@ passing. The physical-width hint selects this fallback only; the standalone
 reader supplies authority. LFTJ first-pass error order and the remaining
 strict/cache/cap/shared/observed/successor policies remain separate units in
 this grouped PR.
+
+### LFTJ source-by-source sizing and error order (#2298)
+
+LFTJ now completes each actual source lookup, incremental combined reader
+acquisition and raw key/checked-size preflight before looking up the next
+source. The raw fixed per-input sizing terms and row/width byte additions use
+an independent semantic accumulator; they are not a fictitious reservation for
+raw workspace. Type/shape compatibility waits until every input passes that
+first pass. Genuine HELD readers are reused, with native token, descriptor and
+canonical-owner gates and captured source generation revalidated; acquisition
+is never repeated as a held-state query. Cleanup high-water includes a slot
+before its first descriptor acquisition, and HELD clears only on actual final
+funded release. Partial descriptor owners remain discoverable on every stop.
+
+Original reader acquisition retains ACTION72. Each subsequent fixed protected
+validation plus one arithmetic step, or one type/shape postcheck, uses a named
+SOURCE_CHECK192 region; the raw fixed sizing prefix uses8. No new dynamic scan
+or width/row loop is hidden under these fixed regions. Signature/name lookup
+and existing copy/sort/seek/output work remain independently metered. The
+source-order correction does not alter raw LFTJ strict/local/shared policies.
+
+An actual pre-fix internal composed fixture returned raw EINVAL versus
+controlled ENOENT for bare input0 followed by missing input1. New comparisons
+cover both missing/key orders and earlier type mismatch versus later missing
+or invalid key, with a postcheck witness distinguishing equal EINVAL paths.
+INT64 empty output comparisons use effective NULL=>INT64 type semantics;
+existing tests that require physical type-array presence remain unchanged.
+FLOAT/STRING empty and graph cases additionally prove actual private source
+preparation, separately from natural typed final-head session controls.
+Checked arithmetic edge tests use real helpers, not forged enormous buffers.
+
+Ten deterministic stops cover descriptor-only acquisition, genuine combined
+HELD, every raw arithmetic stage, the next input and postcheck. Tests check
+exact accumulator progression, cleanup high-water, unchanged source snapshots,
+mutation EBUSY while held, short independent dispatcher refusal, fresh funded
+drainage and successful insertion after ACK. Existing copy/sort/seek/output,
+private-shadow and natural nonempty typed controls continue to run.
+
+A separate schema-context defect was exposed during this qualification: raw
+LFTJ constructs default-INT64 intermediate output while the private controlled
+output carries captured FLOAT/STRING types. A real admitted internal composed
+FLOAT-empty LFTJ followed by FLOAT JOIN returns raw EINVAL versus controlled
+success. This is not normalized away as nullable INT64 representation. A
+separate causal schema/consumer correction and full continuation evidence are
+required next in this same PR before publication or issue closure. The strict,
+cache, cap/shared accounting and observed/successor policies also remain open.
+
+Framed reader-contention and partial-abort fixtures now wait on the actual
+RESOLVE/SOURCE_READER phase. They retain real descriptor/storage writer denial,
+combined-reader transition and pending cleanup assertions. Duplicate input0
+still rejects with its writer held before acquisition; a later duplicate now
+explicitly observes the earlier combined reader and checks full drainage on
+ENOTSUP, rather than holding an artificial writer forever before that lookup.
+The raw reference's actual sorted-arrangement cache is released through its
+normal API before referenced sources are destroyed. The first failed expanded
+validation (that test wait assumption and a raw-fixture sorted-cache leak) is
+preserved separately and does not approve this corrected candidate.

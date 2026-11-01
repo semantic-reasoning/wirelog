@@ -7624,6 +7624,182 @@ anti_reentry_committed(const eval_entry_t *retired, const eval_entry_t *entry)
         wl_evaluation_control_request_cancel(anti_reentry_fixture->operation);
 }
 
+static bool lftj_order_postcheck;
+static void
+lftj_order_checkpoint(wl_evaluation_control_t *control,
+    const wl_columnar_lftj_attempt_t *a)
+{
+    (void)control;
+    if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE)
+        lftj_order_postcheck = true;
+}
+
+/* Internal composed fixtures: the raw sizing pass precedes all type checks.
+ * No fabricated large descriptors are used to provoke arithmetic overflow. */
+static void
+test_lftj_source_order(void)
+{
+    uint64_t checked;
+    CHECK(!wl_columnar_memory_size_mul(UINT64_MAX, 2, &checked));
+    CHECK(!wl_columnar_memory_size_add(UINT64_MAX, 1, &checked));
+    CHECK(wl_columnar_memory_size_mul(UINT64_MAX/8, 8, &checked)
+        && checked == UINT64_MAX-7);
+    for (unsigned mode = 0; mode < 11; ++mode) {
+        fixture_t f;
+        col_rel_t *relations[3];
+        char *names[] = {"a", "b", "c"}; uint32_t keys[] = {0, 0, 0};
+        for (unsigned i = 0; i < 3; ++i) {
+            relations[i] = source_new(1, 0);
+            CHECK(!wl_columnar_relation_rename_checked(relations[i], names[i]));
+        }
+        if (mode < 2) {
+            col_rel_destroy(relations[0]); relations[0] = bare_source("a");
+            if (!mode) names[1] = "missing";
+            else {
+                names[0] = "missing"; names[1] = "a";
+            }
+        }
+        if (mode == 2) {
+            keys[1] = 1; names[2] = "missing";
+        }
+        if (mode == 3) {
+            names[1] = "missing"; keys[2] = 1;
+        }
+        if (mode >= 4 && mode <= 6) {
+            wirelog_column_type_t type = WIRELOG_TYPE_FLOAT;
+            CHECK(!col_rel_set_column_types(relations[1], &type, 1));
+            if (mode == 4) names[2] = "missing";
+            if (mode == 5) keys[2] = 1;
+        }
+        if (mode >= 7) for (unsigned i = 0; i < 3; ++i) {
+                wirelog_column_type_t type = mode == 8 ? WIRELOG_TYPE_FLOAT
+                : mode == 9 ? WIRELOG_TYPE_STRING : WIRELOG_TYPE_INT64;
+                CHECK(!col_rel_set_column_types(relations[i], &type, 1));
+                if (mode == 10) {
+                    relations[i]->has_graph_column = true;
+                    relations[i]->graph_col_idx = 0;
+                }
+            }
+        wl_plan_op_lftj_t metadata = {.k = 3, .rel_names = names,
+                                      .key_cols = keys};
+        wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata};
+        wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+        wl_col_session_t raw = {0}; raw.rels = relations; raw.nrels = 3;
+        eval_stack_t expected = {0};
+        int raw_rc = col_op_lftj(&op, &expected, &raw);
+        int error = mode >= 7 ? 0 : mode == 1 || mode == 3 ||
+            mode == 4 ? ENOENT : EINVAL;
+        CHECK(raw_rc == error);
+        composed_fixture(&f, source_new(1, 0), 0);
+        f.session.base.evaluation_control = f.operation;
+        f.session.rels = relations; f.session.nrels = 3; f.session.rel_cap = 3;
+        CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(&f.record,
+            &body, 0, 1, f.frame, &f.session, 0, f.operation, f.operation_id,
+            f.funding, f.funding_id));
+        lftj_order_postcheck = false;
+        wl_columnar_lftj_test_attempt_checkpoint = lftj_order_checkpoint;
+        composed_run(&f);
+        wl_columnar_lftj_test_attempt_checkpoint = NULL;
+        CHECK(f.record.semantic_result == raw_rc
+            && lftj_order_postcheck == (mode >= 6));
+        eval_stack_t *actual = wl_columnar_eval_stack_cleanup_stack(f.frame);
+        CHECK(actual->top == expected.top);
+        if (!error) {
+            col_rel_t *out = actual->items[0].rel,
+                *reference = expected.items[0].rel;
+            CHECK(out->ncols == reference->ncols && !out->nrows &&
+                !reference->nrows
+                && actual->items[0].owned && !actual->items[0].is_delta
+                && !out->timestamps && !reference->timestamps
+                && out->declared_ncols == reference->declared_ncols
+                && out->has_graph_column == reference->has_graph_column
+                && out->graph_col_idx == reference->graph_col_idx
+                && out->sorted_nrows == reference->sorted_nrows
+                && out->run_count == reference->run_count);
+            for (uint32_t c = 0; c < out->ncols; ++c) {
+                CHECK(!strcmp(out->col_names[c], reference->col_names[c]));
+                wirelog_column_type_t effective = out->column_types
+                    ? out->column_types[c] : WIRELOG_TYPE_INT64;
+                /* FLOAT/STRING here prove actual private source preparation,
+                 * not raw intermediate schema parity. Its demonstrated JOIN
+                 * continuation mismatch requires the next causal schema unit. */
+                if (mode == 8 || mode == 9)
+                    CHECK(effective ==
+                        (mode == 8 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_STRING));
+                else CHECK(effective == (reference->column_types
+                        ? reference->column_types[c] : WIRELOG_TYPE_INT64));
+            }
+        }
+        composed_close(&f); CHECK(!eval_stack_drain(&expected));
+        empty_filter_raw_drain(&raw);
+        CHECK(!raw.sarr_active_pins);
+        col_session_free_sorted_arrangements(&raw);
+        CHECK(!raw.sarr_entries && !raw.sarr_count);
+        for (unsigned i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+    }
+}
+
+static void
+test_lftj_source_order_stops(void)
+{
+    for (unsigned point = 0; point < 10; ++point) {
+        fixture_t f; wl_plan_relation_t body; wl_plan_op_t op;
+        wl_plan_op_lftj_t metadata; char *names[3]; uint32_t keys[3];
+        col_rel_t *relations[3];
+        composed_lftj_fixture(&f, 0, &body, &op, &metadata, names, keys,
+            relations);
+        bool reached = false;
+        for (unsigned turn = 0; !reached; ++turn) {
+            CHECK(turn < 2000 &&
+                f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+            wl_columnar_lftj_attempt_t *a = &f.record.lftj;
+            if (f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD && a->inputs) {
+                wl_columnar_lftj_input_attempt_t *in = &a->inputs[0];
+                reached = point == 0 ? in->reader.acquire_stage == 1
+                    : point < 8 ? in->reader_held && a->cursor == 0
+                    && in->source_phase ==
+                    (wl_columnar_lftj_source_phase_t)(point+1)
+                    : point == 8 ? a->cursor == 1 &&
+                    a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE
+                        : a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE;
+            }
+            if (!reached) composed_action(&f);
+        }
+        wl_columnar_lftj_attempt_t before = f.record.lftj;
+        CHECK(before.input_count >= 1 && before.inputs[0].reader.owner);
+        CHECK(before.inputs[0].reader_held == (point != 0));
+        uint64_t prefix = 3u*(sizeof(wl_lftj_input_t)
+            + sizeof(col_sorted_arrangement_probe_t) + sizeof(col_rel_t *)
+            + sizeof(wl_columnar_source_access_reader_t)
+            + sizeof(bool) + 3u*sizeof(uint32_t));
+        uint64_t rows = 2u*2u*sizeof(int64_t), columns = 2u*sizeof(int64_t);
+        uint64_t contribution = point < 5 ? 0 : point < 7 ? rows
+            : point < 9 ? rows+columns : 3u*(rows+columns);
+        CHECK(before.raw_preflight_scratch_bytes == prefix+contribution);
+        col_relation_snapshot_t snapshot =
+            wl_columnar_relation_snapshot(relations[0]);
+        int64_t row[] = {9, 90};
+        CHECK(col_rel_append_row(relations[0], row) == EBUSY);
+        CHECK(composed_cleanup_lftj_turn(&f, 383,
+            0) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!memcmp(&before, &f.record.lftj, sizeof(before)));
+        wl_evaluation_control_request_cancel(f.operation);
+        for (unsigned turn = 0;
+            f.record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE;
+            ++turn) {
+            CHECK(turn < 100);
+            CHECK(!composed_cleanup_lftj_turn(&f, 386, 0));
+        }
+        CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_CANCELLED
+            && wl_columnar_relation_snapshot_equal(snapshot,
+            wl_columnar_relation_snapshot(relations[0])));
+        composed_close(&f);
+        CHECK(!col_rel_append_row(relations[0], row));
+        for (unsigned i = 0; i < 3; ++i) col_rel_destroy(relations[i]);
+    }
+}
+
 static void
 test_anti_reentry(void)
 {
@@ -7791,6 +7967,7 @@ test_anti_host_budget(void)
 int
 main(void)
 {
+    test_lftj_source_order_stops(); test_lftj_source_order();
     test_anti_reentry();
     test_anti_host_budget(); test_anti_cutoff_refusals();
     test_empty_anti_identity(); test_missing_probe_exact_order();

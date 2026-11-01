@@ -11250,6 +11250,25 @@ test_entry_generated_lftj_empty_sources(void)
     }
 }
 
+static bool
+entry_lftj_source_reached(entry_fixture_t *f, uint32_t index,
+    wl_columnar_lftj_source_phase_t phase)
+{
+    for (unsigned turns = 0; f->reply.kind !=
+        WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_TERMINAL; ++turns) {
+        CHECK(turns < 200000);
+        wl_columnar_eval_serial_framed_attempt_t *ctx = entry_context(f);
+        if (ctx && ctx->child.lftj.identity == &ctx->child.lftj
+            && ctx->child.lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE
+            && ctx->child.lftj.inputs && ctx->child.lftj.cursor == index
+            && index < ctx->child.lftj.metadata->k
+            && ctx->child.lftj.inputs[index].source_phase == phase)
+            return true;
+        (void)entry_turn(f, false, 0);
+    }
+    return false;
+}
+
 static void
 test_entry_generated_lftj_duplicate_names_rejected(void)
 {
@@ -11282,18 +11301,45 @@ test_entry_generated_lftj_duplicate_names_rejected(void)
                 session_rel_free_hash(f.session);
 
             wl_columnar_source_access_writer_t writer = {0};
-            CHECK(!wl_columnar_source_access_writer_acquire(
-                    &f.session->rels[0]->source_access, &writer));
+            if (!duplicate_later_input) CHECK(
+                    !wl_columnar_source_access_writer_acquire(
+                        &f.session->rels[0]->source_access, &writer));
+            else {
+                /* Earlier inputs now finish their real reader/key/size pass
+                * before a later duplicate lookup. No artificial writer may
+                * indefinitely prevent that required earlier acquisition. */
+                CHECK(entry_lftj_source_reached(&f, 1,
+                    WL_COLUMNAR_LFTJ_SOURCE_LOOKUP));
+                wl_columnar_eval_serial_framed_attempt_t *ctx =
+                    entry_context(&f);
+                CHECK(ctx && ctx->child.lftj.input_count == 1
+                    && ctx->child.lftj.inputs[0].reader_held
+                    && ctx->child.lftj.inputs[0].reader.owner
+                    == &f.session->rels[0]->source_access
+                    && ctx->child.lftj.inputs[0].reader.secondary_owner
+                    == &f.session->rels[0]->descriptor_access);
+            }
             entry_complete(&f);
             CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed);
             CHECK(atomic_load_explicit(&f.session->rels[0]->source_access.state,
-                memory_order_acquire) == WL_COLUMNAR_SOURCE_ACCESS_WRITER);
+                memory_order_acquire) ==
+                (duplicate_later_input ? 0 : WL_COLUMNAR_SOURCE_ACCESS_WRITER));
+            for (uint32_t i = 0; i < original_count; ++i) {
+                CHECK(!atomic_load_explicit(
+                        &f.session->rels[i]->descriptor_access.state,
+                        memory_order_acquire));
+                if (i || duplicate_later_input)
+                    CHECK(!atomic_load_explicit(
+                            &f.session->rels[i]->source_access.state,
+                            memory_order_acquire));
+            }
             bool output_present = false;
             for (uint32_t i = 0; i < f.session->nrels; ++i)
                 output_present |= f.session->rels[i]
                     && !strcmp(f.session->rels[i]->name, "output");
             CHECK(!output_present);
-            CHECK(!wl_columnar_source_access_writer_release(&writer));
+            if (!duplicate_later_input)
+                CHECK(!wl_columnar_source_access_writer_release(&writer));
 
             f.session->rels[original_count] = NULL;
             f.session->nrels = original_count;
@@ -11597,8 +11643,7 @@ test_entry_generated_lftj_resumable_reader_acquire(void)
     entry_init_inputs(&f, source, inputs, 3, 0);
     col_rel_t *input = session_find_rel(f.session, "input");
     CHECK(input);
-    CHECK(entry_lftj_phase_reached(&f, WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
-        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    CHECK(entry_lftj_source_reached(&f, 0, WL_COLUMNAR_LFTJ_SOURCE_READER));
 
     wl_columnar_source_access_writer_t descriptor_writer = { 0 };
     CHECK(!wl_columnar_source_access_writer_acquire(
@@ -11670,9 +11715,8 @@ test_entry_generated_lftj_partial_reader_acquire_abort(void)
     entry_fixture_t f;
     entry_init_inputs(&f, source, inputs, 3, 0);
     col_rel_t *input = session_find_rel(f.session, "input");
-    CHECK(input && entry_lftj_phase_reached(&f,
-        WL_COLUMNAR_LFTJ_ATTEMPT_ACQUIRE,
-        WL_COLUMNAR_LFTJ_JOIN_INPUT_CHECK));
+    CHECK(input && entry_lftj_source_reached(&f, 0,
+        WL_COLUMNAR_LFTJ_SOURCE_READER));
     wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
     for (unsigned retry = 0; retry < 16; ++retry) {
         ctx = entry_context(&f);
