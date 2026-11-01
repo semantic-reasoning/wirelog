@@ -511,6 +511,11 @@ wl_lftj_join(const wl_lftj_input_t *inputs, uint32_t k, wl_lftj_result_fn cb,
 
 /* Framed composed LFTJ uses private snapshots rather than the shared sorted
  * arrangement cache. That keeps cancellation/retry free of cache side effects. */
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_lftj_test_attempt_checkpoint)(
+    wl_evaluation_control_t *, const wl_columnar_lftj_attempt_t *);
+#endif
+
 int
 wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
     wl_col_session_t *session)
@@ -541,6 +546,14 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
         return EINVAL;
     int rc = wl_columnar_ops_lftj_attempt_preflight(op, session);
     if (rc) return rc;
+    const wl_columnar_eval_private_bindings_t *bindings = NULL;
+    if (numeric_owner) {
+        rc = wl_columnar_eval_plan_numeric_private_bindings_get(numeric_owner,
+                frame, session, control, attempt_id, &bindings);
+        if (rc) return rc;
+    }
+    if (bindings && session->nrels > UINT32_MAX - bindings->count)
+        return EOVERFLOW;
     memset(attempt, 0, sizeof(*attempt));
     attempt->identity = attempt;
     attempt->metadata = op->opaque_data;
@@ -549,6 +562,7 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     attempt->session = session;
     attempt->registry = session->rels;
     attempt->registry_count = session->nrels;
+    attempt->private_bindings = bindings;
     attempt->control = control;
     attempt->attempt_id = attempt_id;
     attempt->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE;
@@ -556,12 +570,9 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     return 0;
 }
 
-/* PRODUCT_EMIT charges total_columns + 8 around the row append. The widest
- * supported output has 64 columns, so every atomic append fits this quantum. */
+/* Copy/sort slices have a fixed size. Dynamic rows are filled one column at
+ * a time and use the common per-cell controlled append, never a wide raw copy. */
 enum { WL_COLUMNAR_LFTJ_ACTION_UNITS = 72u };
-typedef char wl_columnar_lftj_action_quantum[
-        (WL_COLUMNAR_LFTJ_ACTION_UNITS
-        >= WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 8u) ? 1 : -1];
 enum { WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS = 8u };
 
 static bool
@@ -632,12 +643,24 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         if (a->session->rels != a->registry
             || a->session->nrels != a->registry_count)
             return wl_columnar_lftj_attempt_fail(a, EBUSY);
-        if (in->lookup_slot < a->registry_count) {
+        uint32_t private_count = a->private_bindings
+            ? a->private_bindings->count : 0;
+        uint32_t count = a->registry_count + private_count;
+        if (in->lookup_slot < count) {
             rc = wl_columnar_lftj_attempt_charge(a, 1);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-            col_rel_t *candidate = a->registry[in->lookup_slot];
+            bool private_entry = in->lookup_slot < private_count;
+            col_rel_t *candidate = NULL;
             const char *wanted = a->metadata->rel_names[i];
-            const char *registered = candidate ? candidate->name : NULL;
+            const char *registered = NULL;
+            if (private_entry) {
+                rc = wl_columnar_eval_private_binding_get(a->private_bindings,
+                        in->lookup_slot, &registered, &candidate);
+                if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+            } else {
+                candidate = a->registry[in->lookup_slot - private_count];
+                registered = candidate ? candidate->name : NULL;
+            }
             if (!registered) {
                 ++in->lookup_slot;
                 in->lookup_name_byte = 0;
@@ -656,7 +679,11 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
                 if (in->lookup_matches++)
                     return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
                 in->lookup_match_slot = in->lookup_slot;
+                in->relation = candidate;
                 ++in->lookup_slot;
+                /* An authenticated private image shadows the public head,
+                 * including an absent private value. Never read the old head. */
+                if (private_entry) in->lookup_slot = count;
                 in->lookup_name_byte = 0;
                 return 0;
             }
@@ -670,7 +697,7 @@ wl_columnar_lftj_attempt_resolve(wl_columnar_lftj_attempt_t *a)
         rc = wl_columnar_lftj_attempt_charge(a,
                 WL_COLUMNAR_LFTJ_ACTION_UNITS);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-        col_rel_t *rel = a->registry[in->lookup_match_slot];
+        col_rel_t *rel = in->relation;
         if (!rel) return wl_columnar_lftj_attempt_fail(a, ENOENT);
         in->relation = rel;
         in->key_col = a->metadata->key_cols[i];
@@ -700,13 +727,13 @@ wl_columnar_lftj_attempt_acquire(wl_columnar_lftj_attempt_t *a)
             return 0;
 
         rc = wl_columnar_lftj_attempt_charge(a,
-                WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-                + WL_COLUMNAR_LFTJ_ACTION_UNITS);
+                WL_COLUMNAR_LFTJ_ACTION_UNITS);
         if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
         col_rel_t *rel = in->relation;
         uint32_t key = in->key_col;
-        if (!rel->ncols || key >= rel->ncols || rel->timestamps
-            || rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+        if (!rel->ncols || key >= rel->ncols || rel->nrows > rel->capacity)
+            return wl_columnar_lftj_attempt_fail(a, EINVAL);
+        if (rel->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
             return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
         in->nrows = rel->nrows;
         in->ncols = rel->ncols;
@@ -714,14 +741,9 @@ wl_columnar_lftj_attempt_acquire(wl_columnar_lftj_attempt_t *a)
             : WIRELOG_TYPE_INT64;
         if (a->cursor && in->key_type != a->inputs[0].key_type)
             return wl_columnar_lftj_attempt_fail(a, EINVAL);
-        if (a->total_columns > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-            || in->ncols > WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS
-            - a->total_columns)
-            return wl_columnar_lftj_attempt_fail(a, ENOTSUP);
+        if (in->ncols > UINT32_MAX - a->total_columns)
+            return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
         a->binary_offset[a->cursor] = a->total_columns;
-        for (uint32_t c = 0; c < in->ncols; c++)
-            a->output_types[a->total_columns + c] = rel->column_types
-                ? (int64_t)rel->column_types[c] : WIRELOG_TYPE_INT64;
         a->total_columns += in->ncols;
         ++a->cursor;
         return 0;
@@ -742,12 +764,14 @@ wl_columnar_lftj_attempt_size(wl_columnar_lftj_attempt_t *a)
             sizeof(*a->inputs), &bytes)
             || !wl_columnar_memory_size_mul(a->total_columns,
             sizeof(*a->row), &a->row_bytes)
-            || !wl_columnar_memory_size_add(bytes, a->row_bytes, &bytes))
+            || !wl_columnar_memory_size_add(bytes, a->row_bytes, &bytes)
+            || !wl_columnar_memory_size_add(bytes, a->row_bytes, &bytes)
+            || bytes > SIZE_MAX)
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
         row_slots = a->row_bytes ? a->row_bytes / sizeof(*a->row) : 1u;
         if (!wl_columnar_lftj_allocation_work_add(
                 &a->allocation_work_total,
-                row_slots + WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS))
+                2u * row_slots + WL_COLUMNAR_LFTJ_ALLOCATION_ACTION_UNITS))
             return wl_columnar_lftj_attempt_fail(a, EOVERFLOW);
         a->scratch_bytes = bytes;
         a->scratch_size_initialized = true;
@@ -843,9 +867,10 @@ wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
 #ifdef WL_TEST_LFTJ_ADMISSION_HOOKS
         ++lftj_test_hook_state.controlled_row_allocations;
 #endif
-        a->row = malloc((size_t)(a->row_bytes ? a->row_bytes
-            : sizeof(int64_t)));
+        a->row = malloc((size_t)(a->row_bytes ? 2u * a->row_bytes
+            : 2u * sizeof(int64_t)));
         if (!a->row) return wl_columnar_lftj_attempt_fail(a, ENOMEM);
+        a->output_types = a->row + a->total_columns;
         return 0;
     }
     if (a->cursor < a->input_count) {
@@ -878,7 +903,30 @@ wl_columnar_lftj_attempt_alloc(wl_columnar_lftj_attempt_t *a)
         a->scratch_committed = true;
     }
     a->cursor = 0;
-    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_COPY;
+    a->fill_col = 0;
+    a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_SCHEMA;
+    return 0;
+}
+
+static int
+wl_columnar_lftj_attempt_schema(wl_columnar_lftj_attempt_t *a)
+{
+    if (a->cursor == a->input_count) {
+        a->cursor = a->fill_col = 0;
+        a->phase = WL_COLUMNAR_LFTJ_ATTEMPT_COPY;
+        return 0;
+    }
+    int rc = wl_columnar_lftj_attempt_charge(a, 1);
+    if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
+    wl_columnar_lftj_input_attempt_t *in = &a->inputs[a->cursor];
+    uint32_t col = a->fill_col;
+    a->output_types[a->binary_offset[a->cursor] + col] =
+        in->relation->column_types ? in->relation->column_types[col]
+        : WIRELOG_TYPE_INT64;
+    if (++a->fill_col == in->ncols) {
+        ++a->cursor;
+        a->fill_col = 0;
+    }
     return 0;
 }
 
@@ -1155,10 +1203,12 @@ wl_columnar_lftj_attempt_join(wl_columnar_lftj_attempt_t *a)
             return 0;
         }
         {
-            int rc = wl_columnar_lftj_attempt_charge(a,
-                    (uint64_t)a->total_columns + 8u);
+            int rc = wl_columnar_lftj_attempt_charge(a, 8u);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
-            rc = col_rel_append_batch_row(&a->writer.raw, a->row);
+            rc =
+                wl_columnar_relation_append_batch_numeric_row_operator_controlled
+                (
+                &a->writer, a->row, a->control, a->attempt_id);
             if (rc) return wl_columnar_lftj_attempt_fail(a, rc);
             ++a->output_written;
             a->join_phase = WL_COLUMNAR_LFTJ_JOIN_PRODUCT_ADVANCE;
@@ -1237,7 +1287,25 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
                 funding_id);
         if (rc) return rc;
-        rc = col_rel_destroy_checked(a->output);
+        if (!a->retirement_started) {
+            rc = wl_columnar_relation_scalar_retirement_begin(&a->retirement,
+                    a->output);
+            if (rc) return rc;
+            a->retirement_started = true;
+            return 0;
+        }
+        if (!a->retirement_committed) {
+            rc = wl_columnar_relation_scalar_retirement_prepare(&a->retirement,
+                    funding, funding_id);
+            if (rc == EAGAIN) return 0;
+            if (rc) return rc;
+            rc = wl_columnar_relation_scalar_retirement_commit(&a->retirement);
+            if (rc) return rc;
+            a->retirement_committed = true;
+        }
+        rc = wl_columnar_relation_scalar_retirement_step(&a->retirement,
+                funding, funding_id);
+        if (rc == EAGAIN) return 0;
         if (rc) return rc;
         a->output = NULL;
         a->output_owned = false;
@@ -1276,6 +1344,20 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         a->cleanup_cursor = i + 1;
         a->cleanup_input_stage = 0;
     }
+    if (a->row) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        free(a->row); a->row = a->output_types = NULL;
+        return 0;
+    }
+    if (a->inputs) {
+        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
+                funding_id);
+        if (rc) return rc;
+        free(a->inputs); a->inputs = NULL;
+        return 0;
+    }
     if (a->scratch_reserved) {
         int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
                 funding_id);
@@ -1286,20 +1368,6 @@ wl_columnar_lftj_attempt_release(wl_columnar_lftj_attempt_t *a, bool *done,
         if (rc) return rc;
         if (!released) return 0;
         a->scratch_reserved = a->scratch_committed = false;
-        return 0;
-    }
-    if (a->row) {
-        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
-                funding_id);
-        if (rc) return rc;
-        free(a->row); a->row = NULL;
-        return 0;
-    }
-    if (a->inputs) {
-        int rc = wl_columnar_lftj_attempt_cleanup_charge(funding,
-                funding_id);
-        if (rc) return rc;
-        free(a->inputs); a->inputs = NULL;
         return 0;
     }
     if (!a->semantic_result && a->output_owned) {
@@ -1331,6 +1399,10 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
     *done = false;
     if (!a || a->identity != a || !a->control || !a->session || !a->frame)
         return EINVAL;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_lftj_test_attempt_checkpoint)
+        wl_columnar_lftj_test_attempt_checkpoint(a->control, a);
+#endif
     if (a->phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE) {
         *done = true;
         return 0;
@@ -1351,6 +1423,8 @@ wl_columnar_ops_lftj_attempt_step(wl_columnar_lftj_attempt_t *a, bool *done,
         return wl_columnar_lftj_attempt_alloc_precharge(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_ALLOC:
         return wl_columnar_lftj_attempt_alloc(a);
+    case WL_COLUMNAR_LFTJ_ATTEMPT_SCHEMA:
+        return wl_columnar_lftj_attempt_schema(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_COPY:
         return wl_columnar_lftj_attempt_copy(a);
     case WL_COLUMNAR_LFTJ_ATTEMPT_SORT:

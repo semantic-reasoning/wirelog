@@ -8098,8 +8098,8 @@ test_controlled_snapshot_preparation(void)
     wirelog_program_free(program);
 }
 
-/* Host admission evidence for the serial coverage matrix. These injected
- * modes exercise refusal only; they do not claim differential/LFTJ execution. */
+/* Host admission evidence for foreign state and unsupported operators.
+* Real LFTJ session admission is qualified in evaluation_lftj_hosts. */
 static void
 test_controlled_session_admission_matrix(void)
 {
@@ -8109,7 +8109,7 @@ test_controlled_session_admission_matrix(void)
         "output(x) :- input(x).\n";
     enum {
         ITERATION, RETRACTION, RIGHT_RETRACTION, DIFFERENTIAL,
-        STRICT_BATCH, OTHER_BATCH_SHAPE, LFTJ, EXCHANGE, K_FUSION, CASES
+        STRICT_BATCH, OTHER_BATCH_SHAPE, EXCHANGE, K_FUSION, CASES
     };
     for (unsigned mode = 0; mode < CASES; ++mode) {
         wirelog_error_t error;
@@ -8152,7 +8152,6 @@ test_controlled_session_admission_matrix(void)
             session->join_batch_strict = true;
             break;
         case OTHER_BATCH_SHAPE: session->join_batch_bytes = 224; break;
-        case LFTJ: ops[0].op = WL_PLAN_OP_LFTJ; break;
         case EXCHANGE: ops[0].op = WL_PLAN_OP_EXCHANGE; break;
         case K_FUSION: ops[0].op = WL_PLAN_OP_K_FUSION; break;
         default: CHECK(false);
@@ -11269,7 +11268,7 @@ test_entry_generated_lftj_duplicate_names_rejected(void)
 }
 
 static void
-test_entry_generated_lftj_oversized_source_rejected(void)
+test_entry_generated_lftj_invalid_source_rows_rejected(void)
 {
     static const char source[] =
         ".decl input(k:int64)\n.decl a(k:int64)\n.decl b(k:int64)\n"
@@ -11278,9 +11277,9 @@ test_entry_generated_lftj_oversized_source_rejected(void)
     static const int64_t one[] = {7};
     entry_fixture_t f;
     entry_init(&f, source, one, 1, 1, 0);
-    col_rel_t *wide = col_rel_new_auto("input",
-            WL_COLUMNAR_LFTJ_CONTROLLED_MAX_COLUMNS + 1u);
+    col_rel_t *wide = col_rel_new_auto("input", 65u);
     CHECK(wide);
+    wide->nrows = wide->capacity + 1u;
     uint32_t input_slot = f.session->nrels;
     for (uint32_t i = 0; i < f.session->nrels; ++i)
         if (!strcmp(f.session->rels[i]->name, "input")) {
@@ -11293,7 +11292,7 @@ test_entry_generated_lftj_oversized_source_rejected(void)
     col_rel_destroy(old);
 
     entry_complete(&f);
-    CHECK(f.reply.execution_result == ENOTSUP && !f.reply.committed);
+    CHECK(f.reply.execution_result == EINVAL && !f.reply.committed);
     CHECK(atomic_load_explicit(&wide->source_access.state,
         memory_order_acquire) == 0);
     bool output_present = false;
@@ -11877,9 +11876,9 @@ test_entry_generated_lftj_allocation_precharge(void)
         {"a", rows, ROW_COUNT, 1},
         {"b", rows, ROW_COUNT, 1}
     };
-    /* Three output cells plus the allocation action; each nonempty input pays
-     * two full scalar arrays and two allocation actions. */
-    const uint64_t allocation_tariff = 3u + 8u
+    /* Three row cells and three dynamic type codes share one allocation;
+     * each nonempty input pays two arrays and two allocation actions. */
+    const uint64_t allocation_tariff = 6u + 8u
         + INPUT_COUNT * (2u * ROW_COUNT + 2u * 8u);
     const uint64_t precharge_prefix = entry_lftj_phase_minimum_limit(source,
             inputs, INPUT_COUNT,
@@ -12366,7 +12365,7 @@ main(void)
     test_entry_generated_lftj_bounded_source_resolution();
     test_entry_generated_lftj_empty_sources();
     test_entry_generated_lftj_duplicate_names_rejected();
-    test_entry_generated_lftj_oversized_source_rejected();
+    test_entry_generated_lftj_invalid_source_rows_rejected();
     test_entry_generated_lftj_widest_output_row();
     test_entry_generated_lftj_writer_end_retry();
     test_entry_generated_lftj_successful_writer_end_retry();
