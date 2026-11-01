@@ -520,11 +520,194 @@ test_preparation(void)
     prepare_denial_phase = 0;
 }
 
+static bool schema_stop_work;
+
+static void
+schema_stop(const wl_columnar_join_schema_attempt_t *a)
+{
+    if (a->phase != WL_COLUMNAR_JOIN_SCHEMA_COLUMNS || a->column != 17) return;
+    if (schema_stop_work)
+        CHECK(wl_evaluation_control_charge(a->control, UINT64_C(1000000000))
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    else wl_evaluation_control_request_cancel(a->control);
+}
+
+static void
+test_schema_case(unsigned kind, bool stamps, unsigned stop, bool work)
+{
+    fixture_t f; fixture_begin(&f, 16u * 1024u * 1024u,
+        work ? UINT64_C(1000000000) : 0);
+    col_rel_t *left = prepare_source(&f, "left", 65, stamps, true, false);
+    col_rel_t *right = prepare_source(&f, "right", 192, stamps, false, true);
+    char labels[65][12]; const char *names[65];
+    for (unsigned c = 0; c < 65; ++c) {
+        snprintf(labels[c], sizeof(labels[c]), "named%u", c);
+        names[c] = labels[c];
+    }
+    CHECK(!col_rel_set_schema(left, 65, names));
+    left->has_graph_column = true; left->graph_col_idx = 1;
+    left->declared_ncols = 65;
+    wl_columnar_relation_touch_view(left);
+    CHECK(left->column_types && left->column_types[0] == WIRELOG_TYPE_FLOAT);
+    col_relation_snapshot_t saved_left = wl_columnar_relation_snapshot(left);
+    col_relation_snapshot_t saved_right = wl_columnar_relation_snapshot(right);
+    uint32_t projection[] = {0, 65, 64, UINT32_MAX};
+    uint32_t semi_projection[] = {0, 64, UINT32_MAX};
+    wl_plan_op_t op = {.op = kind < 2 ? WL_PLAN_OP_JOIN
+        : kind == 2 ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN};
+    if (kind == 1 || kind == 3) {
+        op.project_count = 4; op.project_indices = projection;
+    } else if (kind == 2) {
+        op.project_count = 3; op.project_indices = semi_projection;
+    }
+    wl_col_session_t session = {0};
+    wl_mem_ledger_init(&session.mem_ledger, 0);
+    session.memory_governor = f.governor;
+    unsigned width = kind == 0 ? 257 : kind == 1 ? 4 : kind == 2 ? 3 : 65;
+    col_rel_t *raw = NULL, *out = NULL;
+    if (kind < 2) {
+        CHECK(!wl_columnar_relation_new_auto_governed("$raw", width,
+            COL_REL_INIT_CAP, false, f.governor, &raw));
+        CHECK(!col_join_set_output_types(raw, left, right, &op));
+    } else if (kind == 2)
+        CHECK(!wl_columnar_semijoin_new_output(&op, &session, left, right,
+            &raw));
+    else CHECK(!wl_columnar_antijoin_new_output(&op, &session, left, right,
+            &raw));
+    uint64_t baseline = reserved(&f);
+    wl_columnar_relation_scalar_source_t ls, rs;
+    bool li = false, ri = false;
+    CHECK(!wl_columnar_relation_scalar_source_init_attempt_controlled(&ls, &li,
+        f.control, f.id) && li);
+    CHECK(!wl_columnar_relation_scalar_source_begin_attempt_controlled(&ls,
+        left, false));
+    CHECK(!wl_columnar_relation_scalar_source_init_attempt_controlled(&rs, &ri,
+        f.control, f.id) && ri);
+    CHECK(!wl_columnar_relation_scalar_source_begin_attempt_controlled(&rs,
+        right, false));
+    wl_columnar_join_schema_attempt_t a = {0};
+    CHECK(!wl_columnar_join_schema_attempt_begin(&a, &op, &ls, &rs, "$schema",
+        f.governor, &out, f.control, f.id));
+    wl_columnar_join_schema_attempt_t copied = a;
+    bool done = false;
+    CHECK(wl_columnar_join_schema_attempt_step(&copied, 1, &done) == EINVAL);
+    wl_columnar_memory_reservation_t peer;
+    wl_columnar_memory_reservation_init(&peer);
+    if (stop == 3) {
+        uint64_t available = 16u * 1024u * 1024u - reserved(&f);
+        CHECK(available > 1 && wl_columnar_memory_reserve(
+                wl_columnar_memory_governor_ref_get(f.governor), available - 1,
+                &peer));
+    }
+    if (stop == 4) {
+        if (kind ==
+            3) wl_columnar_relation_test_constructor_fail_allocation = 1;
+        else wl_columnar_join_test_attempt_fail_allocation = 0;
+    }
+    schema_stop_work = work;
+    wl_columnar_join_test_schema_checkpoint = stop == 1 ? schema_stop : NULL;
+    int rc = 0;
+    for (unsigned turn = 0; !done && !rc; ++turn) {
+        CHECK(turn < 10000);
+        rc = wl_columnar_join_schema_attempt_step(&a, 1, &done);
+    }
+    wl_columnar_join_test_schema_checkpoint = NULL;
+    wl_columnar_relation_test_constructor_fail_allocation = 0;
+    wl_columnar_join_test_attempt_fail_allocation = -1;
+    if (stop == 2 && !rc) {
+        CHECK(done && a.ready && out && a.output_transferred);
+        if (work) CHECK(wl_evaluation_control_charge(f.control,
+                UINT64_C(1000000000)) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        else wl_evaluation_control_request_cancel(f.control);
+        rc = wl_columnar_join_schema_attempt_step(&a, 1, &done);
+        CHECK(out && a.output_transferred);
+    }
+    if (stop == 1 || stop == 2)
+        CHECK(rc ==
+            (work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+            WL_EVALUATION_CONTROL_CANCELLED));
+    else if (stop == 3) CHECK(rc == ENOSPC && !out);
+    else if (stop == 4) CHECK(rc == ENOMEM && !out);
+    else CHECK(!rc && done && a.ready && a.output_transferred);
+    if (out) {
+        CHECK(!out->nrows && out->ncols == width &&
+            out->capacity == COL_REL_INIT_CAP
+            && !out->timestamps);
+        CHECK(out->has_graph_column == (kind == 3));
+        if (kind == 3) CHECK(out->graph_col_idx == 1 &&
+                out->declared_ncols == 65);
+        for (unsigned c = 0; c < width; ++c) {
+            wirelog_column_type_t expected = c ==
+                0 ? WIRELOG_TYPE_FLOAT : WIRELOG_TYPE_INT64;
+            CHECK(out->column_types[c] == expected &&
+                raw->column_types[c] == expected);
+            CHECK(!strcmp(out->col_names[c], raw->col_names[c]));
+        }
+    }
+    CHECK(wl_evaluation_control_finish(f.control, &f.owner, rc, 0) == rc);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(f.control, &before));
+    CHECK(wl_columnar_relation_scalar_source_end(&ls, rc) == rc);
+    CHECK(wl_columnar_relation_scalar_source_end(&rs, rc) == rc);
+    done = false;
+    CHECK(wl_columnar_join_schema_attempt_end(&a, f.control, f.id,
+        &done) == EINVAL);
+    int owner; wl_evaluation_control_t *funding = NULL;
+    CHECK(!wl_evaluation_control_create(384, &funding));
+    CHECK(!wl_evaluation_control_attach(funding, &owner));
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 10000 && !wl_evaluation_control_reset(funding));
+        CHECK(!wl_evaluation_control_begin(funding, &owner));
+        uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+        if (!turn) CHECK(wl_columnar_join_schema_attempt_end(&a, funding,
+                id + 1, &done) == EINVAL && !done && !a.ending);
+        CHECK(!wl_columnar_join_schema_attempt_end(&a, funding, id, &done));
+        CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+    }
+    CHECK(a.drained && !a.codes && !a.codes_admitted && !a.control_retained);
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    CHECK(!wl_evaluation_control_report(f.control, &after)
+        && before.attempt_id == after.attempt_id &&
+        before.consumed == after.consumed
+        && before.result == after.result &&
+        before.stop_reason == after.stop_reason);
+    if (out) CHECK(!col_rel_destroy_checked(out));
+    CHECK(reserved(&f) == baseline + peer.bytes);
+    if (peer.governor) CHECK(wl_columnar_memory_rollback(&peer));
+    CHECK(wl_columnar_relation_snapshot_equal(saved_left,
+        wl_columnar_relation_snapshot(left))
+        && wl_columnar_relation_snapshot_equal(saved_right,
+        wl_columnar_relation_snapshot(right)));
+    if (stamps) CHECK(left->timestamps[0].iteration == 7 &&
+            left->timestamps[0].multiplicity == -2);
+    CHECK(!col_rel_destroy_checked(raw) && !col_rel_destroy_checked(left)
+        && !col_rel_destroy_checked(right));
+    fixture_end(&f, rc);
+}
+
+static void
+test_schema_preparation(void)
+{
+    for (unsigned kind = 0; kind < 4; ++kind)
+        for (unsigned stamps = 0; stamps < 2; ++stamps) {
+            test_schema_case(kind, stamps, 0, false);
+            test_schema_case(kind, stamps, 2, false);
+            test_schema_case(kind, stamps, 3, false);
+            test_schema_case(kind, stamps, 4, false);
+        }
+    for (unsigned work = 0; work < 2; ++work) {
+        test_schema_case(0, true, 1, work);
+        test_schema_case(0, true, 2, work);
+    }
+}
+
 int
 main(void)
 {
     test_domains();
     test_failures();
     test_preparation();
+    test_schema_preparation();
     return 0;
 }
