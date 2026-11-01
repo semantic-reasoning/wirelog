@@ -50,8 +50,8 @@ Source: [session.c](../../../wirelog/columnar/session.c),
 | E05 / S07 | Exact binary INT64 path manifest with one/two JOINs and terminal zero-worker EXCHANGE → `col_controlled_step_recursive_drive` | R, implemented restricted recursion; charged progress/private merge; S/F; general SCC bound U | `test_controlled_recursive_two_join_step`, `test_controlled_recursive_two_join_successor_stop`, `test_controlled_recursive_successor_work_boundaries`; G3 |
 | E06 / S07 | Ordinary positive recursive multihead/SCC bodies | R, declared positive-arity INT64 route implemented with private synchronous rounds; charged comparison and retirement; S/F/O | `test_controlled_recursive_step_general_join_chain`, `test_controlled_recursive_transaction`, `test_controlled_recursive_transaction_successors`; observed/unobserved and insert/remove recomputation. `test_controlled_recursive_transaction_stops` and `test_controlled_recursive_transaction_shapes` qualify phase stops, multiple strata and empirical budget boundaries; differential and optimized routes remain G3b/G4 |
 | E07 / S08 | Foreign active raw iteration/retraction/differential state at admission versus legal completed-host removal | Foreign states retain their refusal. Qualified scalar mutations and binary recursive removal use private bounded reconstruction; see the #2296 qualification below | `test_controlled_session_admission_matrix` remains refusal evidence. `evaluation_differential` independently qualifies natural scheduler selection, scalar selectors, legal mutation, stop/retry and signed events; physical scalar intersections are qualified in PHYSICAL_METADATA_AUDIT.md |
-| E08 / S09 | Nonzero `join_batch_bytes`, non-strict, exact VARIABLE/keyed JOIN/FILTER/MAP/CONSOLIDATE → prepared producer, controlled per-batch consumers and private relation sink | R, restricted; Q64 preflight, A producer/consumer/sink, same F; intrinsic declines use bounded ordinary JOIN; S/F/B | `evaluation_join_hosts` domains/recovery/failures/funding and existing selector tests; broader policies remain G4 |
-| E09 / S09 | Strict batching or another batch shape | R, refused; strict mode static, other shape charged; no operator owner | `test_controlled_session_admission_matrix`; positive counterpart E08; strict and broader producer/pipeline destinations still required, G4 |
+| E08 / S09 | Nonzero `join_batch_bytes`, non-strict unobserved supported scalar plans → prepared producer, controlled per-batch FILTER/MAP/FULL-probe consumers and private relation sink | R, restricted; Q64 preflight, A producer/consumer/sink, same F; intrinsic declines use bounded ordinary JOIN; S/F/B | `evaluation_join_hosts` domains/recovery/failures/funding and existing selector tests; broader policies remain G4 |
+| E09 / S09 | Remaining strict/cap/shared/observed batch policies and unsupported operator/source dispositions | R, guarded per destination; general non-strict scalar shapes use E08's actual producer/consumer owners | `test_controlled_session_admission_matrix` retains foreign/strict exclusions and positively qualifies scalar batch admission; broader policy/source intersections still required, G4 |
 | E10 / S12 | Fresh/dirty controlled SNAPSHOT versus completed STEP | R; qualifying fresh/dirty → private transaction and staging on one attempt; unrelated pending STEP EBUSY; completed → `col_session_snapshot_controlled` → charged private staging → finite prepaid dispatch; S | `evaluation_lifecycle` covers generated fresh/dirty acyclic and numeric recursive evaluation, shared attempt identity, stop/retry and live-state refusal; `test_controlled_session_snapshot_publication` covers cutoff/reference. `test_controlled_snapshot_preparation` covers charged preparation, no-output stops and retry; finite prepaid dispatch preserves the cutoff |
 | E11 / S11 | Frame bootstrap, funding transfer, retained continuation, ABORT/ACK and destruction | R, implemented receipt protocol; per-transition charging, nested allocation/cleanup U; F | `test_cleanup_receipt_transfer_retry`, `test_entry_abort_and_unsupported_abort`, `test_controlled_session_step_destroy_refusal`; G6 must audit all ownership regions |
 | E12 / S13 | Coordinator, >1 worker, TDD input/subpass/outbound state, shared output counter | P for worker scheduling/global allowance; serial payload still R | Static/composed refusal; #1822 owns worker integration. Serial payload obligations stay in operator rows, not excluded wholesale |
@@ -543,7 +543,7 @@ completion of this bundle alone does not close every #2296/#1953 obligation.
 
 `evaluation_join_hosts` witnesses actual prepared producer generations,
 per-batch FILTER/MAP, transformed sink rows and serialized extent/ACK in the
-existing unobserved non-strict five-op STEP shape. It covers64 candidate pairs,
+original unobserved non-strict five-op STEP fixture. It covers64 candidate pairs,
 32 two-row batches,257-lane rows, narrowed projections, arithmetic MAP, actual
 physical source stamps, left-delta and owned forced-empty inputs. Independent
 literal tuples and a control-disabled reference check results and source
@@ -579,3 +579,39 @@ ENOTSUP test and consumes its genuine bootstrap receipt.
 This unit does not qualify other batch plan shapes, SEMI/ANTI hosting, strict
 mode, local/shared output caps, observed/SNAPSHOT wrappers or their successors.
 Those remain mandatory bundle work; E09/C04 and #2297 are not closed here.
+
+
+### General batch admission and FULL probe prefixes (#2297)
+
+`evaluation_join_probes` extends the actual session host beyond that original
+fixture: a compiler-generated negation body, an explicit SEMI projection into
+an ANTI stage, no-FILTER/no-MAP tails, missing-right truncation with and without
+an earlier FILTER, NULL keys, unresolved-name column-zero fallback (including overflowing and
+non-ASCII numeric suffixes), platform-specific `strtol` index conversion, a large
+FULL right source and a distinct `$d$gate` canary, and a multi-head plan.
+Literal relation-qualified tuples and the same control-disabled plans are
+independent result oracles. These internal edited-plan cases are not claimed
+as compiler-generated selection; the negation and multi-head bodies are.
+
+The schema-only factory and owned template retirement run before producer
+creation. Hooks assert no probe-index work during schema preparation and
+positive index/consumer work after producer preparation. Exact stage FULL
+source identity is checked at consumer START; delta substitution and writes
+through the retained source reader are rejected. The effective prefix length
+leaves excluded stages on the original numeric cursor, so a missing-right
+standalone probe preserves the entire entry and later MAP executes once.
+
+The new tests stop at every schema construction call, FULL/key qualification,
+partial stage initialization, schema END/retirement, producer/consumer/ACK and
+private replacement. Allocation faults and enforcing-budget denial drain
+all temporary resources; reset/retry matches the canonical reference. Actual
+classifier-authorized facade grants1151/1152 exercise probe START/STEP/ACK
+with finished receipts768/1152 and unchanged final original consumption
+compared to an ordinary funded host run. Those host totals are empirical;
+the existing primitive exact and one-short contracts remain separate.
+
+Strict/cache/local-cap ordering, shared-count operation rollback and observed
+STEP/SNAPSHOT/successor policy qualifications remain required before claiming
+all E08/E09/F01–F03/F02a–d/C04 predicates closed. The empty probe fixture
+retains an initialized scalar schema after removing all rows; an unspecialized
+empty EDB descriptor still needs its own bounded source disposition.

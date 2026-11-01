@@ -24,6 +24,16 @@ enum {
 bool wl_columnar_join_pipeline_stream_authorized(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, const void *, unsigned,
     const wl_plan_op_t *, const col_rel_t *, uint64_t, bool);
+/* Raw pipeline's exact-name / strtol(col<N>) / column-zero fallback,
+ * with original-attempt polling on each name byte and suffix digit. */
+int wl_columnar_join_pipeline_key_attempt(
+    const wl_columnar_relation_scalar_source_t *, const char *, uint32_t *,
+    wl_evaluation_control_t *, uint64_t);
+/* Stream probe must read the exact prequalified FULL source, never an old
+ * public image or a delta. The stage reader remains live through ACK. */
+int wl_columnar_join_pipeline_probe_source_owned(const void *,
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_plan_op_t *,
+    const col_rel_t *, const col_rel_t *);
 /* Exact direct consumer payment384 includes this host's dispatch; do not add
  * another1. Root and facade independently keep their existing384 fees. Other
  * phases admit1 plus their actual independently funded cleanup actions. */
@@ -48,7 +58,13 @@ enum {
     WL_COLUMNAR_JOIN_PIPELINE_TEST_EXCHANGED,
     WL_COLUMNAR_JOIN_PIPELINE_TEST_CONSUMER,
     WL_COLUMNAR_JOIN_PIPELINE_TEST_RESTORED,
-    WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK_SCHEMA
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SINK_SCHEMA,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_END,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_RETIRE,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_PROBE_KEYS,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_PROBE_FULL,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_SCHEMA_FINAL,
+    WL_COLUMNAR_JOIN_PIPELINE_TEST_STAGE_INIT
 };
 extern void (*wl_columnar_join_pipeline_test_numeric_checkpoint)(
     wl_evaluation_control_t *, unsigned, uint64_t, uint32_t, uint64_t);

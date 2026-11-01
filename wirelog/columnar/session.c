@@ -29,17 +29,6 @@
 #include <string.h>
 
 typedef enum {
-    COL_CONTROLLED_PREFLIGHT_IDLE = 0,
-    COL_CONTROLLED_PREFLIGHT_SHAPE,
-    COL_CONTROLLED_PREFLIGHT_TARGET,
-    COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL,
-    COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA,
-    COL_CONTROLLED_PREFLIGHT_JOIN_FULL,
-    COL_CONTROLLED_PREFLIGHT_JOIN_DELTA,
-    COL_CONTROLLED_PREFLIGHT_READY
-} col_controlled_preflight_phase_t;
-
-typedef enum {
     COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE = 0,
     COL_CONTROLLED_DEFAULT_PREFLIGHT_PLAN,
     COL_CONTROLLED_DEFAULT_PREFLIGHT_STRATUM,
@@ -260,13 +249,7 @@ struct wl_columnar_controlled_step {
     uint32_t successor_registration_scan_charged;
     uint32_t stratum_index;
     uint32_t relation_index;
-    uint32_t preflight_op;
-    uint32_t preflight_registry_slot;
-    uint32_t preflight_name_byte;
-    uint32_t preflight_registry_count;
-    col_controlled_preflight_phase_t preflight_phase;
     col_controlled_default_preflight_phase_t default_preflight_phase;
-    col_rel_t **preflight_registry;
     col_rel_t **default_preflight_registry;
     const wl_plan_t *default_preflight_plan;
     uint32_t default_preflight_stratum;
@@ -278,14 +261,6 @@ struct wl_columnar_controlled_step {
     uint32_t default_preflight_call_actions;
     uint64_t default_preflight_charged_actions;
     col_controlled_recursive_step_t *recursive;
-    col_rel_t *preflight_variable_full;
-    col_rel_t *preflight_variable_delta;
-    col_rel_t *preflight_join_full;
-    col_rel_t *preflight_join_delta;
-    uint32_t preflight_variable_full_rows;
-    uint32_t preflight_variable_delta_rows;
-    uint32_t preflight_join_full_rows;
-    uint32_t preflight_join_delta_rows;
     bool controlled_materialized_batch_fallback;
     uint32_t observed_preflight_phase;
     uint32_t observed_preflight_slot;
@@ -450,7 +425,9 @@ wl_columnar_session_controlled_batch_authorized(
         ? sess->controlled_step : NULL;
     return step && (uint64_t)(uintptr_t)step == identity
            && step->operation_active && step->operation_id == id
-           && step->preflight_phase == COL_CONTROLLED_PREFLIGHT_READY
+           && step->default_preflight_phase
+           == COL_CONTROLLED_DEFAULT_PREFLIGHT_READY
+           && step->default_preflight_plan == sess->plan
            && step->controlled_materialized_batch_fallback
            && control == sess->base.evaluation_control
            && wl_evaluation_control_active_attempt_id(control) == id;
@@ -7673,19 +7650,6 @@ col_controlled_step_controlled_op(const wl_plan_op_t *op)
     }
 }
 
-static bool
-col_controlled_step_batch_shape(const wl_col_session_t *sess)
-{
-    const wl_plan_t *plan = sess->plan;
-    if (!sess->join_batch_bytes || sess->join_batch_strict || !plan
-        || plan->stratum_count != 1 || !plan->strata
-        || plan->strata[0].is_recursive
-        || plan->strata[0].relation_count != 1
-        || !plan->strata[0].relations)
-        return false;
-    return true;
-}
-
 /* Reject whole-session and recursive routes before opening an operation
  * attempt.  This checks only immutable plan shape and session admission state;
  * relation/operator validation and all evaluation work remain charged below. */
@@ -8075,6 +8039,12 @@ col_controlled_step_default_preflight_action(wl_col_session_t *sess,
             && relation->ops[step->default_preflight_op].op
             == WL_PLAN_OP_EXCHANGE))
             return ENOTSUP;
+        if (sess->join_batch_bytes) {
+            const wl_plan_op_t *op = &relation->ops[step->default_preflight_op];
+            if ((op->op == WL_PLAN_OP_VARIABLE || op->op == WL_PLAN_OP_JOIN)
+                && !wl_columnar_eval_plan_scalar_selector_supported(op))
+                return ENOTSUP;
+        }
         step->default_preflight_op++;
         return 0;
     case COL_CONTROLLED_DEFAULT_PREFLIGHT_TARGET_SLOT:
@@ -8235,182 +8205,10 @@ static int
 col_controlled_step_preflight(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
-    const wl_plan_t *plan = sess->plan;
-    wl_evaluation_control_t *control = sess->base.evaluation_control;
-    uint64_t id = step->operation_id;
-    bool batch = sess->join_batch_bytes != 0;
-    if (!batch) return col_controlled_step_default_preflight(sess, step);
-    int initial_charge = wl_evaluation_control_charge_attempt(control, id, 1);
-    if (initial_charge) return initial_charge;
-    if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
-    if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_IDLE) {
-        step->preflight_registry = sess->rels;
-        step->preflight_registry_count = sess->nrels;
-    } else if (step->preflight_registry != sess->rels
-        || step->preflight_registry_count != sess->nrels) {
-        return ENOTSUP;
-    }
-    const wl_plan_relation_t *relation = plan->stratum_count == 1
-        && plan->strata[0].relation_count == 1
-        ? &plan->strata[0].relations[0] : NULL;
-    if (!relation || !col_controlled_step_batch_shape(sess)) return ENOTSUP;
-    if (!relation->name || !relation->ops || relation->op_count != 5)
-        return ENOTSUP;
-    const char *lookup_name = NULL;
-    bool delta_name = false;
-    for (uint32_t action = 1; action < 64; ++action) {
-        int rc = wl_evaluation_control_charge_attempt(control, id, 1);
-        if (rc) return rc;
-        if (wl_evaluation_control_active_attempt_id(control) != id)
-            return EINVAL;
-        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_IDLE)
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_SHAPE;
-        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_SHAPE) {
-            if (step->preflight_op < relation->op_count) {
-                const wl_plan_op_t *op = &relation->ops[step->preflight_op];
-                if (!col_controlled_step_controlled_op(op)) return ENOTSUP;
-                if (step->preflight_op == 0
-                    && (op->op != WL_PLAN_OP_VARIABLE
-                    || !wl_columnar_eval_plan_scalar_selector_supported(op)))
-                    return ENOTSUP;
-                if (step->preflight_op == 1
-                    && (op->op != WL_PLAN_OP_JOIN || op->materialized
-                    || !op->right_relation || !op->key_count
-                    || !op->left_keys || !op->right_keys)) return ENOTSUP;
-                if (step->preflight_op == 1
-                    && !wl_columnar_eval_plan_scalar_selector_supported(op))
-                    return ENOTSUP;
-                if (step->preflight_op == 2
-                    && (op->op != WL_PLAN_OP_FILTER
-                    || !op->filter_expr.data || !op->filter_expr.size))
-                    return ENOTSUP;
-                if (step->preflight_op == 3
-                    && op->op != WL_PLAN_OP_MAP) return ENOTSUP;
-                if (step->preflight_op == 4
-                    && op->op != WL_PLAN_OP_CONSOLIDATE) return ENOTSUP;
-                ++step->preflight_op;
-                continue;
-            }
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_TARGET;
-            continue;
-        }
-        switch (step->preflight_phase) {
-        case COL_CONTROLLED_PREFLIGHT_TARGET:
-            lookup_name = relation->name;
-            break;
-        case COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL:
-            lookup_name = relation->ops[0].relation_name;
-            break;
-        case COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA:
-            lookup_name = relation->ops[0].relation_name;
-            delta_name = true;
-            break;
-        case COL_CONTROLLED_PREFLIGHT_JOIN_FULL:
-            lookup_name = relation->ops[1].right_relation;
-            break;
-        case COL_CONTROLLED_PREFLIGHT_JOIN_DELTA:
-            lookup_name = relation->ops[1].right_relation;
-            delta_name = true;
-            break;
-        case COL_CONTROLLED_PREFLIGHT_READY:
-            if (step->preflight_registry != sess->rels
-                || step->preflight_registry_count != sess->nrels
-                || step->preflight_variable_full == NULL
-                || step->preflight_join_full == NULL
-                || step->preflight_variable_full->nrows
-                != step->preflight_variable_full_rows
-                || (step->preflight_variable_delta
-                && step->preflight_variable_delta->nrows
-                != step->preflight_variable_delta_rows)
-                || step->preflight_join_full->nrows
-                != step->preflight_join_full_rows
-                || (step->preflight_join_delta
-                && step->preflight_join_delta->nrows
-                != step->preflight_join_delta_rows)) return ENOTSUP;
-            return 0;
-        default:
-            return ENOTSUP;
-        }
-        if (!lookup_name || !lookup_name[0] || lookup_name[0] == '$')
-            return ENOTSUP;
-        col_rel_t *found = NULL;
-        bool finished = false;
-        while (step->preflight_registry_slot < sess->nrels) {
-            col_rel_t *candidate = sess->rels
-                ? sess->rels[step->preflight_registry_slot] : NULL;
-            const char *candidate_name = candidate ? candidate->name : NULL;
-            if (!candidate_name) {
-                ++step->preflight_registry_slot;
-                step->preflight_name_byte = 0;
-                break;
-            }
-            uint32_t offset = step->preflight_name_byte;
-            char wanted;
-            if (delta_name && offset < 3) {
-                wanted = offset == 0 ? '$' : 'd';
-                if (offset == 2) wanted = '$';
-            } else {
-                uint32_t base_offset = delta_name ? offset - 3 : offset;
-                if (base_offset > 252) return ENOTSUP;
-                wanted = lookup_name[base_offset];
-                if (base_offset == 252 && wanted) return ENOTSUP;
-            }
-            char actual = candidate_name[offset];
-            if (actual != wanted) {
-                ++step->preflight_registry_slot;
-                step->preflight_name_byte = 0;
-                break;
-            }
-            if (!wanted) {
-                found = candidate;
-                ++step->preflight_registry_slot;
-                finished = true;
-                break;
-            }
-            ++step->preflight_name_byte;
-            break;
-        }
-        if (step->preflight_registry_slot == sess->nrels)
-            finished = true;
-        if (!finished) continue;
-        step->preflight_registry_slot = 0;
-        step->preflight_name_byte = 0;
-        if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_TARGET) {
-            if (found) return ENOTSUP;
-            step->preflight_phase = batch
-                ? COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL
-                : COL_CONTROLLED_PREFLIGHT_READY;
-        } else if (step->preflight_phase ==
-            COL_CONTROLLED_PREFLIGHT_VARIABLE_FULL) {
-            step->preflight_variable_full = found;
-            if (!found) return ENOTSUP;
-            step->preflight_variable_full_rows = found->nrows;
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA;
-        } else if (step->preflight_phase ==
-            COL_CONTROLLED_PREFLIGHT_VARIABLE_DELTA) {
-            step->preflight_variable_delta = found;
-            step->preflight_variable_delta_rows = found ? found->nrows : 0;
-            /* The child selects full/delta/empty from these immutable sources.
-             * A smaller delta is legal; it must not force a raw fallback. */
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_FULL;
-        } else if (step->preflight_phase ==
-            COL_CONTROLLED_PREFLIGHT_JOIN_FULL) {
-            step->preflight_join_full = found;
-            if (!found) return ENOTSUP;
-            step->preflight_join_full_rows = found->nrows;
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_JOIN_DELTA;
-        } else if (step->preflight_phase ==
-            COL_CONTROLLED_PREFLIGHT_JOIN_DELTA) {
-            step->preflight_join_delta = found;
-            step->preflight_join_delta_rows = found ? found->nrows : 0;
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_READY;
-            step->controlled_materialized_batch_fallback = true;
-        }
-        delta_name = false;
-    }
-    if (step->preflight_phase == COL_CONTROLLED_PREFLIGHT_READY) return 0;
-    int poll_rc = wl_evaluation_control_charge_attempt(control, id, 0);
-    return poll_rc ? poll_rc : EAGAIN;
+    int rc = col_controlled_step_default_preflight(sess, step);
+    if (!rc && sess->join_batch_bytes)
+        step->controlled_materialized_batch_fallback = true;
+    return rc;
 }
 
 static void
@@ -8570,18 +8368,10 @@ static void
 col_controlled_step_advance_cursor(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
-    const wl_plan_t *plan = sess->plan;
-    if (!sess->join_batch_bytes) {
-        /* Publication is complete, but the next relation cursor is advanced
-         * by the charged scheduler. Preserve this marker if that charge stops. */
-        step->cursor_advance_pending = true;
-    } else if (++step->relation_index
-        >= plan->strata[step->stratum_index].relation_count) {
-        /* The admitted batch shape has exactly one relation in one stratum. */
-        step->relation_index = 0;
-        step->stratum_index = plan->stratum_count;
-        step->complete = true;
-    }
+    (void)sess;
+    /* The charged scheduler advances every admitted relation, including
+     * batch plans, after publication and across capacity suspension. */
+    step->cursor_advance_pending = true;
 #ifdef WL_SESSION_TEST_HOOKS
     if (!step->complete &&
         wl_columnar_session_test_exhaust_after_relation > 0) {
@@ -8702,20 +8492,6 @@ col_controlled_step_finish(wl_col_session_t *sess,
     int rc = step->snapshot_owned ? result
         : wl_evaluation_control_finish(sess->base.evaluation_control,
             sess->base.operation_admission, result, 0);
-    step->preflight_phase = COL_CONTROLLED_PREFLIGHT_IDLE;
-    step->preflight_op = 0;
-    step->preflight_registry_slot = 0;
-    step->preflight_name_byte = 0;
-    step->preflight_registry_count = 0;
-    step->preflight_registry = NULL;
-    step->preflight_variable_full = NULL;
-    step->preflight_variable_delta = NULL;
-    step->preflight_join_full = NULL;
-    step->preflight_join_delta = NULL;
-    step->preflight_variable_full_rows = 0;
-    step->preflight_variable_delta_rows = 0;
-    step->preflight_join_full_rows = 0;
-    step->preflight_join_delta_rows = 0;
     step->controlled_materialized_batch_fallback = false;
     step->default_preflight_phase = COL_CONTROLLED_DEFAULT_PREFLIGHT_IDLE;
     step->default_preflight_plan = NULL;
@@ -10090,7 +9866,6 @@ static int
 col_controlled_step_schedule(wl_col_session_t *sess,
     wl_columnar_controlled_step_t *step)
 {
-    if (sess->join_batch_bytes) return 0;
     const wl_plan_t *plan = sess->plan;
     wl_evaluation_control_t *control = sess->base.evaluation_control;
     uint32_t actions = step->default_preflight_call_actions;
@@ -11818,16 +11593,13 @@ col_controlled_step_drive(wl_col_session_t *sess,
     }
 
     if (!step->complete && !step->relation_active
-        && (sess->join_batch_bytes
-            ? step->preflight_phase != COL_CONTROLLED_PREFLIGHT_READY
-            : step->default_preflight_phase
-        != COL_CONTROLLED_DEFAULT_PREFLIGHT_READY)) {
+        && step->default_preflight_phase
+        != COL_CONTROLLED_DEFAULT_PREFLIGHT_READY) {
         int rc = col_controlled_step_preflight(sess, step);
         if (rc == EAGAIN && wl_evaluation_control_active_attempt_id(control)
             == step->operation_id) return EAGAIN;
         if (rc) {
             step->refused = rc == ENOTSUP;
-            step->preflight_phase = COL_CONTROLLED_PREFLIGHT_IDLE;
             step->controlled_materialized_batch_fallback = false;
             return col_controlled_step_finish(sess, step, rc);
         }

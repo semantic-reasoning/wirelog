@@ -6968,3 +6968,14 @@ test_evaluation_physical_retirement_exe = executable(
 )
 test('evaluation_physical_retirement', test_evaluation_physical_retirement_exe,
      suite: ['unit', 'tsan'], timeout: 60)
+
+# #2297: changing prefix schemas, actual FULL probes and excluded stages.
+test_evaluation_join_probes_exe = executable(
+  'test_evaluation_join_probes', files('test_evaluation_join_probes.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  link_with: [testlib_prod],
+)
+test('evaluation_join_probes', test_evaluation_join_probes_exe,
+     suite: ['unit', 'tsan', 'evaluation_join_hosts'], timeout: 60)

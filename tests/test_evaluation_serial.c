@@ -7307,6 +7307,10 @@ test_controlled_batch_join_filter_map_step(void)
     CHECK(!wl_evaluation_control_reset(control));
     CHECK(!wl_evaluation_control_configure(control, UINT64_C(1000000)));
 
+    /* Batch plans now share Q64 admission. Select one actual metadata action
+     * so this cancellation remains before frame construction even when the
+     * source names are no longer traversed by the plan/target proof. */
+    wl_columnar_session_test_preflight_quantum = 1;
     rc = wl_session_step(session);
     CHECK(rc == EAGAIN);
     uint64_t operation_id = wl_evaluation_control_active_attempt_id(control);
@@ -7326,6 +7330,7 @@ test_controlled_batch_join_filter_map_step(void)
     CHECK(rc == EAGAIN);
     operation_id = wl_evaluation_control_active_attempt_id(control);
     CHECK(operation_id > cancelled_id && !columnar->cleanup_active);
+    wl_columnar_session_test_preflight_quantum = 64;
     bool finished = false;
     for (unsigned turn = 0; turn < 10000; ++turn) {
         rc = wl_session_step(session);
@@ -8177,6 +8182,25 @@ test_controlled_session_admission_matrix(void)
         controlled_observer_framed_lookup_hits = 0;
         wl_columnar_eval_serial_test_framed_checkpoint =
             controlled_observer_count_rule_start;
+        if (mode == OTHER_BATCH_SHAPE) {
+            CHECK(!controlled_recursive_run(base, control));
+            const col_rel_t *output = session_find_rel(session, "output");
+            CHECK(controlled_observer_framed_lookup_hits == 1 && output
+                && output->nrows == 3 && output->columns[0][0] == 3
+                && output->columns[0][1] == 7 && output->columns[0][2] == 11
+                && session->nrels == registered + 1
+                && !wl_evaluation_control_active_attempt_id(control)
+                && !session->cleanup_active && !session->cleanup_pending);
+            CHECK(wl_columnar_relation_snapshot_equal(before,
+                wl_columnar_relation_snapshot(input)));
+            CHECK(!wl_evaluation_control_report(control, &report)
+                && !report.result && report.consumed && !report.cleanup_status);
+            wl_columnar_eval_serial_test_framed_checkpoint = NULL;
+            CHECK(!wl_session_try_destroy(&base));
+            wl_evaluation_control_release(control);
+            wl_plan_free(plan); wirelog_program_free(program);
+            continue;
+        }
         CHECK(controlled_recursive_run(base, control) == ENOTSUP);
         CHECK(!controlled_observer_framed_lookup_hits
             && !wl_evaluation_control_active_attempt_id(control)
