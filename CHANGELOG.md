@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Immutable cold inputs stream global COUNT through audited direct MAP/FILTER
+  prefixes without reconstructing a resident source (#1372 follow-up).
+
 - Chunked cold loading supports STRING/flat INLINE inputs through ordinary
   scans and JOINs, retaining program intern and declaration capabilities (#1372).
 

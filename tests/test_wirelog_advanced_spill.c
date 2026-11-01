@@ -1430,6 +1430,87 @@ static void chunked_public_scans(void)
     }
 }
 
+typedef struct { unsigned rows; int64_t count; } cold_count_result_t;
+static void cold_count_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    if (strcmp(name, "result")) return;
+    cold_count_result_t *r = context; CHECK(cols == 1);
+    r->rows++; r->count = row[0];
+}
+static void cold_count_typed(const char *name,
+    const wirelog_typed_row_v1_t *row, int32_t diff, void *context)
+{
+    if (strcmp(name, "result")) return;
+    CHECK(diff == 1 && row->logical_ncols == 1 && row->physical_nlanes == 1);
+    CHECK(row->physical_types[0] == WIRELOG_TYPE_INT64);
+    int64_t value; memcpy(&value, row->lanes, sizeof(value));
+    cold_count_observe(name, &value, 1, context);
+}
+static void cold_global_counts(void)
+{
+    for (unsigned filtered = 0; filtered < 3; filtered++)
+        for (unsigned empty = 0; empty < 2; empty++) {
+            char text[256];
+            snprintf(text, sizeof(text), ".decl a(k:int64,v:int64)\n"
+                ".decl result(n:int64)\nresult(count(v)) :- a(k,v)%s.\n",
+                filtered == 1 ? ",v>2" : filtered == 2 ? ",v>99" : "");
+            cold_count_result_t oracle = {0};
+            for (unsigned mode = 0; mode < 3; mode++) {
+                wirelog_program_t *p = parse(text);
+                wirelog_session_options_v1_t o = configured();
+                wirelog_session_t *s = NULL;
+                CHECK(wirelog_session_create_with_options(p,
+                    WIRELOG_BACKEND_DEFAULT, 1, &o, &s) == WIRELOG_OK);
+                int64_t rows[] = {1, 1, 2, 3, 2, 3, 4, 5};
+                if (mode == 2) {
+                    CHECK(wirelog_session_begin_cold_input(s,
+                        "a") == WIRELOG_OK);
+                    CHECK(wirelog_session_append_cold_input(s, "a", NULL, 0,
+                        2) == WIRELOG_OK);
+                    if (!empty) {
+                        CHECK(wirelog_session_append_cold_input(s, "a", rows, 2,
+                            2) == WIRELOG_OK);
+                        CHECK(wirelog_session_append_cold_input(s, "a", rows+4,
+                            2, 2) == WIRELOG_OK);
+                    }
+                    CHECK(wirelog_session_finish_cold_input(s,
+                        "a") == WIRELOG_OK);
+                } else {
+                    if (!empty) CHECK(wirelog_session_insert(s, "a", rows, 4,
+                            2) == WIRELOG_OK);
+                    if (mode == 1) {
+                        /* Legacy sealing still refuses a fresh uninitialized numeric source. */
+                        if (empty) {
+                            CHECK(wirelog_session_seal_input(s,
+                                "a") == WIRELOG_ERR_EXEC);
+                            wirelog_session_destroy(s); wirelog_program_free(p);
+                            CHECK(!live_files());
+                            continue;
+                        }
+                        CHECK(wirelog_session_seal_input(s, "a") == WIRELOG_OK);
+                    }
+                }
+                for (unsigned repeat = 0; repeat < 2; repeat++) {
+                    cold_count_result_t r = {0}, typed = {0};
+                    CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                    CHECK(wirelog_session_snapshot(s, cold_count_observe,
+                        &r) == WIRELOG_OK);
+                    CHECK(wirelog_session_snapshot_typed(s, cold_count_typed,
+                        &typed) == WIRELOG_OK);
+                    CHECK(r.rows == typed.rows && r.count == typed.count);
+                    if (mode == 0) oracle = r;
+                    CHECK(r.rows == oracle.rows && r.count == oracle.count);
+                    CHECK(r.rows == (!empty && filtered != 2));
+                    CHECK(r.count == (empty ||
+                        filtered == 2 ? 0 : filtered ? 3 : 4));
+                }
+                wirelog_session_destroy(s); wirelog_program_free(p);
+                CHECK(!live_files());
+            }
+        }
+}
+
 int main(void)
 {
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
@@ -1448,6 +1529,7 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
+    cold_global_counts();
     chunked_public_scans(); chunked_public_joins();
     chunked_public_references(); chunked_public_budget();
     inline_public_projections(); inline_public_joins();

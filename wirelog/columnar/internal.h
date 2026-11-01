@@ -5039,6 +5039,16 @@ bool wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *plan,
 int wl_columnar_ops_cold_projection(const wl_plan_relation_t *plan,
     eval_stack_t *stack, wl_col_session_t *session);
 
+typedef struct {
+    uint32_t reduce_index, filter_count, operand;
+} wl_columnar_eval_plan_cold_aggregate_t;
+bool wl_columnar_eval_plan_cold_aggregate_decode(
+    const wl_plan_relation_t *plan, const char *name, uint32_t ncols,
+    const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_aggregate_t *out);
+int wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
+    eval_stack_t *stack, wl_col_session_t *session);
+
 /* Shared schema lookup semantics, including the resident col<N> fallback. */
 int wl_columnar_relation_schema_column_index(uint32_t ncols,
     const char *const *names, const char *name);

@@ -784,8 +784,8 @@ wl_columnar_session_cold_source_schema(const wl_col_session_t *s,
  * its own complete scalar schema, never the candidate's schema. Discovery is
  * read-only: a failed preflight must not allocate a resident registry hash. */
 static bool
-wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp)
+wl_columnar_session_cold_scan_rule(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, bool aggregate)
 {
     if (!rp || !rp->ops || !rp->op_count ||
         rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name)
@@ -828,7 +828,9 @@ wl_columnar_session_cold_projection_rule(const wl_col_session_t *s,
                 !(types[i] == WIRELOG_TYPE_STRING && s->intern &&
                 s->intern == s->plan->intern)) return false;
     }
-    return wl_columnar_eval_plan_cold_projection(rp, name, width, types);
+    return aggregate ? wl_columnar_eval_plan_cold_aggregate_decode(rp, name,
+               width, types, NULL) :
+           wl_columnar_eval_plan_cold_projection(rp, name, width, types);
 }
 
 /* Cold bindings never enter the raw relation registry. Only an audited,
@@ -857,8 +859,9 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
             const wl_plan_relation_t *rp = &sp->relations[ri];
             if (!rp->name || strcmp(rp->name, name) == 0 || !rp->ops)
                 return false;
-            bool projection = wl_columnar_session_cold_projection_rule(sess,
-                    rp);
+            bool projection = wl_columnar_session_cold_scan_rule(sess, rp,
+                    false);
+            bool aggregate = wl_columnar_session_cold_scan_rule(sess, rp, true);
             bool scan_join = wl_columnar_join_cold_scan_prefix(sess, rp, NULL);
             uint32_t scan_end = 1;
             while (scan_end < rp->op_count &&
@@ -870,7 +873,7 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                 scan_end > 1 && scan_end < rp->op_count &&
                 rp->ops[scan_end].op == WL_PLAN_OP_JOIN && !scan_join)
                 return false;
-            bool selected_projection = projection &&
+            bool selected_projection = (projection || aggregate) &&
                 !strcmp(rp->ops[0].relation_name, name);
             bool selected_join = rp->op_count &&
                 rp->ops[0].relation_name &&
@@ -885,8 +888,9 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     (op->op != WL_PLAN_OP_VARIABLE &&
                     op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
                     op->op != WL_PLAN_OP_CONSOLIDATE &&
-                    !((projection || scan_join) &&
-                    op->op == WL_PLAN_OP_FILTER)) ||
+                    !((projection || scan_join || aggregate) &&
+                    op->op == WL_PLAN_OP_FILTER) &&
+                    !(aggregate && op->op == WL_PLAN_OP_REDUCE)) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0 &&

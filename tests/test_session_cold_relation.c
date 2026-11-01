@@ -4273,6 +4273,123 @@ static void chunked_internal(void)
     }
 }
 
+static const wl_plan_relation_t *cold_aggregate_plan(fixture_t *f)
+{
+    for (uint32_t i = 0; i < f->plan->stratum_count; i++)
+        for (uint32_t j = 0; j < f->plan->strata[i].relation_count; j++) {
+            const wl_plan_relation_t *rp = &f->plan->strata[i].relations[j];
+            if (!strcmp(rp->name, "result")) return rp;
+        }
+    abort();
+}
+static void cold_global_internal(void)
+{
+    const char *text = ".decl b(k:int64,v:int64)\n.decl result(n:int64)\n"
+        "result(count(v)) :- b(k,v),v>=0.\n";
+    uint64_t scratch_extra[2] = {0};
+    for (unsigned mode = 0; mode < 2; mode++) {
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+        unsigned rows = mode ? 512 : 64;
+        int64_t chunk[128];
+        for (unsigned i = 0; i < 64; i++) {
+            chunk[2*i] = i; chunk[2*i+1] = i;
+        }
+        for (unsigned i = 0; i < rows; i += 64)
+            CHECK(wl_columnar_session_append_cold_input(f.session, "b", chunk,
+                64, 2) == OK);
+        CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+        const wl_plan_relation_t *rp = cold_aggregate_plan(&f);
+        CHECK(rp->op_count == 4 && rp->ops[1].op == WL_PLAN_OP_FILTER &&
+            rp->ops[2].op == WL_PLAN_OP_REDUCE &&
+            rp->ops[2].aggregate_index == 0);
+        eval_stack_t stack; eval_stack_init(&stack);
+        uint64_t before = reserved(&f);
+        read_fault = 5;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == EIO);
+        CHECK(!stack.top && reserved(&f) == before);
+        allocation_fault = 1;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == ENOMEM);
+        CHECK(!stack.top && reserved(&f) == before);
+        wl_columnar_ops_test_reduce_fail_output_alloc = true;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == ENOMEM);
+        wl_columnar_ops_test_reduce_fail_output_alloc = false;
+        CHECK(!stack.top && reserved(&f) == before);
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(f.governor);
+        uint64_t limit = atomic_load_explicit(&g->usable_bytes,
+                memory_order_acquire);
+        atomic_store_explicit(&g->usable_bytes, before, memory_order_release);
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == ENOSPC);
+        CHECK(!stack.top && reserved(&f) == before);
+        atomic_store_explicit(&g->usable_bytes, limit, memory_order_release);
+        stack.top = COL_STACK_MAX;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == ENOBUFS);
+        CHECK(stack.top == COL_STACK_MAX && reserved(&f) == before);
+        stack.top = 0;
+        budget_peak = before;
+        wl_columnar_memory_governor_test_admitted = budget_admitted;
+        CHECK(wl_columnar_ops_cold_aggregate(rp, &stack, s) == 0);
+        scratch_extra[mode] = budget_peak-before;
+        wl_columnar_memory_governor_test_admitted = NULL;
+        eval_entry_t e = eval_stack_pop(&stack);
+        CHECK(e.rel->nrows == 1 && e.rel->ncols == 1 &&
+            e.rel->columns[0][0] == (int64_t)rows);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        wl_plan_relation_t bad = *rp; wl_plan_op_t ops[5];
+        memcpy(ops, rp->ops, 4*sizeof(*ops)); bad.ops = ops;
+        ops[2].agg_fn = WIRELOG_AGG_SUM;
+        CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        ops[2] = rp->ops[2]; ops[2].agg_result_type = WL_PLAN_AGG_OPERAND_FLOAT;
+        CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        ops[2] = rp->ops[2]; ops[2].agg_expr.size--;
+        CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        ops[2] = rp->ops[2]; ops[2].group_by_count = 1;
+        CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        ops[2] = rp->ops[2]; ops[0].delta_mode = WL_DELTA_FORCE_DELTA;
+        CHECK(!wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        /* A direct projection duplicates lanes but must not deduplicate rows. */
+        ops[0] = rp->ops[0]; ops[4] = rp->ops[3]; ops[3] = rp->ops[2];
+        uint32_t projection[] = {1, 1};
+        ops[2] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP,
+                                .project_count =
+                                    2, .project_indices = projection};
+        bad.op_count = 5;
+        CHECK(wl_columnar_eval_plan_cold_aggregate_decode(&bad, "b", 2, NULL,
+            NULL));
+        CHECK(wl_columnar_ops_cold_aggregate(&bad, &stack, s) == 0);
+        e = eval_stack_pop(&stack);
+        CHECK(e.rel->columns[0][0] == (int64_t)rows);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        destroy(&f);
+    }
+    CHECK(scratch_extra[0] > 0 && scratch_extra[0] == scratch_extra[1]);
+    /* COUNT retains reference provenance without interpreting STRING IDs. */
+    fixture_t f =
+        fixture(
+        ".decl b(s:string)\n.decl result(n:int64)\nresult(count(s)) :- b(s).\n",
+        4*1024*1024, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    int64_t id = wl_intern_put(s->intern, "counted"); CHECK(id >= 0);
+    CHECK(wl_columnar_session_begin_cold_input(f.session, "b") == OK);
+    CHECK(wl_columnar_session_append_cold_input(f.session, "b", &id, 1,
+        1) == OK);
+    CHECK(wl_columnar_session_finish_cold_input(f.session, "b") == OK);
+    eval_stack_t stack; eval_stack_init(&stack);
+    CHECK(wl_columnar_ops_cold_aggregate(cold_aggregate_plan(&f), &stack,
+        s) == 0);
+    eval_entry_t e = eval_stack_pop(&stack); CHECK(e.rel->columns[0][0] == 1);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0); destroy(&f);
+}
+
 int main(void)
 {
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
@@ -4282,6 +4399,7 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
+    cold_global_internal();
     chunked_internal(); chunked_join_failure();
     chunked_reference_failures(); chunked_causal_budget();
     cold_scan_join_key_names();

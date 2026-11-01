@@ -544,6 +544,82 @@ wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
                types, NULL);
 }
 
+/* Separate from scan decoding: a reduction needs no materialized prefix. */
+bool
+wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
+    const char *name, uint32_t ncols, const wirelog_column_type_t *types,
+    wl_columnar_eval_plan_cold_aggregate_t *out)
+{
+    if (!rp || !name || !ncols || !rp->ops || rp->op_count < 3)
+        return false;
+    uint32_t end = rp->op_count - 2, width = ncols;
+    const wl_plan_op_t *reduce = &rp->ops[end];
+    if (rp->ops[0].op != WL_PLAN_OP_VARIABLE ||
+        !rp->ops[0].relation_name || strcmp(rp->ops[0].relation_name,
+        name) != 0 ||
+        rp->ops[end + 1].op != WL_PLAN_OP_CONSOLIDATE ||
+        reduce->op != WL_PLAN_OP_REDUCE ||
+        reduce->agg_fn != WIRELOG_AGG_COUNT ||
+        reduce->group_by_count || reduce->group_by_indices ||
+        reduce->aggregate_index ||
+        reduce->agg_result_type != WL_PLAN_AGG_OPERAND_SCALAR)
+        return false;
+    wl_columnar_eval_plan_cold_aggregate_t decoded = {.reduce_index = end};
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->opaque_data || op->materialized || op->right_relation ||
+            op->key_count || op->left_keys || op->right_keys ||
+            (i && op->relation_name) || op->right_filter_expr.size ||
+            op->right_filter_expr.data ||
+            (op->delta_mode != WL_DELTA_AUTO &&
+            op->delta_mode != WL_DELTA_FORCE_FULL) ||
+            (op->op != WL_PLAN_OP_FILTER &&
+            (op->filter_expr.data || op->filter_expr.size)) ||
+            (op->op != WL_PLAN_OP_MAP &&
+            (op->project_count || op->project_indices || op->map_exprs ||
+            op->map_expr_count)) ||
+            (i != end &&
+            (op->agg_expr.data || op->agg_expr.size || op->group_by_count ||
+            op->group_by_indices)))
+            return false;
+        if (!i || i >= end) continue;
+        if (op->op == WL_PLAN_OP_MAP) {
+            if (!wl_columnar_eval_plan_cold_map(rp, i, width, ncols,
+                types)) return false;
+            width = op->project_count;
+        } else if (op->op == WL_PLAN_OP_FILTER) {
+            wl_columnar_eval_plan_cold_predicate_t predicate;
+            uint32_t source;
+            if (!wl_columnar_eval_plan_cold_predicate_decode(op, width, NULL,
+                &predicate) ||
+                !wl_columnar_eval_plan_cold_column(rp, i, predicate.column,
+                ncols, &source) ||
+                (types && types[source] != WIRELOG_TYPE_INT64)) return false;
+            decoded.filter_count++;
+        } else return false;
+    }
+    const wl_plan_expr_buffer_t *expr = &reduce->agg_expr;
+    if (expr->data || expr->size) {
+        if (!expr->data || expr->size < 7 ||
+            (expr->data[0] != WL_PLAN_EXPR_VAR &&
+            expr->data[0] != WL_PLAN_EXPR_VAR_STRING &&
+            expr->data[0] != WL_PLAN_EXPR_VAR_FLOAT)) return false;
+        uint16_t len; memcpy(&len, expr->data + 1, sizeof(len));
+        if ((uint32_t)len + 3 != expr->size || memcmp(expr->data + 3, "col",
+            3) != 0) return false;
+        uint32_t column = 0;
+        for (uint32_t i = 6; i < expr->size; i++) {
+            unsigned digit = (unsigned)expr->data[i] - '0';
+            if (digit > 9 || column > (UINT32_MAX - digit) / 10) return false;
+            column = column * 10 + digit;
+        }
+        if (column >= width || !wl_columnar_eval_plan_cold_column(rp, end,
+            column, ncols, &decoded.operand)) return false;
+    }
+    if (out) *out = decoded;
+    return true;
+}
+
 int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
@@ -567,6 +643,12 @@ col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
                         join_index);
                 return rc ? rc : wl_columnar_eval_plan_body(rplan, stack, sess,
                            join_index);
+            }
+            if (i == 0 && wl_columnar_eval_plan_cold_aggregate_decode(rplan,
+                cold->name, cold->ncols, wl_columnar_session_cold_types(cold),
+                NULL)) {
+                int rc = wl_columnar_ops_cold_aggregate(rplan, stack, sess);
+                return rc ? rc : col_op_consolidate(stack, sess);
             }
             if (!wl_columnar_eval_plan_cold_projection(rplan, cold->name,
                 cold->ncols,

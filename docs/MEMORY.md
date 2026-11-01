@@ -5261,7 +5261,7 @@ and retained-output floors remain additional; arbitrary-budget completion is
 not promised. No automatic mutable-session or legacy differential-arrangement
 migration, SIDE/nested support, or #1373 scheduling is introduced.
 
-### Remaining #1372 implementation groups
+### Follow-up scope after #1372
 
 The sealed scalar numeric/STRING and declared flat INLINE field JOIN/projection
 subsets now have actual persistent cold storage,
@@ -5275,8 +5275,9 @@ Public advanced configuration and explicit sealing are now available for the
 subsets above. Broader consumer support and native platform qualification
 remain evidence-dependent.
 Existing payload and sealed-session evidence cannot replace those acceptance
-requirements. Close #1372 only when the remaining gaps have concrete tests.
-#1373 scheduling and #1385 DOOP qualification remain separate; #1372 stays open.
+requirements. Issue #1372 was closed after the chunk-loading group merged;
+these broader capabilities remain explicit follow-up scope. #1373 scheduling
+and #1385 DOOP qualification remain separate.
 
 The #1821 controlled prefix-discovery consolidation optimization introduces no
 additional owner or allocation. Its suffix sort and prefix merge reuse the
@@ -5473,3 +5474,21 @@ Reference tests independently exercise admission and write failures, invalid
 unused STRING lanes, declaration/functor mismatch, pending/finalized pins and
 retry without losing the prefix. Broader mutable/differential session routing,
 logical time, SIDE/nested consumers and scheduling remain outside this group.
+
+### Streaming cold global COUNT
+
+An ordinary serial immutable input may feed direct global COUNT after an audited
+direct-column MAP / INT64 literal FILTER prefix. The aggregate decoder is
+separate from cold scan eligibility. It reads a payload or finalized trace
+through the existing bounded reader, validates ordinary metadata even on
+filtered-out rows, and counts physical rows without pre-consolidation. Empty
+or all-filtered input produces no row, matching resident REDUCE semantics.
+
+The prefix is not materialized. Attempt scratch is the predicate array plus
+one reader/cursor and a private one-row INT64 result, independent of source
+cardinality; trace node/directory and intern costs remain additional. Read,
+admission, allocation or stack-publication failure destroys private ownership
+and leaves the immutable source reusable. Only complete results enter the
+evaluator stack. Existing projection/JOIN prefix output floors are unchanged.
+Grouped COUNT, other aggregate functions, expressions, recursive/signed/control
+aggregation and aggregate-over-JOIN are not admitted by this initial increment.
