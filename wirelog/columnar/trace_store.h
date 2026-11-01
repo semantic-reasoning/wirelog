@@ -46,6 +46,15 @@ wl_columnar_spill_status_t wl_columnar_trace_store_floor_with_inline(
 wl_columnar_trace_store_state_t wl_columnar_trace_store_state(
     const wl_columnar_trace_store_t *trace);
 
+/* Borrowed immutable declaration/capability queries while the append owner is
+ * live. No snapshot directory or fresh intern pin is acquired. Caller must stop
+ * using the owner at retirement; finished readers use snapshot queries instead.
+ * These expose schema during loading, never unfinalized row access. */
+bool wl_columnar_trace_store_uses_intern(const wl_columnar_trace_store_t *trace,
+    const wl_intern_t *intern);
+const wirelog_column_t *wl_columnar_trace_store_inline_schema(
+    const wl_columnar_trace_store_t *trace, uint32_t *logical_count);
+
 /* Every lifecycle call (including cursor acquisition/read/release) is externally
  * serialized against lifecycle mutation. Independently acquired cursors of the
  * SAME trace may read concurrently, but never concurrently with explicit

@@ -586,18 +586,27 @@ wl_columnar_trace_store_cursor_read(wl_columnar_trace_store_cursor_t *c,
                cancel, context, lanes, metadata);
 }
 
+bool wl_columnar_trace_store_uses_intern(const wl_columnar_trace_store_t *t,
+    const wl_intern_t *intern)
+{
+    return t && intern && t->intern == intern;
+}
+const wirelog_column_t *wl_columnar_trace_store_inline_schema(
+    const wl_columnar_trace_store_t *t, uint32_t *logical_count)
+{
+    if (logical_count) *logical_count = t ? t->logical_count : 0;
+    return t && t->logical_count ? wl_columnar_trace_store_logical(t) : NULL;
+}
 bool wl_columnar_trace_store_snapshot_uses_intern(
     const wl_columnar_trace_store_snapshot_t *s, const wl_intern_t *intern)
 {
-    return s && intern && s->trace->intern == intern;
+    return wl_columnar_trace_store_uses_intern(s ? s->trace : NULL, intern);
 }
 const wirelog_column_t *wl_columnar_trace_store_snapshot_inline_schema(
     const wl_columnar_trace_store_snapshot_t *s, uint32_t *logical_count)
 {
-    if (logical_count) *logical_count = s ? s->trace->logical_count : 0;
-    return s &&
-           s->trace->logical_count ? wl_columnar_trace_store_logical(s->trace) :
-           NULL;
+    return wl_columnar_trace_store_inline_schema(s ? s->trace : NULL,
+               logical_count);
 }
 wl_columnar_spill_status_t wl_columnar_trace_store_cursor_resolve_string(
     const wl_columnar_trace_store_cursor_t *c, uint64_t id, const char **out)

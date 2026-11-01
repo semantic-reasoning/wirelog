@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Chunked cold loading supports STRING/flat INLINE inputs through ordinary
+  scans and JOINs, retaining program intern and declaration capabilities (#1372).
+
 - Ordinary session JOINs consume chunked numeric inputs alongside sealed or
   resident sources through independent bounded readers (#1372).
 

@@ -604,6 +604,13 @@ static void reference_storage(void)
             CHECK(wl_columnar_trace_store_create_reference(g, types, 3,
                 kind ? columns : NULL, kind ? 2 : 0, intern, &t) == OK);
             CHECK(reserved(g) == before + owner);
+            CHECK(wl_columnar_trace_store_uses_intern(t, intern));
+            uint32_t owner_logical = UINT32_MAX;
+            const wirelog_column_t *owner_columns =
+                wl_columnar_trace_store_inline_schema(t, &owner_logical);
+            CHECK(owner_logical == (kind ? 2u : 0u) &&
+                (kind ? owner_columns != NULL : owner_columns == NULL));
+            CHECK(reserved(g) == before + owner);
             col_rel_t *r = reference_source(g, kind, 0, 11);
             CHECK(wl_columnar_trace_store_append_capture_reference(t, r,
                 kind ? columns : NULL, kind ? 2 : 0, intern,
