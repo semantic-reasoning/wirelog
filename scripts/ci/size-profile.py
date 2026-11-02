@@ -11,9 +11,22 @@ import sys
 import re
 import tempfile
 
+# Options that are not part of the production recipe identity.
+#
+# The first group is environment/install-path specific and never belongs in a
+# recipe fingerprint.  The second group (tests / examples / documentation /
+# enable_fuzz) only adds extra, non-production build targets (test suites, demo
+# executables, docs, the fuzz harness) and never alters how the production
+# `wirelog` library is compiled or linked; the resolved effective_compile_/
+# link_arguments and the binary size budget still guard any real recipe drift.
+# Excluding them lets a PR introduce or toggle such an option (e.g. the new
+# `examples` demos gate) without perturbing the size-comparison baseline, while
+# every option that actually shapes the library (optimization, b_lto, mbedTLS,
+# ...) stays fail-closed.
 EXCLUDED_OPTIONS = {"prefix", "bindir", "datadir", "includedir", "infodir", "libdir",
                     "libexecdir", "localedir", "localstatedir", "mandir", "meson_command",
-                    "sharedstatedir", "sysconfdir"}
+                    "sharedstatedir", "sysconfdir",
+                    "tests", "examples", "documentation", "enable_fuzz"}
 
 def run(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, encoding="utf-8")
