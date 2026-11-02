@@ -3433,6 +3433,153 @@ wl_columnar_eval_stack_framed_context(
     return 0;
 }
 
+/* Output storage is caller owned. These arithmetic predicates inspect no
+ * output bytes and permit exact adjacency without pointer-end overflow. */
+static bool
+wl_columnar_eval_stack_copy_ranges_disjoint(const void *a, size_t a_size,
+    const void *b, size_t b_size)
+{
+    uintptr_t first = (uintptr_t)a, second = (uintptr_t)b;
+    return second < first ? first - second >= b_size
+                          : second - first >= a_size;
+}
+
+static bool
+wl_columnar_eval_stack_frame_copy_output(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const void *out, size_t bytes)
+{
+    return out && (uintptr_t)out <= UINTPTR_MAX - bytes
+           && wl_columnar_eval_stack_copy_ranges_disjoint(frame, sizeof(*frame),
+               out, bytes);
+}
+
+int
+wl_columnar_eval_stack_framed_authenticate(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_col_session_t *session,
+    const wl_columnar_eval_serial_framed_attempt_t *expected)
+{
+    if (!frame || !session || !expected) return EINVAL;
+    if (session->cleanup_active != frame) return EBUSY;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session ||
+        &frame->framed != expected) return EINVAL;
+    return wl_columnar_eval_serial_framed_owner_valid(expected,
+               frame) ? 0 : EINVAL;
+}
+
+static void
+wl_columnar_eval_stack_framed_status_copy(
+    const wl_columnar_eval_serial_framed_attempt_t *ctx,
+    wl_columnar_eval_serial_framed_status_t *out)
+{
+    out->phase = ctx->phase; out->execution_result = ctx->primary_result;
+    out->cleanup_result = ctx->cleanup_result;
+    out->ready = ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY;
+    out->retained = ctx->cleanup_result != 0; out->committed = ctx->committed;
+}
+
+int
+wl_columnar_eval_stack_framed_inspect(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_col_session_t *session, wl_columnar_eval_serial_framed_view_t *out)
+{
+    if (!frame || !session || !out) return EINVAL;
+    if (session->cleanup_active != frame) return EBUSY;
+    if (!wl_columnar_eval_stack_unary_frame_valid(frame)
+        || frame->session != session) return EINVAL;
+    if (!wl_columnar_eval_stack_frame_copy_output(frame, out,
+        sizeof(*out))) return EINVAL;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    /* Host inspection retains the old host's invalid-owner/native mapping. */
+    if (!wl_columnar_eval_serial_framed_owner_valid(ctx, frame)) return EBUSY;
+    out->plan = ctx->plan; out->session = ctx->session;
+    out->control = ctx->control;
+    out->private_bindings = ctx->private_bindings;
+    out->capture_out = (const void *)ctx->capture_out;
+    out->attempt_id = ctx->attempt_id;
+    out->operation_identity = ctx->operation_identity;
+    out->capture_only = ctx->capture_only;
+    out->controlled_materialized_batch_fallback =
+        ctx->controlled_materialized_batch_fallback;
+    out->abort_supported = ctx->abort_supported;
+    out->cleanup_receipt_key = ctx->cleanup_receipt_key;
+    wl_columnar_eval_stack_framed_status_copy(ctx, &out->status);
+    return 0;
+}
+
+static bool
+wl_columnar_eval_stack_framed_key_matches(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_col_session_t *session,
+    const wl_columnar_eval_serial_framed_attempt_t *ctx,
+    const wl_columnar_eval_cleanup_receipt_key_t *key)
+{
+    return key->session_generation ==
+           session->cleanup_receipt_session_generation
+           && key->receipt_id == frame->cleanup_receipt_id
+           && key->plan_epoch == frame->cleanup_receipt_plan_epoch
+           && key->operation_attempt_id == ctx->attempt_id
+           && key->operation_id == ctx->operation_identity
+           && wl_columnar_eval_cleanup_receipt_key_equal(key,
+               &ctx->cleanup_receipt_key);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+void (*wl_columnar_eval_stack_test_framed_status_checkpoint)(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *);
+#endif
+
+int
+wl_columnar_eval_stack_framed_status(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_status_t *out,
+    wl_columnar_eval_cleanup_receipt_key_t *key_out,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!frame || !session) return EINVAL;
+    if (session->cleanup_active != frame) return EBUSY;
+    const wl_columnar_eval_serial_framed_attempt_t *ctx = &frame->framed;
+    int rc = wl_columnar_eval_stack_framed_authenticate(frame, session, ctx);
+    if (rc) return rc;
+    if (!wl_columnar_eval_stack_frame_copy_output(frame, out, sizeof(*out))
+        || !wl_columnar_eval_stack_frame_copy_output(frame, key_out,
+        sizeof(*key_out))
+        || !wl_columnar_eval_stack_copy_ranges_disjoint(out, sizeof(*out),
+        key_out, sizeof(*key_out)))
+        return EINVAL;
+    wl_evaluation_control_t *control = ctx->control;
+    uint64_t identity = wl_evaluation_control_identity(control);
+    uint64_t id = ctx->attempt_id, operation = ctx->operation_identity;
+    wl_columnar_eval_cleanup_receipt_key_t key = ctx->cleanup_receipt_key;
+    if (!wl_columnar_eval_stack_framed_key_matches(frame, session, ctx, &key)
+        || !funding || funding == control || !funding_id
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        funding_id) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK);
+    if (rc) return rc;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_stack_test_framed_status_checkpoint)
+        wl_columnar_eval_stack_test_framed_status_checkpoint(frame, session);
+#endif
+    /* The checkpoint can genuinely retire/recreate the frame. Prove live
+     * lineage before ANY saved frame/context access, then prove generation. */
+    if (session->cleanup_active != frame) return EBUSY;
+    rc = wl_columnar_eval_stack_framed_authenticate(frame, session, ctx);
+    if (rc) return rc;
+    if (ctx->control != control ||
+        wl_evaluation_control_identity(control) != identity
+        || ctx->attempt_id != id || ctx->operation_identity != operation
+        || !wl_columnar_eval_stack_framed_key_matches(frame, session, ctx, &key)
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        funding_id) return EINVAL;
+    wl_columnar_eval_stack_framed_status_copy(ctx, out);
+    *key_out = key;
+    return 0;
+}
+
 int
 wl_columnar_eval_stack_framed_fresh(
     wl_columnar_eval_stack_cleanup_frame_t *frame,

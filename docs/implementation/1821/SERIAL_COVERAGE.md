@@ -1174,3 +1174,49 @@ it is not evidence that the compiler naturally emits a64-input operator.
 This closes the metadata caller-scan gap only. Prepared unary publication,
 registered cache ownership/insertion, strict/cap/shared policy and complete
 observed/configured successor qualification remain separate bundle obligations.
+
+
+### Copied framed authentication and status foundation
+
+The framed host now matches active requests through a copied inspection view.
+It contains only const comparison tokens, IDs, flags, cleanup key and status;
+it returns no mutable context, frame, stack or relation loan. The error-only
+frame authenticator compares actual active lineage before inspecting the frame
+and verifies exact embedded context and native ownership. Ordinary mutation
+still acquires its existing mutable context; this foundation introduces no
+prepared-publication marker or replacement capability.
+
+Direct framed status retains its384 independent-funding fee. Host STATUS keeps
+its outer384 plus inner384, including the old one-short failure metadata: after
+the first charge, a refused inner charge still reports STATUS kind and the real
+cleanup key, while status stays initialized. Observation consumes no pending
+grant/previous tuple or original work and does not require an active original
+attempt. Direct invalid-native observation returns EINVAL; host inspection
+retains EBUSY. Existing ordinary mutation and child tariffs remain unchanged.
+
+Both status and key outputs must be external to the complete actual frame and
+mutually disjoint. Before debit, status captures the original control identity,
+attempt/operation IDs and all five cleanup-key fields authenticated against the
+actual frame/session. After its test-only checkpoint, it first checks live
+session.cleanup_active before any saved frame/context access, then revalidates
+native ownership, complete receipt generation, control/operation identity and
+funding generation. Thus genuine frame retirement or address reuse cannot turn
+a copied status request into a stale read. The control charge itself has no
+production callback; the explicit test hook exercises this defensive boundary.
+
+Serial tests reach actual PENDING, READY and DONE, compare all copied fields
+and untouched context/pending tuples, exercise direct383/384 and host767/768,
+reject actual frame and mutual output overlap before debit, and verify native
+refusal. A genuine finished/reset original successor receives no status debit.
+The retirement hook actually closes the DONE frame, acknowledges its receipt,
+and optionally begins a real new receipted framed owner; direct wrapper,
+frame-based and host STATUS all refuse stale observation without touching the
+freed context. The new owner is normally aborted/drained and governors balance.
+No address reuse, READY state, receipt generation or prepared marker is seeded.
+
+The fixed expanded logical source inventories are separate from the payments:
+authenticate29, common validation31 (previous upper34), copied inspection65,
+frame-status180 and old context wrapper215. The host outer139 and inner180
+are separate existing protocol regions; no whole STATUS-call256 claim is made.
+These observations supply a prerequisite for later prepared unary exclusion;
+cache/strict/cap/shared and general transaction acceptance remain outstanding.

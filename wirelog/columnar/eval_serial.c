@@ -29,7 +29,6 @@
  * Source accounting and first-capacity obligations are qualified against the
  * complete frozen implementation, including callers, before activation. */
 enum {
-    WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK = 384,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_BOOTSTRAP = 392,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_PAYMENT = 192,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_WORK = 256,
@@ -71,14 +70,11 @@ wl_columnar_eval_serial_framed_owner_valid(
 
 static int
 wl_columnar_eval_serial_framed_validate(
-    wl_columnar_eval_serial_framed_attempt_t *ctx)
+    const wl_columnar_eval_serial_framed_attempt_t *ctx)
 {
-    if (!ctx || !wl_columnar_eval_serial_framed_owner_valid(ctx, ctx->frame))
-        return EINVAL;
-    wl_columnar_eval_serial_framed_attempt_t *original = NULL;
-    int rc = wl_columnar_eval_stack_framed_context(ctx->frame, ctx->session,
-            &original);
-    return rc ? rc : original == ctx ? 0 : EINVAL;
+    if (!ctx) return EINVAL;
+    return wl_columnar_eval_stack_framed_authenticate(ctx->frame, ctx->session,
+               ctx);
 }
 
 static int
@@ -784,13 +780,9 @@ wl_columnar_eval_serial_framed_attempt_status(
 {
     int rc = wl_columnar_eval_serial_framed_validate(ctx);
     if (rc || !out) return rc ? rc : EINVAL;
-    rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
-    if (rc) return rc;
-    out->phase = ctx->phase; out->execution_result = ctx->primary_result;
-    out->cleanup_result = ctx->cleanup_result;
-    out->ready = ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY;
-    out->retained = ctx->cleanup_result != 0; out->committed = ctx->committed;
-    return 0;
+    wl_columnar_eval_cleanup_receipt_key_t key;
+    return wl_columnar_eval_stack_framed_status(ctx->frame, ctx->session, out,
+               &key, funding, funding_id);
 }
 
 int
@@ -1335,40 +1327,56 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
         if (recursive) return ENOTSUP;
         int protocol = 0;
         if (sess->cleanup_active) {
-            wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
-            protocol = wl_columnar_eval_stack_framed_context(
-                sess->cleanup_active, sess, &ctx);
+            wl_columnar_eval_stack_cleanup_frame_t *frame =
+                sess->cleanup_active;
+            wl_columnar_eval_serial_framed_view_t view;
+            protocol = wl_columnar_eval_stack_framed_inspect(frame, sess,
+                    &view);
             if (protocol) return protocol;
-            if (!wl_columnar_eval_serial_framed_owner_valid(ctx,
-                sess->cleanup_active)) return EBUSY;
-            if (ctx->plan != rp || ctx->session != sess
-                || ctx->control != request->operation
-                || ctx->attempt_id != request->operation_id
-                || ctx->operation_identity != request->operation_identity
-                || ctx->controlled_materialized_batch_fallback
+            if (view.plan != rp || view.session != sess
+                || view.control != request->operation
+                || view.attempt_id != request->operation_id
+                || view.operation_identity != request->operation_identity
+                || view.controlled_materialized_batch_fallback
                 != request->controlled_materialized_batch_fallback
-                || ctx->private_bindings != request->private_bindings
-                || ctx->capture_only != request->capture_only
-                || ctx->capture_out != request->capture_out)
+                || view.private_bindings != request->private_bindings
+                || view.capture_only != request->capture_only
+                || view.capture_out != (const void *)request->capture_out)
                 return EINVAL;
             if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT
-                && !ctx->abort_supported) return ENOTSUP;
+                && !view.abort_supported) return ENOTSUP;
             if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_RETRY
                 || request->action ==
                 WL_COLUMNAR_EVAL_SERIAL_FRAMED_RECEIPT_ACK)
                 return EBUSY;
+            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
+                protocol = wl_columnar_eval_serial_framed_fund(request->funding,
+                        request->funding_id, request->operation);
+                if (protocol) return protocol;
+                /* Preserve real key/kind even when inner384 is refused. */
+                reply->cleanup_receipt_key = view.cleanup_receipt_key;
+                reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS;
+                wl_columnar_eval_serial_framed_status_t status;
+                wl_columnar_eval_cleanup_receipt_key_t key;
+                protocol = wl_columnar_eval_stack_framed_status(frame, sess,
+                        &status, &key, request->funding, request->funding_id);
+                if (!protocol) {
+                    reply->status = status; reply->cleanup_receipt_key = key;
+                }
+                return protocol;
+            }
+            /* Ordinary mutation retains its actual mutable context loan.
+             * Inspection and getter are callback-free; no observation grants
+             * independent mutation authority. */
+            wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+            protocol = wl_columnar_eval_stack_framed_context(frame, sess, &ctx);
+            if (protocol) return protocol;
+            if (!wl_columnar_eval_serial_framed_owner_valid(ctx,
+                frame)) return EBUSY;
             protocol = wl_columnar_eval_serial_framed_fund(request->funding,
                     request->funding_id, request->operation);
             if (protocol) return protocol;
             reply->cleanup_receipt_key = ctx->cleanup_receipt_key;
-            /* Original may be stopped or turned over: its authenticated old
-             * parent still owns cleanup. No fresh absence lookup is allowed. */
-            if (request->action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS) {
-                reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS;
-                return wl_columnar_eval_serial_framed_attempt_status(ctx,
-                           &reply->status, request->funding,
-                           request->funding_id);
-            }
             if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) {
                 if (!request->previous_valid
                     || request->previous_kind !=
