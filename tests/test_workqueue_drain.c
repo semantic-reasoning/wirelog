@@ -40,6 +40,7 @@ static struct {
     void *worker_arg;
     bool start_worker;
     unsigned work_waits;
+    unsigned open_waits; /* waits entered with the dispatch gate open */
     unsigned calls;
     bool active_started;
     bool release_active;
@@ -74,6 +75,8 @@ observed_cond_wait(wl_cond_t *cond, wl_mutex_t *mutex)
     REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     if (cond == &observer.queue->work_avail) {
         observer.work_waits++;
+        if (observer.queue->dispatch_enabled)
+            observer.open_waits++;
     } else if (cond == &observer.queue->all_done && is_drain_thread) {
         observer.drain_waiting = true;
         observer.drain_gate_closed = !observer.queue->dispatch_enabled;
@@ -276,10 +279,7 @@ test_active_and_pending(unsigned pending)
     item_t *items = calloc(pending ? pending : 1, sizeof(*items));
     REQUIRE(items != NULL);
     REQUIRE(wl_workqueue_submit(queue, blocked_item, NULL) == 0);
-    REQUIRE(wl_mutex_lock(&queue->mutex) == 0);
-    queue->dispatch_enabled = true;
-    REQUIRE(wl_cond_broadcast(&queue->work_avail) == 0);
-    REQUIRE(wl_mutex_unlock(&queue->mutex) == 0);
+    REQUIRE(wl_workqueue_dispatch(queue) == 0);
     start_worker();
     REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
     while (!observer.active_started)
@@ -345,6 +345,95 @@ test_pending_and_shutdown(void)
     free(items);
 }
 
+static void
+wait_for_calls(unsigned calls)
+{
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
+    while (observer.calls < calls)
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+}
+
+static bool
+dispatch_open(wl_work_queue_t *queue)
+{
+    REQUIRE(wl_mutex_lock(&queue->mutex) == 0);
+    bool open = queue->dispatch_enabled;
+    REQUIRE(wl_mutex_unlock(&queue->mutex) == 0);
+    return open;
+}
+
+/* Issue #1373: dispatch returns with the batch running on workers, so the
+ * caller can serve a callback that waits on it.  wait_all then closes it. */
+static void
+test_dispatch_serves_running_batch(void)
+{
+    wl_work_queue_t *queue = new_queue();
+    /* The worker is already waiting with the gate closed, and a closed-gate
+     * submit does not signal: only dispatch's broadcast can wake it. */
+    start_worker();
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
+    while (observer.work_waits == 0)
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_workqueue_submit(queue, blocked_item, NULL) == 0);
+    REQUIRE(wl_workqueue_dispatch(queue) == 0);
+    check(dispatch_open(queue), "dispatch opens the gate");
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
+    while (!observer.active_started)
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    /* Only this thread can release the callback, after dispatch returned. */
+    observer.release_active = true;
+    REQUIRE(wl_cond_broadcast(&observer.changed) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_workqueue_wait_all(queue) == 0);
+    check(batch_reset(queue), "wait_all after dispatch closes the batch");
+    delete_queue(queue);
+    check(observer.active_calls == 1, "dispatched callback executes once");
+}
+
+static void
+test_dispatch_empty_and_late_submit(void)
+{
+    wl_work_queue_t *queue = new_queue();
+    start_worker();
+    REQUIRE(wl_workqueue_dispatch(queue) == 0);
+    REQUIRE(wl_workqueue_wait_all(queue) == 0);
+    check(batch_reset(queue), "empty dispatch leaves an empty batch");
+
+    /* A submit after dispatch runs without another dispatch or wait, even
+     * when the worker has already gone back to waiting on an empty ring.
+     * The gate is closed between batches, so a wait entered with it open
+     * follows this dispatch's broadcast: only a new signal can end it. */
+    item_t item = { 0 };
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
+    unsigned open_waits = observer.open_waits;
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_workqueue_dispatch(queue) == 0);
+    REQUIRE(wl_mutex_lock(&observer.mutex) == 0);
+    while (observer.open_waits == open_waits)
+        REQUIRE(wl_cond_wait(&observer.changed, &observer.mutex) == 0);
+    REQUIRE(wl_mutex_unlock(&observer.mutex) == 0);
+    REQUIRE(wl_workqueue_submit(queue, count_item, &item) == 0);
+    wait_for_calls(1);
+    REQUIRE(wl_workqueue_wait_all(queue) == 0);
+    check_items(&item, 1);
+    check(batch_reset(queue), "late submit batch closes on wait_all");
+
+    /* drain after dispatch closes the gate as well. */
+    item_t drained = { 0 };
+    REQUIRE(wl_workqueue_dispatch(queue) == 0);
+    REQUIRE(wl_workqueue_submit(queue, count_item, &drained) == 0);
+    wait_for_calls(2);
+    is_drain_thread = true;
+    REQUIRE(wl_workqueue_drain(queue) == 0);
+    is_drain_thread = false;
+    check(drained.calls == 1, "dispatched item runs exactly once before drain");
+    check(batch_reset(queue), "drain after dispatch closes the batch");
+    reuse_queue(queue);
+    delete_queue(queue);
+}
+
 int
 main(void)
 {
@@ -353,6 +442,8 @@ main(void)
     test_active_and_pending(3);
     test_active_and_pending(0); /* All workers active; ring empty. */
     test_pending_and_shutdown();
+    test_dispatch_serves_running_batch();
+    test_dispatch_empty_and_late_submit();
     fprintf(stderr, "workqueue_drain: %u failure(s)\n", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

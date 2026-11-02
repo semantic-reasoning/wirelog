@@ -7,14 +7,15 @@
  *
  * INTERNAL - not installed, not part of public API.
  *
- * Implements the 5-function interface declared in workqueue.h:
- *   wl_workqueue_create, wl_workqueue_submit, wl_workqueue_wait_all,
- *   wl_workqueue_drain, wl_workqueue_destroy.
+ * Implements the interface declared in workqueue.h:
+ *   wl_workqueue_create, wl_workqueue_submit, wl_workqueue_dispatch,
+ *   wl_workqueue_wait_all, wl_workqueue_drain, wl_workqueue_destroy.
  *
  * Thread pool design:
  *   - Fixed-size pool of threads, created at create() time.
  *   - Ring buffer of work items protected by a single mutex.
  *   - Workers block on a condition variable until work is available.
+ *   - dispatch() lets workers take the submitted items and returns.
  *   - wait_all() blocks until all submitted items complete (barrier).
  *   - drain() executes all pending items synchronously on the caller thread.
  */
@@ -56,7 +57,8 @@ struct wl_work_queue {
     /* Barrier tracking */
     uint32_t submitted; /* total items submitted in current batch */
     uint32_t completed; /* total items completed in current batch */
-    bool dispatch_enabled; /* protected by mutex; opened by wait_all */
+    bool dispatch_enabled; /* protected by mutex; opened by dispatch or
+                            * wait_all, closed by wait_all or drain */
 
     /* Shutdown flag */
     bool shutdown;
@@ -249,7 +251,26 @@ wl_workqueue_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx)
 
     /* wait_all() opens the dispatch gate and wakes workers after submission.
      * Suppressing signals alone would not prevent startup or late workers
-     * from consuming a submit-only batch intended for synchronous drain. */
+     * from consuming a submit-only batch intended for synchronous drain.
+     * Once dispatch() has opened the gate, an idle worker must be woken. */
+    if (wq->dispatch_enabled)
+        wl_cond_signal(&wq->work_avail);
+    wl_mutex_unlock(&wq->mutex);
+
+    return 0;
+}
+
+int
+wl_workqueue_dispatch(wl_work_queue_t *wq)
+{
+    if (!wq)
+        return -1;
+
+    /* Open the gate and return: the caller can then serve callbacks that
+     * wait on it.  The gate stays open until wait_all() or drain(). */
+    wl_mutex_lock(&wq->mutex);
+    wq->dispatch_enabled = true;
+    wl_cond_broadcast(&wq->work_avail);
     wl_mutex_unlock(&wq->mutex);
 
     return 0;
