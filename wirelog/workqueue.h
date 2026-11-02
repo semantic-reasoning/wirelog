@@ -19,8 +19,8 @@
  *   - Pure C11 + cross-platform thread abstraction (POSIX/MSVC compatible).
  *   - Synchronisation via mutex + condition variables only.
  *   - No async callbacks, no cancellation — thin enough for TSan/GDB.
- *   - Future FPGA backend can implement the same 5-function interface
- *     with DMA/Arrow IPC transport (Phase C).
+ *   - Future FPGA backend can implement the same interface with
+ *     DMA/Arrow IPC transport (Phase C).
  *
  * ========================================================================
  * Threading Model
@@ -29,7 +29,8 @@
  * The work queue owns a fixed-size pool of worker threads, created at
  * wl_workqueue_create() time and joined at wl_workqueue_destroy() time.
  *
- * Workers block on a condition variable until wait_all dispatches a batch.
+ * Workers block on a condition variable until dispatch or wait_all opens
+ * the batch.
  * Tasks are dispatched from a ring buffer protected by a single mutex.
  *
  * The caller submits work items via wl_workqueue_submit(), then calls
@@ -37,10 +38,14 @@
  * (barrier semantics).  After the barrier, results are available in
  * caller-owned buffers for sequential merge.
  *
+ * A caller that must keep serving the running tasks calls
+ * wl_workqueue_dispatch() first, and still ends the batch with wait_all or
+ * drain.
+ *
  * For single-threaded / embedded fallback, wl_workqueue_drain() executes
  * all pending tasks synchronously on the calling thread.
- * The coordinator serializes submit, wait_all, drain, and destroy calls;
- * these control operations must not overlap with each other.
+ * The coordinator serializes submit, dispatch, wait_all, drain, and destroy
+ * calls; these control operations must not overlap with each other.
  *
  * ========================================================================
  * Per-Worker Arena Cloning
@@ -139,6 +144,28 @@ int
 wl_workqueue_submit(wl_work_queue_t *wq, void (*work_fn)(void *ctx), void *ctx);
 
 /**
+ * wl_workqueue_dispatch:
+ * @wq: Work queue handle.  Must not be NULL.
+ *
+ * Open the dispatch gate so worker threads may take the submitted items,
+ * and return without waiting for them, so the caller can serve callbacks
+ * that wait on it.  An item submitted after this call, before the batch
+ * ends, wakes an idle worker without another dispatch.  An item runs only
+ * when a worker is free to take it; while every worker is busy (and a pool
+ * may have fewer threads than requested), items stay queued.
+ *
+ * The batch still ends with wl_workqueue_wait_all() or wl_workqueue_drain(),
+ * which close the dispatch gate again.  Contexts must stay valid until then.
+ * Do not overlap with wait_all or drain.
+ *
+ * Returns:
+ *    0: Dispatch opened.
+ *   -1: @wq is NULL.
+ */
+int
+wl_workqueue_dispatch(wl_work_queue_t *wq);
+
+/**
  * wl_workqueue_wait_all:
  * @wq: Work queue handle.  Must not be NULL.
  *
@@ -170,7 +197,8 @@ wl_workqueue_wait_all(wl_work_queue_t *wq);
  *
  * Returns only after every submitted callback has finished, including any
  * callback already dequeued by a worker. Contexts may then be released and
- * the queue is ready for a new batch. Do not overlap with wait_all or submit.
+ * the queue is ready for a new batch. Do not overlap with submit, dispatch or
+ * wait_all.
  *
  * Returns:
  *    0: All tasks drained successfully.
@@ -184,9 +212,10 @@ wl_workqueue_drain(wl_work_queue_t *wq);
  * @wq: (transfer full): Work queue to destroy.  NULL-safe.
  *
  * Signal all worker threads to shut down, join them, and free all
- * queue resources.  Any pending (un-executed) tasks are discarded.
+ * queue resources.  Workers run every task still queued before they exit,
+ * whether or not the dispatch gate is open.
  *
- * The caller must ensure no concurrent submit/wait_all/drain calls
+ * The caller must ensure no concurrent submit/dispatch/wait_all/drain calls
  * are in progress when destroy is called.
  */
 void
