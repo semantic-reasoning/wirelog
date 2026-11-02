@@ -2394,33 +2394,52 @@ The coordinator submits the W tasks behind the closed dispatch gate, opens
 the gate with `wl_workqueue_dispatch`, pumps the channel on its own thread
 while the workers produce, and joins them at `wl_workqueue_wait_all`.
 Before the join the consumer touches descriptors only: it moves each taken
-batch onto its (worker, relation) list and disposes of nothing. A producer
-stops touching a delta once it is published. Only after the join does the
-coordinator read payloads, when it coalesces each list into the delta
-matrix. The capacity is unbounded on this path, so a reservation does not
-wait for space.
+batch onto its (worker, relation) list, or in discard mode onto the
+coordinator's discard list, and disposes of nothing. A producer stops
+touching a delta once it is published. Only after the join does the
+coordinator touch payloads: it coalesces each list into the delta matrix
+when the round succeeds, and disposes of the batches when it fails.
 
-A worker error does not cancel the round. Once a lane has closed with an
-error, the consumer keeps pumping in discard mode, so the other workers
-run to their natural end, and every batch it takes from then on goes to
-the coordinator's discard list, which is disposed after the join.
+The channel's capacity is `WIRELOG_TDD_CHANNEL_BYTES` when that is a
+positive decimal integer that fits in 64 bits; otherwise an eighth of an
+enforcing governor's budget, clamped to [4 MiB, 1 GiB]; otherwise 256 MiB.
+A producer whose batch does not fit waits in `wl_tdd_channel_reserve`
+until the pump takes batches, and a batch larger than the capacity is
+admitted only when no batch is queued or reserved.
 
-**I1.** After the dispatch, every `wl_workqueue_wait_all` or
-`wl_workqueue_drain` of a round follows a pump that reported COMPLETE or a
-`wl_tdd_channel_cancel`, because a producer may be waiting for space that
-only the pump frees. The sites are:
+A worker error does not cancel the round. The consumer enters discard
+mode on any of three triggers: it takes a batch after a lane has closed
+with an error; it takes a batch whose relation or worker index is out of
+range, which it discards too and which makes it report EPROTO unless it
+already holds an error; or a pump reports an error. From then on it keeps
+pumping, so producers still make progress, and every batch it takes goes
+to the coordinator's discard list, which is disposed after the join. Only
+the pump error also cancels the channel while producers run; after a
+worker error or an invalid batch the other workers run to their natural
+end.
 
-- A failed submit closes the lanes whose tasks were never queued and
-  cancels the channel before it drains the queued tasks, which then close
-  their lanes without running.
-- A pump error cancels the channel, and the consumer keeps pumping until
-  every lane has closed.
-- A failed dispatch or join cancels the channel before the drain.
-- `wl_columnar_eval_tdd_owner_lifetime_quiesce` cancels an open round
-  before it drains. Session destroy and
+**I1.** From the submit on, every `wl_workqueue_wait_all` or
+`wl_workqueue_drain` that waits for a round's tasks is preceded by a pump
+that reported the round COMPLETE, by a `wl_tdd_channel_cancel` of its
+channel, or by the close of every lane, because a producer may be waiting
+for space that only the pump frees. The sites are:
+
+- A failed submit, before any dispatch, closes the lanes whose tasks were
+  never queued and cancels the channel; only then does it drain the queued
+  tasks, which close their lanes without running.
+- After the dispatch the consumer pumps until the round is COMPLETE or,
+  once the channel is cancelled, until every lane has closed. A pump error
+  cancels the channel and the consumer keeps pumping. The consumer returns
+  earlier only on invalid arguments or on a second pump error after its
+  own cancel, and the driver cancels the channel on any consumer error
+  before the join.
+- A failed dispatch or join cancels the channel before the drain. Only a
+  NULL queue fails either, and a NULL queue has already failed the submit.
+- `wl_columnar_eval_tdd_owner_lifetime_quiesce` cancels its channel before
+  it drains if a lane is still open. Session destroy and
   `wl_columnar_session_cleanup_ready_quiescent` call
-  `wl_columnar_eval_tdd_channel_cancel_for_teardown` before they drain the
-  workqueue.
+  `wl_columnar_eval_tdd_channel_cancel_for_teardown`, which does the same
+  for the session's channels, before they drain the workqueue.
 
 **Error of a round.** After the join, the round's rc is the first worker
 rc, in worker order, that is neither 0 nor ECANCELED; otherwise the

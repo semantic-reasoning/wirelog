@@ -94,6 +94,7 @@ typedef enum {
 } wl_tdd_pump_result_t;
 
 typedef struct {
+    uint64_t cap_bytes;
     uint64_t takes;
     uint64_t blocked_waits;
     uint64_t max_queued_bytes;

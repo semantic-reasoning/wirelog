@@ -456,19 +456,19 @@ col_session_get_exchange_time_ns(wl_session_t *sess,
  * col_session_get_tdd_perf_stats:
  *
  * Return recursive TDD evaluator profiling counters accumulated across the
- * last wl_session_snapshot() call.  These counters expose the current
- * queue-assisted after-barrier path for benchmark measurement only.
+ * last wl_session_snapshot() call.  These counters split each sub-pass
+ * round into phases, for benchmark measurement only.
  * All out-parameters are NULL-safe.
  *
  * @param sess                 A wl_session_t* backed by the columnar backend.
  * @param out_total_ns         Total recursive TDD evaluator wall time.
- * @param out_dispatch_wait_ns Submit loop plus wl_workqueue_wait_all time.
+ * @param out_dispatch_wait_ns Submit loop plus wait barrier time.
  * @param out_submit_loop_ns   Workqueue submit loop wall time.
- * @param out_wait_barrier_ns  wl_workqueue_wait_all barrier wall time.
+ * @param out_wait_barrier_ns  Dispatch through join, with the channel pump.
  * @param out_worker_sum_ns    Sum of worker sub-pass wall runtimes.
  * @param out_worker_max_ns    Sum of per-sub-pass maximum worker runtimes.
  * @param out_idle_estimate_ns Estimated barrier/idle time: max(wait - worker max, 0).
- * @param out_queue_drain_ns   Channel collect plus delta matrix coalesce time.
+ * @param out_queue_drain_ns   Delta matrix coalesce time after the join.
  * @param out_convergence_ns   Worker empty-delta and convergence checks.
  * @param out_exchange_ns      Recursive TDD exchange scatter/gather time.
  * @param out_final_merge_ns   Final coordinator worker-result merge/dedup time.

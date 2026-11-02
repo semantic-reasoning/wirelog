@@ -2548,10 +2548,17 @@ typedef struct wl_col_session_t {
      * for Amdahl's Law validation at varying worker counts W.
      * Coordinator-only; reset at the start of each wl_session_snapshot(). */
     uint64_t exchange_time_ns;
-    /* TDD recursive evaluator profiling (#650).  These counters split the
-     * current queue-assisted after-barrier path into phases that can be
-     * compared across W=4/W=8/W=16 before choosing an async/exchange change.
-     * Coordinator-only; reset at the start of each wl_session_snapshot(). */
+    /* TDD recursive evaluator profiling (#650, #1373).  These counters
+     * split each sub-pass round into phases that can be compared across
+     * W=4/W=8/W=16.  tdd_submit_loop_ns is the submit loop.
+     * tdd_wait_barrier_ns runs from the dispatch until the workers are
+     * joined and the batches taken in discard mode are disposed, so it
+     * includes the coordinator's channel pump; tdd_dispatch_wait_ns is the
+     * sum of the two.  tdd_idle_estimate_ns adds how far each round's wait
+     * exceeded its slowest worker's runtime, so it includes pump time too.
+     * tdd_queue_drain_ns covers only the coalesce of the collected batches
+     * after the join.  Coordinator-only; reset at the start of each
+     * wl_session_snapshot(). */
     uint64_t tdd_total_ns;
     uint64_t tdd_dispatch_wait_ns;
     uint64_t tdd_submit_loop_ns;

@@ -3898,8 +3898,8 @@ col_session_get_exchange_time_ns(wl_session_t *sess,
  * col_session_get_tdd_perf_stats:
  *
  * Return recursive TDD evaluator profiling counters from the last
- * wl_session_snapshot() call.  The counters expose the current
- * queue-assisted after-barrier implementation without changing execution.
+ * wl_session_snapshot() call.  The counters split each sub-pass round into
+ * phases; reading them does not change execution.
  * All out-parameters are NULL-safe.
  */
 void

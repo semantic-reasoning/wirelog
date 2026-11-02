@@ -253,11 +253,12 @@ wl_columnar_eval_tdd_channel_discard_lists(wl_tdd_channel_t *ch,
  * non-zero return is handled as a pump error with that value. */
 extern int (*wl_columnar_eval_test_before_pump)(wl_tdd_channel_t *ch);
 
-/* Test hook, called on a worker thread before a delta for @rel_idx is
- * reserved on the channel.  A non-zero return is returned by
- * wl_columnar_eval_tdd_channel_reserve_delta() in place of reserving. */
+/* Test hook, called on a worker thread before a delta for relation
+ * @rel_idx, holding @rows rows, is reserved on the channel.  A non-zero
+ * return is returned by wl_columnar_eval_tdd_channel_reserve_delta() in
+ * place of reserving. */
 extern int (*wl_columnar_eval_test_channel_reserve)(
-    struct wl_col_session_t *worker, uint32_t rel_idx);
+    struct wl_col_session_t *worker, uint32_t rel_idx, uint32_t rows);
 
 /* Test hook, called on a worker thread for every published delta of @rows
  * rows: return the number of batches to publish it as, 0 or 1 for one.  The

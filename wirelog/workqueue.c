@@ -8,8 +8,9 @@
  * INTERNAL - not installed, not part of public API.
  *
  * Implements the interface declared in workqueue.h:
- *   wl_workqueue_create, wl_workqueue_submit, wl_workqueue_dispatch,
- *   wl_workqueue_wait_all, wl_workqueue_drain, wl_workqueue_destroy.
+ *   wl_workqueue_create, wl_workqueue_thread_count, wl_workqueue_submit,
+ *   wl_workqueue_dispatch, wl_workqueue_wait_all, wl_workqueue_drain,
+ *   wl_workqueue_destroy.
  *
  * Thread pool design:
  *   - Fixed-size pool of threads, created at create() time.
@@ -228,6 +229,13 @@ wl_workqueue_create(uint32_t num_workers)
     }
 
     return wq;
+}
+
+uint32_t
+wl_workqueue_thread_count(const wl_work_queue_t *wq)
+{
+    /* Set by create before the handle is returned; never written after. */
+    return wq ? wq->num_workers : 0;
 }
 
 int

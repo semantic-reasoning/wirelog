@@ -695,6 +695,7 @@ static void
 stats_locked(const wl_tdd_channel_t *ch, wl_tdd_channel_stats_t *out)
 {
     *out = ch->stats;
+    out->cap_bytes = ch->cap_bytes;
     out->lanes_open = ch->lanes_open;
     out->space_waiters = ch->space_waiters;
     out->queued_bytes = ch->queued_bytes;
