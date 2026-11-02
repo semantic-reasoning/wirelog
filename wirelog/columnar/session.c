@@ -8359,6 +8359,13 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
     uint64_t host_quanta = step->recursive_route || step->general_observed
         ? 8 : 5;
     uint64_t limit = host_quanta * UINT64_C(384);
+    /* Capacity covers the actual facade/root and each separate setup action;
+     * unused grant capacity is never charged as completed metadata work. */
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE) {
+        uint64_t setup_limit = 2 * UINT64_C(384)
+            + WL_COLUMNAR_JOIN_SETUP_MAX_WORK;
+        if (limit < setup_limit) limit = setup_limit;
+    }
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_session_test_framed_grant_limit)
         limit = wl_columnar_session_test_framed_grant_limit(sess, action,

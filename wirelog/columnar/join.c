@@ -6142,41 +6142,16 @@ wl_columnar_join_op_attempt_start(const wl_plan_op_t *op,
                id, status, NULL);
 }
 
-int
-wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
+static int
+wl_columnar_join_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     wl_evaluation_control_t *control, uint64_t id,
-    wl_columnar_filter_status_t *status, const void *owner)
+    wl_columnar_filter_status_t *status, const void *owner,
+    eval_stack_t *stack,
+    const wl_columnar_eval_private_bindings_t *private_bindings,
+    wl_columnar_filter_context_t *ctx)
 {
-    if (!op || !status) return EINVAL;
-    if (owner && !control) return EINVAL;
-    eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
-            owner);
-    if (rc) return rc;
-    if (owner) {
-        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
-        if (record->control != control || record->attempt_id != id)
-            return EINVAL;
-    }
-    const wl_columnar_eval_private_bindings_t *private_bindings = NULL;
-    if (owner) {
-        rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner, frame,
-                session, control, id, &private_bindings);
-        if (rc) return rc;
-    }
-    if (!control) {
-        int result = col_op_join(op, stack, session);
-        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
-        status->execution_result = result; status->semantic_result = result;
-        status->cleanup_result = 0; status->committed = result == 0;
-        return 0;
-    }
-    rc = wl_columnar_join_attempt_guard(control, id);
-    if (rc) return rc;
-    wl_columnar_filter_context_t *ctx = NULL;
-    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
-    if (rc) return rc;
+    int rc;
     /* Refused first admission has no live context or resource ownership. */
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
@@ -6733,21 +6708,8 @@ done:
     return 0;
 }
 
-/* Controlled existence joins deliberately materialize valid scalar results.
- * They share the original JOIN owners/retirement, not its delta selection,
- * concatenated row shape, multiplicity or output-limit policy. */
 int
-wl_columnar_join_probe_op_attempt_start(const wl_plan_op_t *op,
-    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
-    wl_evaluation_control_t *control, uint64_t id,
-    wl_columnar_filter_status_t *status)
-{
-    return wl_columnar_join_probe_op_attempt_start_owned(op, frame, session,
-               control, id, status, NULL);
-}
-
-int
-wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
+wl_columnar_join_op_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
     wl_evaluation_control_t *control, uint64_t id,
     wl_columnar_filter_status_t *status, const void *owner)
@@ -6755,8 +6717,8 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
     if (!op || !status) return EINVAL;
     if (owner && !control) return EINVAL;
     eval_stack_t *stack = NULL;
-    int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, session, &stack,
-            owner, op);
+    int rc = wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
     if (rc) return rc;
     if (owner) {
         const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
@@ -6770,10 +6732,7 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
         if (rc) return rc;
     }
     if (!control) {
-        int result = op->op == WL_PLAN_OP_SEMIJOIN
-            ? col_op_semijoin(op, stack, session)
-            : op->op == WL_PLAN_OP_ANTIJOIN
-            ? col_op_antijoin(op, stack, session) : EINVAL;
+        int result = col_op_join(op, stack, session);
         status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
         status->execution_result = result; status->semantic_result = result;
         status->cleanup_result = 0; status->committed = result == 0;
@@ -6784,6 +6743,34 @@ wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
     wl_columnar_filter_context_t *ctx = NULL;
     rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
     if (rc) return rc;
+    return wl_columnar_join_op_attempt_start_owned_initialize(op, frame,
+               session,
+               control, id, status, owner, stack, private_bindings, ctx);
+}
+
+/* Controlled existence joins deliberately materialize valid scalar results.
+ * They share the original JOIN owners/retirement, not its delta selection,
+ * concatenated row shape, multiplicity or output-limit policy. */
+int
+wl_columnar_join_probe_op_attempt_start(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status)
+{
+    return wl_columnar_join_probe_op_attempt_start_owned(op, frame, session,
+               control, id, status, NULL);
+}
+
+static int
+wl_columnar_join_probe_op_attempt_start_owned_initialize(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner,
+    eval_stack_t *stack,
+    const wl_columnar_eval_private_bindings_t *private_bindings,
+    wl_columnar_filter_context_t *ctx)
+{
+    int rc;
     /* Refused first admission has no live context or resource ownership. */
     rc = wl_columnar_join_attempt_charge(control, id,
             WL_COLUMNAR_JOIN_ATTEMPT_WORK);
@@ -7283,6 +7270,49 @@ done:
     return 0;
 }
 
+int
+wl_columnar_join_probe_op_attempt_start_owned(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status, const void *owner)
+{
+    if (!op || !status) return EINVAL;
+    if (owner && !control) return EINVAL;
+    eval_stack_t *stack = NULL;
+    int rc = wl_columnar_eval_stack_consumer_stack_owned(frame, session, &stack,
+            owner, op);
+    if (rc) return rc;
+    if (owner) {
+        const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+        if (record->control != control || record->attempt_id != id)
+            return EINVAL;
+    }
+    const wl_columnar_eval_private_bindings_t *private_bindings = NULL;
+    if (owner) {
+        rc = wl_columnar_eval_plan_numeric_private_bindings_get(owner, frame,
+                session, control, id, &private_bindings);
+        if (rc) return rc;
+    }
+    if (!control) {
+        int result = op->op == WL_PLAN_OP_SEMIJOIN
+            ? col_op_semijoin(op, stack, session)
+            : op->op == WL_PLAN_OP_ANTIJOIN
+            ? col_op_antijoin(op, stack, session) : EINVAL;
+        status->progress = WL_COLUMNAR_FILTER_PROGRESS_DONE;
+        status->execution_result = result; status->semantic_result = result;
+        status->cleanup_result = 0; status->committed = result == 0;
+        return 0;
+    }
+    rc = wl_columnar_join_attempt_guard(control, id);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return rc;
+    return wl_columnar_join_probe_op_attempt_start_owned_initialize(op, frame,
+               session,
+               control, id, status, owner, stack, private_bindings, ctx);
+}
+
 /* Compatibility entry points used by internal test fixtures and downstream
  * backend code while the operator implementations use the directory-aware
  * wl_columnar_* naming convention. */
@@ -7311,4 +7341,85 @@ col_op_join_diff(const wl_plan_op_t *op, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
     return wl_columnar_join_diff_op(op, stack, sess);
+}
+
+/* Every pointer proof and its use stay inside this synchronous activation.
+ * The old APIs retain their full checked prefixes above. */
+wl_columnar_join_setup_result_t
+wl_columnar_join_op_attempt_start_funded(const wl_plan_op_t *op,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_columnar_filter_status_t *status,
+    wl_columnar_eval_plan_numeric_attempt_t *owner,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    if (!owner || owner->identity != owner) goto invalid;
+    if (!funding || funding == control || !funding_id
+        || funding == owner->control)
+        return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                  WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_JOIN_SETUP_DISPATCH_WORK);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    if (!op || !status) goto invalid;
+    rc = wl_columnar_eval_stack_numeric_setup_nonstream(frame, owner);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_INVALID };
+    if (owner->control != control || owner->attempt_id != id) goto invalid;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED };
+    bool retained_lftj = owner->lftj.identity == &owner->lftj
+        && (owner->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_RELEASE
+        || owner->lftj.phase == WL_COLUMNAR_LFTJ_ATTEMPT_DONE)
+        && owner->lftj.semantic_result;
+    if (owner->abort_requested && !retained_lftj) {
+        if (wl_evaluation_control_active_attempt_id(control) != id)
+            return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                      WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED };
+        wl_evaluation_control_request_cancel(control);
+    }
+    wl_columnar_join_setup_result_t result =
+        wl_columnar_join_setup_tail(control, id, funding, funding_id);
+    if (result.protocol) return result;
+    bool probe = op->op == WL_PLAN_OP_SEMIJOIN || op->op == WL_PLAN_OP_ANTIJOIN;
+    result = wl_columnar_join_setup_head(control, id, funding, funding_id,
+            WL_COLUMNAR_JOIN_SETUP_STACK_WORK);
+    if (result.protocol) return result;
+    eval_stack_t *stack = NULL;
+    rc = probe
+        ? wl_columnar_eval_stack_consumer_stack_owned(frame, session, &stack,
+            owner, op)
+        : wl_columnar_eval_stack_operator_stack_owned(frame, session, &stack,
+            owner);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_INVALID };
+    result = wl_columnar_join_setup_tail(control, id, funding, funding_id);
+    if (result.protocol) return result;
+    const wl_columnar_eval_private_bindings_t *bindings = NULL;
+    result = wl_columnar_eval_plan_numeric_private_bindings_get_funded(owner,
+            frame, session, control, id, funding, funding_id, &bindings);
+    if (result.protocol) return result;
+    result = wl_columnar_join_setup_head(control, id, funding, funding_id,
+            WL_COLUMNAR_JOIN_SETUP_PRECHILD_WORK);
+    if (result.protocol) return result;
+    wl_columnar_filter_context_t *ctx = NULL;
+    rc = wl_columnar_eval_stack_filter_context_owned(frame, &ctx, owner);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_INVALID };
+    result = wl_columnar_join_setup_tail(control, id, funding, funding_id);
+    if (result.protocol) return result;
+    result = wl_columnar_eval_plan_numeric_composed_join_setup_handoff(owner,
+            frame, session, control, id, op);
+    if (result.protocol) return result;
+    rc = probe ? wl_columnar_join_probe_op_attempt_start_owned_initialize(op,
+            frame, session, control, id, status, owner, stack, bindings, ctx)
+        : wl_columnar_join_op_attempt_start_owned_initialize(op,
+            frame, session, control, id, status, owner, stack, bindings, ctx);
+    return (wl_columnar_join_setup_result_t){ rc,
+                                              WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED };
+invalid:
+    return (wl_columnar_join_setup_result_t){ EINVAL,
+                                              WL_COLUMNAR_JOIN_SETUP_INVALID };
 }

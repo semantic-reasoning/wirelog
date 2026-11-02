@@ -1478,3 +1478,76 @@ still costs 466 before remaining setup; the probe counterpart is at least
 payment boundaries. Those containing-route repairs, automatic prepared publication
 and FINISH selection, cache/policy/shared-cap and general transaction acceptance
 remain required before the grouped issues can close.
+
+
+### Separate ordinary READY setup actions
+
+The selected composed READY path now dispatches ordinary JOIN and nonstream
+SEMIJOIN/ANTIJOIN directly after the retained full public proof. It bypasses
+the unrelated early empty/LFTJ/pipeline classifiers. A refusal-only frame query
+remains inside eval_stack.c; no opaque frame member or mutable loan crosses a
+module boundary. The module-owned handoff checks the exact native owner and
+operation tuple before original forward128 and actual PENDING.
+
+The parent384, DISPATCH128, STACK192, HEADER128, each ENTRY64 and PAIR32 (or
+DYNAMIC64), FINISH64 and PRECHILD128 are separate admissions with actual proof
+work and saved-generation polls between them. The legacy full getter and old
+child APIs retain their full checks. Only private post-proof initializers in
+join.c share the existing first-child192 and subsequent body. No context store
+or resource acquisition precedes that admission.
+
+NONE binding consumes192 for HEADER/FINISH; dynamic or one static consumes256;
+four static consumes640 across ten entry/pair actions and HEADER/FINISH.
+Including parent/dispatch/stack/prechild gives1024,1088 or1472 respectively.
+The production ADVANCE capacity is max(existing five/eight host floor,
+facade384 + root384 + largest1472):2240 normal or3072 recursive/general.
+A no-binding call actually consumes1792 through the full chain;448 capacity
+remains unadmitted. A short grant consumes only its completed action prefix.
+READY/context/stack/output and original positive work remain unchanged until
+handoff; retry repeats real proof and pays it again.
+
+Tests exercise each actual static-four and NONE refusal boundary and exact
+success on constructor-created owners, original consumed-work preservation,
+real stream nonselection at PENDING/JOIN_BATCH, protected pointer output and
+actual no-override normal session progress with1792 consumed/2240 limit.
+The complete emitted source bounds, including expanded helpers, refusal paths,
+loop transitions and actual first-child admission prefix, are:
+
+| Paid region | Source upper bound | Funding fee |
+|---|---:|---:|
+| Parent public proof and caller/result tails | 380 | 384 |
+| DISPATCH | 98 | 128 |
+| STACK (nonstream probe worst case) | 161 | 192 |
+| Binding HEADER | 117 | 128 |
+| Each ENTRY | 58 | 64 |
+| Each PAIR, including terminal outer-loop transition | 31 | 32 |
+| DYNAMIC authorization | 53 | 64 |
+| Binding FINISH and actual caller | 61 | 64 |
+| PRECHILD and typed handoff | 125 | 128 |
+
+The STACK-to-HEADER checkpoint window also includes the new preadmission
+geometry/self/funding-role prefix and remains bounded by189/192. This is a
+separate latency check, not additional summable financing. The private
+post-HEADER head omits only immutable funding pointer/nonzero comparisons;
+every saved-generation charge and every real entry/pair check remains.
+HEADER proves the actual module/native owner before any original-control
+probe. Both full typed entries reject original-as-funding role confusion
+before a debit. Handoff distinguishes invalid proof from an actual original
+forward failure. The old complete getter and child APIs retain their checks.
+
+Actual session tests additionally cover whole-chain NONE1791/1792 and genuinely
+authorized observed-dynamic1855/1856, including unchanged original work on the
+short grant and consuming its real pending root result before retry. A normal
+noncapture facade deliberately refuses supplied private bindings; this refusal
+is not a fabricated static-four capture capability. A separate genuine
+seven-op recursive capture constructor uses four checked alias bindings and
+proves2239/2240 through the real facade/root, including2112 short-prefix fees,
+unchanged original work, consume-first and exact three-row captured output.
+It leaves the public registry unmodified; the production recursive driver
+continues to construct two bindings. No callback is inserted inside the
+metadata loop: generation tests use real API-entry turnover and existing
+post-child callbacks, separately from the source proof of each poll.
+
+Nonselected special classifiers, direct numeric/compatibility callers,
+pipeline bootstrap/final setup, automatic prepared publication/FINISH,
+cache/policy/shared-cap and general transaction acceptance remain OPEN.

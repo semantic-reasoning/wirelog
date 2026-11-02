@@ -6845,6 +6845,310 @@ controlled_session_join_checkpoint(wl_evaluation_control_t *control,
     }
 }
 
+static unsigned controlled_join_setup_grants;
+
+/* Observe the actual production grant; no capacity override is installed. */
+static void
+controlled_join_setup_grant_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    (void)session;
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report));
+    if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        && report.consumed == 1792) {
+        CHECK(report.limit == 2240 && !protocol && !report.result);
+        ++controlled_join_setup_grants;
+    }
+}
+
+static unsigned controlled_setup_boundary, controlled_setup_injections;
+static bool controlled_setup_consumed_short, controlled_setup_dynamic;
+static uint64_t controlled_setup_original_work;
+
+static uint64_t
+controlled_setup_exact_limit(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action, uint64_t limit)
+{
+    controlled_setup_boundary = 0;
+    if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        || !session->cleanup_active || controlled_setup_injections == 2)
+        return limit;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        || ctx->child.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY)
+        return limit;
+    const wl_columnar_eval_plan_numeric_attempt_t *child = &ctx->child;
+    CHECK(child->cursor < child->end && child->cursor < child->plan->op_count);
+    if (child->plan->ops[child->cursor].op != WL_PLAN_OP_JOIN) return limit;
+    if (controlled_setup_dynamic) CHECK(child->private_bindings
+            && child->private_bindings->dynamic_entries && limit == 3072
+            && wl_columnar_session_observed_bindings_authorized(session,
+            child->private_bindings));
+    else CHECK(!child->private_bindings && limit == 2240);
+    if (controlled_setup_injections) CHECK(controlled_setup_consumed_short);
+    else CHECK(!wl_evaluation_control_test_active_consumed(child->control,
+            child->attempt_id, &controlled_setup_original_work));
+    controlled_setup_boundary = ++controlled_setup_injections;
+    uint64_t exact = controlled_setup_dynamic ? 1856 : 1792;
+    return controlled_setup_boundary == 1 ? exact - 1 : exact;
+}
+
+static void
+controlled_setup_exact_finished(const wl_col_session_t *session,
+    wl_columnar_eval_serial_framed_host_action_t action,
+    wl_evaluation_control_t *grant, int protocol)
+{
+    if (action != WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
+        || !controlled_setup_injections || !session->cleanup_active) return;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_framed_context(session->cleanup_active,
+        (wl_col_session_t *)session, &ctx));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report));
+    uint64_t exact = controlled_setup_dynamic ? 1856 : 1792;
+    if (controlled_setup_boundary) {
+        CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+            && ctx->pending_action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            && ctx->pending_funding == grant
+            && ctx->pending_funding_id == report.attempt_id);
+        if (controlled_setup_boundary == 1) {
+            uint64_t after;
+            CHECK(protocol == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && report.limit == exact - 1 && report.consumed == exact - 128
+                && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT
+                && ctx->child.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+            CHECK(!wl_evaluation_control_test_active_consumed(
+                    ctx->child.control,
+                    ctx->child.attempt_id, &after)
+                && after == controlled_setup_original_work);
+        } else CHECK(!protocol && !report.result && report.limit == exact
+                && report.consumed == exact
+                && ctx->child.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                && ctx->child.pending_action ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    } else if (controlled_setup_injections == 1) {
+        CHECK(!protocol && !report.result && report.consumed == 768
+            && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+            && !ctx->pending_funding && !ctx->pending_funding_id);
+        controlled_setup_consumed_short = true;
+    }
+}
+
+static void
+test_controlled_join_setup_exact_retry(void)
+{
+    static const char source[] =
+        ".decl a(k:int64)\n.decl b(k:int64)\n.decl output(k:int64)\n"
+        "output(k) :- a(k), b(k).\n";
+    for (unsigned dynamic = 0; dynamic < 2; ++dynamic) {
+        wirelog_error_t error;
+        wirelog_program_t *program = wirelog_parse_string(source, &error);
+        wl_plan_t *plan = NULL;
+        CHECK(program && !wl_plan_from_program(program, &plan));
+        wl_evaluation_control_t *control = NULL;
+        CHECK(!wl_evaluation_control_create(0, &control));
+        wl_session_options_t options;
+        wl_session_options_init(&options);
+        options.evaluation_control = control;
+        wl_session_t *session = NULL;
+        CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+            &options, &session));
+        const int64_t a[] = {1, 3}, b[] = {1, 2};
+        CHECK(!wl_session_insert(session, "a", a, 2, 1));
+        CHECK(!wl_session_insert(session, "b", b, 2, 1));
+        controlled_observer_order_capture_t capture = {.first = 1};
+        controlled_setup_dynamic = dynamic != 0;
+        if (dynamic) wl_session_set_delta_cb(session,
+                controlled_observer_order_capture, &capture);
+        controlled_setup_boundary = controlled_setup_injections = 0;
+        controlled_setup_consumed_short = false;
+        wl_columnar_session_test_framed_grant_limit =
+            controlled_setup_exact_limit;
+        wl_columnar_session_test_framed_grant_finished =
+            controlled_setup_exact_finished;
+        CHECK(!(dynamic ? controlled_recursive_run(session, control)
+                    : wl_session_step(session)));
+        if (dynamic) CHECK(capture.count == 1);
+        wl_columnar_session_test_framed_grant_limit = NULL;
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        CHECK(controlled_setup_injections == 2 &&
+            controlled_setup_consumed_short);
+        const col_rel_t *out = session_find_rel((wl_col_session_t *)session,
+                "output");
+        CHECK(out && out->nrows == 1 && out->ncols == 1 &&
+            out->columns[0][0] == 1);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(control,
+            &report) && !report.result);
+        wl_session_destroy(session);
+        wl_evaluation_control_release(control);
+        wl_plan_free(plan);
+        wirelog_program_free(program);
+    }
+}
+
+static void
+test_framed_join_setup_bindings_need_capture(void)
+{
+    static const char source[] =
+        ".decl a(k:int64)\n.decl b(k:int64)\n.decl output(k:int64)\n"
+        "output(k) :- a(k), b(k).\n";
+    const int64_t a[] = {1, 3}, b[] = {1, 2};
+    const entry_input_t inputs[] = {{"a", a, 2, 1}, {"b", b, 2, 1}};
+    entry_fixture_t f;
+    entry_init_inputs(&f, source, inputs, 2, 0);
+    col_rel_t *left = session_find_rel(f.session, "a");
+    col_rel_t *right = session_find_rel(f.session, "b");
+    CHECK(left && right);
+    const char *names[] = {"a", "b", "c", "d"};
+    col_rel_t *relations[] = {left, right, left, right};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, f.session,
+        f.relation, f.operation, f.id, names, relations, 4));
+    f.previous.private_bindings = &bindings;
+    uint64_t before, after;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &before));
+    /* Ordinary noncapture is deliberately not a bound capability. */
+    CHECK(entry_turn(&f, false, 0) == EINVAL);
+    CHECK(f.reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED
+        && !f.session->cleanup_active);
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &after) && after == before);
+    CHECK(!wl_evaluation_control_finish(f.operation,
+        f.session->base.operation_admission, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.operation, &report)
+        && !report.consumed && !report.result);
+    entry_destroy(&f);
+}
+
+static void
+entry_init_static_capture(entry_fixture_t *f)
+{
+    static const char source[] =
+        ".decl edge(x:int64,y:int64)\n.decl path(x:int64,y:int64)\n"
+        "path(x,y) :- edge(x,y).\n"
+        "path(x,z) :- path(x,y), edge(y,z).\n";
+    memset(f, 0, sizeof(*f));
+    wirelog_error_t error;
+    f->program = wirelog_parse_string(source, &error);
+    CHECK(f->program && !wl_plan_from_program(f->program, &f->plan));
+    for (uint32_t si = 0; si < f->plan->stratum_count; ++si)
+        for (uint32_t ri = 0; ri < f->plan->strata[si].relation_count; ++ri)
+            if (!strcmp(f->plan->strata[si].relations[ri].name, "path")) {
+                f->stratum = &f->plan->strata[si];
+                f->relation = &f->stratum->relations[ri];
+            }
+    CHECK(f->relation && f->stratum->is_recursive && f->relation->op_count == 7
+        && wl_columnar_eval_plan_numeric_recursive_path_supported(f->relation));
+    CHECK(!wl_evaluation_control_create(0, &f->operation));
+    wl_columnar_memory_resolution_t resolution = {
+        .budget_bytes = UINT64_C(512) << 20,
+            .usable_bytes = UINT64_C(512) << 20,
+            .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING,
+            .source = WL_COLUMNAR_MEMORY_SOURCE_ENV,
+            .status = WL_COLUMNAR_MEMORY_OK
+    };
+    f->governor = wl_columnar_memory_governor_ref_create(&resolution);
+    CHECK(f->governor);
+    wl_session_options_t options;
+    wl_session_options_init(&options);
+    options.evaluation_control = f->operation;
+    options.memory_governor = f->governor;
+    wl_session_t *base = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), f->plan, 1,
+        &options, &base));
+    f->session = (wl_col_session_t *)base;
+    const int64_t edges[] = {1, 2, 2, 3};
+    CHECK(!wl_session_insert(base, "edge", edges, 2, 2));
+    CHECK(!session_find_rel(f->session, "path"));
+    CHECK(!wl_evaluation_control_begin(f->operation,
+        base->operation_admission));
+    f->id = wl_evaluation_control_active_attempt_id(f->operation);
+    f->operation_identity = f->id + 1000;
+    for (unsigned i = 0; i < 3; ++i)
+        f->grants[i].control = control_new(0, &f->grants[i].owner);
+}
+
+static void
+test_framed_join_setup_static_capture(void)
+{
+    entry_fixture_t f;
+    entry_init_static_capture(&f);
+    col_rel_t *edge = session_find_rel(f.session, "edge");
+    CHECK(edge);
+    col_relation_snapshot_t edge_snapshot = wl_columnar_relation_snapshot(edge);
+    col_rel_t *frontier = col_rel_new_like("path", edge);
+    const int64_t first[] = {1, 2};
+    CHECK(frontier && !col_rel_append_row(frontier, first));
+    const char *names[] = {"edge", "path", "alias_edge", "alias_path"};
+    col_rel_t *relations[] = {edge, frontier, edge, frontier};
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, f.session,
+        f.relation, f.operation, f.id, names, relations, 4));
+    col_rel_t *captured = NULL;
+    f.previous.capture_only = true;
+    f.previous.capture_out = &captured;
+    f.previous.private_bindings = &bindings;
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    for (unsigned turns = 0; ; ++turns) {
+        CHECK(turns < 10000);
+        ctx = entry_context(&f);
+        if (ctx && ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+            && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+            && ctx->child.plan->ops[ctx->child.cursor].op == WL_PLAN_OP_JOIN)
+            break;
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    CHECK(ctx->child.private_bindings == &bindings);
+    uint64_t before, after;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &before));
+    CHECK(entry_turn(&f, false, 2239) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        && ctx->pending_funding == f.previous.previous_funding
+        && ctx->pending_funding_id == f.previous.previous_funding_id);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(f.previous.previous_funding, &report)
+        && report.limit == 2239 && report.consumed == 2112
+        && report.result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &after) && after == before);
+    CHECK(!entry_turn(&f, false, 0)); /* Consume the real root result first. */
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_CHILD
+        && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        && !ctx->pending_funding && !ctx->pending_funding_id);
+    CHECK(!entry_turn(&f, false, 2240));
+    CHECK(ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
+        && ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && ctx->child.pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    CHECK(!wl_evaluation_control_report(f.previous.previous_funding, &report)
+        && report.limit == 2240 && report.consumed == 2240 && !report.result);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && !f.reply.cleanup_result
+        && !f.reply.committed && !session_find_rel(f.session, "path"));
+    CHECK(wl_columnar_relation_snapshot_equal(edge_snapshot,
+        wl_columnar_relation_snapshot(edge)));
+    CHECK(captured && captured->nrows == 3 && captured->ncols == 2);
+    const int64_t expected[][2] = {{1, 2}, {1, 3}, {2, 3}};
+    for (unsigned i = 0; i < 3; ++i)
+        CHECK(captured->columns[0][i] == expected[i][0]
+            && captured->columns[1][i] == expected[i][1]);
+    CHECK(!col_rel_destroy_checked(captured));
+    CHECK(!col_rel_destroy_checked(frontier));
+    entry_destroy(&f);
+}
+
 static void
 test_controlled_session_join_step(void)
 {
@@ -6944,7 +7248,13 @@ test_controlled_session_join_step(void)
             && limited.consumed > 0);
         CHECK(!wl_evaluation_control_reset(control));
         CHECK(!wl_evaluation_control_configure(control, 0));
+        CHECK(!wl_columnar_session_test_framed_grant_limit);
+        controlled_join_setup_grants = 0;
+        wl_columnar_session_test_framed_grant_finished =
+            controlled_join_setup_grant_finished;
         CHECK(!wl_session_step(session));
+        wl_columnar_session_test_framed_grant_finished = NULL;
+        CHECK(controlled_join_setup_grants > 0);
         const col_rel_t *output = session_find_rel((wl_col_session_t *)session,
                 "output");
         CHECK(output && output->ncols == (fixture == 0 ? 2 : 1));
@@ -14003,6 +14313,9 @@ main(void)
     test_controlled_observed_large_output();
     test_controlled_observed_admission_work();
     test_controlled_session_join_step();
+    test_controlled_join_setup_exact_retry();
+    test_framed_join_setup_bindings_need_capture();
+    test_framed_join_setup_static_capture();
     test_controlled_step_preflight_byte_cursor();
     test_controlled_step_preflight_work_limit_boundary();
     test_controlled_step_scheduler_empty_strata();
