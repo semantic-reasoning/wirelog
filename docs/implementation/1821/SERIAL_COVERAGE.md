@@ -1313,3 +1313,57 @@ NULL/nonself owners intentionally return EINVAL without changing output because
 their output association is unproven; genuine self owners with safe external
 output retain NULL normalization on ordinary argument errors. Caller-owned
 record/session storage must remain live; this is not arbitrary pointer validation.
+
+### Prepared unary replacement: Mode B ordinary JOIN primitive
+
+A separate typed constructor now binds the actual quiescent ordinary
+JOIN_DECIDE context. It preserves the final-address receipt layout ceiling
+of392 bytes and work ceiling of256 bytes using target-compiled size guards;
+these are portable upper bounds, not measurements of the Windows ABI.
+The constructor leaves confirmation false. Paid header proof authenticates
+the actual JOIN operation and REPLACE disposition, pending parent binding,
+native ownership, original control identity and both borrowed output pointers.
+Separate state and three scratch proofs establish cleanup completion, and repeat
+before sealing. The context's output remains a genuine borrow through
+publication; CONTROL clears it and FINISH clears the private borrow.
+
+Publication moves all seven entry fields and uses the genuine JOIN delta result.
+It records success, clears the JOIN decision history and advances the actual
+context to CONTROL while retaining its original pin for normal release.
+A zero-result RESUME leaves the genuine JOIN decision for the existing driver.
+ABORT hands the first error into the authenticated context before releasing
+exclusion. An unconfirmed receipt requires a distinct funded192 cancellation
+action to authenticate that context without polling the original generation.
+This preserves an actual first cancellation or work limit even after the
+original control finishes, resets and begins a successor. An unsupported
+ANTI_KEEP_ALL or MISSING_EXACT context receives no context stores from this
+cleanup; only the attempted receipt's resources are drained.
+
+Numeric tests drive real CHILD and PENDING boundaries, retain the actual
+outstanding child tuple unchanged through receipt ACK, consume that tuple first
+and then resume normal parent progress. Real preceding JOINs produce owned old
+inputs; borrowed inputs and both segmented variants retain exact ownership
+through publication or abort. Chained delta selection compares actual output
+against the raw route, including six versus24 downstream rows. Genuine missing,
+forced-empty, zero-row and bare inputs exercise empty replacement. Every new
+header/state/scratch phase and typed constructor has an independent literal
+exact/one-short budget oracle. First-stop tests verify successor debit remains
+zero. Unsupported-context tests compare the untouched context and real fallback
+against an unwrapped reference, including whether cancellation was actually
+polled.
+
+The fixed expanded source inventory is separate from nominal payments:
+typed INIT252/256, header113/192, state83/192, each scratch65/128,
+reader acquisition123/128, old validation at most172/192 and output157/192.
+Normal cancellation is81/128 and unconfirmed cancellation142/192.
+No-fail publication plus conservative caller allowance is64/128; drain117/128,
+sanitize143/256, clear92/128 and ACK125/192 retain their existing bounds.
+Existing ended metadata192/192, composed STATUS384/384, ZERO and FINISH254/256
+and prefix249/256 retain their separately qualified inventories.
+
+These fixtures manually select the primitive at an actual engine boundary.
+Normal context-owned FINISH is the legal post-ACK disposal route for this
+precursor; its generic owned disposal is not certified as bounded scalar cleanup.
+Automatic receipt storage, selection and funding, a bounded context FINISH
+adapter, actual cache policy integration and the containing-route audit of
+legacy binding callers remain separate required work for the grouped issues.
