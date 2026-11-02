@@ -21,6 +21,14 @@ All notable changes to wirelog are documented in this file.
   a relation and width, and read-only symbol lookup, so absence of an
   uninterned symbol can be established without interning it (#2321).
 
+- The easy facade gains `wirelog_easy_source_count()`,
+  `wirelog_easy_source_key_exists()`, `wirelog_easy_source_validate()` and
+  `wirelog_easy_lookup_symbol()`.  They never build the lazy session: before
+  the first building call a supported relation answers zero from program
+  metadata.  After a failed lazy build they answer
+  `WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED` until a later build succeeds
+  (#2321).
+
 - Cold JOIN streams support grouped COUNT and direct INT64 MIN/MAX, with
   admitted batch/group floors and a same-budget materialization control (#1372).
 

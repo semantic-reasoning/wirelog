@@ -97,4 +97,26 @@ wl_source_query_resolve(const struct wirelog_program *prog,
     const char *relation, uint32_t expected_ncols, const int64_t *lanes,
     uint32_t nlanes, uint32_t *width_out);
 
+/*
+ * Run one inspection request for a facade.  With a @session: admission
+ * (wl_session_inspection_begin), the backend ADMIT check, then -- unless
+ * q->mode is ADMIT -- wl_source_query_resolve() and the backend query, then
+ * release.  With no @session (an easy session not yet built): resolve only,
+ * answering zero / false, since no host call has been accepted.  On OK the
+ * caller publishes @out; on failure @out is zero / false.
+ */
+wirelog_source_query_status_t
+wl_source_query_run(wl_session_t *session, const struct wirelog_program *prog,
+    const wl_source_origin_t *origin, const wl_intern_t *intern,
+    wl_source_query_t *q, uint32_t expected_ncols, uint32_t nlanes,
+    wl_source_query_result_t *out);
+
+/* Admission as wl_source_query_run() in ADMIT mode, then a read-only
+ * wl_intern_get() while the reservation is still held.  The caller resets
+ * *out_id to -1 and *out_found to false first; they are set only when the
+ * symbol is found. */
+wirelog_source_query_status_t
+wl_source_lookup_symbol(wl_session_t *session, const wl_intern_t *intern,
+    const char *symbol, int64_t *out_id, bool *out_found);
+
 #endif /* WL_SESSION_FACTS_H */

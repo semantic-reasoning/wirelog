@@ -447,3 +447,67 @@ wl_source_query_resolve(const struct wirelog_program *prog,
     *width_out = rel->column_count;
     return WIRELOG_SOURCE_QUERY_OK;
 }
+
+wirelog_source_query_status_t
+wl_source_query_run(wl_session_t *session, const struct wirelog_program *prog,
+    const wl_source_origin_t *origin, const wl_intern_t *intern,
+    wl_source_query_t *q, uint32_t expected_ncols, uint32_t nlanes,
+    wl_source_query_result_t *out)
+{
+    wirelog_source_query_status_t st = WIRELOG_SOURCE_QUERY_OK;
+
+    if (!q || !out)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    out->count = 0;
+    out->exists = false;
+    if (session) {
+        st = wl_session_inspection_begin(session);
+        if (st != WIRELOG_SOURCE_QUERY_OK)
+            return st;
+        /* Session and backend state before identity: a call from a
+         * callback is BUSY whatever it names. */
+        wl_source_query_t admit = { .mode = WL_SOURCE_QUERY_ADMIT };
+        st = wl_session_source_query(session, &admit, out);
+    }
+    if (st == WIRELOG_SOURCE_QUERY_OK && q->mode != WL_SOURCE_QUERY_ADMIT)
+        st = wl_source_query_resolve(prog, origin, intern, q->relation,
+                expected_ncols, q->lanes, nlanes, &q->ncols);
+    /* Without a session no host call has been accepted yet: a validated
+     * relation has no source rows. */
+    if (session && st == WIRELOG_SOURCE_QUERY_OK
+        && q->mode != WL_SOURCE_QUERY_ADMIT)
+        st = wl_session_source_query(session, q, out);
+    if (session)
+        wl_session_inspection_end(session);
+    return st;
+}
+
+wirelog_source_query_status_t
+wl_source_lookup_symbol(wl_session_t *session, const wl_intern_t *intern,
+    const char *symbol, int64_t *out_id, bool *out_found)
+{
+    wirelog_source_query_status_t st = WIRELOG_SOURCE_QUERY_OK;
+
+    if (!symbol || !out_id || !out_found)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    if (session) {
+        st = wl_session_inspection_begin(session);
+        if (st != WIRELOG_SOURCE_QUERY_OK)
+            return st;
+        wl_source_query_t admit = { .mode = WL_SOURCE_QUERY_ADMIT };
+        wl_source_query_result_t result;
+        st = wl_session_source_query(session, &admit, &result);
+    }
+    /* Read-only, and inside the reservation when there is a session:
+     * wl_intern_get() never inserts. */
+    if (st == WIRELOG_SOURCE_QUERY_OK) {
+        int64_t id = wl_intern_get(intern, symbol);
+        if (id >= 0) {
+            *out_id = id;
+            *out_found = true;
+        }
+    }
+    if (session)
+        wl_session_inspection_end(session);
+    return st;
+}

@@ -951,27 +951,15 @@ wirelog_session_make_compound_typed(wirelog_session_t *session,
 /* Host source inspection (Issue #2321)                                     */
 /* ======================================================================== */
 
-/* Admit, validate @relation against the program and its certified origin,
- * then run @q.  Admission precedes identity and schema checks, so a call
- * from a callback is BUSY whatever it names. */
+/* Admission precedes identity and schema checks, so a call from a
+ * callback is BUSY whatever it names (wl_source_query_run). */
 static wirelog_source_query_status_t
 session_source_query(wirelog_session_t *session, wl_source_query_t *q,
     uint32_t expected_ncols, uint32_t nlanes, wl_source_query_result_t *out)
 {
-    wirelog_source_query_status_t st
-        = wl_session_inspection_begin(session->inner);
-    if (st != WIRELOG_SOURCE_QUERY_OK)
-        return st;
-    wl_source_query_t admit = { .mode = WL_SOURCE_QUERY_ADMIT };
-    st = wl_session_source_query(session->inner, &admit, out);
-    if (st == WIRELOG_SOURCE_QUERY_OK && q->mode != WL_SOURCE_QUERY_ADMIT)
-        st = wl_source_query_resolve(session->prog, &session->source_origin,
-                COL_SESSION(session->inner)->intern, q->relation,
-                expected_ncols, q->lanes, nlanes, &q->ncols);
-    if (st == WIRELOG_SOURCE_QUERY_OK && q->mode != WL_SOURCE_QUERY_ADMIT)
-        st = wl_session_source_query(session->inner, q, out);
-    wl_session_inspection_end(session->inner);
-    return st;
+    return wl_source_query_run(session->inner, session->prog,
+               &session->source_origin, COL_SESSION(session->inner)->intern,
+               q, expected_ncols, nlanes, out);
 }
 
 wirelog_source_query_status_t
@@ -1047,24 +1035,9 @@ wirelog_session_lookup_symbol(wirelog_session_t *session, const char *symbol,
         *out_found = false;
     if (!session || !session->inner || !symbol || !out_id || !out_found)
         return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
-    wl_source_query_t q = { .mode = WL_SOURCE_QUERY_ADMIT };
-    wl_source_query_result_t result = { 0 };
-    wirelog_source_query_status_t st = wl_session_inspection_begin(
-        session->inner);
-    if (st != WIRELOG_SOURCE_QUERY_OK)
-        return st;
-    st = wl_session_source_query(session->inner, &q, &result);
-    if (st == WIRELOG_SOURCE_QUERY_OK) {
-        /* Read-only: wl_intern_get() never inserts. */
-        int64_t id = wl_intern_get(COL_SESSION(session->inner)->intern,
-                symbol);
-        if (id >= 0) {
-            *out_id = id;
-            *out_found = true;
-        }
-    }
-    wl_session_inspection_end(session->inner);
-    return st;
+    return wl_source_lookup_symbol(session->inner,
+               COL_SESSION(session->inner)->intern, symbol, out_id,
+               out_found);
 }
 
 #ifdef WL_SESSION_TEST_HOOKS

@@ -56,7 +56,44 @@ struct wirelog_easy_session {
     uint32_t num_workers;
     bool plan_built; /* true once first wirelog_easy_step-class call ran */
     wirelog_extension_snapshot_t *extension_snapshot; /* owns one reference */
+    /* Issue #2321: host-only relations, captured from prog at open,
+     * before any inline fact is loaded. */
+    wl_source_origin_t source_origin;
+    /* Issue #2321: the last lazy initialization failed and none has since
+     * succeeded.  Source inspection then refuses rather than report the
+     * pristine zero of a session that was never built. */
+    bool init_failed;
 };
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test-only: make the next ensure_plan_built() fail at stage 1 (plan),
+ * 2 (session creation) or 3 (inline-fact load). */
+static int easy_testhook_fail_init_stage;
+void wirelog_easy_testhook_fail_next_init(int stage);
+void
+wirelog_easy_testhook_fail_next_init(int stage)
+{
+    easy_testhook_fail_init_stage = stage;
+}
+
+static bool
+easy_testhook_fail_init(int stage)
+{
+    if (easy_testhook_fail_init_stage != stage)
+        return false;
+    easy_testhook_fail_init_stage = 0;
+    return true;
+}
+
+wl_session_t *wirelog_easy_testhook_inner(wirelog_easy_session_t *s);
+wl_session_t *
+wirelog_easy_testhook_inner(wirelog_easy_session_t *s)
+{
+    return s ? s->session : NULL;
+}
+#else
+#define easy_testhook_fail_init(stage) false
+#endif
 
 static bool
 easy_relation_has_float(const wirelog_easy_session_t *s, const char *relation)
@@ -105,21 +142,27 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
     if (s->plan_built)
         return WIRELOG_OK;
 
+    /* Issue #2321: every failure return below marks the session, and only
+     * a complete success clears the mark. */
     wl_plan_t *plan = NULL;
-    int rc = wl_plan_from_program_with_snapshot(
-        s->prog, s->extension_snapshot, &plan);
+    int rc = easy_testhook_fail_init(1) ? EINVAL
+        : wl_plan_from_program_with_snapshot(s->prog, s->extension_snapshot,
+            &plan);
     if (rc != 0 || !plan) {
         if (plan)
             wl_plan_free(plan);
+        s->init_failed = true;
         return WIRELOG_ERR_INVALID_IR;
     }
 
     wl_session_t *session = NULL;
-    rc = wl_session_create_with_snapshot(wl_backend_columnar(), plan,
+    rc = easy_testhook_fail_init(2) ? ENOMEM
+        : wl_session_create_with_snapshot(wl_backend_columnar(), plan,
             num_workers > 0 ? num_workers : 1, s->extension_snapshot,
             &session);
     if (rc != 0 || !session) {
         wl_plan_free(plan);
+        s->init_failed = true;
         /* EOVERFLOW here is governor budget exhaustion, not representation
          * overflow: session creation reports the distinction at this edge. */
         return rc == WL_INTERN_ERR_MEMORY_BUDGET
@@ -137,19 +180,22 @@ ensure_plan_built(wirelog_easy_session_t *s, uint32_t num_workers)
      * installed, so col_session_insert takes the non-incremental path:
      * no spurious static deltas on the first step() and no outer-epoch
      * advance. */
-    rc = wl_session_load_facts(session, s->prog);
+    rc = easy_testhook_fail_init(3) ? EIO
+        : wl_session_load_facts(session, s->prog);
     if (rc != 0) {
         wirelog_error_t load_error
             = (wirelog_error_t)wl_facade_session_error_code_with_budget(
                 rc, 0, wl_session_budget_denied(session));
         wl_session_destroy(session);
         wl_plan_free(plan);
+        s->init_failed = true;
         return load_error;
     }
 
     s->plan = plan;
     s->session = session;
     s->plan_built = true;
+    s->init_failed = false;
     return WIRELOG_OK;
 }
 
@@ -205,6 +251,13 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
     s->extension_snapshot = snapshot;
     if (s->extension_snapshot)
         wirelog_extension_snapshot_retain(s->extension_snapshot);
+    /* Issue #2321: certify from the owned program before any fact load. */
+    if (wl_source_origin_capture(prog, &s->source_origin) != 0) {
+        wirelog_program_free(prog);
+        wirelog_extension_snapshot_release(s->extension_snapshot);
+        free(s);
+        return WIRELOG_ERR_MEMORY;
+    }
 
     if (opts && opts->eager_build) {
         err = ensure_plan_built(s, s->num_workers);
@@ -213,6 +266,7 @@ wirelog_easy_open_opts(const char *dl_src, const wirelog_easy_open_opts_t *opts,
                 wl_session_destroy(s->session);
             if (s->plan)
                 wl_plan_free(s->plan);
+            wl_source_origin_free(&s->source_origin);
             wirelog_program_free(prog);
             wirelog_extension_snapshot_release(s->extension_snapshot);
             free(s);
@@ -242,6 +296,7 @@ wirelog_easy_close(wirelog_easy_session_t *s)
     if (s->prog)
         wirelog_program_free(s->prog);
     wirelog_extension_snapshot_release(s->extension_snapshot);
+    wl_source_origin_free(&s->source_origin);
     free(s);
 }
 
@@ -551,4 +606,100 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     return (wirelog_error_t)wl_facade_session_error_code_with_budget(rc,
                COL_SESSION(s->session)->extension_expr_status,
                wl_columnar_session_budget_denied(COL_SESSION(s->session)));
+}
+
+/* ======================================================================== */
+/* Host source inspection (Issue #2321)                                     */
+/* ======================================================================== */
+
+/* Never builds the session: before the first building call nothing has been
+ * loaded, so a validated relation answers zero / false from the program
+ * alone.  A failed initialization answers INITIALIZATION_FAILED until a
+ * normal building call succeeds. */
+static wirelog_source_query_status_t
+easy_source_query(wirelog_easy_session_t *s, wl_source_query_t *q,
+    uint32_t expected_ncols, uint32_t nlanes, wl_source_query_result_t *out)
+{
+    out->count = 0;
+    out->exists = false;
+    if (s->init_failed)
+        return WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED;
+    return wl_source_query_run(s->session, s->prog, &s->source_origin,
+               s->intern_mut, q, expected_ncols, nlanes, out);
+}
+
+wirelog_source_query_status_t
+wirelog_easy_source_count(wirelog_easy_session_t *s, const char *relation,
+    const int64_t *tuple, uint32_t ncols, uint64_t max_rows,
+    uint64_t *out_count)
+{
+    if (out_count)
+        *out_count = 0;
+    if (!s || !relation || !tuple || !out_count || ncols == 0)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_COUNT,
+        .relation = relation,
+        .lanes = tuple,
+        .max_rows = max_rows,
+    };
+    wl_source_query_result_t result;
+    wirelog_source_query_status_t st = easy_source_query(s, &q, ncols, ncols,
+            &result);
+    if (st == WIRELOG_SOURCE_QUERY_OK)
+        *out_count = result.count;
+    return st;
+}
+
+wirelog_source_query_status_t
+wirelog_easy_source_key_exists(wirelog_easy_session_t *s,
+    const char *relation, int64_t first_key, uint64_t max_rows,
+    bool *out_exists)
+{
+    if (out_exists)
+        *out_exists = false;
+    if (!s || !relation || !out_exists)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_KEY,
+        .relation = relation,
+        .lanes = &first_key,
+        .max_rows = max_rows,
+    };
+    wl_source_query_result_t result;
+    wirelog_source_query_status_t st = easy_source_query(s, &q, 0, 1,
+            &result);
+    if (st == WIRELOG_SOURCE_QUERY_OK)
+        *out_exists = result.exists;
+    return st;
+}
+
+wirelog_source_query_status_t
+wirelog_easy_source_validate(wirelog_easy_session_t *s, const char *relation,
+    uint32_t expected_ncols)
+{
+    if (!s || !relation || expected_ncols == 0)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_VALIDATE,
+        .relation = relation,
+    };
+    wl_source_query_result_t result;
+    return easy_source_query(s, &q, expected_ncols, 0, &result);
+}
+
+wirelog_source_query_status_t
+wirelog_easy_lookup_symbol(wirelog_easy_session_t *s, const char *symbol,
+    int64_t *out_id, bool *out_found)
+{
+    if (out_id)
+        *out_id = -1;
+    if (out_found)
+        *out_found = false;
+    if (!s || !symbol || !out_id || !out_found)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    if (s->init_failed)
+        return WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED;
+    return wl_source_lookup_symbol(s->session, s->intern_mut, symbol, out_id,
+               out_found);
 }

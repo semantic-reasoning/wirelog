@@ -330,6 +330,32 @@ memory floor. A copied raw ID alone does not extend that lifetime.
 - `CHANGELOG.md` — entry for #718.
 - `stable-release-plan.md` §3, §7 — public-surface and conformance plans.
 
+## Host source inspection (Status: Current, #2321)
+
+`wirelog_session_source_count()`, `wirelog_session_source_key_exists()`,
+`wirelog_session_source_validate()`, `wirelog_session_lookup_symbol()` and
+their `wirelog_easy_*` counterparts read the *source*, not the model.
+
+- **Source.** The source of a relation is the multiset of rows the host has
+  inserted into it and not removed, under the Z-set rules above: every
+  insert adds one occurrence, every matching remove takes one away, and a
+  remove with no match changes nothing. Inserts not yet evaluated count.
+  A rule head's source is only its host input (kept in its `$in$` seed
+  shadow), so a tuple that rules also derive still counts its inserted
+  copies alone, and a tuple only derived counts zero.
+- **Origin.** Inline facts are part of a relation's stored rows but not of
+  host input, and an occurrence carries no record of where it came from. A
+  relation with any inline fact in the program the session was created from
+  is therefore refused (`UNSUPPORTED`) for its whole lifetime, even after
+  every fact is removed; facts on other relations do not matter. The set of
+  host-only relations is captured by name at creation, before facts are
+  loaded, and later edits to a borrowed program cannot widen it.
+- **No evaluation.** The calls never evaluate, never invoke a callback, never
+  intern, and never change pending input, generations or caches. An easy
+  session that has not been built yet answers from program metadata alone.
+- **Refusal is never absence.** Every status other than `OK` leaves the
+  outputs reset and must not be read as "not present".
+
 ## Recursive aggregation residue (Status: Implemented for MIN/MAX outside a shared SCC)
 
 Tracked under #692.
