@@ -125,7 +125,6 @@ testlib_prod_src = files(
     '../wirelog/columnar/eval_stack.c',
     '../wirelog/columnar/eval_tdd_insert.c',
     '../wirelog/columnar/eval_tdd_plan.c',
-    '../wirelog/columnar/eval_tdd_queue.c',
     '../wirelog/columnar/tdd_channel.c',
     '../wirelog/columnar/eval_tdd_channel.c',
     '../wirelog/columnar/expr.c',
@@ -716,6 +715,18 @@ test_tdd_channel_spill_exe = executable(
 test('tdd_channel_spill', test_tdd_channel_spill_exe,
      env: ['WL_TDD_CHANNEL_SPILL_DIR=' + meson.current_build_dir()],
      suite: 'unit', timeout: 120)
+
+# Issue #1373: a test hook splits every worker delta into several channel
+# batches; recursive results at W=2 and W=8 must equal the serial result.
+test_tdd_channel_split_exe = executable(
+  'test_tdd_channel_split', files('test_tdd_channel_split.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+)
+test('tdd_channel_split', test_tdd_channel_split_exe, suite: 'unit',
+     timeout: 120)
 
 # Issue #508: bench_argv shim unit tests. Header-only, portable by
 # construction; runs on every platform including MSVC.
@@ -2126,7 +2137,6 @@ backend_src = files(
   '../wirelog/columnar/inline.c',
   '../wirelog/columnar/eval_dedup.c',
   '../wirelog/columnar/eval_delta.c',
-  '../wirelog/columnar/eval_tdd_queue.c',
   '../wirelog/columnar/tdd_channel.c',
   '../wirelog/columnar/eval_tdd_channel.c',
   '../wirelog/columnar/eval_tdd_plan.c',

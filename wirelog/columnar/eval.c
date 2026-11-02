@@ -11,6 +11,7 @@
 
 #define _GNU_SOURCE
 
+#include "columnar/eval_tdd_channel.h"
 #include "columnar/internal.h"
 #include "wirelog/util/log.h"
 
@@ -63,20 +64,12 @@ wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker);
 #endif
 
 static void
-tdd_destroy_delta_payload(void *payload)
+tdd_release_channel_reservation(wl_col_session_t *coord)
 {
-    col_rel_destroy((col_rel_t *)payload);
-}
-
-static void
-tdd_release_queue_ring(wl_col_session_t *coord)
-{
-    if (coord->delta_queue_ring_reservation.bytes
-        && !wl_columnar_memory_release(
-            &coord->delta_queue_ring_reservation))
+    if (coord->tdd_channel_reservation.bytes
+        && !wl_columnar_memory_release(&coord->tdd_channel_reservation))
         abort();
-    wl_columnar_memory_reservation_init(
-        &coord->delta_queue_ring_reservation);
+    wl_columnar_memory_reservation_init(&coord->tdd_channel_reservation);
 }
 
 /* This retry is confined to the coordinator before its first dispatch. */
@@ -97,18 +90,37 @@ tdd_queue_reclaim_safe(const wl_col_session_t *coord)
     return true;
 }
 
-static int
-tdd_reserve_queue_ring(wl_col_session_t *coord, uint32_t workers,
-    uint32_t capacity, uint64_t *bytes)
+int
+wl_columnar_eval_tdd_channel_side_bytes(uint32_t workers, uint32_t nrels,
+    uint64_t *bytes)
 {
-    int rc = wl_mpsc_queue_footprint_checked(workers, capacity, bytes);
+    uint64_t channel = 0;
+    uint64_t lists = 0;
+    if (!bytes)
+        return EINVAL;
+    int rc = wl_tdd_channel_footprint(workers, &channel);
+    if (rc != 0)
+        return rc;
+    if (!wl_columnar_memory_size_mul(workers, nrels, &lists)
+        || !wl_columnar_memory_size_mul(lists, sizeof(wl_tdd_batch_t *),
+        &lists)
+        || !wl_columnar_memory_size_add(channel, lists, bytes))
+        return EOVERFLOW;
+    return 0;
+}
+
+static int
+tdd_reserve_channel(wl_col_session_t *coord, uint32_t workers,
+    uint32_t nrels, uint64_t *bytes)
+{
+    int rc = wl_columnar_eval_tdd_channel_side_bytes(workers, nrels, bytes);
     if (rc || !coord->memory_governor)
         return rc;
     wl_columnar_memory_governor_t *governor
         = wl_columnar_memory_governor_ref_get(coord->memory_governor);
     wl_columnar_memory_admission_status_t status
         = wl_columnar_memory_reserve_checked(governor, *bytes,
-            &coord->delta_queue_ring_reservation);
+            &coord->tdd_channel_reservation);
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_DENIED
         && tdd_queue_reclaim_safe(coord)) {
         uint64_t before = wl_columnar_memory_reserved(governor);
@@ -117,7 +129,7 @@ tdd_reserve_queue_ring(wl_col_session_t *coord, uint32_t workers,
         uint64_t after = wl_columnar_memory_reserved(governor);
         if (reclaimed.bytes_released && after < before)
             status = wl_columnar_memory_reserve_checked(governor, *bytes,
-                    &coord->delta_queue_ring_reservation);
+                    &coord->tdd_channel_reservation);
     }
     if (status == WL_COLUMNAR_MEMORY_ADMISSION_OK
         || status == WL_COLUMNAR_MEMORY_ADMISSION_ADVISORY)
@@ -130,126 +142,199 @@ tdd_reserve_queue_ring(wl_col_session_t *coord, uint32_t workers,
         ? EOVERFLOW : EBUSY;
 }
 
+/*
+ * Create the stratum's channel and its side buffers under one governed
+ * reservation.  The channel's capacity is unbounded: the consumer starts
+ * pumping only after every producer has been joined, so a producer must
+ * never wait for space.
+ */
 static int
-tdd_create_queue_ring(wl_col_session_t *coord, uint32_t workers,
-    uint32_t capacity)
+tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
+    uint32_t nrels)
 {
+    if (coord->tdd_channel || coord->tdd_channel_lists)
+        return EBUSY;
+    size_t list_count = 0;
+    if (wl_columnar_eval_checked_size_mul(workers, nrels, &list_count) != 0)
+        return EOVERFLOW;
     uint64_t bytes = 0;
-    int rc = tdd_reserve_queue_ring(coord, workers, capacity, &bytes);
+    int rc = tdd_reserve_channel(coord, workers, nrels, &bytes);
     if (rc != 0)
         return rc;
-    wl_mpsc_queue_t *queue = wl_mpsc_queue_create_with_destructor(
-        workers, capacity, tdd_destroy_delta_payload);
-    if (!queue) {
-        tdd_release_queue_ring(coord);
+    wl_tdd_batch_t **lists = (wl_tdd_batch_t **)calloc(
+        list_count ? list_count : 1u, sizeof(*lists));
+    wl_tdd_channel_t *ch = lists
+        ? wl_tdd_channel_create(workers, UINT64_MAX,
+            coord->memory_governor
+            ? wl_columnar_memory_governor_ref_get(coord->memory_governor)
+            : NULL, coord)
+        : NULL;
+    if (!ch) {
+        free((void *)lists);
+        tdd_release_channel_reservation(coord);
         return ENOMEM;
     }
     if (coord->memory_governor
-        && !wl_columnar_memory_commit(
-            &coord->delta_queue_ring_reservation, coord))
+        && !wl_columnar_memory_commit(&coord->tdd_channel_reservation, coord))
         abort();
-    coord->delta_queue = queue;
-    coord->mem_channel_ring_bytes = bytes;
+    coord->tdd_channel = ch;
+    coord->tdd_channel_lists = lists;
+    coord->tdd_channel_list_count = list_count;
+    coord->mem_channel_side_bytes = bytes;
     wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL, bytes);
     return 0;
 }
 
+/* Free the channel and its side buffers.  Returns EBUSY, releasing nothing,
+ * while wl_tdd_channel_destroy() refuses: a lane is open, a batch is queued
+ * or reserved, or a taken batch is unretired.  The caller empties the
+ * consumer lists first; this frees their array without looking. */
+static int
+tdd_channel_release(wl_col_session_t *coord)
+{
+    if (coord->tdd_channel) {
+        int rc = wl_tdd_channel_destroy(coord->tdd_channel);
+        if (rc != 0)
+            return rc;
+        coord->tdd_channel = NULL;
+    }
+    free((void *)coord->tdd_channel_lists);
+    coord->tdd_channel_lists = NULL;
+    coord->tdd_channel_list_count = 0;
+    if (coord->mem_channel_side_bytes) {
+        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+            coord->mem_channel_side_bytes);
+        coord->mem_channel_side_bytes = 0;
+    }
+    tdd_release_channel_reservation(coord);
+    return 0;
+}
+
+/* Outside owner mode a refused retirement abandons the relation, as
+ * col_rel_destroy() does, and retires the descriptor. */
+static void
+tdd_channel_abandon_refused(void *ctx, wl_tdd_batch_t *batch, int rc)
+{
+    (void)rc;
+    batch->payload = NULL;
+    wl_tdd_channel_retire((wl_tdd_channel_t *)ctx, batch);
+}
+
 void
-wl_columnar_eval_tdd_dispose_queue_ring(wl_col_session_t *coord)
+wl_columnar_eval_tdd_dispose_channel(wl_col_session_t *coord)
 {
     if (!coord || coord->tdd_owner_lifetime)
         return;
-    if (coord->delta_queue) {
-        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-            coord->delta_queue, &coord->mem_ledger);
-        wl_mpsc_queue_destroy(coord->delta_queue);
-        coord->delta_queue = NULL;
-        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-            coord->mem_channel_ring_bytes);
-        coord->mem_channel_ring_bytes = 0;
+    wl_tdd_channel_t *ch = coord->tdd_channel;
+    if (ch) {
+        wl_tdd_refusal_sink_t refusal = { tdd_channel_abandon_refused, ch };
+        wl_columnar_eval_tdd_channel_discard_lists(ch,
+            coord->tdd_channel_lists, coord->tdd_channel_list_count,
+            &refusal);
+        wl_tdd_discard_ctx_t discard = { ch, refusal, &coord->mem_ledger };
+        wl_tdd_channel_discard_all(ch, wl_columnar_eval_tdd_discard_sink,
+            &discard);
     }
-    tdd_release_queue_ring(coord);
+    /* With a lane still open everything stays attached: a running producer
+     * may still touch the channel. */
+    (void)tdd_channel_release(coord);
 }
 
 #ifdef WL_TEST_ALLOC_WRAP
 int
-wl_columnar_eval_test_reserve_queue_ring(wl_col_session_t *coord,
-    uint32_t workers, uint32_t capacity, uint64_t *bytes)
+wl_columnar_eval_test_reserve_channel(wl_col_session_t *coord,
+    uint32_t workers, uint32_t nrels, uint64_t *bytes)
 {
-    return tdd_reserve_queue_ring(coord, workers, capacity, bytes);
+    return tdd_reserve_channel(coord, workers, nrels, bytes);
 }
 
 int
-wl_columnar_eval_test_create_queue_ring(wl_col_session_t *coord,
-    uint32_t workers, uint32_t capacity)
+wl_columnar_eval_test_create_channel(wl_col_session_t *coord,
+    uint32_t workers, uint32_t nrels)
 {
-    return tdd_create_queue_ring(coord, workers, capacity);
+    return tdd_create_channel(coord, workers, nrels);
 }
 #endif
 
-static bool
-wl_columnar_eval_tdd_owner_lifetime_contains(
-    const wl_columnar_eval_tdd_owner_lifetime_t *lifetime,
-    const col_rel_t *relation)
+/* Owner mode: keep @batch, still holding its payload, on the lifetime's
+ * retained list.  Linking through batch->next allocates nothing. */
+static void
+tdd_lifetime_retain(wl_columnar_eval_tdd_owner_lifetime_t *lifetime,
+    wl_tdd_batch_t *batch)
 {
-    size_t count = lifetime->matrix_slots + lifetime->overflow_slots;
-    for (size_t i = 0; i < count; i++)
-        if (lifetime->relations[i] == relation)
-            return true;
-    return false;
+    batch->next = lifetime->retained;
+    lifetime->retained = batch;
 }
 
-static int
-wl_columnar_eval_tdd_owner_lifetime_capture_queue(wl_col_session_t *coord,
+/* Owner-mode refusal sink: a refused retirement goes to the lifetime. */
+static void
+tdd_lifetime_refusal_sink(void *ctx, wl_tdd_batch_t *batch, int rc)
+{
+    (void)rc;
+    tdd_lifetime_retain((wl_columnar_eval_tdd_owner_lifetime_t *)ctx, batch);
+}
+
+typedef struct {
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime;
+    wl_mem_ledger_t *ledger;
+} tdd_lifetime_capture_t;
+
+/* wl_tdd_channel_discard_all() sink for owner mode: the batch leaves the
+ * channel, so its CHANNEL charge is freed, and the lifetime keeps it. */
+static void
+tdd_lifetime_capture_sink(void *ctx, wl_tdd_batch_t *batch)
+{
+    tdd_lifetime_capture_t *capture = ctx;
+    wl_mem_ledger_free(capture->ledger, WL_MEM_SUBSYS_CHANNEL, batch->charge);
+    tdd_lifetime_retain(capture->lifetime, batch);
+}
+
+/* The refusal sink for the current mode: the owner lifetime record keeps
+ * refused batches; otherwise their relations are abandoned. */
+static wl_tdd_refusal_sink_t
+tdd_channel_refusal_sink(wl_col_session_t *coord)
+{
+    wl_tdd_refusal_sink_t sink = { tdd_channel_abandon_refused,
+                                   coord->tdd_channel };
+    if (coord->tdd_owner_lifetime) {
+        sink.fn = tdd_lifetime_refusal_sink;
+        sink.ctx = coord->tdd_owner_lifetime;
+    }
+    return sink;
+}
+
+/* Move every batch the lifetime's channel still holds, queued or on a
+ * consumer list, onto the retained list.  Allocates nothing. */
+static void
+wl_columnar_eval_tdd_owner_lifetime_capture(wl_col_session_t *coord,
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
 {
-    wl_delta_msg_t msg;
-
-    if (!lifetime->queue)
-        return 0;
-    while (wl_mpsc_dequeue(lifetime->queue, &msg)) {
-        if (!msg.delta)
-            continue;
-        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-            col_rel_transport_bytes((const col_rel_t *)msg.delta));
-        col_rel_t *relation = (col_rel_t *)msg.delta;
-        if (wl_columnar_eval_tdd_owner_lifetime_contains(lifetime, relation))
-            continue;
-        size_t slot = lifetime->matrix_slots;
-        if (msg.worker_id < lifetime->worker_count
-            && msg.rel_idx < lifetime->relation_count) {
-            size_t candidate = (size_t)msg.worker_id
-                * lifetime->relation_count + msg.rel_idx;
-            if (!lifetime->relations[candidate])
-                slot = candidate;
-        }
-        if (slot == lifetime->matrix_slots) {
-            size_t overflow = 0;
-            while (overflow < lifetime->overflow_slots
-                && lifetime->relations[lifetime->matrix_slots + overflow])
-                overflow++;
-            if (overflow == lifetime->overflow_slots) {
-                /* This storage was sized for every message slot in every
-                 * worker ring before dispatch. Losing the dequeued payload
-                 * here would violate the queue's single-owner contract. */
-                abort();
+    wl_tdd_channel_t *ch = lifetime->channel;
+    if (!ch)
+        return;
+    if (coord->tdd_channel == ch && coord->tdd_channel_lists) {
+        for (size_t i = 0; i < coord->tdd_channel_list_count; i++) {
+            wl_tdd_batch_t *batch = coord->tdd_channel_lists[i];
+            coord->tdd_channel_lists[i] = NULL;
+            while (batch) {
+                wl_tdd_batch_t *next = batch->next;
+                tdd_lifetime_retain(lifetime, batch);
+                batch = next;
             }
-            slot = lifetime->matrix_slots + overflow;
         }
-        lifetime->relations[slot] = relation;
     }
-    return 0;
+    tdd_lifetime_capture_t capture = { lifetime, &coord->mem_ledger };
+    wl_tdd_channel_discard_all(ch, tdd_lifetime_capture_sink, &capture);
 }
 
 static int
-wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
-    wl_columnar_eval_tdd_owner_lifetime_t *lifetime, size_t destroy_count);
+wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime);
 
 int
 wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
 {
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime;
-    size_t count;
 
     if (!coord)
         return EINVAL;
@@ -258,24 +343,18 @@ wl_columnar_eval_tdd_owner_lifetime_retry(wl_col_session_t *coord)
         return 0;
     if (lifetime->evaluation_active || lifetime->dispatch_active)
         return EBUSY;
-    int rc = wl_columnar_eval_tdd_owner_lifetime_capture_queue(coord, lifetime);
-    if (rc != 0)
-        return rc;
-    count = lifetime->matrix_slots + lifetime->overflow_slots;
-    rc = wl_columnar_eval_tdd_owner_lifetime_dispose_slots(lifetime, count);
+    wl_columnar_eval_tdd_owner_lifetime_capture(coord, lifetime);
+    int rc = wl_columnar_eval_tdd_owner_lifetime_dispose_all(lifetime);
     if (rc != 0)
         return rc;
 
-    if (lifetime->queue) {
-        if (coord->delta_queue == lifetime->queue) {
-            coord->delta_queue = NULL;
-            coord->mem_channel_ring_bytes = 0;
-        }
-        wl_mpsc_queue_destroy(lifetime->queue);
-        lifetime->queue = NULL;
-        wl_mem_ledger_free(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-            lifetime->queue_ring_bytes);
-        tdd_release_queue_ring(coord);
+    if (lifetime->channel) {
+        rc = coord->tdd_channel == lifetime->channel
+            ? tdd_channel_release(coord)
+            : wl_tdd_channel_destroy(lifetime->channel);
+        if (rc != 0)
+            return rc;
+        lifetime->channel = NULL;
     }
     coord->tdd_owner_lifetime = NULL;
     wl_columnar_memory_release(&lifetime->reservation);
@@ -309,15 +388,11 @@ wl_columnar_eval_tdd_owner_lifetime_quiesce(wl_col_session_t *coord)
 
 static int
 wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
-    col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers, uint32_t nrels,
-    uint32_t queue_capacity)
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t workers, uint32_t nrels)
 {
     size_t matrix_slots;
-    size_t overflow_slots;
-    size_t total_slots;
     size_t slot_bytes;
     size_t allocation_bytes;
-    uint32_t ring_capacity = 2;
     int rc;
 
     if (!coord || !ctxs || workers == 0 || nrels == 0
@@ -326,17 +401,7 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
     rc = wl_columnar_eval_checked_size_mul(workers, nrels, &matrix_slots);
     if (rc != 0)
         return rc;
-    while (ring_capacity < queue_capacity) {
-        if (ring_capacity > UINT32_MAX / 2u)
-            return EOVERFLOW;
-        ring_capacity *= 2u;
-    }
-    rc = wl_columnar_eval_checked_size_mul(workers, ring_capacity,
-            &overflow_slots);
-    if (rc != 0 || overflow_slots > SIZE_MAX - matrix_slots)
-        return EOVERFLOW;
-    total_slots = matrix_slots + overflow_slots;
-    rc = wl_columnar_eval_checked_size_mul(total_slots, sizeof(col_rel_t *),
+    rc = wl_columnar_eval_checked_size_mul(matrix_slots, sizeof(col_rel_t *),
             &slot_bytes);
     if (rc != 0 || slot_bytes > SIZE_MAX - sizeof(
             wl_columnar_eval_tdd_owner_lifetime_t))
@@ -372,7 +437,6 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
     lifetime->worker_count = workers;
     lifetime->relation_count = nrels;
     lifetime->matrix_slots = matrix_slots;
-    lifetime->overflow_slots = overflow_slots;
     lifetime->evaluation_active = true;
     lifetime->worker_ctxs = ctxs;
     for (uint32_t w = 0; w < workers; w++)
@@ -381,29 +445,56 @@ wl_columnar_eval_tdd_owner_lifetime_create(wl_col_session_t *coord,
     return 0;
 }
 
-static int
-wl_columnar_eval_tdd_owner_lifetime_dispose_all(
-    wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
+typedef struct {
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime;
+    int first_rc;
+    size_t refused;
+} tdd_lifetime_pass_t;
+
+/* Refusal sink for one disposal pass: the batch goes back on the retained
+ * list and the first refusal is remembered. */
+static void
+tdd_lifetime_pass_refusal(void *ctx, wl_tdd_batch_t *batch, int rc)
 {
-    if (!lifetime)
-        return EINVAL;
-    return wl_columnar_eval_tdd_owner_lifetime_dispose_slots(lifetime,
-               lifetime->matrix_slots + lifetime->overflow_slots);
+    tdd_lifetime_pass_t *pass = ctx;
+    if (pass->first_rc == 0)
+        pass->first_rc = rc;
+    pass->refused++;
+    tdd_lifetime_retain(pass->lifetime, batch);
+}
+
+/* Whether @payload is held by a matrix slot or by a retained batch before
+ * @until on the retained list. */
+static bool
+tdd_lifetime_holds_earlier(
+    const wl_columnar_eval_tdd_owner_lifetime_t *lifetime,
+    const void *payload, const wl_tdd_batch_t *until)
+{
+    for (size_t i = 0; i < lifetime->matrix_slots; i++)
+        if (lifetime->relations[i] == payload)
+            return true;
+    for (const wl_tdd_batch_t *b = lifetime->retained; b && b != until;
+        b = b->next)
+        if (b->payload == payload)
+            return true;
+    return false;
 }
 
 static int
-wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
-    wl_columnar_eval_tdd_owner_lifetime_t *lifetime, size_t destroy_count)
+wl_columnar_eval_tdd_owner_lifetime_dispose_all(
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
 {
     size_t total;
     int first_rc = 0;
     if (!lifetime)
         return EINVAL;
-    total = lifetime->matrix_slots + lifetime->overflow_slots;
-    if (destroy_count > total)
+    if (lifetime->retained && !lifetime->channel)
         return EINVAL;
-    /* Canonicalize every aliased pointer before a destructor can free it. */
-    for (size_t i = 0; i < total; i++) {
+    total = lifetime->matrix_slots;
+    /* Canonicalize every aliased pointer before a destructor can free it:
+     * a later matrix slot or retained batch naming a relation that an
+     * earlier holder names drops its reference. */
+    for (size_t i = 0; i < lifetime->matrix_slots; i++) {
         col_rel_t *relation = lifetime->relations[i];
         if (!relation)
             continue;
@@ -414,12 +505,17 @@ wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
             }
         }
     }
+    for (wl_tdd_batch_t *b = lifetime->retained; b; b = b->next) {
+        total++;
+        if (b->payload && tdd_lifetime_holds_earlier(lifetime, b->payload, b))
+            b->payload = NULL;
+    }
     /* Keep making progress so aliases can release roots that refused earlier
      * in the same pass. The number of successful disposals is bounded. */
-    for (size_t pass = 0; pass <= destroy_count; pass++) {
+    for (size_t pass = 0; pass <= total; pass++) {
         bool progress = false;
         first_rc = 0;
-        for (size_t i = 0; i < destroy_count; i++) {
+        for (size_t i = 0; i < lifetime->matrix_slots; i++) {
             col_rel_t *relation = lifetime->relations[i];
             if (!relation)
                 continue;
@@ -431,12 +527,30 @@ wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
                 first_rc = rc;
             }
         }
+        wl_tdd_batch_t *pending = lifetime->retained;
+        lifetime->retained = NULL;
+        tdd_lifetime_pass_t state = { lifetime, 0, 0 };
+        wl_tdd_refusal_sink_t sink = { tdd_lifetime_pass_refusal, &state };
+        size_t attempted = 0;
+        while (pending) {
+            wl_tdd_batch_t *next = pending->next;
+            attempted++;
+            wl_columnar_eval_tdd_batch_discard(lifetime->channel, pending,
+                &sink);
+            pending = next;
+        }
+        if (state.refused < attempted)
+            progress = true;
+        if (first_rc == 0)
+            first_rc = state.first_rc;
         if (!progress)
             break;
     }
-    for (size_t i = 0; i < destroy_count; i++)
+    for (size_t i = 0; i < lifetime->matrix_slots; i++)
         if (lifetime->relations[i])
             return first_rc != 0 ? first_rc : EBUSY;
+    if (lifetime->retained)
+        return first_rc != 0 ? first_rc : EBUSY;
     return 0;
 }
 
@@ -445,23 +559,6 @@ wl_columnar_eval_tdd_owner_lifetime_dispose_slots(
 #define WL_COLUMNAR_EVAL_DEDUP_SET_CONTAINS wl_columnar_eval_dedup_set_contains
 #define WL_COLUMNAR_EVAL_DEDUP_SET_INIT_FROM_REL \
         wl_columnar_eval_dedup_set_init_from_rel
-
-int
-wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
-{
-    if (!out)
-        return EINVAL;
-    /* wl_mpsc_queue_create rounds capacity to a uint32 power of two;
-     * 2^31 is its largest non-wrapping request on the current base. */
-    if (nrels > (UINT32_C(1) << 30))
-        return EOVERFLOW;
-    /* A conservative bound: each worker publishes at most one delta per
-     * relation per subpass (an outbound subpass refuses ordinary growth with
-     * EPROTO), and 2*nrels slots leave room for twice that.  The SPSC ring
-     * uses all of its slots. */
-    *out = nrels > 0 ? nrels * 2u : 2u;
-    return 0;
-}
 
 int
 wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
@@ -2235,7 +2332,7 @@ wl_columnar_eval_outbound_framed_relation(col_eval_tdd_worker_ctx_t *ctx,
         wl_columnar_eval_test_outbound_before_publish(sess, result);
 #endif
     bool nonempty = delta->nrows > 0;
-    rc = wl_columnar_eval_tdd_queue_publish_delta(ctx, sess, &result->rel,
+    rc = wl_columnar_eval_tdd_channel_publish_delta(ctx, sess, &result->rel,
             ri, ctx->eff_iter);
     if (!result->rel)
         result->owned = false;
@@ -2521,7 +2618,7 @@ tdd_worker_subpass_fn(void *arg)
         }
 
         wl_col_session_t *coord = sess->coordinator;
-        if (!coord || !coord->delta_queue || !ctx->delta_rels
+        if (!coord || !coord->tdd_channel || !ctx->delta_rels
             || ctx->delta_rels[ri] || sess->worker_id
             >= coord->tdd_workers_count
             || &coord->tdd_workers[sess->worker_id] != sess) {
@@ -2621,16 +2718,12 @@ tdd_worker_subpass_fn(void *arg)
             rc2 = wl_columnar_eval_test_after_worker_private(sess, r,
                     image, delta);
 #endif
-        wl_mpsc_reservation_t queue_slot = { 0 };
-        bool queue_slot_held = false;
+        wl_tdd_batch_t *batch = NULL;
         if (rc2 == 0 && delta->nrows > 0) {
-            /* Claim transport capacity while the source is still private.
-             * A held slot cannot be consumed or bypassed by this producer. */
-            if (wl_mpsc_reserve(coord->delta_queue, sess->worker_id,
-                &queue_slot) != 0)
-                rc2 = ENOMEM;
-            else
-                queue_slot_held = true;
+            /* Fund the descriptor and reserve its bytes while the source
+             * is still private, so a refusal leaves the head unchanged. */
+            rc2 = wl_columnar_eval_tdd_channel_reserve_delta(sess, ri, delta,
+                    &batch);
         }
         if (rc2 != 0) {
             if (rc2 == ENOMEM && ((image
@@ -2644,8 +2737,8 @@ tdd_worker_subpass_fn(void *arg)
                 wl_columnar_eval_test_after_worker_private_error(sess, r,
                     image, delta, rc2);
 #endif
-            if (queue_slot_held)
-                (void)wl_mpsc_reservation_cancel(&queue_slot);
+            if (batch)
+                wl_tdd_channel_batch_abandon(coord->tdd_channel, batch);
             col_rel_mutable_image_discard(&image_txn);
             col_rel_destroy(delta);
             ctx->rc = rc2;
@@ -2655,8 +2748,8 @@ tdd_worker_subpass_fn(void *arg)
         image->memory_budget_denial_pending |= prior_budget_denial;
         rc2 = col_rel_mutable_image_commit(&image_txn);
         if (rc2 != 0) {
-            if (queue_slot_held)
-                (void)wl_mpsc_reservation_cancel(&queue_slot);
+            if (batch)
+                wl_tdd_channel_batch_abandon(coord->tdd_channel, batch);
             col_rel_mutable_image_discard(&image_txn);
             col_rel_destroy(delta);
             ctx->rc = rc2;
@@ -2666,20 +2759,16 @@ tdd_worker_subpass_fn(void *arg)
         col_session_invalidate_arrangements(&sess->base,
             sp->relations[ri].name);
         if (delta->nrows > 0) {
-            uint64_t transport_bytes = col_rel_transport_bytes(delta);
-            wl_delta_msg_t message = { 0 };
-            message.delta = delta;
-            message.stratum = ctx->stratum_idx;
-            message.rel_idx = ri;
-            /* Both operations are infallible for this held producer slot.
-             * Credit must precede publication to the consumer. */
-            wl_mem_ledger_alloc(&coord->mem_ledger,
-                WL_MEM_SUBSYS_CHANNEL, transport_bytes);
-            int publish_rc = wl_mpsc_reservation_publish(&queue_slot,
-                    message);
-            assert(publish_rc == 0);
-            (void)publish_rc;
+            /* The reserved batch publishes without failing; only the test
+             * split hook can refuse a later part of the delta. */
             any_new = true;
+            rc2 = wl_columnar_eval_tdd_channel_publish_reserved(sess, batch,
+                    delta);
+            if (rc2 != 0) {
+                ctx->rc = rc2;
+                free(snap);
+                TDD_WORKER_RETURN();
+            }
         } else {
             col_rel_destroy(delta);
         }
@@ -2710,6 +2799,30 @@ tdd_worker_subpass_fn(void *arg)
      * delta_seeded). */
     TDD_WORKER_RETURN();
 #undef TDD_WORKER_RETURN
+}
+
+/*
+ * tdd_worker_channel_fn:
+ * Workqueue entry for one recursive TDD subpass.  The subpass runs inside
+ * its channel lane, and the lane closes with the subpass's rc on the way
+ * out, so the consumer's completion check accounts for every task,
+ * including one that returned before publishing.  A task that starts after
+ * the channel was cancelled closes its lane without running.
+ */
+static void
+tdd_worker_channel_fn(void *arg)
+{
+    col_eval_tdd_worker_ctx_t *ctx = (col_eval_tdd_worker_ctx_t *)arg;
+    wl_col_session_t *sess = ctx->worker_sess;
+    wl_tdd_channel_t *ch = sess->coordinator
+        ? sess->coordinator->tdd_channel : NULL;
+    if (ch && wl_tdd_channel_cancelled(ch)) {
+        ctx->rc = ECANCELED;
+        wl_tdd_channel_close_lane(ch, sess->worker_id, ECANCELED);
+        return;
+    }
+    tdd_worker_subpass_fn(arg);
+    wl_tdd_channel_close_lane(ch, sess->worker_id, ctx->rc);
 }
 
 /*
@@ -6938,14 +7051,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     int rc = 0;
     uint64_t tdd_total_t0 = now_ns();
 
-    uint32_t delta_queue_capacity = 0;
     col_eval_tdd_worker_ctx_t *ctxs = NULL;
-    int capacity_rc = wl_columnar_eval_delta_queue_capacity(nrels,
-            &delta_queue_capacity);
-    if (capacity_rc != 0) {
-        coord->tdd_total_ns += now_ns() - tdd_total_t0;
-        return capacity_rc;
-    }
 
     /* Pre-register empty IDB relations on coordinator
      * (eval_serial.c:276-289) */
@@ -7249,7 +7355,7 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         || (bdx_mode
         && (!wl_columnar_memory_size_mul(W, nrels, &worker_bytes)
         || !wl_columnar_memory_size_mul(worker_bytes,
-        sizeof(uint32_t) + sizeof(wl_delta_msg_t), &worker_bytes)
+        sizeof(uint32_t), &worker_bytes)
         || !wl_columnar_memory_size_add(worker_scratch_bytes,
         worker_bytes, &worker_scratch_bytes)
         || !wl_columnar_memory_size_mul(W, sizeof(col_rel_t *),
@@ -7281,12 +7387,11 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         rc = ENOMEM;
         goto done;
     }
-    rc = tdd_create_queue_ring(coord, W, delta_queue_capacity);
+    rc = tdd_create_channel(coord, W, nrels);
     if (rc != 0)
         goto done;
     if (owner_exchange_mode) {
-        rc = wl_columnar_eval_tdd_owner_lifetime_create(coord, ctxs, W, nrels,
-                delta_queue_capacity);
+        rc = wl_columnar_eval_tdd_owner_lifetime_create(coord, ctxs, W, nrels);
         if (rc != 0)
             goto done;
         owner_slots_embedded = true;
@@ -7305,13 +7410,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
         }
     }
 
-    /* The queue was admitted and created before the owner lifetime record;
-     * this binding is nonfallible and precedes any worker dispatch. */
+    /* The channel was admitted and created before the owner lifetime
+     * record; this binding is nonfallible and precedes any worker dispatch. */
     if (coord->tdd_owner_lifetime)
-        coord->tdd_owner_lifetime->queue = coord->delta_queue;
-    if (coord->tdd_owner_lifetime)
-        coord->tdd_owner_lifetime->queue_ring_bytes
-            = coord->mem_channel_ring_bytes;
+        coord->tdd_owner_lifetime->channel = coord->tdd_channel;
 
     /* Issue #390: BDX snap array — pre-subpass IDB sizes per worker/relation.
      * Used to truncate worker IDB back to clean partition state after each
@@ -7496,12 +7598,23 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (wl_columnar_eval_test_subpass_boundary)
                 wl_columnar_eval_test_subpass_boundary(coord, eff_iter, true);
 #endif
+            /* The previous round left every lane closed and the channel
+             * empty, so this only fails on a broken invariant. */
+            rc = wl_tdd_channel_begin_round(coord->tdd_channel, stratum_idx,
+                    eff_iter);
+            if (rc != 0)
+                goto done;
+
             /* DISPATCH */
             bool submit_ok = true;
             uint64_t dispatch_t0 = now_ns();
             for (uint32_t w = 0; w < W; w++) {
-                if (WL_COLUMNAR_EVAL_SUBMIT(coord->wq, tdd_worker_subpass_fn,
+                if (WL_COLUMNAR_EVAL_SUBMIT(coord->wq, tdd_worker_channel_fn,
                     &ctxs[w]) != 0) {
+                    /* Tasks that were never queued close their lanes here;
+                     * the queued ones run in the drain and close their own.
+                     * The capacity is unbounded, so none of them waits. */
+                    wl_tdd_channel_close_unstarted(coord->tdd_channel, w, W);
                     int drain_rc = wl_workqueue_drain(coord->wq);
                     owner_dispatch_quiesced = drain_rc == 0;
                     if (owner_dispatch_quiesced && coord->tdd_owner_lifetime)
@@ -7518,10 +7631,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             uint64_t submit_ns = now_ns() - dispatch_t0;
             coord->tdd_submit_loop_ns += submit_ns;
 
+            /* Every exit below reaches done:, which empties the channel
+             * before any replay. */
             if (!submit_ok) {
                 if (!coord->tdd_owner_lifetime) {
-                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                        coord->delta_queue, &coord->mem_ledger);
                     for (uint32_t w = 0; w < W; w++)
                         for (uint32_t ri = 0; ri < nrels; ri++)
                             col_rel_destroy(ctxs[w].delta_rels[ri]);
@@ -7596,8 +7709,6 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                         "TDD worker error stratum=%u iter=%u rc=%d\n",
                         stratum_idx, eff_iter, rc);
                 if (!coord->tdd_owner_lifetime) {
-                    wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                        coord->delta_queue, &coord->mem_ledger);
                     for (uint32_t w = 0; w < W; w++)
                         for (uint32_t ri = 0; ri < nrels; ri++)
                             col_rel_destroy(ctxs[w].delta_rels[ri]);
@@ -7605,75 +7716,28 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 goto done;
             }
 
-            /* Issue #410, Commit 4: Drain MPSC queue and reconstruct
-             * ctxs[w].delta_rels[ri] via adapter.  Workers dual-write to both
-             * ctx and queue; shadow assert verifies agreement (debug only). */
-            if (coord->delta_queue) {
+            /* Issue #1373: every producer has been joined, so pump the
+            * channel until the round is complete, then coalesce each
+            * (worker, relation) list of batches into its matrix slot.
+            * worker_delta_rows counts the rows the batches carried. */
+            {
                 uint64_t queue_t0 = now_ns();
-                if (coord->tdd_owner_lifetime) {
-                    /* The owner record is the allocation-free queue
-                     * destination. It retains every rejected/duplicate slot
-                     * message instead of invoking the legacy destructor. */
-                    rc = wl_columnar_eval_tdd_owner_lifetime_capture_queue(
-                        coord, coord->tdd_owner_lifetime);
-                    coord->tdd_queue_drain_ns += now_ns() - queue_t0;
-                    if (rc != 0)
-                        goto done;
-                } else {
-                    size_t matrix_count = 0;
-                    if (wl_columnar_eval_tdd_matrix_size(W, nrels,
-                        sizeof(wl_delta_msg_t), &matrix_count) != 0) {
-                        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                            coord->delta_queue, &coord->mem_ledger);
-                        rc = EOVERFLOW;
-                        goto done;
-                    }
-                    uint32_t max_msgs = (uint32_t)matrix_count;
-                    wl_delta_msg_t *msgs = (wl_delta_msg_t *)calloc(
-                        max_msgs > 0 ? max_msgs : 1u, sizeof(wl_delta_msg_t));
-                    if (!msgs) {
-                        /* Queue-only workers have not written ctxs yet.  Drain
-                         * and destroy their queued deltas before aborting; do
-                         * not continue with a silently empty exchange. */
-                        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-                            coord->delta_queue, &coord->mem_ledger);
-                        rc = ENOMEM;
-                        coord->tdd_queue_drain_ns += now_ns() - queue_t0;
-                        goto done;
-                    }
-                    uint32_t msg_count = wl_mpsc_dequeue_all(
-                        coord->delta_queue, msgs, max_msgs);
-                    /* Issue #1380: payloads leave the channel here; whatever
-                     * the matrix keeps becomes a coordinator-side delta. */
-                    for (uint32_t mi = 0; mi < msg_count && mi < max_msgs;
-                        mi++) {
-                        if (msgs[mi].delta)
-                            wl_mem_ledger_free(&coord->mem_ledger,
-                                WL_MEM_SUBSYS_CHANNEL,
-                                col_rel_transport_bytes(
-                                    (const col_rel_t *)msgs[mi].delta));
-                    }
-
-                    /* Clear and reconstruct from queue messages. */
-                    for (uint32_t w = 0; w < W; w++)
-                        memset((void *)ctxs[w].delta_rels, 0,
-                            delta_rel_bytes);
-                    wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
-                        ctxs, msgs, msg_count, W, nrels);
-                    free(msgs);
-                    coord->tdd_queue_drain_ns += now_ns() - queue_t0;
-                }
-            }
-
-            /* Queue mode transfers ownership out of ctxs in the worker.
-             * Count only after its delta matrix has been reconstructed. */
-            if (coord->tdd_audit.enabled) {
-                for (uint32_t w = 0; w < W; w++) {
-                    for (uint32_t ri = 0; ri < nrels; ri++) {
-                        const col_rel_t *delta = ctxs[w].delta_rels[ri];
-                        if (delta)
-                            coord->tdd_audit.worker_delta_rows += delta->nrows;
-                    }
+                wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
+                uint64_t delivered = 0;
+                rc = wl_columnar_eval_tdd_channel_collect(coord->tdd_channel,
+                        &coord->mem_ledger, coord->tdd_channel_lists, W, nrels,
+                        &sink, &delivered);
+                if (rc == 0)
+                    rc = wl_columnar_eval_tdd_channel_coalesce_all(coord,
+                            coord->tdd_channel, coord->tdd_channel_lists,
+                            ctxs, W, nrels, &sink);
+                coord->tdd_queue_drain_ns += now_ns() - queue_t0;
+                if (coord->tdd_audit.enabled)
+                    coord->tdd_audit.worker_delta_rows += delivered;
+                if (rc != 0) {
+                    if (!coord->tdd_owner_lifetime)
+                        tdd_destroy_delta_slots(ctxs, W, nrels);
+                    goto done;
                 }
             }
             uint64_t convergence_t0 = now_ns();
@@ -7825,8 +7889,10 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     coord->eval_stratum_iteration_capped = iter == iteration_limit;
 
 done:
-    /* An owner lifetime record owns queue messages and slot arrays across a
-     * refused checked destroy. Do not let the queue destructor consume them. */
+    /* An owner lifetime record owns the channel's batches and the slot
+     * matrix across a refused checked destroy: its retry captures what the
+     * channel still holds, queued or listed, onto its retained list before
+     * disposing anything, and keeps whatever a checked destroy refuses. */
     if (coord->tdd_owner_lifetime) {
         coord->tdd_owner_lifetime->evaluation_active = false;
         if (owner_dispatch_quiesced) {
@@ -7837,15 +7903,11 @@ done:
             = wl_columnar_eval_tdd_owner_lifetime_retry(coord);
         if (lifetime_rc != 0 && rc == 0)
             rc = lifetime_rc;
-        if (!coord->tdd_owner_lifetime
-            && coord->delta_queue_ring_reservation.bytes)
-            tdd_release_queue_ring(coord);
-    } else {
-        /* Issue #410: Destroy MPSC delta queue created for this stratum. */
-        /* Issue #1380: drain with accounting first so the destructor path has
-         * nothing left to reclaim, then release the ring charge. */
-        wl_columnar_eval_tdd_dispose_queue_ring(coord);
     }
+    /* Issue #1380/#1373: discard what the channel still holds, freeing each
+     * batch's CHANNEL charge, then release the side buffers. */
+    if (!coord->tdd_owner_lifetime)
+        wl_columnar_eval_tdd_dispose_channel(coord);
     /* A refused dispatch cleanup retains the contexts with its owner record. */
     if (ctxs && coord->tdd_owner_lifetime
         && coord->tdd_owner_lifetime->dispatch_active) {

@@ -942,11 +942,12 @@ Symmetric for the consumer's `head` cursor.
 
 ### W-way fan-in
 
-For `W` workers feeding one coordinator, the layer above this SPSC
-queue (`wirelog/columnar/eval.c` worker loop) instantiates `W`
-SPSC queues, one per worker. The coordinator round-robins
-dequeues across all `W` tails. This is mechanically MPSC but the
-implementation is `W` independent SPSCs — never an MPMC.
+For `W` producers feeding one consumer, the MPSC wrapper in the same
+file instantiates `W` SPSC queues, one per producer, and the consumer
+round-robins dequeues across all `W` tails. This is mechanically MPSC
+but the implementation is `W` independent SPSCs — never an MPMC. The
+recursive TDD path no longer uses this queue; since #1373 its worker
+deltas travel through the batch channel described in the last section.
 
 ### W=512 stress
 
@@ -2379,3 +2380,19 @@ A momentarily empty FIFO with an open lane keeps the consumer waiting.
 After a cancel, pump returns CANCELLED once every lane is closed. The
 batches still queued are taken by `wl_tdd_channel_discard_all`, which
 allocates nothing.
+
+### Use on the recursive TDD path
+
+`col_eval_stratum_tdd_recursive` creates one channel per stratum, with
+one lane per worker, and begins a round per sub-pass. Each worker task
+runs inside `tdd_worker_channel_fn`, which closes the task's lane with its
+rc after the subpass returns. The coordinator submits the W tasks, waits
+for them at `wl_workqueue_wait_all`, and only then pumps the channel to
+COMPLETE and coalesces each (worker, relation) list into the delta matrix.
+Because nothing pumps before the join, this path creates the channel with
+an unbounded capacity, so a reservation does not wait for space. A
+producer stops touching a delta once it is published, and the consumer
+touches payloads only after the join. In owner mode a batch whose
+retirement is refused stays on the owner lifetime record's retained list,
+and the record keeps the channel until those batches are retired, because
+a taken batch retires through the channel that issued it.

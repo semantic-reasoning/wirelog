@@ -131,6 +131,17 @@ fail_lanes:
 }
 
 int
+wl_tdd_channel_footprint(uint32_t lanes, uint64_t *bytes)
+{
+    if (lanes == 0 || !bytes)
+        return EINVAL;
+    /* A uint32_t lane count times a lane record cannot exceed uint64_t. */
+    *bytes = (uint64_t)sizeof(struct wl_tdd_channel)
+        + (uint64_t)lanes * (uint64_t)sizeof(wl_tdd_lane_t);
+    return 0;
+}
+
+int
 wl_tdd_channel_destroy(wl_tdd_channel_t *ch)
 {
     if (!ch)

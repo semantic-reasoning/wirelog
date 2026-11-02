@@ -17,6 +17,7 @@
 #endif
 
 #include "../wirelog/backend.h"
+#include "../wirelog/columnar/eval_tdd_channel.h"
 #include "../wirelog/columnar/internal.h"
 #include "../wirelog/exec_plan_gen.h"
 #include "../wirelog/passes/fusion.h"
@@ -7222,7 +7223,7 @@ hold_outbound_frame(wl_col_session_t *worker, eval_stack_t *stack,
         wl_mem_ledger_snapshot_t ledger;
         wl_mem_ledger_snapshot(&worker->coordinator->mem_ledger, &ledger);
         outbound_frame_prefix = ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
-            > worker->coordinator->mem_channel_ring_bytes;
+            > worker->coordinator->mem_channel_side_bytes;
     }
     if (worker_frame_storage < 5) {
         hold_worker_frame(worker, stack, result);
@@ -7398,7 +7399,7 @@ test_tdd_outbound_frame_retention(uint32_t workers, unsigned storage,
         wl_mem_ledger_snapshot_t queue_ledger;
         wl_mem_ledger_snapshot(&sess->mem_ledger, &queue_ledger);
         TDD_FRAME_CHECK(queue_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0
-            && !sess->delta_queue && sess->mem_channel_ring_bytes == 0,
+            && !sess->tdd_channel && sess->mem_channel_side_bytes == 0,
             "earlier queue prefix not reclaimed");
         if (later && storage < 5)
             TDD_FRAME_CHECK(session_find_rel(worker,
@@ -9608,6 +9609,24 @@ cleanup:
 #undef WIDE_CHECK
 }
 
+/* Close the fixture channel's only lane and release it through the
+ * production disposal, which frees each queued batch's CHANNEL charge. */
+static bool
+publisher_channel_teardown(wl_col_session_t *coord)
+{
+    if (!coord->tdd_channel)
+        return true;
+    wl_tdd_channel_close_lane(coord->tdd_channel, 0, 0);
+    wl_columnar_eval_tdd_dispose_channel(coord);
+    return coord->tdd_channel == NULL;
+}
+
+/*
+ * Modes: 0 empty candidate; 1-2 held reader; 3 alias borrow; 4 the channel
+ * accepts two prefixes and then refuses a cancelled reservation after the
+ * candidate was stamped; 5-6 timestamp admission failure; 7 the governor
+ * denies the channel descriptor.
+ */
 static void
 test_outbound_publisher_ownership(unsigned mode)
 {
@@ -9639,7 +9658,7 @@ test_outbound_publisher_ownership(unsigned mode)
         coord->memory_governor) == 0, "candidate governor");
     if (mode != 0)
         PUB_CHECK(col_rel_append_row(candidate, &value) == 0, "candidate row");
-    if (mode != 0 && mode <= 4)
+    if ((mode != 0 && mode <= 4) || mode == 7)
         PUB_CHECK(col_rel_enable_timestamps(candidate) == 0, "timestamps");
     col_rel_t *original = candidate;
     col_delta_timestamp_t *timestamps = candidate->timestamps;
@@ -9652,26 +9671,41 @@ test_outbound_publisher_ownership(unsigned mode)
         PUB_CHECK(alias && col_rel_install_shared_view(alias, candidate) == 0,
             "alias");
     }
+    if (mode == 4 || mode == 7) {
+        coord->tdd_channel = wl_tdd_channel_create(1, UINT64_MAX,
+                coord->memory_governor
+                ? wl_columnar_memory_governor_ref_get(coord->memory_governor)
+                : NULL, coord);
+        PUB_CHECK(coord->tdd_channel && wl_tdd_channel_begin_round(
+                coord->tdd_channel, 3, 7) == 0, "channel");
+    }
     if (mode == 4) {
-        coord->delta_queue = wl_mpsc_queue_create(1, 2);
-        PUB_CHECK(coord->delta_queue, "queue");
         for (unsigned i = 0; i < 2; i++) {
             col_rel_t *prefix = col_rel_new_auto("prefix", 1);
             PUB_CHECK(prefix && col_rel_append_row(prefix, &value) == 0,
                 "prefix");
             PUB_CHECK(col_rel_enable_timestamps(prefix) == 0,
                 "prefix timestamps");
-            int rc = wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
-                    &prefix, 0, 4);
+            int rc = wl_columnar_eval_tdd_channel_publish_delta(&ctx, &worker,
+                    &prefix, 0, 7);
             if (rc != 0) col_rel_destroy(prefix);
             PUB_CHECK(rc == 0 && !prefix, "prefix transfer");
         }
+        wl_tdd_channel_stats_t stats;
+        wl_tdd_channel_stats(coord->tdd_channel, &stats);
+        wl_mem_ledger_snapshot_t ledger;
+        wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
+        PUB_CHECK(stats.published == 2 && stats.queued_batches == 2
+            && ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
+            == stats.queued_bytes && stats.queued_bytes != 0,
+            "prefixes queued and charged");
+        wl_tdd_channel_cancel(coord->tdd_channel, ECANCELED);
     }
 #ifdef WL_TEST_ALLOC_WRAP
     if (mode == 5)
         fail_next_alloc = true;
 #endif
-    if (mode == 6) {
+    if (mode == 6 || mode == 7) {
         budget = wl_columnar_memory_governor_ref_get(coord->memory_governor);
         saved_mode = budget->mode;
         saved_limit = atomic_load_explicit(&budget->usable_bytes,
@@ -9680,8 +9714,9 @@ test_outbound_publisher_ownership(unsigned mode)
         atomic_store_explicit(&budget->usable_bytes, 0, memory_order_relaxed);
         budget_changed = true;
     }
-    int rc = mode >= 5 ? col_rel_enable_timestamps(candidate)
-        : wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+    worker.memory_budget_denied = false;
+    int rc = mode == 5 || mode == 6 ? col_rel_enable_timestamps(candidate)
+        : wl_columnar_eval_tdd_channel_publish_delta(&ctx, &worker,
             &candidate, 0, 7);
 #ifdef WL_TEST_ALLOC_WRAP
     fail_next_alloc = false;
@@ -9698,25 +9733,33 @@ test_outbound_publisher_ownership(unsigned mode)
         PUB_CHECK(rc == EBUSY && candidate->timestamps == timestamps
             && candidate->storage_generation == generation,
             "reader/alias refusal mutated candidate");
+    if (mode == 4)
+        PUB_CHECK(rc == ECANCELED, "cancelled channel refuses publication");
+    if (mode == 7)
+        PUB_CHECK(rc == ENOSPC && worker.memory_budget_denied,
+            "denied descriptor refuses publication");
+    if (coord->tdd_channel) {
+        wl_tdd_channel_stats_t stats;
+        wl_tdd_channel_stats(coord->tdd_channel, &stats);
+        PUB_CHECK(stats.published == (mode == 4 ? 2u : 0u)
+            && stats.reserved_bytes == 0,
+            "refused publication left no batch or reservation");
+    }
     if (reader.owner)
         PUB_CHECK(col_rel_source_reader_release(&reader) == 0, "release");
     col_rel_destroy(alias);
     alias = NULL;
-    if (coord->delta_queue) {
-        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-            coord->delta_queue,
-            &coord->mem_ledger);
-        wl_mpsc_queue_destroy(coord->delta_queue);
-        coord->delta_queue = NULL;
+    if (coord->tdd_channel) {
+        PUB_CHECK(publisher_channel_teardown(coord), "channel teardown");
         wl_mem_ledger_snapshot_t ledger;
         wl_mem_ledger_snapshot(&coord->mem_ledger, &ledger);
         PUB_CHECK(ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL] == 0,
             "prefix accounting leaked");
     }
-    if (mode >= 5)
+    if (mode == 5 || mode == 6)
         PUB_CHECK(col_rel_enable_timestamps(candidate) == 0,
             "retry timestamp admission");
-    PUB_CHECK(wl_columnar_eval_tdd_queue_publish_delta(&ctx, &worker,
+    PUB_CHECK(wl_columnar_eval_tdd_channel_publish_delta(&ctx, &worker,
         &candidate, 0, 7) == 0 && !candidate, "retry transfer");
     PUB_CHECK(mode == 0 ? slots[0] == NULL : slots[0] == original,
         "matrix ownership");
@@ -9739,13 +9782,9 @@ cleanup:
     col_rel_destroy(alias);
     col_rel_destroy(candidate);
     col_rel_destroy(slots[0]);
-    if (session && COL_SESSION(session)->delta_queue) {
-        wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(
-            COL_SESSION(session)->delta_queue,
-            &COL_SESSION(session)->mem_ledger);
-        wl_mpsc_queue_destroy(COL_SESSION(session)->delta_queue);
-        COL_SESSION(session)->delta_queue = NULL;
-    }
+    if (session && !publisher_channel_teardown(COL_SESSION(session)) &&
+        !failure)
+        failure = "channel teardown";
     if (initialized && col_worker_session_destroy(&worker) != 0)
         failure = "worker teardown";
     wl_session_destroy(session);
@@ -10722,8 +10761,8 @@ test_global_read_publication(uint32_t workers, unsigned initial,
         GLOBAL_CHECK(rc == (mode <= 3 ? EBUSY : mode == 8 ? ENOSPC : ENOMEM) &&
             tuples.count == 0,
             "global publication failure status or callbacks");
-        GLOBAL_CHECK(coord->mem_channel_ring_bytes == 0 &&
-            coord->delta_queue == NULL,
+        GLOBAL_CHECK(coord->mem_channel_side_bytes == 0 &&
+            coord->tdd_channel == NULL,
             "global failed channel ownership");
         if (mode <= 3) {
             for (unsigned retry = 0; retry < 2; retry++) {
@@ -10868,9 +10907,9 @@ test_outbound_head_growth_refused(uint32_t workers, bool owner)
         memory_order_relaxed) != 0) == owner, "the intended mode ran");
     GROWTH_CHECK(rc == EPROTO, "head growth fails the stratum with EPROTO");
     GROWTH_CHECK(tuples.count == 0, "no tuple is delivered");
-    GROWTH_CHECK(coord->tdd_workers_count == 0 && coord->delta_queue == NULL
-        && coord->mem_channel_ring_bytes == 0,
-        "workers and the queue are torn down after the refusal");
+    GROWTH_CHECK(coord->tdd_workers_count == 0 && coord->tdd_channel == NULL
+        && coord->mem_channel_side_bytes == 0,
+        "workers and the channel are torn down after the refusal");
 cleanup:
     wl_columnar_eval_test_outbound_head_growth = NULL;
     free(values);
@@ -17515,7 +17554,7 @@ main(void)
     test_nonrec_merge_allocation_failure();
     test_tdd_recursive_frame_retention(2, 0, 0, true);
     test_tdd_recursive_frame_retention(8, 3, 1, true);
-    for (unsigned mode = 0; mode < 7; mode++) {
+    for (unsigned mode = 0; mode < 8; mode++) {
 #ifndef WL_TEST_ALLOC_WRAP
         if (mode == 5) continue;
 #endif

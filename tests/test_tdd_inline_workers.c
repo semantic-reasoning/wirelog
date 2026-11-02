@@ -265,21 +265,34 @@ wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
     if (!owner_queue_hold_armed || !worker || worker->worker_id != 0
         || !worker->coordinator
         || !worker->coordinator->tdd_owner_lifetime
-        || !worker->coordinator->delta_queue || owner_queue_hold_fired)
+        || !worker->coordinator->tdd_channel || owner_queue_hold_fired)
         return;
     owner_queue_hold_fired = true;
     wl_col_session_t *coord = worker->coordinator;
-    col_rel_t *relation = col_rel_new_auto("queued_retained_delta", 0);
-    if (!relation || col_rel_source_reader_acquire_transferable(relation,
+    wl_tdd_channel_t *ch = coord->tdd_channel;
+    /* One row, so the batch charges bytes: the channel refuses an empty
+     * reservation. */
+    int64_t row = 1;
+    col_rel_t *relation = col_rel_new_auto("queued_retained_delta", 1);
+    if (!relation || col_rel_append_row(relation, &row) != 0
+        || col_rel_source_reader_acquire_transferable(relation,
         &owner_queue_reader) != 0) {
         col_rel_destroy(relation);
         owner_queue_hold_fired = false;
         return;
     }
-    /* Invalid rel_idx forces the payload into the lifetime's reserved
-     * overflow slots while preserving the real worker matrix output. */
-    int rc = wl_mpsc_enqueue(coord->delta_queue, worker->worker_id,
-            relation, worker->current_iteration, UINT32_MAX);
+    /* An invalid rel_idx keeps the batch out of the worker matrix while
+     * the real worker output still flows; it is published on worker zero's
+     * lane exactly as a producer publishes, ledger charge included. */
+    wl_tdd_batch_t *batch = NULL;
+    int rc = wl_tdd_channel_batch_new(ch, worker->worker_id, UINT32_MAX,
+            worker, &batch);
+    if (rc == 0) {
+        rc = wl_tdd_channel_reserve(ch, batch,
+                col_rel_transport_bytes(relation));
+        if (rc != 0)
+            wl_tdd_channel_batch_abandon(ch, batch);
+    }
     if (rc != 0) {
         (void)col_rel_source_reader_release(&owner_queue_reader);
         col_rel_destroy(relation);
@@ -288,7 +301,8 @@ wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
     }
     owner_queue_relation = relation;
     wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
-        col_rel_transport_bytes(relation));
+        batch->charge);
+    wl_tdd_channel_publish(ch, batch, relation, relation->nrows);
 }
 
 typedef struct {
@@ -788,9 +802,10 @@ fail:
     return 1;
 }
 
-/* Inject one queue-owned payload from a real worker producer. The reader
- * forces owner cleanup to retain the captured overflow slot, then a fresh
- * quiescent retry releases it after the reader is dropped. */
+/* Inject one channel batch from a real worker producer.  The reader
+ * forces owner cleanup to keep the captured batch on the lifetime's
+ * retained list; a fresh quiescent retry releases it once the reader is
+ * dropped. */
 static int
 run_owner_queue_lifetime_retry(void)
 {
@@ -847,11 +862,12 @@ run_owner_queue_lifetime_retry(void)
     }
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime
         = columnar->tdd_owner_lifetime;
-    size_t total = lifetime->matrix_slots + lifetime->overflow_slots;
-    bool retained = false;
-    for (size_t i = lifetime->matrix_slots; i < total; i++)
-        retained |= lifetime->relations[i] == owner_queue_relation;
-    if (!retained) {
+    unsigned retained = 0;
+    for (const wl_tdd_batch_t *b = lifetime->retained; b; b = b->next)
+        retained += b->payload == (void *)owner_queue_relation;
+    for (size_t i = 0; i < lifetime->matrix_slots; i++)
+        retained += lifetime->relations[i] == owner_queue_relation ? 2u : 0u;
+    if (retained != 1 || lifetime->channel != columnar->tdd_channel) {
         rc = EPROTO;
         goto cleanup;
     }
@@ -869,7 +885,7 @@ run_owner_queue_lifetime_retry(void)
     }
     memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
     rc = wl_columnar_session_cleanup_ready_quiescent(columnar);
-    if (rc != 0 || columnar->tdd_owner_lifetime || columnar->delta_queue) {
+    if (rc != 0 || columnar->tdd_owner_lifetime || columnar->tdd_channel) {
         rc = EPROTO;
         goto cleanup;
     }

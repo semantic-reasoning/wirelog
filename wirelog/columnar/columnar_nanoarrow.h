@@ -468,7 +468,7 @@ col_session_get_exchange_time_ns(wl_session_t *sess,
  * @param out_worker_sum_ns    Sum of worker sub-pass wall runtimes.
  * @param out_worker_max_ns    Sum of per-sub-pass maximum worker runtimes.
  * @param out_idle_estimate_ns Estimated barrier/idle time: max(wait - worker max, 0).
- * @param out_queue_drain_ns   MPSC drain plus delta matrix reconstruction time.
+ * @param out_queue_drain_ns   Channel collect plus delta matrix coalesce time.
  * @param out_convergence_ns   Worker empty-delta and convergence checks.
  * @param out_exchange_ns      Recursive TDD exchange scatter/gather time.
  * @param out_final_merge_ns   Final coordinator worker-result merge/dedup time.
