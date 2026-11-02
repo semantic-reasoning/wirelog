@@ -827,6 +827,449 @@ out:
     wl_columnar_memory_governor_ref_release(ref);
 }
 
+/* ======================================================================== */
+/* Key existence, validation and symbol lookup                              */
+/* ======================================================================== */
+
+static wirelog_source_query_status_t
+key(wirelog_session_t *s, const char *rel, int64_t k, uint64_t limit,
+    bool *exists)
+{
+    *exists = true;
+    return wirelog_session_source_key_exists(s, rel, k, limit, exists);
+}
+
+static void
+test_key_exists(void)
+{
+    wirelog_program_t *prog = parse(
+        ".decl p(a: int64, b: int64)\n"
+        ".decl q(a: int64, b: int64)\n"
+        ".decl h(a: int64, b: int64)\n"
+        "h(A, B) :- q(A, B).\n");
+    wirelog_session_t *s = open_session(prog, 1);
+    bool ex = true;
+
+    CHECK(key(s, "p", 1, 0, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "empty source, limit 0");
+    int64_t rows[6] = { 1, 10, 1, 11, 2, 20 };
+    CHECK(wirelog_session_insert(s, "p", rows, 3, 2) == WIRELOG_OK, "p");
+    step(s);
+    /* Two distinct tuples share key 1; a missing full tuple with an
+     * existing key is count 0 but key-present. */
+    CHECK(count2(s, "p", 1, 10) == 1 && count2(s, "p", 1, 11) == 1,
+        "shared key tuples");
+    CHECK(count2(s, "p", 1, 12) == 0, "absent tuple with existing key");
+    CHECK(key(s, "p", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "key 1 present");
+    int64_t absent[2] = { 1, 12 };
+    CHECK(wirelog_session_remove(s, "p", absent, 1, 2) == WIRELOG_OK,
+        "no-match remove");
+    step(s);
+    CHECK(count2(s, "p", 1, 10) == 1 && count2(s, "p", 1, 11) == 1
+        && count2(s, "p", 2, 20) == 1, "no-match remove changed nothing");
+    CHECK(key(s, "p", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "key 1 still present");
+    /* Unrelated keys and relations never match. */
+    CHECK(key(s, "p", 3, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "key 3 absent");
+    CHECK(key(s, "q", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "other relation");
+    CHECK(key(s, "p", 10, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "second-column value is not a key");
+
+    /* Budget: a first-row match needs one row; the last row needs all
+     * three; absence needs all three; exact and key differ at the
+     * boundary. */
+    CHECK(key(s, "p", 1, 1, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "first-row match with limit 1");
+    CHECK(key(s, "p", 2, 2, &ex) == WIRELOG_SOURCE_QUERY_WORK_LIMIT && !ex,
+        "last-row match one short");
+    CHECK(key(s, "p", 2, 3, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "last-row match at exact end");
+    CHECK(key(s, "p", 9, 2, &ex) == WIRELOG_SOURCE_QUERY_WORK_LIMIT && !ex,
+        "absence one short");
+    CHECK(key(s, "p", 9, 3, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "absence at exact end");
+    uint64_t n = 9;
+    int64_t t[2] = { 1, 10 };
+    CHECK(wirelog_session_source_count(s, "p", t, 2, 1, &n)
+        == WIRELOG_SOURCE_QUERY_WORK_LIMIT && n == 0,
+        "count needs a full scan where key does not");
+
+    /* Head: host input only, never derived rows. */
+    int64_t qrow[2] = { 7, 70 };
+    CHECK(wirelog_session_insert(s, "q", qrow, 1, 2) == WIRELOG_OK, "q");
+    step(s);
+    CHECK(key(s, "h", 7, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "derived-only key absent from head source");
+    CHECK(wirelog_session_insert(s, "h", qrow, 1, 2) == WIRELOG_OK, "h");
+    CHECK(key(s, "h", 7, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "inserted head key, pending");
+
+    /* Argument and precedence failures leave the output reset. */
+    ex = true;
+    CHECK(wirelog_session_source_key_exists(NULL, "p", 1, ALL, &ex)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT && !ex, "null session");
+    CHECK(wirelog_session_source_key_exists(s, "p", 1, ALL, NULL)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "null out");
+    CHECK(key(s, "nope", 1, ALL, &ex)
+        == WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION && !ex, "unknown");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+}
+
+static void
+test_key_schema_refusal(void)
+{
+    /* An INT64 key does not make a FLOAT or compound remainder safe. */
+    wirelog_program_t *prog = parse(
+        ".decl f(a: int64, b: float)\n"
+        ".decl c(a: int64, p: pair/2 inline)\n"
+        ".decl s(a: symbol, b: int64)\n"
+        ".decl k(a: int64)\n"
+        "k(1).\n");
+    wirelog_session_t *s = open_session(prog, 1);
+    bool ex = true;
+    CHECK(key(s, "f", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_UNSUPPORTED && !ex,
+        "float remainder");
+    CHECK(key(s, "c", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_UNSUPPORTED,
+        "compound remainder");
+    CHECK(key(s, "k", 1, ALL, &ex) == WIRELOG_SOURCE_QUERY_UNSUPPORTED,
+        "inline-fact relation");
+    CHECK(key(s, "s", 123456, ALL, &ex)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "bad STRING key id");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+}
+
+static void
+test_mixed_symbols_and_lookup(void)
+{
+    wirelog_program_t *prog = parse(
+        ".decl audit(who: symbol, seq: int64, what: symbol)\n"
+        ".decl other(who: symbol)\n"
+        ".decl __hostlog(x: int64)\n");
+    wirelog_session_t *s = open_session(prog, 1);
+    int64_t id = 77;
+    bool found = true;
+
+    /* An empty STRING relation with no suitable ID: validate plus lookup
+     * establishes absence without interning anything. */
+    uint32_t interned = wl_intern_count(prog->intern);
+    CHECK(wirelog_session_source_validate(s, "audit", 3)
+        == WIRELOG_SOURCE_QUERY_OK, "validate empty audit");
+    CHECK(wirelog_session_lookup_symbol(s, "alice", &id, &found)
+        == WIRELOG_SOURCE_QUERY_OK && !found && id == -1, "absent symbol");
+    CHECK(wl_intern_count(prog->intern) == interned, "no intern growth");
+
+    int64_t alice = wl_intern_put(prog->intern, "alice");
+    int64_t bob = wl_intern_put(prog->intern, "bob");
+    int64_t login = wl_intern_put(prog->intern, "login");
+    int64_t row[3] = { alice, 1, login };
+    CHECK(wirelog_session_insert(s, "audit", row, 1, 3) == WIRELOG_OK, "a1");
+    CHECK(wirelog_session_insert(s, "audit", row, 1, 3) == WIRELOG_OK, "a2");
+    int64_t row2[3] = { bob, 1, login };
+    CHECK(wirelog_session_insert(s, "audit", row2, 1, 3) == WIRELOG_OK, "b");
+    step(s);
+    CHECK(wirelog_session_lookup_symbol(s, "alice", &id, &found)
+        == WIRELOG_SOURCE_QUERY_OK && found && id == alice, "found alice");
+    uint64_t n = 0;
+    CHECK(wirelog_session_source_count(s, "audit", row, 3, ALL, &n)
+        == WIRELOG_SOURCE_QUERY_OK && n == 2, "mixed tuple count %llu",
+        (unsigned long long)n);
+    bool ex = false;
+    CHECK(key(s, "audit", bob, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "symbol key");
+    CHECK(key(s, "other", alice, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && !ex,
+        "unrelated relation");
+    interned = wl_intern_count(prog->intern);
+    CHECK(wirelog_session_lookup_symbol(s, "carol", &id, &found)
+        == WIRELOG_SOURCE_QUERY_OK && !found && id == -1, "absent carol");
+    CHECK(wl_intern_count(prog->intern) == interned, "still no growth");
+
+    /* "__" names are reserved for the engine even when declared. */
+    CHECK(count1(s, "__hostlog", 1)
+        == UINT64_MAX - WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION,
+        "declared __ relation is reserved");
+
+    /* Validation refusals and arguments. */
+    CHECK(wirelog_session_source_validate(s, "audit", 2)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "validate arity");
+    CHECK(wirelog_session_source_validate(s, "audit", 0)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "validate zero arity");
+    CHECK(wirelog_session_source_validate(s, "nope", 1)
+        == WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION, "validate unknown");
+    CHECK(wirelog_session_source_validate(NULL, "audit", 3)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "validate null");
+    id = 5;
+    found = true;
+    CHECK(wirelog_session_lookup_symbol(s, NULL, &id, &found)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT && id == -1 && !found,
+        "lookup null symbol resets outputs");
+    CHECK(wirelog_session_lookup_symbol(s, "alice", NULL, &found)
+        == WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT, "lookup null id");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+
+    /* Validation applies the same refusals before any absence claim. */
+    prog = parse(
+        ".decl fact(x: symbol)\n"
+        ".decl fl(x: symbol, y: float)\n"
+        "fact(\"seed\").\n");
+    s = open_session(prog, 1);
+    CHECK(wirelog_session_source_validate(s, "fact", 1)
+        == WIRELOG_SOURCE_QUERY_UNSUPPORTED, "validate inline-fact");
+    CHECK(wirelog_session_source_validate(s, "fl", 2)
+        == WIRELOG_SOURCE_QUERY_UNSUPPORTED, "validate float schema");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+}
+
+struct reentry_all {
+    wirelog_session_t *s;
+    wirelog_source_query_status_t validate, lookup, key;
+    uint32_t calls;
+};
+
+static void
+reenter_all(const char *relation, const int64_t *row, uint32_t ncols,
+    int32_t diff, void *user_data)
+{
+    struct reentry_all *r = (struct reentry_all *)user_data;
+    int64_t id = 0;
+    bool found = true;
+    bool ex = true;
+    (void)relation;
+    (void)ncols;
+    (void)diff;
+    r->calls++;
+    r->validate = wirelog_session_source_validate(r->s, "e", 1);
+    r->lookup = wirelog_session_lookup_symbol(r->s, "x", &id, &found);
+    if (found || id != -1)
+        r->lookup = (wirelog_source_query_status_t)99;
+    r->key = wirelog_session_source_key_exists(r->s, "e", row[0], ALL, &ex);
+    if (ex)
+        r->key = (wirelog_source_query_status_t)99;
+}
+
+static void
+test_unit2_reentry(void)
+{
+    wirelog_program_t *prog = parse(EDB_HEAD_SRC);
+    wirelog_session_t *s = open_session(prog, 1);
+    struct reentry_all r = { 0 };
+    r.s = s;
+    CHECK(wirelog_session_set_delta_cb(s, reenter_all, &r) == WIRELOG_OK,
+        "cb");
+    ins1(s, "e", 3);
+    step(s);
+    CHECK(r.calls > 0, "callback ran");
+    CHECK(r.validate == WIRELOG_SOURCE_QUERY_BUSY, "validate BUSY (%d)",
+        r.validate);
+    CHECK(r.lookup == WIRELOG_SOURCE_QUERY_BUSY, "lookup BUSY (%d)",
+        r.lookup);
+    CHECK(r.key == WIRELOG_SOURCE_QUERY_BUSY, "key BUSY (%d)", r.key);
+    bool ex = false;
+    CHECK(key(s, "e", 3, ALL, &ex) == WIRELOG_SOURCE_QUERY_OK && ex,
+        "after callback");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+}
+
+/* ======================================================================== */
+/* Further required states                                                  */
+/* ======================================================================== */
+
+static void
+test_failed_step_with_callback_and_snapshot(void)
+{
+    const char *src =
+        ".decl e(x: int64)\n"
+        ".decl a(x: int64)\n"
+        ".decl b(x: int64)\n"
+        "a(X) :- e(X).\n"
+        "b(X) :- a(X), e(X).\n";
+    for (int variant = 0; variant < 2; variant++) {
+        wirelog_program_t *prog = parse(src);
+        wl_columnar_memory_governor_ref_t *ref = enforcing_governor();
+        wirelog_session_t *s = open_governed(prog, ref);
+        wl_col_session_t *cs = COL_SESSION(wirelog_session_testhook_inner(s));
+        struct delta_log log = { 0 };
+        if (variant == 0)
+            CHECK(wirelog_session_set_delta_cb(s, record_delta, &log)
+                == WIRELOG_OK, "cb");
+        step(s);
+        ins1(s, "a", 5); /* a head */
+        step(s);
+        for (int i = 0; i < 64; i++)
+            ins1(s, "e", 200 + i);
+        ins1(s, "e", 200);
+        ins1(s, "a", 5);
+        rem1(s, "a", 5);
+        starve(cs, true);
+        wirelog_error_t err = variant == 0 ? wirelog_session_step(s)
+            : wirelog_session_snapshot(s, record_tuple, &log);
+        starve(cs, false);
+        CHECK(err != WIRELOG_OK, "variant %d: starved evaluation fails",
+            variant);
+        CHECK(count1(s, "e", 200) == 2, "variant %d: edb after failure %llu",
+            variant, (unsigned long long)count1(s, "e", 200));
+        CHECK(count1(s, "e", 263) == 1, "variant %d: last edb row", variant);
+        CHECK(count1(s, "a", 5) == 1, "variant %d: head after failure %llu",
+            variant, (unsigned long long)count1(s, "a", 5));
+        err = variant == 0 ? wirelog_session_step(s)
+            : wirelog_session_snapshot(s, record_tuple, &log);
+        CHECK(err == WIRELOG_OK, "variant %d: retry", variant);
+        CHECK(count1(s, "e", 200) == 2 && count1(s, "a", 5) == 1,
+            "variant %d: same after retry", variant);
+        wirelog_session_destroy(s);
+        wirelog_program_free(prog);
+        wl_columnar_memory_governor_ref_release(ref);
+    }
+}
+
+static void
+test_recursive_and_negation_shapes(void)
+{
+    const char *srcs[2] = {
+        ".decl edge(a: int64, b: int64)\n"
+        ".decl path(a: int64, b: int64)\n"
+        "path(A, B) :- edge(A, B).\n"
+        "path(A, C) :- path(A, B), edge(B, C).\n",
+        ".decl edge(a: int64, b: int64)\n"
+        ".decl block(a: int64, b: int64)\n"
+        ".decl path(a: int64, b: int64)\n"
+        "path(A, B) :- edge(A, B), !block(A, B).\n",
+    };
+    for (int v = 0; v < 2; v++)
+        for (int cb = 0; cb < 2; cb++) {
+            wirelog_program_t *prog = parse(srcs[v]);
+            wirelog_session_t *s = open_session(prog, 1);
+            struct delta_log log = { 0 };
+            if (cb)
+                CHECK(wirelog_session_set_delta_cb(s, record_delta, &log)
+                    == WIRELOG_OK, "cb");
+            int64_t e12[2] = { 1, 2 };
+            int64_t e23[2] = { 2, 3 };
+            int64_t p13[2] = { 1, 3 };
+            CHECK(wirelog_session_insert(s, "edge", e12, 1, 2) == WIRELOG_OK,
+                "e12");
+            CHECK(wirelog_session_insert(s, "edge", e23, 1, 2) == WIRELOG_OK,
+                "e23");
+            step(s);
+            /* path(1,3) is derived only (or not at all) */
+            CHECK(count2(s, "path", 1, 3) == 0, "v=%d cb=%d derived 0", v,
+                cb);
+            CHECK(wirelog_session_insert(s, "path", p13, 1, 2) == WIRELOG_OK,
+                "host path");
+            step(s);
+            CHECK(wirelog_session_insert(s, "path", p13, 1, 2) == WIRELOG_OK,
+                "host path 2");
+            step(s);
+            CHECK(count2(s, "path", 1, 3) == 2, "v=%d cb=%d head 2: %llu", v,
+                cb, (unsigned long long)count2(s, "path", 1, 3));
+            CHECK(wirelog_session_remove(s, "path", p13, 1, 2) == WIRELOG_OK,
+                "rm");
+            step(s);
+            CHECK(count2(s, "path", 1, 3) == 1, "v=%d cb=%d head 1", v, cb);
+            CHECK(wirelog_session_remove(s, "path", p13, 1, 2) == WIRELOG_OK,
+                "rm");
+            step(s);
+            CHECK(count2(s, "path", 1, 3) == 0, "v=%d cb=%d head 0", v, cb);
+            CHECK(count2(s, "edge", 1, 2) == 1, "edge intact");
+            wirelog_session_destroy(s);
+            wirelog_program_free(prog);
+        }
+}
+
+static void
+test_typed_remove_of_derived_row_revokes(void)
+{
+    /* Undoing a typed remove re-inserts a derived-only head row that no
+     * host call inserted; the relation must stop being certified rather
+     * than report that phantom. */
+    wirelog_program_t *prog = parse(EDB_HEAD_SRC);
+    wl_columnar_memory_governor_ref_t *ref = enforcing_governor();
+    wirelog_session_t *s = open_governed(prog, ref);
+    wl_col_session_t *cs = COL_SESSION(wirelog_session_testhook_inner(s));
+    for (int64_t v = 8; v < 8 + 300; v++)
+        ins1(s, "e", v);
+    step(s);
+    CHECK(count1(s, "h", 8) == 0, "derived-only before");
+    /* Retire derived-only rows with untyped removes until `$out$h` is one
+     * row short of its capacity: the typed batch's first remove then
+     * appends in place and its second needs a governed growth. */
+    int64_t next = 10;
+    rem1(s, "h", next++);
+    col_rel_t *retired = wl_columnar_session_retired_rows(cs, "h");
+    CHECK(retired != NULL, "retired rows registered");
+    if (!retired)
+        goto out;
+    while (retired->nrows + 1 < retired->capacity && next < 8 + 300)
+        rem1(s, "h", next++);
+    CHECK(retired->nrows + 1 == retired->capacity, "retired filled");
+
+    uint32_t types[1] = { WIRELOG_TYPE_INT64 };
+    uint32_t offsets[1] = { 0 };
+    uint64_t lanes[2] = { 8, 9 };
+    wirelog_typed_row_v1_t rows[2];
+    memset(rows, 0, sizeof(rows));
+    for (int i = 0; i < 2; i++) {
+        rows[i].struct_size = sizeof(rows[i]);
+        rows[i].abi_version = 1;
+        rows[i].logical_ncols = 1;
+        rows[i].physical_nlanes = 1;
+        rows[i].physical_stride = 1;
+        rows[i].types = types;
+        rows[i].lane_offsets = offsets;
+        rows[i].physical_types = types;
+        rows[i].lanes = &lanes[i];
+    }
+    starve(cs, true);
+    wirelog_error_t err = wirelog_session_remove_typed(s, "h", rows, 2, NULL);
+    starve(cs, false);
+    CHECK(err != WIRELOG_OK, "second typed remove denied");
+    CHECK(count1(s, "h", 8) == UINT64_MAX - WIRELOG_SOURCE_QUERY_UNSUPPORTED,
+        "typed remove rollback revokes: %llu",
+        (unsigned long long)count1(s, "h", 8));
+    CHECK(count1(s, "e", 8) == 1, "other relation still certified");
+out:
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+    wl_columnar_memory_governor_ref_release(ref);
+}
+
+static void
+test_engine_written_relation_refused(void)
+{
+    /* make_compound appends engine rows to a declared __compound_ side
+     * relation; they must never be reported as host occurrences. */
+    wirelog_program_t *prog = parse(
+        ".decl event(id: int64, payload: pair/2)\n"
+        ".decl __compound_pair_2(h: int64, a: int64, b: int64)\n");
+    wirelog_session_t *s = open_session(prog, 1);
+    wirelog_compound_arg_t args[2] = {
+        { WIRELOG_TYPE_INT64, 41 }, { WIRELOG_TYPE_INT64, 42 },
+    };
+    uint64_t h = 0;
+    CHECK(wirelog_session_make_compound(s, "pair", 2, args, &h)
+        == WIRELOG_OK && h != 0, "make compound");
+    int64_t t[3] = { (int64_t)h, 41, 42 };
+    uint64_t n = 9;
+    CHECK(wirelog_session_source_count(s, "__compound_pair_2", t, 3, ALL, &n)
+        == WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION && n == 0,
+        "engine-written relation refused");
+    bool ex = true;
+    CHECK(key(s, "__compound_pair_2", (int64_t)h, ALL, &ex)
+        == WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION && !ex,
+        "engine-written relation key refused");
+    CHECK(wirelog_session_source_validate(s, "__compound_pair_2", 3)
+        == WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION, "validate refused");
+    wirelog_session_destroy(s);
+    wirelog_program_free(prog);
+}
+
 int
 main(void)
 {
@@ -845,6 +1288,14 @@ main(void)
     test_sealed_cold_and_controlled();
     test_failures_leave_no_receipts();
     test_typed_rollback_revokes();
+    test_key_exists();
+    test_key_schema_refusal();
+    test_mixed_symbols_and_lookup();
+    test_unit2_reentry();
+    test_failed_step_with_callback_and_snapshot();
+    test_recursive_and_negation_shapes();
+    test_typed_remove_of_derived_row_revokes();
+    test_engine_written_relation_refused();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

@@ -15,6 +15,12 @@ All notable changes to wirelog are documented in this file.
   input, controlled sessions and callback re-entry instead of answering
   zero (#2321).
 
+- `wirelog_session_source_key_exists()`, `wirelog_session_source_validate()`
+  and `wirelog_session_lookup_symbol()` complete the advanced inspection
+  surface: first-column key presence with early exit, row-free validation of
+  a relation and width, and read-only symbol lookup, so absence of an
+  uninterned symbol can be established without interning it (#2321).
+
 - Cold JOIN streams support grouped COUNT and direct INT64 MIN/MAX, with
   admitted batch/group floors and a same-budget materialization control (#1372).
 

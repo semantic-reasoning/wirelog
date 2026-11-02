@@ -304,9 +304,9 @@ typedef struct {
  *     private or generated relation.
  * @WIRELOG_SOURCE_QUERY_UNSUPPORTED:      The relation or session is outside
  *     the inspected subset: a schema lane other than scalar INT64 or STRING,
- *     a zero-width relation, a relation with inline program facts, a cold or
- *     sealed source, a controlled session, or a relation whose stored rows can
- *     no longer be attributed to host calls.
+ *     a zero-width relation, a relation with inline program facts, a session
+ *     with sealed or cold input, a controlled session, or a relation whose
+ *     stored rows can no longer be attributed to host calls.
  * @WIRELOG_SOURCE_QUERY_BUSY:             Called from a callback, during
  *     another operation, or while the source is being rewritten.
  * @WIRELOG_SOURCE_QUERY_WORK_LIMIT:       Answering needs more source rows

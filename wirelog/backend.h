@@ -66,23 +66,6 @@ typedef enum {
     WL_CONTROLLED_STEP_SNAPSHOT_RETRYABLE,
 } wl_controlled_step_state_t;
 
-/**
- * wl_compute_backend_t:
- *
- * Vtable for execution operations, abstracting over backend platforms
- * (e.g., columnar nanoarrow, FPGA). Allow for future engine
- * swappability while maintaining the same C-level session semantics.
- *
- * @name: Identifier for this backend (e.g., "columnar").
- * @session_create: Initialize a session for a given ir plan.
- * @session_destroy: Deallocate session state.
- * @session_insert: Insert EDB facts.
- * @session_make_compound: Allocate a side-tier compound handle.
- * @session_remove: Retract EDB facts (for incremental backends).
- * @session_step: Perform one epoch advance (incremental).
- * @session_set_delta_cb: Set delta callback on updates.
- * @session_snapshot: Batch execution evaluating full rules synchronously.
- */
 /* Host source inspection request (Issue #2321).  ADMIT checks only the
  * session state; VALIDATE also selects and checks the relation's source
  * storage without reading rows; COUNT counts the rows equal to all @ncols
@@ -110,6 +93,23 @@ typedef struct wl_source_query_result {
     bool exists;
 } wl_source_query_result_t;
 
+/**
+ * wl_compute_backend_t:
+ *
+ * Vtable for execution operations, abstracting over backend platforms
+ * (e.g., columnar nanoarrow, FPGA). Allow for future engine
+ * swappability while maintaining the same C-level session semantics.
+ *
+ * @name: Identifier for this backend (e.g., "columnar").
+ * @session_create: Initialize a session for a given ir plan.
+ * @session_destroy: Deallocate session state.
+ * @session_insert: Insert EDB facts.
+ * @session_make_compound: Allocate a side-tier compound handle.
+ * @session_remove: Retract EDB facts (for incremental backends).
+ * @session_step: Perform one epoch advance (incremental).
+ * @session_set_delta_cb: Set delta callback on updates.
+ * @session_snapshot: Batch execution evaluating full rules synchronously.
+ */
 typedef struct {
     const char *name;
 
