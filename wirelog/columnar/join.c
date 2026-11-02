@@ -442,8 +442,8 @@ wl_columnar_join_output_error(wl_col_session_t *sess, const col_rel_t *out,
 }
 
 bool
-wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
-    const col_rel_t *out, uint64_t added_rows)
+wl_columnar_join_output_count_limit(wl_col_session_t *sess,
+    uint64_t total, uint64_t added_rows)
 {
     if (!sess)
         return false;
@@ -453,8 +453,8 @@ wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
      * run that completes still reports what it needed.  Cheap: this helper
      * is already called once per output-size check, and it is a compare and
      * a store on a session-local field. */
-    if (out && out->nrows > sess->join_output_peak)
-        sess->join_output_peak = out->nrows;
+    if (total > sess->join_output_peak)
+        sess->join_output_peak = total;
     if (limit == 0)
         return false;
     if (sess->join_output_shared_count) {
@@ -471,7 +471,15 @@ wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
                 return next >= limit;
         }
     }
-    return out && out->nrows >= limit;
+    return total >= limit;
+}
+
+bool
+wl_columnar_join_output_limit_reached(wl_col_session_t *sess,
+    const col_rel_t *out, uint64_t added_rows)
+{
+    return wl_columnar_join_output_count_limit(sess, out ? out->nrows : 0,
+               added_rows);
 }
 
 bool
@@ -1769,7 +1777,7 @@ wl_columnar_join_scan_key(const wl_col_session_t *s,
 
 static bool
 wl_columnar_join_cold_suffix(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp, uint32_t first)
+    const wl_plan_relation_t *rp, uint32_t first, bool reduction)
 {
     wl_columnar_join_source_t source = wl_columnar_join_source(s,
             rp->ops[0].relation_name, NULL);
@@ -1786,7 +1794,8 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
             (source.cold && !wl_columnar_session_cold_uses_intern(
                 source.cold, source.intern))))) return false;
     }
-    for (uint32_t i = first; i < rp->op_count; i++) {
+    uint32_t end = reduction ? rp->op_count - 2 : rp->op_count;
+    for (uint32_t i = first; i < end; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->opaque_data || op->materialized || op->relation_name ||
             (op->op != WL_PLAN_OP_FILTER &&
@@ -1848,6 +1857,54 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
     return true;
 }
 
+/* The final two operators are audited separately; the existing suffix audit
+ * checks every preceding stage against its real source schema. */
+bool
+wl_columnar_join_aggregate_decode(const wl_col_session_t *s,
+    const wl_plan_relation_t *rp, uint32_t *join_index)
+{
+    if (!s || !rp || !rp->ops || rp->op_count < 4 ||
+        rp->ops[0].op != WL_PLAN_OP_VARIABLE || !rp->ops[0].relation_name ||
+        rp->ops[rp->op_count - 1].op != WL_PLAN_OP_CONSOLIDATE) return false;
+    uint32_t first = 1, reduce_index = rp->op_count - 2;
+    while (first < reduce_index && (rp->ops[first].op == WL_PLAN_OP_MAP ||
+        rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
+    if (first >= reduce_index || rp->ops[first].op != WL_PLAN_OP_JOIN)
+        return false;
+    for (uint32_t i = 0; i < rp->op_count; i++) {
+        const wl_plan_op_t *op = &rp->ops[i];
+        if (op->opaque_data || op->materialized ||
+            (op->delta_mode != WL_DELTA_AUTO &&
+            op->delta_mode != WL_DELTA_FORCE_FULL) ||
+            (i && op->relation_name) || op->right_filter_expr.size ||
+            op->right_filter_expr.data ||
+            (i != first && (op->right_relation || op->key_count ||
+            op->left_keys || op->right_keys)) ||
+            (op->op != WL_PLAN_OP_FILTER &&
+            (op->filter_expr.size || op->filter_expr.data)) ||
+            (i != first && op->op != WL_PLAN_OP_MAP &&
+            (op->project_count || op->project_indices)) ||
+            (op->op != WL_PLAN_OP_MAP &&
+            (op->map_exprs || op->map_expr_count)) ||
+            (i != reduce_index && (op->agg_expr.data || op->agg_expr.size ||
+            op->group_by_count || op->group_by_indices)) ||
+            (i != first && op->op == WL_PLAN_OP_JOIN)) return false;
+    }
+    if (!wl_columnar_join_cold_suffix(s, rp, first, true)) return false;
+    const wl_plan_op_t *reduce = &rp->ops[reduce_index];
+    if (reduce->op != WL_PLAN_OP_REDUCE ||
+        reduce->agg_fn != WIRELOG_AGG_COUNT || reduce->group_by_count ||
+        reduce->group_by_indices || reduce->aggregate_index ||
+        reduce->agg_result_type != WL_PLAN_AGG_OPERAND_SCALAR) return false;
+    uint32_t width;
+    if (!wl_columnar_join_scan_width(s, rp, reduce_index, &width)) return false;
+    if ((reduce->agg_expr.data || reduce->agg_expr.size) &&
+        !wl_columnar_eval_plan_aggregate_column(&reduce->agg_expr, width,
+        NULL)) return false;
+    if (join_index) *join_index = first;
+    return true;
+}
+
 bool
 wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
     const wl_plan_relation_t *rp, uint32_t *join_index)
@@ -1860,7 +1917,7 @@ wl_columnar_join_cold_scan_prefix(const wl_col_session_t *s,
         rp->ops[first].op == WL_PLAN_OP_FILTER)) first++;
     if (first < 2 || first >= rp->op_count ||
         rp->ops[first].op != WL_PLAN_OP_JOIN) return false;
-    if (!wl_columnar_join_cold_suffix(s, rp, first)) return false;
+    if (!wl_columnar_join_cold_suffix(s, rp, first, false)) return false;
     if (join_index) *join_index = first;
     return true;
 }
@@ -1883,7 +1940,7 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
         if (!s || rp->ops[1].op != WL_PLAN_OP_JOIN || variable->opaque_data ||
             variable->materialized || (variable->delta_mode != WL_DELTA_AUTO &&
             variable->delta_mode != WL_DELTA_FORCE_FULL)) return false;
-        return wl_columnar_join_cold_suffix(s, rp, 1);
+        return wl_columnar_join_cold_suffix(s, rp, 1, false);
     }
     for (uint32_t i = 0; i < rp->op_count; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
@@ -1928,7 +1985,8 @@ wl_columnar_join_cold_prefix(const wl_col_session_t *s,
 
 static int
 wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
-    eval_stack_t *stack, eval_entry_t *left, const char *cold_left)
+    eval_stack_t *stack, eval_entry_t *left, const char *cold_left,
+    const wl_plan_relation_t *aggregate, uint32_t join_index)
 {
 #ifdef WL_PROFILE
     uint64_t started = now_ns();
@@ -1981,11 +2039,14 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         types[i] = sources[side].types && col < sources[side].width ?
             sources[side].types[col] : WIRELOG_TYPE_INT64;
     }
-    if (!rc) rc = wl_columnar_join_new_output(sess, sources[0].resident,
+    if (!rc && !aggregate) rc = wl_columnar_join_new_output(sess,
+                sources[0].resident,
                 sources[1].resident, "$join", width, 0, false, true, &out);
-    if (!rc) rc = col_rel_set_column_types(out, types, width);
-    free(types);
-    if (!wl_columnar_memory_rollback(&type_token)) abort();
+    if (!rc && !aggregate) rc = col_rel_set_column_types(out, types, width);
+    if (!aggregate) {
+        free(types); types = NULL;
+        if (!wl_columnar_memory_rollback(&type_token)) abort();
+    }
     wl_columnar_join_key_scratch_t key_scratch;
     memset(&key_scratch, 0, sizeof(key_scratch));
     uint32_t *left_keys = NULL, *right_keys = NULL;
@@ -2000,7 +2061,12 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
                     op->right_keys[k]);
         }
     }
-    if (rc || missing_right) goto done;
+    if (rc) goto done;
+    if (missing_right) {
+        if (aggregate) rc = wl_columnar_ops_join_aggregate(aggregate,
+                    join_index, NULL, sess, width, types, &out);
+        goto done;
+    }
     sess->spill_join_selected_count++;
     for (unsigned i = 0; i < 2; i++) {
         if (sources[i].cold) {
@@ -2083,8 +2149,14 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         wl_columnar_join_test_spill_producer_result(status);
 #endif
     rc = wl_columnar_join_spill_error(sess, status);
-    if (!rc) rc = wl_columnar_join_spill_drain(sess, cont, out);
+    if (!rc) rc = aggregate ? wl_columnar_ops_join_aggregate(aggregate,
+                join_index, cont, sess, width, types, &out) :
+            wl_columnar_join_spill_drain(sess, cont, out);
 done:
+    if (aggregate) {
+        free(types);
+        if (!wl_columnar_memory_rollback(&type_token)) abort();
+    }
     wl_columnar_join_key_scratch_free(&key_scratch, &left_keys);
     wl_columnar_join_key_scratch_free(&key_scratch, &right_keys);
     /* Even self-JOIN drops two reader pins before any temporary owner. The
@@ -2116,7 +2188,21 @@ wl_columnar_join_cold_left(wl_col_session_t *sess, const wl_plan_relation_t *rp,
         rp->ops[0].relation_name)) return ENOTSUP;
     eval_entry_t left = {0};
     return wl_columnar_join_cold_run(sess, &rp->ops[1], stack, &left,
-               rp->ops[0].relation_name);
+               rp->ops[0].relation_name, NULL, 0);
+}
+
+int
+wl_columnar_join_aggregate(wl_col_session_t *s, const wl_plan_relation_t *rp,
+    eval_stack_t *stack, uint32_t join_index, const char *cold_left)
+{
+    uint32_t decoded;
+    if (!wl_columnar_join_aggregate_decode(s, rp, &decoded) ||
+        decoded != join_index) return ENOTSUP;
+    eval_entry_t left = {0};
+    int rc = cold_left ? 0 : eval_stack_pop_relation(stack, &left);
+    if (rc) return rc;
+    return wl_columnar_join_cold_run(s, &rp->ops[join_index], stack, &left,
+               cold_left, rp, join_index);
 }
 
 int
@@ -2143,7 +2229,8 @@ wl_columnar_join_op(const wl_plan_op_t *op, eval_stack_t *stack,
     if (pop_rc != 0)
         return pop_rc;
     if (wl_columnar_session_cold_find(sess, op->right_relation))
-        return wl_columnar_join_cold_run(sess, op, stack, &left_e, NULL);
+        return wl_columnar_join_cold_run(sess, op, stack, &left_e, NULL, NULL,
+                   0);
 
     /* right_filtered: non-NULL only when right was pool-allocated by
      * wl_columnar_filter_apply_right_filter (non-cached path: antijoin/semijoin callers).

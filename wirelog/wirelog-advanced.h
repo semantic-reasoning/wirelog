@@ -256,6 +256,11 @@ wirelog_session_create_with_options(wirelog_program_t *program,
  * Group keys may be direct INT64/STRING scalar lanes. Group index and result
  * storage grow with distinct groups and require admission alongside the reader
  * and predicate storage.
+ * A single ordinary JOIN with an explicit cold input may stream global COUNT
+ * through direct MAP/narrow FILTER stages without a resident pair relation.
+ * Matching pairs count separately; the raw JOIN output cap and UINT32 row
+ * ceiling still apply before filtering. Pre-JOIN prefixes keep their resident
+ * floor. Grouped or non-COUNT aggregates over JOIN remain unsupported.
  * Optimized plans may therefore be ineligible. The session must also not have
  * been created with WIRELOG_JOIN_BATCH_BYTES on (see
  * wirelog_session_options_v1_t). Multiple loaded inputs may be

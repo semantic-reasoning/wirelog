@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Global COUNT streams one ordinary cold JOIN through direct MAP/FILTER stages,
+  preserving raw pair limits without retaining the pair relation (#1372).
+
 - Composite cold JOINs accept mixed INT64/STRING and scalar flat INLINE keys
   with whole-source provenance checks and a public fixed-budget proof (#1372).
 

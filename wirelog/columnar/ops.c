@@ -34,6 +34,7 @@
 
 #include "columnar/internal.h"
 #include "columnar/join_batch.h"
+#include "columnar/payload_join.h"
 #include "columnar/batch_payload.h"
 #include "columnar/trace_store.h"
 #include "columnar/lftj.h"
@@ -823,6 +824,218 @@ done:
     if (rc && out) {
         eval_entry_t entry = {.rel = out, .owned = true};
         return wl_columnar_ops_dispose_entry(stack, &entry, rc);
+    }
+    return rc;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+int wl_columnar_ops_test_join_reduce_fail_after = -1;
+void (*wl_columnar_ops_test_join_reduce_after_batch)(wl_col_session_t *,
+    uint64_t);
+#endif
+
+/* This sink is private to one evaluator attempt. Abort poisons it; the drain
+ * never retries a frozen batch, and only DONE can publish the final result. */
+typedef struct {
+    wl_col_session_t *session;
+    wl_columnar_eval_plan_cold_predicate_t *predicates;
+    uint32_t predicate_count, width;
+    uint64_t pairs, count, pending_pairs, pending_count;
+    int error;
+    bool begun, poisoned;
+} wl_columnar_ops_join_count_t;
+
+static wl_columnar_continuation_status_t
+wl_columnar_ops_join_count_begin(void *context,
+    const wl_columnar_continuation_batch_t *batch)
+{
+    wl_columnar_ops_join_count_t *s = context;
+    if (s->poisoned || s->begun || !batch || !batch->payload || !batch->rows)
+        return WL_COLUMNAR_CONTINUATION_INVALID;
+    s->begun = true;
+    s->pending_count = s->count;
+    s->pending_pairs = s->pairs;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+static wl_columnar_continuation_status_t
+wl_columnar_ops_join_count_reserve(void *context, uint64_t bytes, uint32_t rows)
+{
+    wl_columnar_ops_join_count_t *s = context;
+    (void)bytes;
+    if (s->poisoned || !s->begun) return WL_COLUMNAR_CONTINUATION_INVALID;
+    if (rows > UINT32_MAX - s->pairs) {
+        s->error = EOVERFLOW;
+        return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+    }
+    /* Constant counters and decoded predicate storage were admitted before
+     * the first batch. No retained row storage is needed for global COUNT. */
+    s->pending_pairs += rows;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+static wl_columnar_continuation_status_t
+wl_columnar_ops_join_count_append(void *context,
+    const wl_columnar_continuation_batch_t *batch)
+{
+    wl_columnar_ops_join_count_t *s = context;
+    const col_rel_t *rows = batch->payload;
+    if (s->poisoned || !s->begun || !rows || rows->ncols != s->width ||
+        batch->rows > rows->nrows) return WL_COLUMNAR_CONTINUATION_INVALID;
+    for (uint32_t r = 0; r < batch->rows; r++) {
+        bool keep = true;
+        for (uint32_t p = 0; keep && p < s->predicate_count; p++) {
+            const wl_columnar_eval_plan_cold_predicate_t *predicate =
+                &s->predicates[p];
+            int64_t v = rows->columns[predicate->column][r];
+            int64_t k = predicate->literal;
+            switch (predicate->comparison) {
+            case WL_PLAN_EXPR_CMP_EQ: keep = v == k; break;
+            case WL_PLAN_EXPR_CMP_NEQ: keep = v != k; break;
+            case WL_PLAN_EXPR_CMP_LT: keep = v < k; break;
+            case WL_PLAN_EXPR_CMP_GT: keep = v > k; break;
+            case WL_PLAN_EXPR_CMP_LTE: keep = v <= k; break;
+            case WL_PLAN_EXPR_CMP_GTE: keep = v >= k; break;
+            default: s->error = ENOTSUP;
+                return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+            }
+        }
+        s->pending_count += keep;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (wl_columnar_ops_test_join_reduce_fail_after >= 0 &&
+            !wl_columnar_ops_test_join_reduce_fail_after--) {
+            s->error = ENOMEM;
+            return WL_COLUMNAR_CONTINUATION_SINK_FAILURE;
+        }
+#endif
+    }
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+static wl_columnar_continuation_status_t
+wl_columnar_ops_join_count_commit(void *context, bool *committed)
+{
+    wl_columnar_ops_join_count_t *s = context;
+    *committed = false;
+    if (s->poisoned || !s->begun) return WL_COLUMNAR_CONTINUATION_INVALID;
+    s->count = s->pending_count; s->pairs = s->pending_pairs;
+    s->begun = false; *committed = true;
+    return WL_COLUMNAR_CONTINUATION_OK;
+}
+static void
+wl_columnar_ops_join_count_abort(void *context)
+{
+    wl_columnar_ops_join_count_t *s = context;
+    s->poisoned = true; s->begun = false;
+    s->count = s->pending_count = 0;
+}
+
+int
+wl_columnar_ops_join_aggregate(const wl_plan_relation_t *plan,
+    uint32_t join_index, wl_columnar_continuation_t *continuation,
+    wl_col_session_t *session, uint32_t width,
+    const wirelog_column_type_t *types, col_rel_t **out)
+{
+    (void)types;
+    *out = NULL;
+    uint32_t reduce_index = plan->op_count - 2, filters = 0;
+    for (uint32_t i = join_index + 1; i < reduce_index; i++)
+        filters += plan->ops[i].op == WL_PLAN_OP_FILTER;
+    uint64_t bytes;
+    if (!wl_columnar_memory_size_mul(filters,
+        sizeof(wl_columnar_eval_plan_cold_predicate_t), &bytes) ||
+        bytes > SIZE_MAX) return EOVERFLOW;
+    wl_ops_scratch_t scratch;
+    int rc = wl_ops_scratch_reserve(&scratch, session->memory_governor,
+            bytes + sizeof(wl_columnar_ops_join_count_t), session);
+    if (rc) return rc;
+    wl_columnar_ops_join_count_t state = {.session = session, .width = width};
+    state.predicates = filters ? malloc((size_t)bytes) : NULL;
+    if (filters && !state.predicates) {
+        rc = ENOMEM; goto done;
+    }
+    wl_plan_relation_t suffix = *plan;
+    suffix.ops += join_index; suffix.op_count -= join_index;
+    uint32_t stage_width = width;
+    for (uint32_t i = 1; i < suffix.op_count - 2; i++) {
+        const wl_plan_op_t *op = &suffix.ops[i];
+        if (op->op == WL_PLAN_OP_MAP) {
+            stage_width = op->project_count; continue;
+        }
+        wl_columnar_eval_plan_cold_predicate_t *p =
+            &state.predicates[state.predicate_count];
+        if (!wl_columnar_eval_plan_cold_predicate_decode(op, stage_width,
+            NULL, p) || !wl_columnar_eval_plan_cold_column(&suffix, i,
+            p->column, width, &p->column)) {
+            rc = ENOTSUP; goto done;
+        }
+        state.predicate_count++;
+    }
+    wl_columnar_continuation_sink_t sink = {.context = &state,
+                                            .begin =
+                                                wl_columnar_ops_join_count_begin,
+                                            .reserve =
+                                                wl_columnar_ops_join_count_reserve,
+                                            .append =
+                                                wl_columnar_ops_join_count_append,
+                                            .commit =
+                                                wl_columnar_ops_join_count_commit,
+                                            .abort =
+                                                wl_columnar_ops_join_count_abort};
+    while (continuation) {
+        uint64_t before = state.pairs;
+        wl_columnar_continuation_status_t status =
+            wl_columnar_continuation_publish(continuation, &sink);
+        if (status == WL_COLUMNAR_CONTINUATION_PROGRESS) continue;
+        if (status == WL_COLUMNAR_CONTINUATION_OK) {
+#ifdef WL_SESSION_TEST_HOOKS
+            if (wl_columnar_ops_test_join_reduce_after_batch)
+                wl_columnar_ops_test_join_reduce_after_batch(session,
+                    state.pairs);
+#endif
+            if (wl_columnar_join_output_count_limit(session, state.pairs,
+                state.pairs - before)) {
+                rc = EOVERFLOW; goto done;
+            }
+            continue;
+        }
+        if (status == WL_COLUMNAR_CONTINUATION_DONE) break;
+        wl_columnar_spill_status_t error =
+            wl_columnar_payload_join_error(continuation);
+        if (error == WL_COLUMNAR_SPILL_IO) rc = EIO;
+        else if (error == WL_COLUMNAR_SPILL_MEMORY) rc = ENOSPC;
+        else if (error == WL_COLUMNAR_SPILL_OVERFLOW) rc = EOVERFLOW;
+        else if (error == WL_COLUMNAR_SPILL_UNSUPPORTED) rc = ENOTSUP;
+        else if (error == WL_COLUMNAR_SPILL_BUSY) rc = EBUSY;
+        else if (error == WL_COLUMNAR_SPILL_CANCELLED) rc = ECANCELED;
+        else if (error == WL_COLUMNAR_SPILL_QUOTA ||
+            error == WL_COLUMNAR_SPILL_CAPACITY) rc = ENOSPC;
+        else if (state.error) rc = state.error;
+        else if (status ==
+            WL_COLUMNAR_CONTINUATION_RESERVATION_DENIED) rc = ENOSPC;
+        else if (status == WL_COLUMNAR_CONTINUATION_STALE) rc = EAGAIN;
+        else if (status == WL_COLUMNAR_CONTINUATION_COMMIT_AMBIGUOUS) rc = EIO;
+        else if (status == WL_COLUMNAR_CONTINUATION_UNSUPPORTED) rc = ENOTSUP;
+        else rc = ENOMEM;
+        goto done;
+    }
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_ops_test_reduce_fail_output_alloc) {
+        rc = ENOMEM; goto done;
+    }
+#endif
+    rc = wl_columnar_relation_new_named_governed("$reduce", 1, NULL,
+            state.count ? 1 : 0, false, session->memory_governor, out);
+    wirelog_column_type_t type = WIRELOG_TYPE_INT64;
+    if (!rc) rc = col_rel_set_column_types(*out, &type, 1);
+    if (!rc && state.count) {
+        int64_t count = (int64_t)state.count;
+        bool denied = false;
+        rc = col_rel_append_rows_atomic(*out, &count, 1, 1, &denied);
+        if (denied) rc = ENOSPC;
+    }
+done:
+    free(state.predicates); wl_ops_scratch_release(&scratch);
+    if (rc == ENOSPC) session->memory_budget_denied = true;
+    if (rc) {
+        col_rel_destroy(*out); *out = NULL;
     }
     return rc;
 }

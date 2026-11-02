@@ -5567,8 +5567,8 @@ Resident insertion and full-width materialization refuse under that same
 budget. Retaining actual governed input chunks also refuses; releasing those
 owners permits retry without raising the limit. Trace segment/directory storage
 and resident intern storage remain separate from aggregate attempt state.
-Expressions, FLOAT/AVG, recursive/signed/control aggregation and aggregate-over-
-JOIN remain ineligible. High distinct-group cardinality can still exhaust the
+Expressions, FLOAT/AVG, recursive/signed/control aggregation remain ineligible. The later global
+COUNT-over-JOIN route has its own admission contract. High distinct-group cardinality can still exhaust the
 resident index/result budget.
 
 
@@ -5629,6 +5629,32 @@ The retained control peaks at 253,187,814 bytes. Disk use is 337,187,840 bytes;
 trace owner, nodes, directory and cursor floors are separately 4,304 / 20,480 /
 1,400 / 112 bytes. Values describe this build and fixture rather than universal
 minimum budgets. Intern storage, resident intermediates and high-cardinality
-results remain independent floors. Aggregate-over-JOIN, automatic all-resident
-composite spilling, weighted composite APIs, SIDE/nested layouts and mutable
+results remain independent floors. Except for global COUNT below,
+aggregate-over-JOIN, automatic all-resident composite spilling, weighted composite APIs, SIDE/nested layouts and mutable
 arrangements remain outside this group.
+
+
+### Streaming global COUNT over one cold JOIN (#1372 follow-up)
+
+A serial immutable rule containing exactly one equality JOIN can feed global
+COUNT without retaining the complete joined relation. At least one input must
+be explicitly sealed or chunk-loaded; existing INT64/STRING composite keys and
+flat INLINE scalar fields keep their full-source provenance requirements.
+Direct post-JOIN MAPs and narrow INT64 literal FILTERs stream into the count.
+Physical matching pairs remain distinct even when MAP duplicates lanes. Empty
+or all-filtered streams produce no row, matching resident REDUCE.
+
+The sink admits constant counters and O(filter count) predicate storage in
+addition to the existing producer batch, index, reader and key floors. It
+acknowledges only complete private batches; any failure ends that attempt and
+publishes no partial aggregate. Temporary reader pins are dropped before source
+owners; persistent cold input can be reused by a fresh evaluation. The final
+one-row result remains governed. Pre-JOIN prefixes still materialize under
+their existing source-row capacity floor.
+
+Raw pair counts, including filtered-away pairs, retain the existing JOIN cap
+and UINT32_MAX representation ceiling. Peak reporting measures raw pairs,
+not reduced rows. This does not allow arbitrary-budget completion. Grouped
+aggregation, extrema, SUM, FLOAT/AVG and multiple JOINs in a reduction rule
+remain outside this increment. In particular, checked SUM overflow depends on
+input order and is not interchangeable with bounded window traversal.

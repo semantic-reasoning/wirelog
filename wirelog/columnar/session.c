@@ -861,6 +861,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
             bool projection = wl_columnar_session_cold_scan_rule(sess, rp,
                     false);
             bool aggregate = wl_columnar_session_cold_scan_rule(sess, rp, true);
+            bool join_aggregate = wl_columnar_join_aggregate_decode(sess, rp,
+                    NULL);
             bool scan_join = wl_columnar_join_cold_scan_prefix(sess, rp, NULL);
             bool composite = false;
             for (uint32_t j = 0; j < rp->op_count; j++)
@@ -868,7 +870,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     rp->ops[j].key_count > 1;
             bool composite_prefix = composite &&
                 wl_columnar_join_cold_prefix(sess, rp);
-            if (composite && !composite_prefix && !scan_join) return false;
+            if (composite && !composite_prefix && !scan_join &&
+                !join_aggregate) return false;
             uint32_t scan_end = 1;
             while (scan_end < rp->op_count &&
                 (rp->ops[scan_end].op == WL_PLAN_OP_MAP ||
@@ -877,14 +880,16 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
              * right-input check just because it contains no FILTER opcode. */
             if (rp->op_count && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
                 scan_end > 1 && scan_end < rp->op_count &&
-                rp->ops[scan_end].op == WL_PLAN_OP_JOIN && !scan_join)
+                rp->ops[scan_end].op == WL_PLAN_OP_JOIN && !scan_join &&
+                !join_aggregate)
                 return false;
             bool selected_projection = (projection || aggregate) &&
                 !strcmp(rp->ops[0].relation_name, name);
             bool selected_join = rp->op_count &&
                 rp->ops[0].relation_name &&
                 !strcmp(rp->ops[0].relation_name, name) &&
-                (wl_columnar_join_cold_prefix(sess, rp) || scan_join);
+                (wl_columnar_join_cold_prefix(sess,
+                rp) || scan_join || join_aggregate);
             if (selected_projection || selected_join) consumer = true;
             for (uint32_t oi = 0; oi < rp->op_count; oi++) {
                 const wl_plan_op_t *op = &rp->ops[oi];
@@ -894,10 +899,11 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                     (op->op != WL_PLAN_OP_VARIABLE &&
                     op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_MAP &&
                     op->op != WL_PLAN_OP_CONSOLIDATE &&
-                    !((projection || scan_join || aggregate ||
+                    !((projection || scan_join || aggregate || join_aggregate ||
                     composite_prefix) &&
                     op->op == WL_PLAN_OP_FILTER) &&
-                    !(aggregate && op->op == WL_PLAN_OP_REDUCE)) ||
+                    !((aggregate || join_aggregate) &&
+                    op->op == WL_PLAN_OP_REDUCE)) ||
                     (op->delta_mode != WL_DELTA_AUTO &&
                     op->delta_mode != WL_DELTA_FORCE_FULL)) return false;
                 if (op->relation_name && strcmp(op->relation_name, name) == 0 &&
@@ -922,7 +928,8 @@ wl_columnar_session_cold_plan(const wl_col_session_t *sess, const char *name,
                         types[key] != WIRELOG_TYPE_STRING) return false;
                 }
                 if (oi == 1 && rp->ops[0].op == WL_PLAN_OP_VARIABLE &&
-                    !wl_columnar_join_cold_prefix(sess, rp)) return false;
+                    !wl_columnar_join_cold_prefix(sess,
+                    rp) && !join_aggregate) return false;
                 consumer = true;
             }
         }

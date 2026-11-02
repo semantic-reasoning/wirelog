@@ -544,6 +544,29 @@ wl_columnar_eval_plan_cold_projection(const wl_plan_relation_t *rp,
                types, NULL);
 }
 
+/* Decode only a serialized direct column, with no expression evaluation. */
+bool
+wl_columnar_eval_plan_aggregate_column(const wl_plan_expr_buffer_t *expr,
+    uint32_t width, uint32_t *column)
+{
+    if (!expr || !expr->data || expr->size < 7 ||
+        (expr->data[0] != WL_PLAN_EXPR_VAR &&
+        expr->data[0] != WL_PLAN_EXPR_VAR_STRING &&
+        expr->data[0] != WL_PLAN_EXPR_VAR_FLOAT)) return false;
+    uint16_t len; memcpy(&len, expr->data + 1, sizeof(len));
+    if ((uint32_t)len + 3 != expr->size ||
+        memcmp(expr->data + 3, "col", 3)) return false;
+    uint32_t col = 0;
+    for (uint32_t i = 6; i < expr->size; i++) {
+        unsigned digit = (unsigned)expr->data[i] - '0';
+        if (digit > 9 || col > (UINT32_MAX - digit) / 10) return false;
+        col = col * 10 + digit;
+    }
+    if (col >= width) return false;
+    if (column) *column = col;
+    return true;
+}
+
 /* Separate from scan decoding: a reduction needs no materialized prefix. */
 bool
 wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
@@ -612,21 +635,10 @@ wl_columnar_eval_plan_cold_aggregate_decode(const wl_plan_relation_t *rp,
     }
     const wl_plan_expr_buffer_t *expr = &reduce->agg_expr;
     if (expr->data || expr->size) {
-        if (!expr->data || expr->size < 7 ||
-            (expr->data[0] != WL_PLAN_EXPR_VAR &&
-            expr->data[0] != WL_PLAN_EXPR_VAR_STRING &&
-            expr->data[0] != WL_PLAN_EXPR_VAR_FLOAT)) return false;
-        uint16_t len; memcpy(&len, expr->data + 1, sizeof(len));
-        if ((uint32_t)len + 3 != expr->size || memcmp(expr->data + 3, "col",
-            3) != 0) return false;
-        uint32_t column = 0;
-        for (uint32_t i = 6; i < expr->size; i++) {
-            unsigned digit = (unsigned)expr->data[i] - '0';
-            if (digit > 9 || column > (UINT32_MAX - digit) / 10) return false;
-            column = column * 10 + digit;
-        }
-        if (column >= width || !wl_columnar_eval_plan_cold_column(rp, end,
-            column, ncols, &decoded.operand)) return false;
+        uint32_t column;
+        if (!wl_columnar_eval_plan_aggregate_column(expr, width, &column) ||
+            !wl_columnar_eval_plan_cold_column(rp, end, column, ncols,
+            &decoded.operand)) return false;
     }
     if (reduce->agg_fn != WIRELOG_AGG_COUNT &&
         (!expr->data || !expr->size || expr->data[0] != WL_PLAN_EXPR_VAR ||
@@ -640,6 +652,41 @@ int
 col_eval_relation_plan(const wl_plan_relation_t *rplan, eval_stack_t *stack,
     wl_col_session_t *sess)
 {
+    uint32_t aggregate_join;
+    if (sess->cold_relation &&
+        wl_columnar_join_aggregate_decode(sess, rplan, &aggregate_join) &&
+        (wl_columnar_session_cold_find(sess, rplan->ops[0].relation_name) ||
+        wl_columnar_session_cold_find(sess,
+        rplan->ops[aggregate_join].right_relation))) {
+        int rc = wl_columnar_session_cold_execution_check(sess);
+        if (rc) return rc;
+        const char *cold_left = wl_columnar_session_cold_find(sess,
+                rplan->ops[0].relation_name) ? rplan->ops[0].relation_name :
+            NULL;
+        if (aggregate_join > 1 || !cold_left) {
+            if (cold_left) rc = wl_columnar_ops_cold_scan(rplan, stack, sess,
+                        aggregate_join);
+            else {
+                wl_plan_relation_t prefix = *rplan;
+                prefix.op_count = aggregate_join;
+                rc = wl_columnar_eval_plan_body(&prefix, stack, sess, 0);
+            }
+            if (rc) return rc;
+            bool mapped = false;
+            for (uint32_t i = 1; i < aggregate_join; i++)
+                mapped |= rplan->ops[i].op == WL_PLAN_OP_MAP;
+            if (aggregate_join > 1 && !mapped) {
+                eval_entry_t *entry = &stack->items[stack->top - 1];
+                rc = wl_columnar_relation_rename_checked(entry->rel,
+                        rplan->ops[0].relation_name);
+                if (rc) return rc;
+            }
+            cold_left = NULL;
+        }
+        rc = wl_columnar_join_aggregate(sess, rplan, stack, aggregate_join,
+                cold_left);
+        return rc ? rc : col_op_consolidate(stack, sess);
+    }
     if (sess->cold_relation && rplan->ops) {
         for (uint32_t i = 0; i < rplan->op_count; i++) {
             wl_columnar_session_cold_relation_t *cold =
