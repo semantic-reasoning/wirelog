@@ -455,6 +455,96 @@ test_foreign(void)
     CHECK(control_end(c, &owner, 0) == 1056);
 }
 
+static unsigned single_try_hooks;
+static const void *single_try_owner;
+static bool single_try_turnover;
+
+static void
+single_try_checkpoint(wl_evaluation_control_t *c,
+    wl_columnar_mem_ledger_publication_prepared_t *p, unsigned phase)
+{
+    if (phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PRECAS) return;
+    CHECK(p->phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY);
+    ++single_try_hooks;
+    if (single_try_turnover) {
+        CHECK(!wl_evaluation_control_finish(c, single_try_owner, 0, 0));
+        CHECK(!wl_evaluation_control_reset(c));
+        CHECK(!wl_evaluation_control_begin(c, single_try_owner));
+    }
+}
+
+static void
+test_single_ledger_try(void)
+{
+    wl_mem_ledger_t ledger, expected;
+    seed(&ledger); seed(&expected);
+    wl_columnar_mem_ledger_publication_request_t requests[2] = {
+        {WL_MEM_SUBSYS_RELATION, FREE, 23},
+        {WL_MEM_SUBSYS_TIMESTAMP, FREE, 29}
+    };
+    int holder_owner = 0, owner = 0;
+    wl_evaluation_control_t *holder = control_new(0, &holder_owner);
+    wl_columnar_mem_ledger_publication_prepared_t held = {0};
+    CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(
+            &ledger, NULL, 0, &held, holder));
+    CHECK(!wl_columnar_mem_ledger_publication_try_acquire_controlled(&held)
+        && gate(&ledger) == 1);
+    wl_columnar_mem_ledger_publication_test_checkpoint = single_try_checkpoint;
+    single_try_hooks = 0; single_try_turnover = false;
+    wl_evaluation_control_t *c = control_new(0, &owner);
+    wl_columnar_mem_ledger_publication_prepared_t candidate = {0};
+    CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(
+            &ledger, requests, 2, &candidate, c));
+    /* A genuine other publication owns the gate. Unlimited allowance still
+     * makes exactly one attempt and returns; the candidate is cancel-only. */
+    CHECK(wl_columnar_mem_ledger_publication_try_acquire_controlled(&candidate)
+        == EAGAIN && single_try_hooks == 1 && gate(&ledger) == 1);
+    CHECK(wl_columnar_mem_ledger_publication_try_acquire_controlled(&candidate)
+        == EINVAL && single_try_hooks == 1);
+    CHECK(!wl_columnar_mem_ledger_publication_cancel(&candidate));
+    CHECK(control_end(c, &owner, 0) == 109 + 166 + 28);
+    CHECK(!wl_columnar_mem_ledger_publication_cancel(&held) && !gate(&ledger));
+    CHECK(control_end(holder, &holder_owner, 0) == 109 + 166 + 28);
+    same(&ledger, &expected);
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        candidate = (wl_columnar_mem_ledger_publication_prepared_t){0};
+        c = control_new(109 + 166 + 28 - !exact, &owner);
+        single_try_hooks = 0;
+        CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(
+                &ledger, requests, 2, &candidate, c));
+        int rc =
+            wl_columnar_mem_ledger_publication_try_acquire_controlled(
+            &candidate);
+        CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT)
+            && single_try_hooks == exact && gate(&ledger) == exact);
+        if (exact) {
+            CHECK(!wl_columnar_mem_ledger_publication_apply(&candidate));
+            CHECK(!wl_columnar_mem_ledger_publication_release(&candidate));
+            wl_mem_ledger_free(&expected, WL_MEM_SUBSYS_RELATION, 23);
+            wl_mem_ledger_free(&expected, WL_MEM_SUBSYS_TIMESTAMP, 29);
+        } else CHECK(!wl_columnar_mem_ledger_publication_cancel(&candidate));
+        CHECK(control_end(c, &owner,
+            exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT)
+            == 109 + 166 + (exact ? 28 : 0));
+        same(&ledger, &expected);
+    }
+    candidate = (wl_columnar_mem_ledger_publication_prepared_t){0};
+    c = control_new(0, &owner);
+    CHECK(!wl_columnar_mem_ledger_publication_prepare_controlled(
+            &ledger, requests, 2, &candidate, c));
+    uint64_t old_id = wl_evaluation_control_active_attempt_id(c);
+    single_try_owner = &owner; single_try_turnover = true; single_try_hooks = 0;
+    CHECK(wl_columnar_mem_ledger_publication_try_acquire_controlled(&candidate)
+        == EINVAL && single_try_hooks == 1 && !gate(&ledger));
+    uint64_t successor = wl_evaluation_control_active_attempt_id(c);
+    CHECK(successor != old_id);
+    CHECK(!wl_columnar_mem_ledger_publication_cancel(&candidate));
+    same(&ledger, &expected);
+    single_try_owner = NULL; single_try_turnover = false;
+    wl_columnar_mem_ledger_publication_test_checkpoint = NULL;
+    CHECK(!control_end(c, &owner, 0));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -462,6 +552,7 @@ main(int argc, char **argv)
     if (!strcmp(argv[1], "domains")) test_domains();
     else if (!strcmp(argv[1], "failures")) {
         test_boundaries(); test_stops_and_hooks(); test_pair_contention();
+        test_single_ledger_try();
     }else if (!strcmp(argv[1], "authority")) {
         test_overlap_and_reuse(); test_foreign();
     }else abort();

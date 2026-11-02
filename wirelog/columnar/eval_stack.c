@@ -3694,6 +3694,56 @@ wl_columnar_eval_stack_framed_status(
 
 #ifdef WL_SESSION_TEST_HOOKS
 int
+wl_columnar_eval_stack_test_unary_output_segments_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *f, const void *owner,
+    uint32_t *segments, uint32_t count)
+{
+    int rc = wl_columnar_eval_stack_numeric_writable(f, owner);
+    if (rc) return rc;
+    wl_columnar_filter_context_t *ctx = &f->filter;
+    if (!segments || count != 1
+        || !wl_columnar_eval_stack_frame_copy_output(f, segments,
+        2 * sizeof(*segments))
+        || !wl_columnar_eval_stack_copy_ranges_disjoint(owner,
+        sizeof(wl_columnar_eval_plan_numeric_attempt_t), segments,
+        2 * sizeof(*segments)))
+        return EINVAL;
+    if (!wl_columnar_eval_stack_unary_thread_valid(f)
+        || f->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE ||
+        f->unary_committed
+        || f->unary_scalar_mode || f->unary_scalar_started ||
+        f->unary_scalar_busy
+        || f->unary_scalar_prepared || f->unary_scalar_committed ||
+        f->unary_scalar_for_old
+        || f->unary_scalar_init_target || f->unary_scalar_cancel_clear ||
+        f->unary_scalar_drained
+        || f->unary_scalar_initializer.identity ||
+        f->unary_scalar_retirement.storage.identity
+        || ctx->identity != ctx || ctx->frame != f || ctx->session != f->session
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH || ctx->busy
+        || !ctx->thread_valid || !ctx->unary_started || ctx->committed
+        || ctx->control || ctx->pin_owned || ctx->output
+        || ctx->attempt_id != f->unary_attempt_id
+        || !f->unary_output.owned || !f->unary_output.rel
+        || f->unary_output.kind != WL_COLUMNAR_EVAL_ENTRY_RELATION
+        || f->unary_output.continuation || f->unary_output.seg_boundaries
+        || f->unary_output.seg_count ||
+        ctx->private_output != f->unary_output.rel
+        || segments == f->unary_snapshot.seg_boundaries
+        || segments[0] || segments[1] != f->unary_output.rel->nrows)
+        return EINVAL;
+#if defined(WL_HAVE_C11_THREADS)
+    if (!thrd_equal(ctx->owner_thread, thrd_current())) return EINVAL;
+#elif defined(_WIN32) || defined(_WIN64)
+    if (ctx->owner_thread != GetCurrentThreadId()) return EINVAL;
+#else
+    if (!pthread_equal(ctx->owner_thread, pthread_self())) return EINVAL;
+#endif
+    f->unary_output.seg_boundaries = segments; f->unary_output.seg_count = 1;
+    return 0;
+}
+
+int
 wl_columnar_eval_stack_test_unary_observe(
     wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
     wl_columnar_eval_stack_test_unary_observation_t *out)
@@ -3713,6 +3763,29 @@ wl_columnar_eval_stack_test_unary_observe(
     out->first_result = frame->unary_first_result; out->owned = entry->owned;
     out->is_delta = entry->is_delta; out->committed = frame->unary_committed;
     out->result_saved = frame->unary_result_saved;
+    out->snapshot_relation = frame->unary_snapshot.rel;
+    out->snapshot_segments = frame->unary_snapshot.seg_boundaries;
+    out->snapshot_segment_count = frame->unary_snapshot.seg_count;
+    out->scalar_init_phase = frame->unary_scalar_initializer.phase;
+    out->scalar_started = frame->unary_scalar_started;
+    /* The staged initializer may not have zeroed the whole raw scalar yet.
+     * Only actual BIND makes those fields meaningful to an observer. */
+    out->scalar_phase = frame->unary_scalar_started
+        ? frame->unary_scalar_retirement.phase : 0;
+    out->managed_phase = frame->unary_scalar_started
+        ? (unsigned)frame->unary_scalar_retirement.storage.phase : 0;
+    out->scalar_ready = frame->unary_scalar_started
+        && frame->unary_scalar_retirement.ready;
+    out->scalar_ledger_pending = frame->unary_scalar_started
+        && frame->unary_scalar_retirement.ledger
+        && (frame->unary_scalar_retirement.ledger_bytes
+        || frame->unary_scalar_retirement.ledger_timestamp_bytes);
+    for (unsigned i = 0; i < 4; ++i) {
+        out->credit_started[i] = frame->unary_scalar_started
+            && frame->unary_scalar_retirement.storage.receipt_started[i];
+        out->credit_empty[i] = frame->unary_scalar_started
+            && frame->unary_scalar_retirement.storage.token_empty[i];
+    }
     return 0;
 }
 #endif
@@ -4549,6 +4622,353 @@ wl_columnar_eval_stack_unary_prepared_query(
     out->alias_complete = p->alias_complete; out->old_held = p->old_held;
     out->output_held = p->output_held;
     return 0;
+}
+
+/* The old publication receipt is ACKED before this independent cleanup lease.
+ * Original control ownership is retained, but only distinct funding is polled. */
+int
+wl_columnar_eval_stack_unary_prepared_join_finish_begin(
+    wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_cleanup_frame_t *frame,
+    const wl_columnar_eval_plan_numeric_attempt_t *owner,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    if (!p || !frame || !owner) return EINVAL;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    if (!wl_columnar_eval_stack_frame_copy_output(frame, p, sizeof(*p))
+        || !wl_columnar_eval_stack_copy_ranges_disjoint(owner, sizeof(*owner),
+        p, sizeof(*p))) return EINVAL;
+    if (p->identity != p || !wl_columnar_eval_stack_prepared_thread(p))
+        return EINVAL;
+    if (p->busy || p->phase != WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED
+        || !wl_columnar_eval_stack_prepared_terminal_inert(p)) return EBUSY;
+    const wl_columnar_filter_context_t *ctx = &frame->filter;
+    if (frame->prepared_unary || frame->stream_host
+        || ctx->identity != ctx || ctx->frame != frame ||
+        ctx->session != frame->session
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH || ctx->busy
+        || !ctx->thread_valid || !ctx->unary_started || ctx->control ||
+        ctx->pin_owned
+        || ctx->output ||
+        (frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE
+        && frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED)
+        || !wl_columnar_eval_stack_unary_thread_valid(frame)
+        || frame->unary_control != owner->control
+        || frame->unary_attempt_id != owner->attempt_id || !owner->plan
+        || !owner->plan->ops || owner->cursor >= owner->end
+        || owner->end > owner->plan->op_count
+        || !frame->unary_top || frame->unary_top != frame->stack.top
+        || frame->unary_index != frame->unary_top - 1
+        || frame->unary_scalar_busy || frame->unary_scalar_init_target
+        || frame->unary_scalar_cancel_clear || frame->unary_scalar_drained)
+        return EBUSY;
+    if (!funding || !id || funding == owner->control
+        || wl_evaluation_control_identity(funding) ==
+        wl_evaluation_control_identity(owner->control)
+        || wl_evaluation_control_active_attempt_id(funding) !=
+        id) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(funding, id, 256);
+    if (rc) return rc;
+    rc = wl_evaluation_control_retain(owner->control);
+    if (rc) return rc;
+    /* Work is genuinely inert; preserve native final-address provenance.
+     * No whole receipt clear and no copied live resource is introduced. */
+    p->frame = frame; p->session = frame->session; p->numeric_owner = owner;
+    p->plan = owner->plan; p->operation = &owner->plan->ops[owner->cursor];
+    p->numeric_cursor = owner->cursor; p->numeric_phase = owner->phase;
+    p->control = owner->control;
+    p->control_identity = wl_evaluation_control_identity(owner->control);
+    p->attempt_id = owner->attempt_id; p->control_ref = true;
+    p->top = frame->unary_top; p->index = frame->unary_index;
+    p->first_result = p->cleanup_result = 0;
+    p->committed = p->result_saved = p->join_mode = p->publication_is_delta =
+        false;
+    p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD;
+    frame->prepared_unary = p;
+    return 0;
+}
+
+static int
+wl_columnar_eval_stack_prepared_finish_head(
+    wl_columnar_eval_stack_unary_prepared_t *p)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *f = p->frame;
+    const wl_columnar_eval_plan_numeric_attempt_t *n = p->numeric_owner;
+    wl_columnar_filter_context_t *ctx = &f->filter;
+    bool child = n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD
+        || ((n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING
+        || n->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
+        && (n->pending_action == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+        || n->pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD));
+    if (!child || ctx->identity != ctx || ctx->frame != f ||
+        ctx->session != p->session
+        || ctx->stage != WL_COLUMNAR_FILTER_STAGE_FINISH || ctx->busy
+        || !ctx->thread_valid ||
+        !wl_columnar_eval_stack_prepared_join_thread(ctx)
+        || !ctx->unary_started || ctx->control || ctx->pin_owned || ctx->output
+        || ctx->attempt_id != p->attempt_id ||
+        ctx->committed != f->unary_committed
+        || ctx->semantic_result != ctx->execution_result ||
+        ctx->join_metadata_busy
+        || ctx->join_operation || ctx->join_decision_pending ||
+        ctx->join_result_is_delta
+        || ctx->join_disposition != WL_COLUMNAR_JOIN_DISPOSITION_REPLACE
+        || ctx->join_input_snapshot.relation_identity
+        || ctx->join_input_snapshot.view_generation ||
+        ctx->join_input_snapshot.storage_generation
+        || p->operation->op != WL_PLAN_OP_JOIN
+        || ctx->private_output != (f->unary_committed
+            ? f->stack.items[p->index].rel : f->unary_output.rel)
+        || f->unary_scalar_mode || f->unary_scalar_started ||
+        f->unary_scalar_prepared
+        || f->unary_scalar_committed || f->unary_scalar_for_old
+        || f->unary_scalar_initializer.identity ||
+        f->unary_scalar_retirement.storage.identity)
+        return EINVAL;
+    eval_entry_t *entry =
+        f->unary_committed ? &f->unary_retired : &f->unary_output;
+    if (entry->kind != WL_COLUMNAR_EVAL_ENTRY_RELATION || entry->continuation)
+        return ENOTSUP;
+    wl_columnar_eval_stack_unary_entry_copy(&p->work.original, entry);
+    p->work.output.rel = ctx->private_output;
+    if (entry->rel) p->work.old_snapshot =
+            wl_columnar_relation_snapshot(entry->rel);
+    p->first_result =
+        f->unary_result_saved ? f->unary_first_result : ctx->execution_result;
+    p->result_saved = true; p->committed = f->unary_committed;
+    if (!f->unary_result_saved) {
+        f->unary_first_result = p->first_result; f->unary_result_saved = true;
+    }
+    p->join_mode = true;
+    ctx->private_output = NULL;
+    f->unary_scalar_mode = true;
+    f->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_RETAINED;
+    p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SEGMENTS;
+    return 0;
+}
+
+static uint64_t
+wl_columnar_eval_stack_prepared_finish_fee(
+    const wl_columnar_eval_stack_unary_prepared_t *p)
+{
+    switch (p->phase) {
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD:
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT: return 192;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_INIT:
+        return p->frame->unary_scalar_initializer.phase ==
+               WL_COLUMNAR_RELATION_SCALAR_INIT_DONE
+               ? 128 : 192;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE:
+        switch (p->frame->unary_scalar_retirement.phase) {
+        case 0: return 256;
+        case 1: case 2: return 192;
+        default: return 128;
+        }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DISPOSE:
+        return p->frame->unary_scalar_retirement.phase == 12 ? 128 : 256;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR:
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR: return 256;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLAIMS:
+        /* The existing controlled claim-release supplies the real256. */
+        return 0;
+    default: return 128;
+    }
+}
+
+static int
+wl_columnar_eval_stack_prepared_finish_body(
+    wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    wl_columnar_eval_stack_cleanup_frame_t *f = p->frame;
+    wl_columnar_relation_scalar_retirement_t *s = &f->unary_scalar_retirement;
+    switch (p->phase) {
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD:
+        return wl_columnar_eval_stack_prepared_finish_head(p);
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SEGMENTS: {
+        eval_entry_t *entry =
+            f->unary_committed ? &f->unary_retired : &f->unary_output;
+        uint32_t *segments = entry->seg_boundaries;
+        if (!f->unary_committed && segments
+            && segments ==
+            f->stack.items[p->index].seg_boundaries) return EINVAL;
+        /* Dispose an irreversible legal array prefix. No stale shadow may
+         * resurrect it during decline; a different live ABORT array survives. */
+        entry->seg_boundaries = NULL; entry->seg_count = 0;
+        p->work.original.seg_boundaries = NULL; p->work.original.seg_count = 0;
+        if (segments && f->unary_snapshot.seg_boundaries == segments) {
+            f->unary_snapshot.seg_boundaries = NULL;
+            f->unary_snapshot.seg_count = 0;
+        }
+        free(segments);
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SELECT;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SELECT: {
+        eval_entry_t *entry =
+            f->unary_committed ? &f->unary_retired : &f->unary_output;
+        if (!entry->owned || !entry->rel) {
+            wl_columnar_eval_stack_unary_entry_clear(entry);
+            wl_columnar_eval_stack_unary_entry_clear(&p->work.original);
+            wl_columnar_eval_stack_unary_entry_clear(&f->unary_snapshot);
+            p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR;
+        } else p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_INIT;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_INIT: {
+        int rc = wl_columnar_eval_stack_unary_scalar_initialize(f,
+                p->work.original.rel, false, funding, id);
+        if (!rc && f->unary_scalar_started && !f->unary_scalar_init_target)
+            p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE;
+        return rc;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE: {
+        int rc = wl_columnar_relation_scalar_retirement_prepare_finite(s,
+                funding, id);
+        if (!rc &&
+            s->ready) p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT;
+        return rc;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT: {
+        eval_entry_t *entry =
+            f->unary_committed ? &f->unary_retired : &f->unary_output;
+        if (!wl_columnar_eval_stack_prepared_entry_equal(entry,
+            &p->work.original))
+            return EINVAL;
+        int rc = wl_columnar_relation_scalar_retirement_ready_validate(s,
+                entry->rel, p->work.old_snapshot);
+        if (rc) return rc;
+        rc = wl_columnar_relation_scalar_retirement_commit(s);
+        if (rc) return rc;
+        /* Real destruction authority has moved, but no physical free occurs
+         * until a later funded action. Keep only immutable control binding. */
+        wl_columnar_eval_stack_unary_entry_clear(entry);
+        wl_columnar_eval_stack_unary_entry_clear(&p->work.original);
+        wl_columnar_eval_stack_unary_entry_clear(&p->work.output);
+        wl_columnar_eval_stack_unary_entry_clear(&f->unary_snapshot);
+        f->unary_scalar_committed = true;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DISPOSE;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DISPOSE: {
+        int rc = s->phase == 12
+            ? wl_columnar_relation_scalar_retirement_ledger_step_finite(s,
+                funding, id)
+            : wl_columnar_relation_scalar_retirement_step(s, funding, id);
+        if (!rc &&
+            s->storage.phase == WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE)
+            p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR;
+        return rc;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR:
+        if (f->unary_scalar_init_target || f->unary_scalar_initializer.identity
+            || (f->unary_scalar_started
+            && s->storage.phase !=
+            WL_COLUMNAR_RELATION_MANAGED_RETIREMENT_DONE))
+            return EBUSY;
+        memset(s, 0, sizeof(*s));
+        f->unary_scalar_mode = f->unary_scalar_started =
+            f->unary_scalar_prepared = false;
+        f->unary_scalar_committed = f->unary_scalar_for_old = false;
+        f->unary_scalar_cancel_clear = f->unary_scalar_drained = false;
+        f->unary_cleanup_result = 0;
+        f->unary_phase = WL_COLUMNAR_EVAL_STACK_UNARY_DONE;
+        f->filter.semantic_result = p->first_result;
+        f->filter.cleanup_result = 0;
+        f->filter.stage = WL_COLUMNAR_FILTER_STAGE_RESET;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK;
+        return 0;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_INIT: {
+        int rc = f->unary_scalar_initializer.identity
+            ? wl_columnar_relation_scalar_retirement_init_reset(
+            &f->unary_scalar_initializer, f, funding, id) : 0;
+        if (rc) return rc;
+        f->unary_scalar_init_target = NULL;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLAIMS;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLAIMS: {
+        int rc = s->storage.identity
+            ? wl_columnar_relation_scalar_retirement_release_claims_controlled(
+            s, funding, id)
+            : wl_evaluation_control_charge_attempt(funding, id, 256);
+        if (rc) return rc;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR;
+        return 0;
+    }
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR:
+        memset(s, 0, sizeof(*s));
+        f->unary_scalar_started = f->unary_scalar_prepared =
+            f->unary_scalar_committed = false;
+        f->unary_scalar_for_old = f->unary_scalar_cancel_clear =
+            f->unary_scalar_drained = false;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_RESTORE;
+        return 0;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_RESTORE:
+        f->filter.private_output = p->work.output.rel;
+        f->unary_scalar_mode = false;
+        f->unary_phase =
+            f->unary_committed ? WL_COLUMNAR_EVAL_STACK_UNARY_COMMITTED
+            : WL_COLUMNAR_EVAL_STACK_UNARY_ACTIVE;
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK;
+        return 0;
+    case WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK:
+        memset(&p->work, 0, sizeof(p->work));
+        p->phase = WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY;
+        return 0;
+    default: return EINVAL;
+    }
+}
+
+int
+wl_columnar_eval_stack_unary_prepared_join_finish_step(
+    wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_eval_stack_prepared_validate(p);
+    if (rc) return rc;
+    if (p->phase < WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD
+        || p->phase >
+        WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_RESTORE) return EBUSY;
+    rc = wl_columnar_eval_stack_prepared_funding_check(p, funding, id);
+    if (rc) return rc;
+    p->busy = true; wl_columnar_eval_stack_prepared_checkpoint(p);
+    rc = wl_evaluation_control_charge_attempt(funding, id,
+            wl_columnar_eval_stack_prepared_finish_fee(p));
+    if (!rc) rc = wl_columnar_eval_stack_prepared_finish_body(p, funding, id);
+    if (rc && rc != EAGAIN
+        && (p->disposition != WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINED
+        || !p->cleanup_result)) p->cleanup_result = rc;
+    else if (!rc &&
+        p->disposition != WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINED)
+        p->cleanup_result = 0;
+    p->busy = false; return rc;
+}
+
+int
+wl_columnar_eval_stack_unary_prepared_join_finish_decline(
+    wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    int rc = wl_columnar_eval_stack_prepared_validate(p);
+    if (rc) return rc;
+    if (p->phase < WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD
+        || p->phase > WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT
+        || p->frame->unary_scalar_committed) return EBUSY;
+    rc = wl_columnar_eval_stack_prepared_funding_check(p, funding, id);
+    if (rc) return rc;
+    p->busy = true; wl_columnar_eval_stack_prepared_checkpoint(p);
+    rc = wl_evaluation_control_charge_attempt(funding, id, 128);
+    if (!rc) {
+        p->disposition = WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINED;
+        p->phase =
+            !p->join_mode ? WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK
+            : WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_INIT;
+    }
+    p->busy = false; return rc;
 }
 
 int

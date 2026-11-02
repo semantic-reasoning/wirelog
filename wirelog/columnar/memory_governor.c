@@ -3163,6 +3163,10 @@ wl_columnar_memory_retirement_step(
         wl_columnar_memory_governor_test_before_total_cas(control,
             receipt->captured_governor, old, false);
 #endif
+    /* The actual credit checkpoint may finish/reset the cleanup attempt.
+     * Reject its saved generation before touching credit or the successor. */
+    rc = wl_evaluation_control_charge_attempt(control, expected_attempt_id, 0);
+    if (rc) return rc;
     if (!atomic_compare_exchange_strong_explicit(
             &receipt->captured_governor->reserved_bytes, &old, desired,
             memory_order_release, memory_order_relaxed))

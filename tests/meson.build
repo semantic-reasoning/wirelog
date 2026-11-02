@@ -6754,7 +6754,8 @@ test_evaluation_numeric_plan_exe = executable(
   include_directories: [wirelog_inc, wirelog_src_inc],
   dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
   c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_COLUMNAR_MEMORY_TEST_HOOKS=1',
-           '-DWL_TEST_RELATION_RESIZE_HOOK=1'],
+           '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+           '-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1'],
   link_with: [testlib_prod_memory_hooks],
 )
 test('evaluation_numeric_plan', test_evaluation_numeric_plan_exe,

@@ -256,6 +256,37 @@ wl_columnar_mem_ledger_publication_acquire_controlled(
     }
 }
 
+/* Finite, cancel-only sibling. The caller immediately applies/releases a
+ * successful claim; failed admission never retries inside this invocation. */
+int
+wl_columnar_mem_ledger_publication_try_acquire_controlled(
+    wl_columnar_mem_ledger_publication_prepared_t *prepared)
+{
+    if (!wl_columnar_mem_ledger_publication_origin(prepared)
+        || prepared->phase != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY
+        || prepared->acquisition_started
+        || prepared->prepaid_initial
+        != WL_COLUMNAR_MEM_LEDGER_PUBLICATION_INITIAL_WORK)
+        return EINVAL;
+    prepared->acquisition_started = true;
+    uint64_t active =
+        wl_evaluation_control_active_attempt_id(prepared->control);
+    if (!active || active != prepared->attempt_id) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(prepared->control,
+            prepared->attempt_id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_ROUND_WORK);
+    if (rc) return rc;
+    rc = wl_columnar_mem_ledger_publication_checkpoint(prepared->control,
+            prepared, prepared->attempt_id,
+            WL_COLUMNAR_MEM_LEDGER_PUBLICATION_PRECAS);
+    if (rc) return rc;
+    uint64_t expected = 0;
+    if (!wl_columnar_mem_ledger_publication_strong(prepared->ledger, &expected))
+        return EAGAIN;
+    prepared->phase = WL_COLUMNAR_MEM_LEDGER_PUBLICATION_HELD;
+    return 0;
+}
+
 int
 wl_columnar_mem_ledger_publication_apply(
     wl_columnar_mem_ledger_publication_prepared_t *prepared)

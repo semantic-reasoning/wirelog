@@ -63,6 +63,10 @@ int wl_columnar_mem_ledger_publication_prepare_controlled(wl_mem_ledger_t *,
  */
 int wl_columnar_mem_ledger_publication_acquire_controlled(
     wl_columnar_mem_ledger_publication_prepared_t *);
+/* Exactly one gate attempt. EAGAIN is cancel-only; success must be followed
+ * immediately by callback-free apply/release on the acquiring thread. */
+int wl_columnar_mem_ledger_publication_try_acquire_controlled(
+    wl_columnar_mem_ledger_publication_prepared_t *);
 /* Finite current-counter updates under original held gate; all validation
  * precedes writes. Count0 still transitions to APPLIED and requires release.
  */
