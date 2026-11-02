@@ -8036,6 +8036,18 @@ typedef struct {
     bool ready, retained, committed;
 } wl_columnar_eval_serial_framed_status_t;
 
+enum { WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK = 384 };
+
+/* Copied observations only. Opaque addresses are comparison tokens, never
+ * mutable frame/context/output loans or transferable ownership. */
+typedef struct {
+    const void *plan, *session, *control, *private_bindings, *capture_out;
+    uint64_t attempt_id, operation_identity;
+    bool capture_only, controlled_materialized_batch_fallback, abort_supported;
+    wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
+    wl_columnar_eval_serial_framed_status_t status;
+} wl_columnar_eval_serial_framed_view_t;
+
 typedef enum {
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE = 0,
     WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS,
@@ -8106,6 +8118,24 @@ struct wl_columnar_eval_serial_framed_host_request {
     wl_columnar_eval_serial_framed_host_reply_t *reply;
 };
 
+/* Serialized caller keeps session/control handles live. Copied outputs must
+ * be external to the whole frame and disjoint from each other. Status keeps
+ * its existing384 fee; the containing host retains its separate384 fee. */
+int wl_columnar_eval_stack_framed_authenticate(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    const wl_columnar_eval_serial_framed_attempt_t *);
+int wl_columnar_eval_stack_framed_inspect(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    wl_columnar_eval_serial_framed_view_t *);
+int wl_columnar_eval_stack_framed_status(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_columnar_eval_serial_framed_status_t *,
+    wl_columnar_eval_cleanup_receipt_key_t *, wl_evaluation_control_t *,
+    uint64_t);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_stack_test_framed_status_checkpoint)(
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *);
+#endif
 int wl_columnar_eval_stack_framed_context(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_columnar_eval_serial_framed_attempt_t **);
