@@ -5511,8 +5511,8 @@ Resident insertion and full-width materialization refuse under that same
 budget. Retaining actual governed input chunks also refuses; releasing those
 owners permits retry without raising the limit. Trace segment/directory storage
 and resident intern storage remain separate from aggregate attempt state.
-Expressions, FLOAT/AVG, recursive/signed/control aggregation remain ineligible. The later global
-COUNT-over-JOIN route has its own admission contract. High distinct-group cardinality can still exhaust the
+Expressions, FLOAT/AVG, recursive/signed/control aggregation remain ineligible. The later streaming
+JOIN-reduction route has its own admission contract. High distinct-group cardinality can still exhaust the
 resident index/result budget.
 
 
@@ -5573,18 +5573,19 @@ The retained control peaks at 253,187,814 bytes. Disk use is 337,187,840 bytes;
 trace owner, nodes, directory and cursor floors are separately 4,304 / 20,480 /
 1,400 / 112 bytes. Values describe this build and fixture rather than universal
 minimum budgets. Intern storage, resident intermediates and high-cardinality
-results remain independent floors. Except for global COUNT below,
+results remain independent floors. Except for the single-JOIN reductions below,
 aggregate-over-JOIN, automatic all-resident composite spilling, weighted composite APIs, SIDE/nested layouts and mutable
 arrangements remain outside this group.
 
 
-### Streaming global COUNT over one cold JOIN (#1372 follow-up)
+### Streaming COUNT and extrema over one cold JOIN (#1372 follow-up)
 
 A serial immutable rule containing exactly one equality JOIN can feed global
-COUNT without retaining the complete joined relation. At least one input must
+COUNT or direct INT64 MIN/MAX without retaining the complete joined relation.
+Both global and grouped forms are supported. At least one input must
 be explicitly sealed or chunk-loaded; existing INT64/STRING composite keys and
 flat INLINE scalar fields keep their full-source provenance requirements.
-Direct post-JOIN MAPs and narrow INT64 literal FILTERs stream into the count.
+Direct post-JOIN MAPs and narrow INT64 literal FILTERs stream into the reduction.
 Physical matching pairs remain distinct even when MAP duplicates lanes. Empty
 or all-filtered streams produce no row, matching resident REDUCE.
 
@@ -5598,7 +5599,48 @@ their existing source-row capacity floor.
 
 Raw pair counts, including filtered-away pairs, retain the existing JOIN cap
 and UINT32_MAX representation ceiling. Peak reporting measures raw pairs,
-not reduced rows. This does not allow arbitrary-budget completion. Grouped
-aggregation, extrema, SUM, FLOAT/AVG and multiple JOINs in a reduction rule
-remain outside this increment. In particular, checked SUM overflow depends on
+not reduced rows. This does not allow arbitrary-budget completion. SUM,
+FLOAT/AVG and multiple JOINs in a reduction rule remain outside this group. In particular, checked SUM overflow depends on
 input order and is not interchangeable with bounded window traversal.
+
+Group keys are direct INT64/STRING lanes, including validated scalar INLINE
+fields, and every key participates in equality. Output positions and types
+match resident REDUCE. MIN/MAX initialize from the first surviving operand,
+including INT64_MIN/MAX; empty/all-filtered input never emits a zero sentinel.
+A declared but absent right EDB contributes its schema to validation and an
+empty result, without constructing a fake relation. Existing non-reducing
+JOIN missing-right typing is unchanged.
+
+Before each batch, the private reducer admits index and result capacity for
+current logical groups plus that batch's maximum possible new groups. Capacity
+is reused rather than enlarged from cumulative pair counts. The index begins
+with eight buckets, maintains half occupancy, and admits old and new tables
+together during rehash. This conservative group-plus-batch floor can refuse
+where exact per-batch deduplication would fit; it is not an exact-distinct-only
+memory promise. Mapping, tuple, type and mutation-lease state are also charged.
+Append allocates no storage; an unexpected partial-update failure poisons and
+discards the entire private attempt. A failed batch is never replayed into
+partly updated groups. Tests cover late reserve/read/update failures and fresh
+retry, collisions, type/position preservation and high-cardinality refusal.
+
+The dedicated public experiment uses two 512-row, 65-lane cold inputs and a
+16,640-byte reusable host chunk. The generated JOIN retains 130 physical lanes
+(no JOIN projection): 262,144 physical matching pairs would require 272,629,760
+raw lane bytes (260 MiB), before relation overhead. Under the unchanged public
+256 MiB budget, four exact COUNT groups complete. An internal test-only control
+uses the identical producer/projection with the existing governed materializing
+spill drain and refuses with ENOSPC. After complete private cleanup, streaming
+succeeds under that same limit; this measures removal of the JOIN intermediate
+floor, not merely source ingestion.
+
+With a 16 KiB batch cap and a 1 KiB index cap, 256 and 512 rows per input
+(65,536 and 262,144 pairs) both add 49,828 reserved bytes at peak in this build.
+The final group index is 1,024 bytes, group relation ownership 1,675 bytes,
+and reducer/mapping workspace 808 bytes in both cases (the peak also includes
+producer/readers and temporary growth). Source baselines are separately
+134,708,009 and 134,724,201 bytes; owned spill
+usage is 283,200 and 566,400 bytes. Both inputs saturate the same bounded index
+window. These measurements are fixture/build-specific; intern storage,
+pre-JOIN prefixes, reader/key state, distinct groups and final output remain
+independent governed floors. Dedicated default/unit/TSan budget registrations
+run serially outside the duplicated regular/environment tests.

@@ -1702,19 +1702,41 @@ wl_columnar_join_cold_shape(const wl_plan_op_t *op,
     return true;
 }
 
+/* Reduction schema auditing may use a declared but absent right EDB. It
+* supplies types only, never a fabricated relation or any readable rows.
+* Legacy JOIN suffixes retain their missing-right fallback semantics. */
+static wl_columnar_join_source_t
+wl_columnar_join_audit_source(const wl_col_session_t *s, const char *name,
+    bool declared)
+{
+    wl_columnar_join_source_t source = wl_columnar_join_source(s, name, NULL);
+    if (declared && !source.cold && !source.resident) {
+        source.types = wl_columnar_session_cold_declared_types(s, name,
+                &source.width);
+        source.virtual_auto = source.width && source.types;
+        for (uint32_t i = 0; source.types && i < source.width; i++)
+            if (source.types[i] < WIRELOG_TYPE_INT32 ||
+                source.types[i] > WIRELOG_TYPE_BOOL ||
+                (source.types[i] == WIRELOG_TYPE_STRING && !source.intern))
+                source.schema_valid = false;
+    }
+    return source;
+}
+
 /* The extended scan route audits actual stage schemas, not just widths. These
  * iterative queries use constant audit memory; every preceding stage has
  * already been checked before its result is queried. */
 static bool
 wl_columnar_join_scan_width(const wl_col_session_t *s,
-    const wl_plan_relation_t *rp, uint32_t end, uint32_t *out)
+    const wl_plan_relation_t *rp, uint32_t end, uint32_t *out, bool declared)
 {
     uint64_t width = wl_columnar_join_source(s, rp->ops[0].relation_name,
             NULL).width;
     for (uint32_t i = 1; i < end; i++) {
         const wl_plan_op_t *op = &rp->ops[i];
         if (op->op == WL_PLAN_OP_JOIN) {
-            width += wl_columnar_join_source(s, op->right_relation, NULL).width;
+            width += wl_columnar_join_audit_source(s, op->right_relation,
+                    declared).width;
             if (width > UINT32_MAX) return false;
             if (op->project_count) width = op->project_count;
         } else if (op->op == WL_PLAN_OP_MAP) width = op->project_count;
@@ -1726,20 +1748,22 @@ wl_columnar_join_scan_width(const wl_col_session_t *s,
 static bool
 wl_columnar_join_scan_type(const wl_col_session_t *s,
     const wl_plan_relation_t *rp, uint32_t end, uint32_t column,
-    wirelog_column_type_t *type)
+    wirelog_column_type_t *type, bool declared)
 {
     uint32_t width;
-    if (!wl_columnar_join_scan_width(s, rp, end, &width) || column >= width)
+    if (!wl_columnar_join_scan_width(s, rp, end, &width,
+        declared) || column >= width)
         return false;
     for (uint32_t i = end; i > 1; ) {
         const wl_plan_op_t *op = &rp->ops[--i];
         if (op->op == WL_PLAN_OP_MAP) column = op->project_indices[column];
         else if (op->op == WL_PLAN_OP_JOIN) {
             if (op->project_count) column = op->project_indices[column];
-            if (!wl_columnar_join_scan_width(s, rp, i, &width)) return false;
+            if (!wl_columnar_join_scan_width(s, rp, i, &width,
+                declared)) return false;
             if (column < width) continue;
-            wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
-                    op->right_relation, NULL);
+            wl_columnar_join_source_t rhs = wl_columnar_join_audit_source(s,
+                    op->right_relation, declared);
             column -= width;
             if (column >= rhs.width) {
                 /* Ordinary missing-right JOIN produces no rows and assigns
@@ -1805,7 +1829,8 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
             op->delta_mode != WL_DELTA_FORCE_FULL))
             return false;
         uint32_t width;
-        if (!wl_columnar_join_scan_width(s, rp, i, &width)) return false;
+        if (!wl_columnar_join_scan_width(s, rp, i, &width,
+            reduction)) return false;
         if (op->op == WL_PLAN_OP_MAP) {
             if (op->right_relation || !op->project_count ||
                 !op->project_indices)
@@ -1813,7 +1838,7 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
             for (uint32_t c = 0; c < op->project_count; c++) {
                 wirelog_column_type_t type;
                 if (!wl_columnar_join_scan_type(s, rp, i,
-                    op->project_indices[c], &type) ||
+                    op->project_indices[c], &type, reduction) ||
                     !wl_columnar_eval_plan_cold_map_lane(op, c, width,
                     type)) return false;
             }
@@ -1823,26 +1848,29 @@ wl_columnar_join_cold_suffix(const wl_col_session_t *s,
             if (op->right_relation ||
                 !wl_columnar_eval_plan_cold_predicate_decode(op, width, NULL,
                 &predicate) || !wl_columnar_join_scan_type(s, rp, i,
-                predicate.column, &type) || type != WIRELOG_TYPE_INT64)
+                predicate.column, &type,
+                reduction) || type != WIRELOG_TYPE_INT64)
                 return false;
         } else if (op->op == WL_PLAN_OP_JOIN) {
             if (!wl_columnar_join_cold_key_names(op) || !op->right_relation ||
                 (op->project_count && !op->project_indices)) return false;
-            wl_columnar_join_source_t rhs = wl_columnar_join_source(s,
-                    op->right_relation, NULL);
+            wl_columnar_join_source_t rhs = wl_columnar_join_audit_source(s,
+                    op->right_relation, reduction);
             if (!rhs.schema_valid) return false;
             bool present = rhs.cold || rhs.resident;
             for (uint32_t k = 0; k < op->key_count; k++) {
                 uint32_t key = wl_columnar_join_scan_key(s, rp, i, width,
                         op->left_keys ? op->left_keys[k] : NULL);
                 wirelog_column_type_t type;
-                if (!wl_columnar_join_scan_type(s, rp, i, key, &type) ||
+                if (!wl_columnar_join_scan_type(s, rp, i, key, &type,
+                    reduction) ||
                     (type != WIRELOG_TYPE_INT64 &&
                     type != WIRELOG_TYPE_STRING)) return false;
-                if (!present) continue;
+                if (!present && !(reduction && rhs.width)) continue;
                 uint32_t right_key = wl_columnar_join_source_key(&rhs,
                         op->right_keys ? op->right_keys[k] : NULL);
-                if (!wl_columnar_join_source_valid(&rhs, right_key) ||
+                if ((present ? !wl_columnar_join_source_valid(&rhs, right_key) :
+                    right_key >= rhs.width) ||
                     type !=
                     (rhs.types ? rhs.types[right_key] :
                     WIRELOG_TYPE_INT64)) return false;
@@ -1893,14 +1921,36 @@ wl_columnar_join_aggregate_decode(const wl_col_session_t *s,
     if (!wl_columnar_join_cold_suffix(s, rp, first, true)) return false;
     const wl_plan_op_t *reduce = &rp->ops[reduce_index];
     if (reduce->op != WL_PLAN_OP_REDUCE ||
-        reduce->agg_fn != WIRELOG_AGG_COUNT || reduce->group_by_count ||
-        reduce->group_by_indices || reduce->aggregate_index ||
+        (reduce->agg_fn != WIRELOG_AGG_COUNT &&
+        reduce->agg_fn != WIRELOG_AGG_MIN &&
+        reduce->agg_fn != WIRELOG_AGG_MAX) ||
+        reduce->group_by_count == UINT32_MAX ||
+        (reduce->group_by_count && !reduce->group_by_indices) ||
+        (!reduce->group_by_count && reduce->group_by_indices) ||
+        reduce->aggregate_index > reduce->group_by_count ||
         reduce->agg_result_type != WL_PLAN_AGG_OPERAND_SCALAR) return false;
-    uint32_t width;
-    if (!wl_columnar_join_scan_width(s, rp, reduce_index, &width)) return false;
+    uint32_t width, operand = 0;
+    if (!wl_columnar_join_scan_width(s, rp, reduce_index, &width,
+        true)) return false;
+    for (uint32_t i = 0; i < reduce->group_by_count; i++) {
+        wirelog_column_type_t type;
+        if (!wl_columnar_join_scan_type(s, rp, reduce_index,
+            reduce->group_by_indices[i], &type, true) ||
+            (type != WIRELOG_TYPE_INT64 && type != WIRELOG_TYPE_STRING))
+            return false;
+    }
     if ((reduce->agg_expr.data || reduce->agg_expr.size) &&
         !wl_columnar_eval_plan_aggregate_column(&reduce->agg_expr, width,
-        NULL)) return false;
+        &operand)) return false;
+    if (reduce->agg_fn != WIRELOG_AGG_COUNT) {
+        wirelog_column_type_t type;
+        if (!reduce->agg_expr.data || !reduce->agg_expr.size ||
+            reduce->agg_expr.data[0] != WL_PLAN_EXPR_VAR ||
+            reduce->agg_operand_type != WL_PLAN_AGG_OPERAND_SCALAR ||
+            !wl_columnar_join_scan_type(s, rp, reduce_index, operand, &type,
+            true) ||
+            type != WIRELOG_TYPE_INT64) return false;
+    }
     if (join_index) *join_index = first;
     return true;
 }
@@ -1994,7 +2044,8 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
 #endif
     wl_columnar_join_source_t sources[2] = {
         wl_columnar_join_source(sess, cold_left, left->rel),
-        wl_columnar_join_source(sess, op->right_relation, NULL)
+        wl_columnar_join_audit_source(sess, op->right_relation,
+            aggregate != NULL)
     };
     int rc = wl_columnar_session_cold_execution_check(sess);
     if (rc || left->is_delta || !wl_columnar_join_cold_shape(op, &sources[0],
@@ -2009,7 +2060,8 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
     if (!wl_columnar_join_source_valid(&sources[0], lk))
         return wl_columnar_join_dispose_left(stack, left, ENOTSUP);
     bool missing_right = !sources[1].cold && !sources[1].resident;
-    uint32_t joined = sources[0].width + (missing_right ? 0 : sources[1].width);
+    uint32_t joined = sources[0].width + (missing_right &&
+        !aggregate ? 0 : sources[1].width);
     bool projected = op->project_count && op->project_indices;
     uint32_t width = projected ? op->project_count : joined;
     uint64_t type_bytes = (uint64_t)width * sizeof(wirelog_column_type_t);
@@ -2149,6 +2201,19 @@ wl_columnar_join_cold_run(wl_col_session_t *sess, const wl_plan_op_t *op,
         wl_columnar_join_test_spill_producer_result(status);
 #endif
     rc = wl_columnar_join_spill_error(sess, status);
+#ifdef WL_SESSION_TEST_HOOKS
+    /* The causal control uses this exact producer, projection and native
+     * spill drain (including PROGRESS), retaining real governed pair rows. */
+    extern bool wl_columnar_ops_test_join_reduce_materialize;
+    if (!rc && aggregate && wl_columnar_ops_test_join_reduce_materialize) {
+        rc = wl_columnar_relation_new_named_governed("$control", width,
+                NULL, 0, false, sess->memory_governor, &out);
+        if (!rc) rc = col_rel_set_column_types(out, types, width);
+        if (!rc) rc = wl_columnar_join_spill_drain(sess, cont, out);
+        if (!rc) rc = ENOTSUP; /* This test control never publishes a reduction. */
+        goto done;
+    }
+#endif
     if (!rc) rc = aggregate ? wl_columnar_ops_join_aggregate(aggregate,
                 join_index, cont, sess, width, types, &out) :
             wl_columnar_join_spill_drain(sess, cont, out);
