@@ -4,9 +4,9 @@
  * Copyright (C) CleverPlant
  * Licensed under LGPL-3.0
  *
- * Payloads are fake pointers; the channel never dereferences them.  Every
- * wait is condition based: helpers wait on channel stats with a deadline,
- * and an expired deadline fails the test instead of hanging it.
+ * Payloads are fake pointers; the channel never dereferences them.  Waits
+ * for a channel state go through a helper that fails after a quiet period
+ * instead of hanging; pump and thread joins rely on the meson timeout.
  */
 #include "../wirelog/columnar/tdd_channel.h"
 #include "../wirelog/thread.h"
@@ -667,9 +667,27 @@ test_advisory_governor(void)
     REQUIRE(wl_tdd_channel_destroy(ch) == 0);
 }
 
+static void
+test_footprint(void)
+{
+    uint64_t one = 0, two = 0, eight = 0;
+    check(wl_tdd_channel_footprint(1, &one) == 0 && one > 0,
+        "one lane has a footprint");
+    check(wl_tdd_channel_footprint(2, &two) == 0 && two > one,
+        "a second lane adds bytes");
+    check(wl_tdd_channel_footprint(8, &eight) == 0
+        && eight - one == 7u * (two - one),
+        "each lane adds one lane record");
+    check(wl_tdd_channel_footprint(0, &one) == EINVAL,
+        "zero lanes are refused");
+    check(wl_tdd_channel_footprint(1, NULL) == EINVAL,
+        "a NULL result is refused");
+}
+
 int
 main(void)
 {
+    test_footprint();
     test_multi_batch_order();
     test_empty_is_not_complete();
     test_orphan_reclaim();

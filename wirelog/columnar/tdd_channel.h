@@ -62,10 +62,11 @@ typedef enum {
  * A batch descriptor.  It is heap allocated with a stable address and is its
  * own list node.  The channel sets worker, stratum, round, seq, charge and
  * state, batch_new sets kind to RESIDENT, the producer sets rel_idx and may
- * set flags before publish, and publish attaches payload and rows.  The
- * channel links queued batches through next; once the consumer has taken a
- * batch, next is the consumer's (for its own lists), and it may rewrite
- * payload, kind, charge and flags (for example after spilling).
+ * set flags before publish, and publish attaches payload and rows.  next
+ * belongs to the channel from batch_new until the batch is taken (it links
+ * the lane's unpublished descriptors, then the queue); once the consumer
+ * has taken a batch, next is the consumer's (for its own lists), and it may
+ * rewrite payload, kind, charge and flags (for example after spilling).
  */
 typedef struct wl_tdd_batch {
     struct wl_tdd_batch *next;
@@ -125,6 +126,12 @@ typedef struct {
 wl_tdd_channel_t *
 wl_tdd_channel_create(uint32_t lanes, uint64_t cap_bytes,
     wl_columnar_memory_governor_t *governor, const void *consumer_owner);
+
+/* The bytes wl_tdd_channel_create() allocates for @lanes lanes: the channel
+ * object and its lane array.  Returns 0, or EINVAL for zero lanes or a NULL
+ * @bytes. */
+int
+wl_tdd_channel_footprint(uint32_t lanes, uint64_t *bytes);
 
 /* Free the channel.  Returns EBUSY, and frees nothing, while a lane is open,
  * a batch is queued or reserved, or a taken batch has not been retired; 0

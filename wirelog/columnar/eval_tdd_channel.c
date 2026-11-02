@@ -6,9 +6,10 @@
  * Licensed under LGPL-3.0
  * For commercial licenses, contact: inquiry@cleverplant.com
  *
- * See eval_tdd_channel.h.  Everything here runs on the coordinator thread
- * and touches only CONSUMER descriptors, so no channel lock is taken except
- * inside wl_tdd_channel_retire().
+ * See eval_tdd_channel.h.  The producer helpers run on a worker's thread
+ * and touch only that lane's PRODUCER descriptors; everything else runs on
+ * the coordinator thread and touches only CONSUMER descriptors.  Channel
+ * state is reached only through the tdd_channel.h calls, which lock.
  */
 #include "columnar/eval_tdd_channel.h"
 
@@ -209,6 +210,9 @@ wl_columnar_eval_tdd_discard_sink(void *ctx, wl_tdd_batch_t *batch)
         return;
     if (!discard)
         abort();
+    if (discard->ledger)
+        wl_mem_ledger_free(discard->ledger, WL_MEM_SUBSYS_CHANNEL,
+            batch->charge);
     batch->next = NULL;
     tdd_batch_dispose(discard->channel, batch, &discard->refusal);
 }
@@ -386,4 +390,367 @@ wl_columnar_eval_tdd_coalesce_slot(wl_col_session_t *coord,
     }
     *out_slot = slot;
     return 0;
+}
+
+/* The bytes a delta charges against the channel: its transport bytes,
+ * which a stamped non-empty delta keeps above zero.  EOVERFLOW when they
+ * cannot be represented. */
+static int
+tdd_delta_charge(const col_rel_t *delta, uint64_t *charge)
+{
+    *charge = col_rel_transport_bytes(delta);
+    return *charge == UINT64_MAX ? EOVERFLOW : 0;
+}
+
+int
+wl_columnar_eval_tdd_channel_reserve_delta(wl_col_session_t *sess,
+    uint32_t rel_idx, const col_rel_t *delta, wl_tdd_batch_t **out)
+{
+    if (!out)
+        return EINVAL;
+    *out = NULL;
+    if (!sess || !delta || !sess->coordinator
+        || !sess->coordinator->tdd_channel)
+        return EINVAL;
+    wl_tdd_channel_t *ch = sess->coordinator->tdd_channel;
+    wl_tdd_batch_t *batch = NULL;
+    uint64_t charge = 0;
+    int rc = tdd_delta_charge(delta, &charge);
+    if (rc == 0)
+        rc = wl_tdd_channel_batch_new(ch, sess->worker_id, rel_idx, sess,
+                &batch);
+    if (rc == 0) {
+        rc = wl_tdd_channel_reserve(ch, batch, charge);
+        if (rc != 0)
+            wl_tdd_channel_batch_abandon(ch, batch);
+    }
+    if (rc == ENOSPC)
+        sess->memory_budget_denied = true;
+    if (rc == 0)
+        *out = batch;
+    return rc;
+}
+
+/* Charge the CHANNEL ledger with @batch's reserved bytes, then queue
+ * @delta on it.  The credit comes first so the consumer's free, which
+ * follows its take, never runs ahead of it. */
+static void
+tdd_channel_publish_one(wl_col_session_t *coord, wl_tdd_batch_t *batch,
+    col_rel_t *delta)
+{
+    wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+        batch->charge);
+    wl_tdd_channel_publish(coord->tdd_channel, batch, delta, delta->nrows);
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+uint32_t (*wl_columnar_eval_test_channel_split)(wl_col_session_t *worker,
+    uint32_t rel_idx, uint32_t rows, bool *overlap);
+
+/* Copy rows [@from, @to) of @src, with their timestamps, into a new
+ * relation governed like the worker's deltas. */
+static int
+tdd_test_split_part(wl_col_session_t *sess, const col_rel_t *src,
+    uint32_t from, uint32_t to, col_rel_t **out)
+{
+    col_rel_t *part = NULL;
+    int64_t *row = NULL;
+    col_rel_append_batch_t append;
+    bool appending = false;
+    memset(&append, 0, sizeof(append));
+    int rc = wl_columnar_relation_new_like_governed_checked(&part, src->name,
+            src, sess->memory_governor);
+    if (rc == 0)
+        rc = col_rel_enable_timestamps(part);
+    if (rc == 0) {
+        row = calloc(src->ncols ? src->ncols : 1u, sizeof(*row));
+        if (!row)
+            rc = ENOMEM;
+    }
+    if (rc == 0) {
+        rc = col_rel_append_batch_begin(&append, part);
+        appending = rc == 0;
+    }
+    for (uint32_t r = from; rc == 0 && r < to; r++) {
+        for (uint32_t c = 0; c < src->ncols; c++)
+            row[c] = col_rel_get(src, r, c);
+        rc = col_rel_append_batch_row(&append, row);
+        /* The append zeroed this row's timestamp; this thread holds the
+         * new relation's writer for the whole batch. */
+        if (rc == 0)
+            part->timestamps[part->nrows - 1] = src->timestamps[r];
+    }
+    if (appending) {
+        int ended = col_rel_append_batch_end(&append, rc == 0);
+        if (ended != 0 && rc == 0)
+            rc = ended;
+    }
+    free(row);
+    if (rc != 0) {
+        col_rel_destroy(part);
+        return rc;
+    }
+    *out = part;
+    return 0;
+}
+
+/* The first row of part @j when @rows rows are split into @parts parts. */
+static uint32_t
+tdd_test_split_bound(uint32_t rows, uint32_t parts, uint32_t j)
+{
+    return (uint32_t)(((uint64_t)rows * j) / parts);
+}
+
+/* Publish @delta as @parts batches: @batch carries the first range, the
+ * others get descriptors of their own.  See
+ * wl_columnar_eval_tdd_channel_publish_reserved(). */
+static int
+tdd_test_publish_split(wl_col_session_t *sess, wl_tdd_batch_t *batch,
+    col_rel_t *delta, uint32_t parts, bool overlap)
+{
+    wl_col_session_t *coord = sess->coordinator;
+    wl_tdd_channel_t *ch = coord->tdd_channel;
+    col_rel_t *part[WL_TDD_CHANNEL_TEST_SPLIT_MAX] = { NULL };
+    wl_tdd_batch_t *desc[WL_TDD_CHANNEL_TEST_SPLIT_MAX] = { NULL };
+    uint32_t rows = delta->nrows;
+    if (parts > WL_TDD_CHANNEL_TEST_SPLIT_MAX)
+        parts = WL_TDD_CHANNEL_TEST_SPLIT_MAX;
+    if (parts > rows)
+        parts = rows;
+    if (parts < 2 || !delta->timestamps) {
+        tdd_channel_publish_one(coord, batch, delta);
+        return 0;
+    }
+    int rc = 0;
+    for (uint32_t j = 1; rc == 0 && j < parts; j++) {
+        uint32_t from = tdd_test_split_bound(rows, parts, j);
+        uint32_t to = tdd_test_split_bound(rows, parts, j + 1);
+        if (overlap)
+            from--;
+        rc = tdd_test_split_part(sess, delta, from, to, &part[j]);
+        if (rc == 0)
+            rc = wl_tdd_channel_batch_new(ch, batch->worker, batch->rel_idx,
+                    sess, &desc[j]);
+    }
+    if (rc != 0) {
+        /* The split could not be prepared: publish the delta whole. */
+        for (uint32_t j = 1; j < parts; j++) {
+            if (desc[j])
+                wl_tdd_channel_batch_abandon(ch, desc[j]);
+            col_rel_destroy(part[j]);
+        }
+        tdd_channel_publish_one(coord, batch, delta);
+        return 0;
+    }
+    /* @delta keeps the first range; @batch's reservation was sized for the
+     * whole delta and is charged as reserved. */
+    uint32_t keep = tdd_test_split_bound(rows, parts, 1);
+    delta->nrows = keep;
+    if (delta->sorted_nrows > keep)
+        delta->sorted_nrows = keep;
+    wl_columnar_relation_touch_view(delta);
+    tdd_channel_publish_one(coord, batch, delta);
+    for (uint32_t j = 1; j < parts; j++) {
+        uint64_t charge = 0;
+        if (rc == 0)
+            rc = tdd_delta_charge(part[j], &charge);
+        if (rc == 0)
+            rc = wl_tdd_channel_reserve(ch, desc[j], charge);
+        if (rc == 0) {
+            tdd_channel_publish_one(coord, desc[j], part[j]);
+            continue;
+        }
+        wl_tdd_channel_batch_abandon(ch, desc[j]);
+        col_rel_destroy(part[j]);
+    }
+    return rc;
+}
+#endif
+
+int
+wl_columnar_eval_tdd_channel_publish_reserved(wl_col_session_t *sess,
+    wl_tdd_batch_t *batch, col_rel_t *delta)
+{
+    if (!sess || !batch || !delta || !sess->coordinator
+        || !sess->coordinator->tdd_channel)
+        abort();
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_channel_split) {
+        bool overlap = false;
+        uint32_t parts = wl_columnar_eval_test_channel_split(sess,
+                batch->rel_idx, delta->nrows, &overlap);
+        if (parts >= 2)
+            return tdd_test_publish_split(sess, batch, delta, parts, overlap);
+    }
+#endif
+    tdd_channel_publish_one(sess->coordinator, batch, delta);
+    return 0;
+}
+
+int
+wl_columnar_eval_tdd_channel_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
+    wl_col_session_t *sess, col_rel_t **candidate, uint32_t rel_idx,
+    uint32_t eff_iter)
+{
+    if (!ctx || !sess || !candidate || !*candidate)
+        return EINVAL;
+    col_rel_t *delta = *candidate;
+    if (delta->nrows == 0) {
+        int rc = col_rel_destroy_checked(delta);
+        if (rc == 0)
+            *candidate = NULL;
+        return rc;
+    }
+
+    /* The producer admitted the whole timestamp image before this call. */
+    if (!delta->timestamps || delta->timestamp_capacity < delta->nrows)
+        return EINVAL;
+    wl_columnar_source_access_writer_t writer = { 0 };
+    int rc = col_rel_source_writer_acquire(delta, &writer);
+    if (rc != 0)
+        return rc;
+    if (col_rel_storage_alias_borrow_count(delta) != 0) {
+        rc = EBUSY;
+    } else {
+        for (uint32_t ti = 0; ti < delta->nrows; ti++) {
+            delta->timestamps[ti].iteration = eff_iter;
+            delta->timestamps[ti].stratum = ctx->stratum_idx;
+            delta->timestamps[ti].worker = (uint16_t)sess->worker_id;
+            delta->timestamps[ti].multiplicity = 1;
+        }
+        wl_columnar_relation_touch_storage(delta);
+    }
+    /* The writer is released before publication (#1373): once queued, the
+     * payload belongs to the consumer, whose spill needs the relation free
+     * of leases.  If the release fails, the candidate is still the
+     * caller's. */
+    int release_rc = wl_columnar_source_access_writer_release(&writer);
+    if (rc != 0)
+        return rc;
+    if (release_rc != 0)
+        return release_rc;
+
+    wl_col_session_t *coord = sess->coordinator;
+    if (coord && coord->tdd_channel) {
+        wl_tdd_batch_t *batch = NULL;
+        rc = wl_columnar_eval_tdd_channel_reserve_delta(sess, rel_idx, delta,
+                &batch);
+        if (rc != 0)
+            return rc;
+        *candidate = NULL;
+        return wl_columnar_eval_tdd_channel_publish_reserved(sess, batch,
+                   delta);
+    }
+    if (ctx->delta_rels[rel_idx])
+        return EBUSY;
+    ctx->delta_rels[rel_idx] = delta;
+    *candidate = NULL;
+    return 0;
+}
+
+/* The channel's error after a cancelled round, ECANCELED when it has none. */
+static int
+tdd_channel_cancel_rc(wl_tdd_channel_t *ch)
+{
+    wl_tdd_channel_stats_t stats;
+    wl_tdd_channel_stats(ch, &stats);
+    return stats.channel_rc != 0 ? stats.channel_rc : ECANCELED;
+}
+
+int
+wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
+    wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
+    uint32_t nrels, const wl_tdd_refusal_sink_t *sink, uint64_t *rows)
+{
+    if (!ch || !lists || nworkers == 0 || !sink || !sink->fn)
+        return EINVAL;
+    int rc = 0;
+    for (;;) {
+        wl_tdd_batch_t *batch = NULL;
+        int err = 0;
+        wl_tdd_pump_result_t result = wl_tdd_channel_pump(ch, &batch, &err);
+        if (result == WL_TDD_PUMP_COMPLETE) {
+            /* An orphan reclaimed on a lane that returned 0 leaves its
+             * EPROTO on the channel; a completed round must report it. */
+            wl_tdd_channel_stats_t stats;
+            wl_tdd_channel_stats(ch, &stats);
+            return rc != 0 ? rc : stats.channel_rc;
+        }
+        if (result == WL_TDD_PUMP_CANCELLED)
+            return rc != 0 ? rc : tdd_channel_cancel_rc(ch);
+        if (result != WL_TDD_PUMP_DATA)
+            return rc != 0 ? rc : (err != 0 ? err : EPROTO);
+        if (ledger)
+            wl_mem_ledger_free(ledger, WL_MEM_SUBSYS_CHANNEL, batch->charge);
+        if (batch->rel_idx >= nrels || batch->worker >= nworkers) {
+            wl_columnar_eval_tdd_batch_discard(ch, batch, sink);
+            if (rc == 0)
+                rc = EPROTO;
+            continue;
+        }
+        if (rows)
+            *rows += batch->rows;
+        size_t index = (size_t)batch->rel_idx * nworkers + batch->worker;
+        batch->next = lists[index];
+        lists[index] = batch;
+    }
+}
+
+/* Reverse an intrusive list in place. */
+static void
+tdd_list_reverse(wl_tdd_batch_t **list)
+{
+    wl_tdd_batch_t *reversed = NULL;
+    wl_tdd_batch_t *batch = *list;
+    while (batch) {
+        wl_tdd_batch_t *next = batch->next;
+        batch->next = reversed;
+        reversed = batch;
+        batch = next;
+    }
+    *list = reversed;
+}
+
+int
+wl_columnar_eval_tdd_channel_coalesce_all(wl_col_session_t *coord,
+    wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
+    col_eval_tdd_worker_ctx_t *ctxs, uint32_t nworkers, uint32_t nrels,
+    const wl_tdd_refusal_sink_t *sink)
+{
+    if (!coord || !ch || !lists || !ctxs || !sink || !sink->fn)
+        return EINVAL;
+    int rc = 0;
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        for (uint32_t w = 0; w < nworkers; w++) {
+            wl_tdd_batch_t **list = &lists[(size_t)ri * nworkers + w];
+            if (!*list)
+                continue;
+            if (rc == 0 && ctxs[w].delta_rels[ri])
+                rc = EPROTO;
+            if (rc != 0) {
+                wl_columnar_eval_tdd_discard_list(ch, list, sink);
+                continue;
+            }
+            /* Collect pushed newest first; coalesce wants seq order. */
+            tdd_list_reverse(list);
+            const char *name = ctxs[w].sp
+                ? ctxs[w].sp->relations[ri].delta_name : NULL;
+            rc = wl_columnar_eval_tdd_coalesce_slot(coord, ch, list, nworkers,
+                    name, sink, &ctxs[w].delta_rels[ri]);
+            if (rc != 0)
+                wl_columnar_eval_tdd_discard_list(ch, list, sink);
+        }
+    }
+    return rc;
+}
+
+void
+wl_columnar_eval_tdd_channel_discard_lists(wl_tdd_channel_t *ch,
+    wl_tdd_batch_t **lists, size_t count, const wl_tdd_refusal_sink_t *sink)
+{
+    if (!ch || !lists)
+        return;
+    for (size_t i = 0; i < count; i++)
+        if (lists[i])
+            wl_columnar_eval_tdd_discard_list(ch, &lists[i], sink);
 }

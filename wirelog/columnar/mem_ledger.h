@@ -242,8 +242,8 @@ typedef struct {
  *   ARRANGEMENT: 10% - hash, delta, filtered, sorted and differential
  *                      arrangements
  *   TIMESTAMP:    5% - timestamp arrays of ledger-attached relations
- *   CHANNEL:      5% - TDD delta transport: MPSC ring storage plus
- *                      payloads in flight between publish and drain
+ *   CHANNEL:      5% - TDD delta transport: the channel's side buffers
+ *                      plus payloads in flight between publish and collect
  *   STORED:       5% - session-owned relations (EDB/IDB and worker
  *                      partitions); a gauge sampled at iteration
  *                      boundaries, see wl_mem_ledger_set_gauge()

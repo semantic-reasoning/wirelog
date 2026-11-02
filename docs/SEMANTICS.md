@@ -865,7 +865,7 @@ and resumable independently.
 | `columnar/join.c`, `join_batch.c`, `diff_join_batch.c`, `join_pipeline.c` | One hash/build/probe-chain visit or candidate-pair inspection; unsuccessful probes and rejected candidates count |
 | `columnar/lftj.c` | One seek/comparison/traversal action, including unsuccessful seeks |
 | `columnar/relation.c`, `arrangement.c`, `eval_dedup.c`, `merge.c`, `partition.c` | One compare/hash action or copied/visited scalar cell; fresh contiguous relation lanes additionally admit one unit per requested 64-bit cell before allocation; sort, consolidation, materialization and coordinator partitioning require bounded chunks |
-| `columnar/eval_tdd_plan.c`, `eval_tdd_queue.c`, `kfusion.c`, `workqueue.c` | One dispatch/exchange/progress action; payload processing additionally charges rows/cells, and blocking waits must observe stop |
+| `columnar/eval_tdd_plan.c`, `eval_tdd_channel.c`, `tdd_channel.c`, `kfusion.c`, `workqueue.c` | One dispatch/exchange/progress action; payload processing additionally charges rows/cells, and blocking waits must observe stop |
 
 The internal `wl_columnar_merge_incremental_delta_attempt_advance` path charges
 each copied or compared scalar cell, each copied evaluator-dedup slot, and each

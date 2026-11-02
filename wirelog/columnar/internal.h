@@ -28,10 +28,10 @@
 #include "columnar/continuation.h"
 #include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
+#include "columnar/tdd_channel.h"
 #include "session.h"
 #include "evaluation_control.h"
 #include "intern.h"
-#include "util/lockfree_queue.h"
 #include "workqueue.h"
 #include "arena/arena.h"
 #include "arena/compound_arena.h"
@@ -2392,15 +2392,19 @@ typedef struct wl_columnar_tdd_owner_lifetime {
     uint32_t worker_count;
     uint32_t relation_count;
     size_t matrix_slots;
-    size_t overflow_slots;
     bool evaluation_active;
     bool dispatch_active;
     void *worker_ctxs;
     wl_columnar_memory_reservation_t reservation;
-    wl_mpsc_queue_t *queue;
-    uint64_t queue_ring_bytes;
-    /* First matrix_slots entries are the worker/relation matrix. The tail
-     * owns overflow queue payloads, with capacity reserved before dispatch. */
+    /* The stratum's TDD channel (coord->tdd_channel) while this record
+     * holds it; retained batches are retired through it. */
+    wl_tdd_channel_t *channel;
+    /* CONSUMER batches taken from the channel whose payloads have not been
+     * retired yet: captured at cleanup or refused by a checked destroy.
+     * Linked through batch->next, so appending allocates nothing. */
+    wl_tdd_batch_t *retained;
+    /* The worker/relation matrix: matrix_slots entries, worker w's starting
+     * at w * relation_count. */
     col_rel_t *relations[];
 } wl_columnar_eval_tdd_owner_lifetime_t;
 
@@ -2737,17 +2741,19 @@ typedef struct wl_col_session_t {
     bool cold_seal_closed; /* First evaluation attempt permanently closes seal. */
     /* Issue #1380: memory instrumentation state that is not part of the
      * ledger proper.
-     *   mem_channel_ring_bytes: bytes charged to CHANNEL for the MPSC ring
-     *       storage of the stratum currently being evaluated (0 otherwise).
+     *   mem_channel_side_bytes: bytes charged to CHANNEL for the TDD
+     *       channel object, its lanes and the consumer list heads of the
+     *       stratum currently being evaluated (0 otherwise).
      *   mem_worker_reports / mem_worker_peak_max / mem_worker_peak_sum:
      *       aggregates of TDD worker ledger peaks folded in at
      *       col_worker_session_destroy() so one coordinator report can
      *       stand in for the per-worker lines.
      *   mem_report_level: cached WL_MEM_REPORT level (0 = off, 1 =
      *       coordinator summary, 2 = also every worker teardown). */
-    uint64_t mem_channel_ring_bytes;
-    /* Coordinator-owned MPSC ring storage; workers never inherit this token. */
-    wl_columnar_memory_reservation_t delta_queue_ring_reservation;
+    uint64_t mem_channel_side_bytes;
+    /* Coordinator-owned TDD channel side buffers (the channel, its lanes and
+     * the consumer list heads); workers never inherit this token. */
+    wl_columnar_memory_reservation_t tdd_channel_reservation;
     uint64_t mem_worker_reports;
     uint64_t mem_worker_peak_max;
     uint64_t mem_worker_peak_sum;
@@ -2876,7 +2882,8 @@ typedef struct wl_col_session_t {
     struct wl_col_session_t *tdd_workers; /* owned array [tdd_workers_cap] */
     uint32_t tdd_workers_cap;           /* allocated slots in tdd_workers */
     uint32_t tdd_workers_count;         /* number of initialized workers */
-    /* Retains owner-mode TDD delta slots/queue when checked cleanup refuses.
+    /* Retains owner-mode TDD delta slots and channel batches when checked
+     * cleanup refuses.
      * This record owns no plan or execution context and is cleanup-only. */
     wl_columnar_eval_tdd_owner_lifetime_t *tdd_owner_lifetime;
     uint32_t tdd_active_workers;        /* current adaptive TDD width */
@@ -2886,11 +2893,18 @@ typedef struct wl_col_session_t {
      * relation after the first iteration (Issue #2127).  Each session
      * counts its own; a test reads it on a one-worker session. */
     uint64_t base_case_skips;
-    /* MPSC delta queue for async delta transport (Issue #410).
-     * Created/destroyed per recursive stratum evaluation in
-     * col_eval_stratum_tdd_recursive(). NULL outside that scope.
-     * Coordinator only; worker sessions always have delta_queue=NULL. */
-    wl_mpsc_queue_t *delta_queue;
+    /* TDD batch channel carrying worker deltas to the coordinator (Issue
+     * #1373).  Created per recursive stratum evaluation in
+     * col_eval_stratum_tdd_recursive() and destroyed when it ends, or by
+     * the owner lifetime record that retains it.  Coordinator only; worker
+     * sessions are created with tdd_channel=NULL. */
+    wl_tdd_channel_t *tdd_channel;
+    /* Consumer list heads for tdd_channel, one per (relation, worker) and
+     * indexed rel_idx * workers + worker; tdd_channel_list_count entries.
+     * They hold batches only between a round's collect and its coalesce,
+     * or until the driver's cleanup disposes of them. */
+    wl_tdd_batch_t **tdd_channel_lists;
+    size_t tdd_channel_list_count;
     /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */
@@ -6040,13 +6054,17 @@ wl_columnar_eval_serial_canonicalize_aggregates(const wl_plan_stratum_t *sp,
 int
 wl_columnar_eval_nonrec_relation_parallel(const wl_plan_relation_t *rp,
     wl_col_session_t *coord);
+/* The bytes of a TDD channel's side buffers for @workers lanes and @nrels
+ * relations: the channel object, its lanes and the consumer list heads.
+ * Returns 0, EINVAL for zero workers, or EOVERFLOW. */
 int
-wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out);
+wl_columnar_eval_tdd_channel_side_bytes(uint32_t workers, uint32_t nrels,
+    uint64_t *bytes);
 #ifdef WL_TEST_ALLOC_WRAP
-int wl_columnar_eval_test_reserve_queue_ring(wl_col_session_t *coord,
-    uint32_t workers, uint32_t capacity, uint64_t *bytes);
-int wl_columnar_eval_test_create_queue_ring(wl_col_session_t *coord,
-    uint32_t workers, uint32_t capacity);
+int wl_columnar_eval_test_reserve_channel(wl_col_session_t *coord,
+    uint32_t workers, uint32_t nrels, uint64_t *bytes);
+int wl_columnar_eval_test_create_channel(wl_col_session_t *coord,
+    uint32_t workers, uint32_t nrels);
 #endif
 int
 wl_columnar_eval_tdd_matrix_size(uint32_t W, uint32_t nrels,
@@ -6248,60 +6266,13 @@ typedef struct col_eval_tdd_worker_ctx {
     int rc;                        /* OUT: return code                */
 } col_eval_tdd_worker_ctx_t;
 
-/*
- * wl_columnar_eval_tdd_queue_reconstruct_delta_matrix:
- * Convert flat delta message buffer from MPSC queue drain into the
- * ctxs[w].delta_rels[ri] matrix used by existing exchange functions.
- *
- * For each message in msgs[0..count), places msg.delta into
- * ctxs[msg.worker_id].delta_rels[msg.rel_idx].
- *
- * Precondition: ctxs[w].delta_rels[ri] == NULL for all w,ri (freshly reset).
- * Postcondition: ctxs[msg.worker_id].delta_rels[msg.rel_idx] holds the
- *                last valid, non-aliased delta for each pair.  Distinct
- *                duplicates are destroyed; repeated pointer aliases are
- *                retained under one slot owner.  Invalid messages are
- *                destroyed exactly once unless the same pointer also has a
- *                valid occurrence, in which case that valid occurrence
- *                retains the sole ownership token.
- *
- * No allocations or atomics are performed.  The matrix is mutated and
- * rejected/replaced payloads are destroyed.  The bounded malformed-input
- * checks use O(count * (num_workers * nrels + count)) time and O(1) space.
- */
-void
-wl_columnar_eval_tdd_queue_reconstruct_delta_matrix(
-    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
-    uint32_t count, uint32_t num_workers, uint32_t nrels);
-
-void
-wl_columnar_eval_tdd_queue_reconstruct_delta_matrix_with_destroyer(
-    col_eval_tdd_worker_ctx_t *ctxs, const wl_delta_msg_t *msgs,
-    uint32_t count, uint32_t num_workers, uint32_t nrels,
-    wl_mpsc_payload_destroy_fn destroy_payload);
-
-void
-wl_columnar_eval_tdd_queue_discard_delta_queue(wl_mpsc_queue_t *queue,
-    uint32_t W, uint32_t nrels);
-
-/* Drain and destroy every queued delta, crediting each payload's bytes to
- * @ledger under WL_MEM_SUBSYS_CHANNEL (Issue #1380).  @ledger may be NULL. */
-void
-wl_columnar_eval_tdd_queue_discard_delta_queue_ledger(wl_mpsc_queue_t *queue,
-    wl_mem_ledger_t *ledger);
-void wl_columnar_eval_tdd_dispose_queue_ring(wl_col_session_t *coord);
-
-/* Allocation-free ownership-test seam; drains every live message. */
-void
-wl_columnar_eval_tdd_queue_discard_delta_queue_with_destroyer(
-    wl_mpsc_queue_t *queue, wl_mpsc_payload_destroy_fn destroy_payload);
-
-/* Refusal retains *delta; transfer clears it before releasing the writer.
- * Consumers must wait for the worker barrier before reading the payload. */
-int
-wl_columnar_eval_tdd_queue_publish_delta(col_eval_tdd_worker_ctx_t *ctx,
-    wl_col_session_t *sess, col_rel_t **delta, uint32_t rel_idx,
-    uint32_t eff_iter);
+/* Release the coordinator's TDD channel and its side buffers: every batch
+ * still queued or on a consumer list is discarded.  A queued batch's CHANNEL
+ * charge is freed here; a listed batch's was freed when it was collected.
+ * A no-op while an owner lifetime record holds the channel; the record
+ * releases it instead.  If a lane is still open the channel is left
+ * attached, because a running producer may still touch it. */
+void wl_columnar_eval_tdd_dispose_channel(wl_col_session_t *coord);
 
 /*
  * COL_FILTER_SEL_SLACK:

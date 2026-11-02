@@ -11,19 +11,24 @@
  * The channel (tdd_channel.h) moves descriptors without looking at their
  * payloads.  These helpers give the payloads a type: a RESIDENT batch
  * carries a col_rel_t *, a SPILLED batch a wl_columnar_batch_payload_t *.
- * Every function here runs on the coordinator thread, on CONSUMER-state
- * descriptors whose producers have released their leases.
+ * The producer helpers run on a worker's thread inside its lane; every other
+ * function runs on the coordinator thread, on CONSUMER-state descriptors
+ * whose producers have released their leases.
  */
 #ifndef WL_COLUMNAR_EVAL_TDD_CHANNEL_H
 #define WL_COLUMNAR_EVAL_TDD_CHANNEL_H
 
 #include "batch_payload.h"
+#include "mem_ledger.h"
 #include "tdd_channel.h"
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct col_rel;
 struct wl_col_session_t;
+struct col_eval_tdd_worker_ctx;
 
 /*
  * Receives a CONSUMER descriptor whose payload could not be retired: @rc is
@@ -37,10 +42,14 @@ typedef struct {
     void *ctx;
 } wl_tdd_refusal_sink_t;
 
-/* Context for wl_columnar_eval_tdd_discard_sink(). */
+/* Context for wl_columnar_eval_tdd_discard_sink().  @refusal.fn must be
+ * set: a refused retirement without it aborts.  When @ledger is set, each
+ * batch's charge is freed from it under WL_MEM_SUBSYS_CHANNEL before the
+ * batch is disposed. */
 typedef struct {
     wl_tdd_channel_t *channel;
     wl_tdd_refusal_sink_t refusal;
+    wl_mem_ledger_t *ledger;
 } wl_tdd_discard_ctx_t;
 
 /* The errno a spill status maps to, as the cold-relation reader maps it:
@@ -99,13 +108,13 @@ wl_columnar_eval_tdd_batch_rehydrate(const wl_tdd_batch_t *batch,
  * every batch is SPILLED and @name is NULL.  *@out_slot must be NULL on
  * entry.
  *
- * Success: *@out_slot is the slot (NULL for an empty list), *@list is NULL,
- * and every descriptor has been retired through wl_tdd_channel_retire().
- * An adopted relation becomes the slot.  Every other source has been
+ * Success: *@out_slot is the slot (NULL for an empty list) and *@list is
+ * NULL.  An adopted relation becomes the slot.  Every other source is
  * retired: relations through col_rel_destroy_checked(), payloads through
  * wl_columnar_batch_payload_release().  A source whose retirement is
- * refused goes to @sink with its descriptor instead; that is not a
- * failure.
+ * refused goes to @sink with its descriptor instead, which is not a
+ * failure; every descriptor not handed to @sink has been retired through
+ * wl_tdd_channel_retire().
  *
  * Failure: *@list and every descriptor on it are unchanged (still CONSUMER,
  * payloads intact, same order), *@out_slot stays NULL, and the partly built
@@ -138,8 +147,104 @@ void
 wl_columnar_eval_tdd_discard_list(wl_tdd_channel_t *ch, wl_tdd_batch_t **list,
     const wl_tdd_refusal_sink_t *sink);
 
-/* A wl_tdd_channel_discard_all() sink; @ctx is a wl_tdd_discard_ctx_t. */
+/* A wl_tdd_channel_discard_all() sink; @ctx is a wl_tdd_discard_ctx_t and
+ * must not be NULL (it aborts otherwise). */
 void
 wl_columnar_eval_tdd_discard_sink(void *ctx, wl_tdd_batch_t *batch);
+
+/*
+ * Producer: fund a descriptor on @sess's lane of the coordinator's channel
+ * for relation @rel_idx and reserve @delta's transport bytes on it.  On
+ * success *@out is the reserved PRODUCER batch and nothing has been
+ * published; the caller either publishes it with
+ * wl_columnar_eval_tdd_channel_publish_reserved() or drops it with
+ * wl_tdd_channel_batch_abandon().  EOVERFLOW when the transport bytes
+ * cannot be represented; otherwise errors are the channel's: EINVAL without
+ * a coordinator channel or for an empty charge, ENOSPC (also recorded on
+ * @sess), ENOMEM, EBUSY, EOVERFLOW, ECANCELED or EPROTO.
+ */
+int
+wl_columnar_eval_tdd_channel_reserve_delta(struct wl_col_session_t *sess,
+    uint32_t rel_idx, const struct col_rel *delta, wl_tdd_batch_t **out);
+
+/*
+ * Producer: charge the coordinator's CHANNEL ledger with @batch's reserved
+ * bytes and publish @delta, which must be stamped, on it.  @delta passes to
+ * the channel and 0 is returned.
+ *
+ * Under WL_SESSION_TEST_HOOKS the split hook may ask for @delta to be
+ * published as several batches.  If the extra batches cannot be prepared,
+ * @delta is published whole; once the first part is published, a later
+ * part's refused reservation is returned and that part is destroyed, so
+ * the round fails instead of losing rows silently.
+ */
+int
+wl_columnar_eval_tdd_channel_publish_reserved(struct wl_col_session_t *sess,
+    wl_tdd_batch_t *batch, struct col_rel *delta);
+
+/*
+ * Outbound producer: stamp *@candidate with (@eff_iter, the context's
+ * stratum, @sess's worker id, multiplicity 1) under its writer, release the
+ * writer, then publish it on the coordinator's channel; without a channel it
+ * goes to ctx->delta_rels[@rel_idx] instead.  An empty candidate is
+ * destroyed.  On success *@candidate is NULL.  On any refusal, including a
+ * failed writer release, *@candidate still belongs to the caller.
+ */
+int
+wl_columnar_eval_tdd_channel_publish_delta(struct col_eval_tdd_worker_ctx *ctx,
+    struct wl_col_session_t *sess, struct col_rel **candidate,
+    uint32_t rel_idx, uint32_t eff_iter);
+
+/*
+ * Consumer, after the producers are joined: pump @ch until it reports the
+ * round complete.  Each taken batch's charge is freed from @ledger (when
+ * set) under WL_MEM_SUBSYS_CHANNEL, its rows are added to *@rows (when set),
+ * and it is pushed onto lists[rel_idx * @nworkers + worker], so each list
+ * holds its batches newest first.  A batch whose relation is not below
+ * @nrels, or whose worker is not below @nworkers, is destroyed (a refused
+ * retirement goes to @sink) and makes the call return EPROTO after the
+ * round has been pumped to its end; its rows are not counted.  Returns 0,
+ * EINVAL, EPROTO, or the channel's error: when the round is cancelled or
+ * unbalanced, and when it completed with an error recorded on the channel
+ * (an orphan reclaimed on a lane that returned 0).  The lists keep what was
+ * collected either way.
+ */
+int
+wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
+    wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
+    uint32_t nrels, const wl_tdd_refusal_sink_t *sink, uint64_t *rows);
+
+/*
+ * Consumer: coalesce every list built by wl_columnar_eval_tdd_channel_collect()
+ * into ctxs[w].delta_rels[ri] with wl_columnar_eval_tdd_coalesce_slot(), in
+ * seq order, naming each slot after relation ri's delta in ctxs[w].sp.
+ * Unless an argument is invalid (EINVAL), every list is empty on return.  On
+ * failure the remaining lists are destroyed (a refused retirement goes to
+ * @sink), slots already built stay in the matrix for the caller's cleanup,
+ * and the error is returned; a slot that is already occupied gives EPROTO.
+ */
+int
+wl_columnar_eval_tdd_channel_coalesce_all(struct wl_col_session_t *coord,
+    wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
+    struct col_eval_tdd_worker_ctx *ctxs, uint32_t nworkers, uint32_t nrels,
+    const wl_tdd_refusal_sink_t *sink);
+
+/* Dispose every batch on lists[0..@count) through
+ * wl_columnar_eval_tdd_discard_list() and leave each list empty. */
+void
+wl_columnar_eval_tdd_channel_discard_lists(wl_tdd_channel_t *ch,
+    wl_tdd_batch_t **lists, size_t count, const wl_tdd_refusal_sink_t *sink);
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Test hook, called on a worker thread for every published delta of @rows
+ * rows: return the number of batches to publish it as, 0 or 1 for one.  The
+ * count is capped at WL_TDD_CHANNEL_TEST_SPLIT_MAX and at @rows.  Setting
+ * *@overlap makes every batch after the first repeat the previous batch's
+ * last row. */
+#define WL_TDD_CHANNEL_TEST_SPLIT_MAX 8u
+extern uint32_t (*wl_columnar_eval_test_channel_split)(
+    struct wl_col_session_t *worker, uint32_t rel_idx, uint32_t rows,
+    bool *overlap);
+#endif
 
 #endif /* WL_COLUMNAR_EVAL_TDD_CHANNEL_H */

@@ -282,7 +282,7 @@ test_round_trip(void)
     CHECK(dst->nrows == 6);
     for (uint32_t i = 0; i < 6; i++)
         check_row(dst, i, values[i], stamps[i]);
-    /* Worker 1 is out of range for a one-worker round (plan N9). */
+    /* Worker 1 is out of range for a one-worker round (#1373). */
     col_rel_t *narrow = make_dst(g);
     CHECK(wl_columnar_eval_tdd_batch_rehydrate(b[0], narrow, 1) == EPROTO);
     /* The batch survives a failed rehydrate and can be read again. */
@@ -768,6 +768,33 @@ test_coalesce_invalid_list(void)
     CHECK(slot == NULL);
     check_list_intact(list, reversed, reversed_payloads, 2);
 
+    list = link_list(b, 3);
+    wl_columnar_eval_tdd_discard_list(ch, &list, &sink);
+    CHECK(list == NULL && log.count == 0);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+
+    /* Two lanes: lane 1's second batch follows lane 0's first in seq, so
+     * only the worker check can refuse the pair. */
+    ch = open_channel(cg, 2);
+    publish(ch, 0, 0, make_rel(cg, "inv", v, s, 1));
+    publish(ch, 1, 0, make_rel(cg, "inv", v, s, 1));
+    publish(ch, 1, 0, make_rel(cg, "inv", v, s, 1));
+    take_all(ch, 2, b, &n, 3);
+    wl_tdd_batch_t *lane0 = NULL, *lane1_second = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        if (b[i]->worker == 0)
+            lane0 = b[i];
+        else if (b[i]->seq == 1)
+            lane1_second = b[i];
+    }
+    CHECK(lane0 && lane1_second && lane0->seq < lane1_second->seq);
+    wl_tdd_batch_t *workers[2] = { lane0, lane1_second };
+    void *worker_payloads[2] = { lane0->payload, lane1_second->payload };
+    list = link_list(workers, 2);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, &sink,
+        &slot) == EINVAL);
+    CHECK(slot == NULL);
+    check_list_intact(list, workers, worker_payloads, 2);
     list = link_list(b, 3);
     wl_columnar_eval_tdd_discard_list(ch, &list, &sink);
     CHECK(list == NULL && log.count == 0);
