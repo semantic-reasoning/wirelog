@@ -7241,7 +7241,9 @@ typedef enum {
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_RELEASE,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_INPUTS,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PREFLIGHT_LFTJ,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY,
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_BEGIN,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_LFTJ_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_CHILD,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_UNARY_ACK,
@@ -7393,6 +7395,39 @@ extern void (*wl_columnar_lftj_test_attempt_checkpoint)(
     wl_evaluation_control_t *, const wl_columnar_lftj_attempt_t *);
 #endif
 
+/* Actual composed parent owns this proof through ACK; plan/header/arrays and
+ * private bindings remain immutable. It supplies no source-reader authority. */
+typedef enum {
+    WL_COLUMNAR_LFTJ_METADATA_INERT,
+    WL_COLUMNAR_LFTJ_METADATA_HEADER,
+    WL_COLUMNAR_LFTJ_METADATA_NAMES,
+    WL_COLUMNAR_LFTJ_METADATA_VALIDATED,
+    WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER,
+    WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY,
+    WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR,
+    WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC,
+    WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL,
+    WL_COLUMNAR_LFTJ_METADATA_PREFIX,
+    WL_COLUMNAR_LFTJ_METADATA_INSTALL,
+    WL_COLUMNAR_LFTJ_METADATA_CONSUMED
+} wl_columnar_lftj_metadata_phase_t;
+
+typedef struct {
+    wl_columnar_lftj_metadata_phase_t phase;
+    const wl_plan_op_t *operation;
+    const wl_plan_op_lftj_t *metadata;
+    char **names;
+    uint32_t *keys;
+    uint32_t op_index, k, name_index;
+    const struct wl_columnar_eval_private_bindings *bindings;
+    const void *dynamic_entries;
+    uint64_t binding_generation;
+    uint32_t binding_count, entry, pair;
+    col_rel_t **registry;
+    uint32_t registry_count;
+    bool prefix_cleared;
+} wl_columnar_lftj_metadata_proof_t;
+
 typedef struct wl_columnar_eval_plan_numeric_attempt {
     struct wl_columnar_eval_plan_numeric_attempt *identity;
     wl_columnar_eval_stack_cleanup_frame_t *frame;
@@ -7432,6 +7467,8 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     /* Set only by the exact framed controlled STEP fallback preflight. */
     bool controlled_materialized_batch_fallback;
     const struct wl_columnar_eval_private_bindings *private_bindings;
+    bool lftj_metadata_ended, lftj_metadata_dispatch;
+    wl_columnar_lftj_metadata_proof_t lftj_metadata;
     wl_columnar_lftj_attempt_t lftj;
     bool composed_busy, lftj_cleanup_authorized;
     void *join_host;
@@ -7579,6 +7616,12 @@ int wl_columnar_eval_stack_numeric_source_release(
  * Owner arguments are original stable records, not transferable capabilities. */
 int wl_columnar_eval_stack_numeric_owner(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+/* Fixed status-only shape observation AFTER the caller's actual native/frame
+ * owner proof. No pointer loan or independent ownership capability. */
+bool wl_columnar_eval_stack_metadata_result_disjoint(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const int *);
+int wl_columnar_eval_stack_numeric_metadata_empty(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const void *, const int *);
 int wl_columnar_eval_stack_numeric_claim(
     wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *, const void *);
 int wl_columnar_eval_stack_numeric_unbind(
@@ -7738,6 +7781,41 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback(
     uint32_t, uint32_t, wl_columnar_eval_stack_cleanup_frame_t *,
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t);
+/* Fixed header only; the compatibility preflight below also scans names.
+ * Controlled hosts instead use their actual parent-owned ordered cursor. */
+int wl_columnar_lftj_metadata_header(const wl_plan_op_t *, wl_col_session_t *);
+typedef struct {
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    wl_evaluation_control_t *control;
+    uint64_t attempt_id;
+    const wl_plan_op_lftj_t *metadata;
+    const wl_columnar_eval_private_bindings_t *bindings;
+    col_rel_t **registry;
+    uint32_t registry_count;
+    wl_columnar_lftj_metadata_phase_t phase;
+} wl_columnar_lftj_begin_context_t;
+int wl_columnar_eval_plan_numeric_lftj_begin_context_get(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_columnar_lftj_attempt_t *,
+    wl_columnar_lftj_begin_context_t *);
+/* Stop-only, no-child cleanup after the actual original finished. Result
+ * must be disjoint from the whole parent and frame; caller owns all output/control
+ * lifetimes. Independent cleanup192 and ACK384; normal validators stay strict. */
+int wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, int *);
+int wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t, int *);
+int wl_columnar_lftj_attempt_begin_prevalidated(
+    wl_columnar_lftj_attempt_t *, wl_columnar_eval_plan_numeric_attempt_t *,
+    bool *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_plan_test_lftj_metadata_checkpoint)(
+    wl_columnar_eval_plan_numeric_attempt_t *);
+extern void (*wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint)(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *);
+#endif
 int wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *,
     wl_col_session_t *);
 int wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *,

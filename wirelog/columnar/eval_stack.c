@@ -878,6 +878,34 @@ wl_columnar_eval_stack_numeric_owner(
     return 0;
 }
 
+bool
+wl_columnar_eval_stack_metadata_result_disjoint(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame, const int *out)
+{
+    uintptr_t base = (uintptr_t)frame, dest = (uintptr_t)out;
+    return dest < base ? base - dest >= sizeof(*out)
+                      : dest - base >= sizeof(*frame);
+}
+
+int
+wl_columnar_eval_stack_numeric_metadata_empty(
+    const wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner,
+    const int *out)
+{
+    if (!frame || frame->identity != frame ||
+        frame->numeric_plan_owner != owner)
+        return EINVAL;
+    if (!wl_columnar_eval_stack_metadata_result_disjoint(frame,
+        out)) return EINVAL;
+    if (frame->stack.top ||
+        !wl_columnar_eval_stack_unary_entry_inert(&frame->result)
+        || frame->unary_phase != WL_COLUMNAR_EVAL_STACK_UNARY_IDLE
+        || frame->filter.stage != WL_COLUMNAR_FILTER_STAGE_INERT
+        || frame->binary.phase || frame->concat.identity || frame->stream_host)
+        return EBUSY;
+    return 0;
+}
+
 static bool
 wl_columnar_eval_stack_unary_thread_valid(
     const wl_columnar_eval_stack_cleanup_frame_t *frame)

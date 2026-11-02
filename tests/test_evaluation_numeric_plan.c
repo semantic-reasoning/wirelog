@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define CHECK(x) do { if (!(x)) { \
                           fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, \
@@ -5311,6 +5316,9 @@ composed_raw_parity(fixture_t *f, const wl_plan_relation_t *body,
         col_arr_detach_memory_governor(&raw.arr_entries[i].arr);
     }
     free(raw.arr_entries); session_rel_free_hash(&raw);
+    CHECK(!raw.sarr_active_pins);
+    col_session_free_sorted_arrangements(&raw);
+    CHECK(!raw.sarr_entries && !raw.sarr_count);
     for (uint32_t i = 0; i < raw.nrels; ++i) col_rel_destroy(raw.rels[i]);
     free(raw.rels);
     CHECK(!f->session.rel_hash_nbuckets && !f->session.arr_count);
@@ -8475,9 +8483,1036 @@ static void test_lftj_success_retains_funding_class(void)
     for (unsigned n = 0; n < 3; ++n) col_rel_destroy(relations[n]);
 }
 
+static bool metadata_reports_equal(const wl_evaluation_control_report_t *,
+    const wl_evaluation_control_report_t *);
+typedef struct {
+    wl_columnar_eval_plan_numeric_attempt_t *record;
+    int rc; bool done;
+} metadata_target_peer_t;
+
+static void *
+metadata_target_peer(void *data)
+{
+    metadata_target_peer_t *p = data;
+    p->rc = wl_columnar_lftj_attempt_begin_prevalidated(&p->record->lftj,
+            p->record, &p->done);
+    return NULL;
+}
+
+typedef struct {
+    fixture_t *fixture;
+    unsigned hits[WL_COLUMNAR_LFTJ_METADATA_CONSUMED + 1];
+    uint32_t next_name, entries, pairs;
+    bool native_checked;
+    uint64_t consumed[WL_COLUMNAR_LFTJ_METADATA_CONSUMED + 1][64];
+} metadata_trace_t;
+static metadata_trace_t *metadata_trace;
+
+static void
+metadata_trace_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *record)
+{
+    metadata_trace_t *t = metadata_trace;
+    CHECK(t && record == &t->fixture->record && record->composed_busy &&
+        !record->lftj_metadata_dispatch);
+    wl_columnar_lftj_metadata_proof_t *p = &record->lftj_metadata;
+    CHECK(p->phase > WL_COLUMNAR_LFTJ_METADATA_INERT
+        && p->phase < WL_COLUMNAR_LFTJ_METADATA_CONSUMED);
+    unsigned hit = t->hits[p->phase]++;
+    CHECK(hit < 64);
+    CHECK(!wl_evaluation_control_test_active_consumed(record->control,
+        record->attempt_id, &t->consumed[p->phase][hit]));
+    CHECK(!record->lftj.identity && !record->lftj.inputs &&
+        !record->lftj.output);
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_NAMES) {
+        CHECK(p->name_index == t->next_name++ && !record->preflight_depth);
+    }
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY) {
+        CHECK(p->entry == t->entries++);
+    }
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR) {
+        CHECK(p->pair < p->entry); ++t->pairs;
+    }
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_INSTALL) CHECK(p->prefix_cleared);
+    if (p->phase == WL_COLUMNAR_LFTJ_METADATA_PREFIX ||
+        p->phase == WL_COLUMNAR_LFTJ_METADATA_INSTALL){
+        unsigned stage = p->phase; bool installed = true;
+        bool cleared = p->prefix_cleared;
+        unsigned char historic[offsetof(wl_columnar_lftj_attempt_t,
+            retirement)];
+        memcpy(historic, &record->lftj, sizeof(historic));
+        uint64_t before_work = t->consumed[stage][hit], after_work;
+        wl_evaluation_control_report_t before_report = {0}, after_report = {0};
+        int report_status = wl_evaluation_control_report(record->control,
+                &before_report);
+        int rc = wl_columnar_lftj_attempt_begin_prevalidated(&record->lftj,
+                record, &installed);
+        CHECK(!wl_evaluation_control_test_active_consumed(record->control,
+            record->attempt_id, &after_work));
+        if (rc != EBUSY) fprintf(stderr,
+                "actual metadata target reentry: phase=%u rc=%d added=%llu\n",
+                stage, rc, (unsigned long long)(after_work - before_work));
+        CHECK(wl_evaluation_control_report(record->control,
+            &after_report) == report_status);
+        if (!report_status) CHECK(metadata_reports_equal(&before_report,
+                &after_report));
+        if (!t->native_checked) {
+            metadata_target_peer_t peer = {.record = record, .done = true};
+            wl_thread_t thread;
+            CHECK(!wl_thread_create(&thread, metadata_target_peer,
+                &peer) && !wl_thread_join(&thread));
+            CHECK(peer.rc == EBUSY && peer.done); t->native_checked = true;
+        }
+        CHECK(rc == EBUSY && installed && stage == p->phase &&
+            cleared == p->prefix_cleared
+            && !record->lftj_metadata_dispatch && !memcmp(historic,
+            &record->lftj, sizeof(historic))
+            && after_work == before_work
+            && !record->lftj.identity && !record->lftj.inputs &&
+            !record->lftj.output);
+    }
+    /* Use genuine parent/address authority. Copies or another target never
+     * obtain the cheap handoff, including while the real owner is busy. */
+    wl_columnar_eval_plan_numeric_attempt_t copy = *record;
+    copy.identity = &copy; copy.lftj_metadata_dispatch = true; /* Negative forgery only. */
+    wl_columnar_lftj_begin_context_t context;
+    CHECK(wl_columnar_eval_plan_numeric_lftj_begin_context_get(&copy,
+        &copy.lftj, &context) != 0);
+    wl_columnar_lftj_attempt_t other = {0}; bool done = false;
+    CHECK(wl_columnar_lftj_attempt_begin_prevalidated(&other, record,
+        &done) == EINVAL
+        && !other.identity && !other.inputs && !other.output);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(record,
+        t->fixture->funding, t->fixture->funding_id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(record,
+        t->fixture->funding, t->fixture->funding_id) == EBUSY);
+}
+
+static void
+test_lftj_metadata_maximum(void)
+{
+    for (unsigned kind = 0; kind < 12; ++kind) {
+        fixture_t f;
+        char *names[64]; uint32_t keys[64] = {0};
+        for (unsigned i = 0; i < 64; ++i) names[i] = "a";
+        if (kind == 2 || kind == 4) names[63] = NULL;
+        if (kind == 3) names[0] = NULL;
+        if (kind == 4 || kind == 5) names[0] = "missing";
+        if (kind == 6) names[0] = "";
+        wl_plan_op_lftj_t metadata = {.k = kind == 7 ? 1 : kind == 8 ? 65 : 64,
+                                      .rel_names = kind == 9 ? NULL : names,
+                                      .key_cols = kind == 10 ? NULL : keys};
+        wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ,
+                           .opaque_data = kind == 11 ? NULL : &metadata};
+        wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+        col_rel_t *source = source_new(1, 1);
+        CHECK(!wl_columnar_relation_rename_checked(source, "a"));
+        col_rel_t *relations[] = {source};
+        composed_fixture(&f, source_new(1, 0), 0);
+        f.session.base.evaluation_control = f.operation;
+        f.session.rels = relations; f.session.nrels = f.session.rel_cap = 1;
+        wl_columnar_eval_private_bindings_t bindings = {0};
+        if (kind == 1) {
+            const char *binding_names[] = {"a", "b", "c", "d"};
+            col_rel_t *binding_relations[] = {source, source, source, source};
+            CHECK(!wl_columnar_eval_private_bindings_begin(&bindings,
+                &f.session,
+                &body, f.operation, f.operation_id, binding_names,
+                binding_relations, 4));
+        }
+        CHECK(!(kind ==
+            1 ? wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &f.record, &body, 0, 1, f.frame, &f.session, 0, f.operation,
+                f.operation_id,
+                f.funding, f.funding_id, &bindings)
+            : wl_columnar_eval_plan_numeric_composed_attempt_begin(&f.record,
+            &body, 0, 1,
+            f.frame, &f.session, 0, f.operation, f.operation_id, f.funding,
+            f.funding_id)));
+        metadata_trace_t trace = {.fixture = &f};
+        metadata_trace = &trace;
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+            metadata_trace_checkpoint;
+        composed_run(&f);
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+        metadata_trace = NULL;
+        int expected = kind < 2 ? 0 : kind == 5 || kind == 6 ? ENOENT : EINVAL;
+        CHECK(f.record.semantic_result == expected);
+        CHECK(f.record.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT &&
+            !f.record.lftj_metadata_dispatch);
+        CHECK(trace.hits[WL_COLUMNAR_LFTJ_METADATA_HEADER] == 1);
+        if (!expected) {
+            CHECK(trace.next_name == 64
+                && trace.hits[WL_COLUMNAR_LFTJ_METADATA_VALIDATED] == 1
+                && trace.hits[WL_COLUMNAR_LFTJ_METADATA_PREFIX] == 1
+                && trace.hits[WL_COLUMNAR_LFTJ_METADATA_INSTALL] == 1);
+            CHECK(trace.entries == (kind ? 4u : 0u) &&
+                trace.pairs == (kind ? 6u : 0u));
+            eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+            CHECK(stack->top == 1 && stack->items[0].owned
+                && stack->items[0].rel->ncols == 64 &&
+                stack->items[0].rel->nrows == 1);
+            for (unsigned c = 0; c < 64;
+                ++c) CHECK(stack->items[0].rel->columns[c][0] == 0);
+            composed_raw_parity(&f, &body, 0);
+        } else if (kind == 2 || kind == 4) {
+            CHECK(trace.next_name == 64 &&
+                !trace.hits[WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER]
+                && !f.record.lftj.identity);
+        } else if (kind == 3) CHECK(trace.next_name == 1 &&
+                !f.record.lftj.identity);
+        CHECK(source->nrows == 1 && source->columns[0][0] == 0
+            && !f.session.arr_count && !f.session.rel_hash_nbuckets);
+        composed_close(&f); col_rel_destroy(source);
+    }
+}
+
+typedef struct {
+    fixture_t fixture;
+    char *names[64]; uint32_t keys[64];
+    wl_plan_op_lftj_t metadata;
+    wl_plan_op_t op;
+    wl_plan_relation_t body;
+    col_rel_t *relations[1];
+    wl_columnar_eval_private_bindings_t bindings;
+    metadata_trace_t trace;
+    wl_columnar_memory_governor_ref_t *governor;
+} metadata_fixture_t;
+
+static void
+metadata_fixture_begin_options(metadata_fixture_t *m, uint64_t limit,
+    bool governed)
+{
+    memset(m, 0, sizeof(*m));
+    for (unsigned i = 0; i < 64; ++i) m->names[i] = "a";
+    m->metadata = (wl_plan_op_lftj_t){.k = 64, .rel_names = m->names,
+                                      .key_cols = m->keys};
+    m->op = (wl_plan_op_t){.op = WL_PLAN_OP_LFTJ, .opaque_data = &m->metadata};
+    m->body = (wl_plan_relation_t){.ops = &m->op, .op_count = 1};
+    m->relations[0] = source_new(1, 1);
+    CHECK(!wl_columnar_relation_rename_checked(m->relations[0], "a"));
+    fixture_t *f = &m->fixture;
+    composed_fixture(f, source_new(1, 0), limit);
+    if (governed) m->governor = composed_governor(f);
+    f->session.base.evaluation_control = f->operation;
+    f->session.rels = m->relations; f->session.nrels = f->session.rel_cap = 1;
+    const char *binding_names[] = {"a", "b", "c", "d"};
+    col_rel_t *binding_relations[] = {m->relations[0], m->relations[0],
+                                      m->relations[0], m->relations[0]};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&m->bindings, &f->session,
+        &m->body, f->operation, f->operation_id, binding_names,
+        binding_relations, 4));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+            &f->record,
+            &m->body, 0, 1, f->frame, &f->session, 0, f->operation,
+            f->operation_id,
+            f->funding, f->funding_id, &m->bindings));
+    m->trace.fixture = f;
+    metadata_trace = &m->trace;
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+        metadata_trace_checkpoint;
+}
+
+static void
+metadata_fixture_begin(metadata_fixture_t *m, uint64_t limit)
+{
+    metadata_fixture_begin_options(m, limit, false);
+}
+
+static void
+metadata_fixture_close(metadata_fixture_t *m)
+{
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    composed_close(&m->fixture);
+    col_rel_destroy(m->relations[0]);
+    if (m->governor) {
+        CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+                m->governor))
+            && wl_columnar_memory_governor_ref_is_sole(m->governor));
+        wl_columnar_memory_governor_ref_release(m->governor);
+    }
+}
+
+static void
+test_lftj_metadata_original_boundaries(void)
+{
+    const struct { wl_columnar_lftj_metadata_phase_t phase;
+                   unsigned index, work; } targets[] = {
+        {WL_COLUMNAR_LFTJ_METADATA_HEADER, 0, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_NAMES, 0, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_NAMES, 63, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_VALIDATED, 0, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER, 0, 192},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY, 0, 192},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY, 3, 192},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR, 0, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR, 5, 128},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL, 0, 192},
+        {WL_COLUMNAR_LFTJ_METADATA_PREFIX, 0, 256},
+        {WL_COLUMNAR_LFTJ_METADATA_INSTALL, 0, 192}
+    };
+    metadata_fixture_t baseline;
+    metadata_fixture_begin(&baseline, 0);
+    composed_run(&baseline.fixture);
+    CHECK(!baseline.fixture.record.semantic_result);
+    uint64_t before[sizeof(targets)/sizeof(targets[0])];
+    for (unsigned i = 0; i < sizeof(targets)/sizeof(targets[0]); ++i) {
+        CHECK(baseline.trace.hits[targets[i].phase] > targets[i].index);
+        before[i] = baseline.trace.consumed[targets[i].phase][targets[i].index];
+    }
+    metadata_fixture_close(&baseline);
+    for (unsigned i = 0; i < sizeof(targets)/sizeof(targets[0]); ++i)
+        for (unsigned exact = 0; exact < 2; ++exact) {
+            metadata_fixture_t m;
+            metadata_fixture_begin(&m,
+                before[i] + targets[i].work - (exact ? 0 : 1));
+            composed_run(&m.fixture);
+            CHECK(m.fixture.record.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT
+                && m.trace.hits[targets[i].phase] > targets[i].index);
+            uint64_t consumed;
+            CHECK(!wl_evaluation_control_test_active_consumed(
+                    m.fixture.operation,
+                    m.fixture.operation_id, &consumed)
+                && consumed == before[i] + (exact ? targets[i].work : 0));
+            CHECK(m.fixture.record.lftj_metadata.phase ==
+                WL_COLUMNAR_LFTJ_METADATA_INERT
+                && m.relations[0]->nrows == 1 &&
+                m.relations[0]->columns[0][0] == 0);
+            if (targets[i].phase == WL_COLUMNAR_LFTJ_METADATA_PREFIX ||
+                !exact){
+                CHECK(!m.fixture.record.lftj.identity &&
+                    !m.fixture.record.lftj.inputs
+                    && !m.fixture.record.lftj.output);
+            }
+            metadata_fixture_close(&m);
+        }
+}
+
+static metadata_fixture_t *metadata_ended_probe;
+static unsigned metadata_ended_reentries;
+
+static bool
+metadata_reports_equal(const wl_evaluation_control_report_t *a,
+    const wl_evaluation_control_report_t *b)
+{
+    return a->attempt_id == b->attempt_id && a->limit == b->limit
+           && a->consumed == b->consumed && a->result == b->result
+           && a->stop_reason == b->stop_reason &&
+           a->execution_status == b->execution_status
+           && a->cleanup_status == b->cleanup_status;
+}
+
+static void
+metadata_ended_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r,
+    wl_evaluation_control_t *funding)
+{
+    CHECK(metadata_ended_probe && r == &metadata_ended_probe->fixture.record &&
+        r->composed_busy);
+    fixture_t *f = &metadata_ended_probe->fixture;
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(r->control, &before));
+    uint64_t consumed, after_work,
+        id = wl_evaluation_control_active_attempt_id(funding);
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id, &consumed));
+    wl_columnar_lftj_metadata_proof_t saved = r->lftj_metadata;
+    int output = 12345;
+    CHECK(wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(r, funding,
+        id, &output) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(r, funding, id,
+        &output) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(r, funding,
+        id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(r, funding,
+        id) == EBUSY);
+    CHECK(wl_columnar_eval_plan_numeric_composed_abort_request(r, funding,
+        id) == EBUSY);
+    CHECK(output == 12345 && !memcmp(&saved, &r->lftj_metadata, sizeof(saved)));
+    CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+    CHECK(!wl_evaluation_control_report(r->control,
+        &after) && metadata_reports_equal(&before, &after));
+    CHECK(!wl_evaluation_control_test_active_consumed(funding, id,
+        &after_work) && consumed == after_work);
+    ++metadata_ended_reentries;
+}
+
+static int
+metadata_ended_turn(metadata_fixture_t *m, bool ack, uint64_t limit,
+    uint64_t adjustment,
+    uint64_t *work, int *result)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    int rc = ack ? wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
+        &m->fixture.record, funding, id + adjustment, result)
+        : wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+        &m->fixture.record, funding, id + adjustment, result);
+    CHECK(wl_evaluation_control_finish(funding, &owner, rc, 0) == rc);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report));
+    *work = report.consumed;
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+typedef struct {
+    fixture_t *fixture;
+    int rc, result;
+} metadata_ended_peer_t;
+
+static void *
+metadata_ended_peer(void *data)
+{
+    metadata_ended_peer_t *p = data;
+    p->rc =
+        wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+        &p->fixture->record,
+        p->fixture->funding, p->fixture->funding_id, &p->result);
+    return NULL;
+}
+
+static void
+test_lftj_metadata_ended_cleanup(void)
+{
+    const struct { wl_columnar_lftj_metadata_phase_t phase;
+                   uint32_t entry, pair; } targets[] = {
+        {WL_COLUMNAR_LFTJ_METADATA_HEADER, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_NAMES, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_NAMES, 63, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_VALIDATED, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_HEADER, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY, 3, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR, 3, 2},
+        {WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_PREFIX, 0, 0},
+        {WL_COLUMNAR_LFTJ_METADATA_INSTALL, 0, 0}
+    };
+    for (unsigned trial = 0; trial < sizeof(targets)/sizeof(targets[0]);
+        ++trial)
+        for (unsigned work_stop = 0; work_stop < 2; ++work_stop) {
+            metadata_fixture_t m;
+            metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+            fixture_t *f = &m.fixture;
+            for (unsigned turn = 0;; ++turn) {
+                CHECK(turn < 10000);
+                const wl_columnar_lftj_metadata_proof_t *p =
+                    &f->record.lftj_metadata;
+                if (p->phase == targets[trial].phase
+                    && (p->phase != WL_COLUMNAR_LFTJ_METADATA_NAMES ||
+                    p->name_index == targets[trial].entry)
+                    && (p->phase != WL_COLUMNAR_LFTJ_METADATA_BIND_ENTRY ||
+                    p->entry == targets[trial].entry)
+                    && (p->phase != WL_COLUMNAR_LFTJ_METADATA_BIND_PAIR
+                    || (p->entry == targets[trial].entry &&
+                    p->pair == targets[trial].pair))) break;
+                composed_action(f);
+            }
+            wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+            metadata_trace = NULL;
+            int output = 12345; uint64_t charge;
+            /* Active original is not a genuinely completed-stop capability. */
+            CHECK(metadata_ended_turn(&m, false, 0, 0, &charge,
+                &output) == EINVAL
+                && !charge && output == 12345);
+            if (!work_stop) wl_evaluation_control_request_cancel(f->operation);
+            int stop = work_stop ? wl_evaluation_control_charge(f->operation,
+                    UINT64_MAX)
+                : wl_evaluation_control_charge(f->operation, 0);
+            CHECK(stop ==
+                (work_stop ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                WL_EVALUATION_CONTROL_CANCELLED));
+            CHECK(wl_evaluation_control_finish(f->operation,
+                &f->operation_owner, 0, 0) == stop);
+            CHECK(!wl_evaluation_control_reset(f->operation) &&
+                !wl_evaluation_control_configure(f->operation, 0));
+            wl_evaluation_control_report_t before, after;
+            CHECK(!wl_evaluation_control_report(f->operation, &before));
+            CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(
+                    &f->record,
+                    f->funding, f->funding_id) == EINVAL);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+            wl_columnar_eval_plan_numeric_attempt_t copy = f->record;
+            CHECK(wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+                    &copy,
+                    f->funding, f->funding_id,
+                    &output) == EBUSY && output == 12345);
+            CHECK(wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+                    &f->record,
+                    f->funding, f->funding_id,
+                    &f->record.semantic_result) == EINVAL);
+            CHECK(wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
+                    &f->record,
+                    f->operation, f->operation_id, &output) == EINVAL);
+            metadata_ended_peer_t peer = {.fixture = f, .result = 12345};
+            wl_thread_t thread;
+            CHECK(!wl_thread_create(&thread, metadata_ended_peer,
+                &peer) && !wl_thread_join(&thread));
+            CHECK(peer.rc == EINVAL && peer.result == 12345);
+            CHECK(metadata_ended_turn(&m, false, 0, 1, &charge,
+                &output) == EINVAL
+                && !charge && output == 12345);
+            metadata_ended_probe = &m; metadata_ended_reentries = 0;
+            wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint =
+                metadata_ended_checkpoint;
+            CHECK(metadata_ended_turn(&m, false, 191, 0, &charge, &output)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !charge &&
+                output == 12345
+                && !f->record.lftj_metadata_ended && !f->record.lftj.identity);
+            CHECK(metadata_ended_turn(&m, false, 192, 0, &charge, &output) == 0
+                && charge == 192 && output == stop &&
+                f->record.lftj_metadata_ended
+                && f->record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE);
+            CHECK(metadata_ended_reentries == 2);
+            wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint = NULL;
+            metadata_ended_probe = NULL;
+            CHECK(wl_columnar_eval_plan_numeric_composed_attempt_ack(&f->record,
+                f->funding, f->funding_id) == EBUSY);
+            output = 12345;
+            CHECK(metadata_ended_turn(&m, true, 0, 1, &charge,
+                &output) == EINVAL && !charge && output == 12345);
+            CHECK(metadata_ended_turn(&m, true, 383, 0, &charge, &output)
+                == WL_EVALUATION_CONTROL_WORK_LIMIT && !charge &&
+                output == 12345
+                && f->record.identity == &f->record &&
+                f->record.lftj_metadata_ended);
+            CHECK(wl_columnar_eval_stack_cleanup_finish(&f->frame) == EBUSY);
+            CHECK(metadata_ended_turn(&m, true, 384, 0, &charge, &output) == 0
+                && charge == 384 && output == stop && !f->record.identity
+                && !f->record.control && !f->record.frame &&
+                !f->record.private_bindings);
+            CHECK(!wl_evaluation_control_report(f->operation,
+                &after) && metadata_reports_equal(&before, &after));
+            CHECK(m.relations[0]->nrows == 1 &&
+                m.relations[0]->columns[0][0] == 0);
+            metadata_fixture_close(&m);
+        }
+}
+
+static void
+test_lftj_metadata_ended_last_reference(void)
+{
+    metadata_fixture_t m;
+    metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+    fixture_t *f = &m.fixture;
+    for (unsigned n = 0;
+        f->record.lftj_metadata.phase != WL_COLUMNAR_LFTJ_METADATA_INSTALL;
+        ++n){
+        CHECK(n < 10000); composed_action(f);
+    }
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    wl_evaluation_control_request_cancel(f->operation);
+    CHECK(wl_evaluation_control_charge(f->operation,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!wl_evaluation_control_detach(f->operation, &f->operation_owner));
+    wl_evaluation_control_release(f->operation); /* Only the real parent ownref remains. */
+    int result = 12345; uint64_t work;
+    CHECK(!metadata_ended_turn(&m, false, 192, 0, &work, &result)
+        && work == 192 && result == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result)
+        && work == 384 && result == WL_EVALUATION_CONTROL_CANCELLED);
+    f->operation = NULL; /* ACK dropped its last actual ref; never query it. */
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&f->frame));
+    CHECK(!wl_evaluation_control_finish(f->funding, &f->funding_owner, 0, 0)
+        && !wl_evaluation_control_detach(f->funding, &f->funding_owner));
+    wl_evaluation_control_release(f->funding); col_rel_destroy(f->input);
+    col_rel_destroy(m.relations[0]);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            m.governor))
+        && wl_columnar_memory_governor_ref_is_sole(m.governor));
+    wl_columnar_memory_governor_ref_release(m.governor);
+}
+
+static void
+test_lftj_metadata_ended_frame_refusal(void)
+{
+    metadata_fixture_t m;
+    metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+    fixture_t *f = &m.fixture;
+    while (f->record.lftj_metadata.phase !=
+        WL_COLUMNAR_LFTJ_METADATA_BIND_FINAL) composed_action(f);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    wl_evaluation_control_request_cancel(f->operation);
+    CHECK(wl_evaluation_control_charge(f->operation,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    int result; uint64_t work;
+    CHECK(!metadata_ended_turn(&m, false, 192, 0, &work, &result));
+    wl_columnar_eval_stack_cleanup_frame_t *nested = NULL;
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session, &nested));
+    result = 12345;
+    CHECK(metadata_ended_turn(&m, true, 384, 0, &work,
+        &result) == EINVAL && !work
+        && result == 12345 && f->record.identity == &f->record &&
+        f->record.lftj_metadata_ended);
+    CHECK(!wl_columnar_eval_stack_cleanup_finish(&nested));
+    CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result)
+        && result == WL_EVALUATION_CONTROL_CANCELLED && work == 384);
+    metadata_fixture_close(&m);
+}
+
+static void
+test_lftj_metadata_header_and_grammar(void)
+{
+    char *names[] = {"a", "a"}; uint32_t keys[] = {0, 0};
+    wl_plan_op_lftj_t metadata = {.k = 2, .rel_names = names, .key_cols = keys};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata};
+    wl_col_session_t session = {0};
+    CHECK(!wl_columnar_lftj_metadata_header(&op, &session));
+    CHECK(wl_columnar_lftj_metadata_header(NULL, &session) == EINVAL);
+    CHECK(wl_columnar_lftj_metadata_header(&op, NULL) == EINVAL);
+    session.current_iteration = 1; metadata.k = 1;
+    CHECK(wl_columnar_lftj_metadata_header(&op, &session) == ENOTSUP);
+    session.current_iteration = 0; session.diff_operators_active = true;
+    CHECK(wl_columnar_lftj_metadata_header(&op, &session) == ENOTSUP);
+    op.opaque_data = NULL;
+    CHECK(wl_columnar_lftj_metadata_header(&op, &session) == EINVAL);
+    op.opaque_data = &metadata; session.diff_operators_active = false;
+    CHECK(wl_columnar_lftj_metadata_header(&op, &session) == EINVAL);
+    metadata.k = 2;
+    fixture_t f; fixture_init(&f, 1, 1, 0);
+    wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin(&f.record,
+        &body, 0, 1,
+        f.frame, &f.session, 1, f.operation, f.operation_id, f.funding,
+        f.funding_id));
+    composed_run(&f);
+    CHECK(f.record.semantic_result == EINVAL
+        && f.record.lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INERT
+        && !f.record.lftj.identity && !f.record.completed);
+    composed_close(&f);
+}
+
+#ifndef _WIN32
+static void
+test_lftj_metadata_replaced_original_refusal(void)
+{
+    metadata_fixture_t m;
+    metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+    fixture_t *f = &m.fixture;
+    while (f->record.lftj_metadata.phase !=
+        WL_COLUMNAR_LFTJ_METADATA_INSTALL) composed_action(f);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    wl_evaluation_control_request_cancel(f->operation);
+    CHECK(wl_evaluation_control_charge(f->operation,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    /* A replacement completion intentionally invalidates the old stop proof.
+     * Isolate that protocol violation; the parent retains its genuine proof
+     * and completes normal resource checks after the child exits. */
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        wl_columnar_lftj_metadata_proof_t saved = f->record.lftj_metadata;
+        CHECK(!wl_evaluation_control_reset(f->operation)
+            && !wl_evaluation_control_begin(f->operation, &f->operation_owner));
+        int result = 12345; uint64_t work;
+        CHECK(metadata_ended_turn(&m, false, 0, 0, &work, &result) == EINVAL
+            && !work && result == 12345);
+        CHECK(!wl_evaluation_control_finish(f->operation, &f->operation_owner,
+            0, 0));
+        CHECK(metadata_ended_turn(&m, false, 0, 0, &work, &result) == EINVAL
+            && !work && result == 12345
+            && !memcmp(&saved, &f->record.lftj_metadata, sizeof(saved))
+            && f->record.identity == &f->record);
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status,
+        0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    int result; uint64_t work;
+    CHECK(!metadata_ended_turn(&m, false, 192, 0, &work, &result));
+    CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result));
+    metadata_fixture_close(&m);
+}
+#endif
+
+static void
+test_lftj_metadata_binding_semantic_parity(void)
+{
+    fixture_t f; composed_fixture(&f, source_new(1, 0), 0);
+    f.session.base.evaluation_control = f.operation;
+    char *names[] = {"a", "b"}; uint32_t keys[] = {0, 0};
+    wl_plan_op_lftj_t metadata = {.k = 2, .rel_names = names, .key_cols = keys};
+    wl_plan_op_t op = {.op = WL_PLAN_OP_LFTJ, .opaque_data = &metadata};
+    wl_plan_relation_t body = {.ops = &op, .op_count = 1};
+    const char *binding_names[] = {"a", "b", "c", "d"};
+    col_rel_t *sources[4];
+    for (unsigned i = 0; i < 4; ++i) {
+        sources[i] = source_new(1, 1);
+        CHECK(!wl_columnar_relation_rename_checked(sources[i],
+            binding_names[i]));
+    }
+    f.session.rels = sources; f.session.nrels = f.session.rel_cap = 4;
+    wl_columnar_eval_private_bindings_t bindings = {0};
+    for (unsigned i = 1; i < 4; ++i) for (unsigned j = 0; j < i; ++j) {
+            const char *duplicate[] = {"a", "b", "c", "d"};
+            duplicate[i] = duplicate[j];
+            CHECK(wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+                &body,
+                f.operation, f.operation_id, duplicate, sources, 4) == EINVAL
+                && !bindings.identity && !f.record.identity);
+        }
+    char unterminated[256]; memset(unterminated, 'z', sizeof(unterminated));
+    for (unsigned bad = 0; bad < 4; ++bad) {
+        const char *invalid[] = {"a", "b", "c", "d"};
+        col_rel_t *relations[] = {sources[0], sources[1], sources[2],
+                                  sources[3]};
+        if (bad < 3) invalid[3] = bad == 0 ? NULL : bad ==
+                1 ? "" : unterminated;
+        else relations[3] = NULL;
+        CHECK(wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+            &body,
+            f.operation, f.operation_id, invalid, relations,
+            4) == EINVAL && !f.record.identity);
+    }
+    /* Staleness arises from real writes before any parent adopts the proof.
+     * It is an early authentication failure, not a forged ENTRY error. */
+    for (unsigned i = 0; i < 4; ++i) {
+        /* No parent adopted the preceding borrowed recipe. */
+        memset(&bindings, 0, sizeof(bindings));
+        CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session,
+            &body,
+            f.operation, f.operation_id, binding_names, sources, 4));
+        int64_t extra = 10 + i; CHECK(!col_rel_append_row(sources[i], &extra));
+        CHECK(wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
+                &f.record,
+                &body, 0, 1, f.frame, &f.session, 0, f.operation,
+                f.operation_id,
+                f.funding, f.funding_id,
+                &bindings) == EINVAL && !f.record.identity);
+    }
+    memset(&bindings, 0, sizeof(bindings));
+    char longest[256]; memset(longest, 'z', sizeof(longest));
+    longest[255] = '\0';
+    const char *bounded_names[] = {"a", "b", "c", longest};
+    CHECK(!wl_columnar_eval_private_bindings_begin(&bindings, &f.session, &body,
+        f.operation, f.operation_id, bounded_names, sources, 4));
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(&f.record,
+        &body, 0, 1, f.frame, &f.session, 0, f.operation, f.operation_id,
+        f.funding, f.funding_id, &bindings));
+    metadata_trace_t trace = {.fixture = &f}; metadata_trace = &trace;
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+        metadata_trace_checkpoint;
+    composed_run(&f);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    CHECK(!f.record.semantic_result && trace.entries == 4 && trace.pairs == 6);
+    composed_raw_parity(&f, &body, 0); composed_close(&f);
+    for (unsigned i = 0; i < 4; ++i) col_rel_destroy(sources[i]);
+}
+
+static metadata_fixture_t *metadata_shape_fixture;
+static bool metadata_shape_result;
+
+static void
+metadata_shape_add(metadata_fixture_t *m, bool result_slot)
+{
+    fixture_t *f = &m->fixture;
+    eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+    CHECK(stack && !stack->top);
+    CHECK(!eval_stack_push_delta(stack, m->relations[0], false, true));
+    if (result_slot) {
+        eval_entry_t *slot = wl_columnar_eval_stack_cleanup_result(f->frame);
+        CHECK(slot && !slot->rel);
+        eval_entry_t borrowed = eval_stack_pop(stack);
+        *slot = borrowed;
+        memset(&borrowed, 0, sizeof(borrowed));
+    }
+}
+
+static void
+metadata_shape_restore(metadata_fixture_t *m, bool result_slot)
+{
+    fixture_t *f = &m->fixture;
+    if (result_slot) {
+        eval_entry_t *slot = wl_columnar_eval_stack_cleanup_result(f->frame);
+        CHECK(slot && slot->rel == m->relations[0] && !slot->owned &&
+            slot->is_delta);
+        *slot = (eval_entry_t){0};
+    } else {
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+        CHECK(stack && stack->top == 1);
+        eval_entry_t borrowed = eval_stack_pop(stack);
+        CHECK(borrowed.rel == m->relations[0] && !borrowed.owned &&
+            borrowed.is_delta);
+    }
+}
+
+static void
+metadata_shape_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r,
+    wl_evaluation_control_t *funding)
+{
+    (void)funding;
+    CHECK(metadata_shape_fixture && r == &metadata_shape_fixture->fixture.record
+        && r->composed_busy);
+    metadata_shape_add(metadata_shape_fixture, metadata_shape_result);
+}
+
+static void
+test_lftj_metadata_real_frame_shape(void)
+{
+    for (unsigned kind = 0; kind < 5; ++kind) {
+        metadata_fixture_t m;
+        metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+        fixture_t *f = &m.fixture;
+        while (f->record.lftj_metadata.phase !=
+            WL_COLUMNAR_LFTJ_METADATA_INSTALL) composed_action(f);
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+        metadata_trace = NULL;
+        wl_evaluation_control_request_cancel(f->operation);
+        CHECK(wl_evaluation_control_charge(f->operation,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        wl_evaluation_control_report_t before, after;
+        CHECK(!wl_evaluation_control_report(f->operation, &before));
+        int result = 12345; uint64_t work;
+        bool slot = (kind & 1u) != 0;
+        if (kind == 4) CHECK(!metadata_ended_turn(&m, false, 192, 0, &work,
+                &result));
+        if (kind < 2 || kind == 4) metadata_shape_add(&m, slot);
+        else {
+            metadata_shape_fixture = &m; metadata_shape_result = slot;
+            wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint =
+                metadata_shape_checkpoint;
+        }
+        result = 12345;
+        int rc = metadata_ended_turn(&m, kind == 4, kind == 4 ? 384 : 192, 0,
+                &work, &result);
+        if (rc != EBUSY) fprintf(stderr,
+                "metadata real frame shape: case=%u rc=%d consumed=%llu\n",
+                kind, rc, (unsigned long long)work);
+        CHECK(rc == EBUSY && result == 12345 && work == (kind == 4 ? 384u : 0u)
+            && f->record.identity == &f->record &&
+            f->record.control == f->operation
+            && f->record.lftj_metadata_ended == (kind == 4));
+        wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint = NULL;
+        metadata_shape_fixture = NULL;
+        CHECK(!wl_evaluation_control_report(f->operation,
+            &after) && metadata_reports_equal(&before, &after));
+        metadata_shape_restore(&m, slot);
+        if (kind != 4) CHECK(!metadata_ended_turn(&m, false, 192, 0, &work,
+                &result));
+        CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result));
+        metadata_fixture_close(&m);
+    }
+}
+
+static metadata_fixture_t *metadata_fault_fixture;
+static unsigned metadata_fault_kind, metadata_fault_hits;
+static wl_plan_op_lftj_t metadata_fault_replacement;
+static wl_columnar_eval_stack_cleanup_frame_t *metadata_fault_nested;
+
+static void
+metadata_fault_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r)
+{
+    wl_columnar_lftj_metadata_phase_t phase = metadata_fault_kind == 4
+        ? WL_COLUMNAR_LFTJ_METADATA_INSTALL : WL_COLUMNAR_LFTJ_METADATA_PREFIX;
+    if (r->lftj_metadata.phase != phase) return;
+    CHECK(metadata_fault_fixture && r == &metadata_fault_fixture->fixture.record
+        && r->composed_busy && !r->lftj_metadata_dispatch &&
+        !metadata_fault_hits++);
+    metadata_fixture_t *m = metadata_fault_fixture;
+    if (metadata_fault_kind == 0) {
+        m->op.opaque_data = NULL; m->fixture.session.current_iteration = 1;
+    } else if (metadata_fault_kind ==
+        1) m->fixture.session.current_iteration = 1;
+    else if (metadata_fault_kind == 2) {
+        metadata_fault_replacement = m->metadata;
+        m->op.opaque_data = &metadata_fault_replacement;
+    } else if (metadata_fault_kind == 5)
+        CHECK(!wl_columnar_eval_stack_cleanup_begin(&m->fixture.session,
+            &metadata_fault_nested));
+    else wl_evaluation_control_request_cancel(r->control);
+}
+
+static void
+test_lftj_metadata_checked_handoff_failures(void)
+{
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        metadata_fixture_t m;
+        metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+        fixture_t *f = &m.fixture;
+        wl_columnar_lftj_metadata_phase_t target = kind == 4
+            ? WL_COLUMNAR_LFTJ_METADATA_INSTALL :
+            WL_COLUMNAR_LFTJ_METADATA_PREFIX;
+        while (f->record.lftj_metadata.phase != target) composed_action(f);
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+        metadata_trace = NULL;
+        unsigned char prefix[offsetof(wl_columnar_lftj_attempt_t, retirement)];
+        memcpy(prefix, &f->record.lftj, sizeof(prefix));
+        uint64_t before, after;
+        CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+            f->operation_id, &before));
+        metadata_fault_fixture = &m; metadata_fault_kind = kind;
+        metadata_fault_hits = 0;
+        metadata_fault_nested = NULL;
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+            metadata_fault_checkpoint;
+        composed_action(f);
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+        metadata_fault_fixture = NULL;
+        CHECK(metadata_fault_hits == 1 && !f->record.lftj_metadata_dispatch
+            && f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            && !memcmp(prefix, &f->record.lftj,
+            sizeof(prefix)) && !f->record.lftj.identity);
+        CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+            f->operation_id, &after) && before == after);
+        int expected = kind == 1 ? ENOTSUP : kind == 3 ||
+            kind == 4 ? WL_EVALUATION_CONTROL_CANCELLED : EINVAL;
+        CHECK(f->record.semantic_result == expected);
+        /* These are negative immutable-header fault injections. Restore only
+         * outside the returned action, before independent cleanup; no positive
+         * progress is claimed under changed metadata/session context. */
+        m.op.opaque_data = &m.metadata; f->session.current_iteration = 0;
+        if (metadata_fault_nested) CHECK(!wl_columnar_eval_stack_cleanup_finish(
+                    &metadata_fault_nested));
+        composed_run(f);
+        CHECK(f->record.semantic_result == expected &&
+            !f->record.lftj_metadata_dispatch
+            && f->record.lftj_metadata.phase ==
+            WL_COLUMNAR_LFTJ_METADATA_INERT);
+        metadata_fixture_close(&m);
+    }
+}
+
+static void
+test_lftj_metadata_frame_output_alias(void)
+{
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        bool ack = (kind & 1u) != 0;
+        metadata_fixture_t m;
+        metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+        fixture_t *f = &m.fixture;
+        while (f->record.lftj_metadata.phase !=
+            WL_COLUMNAR_LFTJ_METADATA_INSTALL) composed_action(f);
+        wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+        metadata_trace = NULL;
+        wl_evaluation_control_request_cancel(f->operation);
+        CHECK(wl_evaluation_control_charge(f->operation,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+            0) == WL_EVALUATION_CONTROL_CANCELLED);
+        int result = 12345; uint64_t work;
+        if (ack) CHECK(!metadata_ended_turn(&m, false, 192, 0, &work, &result));
+        eval_stack_t *stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+        CHECK(stack && !stack->top && sizeof(stack->top) == sizeof(int));
+        /* This is an actual mutable frame loan. The API must not turn its
+         * copied status result into a write to its own stack metadata. */
+        eval_entry_t *entry = wl_columnar_eval_stack_cleanup_result(f->frame);
+        CHECK(entry && !entry->seg_count &&
+            sizeof(entry->seg_count) == sizeof(int));
+        wl_evaluation_control_report_t before, after;
+        CHECK(!wl_evaluation_control_report(f->operation, &before));
+        int *alias = kind < 2 ? (int *)(void *)&stack->top
+                             : (int *)(void *)&entry->seg_count;
+        int rc = metadata_ended_turn(&m, ack, ack ? 384 : 192, 0, &work, alias);
+        if (rc != EINVAL) fprintf(stderr,
+                "metadata frame output alias: ack=%u rc=%d work=%llu top=%u\n",
+                ack, rc, (unsigned long long)work, stack->top);
+        CHECK(rc == EINVAL && !work && !stack->top && !entry->seg_count
+            && f->record.identity == &f->record && f->record.frame == f->frame
+            && f->record.lftj_metadata_ended == ack);
+        CHECK(!wl_evaluation_control_report(f->operation, &after)
+            && metadata_reports_equal(&before, &after));
+        if (!ack) CHECK(!metadata_ended_turn(&m, false, 192, 0, &work,
+                &result));
+        CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result));
+        metadata_fixture_close(&m);
+    }
+}
+
+static const void *metadata_funding_hook_owner;
+static uint64_t metadata_funding_hook_id;
+static unsigned metadata_funding_hook_hits;
+
+static void
+metadata_funding_generation_checkpoint(
+    wl_columnar_eval_plan_numeric_attempt_t *r,
+    wl_evaluation_control_t *funding)
+{
+    CHECK(r->composed_busy && metadata_funding_hook_owner &&
+        !metadata_funding_hook_hits++);
+    CHECK(!wl_evaluation_control_finish(funding, metadata_funding_hook_owner, 0,
+        0));
+    CHECK(!wl_evaluation_control_reset(funding));
+    CHECK(!wl_evaluation_control_begin(funding, metadata_funding_hook_owner));
+    metadata_funding_hook_id = wl_evaluation_control_active_attempt_id(funding);
+}
+
+static void
+test_lftj_metadata_funding_generation(void)
+{
+    metadata_fixture_t m;
+    metadata_fixture_begin_options(&m, UINT64_C(1000000000), true);
+    fixture_t *f = &m.fixture;
+    while (f->record.lftj_metadata.phase !=
+        WL_COLUMNAR_LFTJ_METADATA_INSTALL) composed_action(f);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_trace = NULL;
+    wl_evaluation_control_request_cancel(f->operation);
+    CHECK(wl_evaluation_control_charge(f->operation,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(wl_evaluation_control_finish(f->operation, &f->operation_owner, 0,
+        0) == WL_EVALUATION_CONTROL_CANCELLED);
+    wl_evaluation_control_report_t before, after;
+    CHECK(!wl_evaluation_control_report(f->operation, &before));
+    wl_columnar_lftj_metadata_proof_t proof = f->record.lftj_metadata;
+    int owner = 0, result = 12345;
+    wl_evaluation_control_t *funding = control_new(192, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding), work;
+    metadata_funding_hook_owner = &owner; metadata_funding_hook_hits = 0;
+    wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint =
+        metadata_funding_generation_checkpoint;
+    int rc =
+        wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(&f->record,
+            funding, id, &result);
+    wl_columnar_eval_plan_test_lftj_metadata_cleanup_checkpoint = NULL;
+    metadata_funding_hook_owner = NULL;
+    CHECK(rc == EINVAL && metadata_funding_hook_hits == 1 &&
+        metadata_funding_hook_id != id
+        && result == 12345 && !f->record.lftj_metadata_ended &&
+        !f->record.composed_busy
+        && !memcmp(&proof, &f->record.lftj_metadata, sizeof(proof)));
+    CHECK(!wl_evaluation_control_test_active_consumed(funding,
+        metadata_funding_hook_id, &work) && !work);
+    CHECK(!wl_evaluation_control_report(f->operation,
+        &after) && metadata_reports_equal(&before, &after));
+    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    CHECK(!metadata_ended_turn(&m, false, 192, 0, &work, &result));
+    CHECK(!metadata_ended_turn(&m, true, 384, 0, &work, &result));
+    metadata_fixture_close(&m);
+}
+
 int
 main(void)
 {
+    test_lftj_metadata_maximum();
+    test_lftj_metadata_original_boundaries();
+    test_lftj_metadata_ended_cleanup();
+    test_lftj_metadata_ended_last_reference();
+    test_lftj_metadata_ended_frame_refusal();
+    test_lftj_metadata_header_and_grammar();
+    test_lftj_metadata_binding_semantic_parity();
+    test_lftj_metadata_real_frame_shape();
+    test_lftj_metadata_checked_handoff_failures();
+    test_lftj_metadata_frame_output_alias();
+    test_lftj_metadata_funding_generation();
+#ifndef _WIN32
+    test_lftj_metadata_replaced_original_refusal();
+#endif
     test_scalar_initialization_frame_stops();
     test_lftj_scalar_cleanup_grants();
     test_lftj_success_retains_funding_class();

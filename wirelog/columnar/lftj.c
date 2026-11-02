@@ -517,7 +517,7 @@ void (*wl_columnar_lftj_test_attempt_checkpoint)(
 #endif
 
 int
-wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
+wl_columnar_lftj_metadata_header(const wl_plan_op_t *op,
     wl_col_session_t *session)
 {
     if (!op || op->op != WL_PLAN_OP_LFTJ || !op->opaque_data || !session)
@@ -530,6 +530,16 @@ wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
     if (meta->k < 2 || meta->k > WL_LFTJ_MAX_K || !meta->rel_names
         || !meta->key_cols)
         return EINVAL;
+    return 0;
+}
+
+int
+wl_columnar_ops_lftj_attempt_preflight(const wl_plan_op_t *op,
+    wl_col_session_t *session)
+{
+    int rc = wl_columnar_lftj_metadata_header(op, session);
+    if (rc) return rc;
+    const wl_plan_op_lftj_t *meta = op->opaque_data;
     for (uint32_t i = 0; i < meta->k; i++) {
         if (!meta->rel_names[i]) return EINVAL;
     }
@@ -594,6 +604,68 @@ wl_columnar_ops_lftj_attempt_begin(wl_columnar_lftj_attempt_t *attempt,
     attempt->attempt_id = attempt_id;
     attempt->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE;
     wl_columnar_memory_reservation_init(&attempt->scratch_reservation);
+    return 0;
+}
+
+/* The actual numeric parent completed every metadata/binding slice. PREFIX
+ * owns no child resource; INSTALL publishes identity only after real setup. */
+typedef char wl_columnar_lftj_prevalidated_prefix_bound[
+        (offsetof(wl_columnar_lftj_attempt_t,
+        retirement)+7u)/8u+100u <= 256u ? 1 : -1];
+int
+wl_columnar_lftj_attempt_begin_prevalidated(wl_columnar_lftj_attempt_t *attempt,
+    wl_columnar_eval_plan_numeric_attempt_t *owner, bool *done)
+{
+    if (!done) return EINVAL;
+    wl_columnar_lftj_begin_context_t context;
+    int rc = wl_columnar_eval_plan_numeric_lftj_begin_context_get(owner,
+            attempt, &context);
+    if (rc) return rc;
+    *done = false;
+    if (context.phase == WL_COLUMNAR_LFTJ_METADATA_PREFIX) {
+        rc = wl_evaluation_control_charge_attempt(context.control,
+                context.attempt_id, 256);
+        if (rc) return rc;
+        memset(attempt, 0, offsetof(wl_columnar_lftj_attempt_t, retirement));
+        owner->lftj_metadata.prefix_cleared = true;
+        owner->lftj_metadata.phase = WL_COLUMNAR_LFTJ_METADATA_INSTALL;
+        return 0;
+    }
+    if (context.phase != WL_COLUMNAR_LFTJ_METADATA_INSTALL
+        || !owner->lftj_metadata.prefix_cleared) return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(context.control,
+            context.attempt_id, 192);
+    if (rc) return rc;
+    attempt->retirement_initializer.identity = NULL;
+    attempt->retirement_initializer.parent = NULL;
+    attempt->retirement_initializer.retirement = NULL;
+    attempt->retirement_initializer.relation = NULL;
+    attempt->retirement_initializer.thread_valid = false;
+    attempt->retirement_initializer.busy = false;
+    attempt->retirement_initializer.phase =
+        WL_COLUMNAR_RELATION_SCALAR_INIT_INERT;
+    attempt->retirement_started = attempt->retirement_committed =
+        attempt->retirement_drained = false;
+    attempt->busy = false; attempt->thread_valid = true;
+#if defined(WL_HAVE_C11_THREADS)
+    attempt->owner_thread = thrd_current();
+#elif defined(_WIN32) || defined(_WIN64)
+    attempt->owner_thread = GetCurrentThreadId();
+#else
+    attempt->owner_thread = pthread_self();
+#endif
+    attempt->metadata = context.metadata;
+    attempt->frame = context.frame; attempt->numeric_owner = owner;
+    attempt->session = context.session; attempt->control = context.control;
+    attempt->registry = context.registry;
+    attempt->registry_count = context.registry_count;
+    attempt->private_bindings = context.bindings;
+    attempt->attempt_id = context.attempt_id;
+    attempt->phase = WL_COLUMNAR_LFTJ_ATTEMPT_RESOLVE;
+    wl_columnar_memory_reservation_init(&attempt->scratch_reservation);
+    owner->lftj_metadata.phase = WL_COLUMNAR_LFTJ_METADATA_CONSUMED;
+    attempt->identity = attempt; /* No hook between setup and authority. */
+    *done = true;
     return 0;
 }
 
