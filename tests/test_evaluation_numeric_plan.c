@@ -4727,11 +4727,13 @@ test_composed_private_input_binding(void)
     col_rel_t *join_registry[] = {public_b};
     composed_fixture(&f, private_a, 0);
     f.session.base.evaluation_control = f.operation;
-    static const char *const join_names[] = {"a", "b"};
-    col_rel_t *join_relations[] = {private_a, private_b};
+    /* Four genuine checked bindings exercise the largest static owner proof;
+     * extra names may alias live sources and do not replace the public shadow. */
+    static const char *const join_names[] = {"a", "b", "c", "d"};
+    col_rel_t *join_relations[] = {private_a, private_b, private_a, private_b};
     wl_columnar_eval_private_bindings_t join_bindings = {0};
     CHECK(!wl_columnar_eval_private_bindings_begin(&join_bindings, &f.session,
-        join, f.operation, f.operation_id, join_names, join_relations, 2));
+        join, f.operation, f.operation_id, join_names, join_relations, 4));
     f.session.rels = join_registry;
     f.session.nrels = 1;
     f.session.rel_cap = 1;

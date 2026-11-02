@@ -2881,13 +2881,15 @@ wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
     return rc;
 }
 
+/* The sole caller has completed the full composed attempt proof and set
+ * composed_busy immediately before entry, without a callback or yield.
+ * This lexical proof is never retained across a return. */
 static int
-wl_columnar_eval_plan_numeric_composed_attempt_step_body(
+wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_plan_composed_validate(record);
-    if (rc) return rc;
+    int rc = 0;
     if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
         && (record->join_host || record->join_host_admitted
         || record->join_host_governor)) {
@@ -3635,8 +3637,10 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     if (rc) return rc;
     if (record->composed_busy) return EBUSY;
     record->composed_busy = true;
-    rc = wl_columnar_eval_plan_numeric_composed_attempt_step_body(record,
-            funding, funding_id);
+    rc =
+        wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
+        record,
+        funding, funding_id);
     record->composed_busy = false; return rc;
 }
 
