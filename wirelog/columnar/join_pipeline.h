@@ -9,6 +9,11 @@
 
 /* First same-frame controlled producer-to-relation destination. Only the
  * authenticated materializing fallback owner may enter these private APIs. */
+/* Size observation only: never a mutable host loan or setup permission. */
+size_t wl_columnar_join_pipeline_numeric_host_size(void);
+int wl_columnar_join_pipeline_numeric_setup_step(
+    wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_join_pipeline_numeric_step(
     wl_columnar_eval_plan_numeric_attempt_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -36,7 +41,9 @@ int wl_columnar_join_pipeline_probe_source_owned(const void *,
     const col_rel_t *, const col_rel_t *);
 /* Exact direct consumer payment384 includes this host's dispatch; do not add
  * another1. Root and facade independently keep their existing384 fees. Other
- * phases admit1 plus their actual independently funded cleanup actions. */
+ * ready phases admit1 plus their actual independently funded cleanup actions.
+ * Bootstrap/unready setup uses numeric_setup_step after separate parent384,
+ * followed by independently paid setup actions; this quote is bypassed. */
 int wl_columnar_join_pipeline_numeric_funding_work(
     const wl_columnar_eval_plan_numeric_attempt_t *, uint64_t *);
 bool wl_columnar_join_pipeline_sink_authorized(const void *,

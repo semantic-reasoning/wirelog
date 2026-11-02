@@ -2317,6 +2317,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
     record->join_host_governor = NULL;
     record->join_host_admitted = record->join_host_committed = false;
     record->join_host_terminal = record->join_host_declined = false;
+    record->join_host_busy = false;
     wl_columnar_memory_reservation_init(&record->join_host_credit);
     record->preflight_depth = initial_depth;
     record->runtime_depth = initial_depth;
@@ -3050,6 +3051,7 @@ wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
         r->abort_supported = r->abort_requested = r->lftj_cleanup_authorized =
             false;
         r->join_host_terminal = r->join_host_declined = false;
+        r->join_host_busy = false;
         r->lftj_metadata_ended = r->lftj_metadata_dispatch = false;
         r->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_INERT;
         *result = saved;
@@ -3078,6 +3080,16 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
         if (!funding || funding == record->control || !funding_id
             || wl_evaluation_control_active_attempt_id(funding) != funding_id)
             return EINVAL;
+        if (!record->join_host || record->join_host_initialized_bytes
+            <= wl_columnar_join_pipeline_numeric_host_size()) {
+            rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+            if (rc) return rc;
+            record->pending_action = record->phase;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+            return wl_columnar_join_pipeline_numeric_setup_step(record,
+                       funding, funding_id);
+        }
         uint64_t host_work = 0;
         rc = wl_columnar_join_pipeline_numeric_funding_work(record, &host_work);
         if (rc) return rc;
@@ -3419,6 +3431,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
             || record->join_host_governor) return EBUSY;
         record->join_host_declined = false;
         record->join_host_terminal = record->join_host_committed = false;
+        record->join_host_busy = false;
         record->join_host_initialized_bytes = 0;
         if (record->phase ==
             WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_CONCAT_ADVANCE
@@ -3793,6 +3806,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     record->runtime_depth = 0;
     record->controlled_materialized_batch_fallback = false;
     record->join_host_terminal = record->join_host_declined = false;
+    record->join_host_busy = false;
     record->private_bindings = NULL;
     record->lftj_metadata_dispatch = false;
     record->abort_supported = false; record->abort_requested = false;

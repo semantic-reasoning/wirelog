@@ -2119,3 +2119,22 @@ exhausted, existing maintenance drains the retained transaction first. Pending
 calls keep the prior work-limit report; after cleanup the native call returns
 `EOVERFLOW` without creating or finishing another attempt. The previous
 completed report is preserved, and idle destruction is then allowed.
+
+Controlled materialized JOIN batch bootstrap pays separate metadata actions
+before stack verification, source lookup, governor selection, reservation,
+allocation and commit. Support-grant capacity is distinct from admitted work:
+normal ADVANCE capacity is2496, while each executed action charges only its own
+fee. A funding refusal keeps completed ownership and its real pending receipt;
+consume that receipt before retrying. Read-only bootstrap lookup may repeat on
+retry and is charged again to the same cumulative original attempt.
+
+Private initialization clears at most256 host bytes per original admission,
+then validates one plan classifier primitive per turn with a persistent private
+cursor. The original attempt is never reset to make this progress. Full binding
+and fresh stack/input proofs finish before the last ready-marker store. Existing
+lookup callback seams reauthenticate the actual active native frame before
+later ownership mutations. Before readiness, cleanup frees physical storage,
+finishes its credit and releases its governor under independent maintenance
+funding, retaining the first semantic error. The initialized pipeline and other
+remaining #2293 policy/transaction obligations keep their separate qualification
+requirements; these setup boundaries do not certify an entire containing call.

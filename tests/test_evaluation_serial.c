@@ -6858,7 +6858,7 @@ controlled_join_setup_grant_finished(const wl_col_session_t *session,
     CHECK(!wl_evaluation_control_report(grant, &report));
     if (action == WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE
         && report.consumed == 1792) {
-        CHECK(report.limit == 2240 && !protocol && !report.result);
+        CHECK(report.limit == 2496 && !protocol && !report.result);
         ++controlled_join_setup_grants;
     }
 }
@@ -6888,7 +6888,7 @@ controlled_setup_exact_limit(const wl_col_session_t *session,
             && child->private_bindings->dynamic_entries && limit == 3072
             && wl_columnar_session_observed_bindings_authorized(session,
             child->private_bindings));
-    else CHECK(!child->private_bindings && limit == 2240);
+    else CHECK(!child->private_bindings && limit == 2496);
     if (controlled_setup_injections) CHECK(controlled_setup_consumed_short);
     else CHECK(!wl_evaluation_control_test_active_consumed(child->control,
             child->attempt_id, &controlled_setup_original_work));
