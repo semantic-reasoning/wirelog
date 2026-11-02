@@ -5011,13 +5011,15 @@ static void cold_join_count_internal(void)
         if (fault == 3)wl_columnar_ops_test_reduce_fail_output_alloc = true;
         wl_columnar_memory_governor_t *g =
             wl_columnar_memory_governor_ref_get(f.governor);
-        uint64_t limit = atomic_load(&g->usable_bytes);
-        if (fault == 4)atomic_store(&g->usable_bytes, before);
+        uint64_t limit = atomic_load_explicit(&g->usable_bytes,
+                memory_order_acquire);
+        if (fault == 4)atomic_store_explicit(&g->usable_bytes, before,
+                memory_order_release);
         CHECK(col_eval_relation_plan(rp, &stack,
             s) == (fault == 0?EIO:fault == 4?ENOSPC:ENOMEM));
         CHECK(!stack.top && reserved(&f) == before &&
             wl_columnar_spill_store_bytes(s->spill_store) == disk);
-        atomic_store(&g->usable_bytes, limit);
+        atomic_store_explicit(&g->usable_bytes, limit, memory_order_release);
         wl_columnar_ops_test_reduce_fail_output_alloc = false;
         wl_columnar_ops_test_join_reduce_fail_after = -1;
         CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
@@ -5170,7 +5172,8 @@ static void join_group_deny_later(wl_col_session_t *s, uint64_t pairs)
     CHECK(pairs > 0);
     wl_columnar_memory_governor_t *g =
         wl_columnar_memory_governor_ref_get(s->memory_governor);
-    uint64_t available = atomic_load(&g->usable_bytes)-
+    uint64_t available = atomic_load_explicit(&g->usable_bytes,
+            memory_order_acquire)-
         wl_columnar_memory_reserved(g);
     wl_columnar_memory_reservation_init(&join_group_pressure);
     CHECK(wl_columnar_memory_reserve(g, available, &join_group_pressure));
