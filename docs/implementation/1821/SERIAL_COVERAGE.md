@@ -969,9 +969,10 @@ executes it. Successful RELEASE remains outside the new cleanup class.
 This caller set alone does not cover containing session staging, recursive-round,
 original CLAIMS or transaction-disposal initialization. The session protocol
 below supplies those distinct ownership and rollback transitions.
-The existing raw LFTJ metadata preflight's bounded-count loop is also retained
-for the final source audit; this initializer change does not certify that
-loop's full caller envelope. Prepared unary publication, registered cache
+The raw LFTJ metadata preflight remains a compatibility helper; the actual
+controlled host uses the separate metadata cursor documented below rather than
+charging its whole scan inside a fixed constructor envelope. Prepared unary
+publication, registered cache
 ownership/exclusion/insertion, strict/cap/shared policy and observed/configured
 successor qualification remain prerequisites for the completed grouped PR.
 
@@ -1126,3 +1127,50 @@ most40 within its genuine prepaid128. Existing disposal leaves and allocator,
 control/native runtime and registered cleanup boundaries retain their own
 contracts; none of these inventories claims the entire disposal/STEP is128
 or256. Test-only fixed counter observation has no production tariff or ABI.
+
+
+### Bounded LFTJ metadata validation and stopped-parent cleanup
+
+The actual numeric host validates LFTJ metadata before acquiring child resources.
+HEADER, one input-name check per NAMES action, and VALIDATED each pay128.
+All names, including input63 at the maximum k64, are checked before source lookup,
+preserving raw error precedence. After whole-plan preflight, BIND_HEADER,
+one BIND_ENTRY, and BIND_FINAL pay192; each prior-name pair pays128.
+The dynamic session binding path uses its actual registered generation and a
+separate192 validation. These actions preserve the existing outer host proof
+and its separate384 charge; that charge does not subsidize metadata work.
+
+The checked constructor authenticates the exact live numeric/frame/native owner,
+operation, captured metadata header and binding generation without scanning
+names again. PREFIX pays256 for its fixed proof and1128-byte prefix clear;
+INSTALL pays192 for binding the initialized child, with identity installed last.
+The module sets a dispatch marker only around the callback-free constructor,
+after the metadata checkpoint. Reentry from that checkpoint, copied parents,
+wrong targets and changed headers cannot acquire the child or spend original
+work. Legacy direct constructors retain their compatibility preflight.
+
+A genuine completed CANCEL/WORK original can leave validated metadata before
+any child exists. The dedicated stop-only cleanup preserves the actual completed
+report and requires distinct live funding. It pays192, rechecks original report
+and funding generation after its last hook, excludes output overlapping the
+whole parent or actual frame, verifies actual empty frame state, then clears
+only the fixed metadata proof. A separately funded384 ACK performs normal
+frame release before dropping the parent's final original-control reference.
+Neither action revives the original attempt or relaxes normal private-binding
+validation. Active successors or replaced completed reports refuse cleanup.
+
+The numeric suite exercises all64 names, null tails and source-error priority,
+all four static bindings/six pairs, exact/one-short action grants,11 genuine
+metadata stop phases under CANCEL and WORK, real copied/native/reentrant
+refusal, sole-reference ACK, occupied frame and hook-injected payload refusal.
+Actual stack.top and result.seg_count output loans reject before debit and
+remain usable for valid retry. A funding hook genuinely finishes/resets/begins
+a new attempt; the old generation rejects without debiting its successor.
+The host domains group additionally executes a k64 owned-plan fixture and a
+real observed dynamic binding registry larger than the static four-entry limit.
+The k64 fixture deliberately edits owned plan metadata before session binding;
+it is not evidence that the compiler naturally emits a64-input operator.
+
+This closes the metadata caller-scan gap only. Prepared unary publication,
+registered cache ownership/insertion, strict/cap/shared policy and complete
+observed/configured successor qualification remain separate bundle obligations.

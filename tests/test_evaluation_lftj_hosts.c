@@ -839,6 +839,208 @@ test_partial_append(void)
     }
 }
 
+static wl_session_t *metadata_maximum_session;
+static unsigned metadata_maximum_names, metadata_maximum_installs;
+
+static void
+metadata_maximum_host_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r)
+{
+    CHECK(metadata_maximum_session &&
+        r->session == (wl_col_session_t *)metadata_maximum_session
+        && r->composed_busy && !wl_columnar_eval_stack_numeric_owner(r->frame,
+        r));
+    if (r->lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_NAMES) {
+        CHECK(r->lftj_metadata.k == 64 &&
+            r->lftj_metadata.name_index == metadata_maximum_names);
+        ++metadata_maximum_names;
+    }
+    if (r->lftj_metadata.phase == WL_COLUMNAR_LFTJ_METADATA_INSTALL) {
+        CHECK(r->lftj_metadata.prefix_cleared && !r->lftj.identity);
+        ++metadata_maximum_installs;
+    }
+}
+
+static void
+test_session_metadata_maximum(void)
+{
+    /* Enlarge a valid internal plan before any session borrows it. This is
+     * actual session hosting, not a claim that the optimizer emits64 sources. */
+    const char *text = ".decl a(x:int64)\n.decl b(x:int64)\n.decl c(x:int64)\n"
+        ".decl output(x:int64)\noutput(x) :- a(x), b(x), c(x).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *head = &plan->strata[0].relations[0];
+    CHECK(head->ops[0].op == WL_PLAN_OP_LFTJ);
+    wl_plan_op_lftj_t *metadata = head->ops[0].opaque_data;
+    CHECK(metadata && metadata->k == 3);
+    char **names = calloc(64, sizeof(*names));
+    uint32_t *keys = calloc(64, sizeof(*keys));
+    CHECK(names && keys);
+    for (unsigned i = 0; i < 64; ++i) {
+        const char *name = metadata->rel_names[i % 3];
+        names[i] = malloc(strlen(name) + 1); CHECK(names[i]);
+        memcpy(names[i], name, strlen(name) + 1);
+        keys[i] = metadata->key_cols[i % 3];
+    }
+    for (uint32_t i = 0; i < metadata->k; ++i) free(metadata->rel_names[i]);
+    free(metadata->rel_names); free(metadata->key_cols);
+    metadata->rel_names = names; metadata->key_cols = keys; metadata->k = 64;
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_columnar_memory_resolution_t resolution =
+    {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+     .usable_bytes =
+         WL_COLUMNAR_MEMORY_MIN_BUDGET,
+     .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+    wl_columnar_memory_governor_ref_t *g =
+        wl_columnar_memory_governor_ref_create(&resolution); CHECK(g);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.evaluation_control = control; options.memory_governor = g;
+    wl_session_t *session = NULL, *raw = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session));
+    CHECK(!wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    const int64_t values[] = {3, 1, 2}; const char *sources[] = {"a", "b", "c"};
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(!wl_session_insert(session, sources[i], values, 3, 1));
+        CHECK(!wl_session_insert(raw, sources[i], values, 3, 1));
+    }
+    metadata_maximum_session = session;
+    metadata_maximum_names = metadata_maximum_installs = 0;
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+        metadata_maximum_host_checkpoint;
+    CHECK(!finish_step(session));
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_maximum_session = NULL;
+    CHECK(metadata_maximum_names == 64 && metadata_maximum_installs == 1);
+    CHECK(!wl_session_step(raw));
+    const col_rel_t *actual = session_find_rel((wl_col_session_t *)session,
+            "output");
+    const col_rel_t *expected = session_find_rel((wl_col_session_t *)raw,
+            "output");
+    CHECK(actual && expected && actual->ncols == 1 && expected->ncols == 1
+        && actual->nrows == 3 && expected->nrows == 3);
+    for (unsigned row = 0; row < 3;
+        ++row) CHECK(actual->columns[0][row] == (int64_t)row + 1
+            && actual->columns[0][row] == expected->columns[0][row]);
+    for (unsigned i = 0; i < 3; ++i) {
+        const col_rel_t *input = session_find_rel((wl_col_session_t *)session,
+                sources[i]);
+        CHECK(input && input->nrows == 3);
+        for (unsigned row = 0; row < 3;
+            ++row) CHECK(input->columns[0][row] == values[row]);
+    }
+    CHECK(!wl_session_try_destroy(&session) && !wl_session_try_destroy(&raw));
+    wl_evaluation_control_release(control); wl_plan_free(plan);
+    wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g))
+        && wl_columnar_memory_governor_ref_is_sole(g));
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+static wl_session_t *metadata_dynamic_session;
+static unsigned metadata_dynamic_hits, metadata_dynamic_events;
+static unsigned metadata_dynamic_masks[2];
+
+static void
+metadata_dynamic_checkpoint(wl_columnar_eval_plan_numeric_attempt_t *r)
+{
+    if (r->lftj_metadata.phase !=
+        WL_COLUMNAR_LFTJ_METADATA_BIND_DYNAMIC) return;
+    CHECK(metadata_dynamic_session &&
+        r->session == (wl_col_session_t *)metadata_dynamic_session
+        && r->private_bindings && r->private_bindings->dynamic_entries
+        && r->private_bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+        && r->lftj_metadata.binding_count == r->private_bindings->count
+        && r->lftj_metadata.binding_generation ==
+        r->private_bindings->generation
+        && wl_columnar_session_observed_bindings_authorized(r->session,
+        r->private_bindings));
+    ++metadata_dynamic_hits;
+}
+
+static void
+metadata_dynamic_delta(const char *name, const int64_t *row, uint32_t width,
+    int diff, void *data)
+{
+    (void)data;
+    CHECK(metadata_dynamic_session && width == 1 && diff == 1 && row[0] >= 1 &&
+        row[0] <= 3);
+    unsigned head = !strcmp(name, "one") ? 0 : !strcmp(name, "two") ? 1 : 2;
+    CHECK(head < 2 &&
+        !(metadata_dynamic_masks[head] & (1u << (unsigned)row[0])));
+    metadata_dynamic_masks[head] |= 1u << (unsigned)row[0];
+    ++metadata_dynamic_events;
+    CHECK(session_find_rel((wl_col_session_t *)metadata_dynamic_session, "one")
+        && session_find_rel((wl_col_session_t *)metadata_dynamic_session,
+        "two"));
+}
+
+static void
+test_session_metadata_dynamic_bindings(void)
+{
+    const char *text = ".decl a(x:int64)\n.decl b(x:int64)\n.decl c(x:int64)\n"
+        ".decl one(x:int64)\n.decl two(x:int64)\n"
+        "one(x) :- a(x), b(x), c(x).\ntwo(x) :- a(x), x > 1.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    wl_evaluation_control_t *control = NULL;
+    CHECK(!wl_evaluation_control_create(0, &control));
+    wl_columnar_memory_resolution_t resolution =
+    {.budget_bytes = WL_COLUMNAR_MEMORY_MIN_BUDGET,
+     .usable_bytes =
+         WL_COLUMNAR_MEMORY_MIN_BUDGET,
+     .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING};
+    wl_columnar_memory_governor_ref_t *g =
+        wl_columnar_memory_governor_ref_create(&resolution); CHECK(g);
+    wl_session_options_t options; wl_session_options_init(&options);
+    options.evaluation_control = control; options.memory_governor = g;
+    wl_session_t *session = NULL, *raw = NULL;
+    CHECK(!wl_session_create_with_options(wl_backend_columnar(), plan, 1,
+        &options, &session)
+        && !wl_session_create(wl_backend_columnar(), plan, 1, &raw));
+    const int64_t rows[] = {3, 1, 2}; const char *names[] = {"a", "b", "c"};
+    for (unsigned i = 0; i < 3; ++i) {
+        CHECK(!wl_session_insert(session, names[i], rows, 3, 1)
+            && !wl_session_insert(raw, names[i], rows, 3, 1));
+    }
+    metadata_dynamic_session = session;
+    metadata_dynamic_hits = metadata_dynamic_events = 0;
+    metadata_dynamic_masks[0] = metadata_dynamic_masks[1] = 0;
+    wl_session_set_delta_cb(session, metadata_dynamic_delta, NULL);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint =
+        metadata_dynamic_checkpoint;
+    int rc = finish_step(session);
+    if (rc) fprintf(stderr, "dynamic metadata session: %d\n", rc);
+    CHECK(!rc && metadata_dynamic_hits == 1 && metadata_dynamic_events == 5
+        && metadata_dynamic_masks[0] == 14 && metadata_dynamic_masks[1] == 12);
+    wl_columnar_eval_plan_test_lftj_metadata_checkpoint = NULL;
+    metadata_dynamic_session = NULL;
+    CHECK(!wl_session_step(raw));
+    for (unsigned head = 0; head < 2; ++head) {
+        const char *name = head ? "two" : "one";
+        const col_rel_t *actual = session_find_rel((wl_col_session_t *)session,
+                name);
+        const col_rel_t *expected = session_find_rel((wl_col_session_t *)raw,
+                name);
+        CHECK(actual && expected && actual->nrows == (head ? 2u : 3u)
+            && actual->nrows == expected->nrows && actual->ncols == 1 &&
+            expected->ncols == 1);
+        for (unsigned r = 0; r < actual->nrows; ++r)
+            CHECK(actual->columns[0][r] == expected->columns[0][r]);
+    }
+    CHECK(!wl_session_try_destroy(&session) && !wl_session_try_destroy(&raw));
+    wl_evaluation_control_release(control); wl_plan_free(plan);
+    wirelog_program_free(program);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(g))
+        && wl_columnar_memory_governor_ref_is_sole(g));
+    wl_columnar_memory_governor_ref_release(g);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -849,6 +1051,8 @@ main(int argc, char **argv)
     }
     if (argc == 1 || !strcmp(argv[1], "domains")) {
         test_session_initial();
+        test_session_metadata_maximum();
+        test_session_metadata_dynamic_bindings();
         test_session_domains();
     }
     if (argc == 1 || !strcmp(argv[1], "recovery")) {
