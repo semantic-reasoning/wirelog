@@ -110,16 +110,31 @@ typedef struct wl_work_queue wl_work_queue_t;
  *               power-of-two ring capacity.
  *
  * Create a work queue backed by a fixed-size thread pool.
- * Worker threads are created immediately and block until work is
- * submitted.
+ * Worker threads are created immediately and block until a batch is
+ * dispatched by wl_workqueue_dispatch() or wl_workqueue_wait_all().  If
+ * the OS refuses a thread after the first, the pool keeps the threads it
+ * created; wl_workqueue_thread_count() reports how many.
  *
  * Returns:
  *   non-NULL: Opaque queue handle (caller must destroy with
  *             wl_workqueue_destroy).
- *   NULL:     Allocation or thread creation failure.
+ *   NULL:     Failure, for example @num_workers out of range, an
+ *             allocation failure, or no thread could be created.
  */
 wl_work_queue_t *
 wl_workqueue_create(uint32_t num_workers);
+
+/**
+ * wl_workqueue_thread_count:
+ * @wq: Work queue handle.  Must not be NULL.
+ *
+ * The number of worker threads in the pool, which is below the
+ * @num_workers passed to wl_workqueue_create() when the OS refused some.
+ * At most this many submitted items run on worker threads at once;
+ * wl_workqueue_drain() also runs items on its caller's thread.
+ */
+uint32_t
+wl_workqueue_thread_count(const wl_work_queue_t *wq);
 
 /**
  * wl_workqueue_submit:

@@ -554,6 +554,15 @@ and operator staging use governor reservations; remaining LFTJ output/source
 boundaries, auxiliary metadata, and eval-entry segment allocations remain
 follow-up work tracked by #1978.
 
+The recursive TDD path's batch channel (#1373) derives its capacity from
+the budget: an eighth of an enforcing budget, clamped to [4 MiB, 1 GiB], or
+256 MiB when no budget is enforced. `WIRELOG_TDD_CHANNEL_BYTES=<bytes>`
+overrides it with a positive decimal that fits in 64 bits; any other value
+is ignored. The capacity bounds the transport bytes queued or reserved at
+once, apart from one batch larger than the capacity, which is admitted into
+an empty channel. Producers wait for space while the coordinator takes
+batches; the batches it has taken are not counted against the capacity.
+
 The ledger's RELATION worker-share hint can still trigger join backpressure
 at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also
 admits covered allocations and reports refusals upstream. The legacy

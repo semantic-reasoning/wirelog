@@ -142,11 +142,46 @@ tdd_reserve_channel(wl_col_session_t *coord, uint32_t workers,
         ? EOVERFLOW : EBUSY;
 }
 
+/* Default TDD channel capacities (#1373). */
+#define TDD_CHANNEL_MIN_BYTES (UINT64_C(4) * 1024 * 1024)
+#define TDD_CHANNEL_MAX_BYTES (UINT64_C(1024) * 1024 * 1024)
+#define TDD_CHANNEL_ADVISORY_BYTES (UINT64_C(256) * 1024 * 1024)
+
+/*
+ * The byte capacity of a stratum's channel.  WIRELOG_TDD_CHANNEL_BYTES
+ * overrides it when the whole value is a positive decimal integer that
+ * fits in 64 bits; any other value, including a sign or whitespace, is
+ * ignored.  Otherwise an enforcing governor gives an eighth of its budget,
+ * clamped to [4 MiB, 1 GiB], and anything else 256 MiB.  A budget resolved
+ * from the environment or the host is at least 256 MiB, which keeps the
+ * cap at 32 MiB or more; only an injected governor reaches the 4 MiB floor.
+ */
+static uint64_t
+tdd_channel_cap_bytes(wl_col_session_t *coord)
+{
+    const char *env = getenv("WIRELOG_TDD_CHANNEL_BYTES");
+    if (env && env[0] >= '0' && env[0] <= '9') {
+        char *endp = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(env, &endp, 10);
+        if (*endp == '\0' && errno != ERANGE && value > 0)
+            return (uint64_t)value;
+    }
+    const wl_columnar_memory_governor_t *governor = coord->memory_governor
+        ? wl_columnar_memory_governor_ref_get(coord->memory_governor) : NULL;
+    if (!governor || governor->mode != WL_COLUMNAR_MEMORY_MODE_ENFORCING)
+        return TDD_CHANNEL_ADVISORY_BYTES;
+    uint64_t cap = governor->budget_bytes / 8u;
+    if (cap < TDD_CHANNEL_MIN_BYTES)
+        return TDD_CHANNEL_MIN_BYTES;
+    return cap > TDD_CHANNEL_MAX_BYTES ? TDD_CHANNEL_MAX_BYTES : cap;
+}
+
 /*
  * Create the stratum's channel and its side buffers under one governed
  * reservation.  The coordinator pumps the channel while the workers
- * produce; the capacity is unbounded, so a reservation never waits for
- * space.
+ * produce, so a producer whose batch does not fit waits for space that the
+ * pump frees; see tdd_channel_cap_bytes() for the capacity.
  */
 static int
 tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
@@ -164,7 +199,7 @@ tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
     wl_tdd_batch_t **lists = (wl_tdd_batch_t **)calloc(
         list_count ? list_count : 1u, sizeof(*lists));
     wl_tdd_channel_t *ch = lists
-        ? wl_tdd_channel_create(workers, UINT64_MAX,
+        ? wl_tdd_channel_create(workers, tdd_channel_cap_bytes(coord),
             coord->memory_governor
             ? wl_columnar_memory_governor_ref_get(coord->memory_governor)
             : NULL, coord)
@@ -7756,14 +7791,18 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     coord->tdd_channel, &coord->mem_ledger,
                     coord->tdd_channel_lists, W, nrels,
                     &coord->tdd_channel_discard, &delivered);
-                /* Collect ends the round before it returns, except on
-                 * invalid arguments; the cancel covers that case. */
+                /* Collect ends the round before it returns, with two
+                 * exceptions: invalid arguments, which this cancel covers,
+                 * and a second pump error after collect has cancelled the
+                 * channel itself, which leaves it cancelled already. */
                 if (consumer_rc != 0)
                     wl_tdd_channel_cancel(coord->tdd_channel, consumer_rc);
             }
-            /* Only a missing queue refuses the dispatch or the join.  A
-             * refused dispatch ran nothing, so after the cancel the drain
-             * runs each task, which closes its lane without running. */
+            /* Only a NULL queue refuses the dispatch or the join, and a
+             * NULL queue has already failed the first submit above, so
+             * with the current workqueue neither refusal is reached.  The
+             * branch below stays as a guard: it cancels the channel before
+             * the drain (I1), and the drain of a NULL queue runs nothing. */
             int wait_rc = dispatched ? wl_workqueue_wait_all(coord->wq) : -1;
             owner_dispatch_quiesced = wait_rc == 0;
             if (wait_rc != 0) {
@@ -8016,8 +8055,9 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
 done:
     /* An owner lifetime record owns the channel's batches and the slot
      * matrix across a refused checked destroy: its retry captures what the
-     * channel still holds, queued or listed, onto its retained list before
-     * disposing anything, and keeps whatever a checked destroy refuses. */
+     * channel still holds, queued, on the discard list or on a consumer
+     * list, onto its retained list before disposing anything, and keeps
+     * whatever a checked destroy refuses. */
     if (coord->tdd_owner_lifetime) {
         coord->tdd_owner_lifetime->evaluation_active = false;
         if (owner_dispatch_quiesced) {

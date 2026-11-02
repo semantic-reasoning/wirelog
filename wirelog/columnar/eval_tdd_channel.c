@@ -394,7 +394,7 @@ wl_columnar_eval_tdd_coalesce_slot(wl_col_session_t *coord,
 
 #ifdef WL_SESSION_TEST_HOOKS
 int (*wl_columnar_eval_test_channel_reserve)(wl_col_session_t *worker,
-    uint32_t rel_idx);
+    uint32_t rel_idx, uint32_t rows);
 #endif
 
 /* The bytes a delta charges against the channel: its transport bytes,
@@ -423,7 +423,8 @@ wl_columnar_eval_tdd_channel_reserve_delta(wl_col_session_t *sess,
     int rc = 0;
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_eval_test_channel_reserve)
-        rc = wl_columnar_eval_test_channel_reserve(sess, rel_idx);
+        rc = wl_columnar_eval_test_channel_reserve(sess, rel_idx,
+                delta->nrows);
 #endif
     if (rc == 0)
         rc = tdd_delta_charge(delta, &charge);

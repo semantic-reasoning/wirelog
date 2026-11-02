@@ -729,9 +729,11 @@ test_tdd_channel_split_exe = executable(
 test('tdd_channel_split', test_tdd_channel_split_exe, suite: 'unit',
      timeout: 120)
 
-# Issue #1373: how a TDD round ends at session level -- rc selection and
-# the teardown cancel of a round the driver left open (I1).  The channel's
-# test hooks give the hooks a condition-based wait.
+# Issue #1373: TDD rounds at session level -- the channel capacity table,
+# backpressure and skew under a tiny capacity, cancellation with waiting
+# producers, rc selection, and the teardown cancel of a round the driver
+# left open (I1).  The channel's test hooks give the hooks a
+# condition-based wait.
 test_tdd_channel_round_exe = executable(
   'test_tdd_channel_round', files('test_tdd_channel_round.c'),
   include_directories: [wirelog_inc, wirelog_src_inc],
