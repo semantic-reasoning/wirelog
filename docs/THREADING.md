@@ -339,8 +339,8 @@ allocation.
 |---|---|---|---|---|
 | `join.c:wl_columnar_join_original_is_accounted` | `source->retained_reservation.state` | `atomic_load_explicit` | `acquire` | Observe the committed reservation before accepting the existing relation as an accounted single-owner fallback; pairs with the governor's release publication |
 | `join.c:col_join_pair_cache_append` | `wl_columnar_join_test_fail_pair_commit` | `atomic_exchange_explicit` | `acq_rel` | Consume the one-shot test-only pair-commit failure flag without racing its setter |
-| `join.c:wl_columnar_join_output_limit_reached` | `sess->join_output_shared_count` | `atomic_load_explicit` | `relaxed` | Observe the committed-row counter shared by JOIN workers; counter only, no payload publication |
-| `join.c:wl_columnar_join_output_limit_reached#2` | `sess->join_output_shared_count` | `atomic_compare_exchange_weak_explicit` | `relaxed` / `relaxed` | Add newly committed rows, saturating at UINT64_MAX without exposing wraparound; counter only, no payload publication |
+| `join.c:wl_columnar_join_output_count_limit` | `sess->join_output_shared_count` | `atomic_load_explicit` | `relaxed` | Observe the committed-row counter shared by JOIN workers; counter only, no payload publication |
+| `join.c:wl_columnar_join_output_count_limit#2` | `sess->join_output_shared_count` | `atomic_compare_exchange_weak_explicit` | `relaxed` / `relaxed` | Add newly committed rows, saturating at UINT64_MAX without exposing wraparound; counter only, no payload publication |
 | `join.c:col_join_keyed_count_worker_fn` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll; eventual visibility is acceptable for cooperative cancel |
 | `join.c:col_join_keyed_count_worker_fn#2` | `*ctx->stop` | `atomic_load_explicit` | `relaxed` | Cancellation poll |
 | `join.c:col_join_keyed_count_worker_fn#3` | `*ctx->shared_count` | `atomic_fetch_add_explicit` | `relaxed` | Cross-worker counter increment |

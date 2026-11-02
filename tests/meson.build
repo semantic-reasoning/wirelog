@@ -5773,6 +5773,11 @@ foreach workload : ['join', 'aggregate', 'composite']
     args: ['--budget-' + workload], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
     suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
 endforeach
+# Large JOIN-result floor experiment, separate from repeated regular/env runs.
+test('wirelog_advanced_spill_budget_join_aggregate', test_wirelog_advanced_spill_exe,
+  args: ['--budget-join-aggregate'], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+  suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
+
 
 
 # Issue #841: umbrella public API symbols are real linkable/runtime
@@ -6678,6 +6683,11 @@ foreach workload : ['join', 'aggregate', 'composite']
     args: ['--budget-' + workload], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
     suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
 endforeach
+# Large JOIN-result floor experiment, separate from repeated regular/env runs.
+test('session_cold_relation_budget_join_aggregate', test_session_cold_relation_exe,
+  args: ['--budget-join-aggregate'], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+  suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
+
 
 # #2294/#2295: generated controlled STEP/SNAPSHOT lifecycle composition.
 test_evaluation_lifecycle_exe = executable(

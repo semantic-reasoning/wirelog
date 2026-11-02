@@ -94,4 +94,47 @@ static void wl_test_cold_group_observe(const char *name, const int64_t *row,
     *seen |= 1u << row[0];
 }
 
+/* A small pair of 65-lane sources expands to 260 MiB of raw JOIN lanes.
+* The actual generated JOIN has no projection; four COUNT groups fit. */
+#define WL_TEST_JOIN_REDUCE_WIDTH 65u
+#define WL_TEST_JOIN_REDUCE_ROWS 512u
+#define WL_TEST_JOIN_REDUCE_CHUNK 32u
+static char *wl_test_join_reduce_query(void)
+{
+    size_t remaining = 32768; char *text = malloc(remaining); assert(text);
+    char *cursor = text;
+    for (unsigned side = 0; side < 2; side++) {
+        wl_test_cold_text(&cursor, &remaining, ".decl %s(", side?"b":"a");
+        for (unsigned i = 0; i < WL_TEST_JOIN_REDUCE_WIDTH; i++)
+            wl_test_cold_text(&cursor, &remaining, "%sc%u:int64", i?",":"", i);
+        wl_test_cold_text(&cursor, &remaining, ")\n");
+    }
+    wl_test_cold_text(&cursor, &remaining,
+        ".decl result(g:int64,n:int64)\nresult(g,count(v)) :- ");
+    for (unsigned side = 0; side < 2; side++) {
+        wl_test_cold_text(&cursor, &remaining, "%s(k,%s", side?",b":"a",
+            side?"v":"g");
+        for (unsigned i = 2; i < WL_TEST_JOIN_REDUCE_WIDTH; i++)
+            wl_test_cold_text(&cursor, &remaining, ",%c%u", side?'y':'x', i);
+        wl_test_cold_text(&cursor, &remaining, ")");
+    }
+    wl_test_cold_text(&cursor, &remaining, ".\n"); return text;
+}
+static void wl_test_join_reduce_rows(int64_t *rows, unsigned first)
+{
+    for (unsigned i = 0; i < WL_TEST_JOIN_REDUCE_CHUNK; i++)
+        for (unsigned c = 0; c < WL_TEST_JOIN_REDUCE_WIDTH; c++)
+            rows[(size_t)i*WL_TEST_JOIN_REDUCE_WIDTH+c] = c == 0?7:c ==
+                1?(first+i)%4:(int64_t)(first+i+c);
+}
+static void wl_test_join_reduce_observe(const char *name, const int64_t *row,
+    uint32_t cols, void *context)
+{
+    if (strcmp(name, "result"))return;
+    unsigned *seen = context; assert(cols == 2 && row[0] >= 0 && row[0] < 4);
+    assert(row[1] ==
+        (int64_t)WL_TEST_JOIN_REDUCE_ROWS*WL_TEST_JOIN_REDUCE_ROWS/4);
+    assert(!(*seen & (1u<<row[0]))); *seen |= 1u<<row[0];
+}
+
 #endif

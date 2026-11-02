@@ -6,6 +6,9 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- Cold JOIN streams support grouped COUNT and direct INT64 MIN/MAX, with
+  admitted batch/group floors and a same-budget materialization control (#1372).
+
 - Global COUNT streams one ordinary cold JOIN through direct MAP/FILTER stages,
   preserving raw pair limits without retaining the pair relation (#1372).
 
