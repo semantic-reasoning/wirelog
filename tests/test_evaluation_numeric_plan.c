@@ -5735,6 +5735,8 @@ composed_raw_parity(fixture_t *f, const wl_plan_relation_t *body,
         CHECK(actual->items[0].rel->run_count == stack.items[0].rel->run_count);
     }
     CHECK(!eval_stack_drain(&stack));
+    col_session_free_delta_arrangements(&raw);
+    CHECK(!raw.darr_entries && !raw.darr_count && !raw.darr_cap);
     for (uint32_t i = 0; i < raw.arr_count; ++i) {
         CHECK(!raw.arr_entries[i].pin_count);
         free(raw.arr_entries[i].rel_name); free(raw.arr_entries[i].key_cols);
@@ -6587,6 +6589,146 @@ test_composed_domain_and_repeated_source(void)
         else CHECK(result->items[0].rel->timestamps);
         composed_close(&f);
     }
+}
+
+static fixture_t *pipeline_lookup_fixture;
+static wl_columnar_eval_stack_cleanup_frame_t *pipeline_lookup_nested;
+static unsigned pipeline_lookup_ordinal, pipeline_lookup_target,
+    pipeline_lookup_phase, pipeline_lookup_hits;
+static bool pipeline_lookup_cancel;
+
+static void
+pipeline_lookup_checkpoint(wl_evaluation_control_t *control, unsigned phase,
+    uint64_t value)
+{
+    fixture_t *f = pipeline_lookup_fixture;
+    CHECK(f && control == f->operation);
+    if (phase == 5 && !value) ++pipeline_lookup_ordinal;
+    if (pipeline_lookup_hits ||
+        pipeline_lookup_ordinal != pipeline_lookup_target
+        || phase != pipeline_lookup_phase) return;
+    /* This genuine nested frame keeps the original frame/storage alive while
+     * changing which frame is active. No ownership fields are assigned. */
+    CHECK(!wl_columnar_eval_stack_cleanup_begin(&f->session,
+        &pipeline_lookup_nested));
+    CHECK(f->session.cleanup_active == pipeline_lookup_nested);
+    ++pipeline_lookup_hits;
+    if (pipeline_lookup_cancel) wl_evaluation_control_request_cancel(control);
+}
+
+static col_rel_t *
+pipeline_lookup_right(wl_columnar_memory_governor_ref_t *governor,
+    const char *name, int64_t value)
+{
+    col_rel_t *right = NULL;
+    CHECK(!wl_columnar_relation_new_auto_governed(name, 2, 1, false,
+        governor, &right));
+    wirelog_column_type_t types[] = {WIRELOG_TYPE_INT64, WIRELOG_TYPE_INT64};
+    CHECK(!col_rel_set_column_types(right, types, 2));
+    int64_t row[] = {1, value};
+    CHECK(!col_rel_append_row(right, row));
+    return right;
+}
+
+static void
+test_composed_pipeline_lookup_lineage(void)
+{
+    static const char text[] =
+        ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+        ".decl output(k:int64,x:int64,k2:int64,y:int64)\n"
+        "output(k,x,k,y) :- a(k,x), b(k,y), x < y.\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(text, &error);
+    wl_plan_t *plan = NULL;
+    CHECK(program && !wl_plan_from_program(program, &plan));
+    const wl_plan_relation_t *parsed = composed_find_relation(plan, "output");
+    CHECK(parsed && parsed->op_count == 5);
+    for (unsigned which = 1; which <= 2; ++which)
+        for (unsigned seam = 0; seam < 3; ++seam)
+            for (unsigned cancel = 0; cancel < (seam ? 2u : 1u); ++cancel) {
+                wl_plan_op_t ops[5]; memcpy(ops, parsed->ops, sizeof(ops));
+                ops[1].delta_mode = which == 1 ? WL_DELTA_FORCE_FULL
+                    : WL_DELTA_FORCE_DELTA;
+                wl_plan_relation_t body = *parsed; body.ops = ops;
+                const double values[] = {1};
+                col_rel_t *left = composed_source("a", 2, values, 1, false);
+                fixture_t f; composed_fixture(&f, left, 0);
+                wl_columnar_memory_resolution_t resolution = {
+                    .budget_bytes = 1u << 24, .usable_bytes = 1u << 24,
+                        .mode = WL_COLUMNAR_MEMORY_MODE_ENFORCING
+                };
+                wl_columnar_memory_governor_ref_t *governor =
+                    wl_columnar_memory_governor_ref_create(&resolution);
+                CHECK(governor);
+                col_rel_t *right = pipeline_lookup_right(governor, "b", 3);
+                col_rel_t *delta = pipeline_lookup_right(governor, "$d$b", 4);
+                col_rel_t *registry[] = {left, right, delta};
+                f.session.rels = registry;
+                f.session.nrels = f.session.rel_cap = 3;
+                f.session.join_batch_bytes = 224;
+                CHECK(!f.session.memory_governor && !left->memory_governor);
+                CHECK(
+                    !
+                    wl_columnar_eval_plan_numeric_composed_attempt_begin_batch_fallback
+                    (
+                        &f.record, &body, 0, body.op_count, f.frame, &f.session,
+                        0,
+                        f.operation, f.operation_id, f.funding, f.funding_id));
+                for (unsigned turns = 0; f.record.phase !=
+                    WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH; ++turns) {
+                    CHECK(turns < 1000); composed_action(&f);
+                }
+                CHECK(!f.record.join_host && !f.record.private_bindings);
+                uint64_t reserved = wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(governor));
+                if (seam) {
+                    pipeline_lookup_fixture = &f;
+                    pipeline_lookup_nested = NULL;
+                    pipeline_lookup_target = which;
+                    pipeline_lookup_phase = seam == 1 ? 5 : 6;
+                    pipeline_lookup_ordinal = pipeline_lookup_hits = 0;
+                    pipeline_lookup_cancel = cancel != 0;
+                    wl_columnar_join_test_attempt_checkpoint =
+                        pipeline_lookup_checkpoint;
+                    composed_action(&f);
+                    wl_columnar_join_test_attempt_checkpoint = NULL;
+                    CHECK(pipeline_lookup_hits == 1 && pipeline_lookup_nested
+                        && f.record.join_host_terminal && !f.record.join_host
+                        && !f.record.join_host_governor
+                        && !f.record.join_host_admitted
+                        && !f.record.join_host_committed);
+                    CHECK(f.record.phase ==
+                        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                        && f.record.child_status.semantic_result == (cancel
+                        ? WL_EVALUATION_CONTROL_CANCELLED : EINVAL));
+                    CHECK(wl_columnar_memory_reserved(
+                            wl_columnar_memory_governor_ref_get(governor)) ==
+                        reserved);
+                    CHECK(!wl_columnar_eval_stack_cleanup_finish(
+                            &pipeline_lookup_nested));
+                    pipeline_lookup_fixture = NULL;
+                }
+                composed_run(&f);
+                if (seam) CHECK(f.record.semantic_result == (cancel
+                        ? WL_EVALUATION_CONTROL_CANCELLED : EINVAL));
+                else {
+                    CHECK(!f.record.semantic_result);
+                    composed_raw_parity(&f, &body, 0);
+                    eval_stack_t *stack =
+                        wl_columnar_eval_stack_cleanup_stack(f.frame);
+                    col_rel_t *out = stack->items[0].rel;
+                    CHECK(out->nrows == 1 && out->ncols == 4
+                        && out->columns[0][0] == 1 && out->columns[1][0] == 2
+                        && out->columns[2][0] == 1
+                        && out->columns[3][0] == (which == 1 ? 3 : 4));
+                }
+                composed_close(&f);
+                col_rel_destroy(right); col_rel_destroy(delta);
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(governor)));
+                wl_columnar_memory_governor_ref_release(governor);
+            }
+    wl_plan_free(plan); wirelog_program_free(program);
 }
 
 static void
@@ -13323,6 +13465,7 @@ main(void)
     test_composed_source_cleanup_pre_action_phases();
     test_composed_domain_and_repeated_source();
     test_composed_controlled_batch_fallback_owner();
+    test_composed_pipeline_lookup_lineage();
     test_composed_abort_request();
     test_composed_generated_union(); test_composed_nested_and_wide();
     test_composed_branch_children(); test_composed_grammar();

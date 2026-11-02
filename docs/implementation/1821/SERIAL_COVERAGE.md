@@ -1499,9 +1499,10 @@ or resource acquisition precedes that admission.
 NONE binding consumes192 for HEADER/FINISH; dynamic or one static consumes256;
 four static consumes640 across ten entry/pair actions and HEADER/FINISH.
 Including parent/dispatch/stack/prechild gives1024,1088 or1472 respectively.
-The production ADVANCE capacity is max(existing five/eight host floor,
-facade384 + root384 + largest1472):2240 normal or3072 recursive/general.
-A no-binding call actually consumes1792 through the full chain;448 capacity
+The ordinary READY maximum alone requires facade384 + root384 + largest1472
+=2240. The pipeline bootstrap allowance below raises actual production ADVANCE
+capacity to2496 normal; recursive/general remains3072.
+A no-binding READY call actually consumes1792 through the full chain;704 capacity
 remains unadmitted. A short grant consumes only its completed action prefix.
 READY/context/stack/output and original positive work remain unchanged until
 handoff; retry repeats real proof and pays it again.
@@ -1509,7 +1510,7 @@ handoff; retry repeats real proof and pays it again.
 Tests exercise each actual static-four and NONE refusal boundary and exact
 success on constructor-created owners, original consumed-work preservation,
 real stream nonselection at PENDING/JOIN_BATCH, protected pointer output and
-actual no-override normal session progress with1792 consumed/2240 limit.
+actual no-override normal session progress with1792 consumed/2496 limit.
 The complete emitted source bounds, including expanded helpers, refusal paths,
 loop transitions and actual first-child admission prefix, are:
 
@@ -1549,5 +1550,97 @@ metadata loop: generation tests use real API-entry turnover and existing
 post-child callbacks, separately from the source proof of each poll.
 
 Nonselected special classifiers, direct numeric/compatibility callers,
-pipeline bootstrap/final setup, automatic prepared publication/FINISH,
+initialized pipeline containing calls, automatic prepared publication/FINISH,
 cache/policy/shared-cap and general transaction acceptance remain OPEN.
+
+### Controlled batch bootstrap and final initialization
+
+The actual composed JOIN_BATCH fallback constructor has no private bindings.
+Its unready path now pays parent384 before PENDING, then separately admits
+STACK192, optional NONE HEADER128/FINISH64, full and optional delta LOOKUP128
+each, SELECT128, RESERVE256, ALLOC128 and COMMIT192. These are real actions
+with work and exact original/funding-generation checks between them. The
+maximum1728 sizes capacity; it is not a bulk debit. Actual normal ADVANCE
+capacity is max(2240, facade384 + root384 +1728)=2496. The session-governor
+bootstrap consumes2048 through that chain; the right-governor worst path fits
+2496. Unexecuted optional actions remain uncharged.
+
+Bootstrap lookup locals live only during one activation. A late refusal can
+repeat the read-only lookup and its actual original128 per registry slot/name
+byte; this work is honestly charged to the same cumulative original attempt.
+The governor ref, admitted credit, allocated host and committed credit are
+recorded before fallible outer checks, so retry acquires each owner once. Both
+lookup returns reauthenticate native/module/frame lineage after the existing
+phase5/6 callback seams, before SELECT retains or stores a governor. An earlier
+lookup semantic error keeps precedence over a later lineage error.
+
+Descriptor reserve/commit use the existing attempt-bound governor APIs, with
+their actual original ENTRY/CLAIM/ROUND/publication regions. Outputs are
+authoritative only with execution rc0. Failure restores canonical token state;
+commit has no negative poll or callback after irreversible COMMITTED. The
+new wrapper fees cover their caller work, not these already admitted interiors.
+
+Each ZERO128 funds metadata and admits the actual original slice of at most256
+bytes. Even the last slice returns before HEADER. HEADER192 pays the fixed
+final original16 once and initializes the three private tokens. A small private
+cursor then admits CLASSIFY192 and the same original1 per tail descriptor,
+MAP column or bytecode instruction. It preserves the raw numeric whitelist,
+empty/default MAP columns, longest prefix and MAP termination. Only immutable
+plan progress persists; no relation pointer or reader proof is retained across
+classification yields. Full funded NONE binding verification precedes a fresh
+PUBLISH192 stack/input/header/token proof. Final exact control polls precede
+the no-fail stores, and sizeof(host)+1 is the last ready-marker store.
+
+On prepublication error, separate FREE128, finite CREDIT192 steps and REF128
+drain actual owned resources in physical-free-before-credit order. They use
+maintenance funding only, preserving the first semantic error even if the
+original ended or changed generation. Done/ownership flags precede fallible
+funding tails. The record busy flag protects reentry before host allocation or
+full zeroing; it is not a destruction lease or transferable proof.
+
+| Paid setup region | Complete source upper bound | Fee |
+|---|---:|---:|
+| Parent proof/dispatch/result | 213 | 384 |
+| STACK through next HEADER admission | 189 | 192 |
+| Optional NONE HEADER / FINISH core | 117 / 56 | 128 / 64 |
+| Full or delta LOOKUP wrapper, including posthook lineage | 101 | 128 |
+| SELECT | 71 | 128 |
+| RESERVE wrapper / COMMIT wrapper | 104 / 82 | 256 / 192 |
+| ALLOC | 92 | 128 |
+| ZERO metadata and slice | 88 | 128 |
+| HEADER, including three actual token initializers | 110 | 192 |
+| One classifier primitive | 110 | 192 |
+| PUBLISH with fresh stack and token checks | 162 | 192 |
+| FREE / finite CREDIT / REF | 24 / 112 / 32 | 128 / 192 / 128 |
+
+Compound-result conversions, caller transitions and refusal/tail branches are
+expanded. The nine NONE getter conversion/caller slots belong to this paid
+parent, separately from the getter FINISH core. The lookup original128 regions
+and attempt-governor interiors keep their own admissions; allocator, control
+and mandatory library cleanup retain the existing cooperative boundaries.
+
+Actual native C11 layout is host5392 versus5376: the20-byte private cursor uses
+four old padding bytes. Zeroing therefore adds16 original bytes and one final
+slice. Record3048, framed4872, frame11440, prepared392 and scalar retirement984
+are unchanged. Fees and allocation/zero/marker use actual sizeof, with portable
+cursor/quantum guards; these measurements are not Windows size claims. Existing
+STATUS384, metadata192, PREFIX249 and ordinary READY source bounds remain intact.
+
+The funding family checks each bootstrap short/exact boundary, canonical partial
+resource state, physical-pointer reuse, every zero/final phase refusal, one
+HEADER16, and marker-last. A predicate extended before session construction by
+2000 genuine numeric instructions preserves all28 literal rows and raw parity;
+classification takes more than2000 turns and adds exactly2000 original units.
+Ready consumer383/384 and facade1151/1152 checks remain. Existing governor seams
+finish/reset/begin either original or funding at reserve/commit: successor work
+stays zero, canonical state is drained or resumed, and both module entries
+reject actual reentry. A constructor-created local no-session/no-left-governor
+fixture reaches full/delta right-governor lookup; genuine nested-frame API
+pushes at phase5/6 prove no later retain/allocation, semantic cancellation
+precedence and complete cleanup. Successful full/delta cases also match raw
+and literal output.
+
+This qualifies bootstrap/unready setup only. Ready consumer/forward/cleanup
+containing proofs, direct compatibility paths, nonselected special dispatch,
+automatic prepared publication/FINISH, cache/policy/shared-cap and general
+transaction acceptance remain required for the grouped issues.

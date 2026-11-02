@@ -8365,6 +8365,9 @@ col_controlled_step_grant_begin(wl_col_session_t *sess,
         uint64_t setup_limit = 2 * UINT64_C(384)
             + WL_COLUMNAR_JOIN_SETUP_MAX_WORK;
         if (limit < setup_limit) limit = setup_limit;
+        uint64_t pipeline_limit = 2 * UINT64_C(384)
+            + WL_COLUMNAR_JOIN_PIPELINE_SETUP_MAX_WORK;
+        if (limit < pipeline_limit) limit = pipeline_limit;
     }
 #ifdef WL_SESSION_TEST_HOOKS
     if (wl_columnar_session_test_framed_grant_limit)

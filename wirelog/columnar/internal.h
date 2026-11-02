@@ -7493,6 +7493,7 @@ typedef struct wl_columnar_eval_plan_numeric_attempt {
     wl_columnar_memory_governor_ref_t *join_host_governor;
     bool join_host_admitted, join_host_committed;
     bool join_host_terminal, join_host_declined;
+    bool join_host_busy;
 } wl_columnar_eval_plan_numeric_attempt_t;
 
 typedef struct {
@@ -7831,6 +7832,47 @@ typedef char wl_columnar_join_setup_quantum_t[
         && WL_COLUMNAR_JOIN_SETUP_DYNAMIC_WORK <= 256
         && WL_COLUMNAR_JOIN_SETUP_FINISH_WORK <= 256
         && WL_COLUMNAR_JOIN_SETUP_PRECHILD_WORK <= 256) ? 1 : -1];
+/* Separate pipeline setup actions; the maximum sizes grant capacity only. */
+enum {
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_STACK_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_LOOKUP_WORK = 128,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_SELECT_WORK = 128,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_RESERVE_WORK = 256,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_ALLOC_WORK = 128,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_COMMIT_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_ZERO_WORK = 128,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_HEADER_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_CLASSIFY_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_PUBLISH_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_CREDIT_WORK = 192,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_REF_WORK = 128,
+    WL_COLUMNAR_JOIN_PIPELINE_SETUP_MAX_WORK =
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK
+        + WL_COLUMNAR_JOIN_PIPELINE_SETUP_STACK_WORK
+        + WL_COLUMNAR_JOIN_SETUP_HEADER_WORK +
+        WL_COLUMNAR_JOIN_SETUP_FINISH_WORK
+        + 2 * WL_COLUMNAR_JOIN_PIPELINE_SETUP_LOOKUP_WORK
+        + WL_COLUMNAR_JOIN_PIPELINE_SETUP_SELECT_WORK
+        + WL_COLUMNAR_JOIN_PIPELINE_SETUP_RESERVE_WORK
+        + WL_COLUMNAR_JOIN_PIPELINE_SETUP_ALLOC_WORK
+        + WL_COLUMNAR_JOIN_PIPELINE_SETUP_COMMIT_WORK
+};
+typedef char wl_columnar_join_pipeline_setup_max_t[
+        WL_COLUMNAR_JOIN_PIPELINE_SETUP_MAX_WORK == 1728 ? 1 : -1];
+typedef char wl_columnar_join_pipeline_setup_quantum_t[
+        (WL_COLUMNAR_JOIN_PIPELINE_SETUP_STACK_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_LOOKUP_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_SELECT_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_RESERVE_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_ALLOC_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_COMMIT_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_ZERO_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_HEADER_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_CLASSIFY_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_PUBLISH_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_CREDIT_WORK <= 256
+        && WL_COLUMNAR_JOIN_PIPELINE_SETUP_REF_WORK <= 256) ? 1 : -1];
+
 wl_columnar_join_setup_result_t wl_columnar_join_setup_head(
     wl_evaluation_control_t *, uint64_t, wl_evaluation_control_t *, uint64_t,
     uint64_t);
