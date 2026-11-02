@@ -4969,8 +4969,20 @@ static void composite_reference_chains(void)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *modes[] = {"--budget-join", "--budget-aggregate",
+                           "--budget-composite"};
+    int workload = -1;
+    if (argc == 2)
+        for (unsigned i = 0; i < 3; i++)
+            if (!strcmp(argv[1], modes[i])) workload = (int)i;
+    if (argc > 2 || (argc == 2 && workload < 0)) {
+        fprintf(stderr,
+            "usage: %s [--budget-join|--budget-aggregate|--budget-composite]\n",
+            argv[0]);
+        return 2;
+    }
     /* Issue #2287: session creation reads WIRELOG_JOIN_BATCH_BYTES and
      * _STRICT, and a nonzero batch size refuses spill JOIN selection and
      * sealed cold input. The knob cases here set the session fields
@@ -4978,56 +4990,65 @@ int main(void)
      * session exists. */
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_BYTES"));
     CHECK(!unsetenv("WIRELOG_JOIN_BATCH_STRICT"));
-    composite_reference_failures(); composite_reference_chains();
-    cold_virtual_key_names(); composite_numeric_admission();
-    composite_computed_tail_refused();
-    composite_numeric_chains(); composite_numeric_prefix();
-    cold_global_internal();
-    cold_group_internal();
-    cold_integer_internal(); cold_aggregate_mixed_eligibility();
-    cold_many_groups_floor();
-    chunked_internal(); chunked_join_failure();
-    chunked_reference_failures(); chunked_causal_budget(false);
-    chunked_causal_budget(true); chunked_causal_budget(2);
-    cold_scan_join_key_names();
-    cold_scan_map_only_right_audit();
-    cold_scan_join_self_missing();
-    cold_scan_join_budget(); parsed_cold_scan_join();
-    cold_scan_join_stages();
-    composed_cold_stages();
-    repeated_cold_predicates(); parsed_repeated_predicates();
-    repeated_predicate_scratch();
-    inline_source_refusals(); numeric_inline_cold_source();
-    inline_projection_failures(); inline_projection_memory();
-    inline_join_reclamation(); inline_join_bounded_scratch();
-    inline_join_directions();
-    inline_initialization_budget();
-    inline_initialized_sources();
-    reference_join_reclamation(); reference_join_bounded_scratch();
-    reference_join_directions();
-    reference_projection_memory();
-    reference_projections(); reference_projection_failures();
-    reference_projection_bytecode();
-    cold_intermediate_floor();
-    directional_constructor_floor();
-    directional_reclamation(); directional_bounded_scratch();
-    direction_matrix(); self_join(); chained_consumers();
-    directional_failures(); cold_left_missing_right(); cold_join_preflight();
-    multiple_runtime_guard(); multiple_memory_floor();
-    multiple_idb_filter_refusal();
-    multiple_schema_audit(); multiple_right_joins();
-    multiple_bindings(); multiple_seal_failures();
-    standalone_reads();
-    projection_shape(); filtered_predicates(); filtered_shape();
-    for (unsigned filtered = 0; filtered < 2; filtered++) {
-        projection_consumers(filtered != 0); projection_failures(filtered != 0);
-        projection_budget(filtered != 0);
-        projection_scratch_floor(filtered != 0);
-        projection_numeric_lanes(filtered != 0);
+    if (workload >= 0) {
+        printf("cold input budget workload: %s\n", modes[workload]);
+        fflush(stdout);
+        chunked_causal_budget((unsigned)workload);
+    } else {
+        composite_reference_failures(); composite_reference_chains();
+        cold_virtual_key_names(); composite_numeric_admission();
+        composite_computed_tail_refused();
+        composite_numeric_chains(); composite_numeric_prefix();
+        cold_global_internal();
+        cold_group_internal();
+        cold_integer_internal(); cold_aggregate_mixed_eligibility();
+        cold_many_groups_floor();
+        chunked_internal(); chunked_join_failure();
+        chunked_reference_failures();
+
+        cold_scan_join_key_names();
+        cold_scan_map_only_right_audit();
+        cold_scan_join_self_missing();
+        cold_scan_join_budget(); parsed_cold_scan_join();
+        cold_scan_join_stages();
+        composed_cold_stages();
+        repeated_cold_predicates(); parsed_repeated_predicates();
+        repeated_predicate_scratch();
+        inline_source_refusals(); numeric_inline_cold_source();
+        inline_projection_failures(); inline_projection_memory();
+        inline_join_reclamation(); inline_join_bounded_scratch();
+        inline_join_directions();
+        inline_initialization_budget();
+        inline_initialized_sources();
+        reference_join_reclamation(); reference_join_bounded_scratch();
+        reference_join_directions();
+        reference_projection_memory();
+        reference_projections(); reference_projection_failures();
+        reference_projection_bytecode();
+        cold_intermediate_floor();
+        directional_constructor_floor();
+        directional_reclamation(); directional_bounded_scratch();
+        direction_matrix(); self_join(); chained_consumers();
+        directional_failures(); cold_left_missing_right();
+        cold_join_preflight();
+        multiple_runtime_guard(); multiple_memory_floor();
+        multiple_idb_filter_refusal();
+        multiple_schema_audit(); multiple_right_joins();
+        multiple_bindings(); multiple_seal_failures();
+        standalone_reads();
+        projection_shape(); filtered_predicates(); filtered_shape();
+        for (unsigned filtered = 0; filtered < 2; filtered++) {
+            projection_consumers(filtered != 0);
+            projection_failures(filtered != 0);
+            projection_budget(filtered != 0);
+            projection_scratch_floor(filtered != 0);
+            projection_numeric_lanes(filtered != 0);
+        }
+        lifecycle(); rollback(); read_failure(); exclusions();
+        empty_and_multiple();
+        typed_projection(); quota_and_alias(); loaders(); generation_boundary();
+        fixed_budget(); retention_lifetime(); fixed_floors();
+        concurrent_cold_readers();
     }
-    lifecycle(); rollback(); read_failure(); exclusions(); empty_and_multiple();
-    typed_projection(); quota_and_alias(); loaders(); generation_boundary();
-    fixed_budget(); retention_lifetime(); fixed_floors();
-    concurrent_cold_readers();
     return 0;
 }

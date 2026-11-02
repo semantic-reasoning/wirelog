@@ -5764,6 +5764,16 @@ test('wirelog_advanced_spill_join_batch_env', test_wirelog_advanced_spill_exe,
   env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
   suite: ['unit'], timeout: 120)
 
+# #2318: keep each 320 MiB causal workload out of the duplicated regular/env
+# runs. MSVC hit their 120s ceiling; public spill also approached it (115/116s).
+# 300s is scoped I/O headroom, not a measured Windows completion time.
+# Serial execution avoids competing spill I/O; all cases remain in default/TSan.
+foreach workload : ['join', 'aggregate', 'composite']
+  test('wirelog_advanced_spill_budget_' + workload, test_wirelog_advanced_spill_exe,
+    args: ['--budget-' + workload], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+    suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
+endforeach
+
 
 # Issue #841: umbrella public API symbols are real linkable/runtime
 # entry points, not only header declarations.
@@ -6658,6 +6668,16 @@ test('session_cold_relation', test_session_cold_relation_exe, suite: ['unit', 't
 test('session_cold_relation_join_batch_env', test_session_cold_relation_exe,
   env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
   suite: ['unit'], timeout: 120)
+
+# #2318: keep each 320 MiB causal workload out of the duplicated regular/env
+# runs. MSVC hit their 120s ceiling; public spill also approached it (115/116s).
+# 300s is scoped I/O headroom, not a measured Windows completion time.
+# Serial execution avoids competing spill I/O; all cases remain in default/TSan.
+foreach workload : ['join', 'aggregate', 'composite']
+  test('session_cold_relation_budget_' + workload, test_session_cold_relation_exe,
+    args: ['--budget-' + workload], env: ['WIRELOG_JOIN_BATCH_BYTES=224'],
+    suite: ['unit', 'tsan', 'spill_budget'], timeout: 300, is_parallel: false)
+endforeach
 
 # #2294/#2295: generated controlled STEP/SNAPSHOT lifecycle composition.
 test_evaluation_lifecycle_exe = executable(
