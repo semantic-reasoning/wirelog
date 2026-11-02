@@ -2302,3 +2302,80 @@ its queries read program metadata only.
 The scan reads the selected relation's columns without taking its source
 gate; it refuses as BUSY when that gate is held, and relies on external
 serialization for the rest. `WL_LOG` and destroy rules are unchanged.
+
+## TDD batch channel (#1373)
+
+`wirelog/columnar/tdd_channel.{c,h}` carries the batches that W producer
+lanes publish during one TDD round to the single consumer, which is the
+coordinator. One mutex, `ch->mu`, guards every mutable field; the
+governor, the consumer owner, the lane count and the lane array pointer
+never change after `wl_tdd_channel_create` and are read without it.
+Producers wait on `cond_space` and the consumer waits on `cond_state`. The
+channel has no atomics, so it adds no rows to the audit in section 5.
+
+### Lock order
+
+`ch->mu` is a leaf. No library function of the channel calls the memory
+governor, frees memory, or calls back into the caller while it holds
+`ch->mu`:
+
+- `wl_tdd_channel_batch_new` admits and commits the descriptor token before
+  it takes the mutex.
+- `wl_tdd_channel_pump` relabels the token with
+  `wl_columnar_memory_transfer` after it releases the mutex.
+- Descriptors reclaimed by `wl_tdd_channel_close_lane` are freed after it
+  releases the mutex.
+- `wl_tdd_channel_discard_all` relabels each token and hands each batch to
+  its sink after it releases the mutex.
+
+The test-only `wl_tdd_channel_test_wait`, built under
+`WL_TDD_CHANNEL_TEST_HOOKS`, is the exception: it runs its predicate under
+`ch->mu` on a stats snapshot, so the predicate must not call into the
+channel.
+
+### Who waits on whom
+
+- **A producer blocked in `wl_tdd_channel_reserve`** waits for the consumer
+  to take a batch, for another producer to cancel a reservation, for an
+  earlier ticket to be admitted, or for `wl_tdd_channel_cancel`. The wait
+  on an earlier ticket cannot form a cycle: tickets are served in the order
+  they were taken.
+- **The consumer blocked in `wl_tdd_channel_pump`** waits for a publish, a
+  cancelled reservation, a lane close, or a cancel.
+- **Lane close.** Each task wrapper ends its lane with
+  `wl_tdd_channel_close_lane`. That call returns an outstanding reservation
+  and reclaims every descriptor the producer left unpublished. A producer
+  that returns early therefore cannot keep the consumer waiting. If it
+  returned 0 with a batch unpublished, the lane and the channel record
+  EPROTO.
+
+### Admission
+
+Reservations are admitted in ticket order. A reservation is admitted when
+the queued plus reserved bytes stay within the capacity, or when no bytes
+are queued or reserved at all. A zero-byte reservation is refused, so the
+second case means the channel holds no batch and no reservation, and it
+lets one batch larger than the capacity through.
+
+Each lane holds at most one reservation (the channel enforces this) and,
+because each lane has a single producer thread, at most one ticket at a
+time. So a producer that blocks is admitted within the number of batches
+queued at that moment plus W - 1 takes. `admission_bound_violations` in
+the channel stats counts breaches, and `tests/test_tdd_channel.c` asserts
+it stays 0.
+
+No lane has a fixed share of the capacity.
+
+### Completion
+
+`wl_tdd_channel_pump` returns COMPLETE only when all of these hold:
+
+- every lane is closed;
+- no batch is queued;
+- no bytes are reserved;
+- each lane's received count equals its published count.
+
+A momentarily empty FIFO with an open lane keeps the consumer waiting.
+After a cancel, pump returns CANCELLED once every lane is closed. The
+batches still queued are taken by `wl_tdd_channel_discard_all`, which
+allocates nothing.
