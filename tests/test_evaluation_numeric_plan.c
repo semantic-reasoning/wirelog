@@ -10595,9 +10595,748 @@ test_prepared_unary_acked_reuse(void)
     }
 }
 
+static void
+prepared_join_until_decision(fixture_t *f, wl_columnar_filter_context_t **ctx,
+    uint32_t cursor, bool pending)
+{
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 10000 &&
+            f->record.phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE);
+        if (f->record.cursor == cursor && f->record.phase == (pending
+            ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING :
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD)){
+            CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, ctx,
+                &f->record));
+            if ((*ctx)->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE) return;
+        }
+        engine_dispatch(f); ++f->witnesses;
+    }
+}
+
+static void
+prepared_join_drain_ack(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_evaluation_control_t *funding, uint64_t id)
+{
+    for (unsigned turn = 0; ; ++turn) {
+        wl_columnar_eval_stack_unary_prepared_status_t status;
+        CHECK(!wl_columnar_eval_stack_unary_prepared_query(p, &status));
+        if (status.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY) break;
+        CHECK(turn < 1000);
+        int rc = wl_columnar_eval_stack_unary_prepared_drain(p, funding, id);
+        CHECK(!rc || rc == EAGAIN);
+    }
+    CHECK(!wl_columnar_eval_stack_unary_prepared_ack(p, funding, id));
+}
+
+static void
+test_prepared_join_chained_delta(void)
+{
+    uint32_t projection[] = {0};
+    for (unsigned owned = 0; owned < 2; ++owned)
+        for (unsigned segmented = 0; segmented < 2; ++segmented)
+            for (unsigned pending = 0; pending < 2; ++pending)
+                for (unsigned projected = 0; projected < 4; ++projected)
+                    for (unsigned action = 0; action < 3; ++action) {
+                        fixture_t f; source_fixture(&f, 1, 7, 0);
+                        wl_columnar_memory_governor_ref_t *g = join_governor(&f,
+                                1u << 24);
+                        col_rel_t *delta = source_new(1, 2),
+                            *right = source_new(1, 3),
+                            *rd = source_new(1, 1), *third = source_new(1, 4),
+                            *td = source_new(1, 1),
+                            *prefix = source_new(1, 1);
+                        CHECK(!wl_columnar_relation_rename_checked(delta,
+                            "$d$input"));
+                        CHECK(!wl_columnar_relation_rename_checked(right,
+                            "right"));
+                        CHECK(!wl_columnar_relation_rename_checked(rd,
+                            "$d$right"));
+                        CHECK(!wl_columnar_relation_rename_checked(third,
+                            "third"));
+                        CHECK(!wl_columnar_relation_rename_checked(td,
+                            "$d$third"));
+                        CHECK(!wl_columnar_relation_rename_checked(prefix,
+                            "prefix"));
+                        col_rel_t *registry[] = {f.input, delta, right, rd,
+                                                 third, td, prefix};
+                        unsigned cursor = 1 + owned;
+                        wl_plan_op_t ops[4] = {{.op = WL_PLAN_OP_VARIABLE,
+                                                .relation_name = "input"}};
+                        if (owned) ops[1] =
+                                (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                               .right_relation = "prefix"};
+                        ops[cursor] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                                     .right_relation = "right"};
+                        ops[cursor + 1] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                                         .right_relation =
+                                                             "third"};
+                        for (unsigned j = 0; j < 2; ++j)
+                            if (projected & (1u << j)) {
+                                ops[cursor + j].project_count = 1;
+                                ops[cursor + j].project_indices = projection;
+                            }
+                        wl_plan_relation_t plan = {.ops = ops,
+                                                   .op_count = 3 + owned};
+                        source_begin(&f, &plan, registry, 7);
+                        if (segmented) {
+                            /* Configure genuine input metadata before the next unary
+                             * claims it. Ownership comes from the real source/prefix
+                             * operator, never from editing its owned flag. */
+                            join_until_ready(&f, cursor);
+                            eval_stack_t *input =
+                                wl_columnar_eval_stack_cleanup_stack(f.frame);
+                            CHECK(input && input->top == 1 &&
+                                !input->items[0].seg_boundaries);
+                            uint32_t *boundaries = malloc(2 *
+                                    sizeof(*boundaries)); CHECK(boundaries);
+                            boundaries[0] = 0;
+                            boundaries[1] = input->items[0].rel->nrows;
+                            input->items[0].seg_boundaries = boundaries;
+                            input->items[0].seg_count = 1;
+                        }
+                        wl_columnar_filter_context_t *ctx = NULL;
+                        prepared_join_until_decision(&f, &ctx, cursor, pending);
+                        CHECK(f.record.cursor == cursor &&
+                            f.record.phase == (pending
+                ? WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING :
+                            WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD)
+                            && ctx->join_operation == &ops[cursor] &&
+                            !ctx->busy);
+                        eval_stack_t *stack =
+                            wl_columnar_eval_stack_cleanup_stack(f.frame);
+                        eval_entry_t old = stack->items[0];
+                        CHECK(old.rel != f.input && old.rel->nrows == 2 &&
+                            old.owned == (owned != 0));
+                        col_rel_t *output = ctx->private_output;
+                        bool delta_result = !(projected & 1);
+                        CHECK(output && ctx->output == output &&
+                            output->nrows == 6
+                            && ctx->join_result_is_delta == delta_result);
+                        wl_columnar_eval_plan_numeric_attempt_t parent_before;
+                        memcpy(&parent_before, &f.record,
+                            sizeof(parent_before));
+                        uint64_t pending_work_before, pending_work_after;
+                        CHECK(!wl_evaluation_control_test_active_consumed(
+                                f.funding, f.funding_id, &pending_work_before));
+                        int pending_result = f.pending_protocol;
+                        int cleanup_owner = 0;
+                        wl_evaluation_control_t *cleanup = control_new(0,
+                                &cleanup_owner);
+                        uint64_t cleanup_id =
+                            wl_evaluation_control_active_attempt_id(cleanup);
+                        wl_columnar_eval_stack_unary_prepared_t p = {0};
+                        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+                                &p, f.frame, &f.record));
+                        CHECK(!p.join_mode &&
+                            p.phase ==
+                            WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD);
+                        CHECK(!wl_columnar_eval_stack_unary_prepared_step(&p)
+                            && p.join_mode &&
+                            p.phase ==
+                            WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_STATE);
+                        CHECK(!wl_columnar_eval_stack_unary_prepared_step(&p));
+                        prepared_until(&p,
+                            WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
+                        CHECK(p.join_mode &&
+                            p.publication_is_delta == delta_result
+                            && p.old_held && p.output_held && !p.scalar_ready
+                            && !memcmp(&parent_before, &f.record,
+                            sizeof(parent_before)));
+                        if (!action) {
+                            prepared_until(&p,
+                                WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
+                            wl_columnar_eval_stack_unary_commit_prepared_nofail(
+                                &p);
+                            CHECK(ctx->committed &&
+                                ctx->stage == WL_COLUMNAR_FILTER_STAGE_CONTROL
+                                && !ctx->execution_result &&
+                                !ctx->semantic_result
+                                && !ctx->join_decision_pending &&
+                                !ctx->join_operation
+                                && !ctx->join_result_is_delta &&
+                                ctx->output == output
+                                && ctx->private_output == output);
+                            wl_columnar_eval_stack_test_unary_observation_t
+                                retired;
+                            CHECK(!wl_columnar_eval_stack_test_unary_observe(
+                                    f.frame, &f.record, &retired));
+                            CHECK(retired.committed &&
+                                retired.relation == old.rel
+                                && retired.owned == old.owned &&
+                                retired.is_delta == old.is_delta
+                                && retired.segments == old.seg_boundaries &&
+                                retired.segment_count == old.seg_count
+                                && retired.continuation == old.continuation &&
+                                retired.kind == (unsigned)old.kind);
+                            CHECK(!wl_columnar_eval_stack_unary_prepared_cancel(
+                                    &p, ERANGE, cleanup, cleanup_id));
+                            CHECK(p.committed && !p.first_result);
+                        } else {
+                            CHECK(!wl_columnar_eval_stack_unary_prepared_cancel(
+                                    &p, action == 1 ? 0 : ERANGE,
+                                    cleanup, cleanup_id));
+                            CHECK(!ctx->committed &&
+                                ctx->stage ==
+                                WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+                                && ctx->join_decision_pending &&
+                                ctx->join_operation == &ops[cursor]
+                                && ctx->join_result_is_delta == delta_result);
+                            CHECK(ctx->execution_result ==
+                                (action == 1 ? 0 : ERANGE)
+                                && ctx->semantic_result ==
+                                (action == 1 ? 0 : ERANGE));
+                        }
+                        prepared_join_drain_ack(&p, cleanup, cleanup_id);
+                        CHECK(!memcmp(&parent_before, &f.record,
+                            sizeof(parent_before))
+                            && f.pending_protocol == pending_result
+                            && !wl_evaluation_control_test_active_consumed(
+                                f.funding, f.funding_id, &pending_work_after)
+                            && pending_work_before == pending_work_after);
+                        CHECK(!wl_evaluation_control_finish(cleanup,
+                            &cleanup_owner, 0, 0));
+                        CHECK(!wl_evaluation_control_detach(cleanup,
+                            &cleanup_owner));
+                        wl_evaluation_control_release(cleanup);
+                        if (pending) {
+                            /* Consume the real prior YIELD, not a fabricated prepared
+                             * status, before the parent dispatches its next child turn. */
+                            engine_dispatch(&f); ++f.witnesses;
+                            CHECK(f.record.phase ==
+                                WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD
+                                && f.record.cursor == cursor);
+                        }
+                        run(&f);
+                        stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+                        CHECK(stack && stack->top == 1);
+                        if (action == 2) {
+                            CHECK(f.record.semantic_result == ERANGE &&
+                                f.record.completed == owned
+                                && stack->items[0].rel == old.rel &&
+                                stack->items[0].is_delta
+                                && stack->items[0].seg_boundaries ==
+                                old.seg_boundaries
+                                && stack->items[0].seg_count == old.seg_count
+                                && old.rel->nrows == 2 &&
+                                old.rel->columns[0][0] == 0
+                                && old.rel->columns[0][1] == 1);
+                        } else {
+                            CHECK(!f.record.semantic_result &&
+                                f.record.completed == 2 + owned
+                                && stack->items[0].rel->nrows ==
+                                (projected & 1 ? 6u : 24u)
+                                && stack->items[0].is_delta ==
+                                !(projected & 2));
+                            join_raw_parity(&f, &plan, false);
+                        }
+                        fixture_close(&f);
+                        col_rel_destroy(delta); col_rel_destroy(right);
+                        col_rel_destroy(rd);
+                        col_rel_destroy(third); col_rel_destroy(td);
+                        col_rel_destroy(prefix);
+                        CHECK(!wl_columnar_memory_reserved(
+                                wl_columnar_memory_governor_ref_get(g)));
+                        wl_columnar_memory_governor_ref_release(g);
+                        wl_columnar_eval_stack_unary_prepared_status_t history;
+                        CHECK(!wl_columnar_eval_stack_unary_prepared_query(&p,
+                            &history)
+                            && history.phase ==
+                            WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED);
+                    }
+}
+
+typedef struct {
+    fixture_t f;
+    wl_columnar_memory_governor_ref_t *governor;
+    col_rel_t *right, *prefix, *registry[2];
+    wl_plan_op_t ops[2];
+    wl_plan_relation_t plan;
+    wl_columnar_filter_context_t *context;
+    unsigned cursor;
+} prepared_join_case_t;
+
+static void
+prepared_join_case_init(prepared_join_case_t *m, bool owned, bool pending,
+    uint64_t limit)
+{
+    memset(m, 0, sizeof(*m));
+    fixture_init(&m->f, 2, 3, limit);
+    m->governor = join_governor(&m->f, 1u << 24);
+    m->right = source_new(1, 2);
+    CHECK(!wl_columnar_relation_rename_checked(m->right, "right"));
+    m->registry[0] = m->right;
+    if (owned) {
+        m->prefix = source_new(1, 1);
+        CHECK(!wl_columnar_relation_rename_checked(m->prefix, "prefix"));
+        m->registry[1] = m->prefix;
+        m->ops[0] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                   .right_relation = "prefix",
+                                   .delta_mode = WL_DELTA_FORCE_FULL};
+    }
+    m->cursor = owned;
+    m->ops[m->cursor] = (wl_plan_op_t){.op = WL_PLAN_OP_JOIN,
+                                       .right_relation = "right",
+                                       .delta_mode = WL_DELTA_FORCE_FULL};
+    m->plan = (wl_plan_relation_t){.ops = m->ops, .op_count = 1 + owned};
+    m->f.session.rels = m->registry;
+    m->f.session.nrels = m->f.session.rel_cap = 1 + owned;
+    fixture_begin(&m->f, &m->plan, 0, m->plan.op_count);
+    prepared_join_until_decision(&m->f, &m->context, m->cursor, pending);
+}
+
+static void
+prepared_join_case_close(prepared_join_case_t *m)
+{
+    fixture_close(&m->f);
+    col_rel_destroy(m->right);
+    if (m->prefix) col_rel_destroy(m->prefix);
+    CHECK(!wl_columnar_memory_reserved(wl_columnar_memory_governor_ref_get(
+            m->governor)));
+    wl_columnar_memory_governor_ref_release(m->governor);
+}
+
+static int
+prepared_join_cancel_turn(wl_columnar_eval_stack_unary_prepared_t *p,
+    uint64_t limit, int result, uint64_t *spent)
+{
+    int owner = 0;
+    wl_evaluation_control_t *funding = control_new(limit, &owner);
+    uint64_t id = wl_evaluation_control_active_attempt_id(funding);
+    int rc = wl_columnar_eval_stack_unary_prepared_cancel(p, result, funding,
+            id);
+    (void)wl_evaluation_control_finish(funding, &owner, 0, 0);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(funding, &report));
+    *spent = report.consumed;
+    CHECK(!wl_evaluation_control_detach(funding, &owner));
+    wl_evaluation_control_release(funding);
+    return rc;
+}
+
+static void
+test_prepared_join_early_stop_turnover(void)
+{
+    for (unsigned owned = 0; owned < 2; ++owned)
+        for (unsigned pending = 0; pending < 2; ++pending) {
+            prepared_join_case_t baseline;
+            prepared_join_case_init(&baseline, owned, pending, 0);
+            uint64_t before_init;
+            CHECK(!wl_evaluation_control_test_active_consumed(
+                    baseline.f.operation,
+                    baseline.f.operation_id, &before_init));
+            run(&baseline.f); CHECK(!baseline.f.record.semantic_result);
+            prepared_join_case_close(&baseline);
+            for (unsigned work = 0; work < 2; ++work) {
+                prepared_join_case_t m;
+                prepared_join_case_init(&m, owned, pending,
+                    work ? before_init + 256 + 191 : 0);
+                fixture_t *f = &m.f;
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f->frame);
+                eval_entry_t old = stack->items[0];
+                CHECK(old.owned == (owned != 0));
+                col_relation_snapshot_t old_snapshot =
+                    wl_columnar_relation_snapshot(old.rel);
+                wl_columnar_filter_context_t context_before;
+                wl_columnar_eval_plan_numeric_attempt_t parent_before;
+                memcpy(&context_before, m.context, sizeof(context_before));
+                memcpy(&parent_before, &f->record, sizeof(parent_before));
+                int pending_result = f->pending_protocol;
+                uint64_t pending_work;
+                CHECK(!wl_evaluation_control_test_active_consumed(f->funding,
+                    f->funding_id, &pending_work));
+                wl_columnar_eval_stack_unary_prepared_t p = {0};
+                CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                    f->frame, &f->record));
+                if (!work) wl_evaluation_control_request_cancel(f->operation);
+                int stop =
+                    work ? WL_EVALUATION_CONTROL_WORK_LIMIT :
+                    WL_EVALUATION_CONTROL_CANCELLED;
+                CHECK(wl_columnar_eval_stack_unary_prepared_step(&p) == stop
+                    && !p.join_mode &&
+                    p.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD
+                    && p.result_saved && p.first_result == stop);
+                CHECK(wl_evaluation_control_finish(f->operation,
+                    &f->operation_owner, 0, 0) == stop);
+                CHECK(!wl_evaluation_control_reset(f->operation) &&
+                    !wl_evaluation_control_configure(f->operation, 0));
+                CHECK(!wl_evaluation_control_begin(f->operation,
+                    &f->operation_owner));
+                uint64_t successor =
+                    wl_evaluation_control_active_attempt_id(f->operation);
+                CHECK(successor != f->operation_id);
+                wl_evaluation_control_report_t original_before, original_after;
+                CHECK(!wl_evaluation_control_report(f->operation,
+                    &original_before));
+                wl_columnar_eval_stack_unary_prepared_t saved;
+                memcpy(&saved, &p, sizeof(saved));
+                uint64_t spent;
+                CHECK(prepared_join_cancel_turn(&p, 191, ERANGE,
+                    &spent) == WL_EVALUATION_CONTROL_WORK_LIMIT
+                    && !spent && !memcmp(&saved, &p, sizeof(saved))
+                    && !memcmp(&context_before, m.context,
+                    sizeof(context_before)));
+                CHECK(!prepared_join_cancel_turn(&p, 192, ERANGE,
+                    &spent) && spent == 192);
+                CHECK(p.join_mode && p.first_result == stop
+                    && m.context->execution_result == stop &&
+                    m.context->semantic_result == stop
+                    && m.context->stage == WL_COLUMNAR_FILTER_STAGE_JOIN_DECIDE
+                    && !m.context->committed &&
+                    m.context->join_decision_pending);
+                int cleanup_owner = 0;
+                wl_evaluation_control_t *cleanup = control_new(0,
+                        &cleanup_owner);
+                uint64_t cleanup_id =
+                    wl_evaluation_control_active_attempt_id(cleanup);
+                prepared_join_drain_ack(&p, cleanup, cleanup_id);
+                CHECK(!wl_evaluation_control_finish(cleanup, &cleanup_owner, 0,
+                    0));
+                CHECK(!wl_evaluation_control_detach(cleanup, &cleanup_owner));
+                wl_evaluation_control_release(cleanup);
+                uint64_t after;
+                CHECK(!memcmp(&parent_before, &f->record, sizeof(parent_before))
+                    && f->pending_protocol == pending_result
+                    && !wl_evaluation_control_test_active_consumed(f->funding,
+                    f->funding_id, &after)
+                    && after == pending_work);
+                run(f);
+                CHECK(f->record.semantic_result == stop &&
+                    f->record.completed == owned);
+                stack = wl_columnar_eval_stack_cleanup_stack(f->frame);
+                CHECK(stack && stack->top == 1 && stack->items[0].rel == old.rel
+                    && stack->items[0].owned == old.owned
+                    && stack->items[0].is_delta == old.is_delta
+                    && wl_columnar_relation_snapshot_equal(old_snapshot,
+                    wl_columnar_relation_snapshot(old.rel))
+                    && old.rel->nrows == 3 && old.rel->columns[0][2] == 2);
+                CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+                    successor, &after) && !after);
+                CHECK(!wl_evaluation_control_report(f->operation,
+                    &original_after)
+                    && metadata_reports_equal(&original_before,
+                    &original_after));
+                prepared_join_case_close(&m);
+                wl_columnar_eval_stack_unary_prepared_status_t history;
+                CHECK(!wl_columnar_eval_stack_unary_prepared_query(&p, &history)
+                    && history.first_result == stop && !history.committed);
+            }
+        }
+}
+
+/* Literal contract fees, independent of the implementation fee table. */
+static void
+test_prepared_join_original_boundaries(void)
+{
+    static const prepared_boundary_t boundaries[] = {
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD, 0, 192},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_STATE, 0, 192},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH0, 0, 128},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH1, 0, 128},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH2, 0, 128},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_HEAD, 0, 192},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_STATE, 0, 192},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH0, 0, 128},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH1, 0, 128},
+        {WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH2, 0, 128}
+    };
+    for (unsigned owned = 0; owned < 2; ++owned)
+        for (unsigned pending = 0; pending < 2; ++pending)
+            for (unsigned b =
+                0; b <= sizeof(boundaries) / sizeof(boundaries[0]);
+                ++b){
+                bool init = b == sizeof(boundaries) / sizeof(boundaries[0]);
+                uint64_t fee = init ? 256 : boundaries[b].fee;
+                prepared_join_case_t baseline;
+                prepared_join_case_init(&baseline, owned, pending, 0);
+                wl_columnar_eval_stack_unary_prepared_t p = {0};
+                if (!init) {
+                    CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                        baseline.f.frame, &baseline.f.record));
+                    prepared_until(&p, boundaries[b].phase);
+                }
+                uint64_t before, spent;
+                CHECK(!wl_evaluation_control_test_active_consumed(
+                        baseline.f.operation,
+                        baseline.f.operation_id, &before));
+                if (!init) {
+                    CHECK(!prepared_join_cancel_turn(&p, 0, ERANGE, &spent));
+                    int owner = 0;
+                    wl_evaluation_control_t *funding = control_new(0, &owner);
+                    prepared_join_drain_ack(&p, funding,
+                        wl_evaluation_control_active_attempt_id(funding));
+                    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+                    CHECK(!wl_evaluation_control_detach(funding, &owner));
+                    wl_evaluation_control_release(funding);
+                }
+                run(&baseline.f);
+                CHECK(baseline.f.record.semantic_result == (init ? 0 : ERANGE));
+                prepared_join_case_close(&baseline);
+                for (unsigned exact = 0; exact < 2; ++exact) {
+                    prepared_join_case_t m;
+                    prepared_join_case_init(&m, owned, pending,
+                        before + fee - !exact);
+                    fixture_t *f = &m.f;
+                    wl_columnar_eval_stack_unary_prepared_t receipt = {0};
+                    if (!init) {
+                        CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(
+                                &receipt, f->frame, &f->record));
+                        prepared_until(&receipt, boundaries[b].phase);
+                    }
+                    int rc = init
+                    ? wl_columnar_eval_stack_unary_prepared_join_begin(
+                        &receipt, f->frame, &f->record)
+                    : wl_columnar_eval_stack_unary_prepared_step(&receipt);
+                    CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT));
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            f->operation,
+                            f->operation_id,
+                            &spent) && spent == before + (exact ? fee : 0));
+                    if (exact) CHECK(wl_evaluation_control_charge_attempt(
+                                f->operation,
+                                f->operation_id,
+                                1) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    if (receipt.identity) {
+                        CHECK(!prepared_join_cancel_turn(&receipt, 0,
+                            WL_EVALUATION_CONTROL_WORK_LIMIT, &spent));
+                        int owner = 0;
+                        wl_evaluation_control_t *funding = control_new(0,
+                                &owner);
+                        prepared_join_drain_ack(&receipt, funding,
+                            wl_evaluation_control_active_attempt_id(funding));
+                        CHECK(!wl_evaluation_control_finish(funding, &owner, 0,
+                            0));
+                        CHECK(!wl_evaluation_control_detach(funding, &owner));
+                        wl_evaluation_control_release(funding);
+                    }
+                    run(f);
+                    CHECK(f->record.semantic_result ==
+                        WL_EVALUATION_CONTROL_WORK_LIMIT);
+                    prepared_join_case_close(&m);
+                }
+            }
+}
+
+static void
+test_prepared_join_unsupported_contexts(void)
+{
+    static const char *keys[] = {"col0"};
+    for (unsigned missing = 0; missing < 2; ++missing)
+        for (unsigned stopped = 0; stopped < 2; ++stopped) {
+            int expected_semantic = 0;
+            uint32_t expected_completed = 0, expected_segments = 0;
+            bool expected_delta = false, expected_has_segments = false;
+            for (unsigned attempt = 0; attempt < 2; ++attempt) {
+                fixture_t f; fixture_init(&f, 2, 3, 0);
+                wl_columnar_memory_governor_ref_t *g = join_governor(&f,
+                        1u << 24);
+                eval_stack_t *stack =
+                    wl_columnar_eval_stack_cleanup_stack(f.frame);
+                stack->items[0].is_delta = true;
+                uint32_t *segments = malloc(2 * sizeof(*segments));
+                CHECK(segments);
+                segments[0] = 0; segments[1] = 3;
+                stack->items[0].seg_boundaries = segments;
+                stack->items[0].seg_count = 1;
+                col_rel_t *right = source_new(2, 0);
+                CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+                col_rel_t *registry[] = {right};
+                f.session.rels = registry;
+                f.session.nrels = f.session.rel_cap = missing ? 0 : 1;
+                wl_plan_op_t op =
+                {.op = missing ? WL_PLAN_OP_SEMIJOIN : WL_PLAN_OP_ANTIJOIN,
+                 .right_relation =
+                     missing ? "missing" : "right",
+                 .key_count = 1, .left_keys = keys,
+                 .right_keys = keys};
+                wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+                fixture_begin(&f, &plan, 0, 1);
+                wl_columnar_filter_context_t *ctx = NULL;
+                prepared_join_until_decision(&f, &ctx, 0, true);
+                CHECK(ctx->unary_started && ctx->pin_owned && !ctx->busy
+                    && ctx->join_disposition == (missing
+                    ? WL_COLUMNAR_JOIN_DISPOSITION_MISSING_EXACT
+                    : WL_COLUMNAR_JOIN_DISPOSITION_ANTI_KEEP_ALL));
+                col_relation_snapshot_t source_image =
+                    wl_columnar_relation_snapshot(f.input);
+                wl_columnar_eval_stack_unary_prepared_t p = {0};
+                wl_columnar_filter_context_t context_before;
+                wl_columnar_eval_plan_numeric_attempt_t parent_before;
+                memcpy(&context_before, ctx, sizeof(context_before));
+                memcpy(&parent_before, &f.record, sizeof(parent_before));
+                if (attempt) CHECK(
+                        !wl_columnar_eval_stack_unary_prepared_join_begin(&p,
+                        f.frame, &f.record));
+                if (stopped) wl_evaluation_control_request_cancel(f.operation);
+                if (attempt) {
+                    int expected =
+                        stopped ? WL_EVALUATION_CONTROL_CANCELLED : EINVAL;
+                    CHECK(wl_columnar_eval_stack_unary_prepared_step(&p) ==
+                        expected
+                        && !p.join_mode && p.first_result == expected
+                        && p.phase ==
+                        WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD);
+                    wl_columnar_eval_stack_unary_prepared_t saved;
+                    memcpy(&saved, &p, sizeof(saved));
+                    uint64_t spent, original_before, original_after,
+                        pending_before, pending_after;
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            f.operation, f.operation_id, &original_before));
+                    CHECK(!wl_evaluation_control_test_active_consumed(f.funding,
+                        f.funding_id, &pending_before));
+                    CHECK(prepared_join_cancel_turn(&p, 191, ERANGE, &spent)
+                        == WL_EVALUATION_CONTROL_WORK_LIMIT && !spent
+                        && !memcmp(&saved, &p, sizeof(saved)));
+                    CHECK(!prepared_join_cancel_turn(&p, 192, ERANGE,
+                        &spent) && spent == 192
+                        && !p.join_mode && p.first_result == expected);
+                    CHECK(!memcmp(&context_before, ctx,
+                        sizeof(context_before)));
+                    int owner = 0;
+                    wl_evaluation_control_t *funding = control_new(0, &owner);
+                    prepared_join_drain_ack(&p, funding,
+                        wl_evaluation_control_active_attempt_id(funding));
+                    CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+                    CHECK(!wl_evaluation_control_detach(funding, &owner));
+                    wl_evaluation_control_release(funding);
+                    CHECK(!memcmp(&context_before, ctx, sizeof(context_before))
+                        && !memcmp(&parent_before, &f.record,
+                        sizeof(parent_before)));
+                    CHECK(!wl_evaluation_control_test_active_consumed(
+                            f.operation, f.operation_id, &original_after)
+                        && original_before == original_after);
+                    CHECK(!wl_evaluation_control_test_active_consumed(f.funding,
+                        f.funding_id, &pending_after)
+                        && pending_before == pending_after);
+                }
+                run(&f);
+                stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+                CHECK(stack && stack->top == 1 && stack->items[0].rel == f.input
+                    && !stack->items[0].owned && f.input->nrows == 3
+                    && f.input->columns[0][2] == 2 &&
+                    f.input->columns[1][2] == 3
+                    && wl_columnar_relation_snapshot_equal(source_image,
+                    wl_columnar_relation_snapshot(f.input)));
+                if (!attempt) {
+                    expected_semantic = f.record.semantic_result;
+                    expected_completed = f.record.completed;
+                    expected_delta = stack->items[0].is_delta;
+                    expected_segments = stack->items[0].seg_count;
+                    expected_has_segments = stack->items[0].seg_boundaries !=
+                        NULL;
+                } else CHECK(f.record.semantic_result == expected_semantic
+                        && f.record.completed == expected_completed
+                        && stack->items[0].is_delta == expected_delta
+                        && stack->items[0].seg_count == expected_segments
+                        && (stack->items[0].seg_boundaries != NULL) ==
+                        expected_has_segments);
+                if (stack->items[0].seg_boundaries) CHECK(
+                        stack->items[0].seg_boundaries == segments);
+                int finish = wl_evaluation_control_finish(f.operation,
+                        &f.operation_owner,
+                        f.record.semantic_result, 0);
+                /* Unwrapped MISSING_EXACT performs no further original poll;
+                 * request_cancel alone is not a latched stop. The attempted
+                 * proof genuinely polls once, so its own control report records
+                 * CANCEL while the original no-op semantic/entry stays intact. */
+                int expected_finish = stopped && (!missing || attempt)
+                ? WL_EVALUATION_CONTROL_CANCELLED : 0;
+                if (finish != expected_finish)
+                    fprintf(stderr,
+                        "unsupported context missing=%u stopped=%u attempt=%u semantic=%d completed=%u finish=%d\n",
+                        missing, stopped, attempt, f.record.semantic_result,
+                        f.record.completed, finish);
+                CHECK(finish == expected_finish);
+                fixture_close(&f); col_rel_destroy(right);
+                CHECK(!wl_columnar_memory_reserved(
+                        wl_columnar_memory_governor_ref_get(g)));
+                wl_columnar_memory_governor_ref_release(g);
+                if (attempt) {
+                    wl_columnar_eval_stack_unary_prepared_status_t history;
+                    CHECK(!wl_columnar_eval_stack_unary_prepared_query(&p,
+                        &history)
+                        && history.phase ==
+                        WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED);
+                }
+            }
+        }
+}
+
+static void
+test_prepared_join_empty_destinations(void)
+{
+    for (unsigned kind = 0; kind < 5; ++kind)
+        for (unsigned pending = 0; pending < 2; ++pending) {
+            fixture_t f; fixture_init(&f, 2, kind == 2 ? 0 : 3, 0);
+            wl_columnar_memory_governor_ref_t *g = join_governor(&f, 1u << 24);
+            if (kind == 3) {
+                col_rel_destroy(f.input); f.input = bare_source("input");
+                wl_columnar_eval_stack_cleanup_stack(f.frame)->items[0].rel =
+                    f.input;
+            }
+            col_rel_t *right = kind == 3 ? bare_source("right") : source_new(1,
+                    kind == 4 ? 0 : 2);
+            CHECK(!wl_columnar_relation_rename_checked(right, "right"));
+            col_rel_t *registry[] = {f.input, kind == 0 ? NULL : right};
+            f.session.rels = registry; f.session.nrels = f.session.rel_cap = 2;
+            f.session.delta_seeded = kind == 1;
+            wl_plan_op_t op = {.op = WL_PLAN_OP_JOIN,
+                               .right_relation = kind ==
+                                   0 ? "missing" : "right",
+                               .delta_mode = kind ==
+                                   1 ? WL_DELTA_FORCE_DELTA :
+                                   WL_DELTA_FORCE_FULL};
+            wl_plan_relation_t plan = {.ops = &op, .op_count = 1};
+            fixture_begin(&f, &plan, 0, 1);
+            wl_columnar_filter_context_t *ctx = NULL;
+            prepared_join_until_decision(&f, &ctx, 0, pending);
+            CHECK(!ctx->execution_result && ctx->output &&
+                ctx->output == ctx->private_output
+                && !ctx->output->nrows &&
+                ctx->join_disposition == WL_COLUMNAR_JOIN_DISPOSITION_REPLACE);
+            wl_columnar_eval_stack_unary_prepared_t p = {0};
+            CHECK(!wl_columnar_eval_stack_unary_prepared_join_begin(&p, f.frame,
+                &f.record));
+            prepared_until(&p, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
+            wl_columnar_eval_stack_unary_commit_prepared_nofail(&p);
+            int owner = 0;
+            wl_evaluation_control_t *funding = control_new(0, &owner);
+            prepared_join_drain_ack(&p, funding,
+                wl_evaluation_control_active_attempt_id(funding));
+            CHECK(!wl_evaluation_control_finish(funding, &owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(funding, &owner));
+            wl_evaluation_control_release(funding);
+            run(&f);
+            CHECK(!f.record.semantic_result && f.record.completed == 1);
+            eval_stack_t *actual =
+                wl_columnar_eval_stack_cleanup_stack(f.frame);
+            wl_col_session_t raw = {0}; wl_mem_ledger_init(&raw.mem_ledger, 0);
+            raw.rels = registry; raw.nrels = raw.rel_cap = 2;
+            raw.delta_seeded = f.session.delta_seeded;
+            eval_stack_t expected = {0};
+            CHECK(!eval_stack_push(&expected, f.input,
+                false) && !col_op_join(&op, &expected, &raw));
+            CHECK(actual && actual->top == 1 && expected.top == 1 &&
+                actual->items[0].owned
+                && !actual->items[0].rel->nrows &&
+                actual->items[0].is_delta == expected.items[0].is_delta);
+            same_relation(actual->items[0].rel, expected.items[0].rel);
+            CHECK(!eval_stack_drain(&expected)); empty_filter_raw_drain(&raw);
+            fixture_close(&f); col_rel_destroy(right);
+            CHECK(!wl_columnar_memory_reserved(
+                    wl_columnar_memory_governor_ref_get(g)));
+            wl_columnar_memory_governor_ref_release(g);
+        }
+}
+
 int
 main(void)
 {
+    test_prepared_join_chained_delta();
+    test_prepared_join_early_stop_turnover();
+    test_prepared_join_unsupported_contexts();
+    test_prepared_join_empty_destinations();
+    test_prepared_join_original_boundaries();
     test_prepared_unary_actual_lifecycle();
     test_prepared_unary_original_boundaries();
     test_prepared_unary_cancelled_parent_cleanup();

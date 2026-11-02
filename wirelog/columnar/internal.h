@@ -8041,11 +8041,18 @@ typedef struct {
 
 /* A prepared receipt owns only leases, exclusion and one control reference.
  * Prior mutable loans are surrendered through ACK. Owned original inputs
- * require genuine preexisting scalar READY; callers consume ABORT history
- * into the existing numeric-owned funded finish, never generic publication. */
+ * in ModeA require genuine preexisting scalar READY; callers consume ABORT
+ * history into numeric-owned funded finish. ModeB authenticates the actual
+ * ordinary JOIN context and uses its normal context-owned finish after ACK;
+ * bounded scalar cleanup/automatic driver selection are separate adapters. */
 typedef enum {
     WL_COLUMNAR_EVAL_STACK_PREPARED_INERT,
     WL_COLUMNAR_EVAL_STACK_PREPARED_HEAD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_HEAD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_STATE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH0,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH1,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SCRATCH2,
     WL_COLUMNAR_EVAL_STACK_PREPARED_ALIAS_FIXED,
     WL_COLUMNAR_EVAL_STACK_PREPARED_ALIAS_ROWS,
     WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OLD,
@@ -8053,6 +8060,11 @@ typedef enum {
     WL_COLUMNAR_EVAL_STACK_PREPARED_VALIDATE_OLD,
     WL_COLUMNAR_EVAL_STACK_PREPARED_VALIDATE_OUTPUT,
     WL_COLUMNAR_EVAL_STACK_PREPARED_READY,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_HEAD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_STATE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH0,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH1,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_JOIN_SEAL_SCRATCH2,
     WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_OLD,
     WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_OUTPUT,
     WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_LATCH,
@@ -8105,7 +8117,13 @@ typedef struct wl_columnar_eval_stack_unary_prepared {
     bool thread_valid, busy, control_ref, scalar_ready;
     bool old_held, output_held, alias_complete, needs_sanitize;
     bool commit_prepaid, committed, result_saved;
+    /* Confirmation is earned by the paid ordinary JOIN context proof. */
+    bool join_mode, publication_is_delta;
 } wl_columnar_eval_stack_unary_prepared_t;
+typedef char wl_columnar_eval_stack_prepared_size_fits_t[
+        sizeof(wl_columnar_eval_stack_unary_prepared_t) <= 392 ? 1 : -1];
+typedef char wl_columnar_eval_stack_prepared_work_fits_t[
+        sizeof(wl_columnar_eval_stack_unary_prepared_work_t) <= 256 ? 1 : -1];
 
 typedef struct {
     wl_columnar_eval_stack_unary_prepared_phase_t phase;
@@ -8116,6 +8134,12 @@ typedef struct {
 } wl_columnar_eval_stack_unary_prepared_status_t;
 
 int wl_columnar_eval_stack_unary_prepared_begin(
+    wl_columnar_eval_stack_unary_prepared_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *);
+/* Normal ordinary JOIN context at its real JOIN_DECIDE boundary. This
+ * primitive does not itself select or own an automatic session driver. */
+int wl_columnar_eval_stack_unary_prepared_join_begin(
     wl_columnar_eval_stack_unary_prepared_t *,
     wl_columnar_eval_stack_cleanup_frame_t *,
     const wl_columnar_eval_plan_numeric_attempt_t *);
