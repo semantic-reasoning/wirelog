@@ -19,5 +19,8 @@ main(void)
 {
     wirelog_source_query_status_t st = WIRELOG_SOURCE_QUERY_OK;
     (void)sizeof(&wirelog_session_source_count);
+    (void)sizeof(&wirelog_session_source_key_exists);
+    (void)sizeof(&wirelog_session_source_validate);
+    (void)sizeof(&wirelog_session_lookup_symbol);
     return (int)st;
 }

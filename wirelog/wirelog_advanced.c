@@ -998,6 +998,75 @@ wirelog_session_source_count(wirelog_session_t *session, const char *relation,
     return st;
 }
 
+wirelog_source_query_status_t
+wirelog_session_source_key_exists(wirelog_session_t *session,
+    const char *relation, int64_t first_key, uint64_t max_rows,
+    bool *out_exists)
+{
+    if (out_exists)
+        *out_exists = false;
+    if (!session || !session->inner || !relation || !out_exists)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_KEY,
+        .relation = relation,
+        .lanes = &first_key,
+        .max_rows = max_rows,
+    };
+    wl_source_query_result_t result = { 0 };
+    /* The whole declared schema is validated; only the key lane's value
+     * domain is checked, since no other lane is supplied. */
+    wirelog_source_query_status_t st = session_source_query(session, &q, 0,
+            1, &result);
+    if (st == WIRELOG_SOURCE_QUERY_OK)
+        *out_exists = result.exists;
+    return st;
+}
+
+wirelog_source_query_status_t
+wirelog_session_source_validate(wirelog_session_t *session,
+    const char *relation, uint32_t expected_ncols)
+{
+    if (!session || !session->inner || !relation || expected_ncols == 0)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_VALIDATE,
+        .relation = relation,
+    };
+    wl_source_query_result_t result = { 0 };
+    return session_source_query(session, &q, expected_ncols, 0, &result);
+}
+
+wirelog_source_query_status_t
+wirelog_session_lookup_symbol(wirelog_session_t *session, const char *symbol,
+    int64_t *out_id, bool *out_found)
+{
+    if (out_id)
+        *out_id = -1;
+    if (out_found)
+        *out_found = false;
+    if (!session || !session->inner || !symbol || !out_id || !out_found)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = { .mode = WL_SOURCE_QUERY_ADMIT };
+    wl_source_query_result_t result = { 0 };
+    wirelog_source_query_status_t st = wl_session_inspection_begin(
+        session->inner);
+    if (st != WIRELOG_SOURCE_QUERY_OK)
+        return st;
+    st = wl_session_source_query(session->inner, &q, &result);
+    if (st == WIRELOG_SOURCE_QUERY_OK) {
+        /* Read-only: wl_intern_get() never inserts. */
+        int64_t id = wl_intern_get(COL_SESSION(session->inner)->intern,
+                symbol);
+        if (id >= 0) {
+            *out_id = id;
+            *out_found = true;
+        }
+    }
+    wl_session_inspection_end(session->inner);
+    return st;
+}
+
 #ifdef WL_SESSION_TEST_HOOKS
 /* Tests inspect the inner session to prove a query changed nothing. */
 wl_session_t *wirelog_session_testhook_inner(wirelog_session_t *session);

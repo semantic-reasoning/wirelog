@@ -525,7 +525,12 @@ wirelog_session_make_compound_typed(wirelog_session_t *session,
  * batch (wirelog_session_insert_typed / _remove_typed) that fails after
  * applying a row also makes its relation UNSUPPORTED for the session's
  * lifetime, because its rollback can leave rows no host call requested.
- * Cold, loading or sealed sources and controlled sessions are UNSUPPORTED.
+ * Controlled sessions are UNSUPPORTED, and so is every relation of a session
+ * in which any relation has been sealed or is being or has been loaded as
+ * cold input, since each closes the whole session to further inserts.
+ * Names starting with `$` or `__` are reserved for the engine, which writes
+ * some such relations itself, and are UNKNOWN_RELATION even when the program
+ * declares them; so are relations without a user `.decl`.
  *
  * Admission: call from the session's owner between operations.  A call made
  * from inside a callback, or while another operation is running, is BUSY and
@@ -538,7 +543,9 @@ wirelog_session_make_compound_typed(wirelog_session_t *session,
  * pointers and zero arity are INVALID_ARGUMENT; then BUSY / UNSUPPORTED
  * session states; then relation identity (UNKNOWN_RELATION); then full
  * schema and origin (UNSUPPORTED); then arity and STRING-lane IDs
- * (INVALID_ARGUMENT); only then storage emptiness and the row limit.
+ * (INVALID_ARGUMENT); only then the relation's own storage -- BUSY while
+ * that storage is being rewritten, UNSUPPORTED if it is not a plain
+ * occurrence list -- its emptiness, and the row limit.
  *
  * Work: @max_rows bounds the physical source rows examined; there is no
  * default.  0 allows only answers that need no row (an empty source); a
@@ -574,6 +581,79 @@ WIRELOG_API wirelog_source_query_status_t
 wirelog_session_source_count(wirelog_session_t *session, const char *relation,
     const int64_t *tuple, uint32_t ncols, uint64_t max_rows,
     uint64_t *out_count);
+
+/**
+ * wirelog_session_source_key_exists:
+ * @session:    Session.
+ * @relation:   Relation name.
+ * @first_key:  Value of the relation's first column (an intern ID when that
+ *              column is a STRING).
+ * @max_rows:   Maximum source rows to examine.
+ * @out_exists: (out) True when some source occurrence has @first_key in its
+ *              first column.  Reset to false on entry; meaningful only on
+ *              WIRELOG_SOURCE_QUERY_OK.
+ *
+ * Report whether any host source occurrence of @relation has @first_key as
+ * its first column.  The whole declared schema is validated first: an
+ * integer key never makes the remaining columns safe.  True may be answered
+ * at the first match; false only after every source row was examined, so a
+ * nonempty source needs @max_rows to reach its end.  Cost is
+ * O(min(rows, max_rows)).  See the section comment above for the rest of the
+ * contract.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status; a failure is
+ * never absence.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_session_source_key_exists(wirelog_session_t *session,
+    const char *relation, int64_t first_key, uint64_t max_rows,
+    bool *out_exists);
+
+/**
+ * wirelog_session_source_validate:
+ * @session:        Session.
+ * @relation:       Relation name.
+ * @expected_ncols: The width the caller will query with; must be positive.
+ *
+ * Validate, without reading any source row or allocating, everything a
+ * count or key query on @relation checks before it reads rows: session
+ * state, relation identity, full schema, origin, @expected_ncols, and the
+ * relation's source storage.  OK certifies that @relation is a supported
+ * scalar relation of that width in this session's current state; it says
+ * nothing about which tuples are present.
+ *
+ * With wirelog_session_lookup_symbol() it establishes absence without
+ * interning: if validation is OK and a symbol is not found, the symbol has
+ * no ID, so no source occurrence of @relation holds it in a STRING column.
+ * Both calls must fall within one uninterrupted ownership interval of the
+ * session, with no interning in between.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_session_source_validate(wirelog_session_t *session,
+    const char *relation, uint32_t expected_ncols);
+
+/**
+ * wirelog_session_lookup_symbol:
+ * @session:   Session.
+ * @symbol:    NUL-terminated symbol text.
+ * @out_id:    (out) The symbol's intern ID.  Reset to -1 on entry;
+ *             meaningful only on WIRELOG_SOURCE_QUERY_OK with *@out_found.
+ * @out_found: (out) True when the symbol is interned.  Reset to false on
+ *             entry; meaningful only on WIRELOG_SOURCE_QUERY_OK.
+ *
+ * Look @symbol up in the session's intern table without inserting it, so a
+ * caller can build a STRING lane for a count or key query, or learn that no
+ * such value can be stored.  Not finding a symbol is OK with *@out_found
+ * false.  Subject to the same admission as the other inspection calls; it
+ * checks no relation.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_session_lookup_symbol(wirelog_session_t *session, const char *symbol,
+    int64_t *out_id, bool *out_found);
 
 #ifdef __cplusplus
 }

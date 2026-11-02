@@ -297,6 +297,11 @@ wl_session_load_input_files(wl_session_t *sess,
 /* Host source origin certification (Issue #2321)                           */
 /* ======================================================================== */
 
+/* Reserved name spaces.  Session-private relations ($in$, $out$, $r$, ...)
+ * start with '$'.  The engine also writes relations under "__" -- for
+ * example the __compound_<functor>_<arity> side relations, which
+ * make_compound appends to even when the program declares one -- so a
+ * "__" name is refused as a whole rather than name by name. */
 static bool
 source_relation_is_private(const char *name)
 {

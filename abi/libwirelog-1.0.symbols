@@ -88,6 +88,7 @@ wirelog_session_destroy
 wirelog_session_finish_cold_input
 wirelog_session_insert
 wirelog_session_insert_typed
+wirelog_session_lookup_symbol
 wirelog_session_make_compound
 wirelog_session_make_compound_typed
 wirelog_session_remove
@@ -99,5 +100,7 @@ wirelog_session_set_typed_delta_cb
 wirelog_session_snapshot
 wirelog_session_snapshot_typed
 wirelog_session_source_count
+wirelog_session_source_key_exists
+wirelog_session_source_validate
 wirelog_session_step
 wirelog_version_string

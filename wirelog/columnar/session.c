@@ -1951,8 +1951,6 @@ col_session_source_query(wl_session_t *session, const wl_source_query_t *q,
     if (!src || src->nrows == 0) {
         if (src && src->ncols != 0 && src->ncols != q->ncols)
             return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
-        if (q->mode == WL_SOURCE_QUERY_VALIDATE)
-            return WIRELOG_SOURCE_QUERY_OK;
         return src && wl_columnar_source_access_gate_busy(&src->source_access)
                ? WIRELOG_SOURCE_QUERY_BUSY : WIRELOG_SOURCE_QUERY_OK;
     }
