@@ -1455,3 +1455,26 @@ selection and funding through the actual session driver, cache/policy acceptance
 shared/cap rollback and the reachable containing-route audit remain required.
 Unsupported decline's legal generic disposer is not a bounded fallback acceptance
 claim, and no broader issue or coverage row closes from this lease alone.
+
+### One lexical composed-step validation
+
+The public composed step still performs its complete native/frame/private-binding
+owner proof on every entry. It sets the existing busy guard and immediately calls
+a sole static validated body without a callback or yield. That body no longer
+repeats the same proof. No token, field, bypass API or cross-return authority is
+introduced; route branches, funding order, pending results and busy clear remain
+unchanged. The checked private JOIN shadow fixture now uses four real static
+bindings, including permitted aliases, while retaining distinguishable output.
+Existing dynamic observed-transaction, copy/native, stale-generation and reentry
+fixtures exercise the same retained public boundary.
+
+Removing the duplicate body proof saves 54 logical source operations for no
+bindings, 89 for dynamic bindings and 338 for four static bindings. The local
+wrapper-through-body-entry envelopes are 64, 99 and 348 respectively, excluding
+unchanged route classification, child setup and later result tails. These local
+deltas do not certify a complete host allowance of 384. Ordinary JOIN stack plus getter with four static bindings
+still costs 466 before remaining setup; the probe counterpart is at least
+494. Reachable unbound pipeline bootstrap/final setup still needs its own actual
+payment boundaries. Those containing-route repairs, automatic prepared publication
+and FINISH selection, cache/policy/shared-cap and general transaction acceptance
+remain required before the grouped issues can close.
