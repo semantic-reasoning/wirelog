@@ -28,6 +28,7 @@
 #include "columnar/continuation.h"
 #include "columnar/kfusion_adaptive.h"
 #include "columnar/progress.h"
+#include "columnar/eval_tdd_channel.h"
 #include "columnar/tdd_channel.h"
 #include "session.h"
 #include "evaluation_control.h"
@@ -2553,12 +2554,13 @@ typedef struct wl_col_session_t {
      * W=4/W=8/W=16.  tdd_submit_loop_ns is the submit loop.
      * tdd_wait_barrier_ns runs from the dispatch until the workers are
      * joined and the batches taken in discard mode are disposed, so it
-     * includes the coordinator's channel pump; tdd_dispatch_wait_ns is the
-     * sum of the two.  tdd_idle_estimate_ns adds how far each round's wait
-     * exceeded its slowest worker's runtime, so it includes pump time too.
-     * tdd_queue_drain_ns covers only the coalesce of the collected batches
-     * after the join.  Coordinator-only; reset at the start of each
-     * wl_session_snapshot(). */
+     * includes the coordinator's channel pump and the held-cap spills it
+     * makes while the workers run; tdd_dispatch_wait_ns is the sum of the
+     * two.  tdd_idle_estimate_ns adds how far each round's wait exceeded
+     * its slowest worker's runtime, so it includes pump and spill time
+     * too.  tdd_queue_drain_ns covers only the coalesce of the collected
+     * batches after the join.  Coordinator-only; reset at the start of
+     * each wl_session_snapshot(). */
     uint64_t tdd_total_ns;
     uint64_t tdd_dispatch_wait_ns;
     uint64_t tdd_submit_loop_ns;
@@ -2916,6 +2918,10 @@ typedef struct wl_col_session_t {
      * cannot succeed, linked through batch->next.  They are disposed after
      * the round's producers are joined, or by the driver's cleanup. */
     wl_tdd_batch_t *tdd_channel_discard;
+    /* Consumer-side accounting of the channel: the held cap and consumer
+     * spill (#1373).  Coordinator only; reset at the start of each
+     * wl_session_snapshot(). */
+    wl_tdd_consumer_stats_t tdd_consumer;
     /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */

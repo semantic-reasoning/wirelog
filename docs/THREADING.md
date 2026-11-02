@@ -2393,12 +2393,41 @@ the lane with the subpass's rc.
 The coordinator submits the W tasks behind the closed dispatch gate, opens
 the gate with `wl_workqueue_dispatch`, pumps the channel on its own thread
 while the workers produce, and joins them at `wl_workqueue_wait_all`.
-Before the join the consumer touches descriptors only: it moves each taken
-batch onto its (worker, relation) list, or in discard mode onto the
-coordinator's discard list, and disposes of nothing. A producer stops
-touching a delta once it is published. Only after the join does the
-coordinator touch payloads: it coalesces each list into the delta matrix
-when the round succeeds, and disposes of the batches when it fails.
+Before the join the consumer moves each taken batch onto its (worker,
+relation) list, or in discard mode onto the coordinator's discard list,
+and disposes of no batch. A producer stops touching a delta once it is
+published, and the one payload access the consumer makes before the join
+is the held cap's spill: after each batch it lists, while the charges of
+the RESIDENT batches it holds exceed the held cap and the session has a
+spill store, it spills the largest of them with
+`wl_columnar_batch_payload_take` on its own thread, before it pumps
+again. A batch whose spill fails is marked and not tried again in the
+round. The spill does not race the producers that are still running:
+
+- A published delta is a heap relation of its own: the ordinary path
+  copies the new rows of the worker's relation into it, and the outbound
+  path publishes a frame's private delta once no relation borrows its
+  storage. The worker keeps no pointer to it after the publish.
+- take accepts only a relation that owns its storage, is not an alias,
+  and holds no memory token that is not its own, and it leaves the
+  relation unchanged when it fails.
+- What take releases goes back through the governor, whose tokens are
+  atomic, and through the relation's memory ledger, whose updates take
+  the ledger's writer gate.
+- Worker sessions borrow the coordinator's spill store without owning it.
+  The join spill and the cold-input paths, which also write to or read
+  from a store, need a session that owns its store, has no coordinator
+  and has at most one worker, which rules out both the workers and the
+  coordinator of a round.
+
+After the join the coordinator coalesces each list into the delta matrix,
+reading spilled batches back, when the round succeeds, and disposes of
+the batches when it fails.
+
+The held cap is `WIRELOG_TDD_HELD_BYTES` when that is a positive decimal
+integer that fits in 64 bits; otherwise a quarter of an enforcing
+governor's budget; otherwise there is none. A batch that cannot be spilled
+stays resident and governed.
 
 The channel's capacity is `WIRELOG_TDD_CHANNEL_BYTES` when that is a
 positive decimal integer that fits in 64 bits; otherwise an eighth of an

@@ -148,33 +148,75 @@ tdd_reserve_channel(wl_col_session_t *coord, uint32_t workers,
 #define TDD_CHANNEL_ADVISORY_BYTES (UINT64_C(256) * 1024 * 1024)
 
 /*
- * The byte capacity of a stratum's channel.  WIRELOG_TDD_CHANNEL_BYTES
- * overrides it when the whole value is a positive decimal integer that
- * fits in 64 bits; any other value, including a sign or whitespace, is
- * ignored.  Otherwise an enforcing governor gives an eighth of its budget,
- * clamped to [4 MiB, 1 GiB], and anything else 256 MiB.  A budget resolved
- * from the environment or the host is at least 256 MiB, which keeps the
- * cap at 32 MiB or more; only an injected governor reaches the 4 MiB floor.
+ * A byte count from the environment variable @name: true, with *@out set,
+ * when the whole value is a positive decimal integer that fits in 64 bits.
+ * Any other value, including a sign or whitespace, is ignored.
  */
-static uint64_t
-tdd_channel_cap_bytes(wl_col_session_t *coord)
+static bool
+tdd_env_bytes(const char *name, uint64_t *out)
 {
-    const char *env = getenv("WIRELOG_TDD_CHANNEL_BYTES");
-    if (env && env[0] >= '0' && env[0] <= '9') {
-        char *endp = NULL;
-        errno = 0;
-        unsigned long long value = strtoull(env, &endp, 10);
-        if (*endp == '\0' && errno != ERANGE && value > 0)
-            return (uint64_t)value;
-    }
+    const char *env = getenv(name);
+    if (!env || env[0] < '0' || env[0] > '9')
+        return false;
+    char *endp = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(env, &endp, 10);
+    if (*endp != '\0' || errno == ERANGE || value == 0)
+        return false;
+    *out = (uint64_t)value;
+    return true;
+}
+
+/* @coord's governor when it enforces a budget, else NULL. */
+static const wl_columnar_memory_governor_t *
+tdd_enforcing_governor(const wl_col_session_t *coord)
+{
     const wl_columnar_memory_governor_t *governor = coord->memory_governor
         ? wl_columnar_memory_governor_ref_get(coord->memory_governor) : NULL;
-    if (!governor || governor->mode != WL_COLUMNAR_MEMORY_MODE_ENFORCING)
+    return governor && governor->mode == WL_COLUMNAR_MEMORY_MODE_ENFORCING
+        ? governor : NULL;
+}
+
+/*
+ * The byte capacity of a stratum's channel: WIRELOG_TDD_CHANNEL_BYTES when
+ * tdd_env_bytes() accepts it; otherwise an eighth of an enforcing
+ * governor's budget, clamped to [4 MiB, 1 GiB]; otherwise 256 MiB.  A
+ * budget resolved from the environment or the host is at least 256 MiB,
+ * which keeps the cap at 32 MiB or more; only an injected governor reaches
+ * the 4 MiB floor.
+ */
+static uint64_t
+tdd_channel_cap_bytes(const wl_col_session_t *coord)
+{
+    uint64_t cap = 0;
+    if (tdd_env_bytes("WIRELOG_TDD_CHANNEL_BYTES", &cap))
+        return cap;
+    const wl_columnar_memory_governor_t *governor =
+        tdd_enforcing_governor(coord);
+    if (!governor)
         return TDD_CHANNEL_ADVISORY_BYTES;
-    uint64_t cap = governor->budget_bytes / 8u;
+    cap = governor->budget_bytes / 8u;
     if (cap < TDD_CHANNEL_MIN_BYTES)
         return TDD_CHANNEL_MIN_BYTES;
     return cap > TDD_CHANNEL_MAX_BYTES ? TDD_CHANNEL_MAX_BYTES : cap;
+}
+
+/*
+ * The consumer-held cap of a stratum (#1373): the resident bytes of taken
+ * batches the coordinator holds before it spills, checked after each take
+ * while a round runs.  WIRELOG_TDD_HELD_BYTES when tdd_env_bytes() accepts
+ * it; otherwise a quarter of an enforcing governor's budget; otherwise no
+ * cap (UINT64_MAX).
+ */
+static uint64_t
+tdd_held_cap_bytes(const wl_col_session_t *coord)
+{
+    uint64_t cap = 0;
+    if (tdd_env_bytes("WIRELOG_TDD_HELD_BYTES", &cap))
+        return cap;
+    const wl_columnar_memory_governor_t *governor =
+        tdd_enforcing_governor(coord);
+    return governor ? governor->budget_bytes / 4u : UINT64_MAX;
 }
 
 /*
@@ -245,8 +287,10 @@ tdd_channel_release(wl_col_session_t *coord)
     return 0;
 }
 
-/* Outside owner mode a refused retirement abandons the relation, as
- * col_rel_destroy() does, and retires the descriptor. */
+/* Outside owner mode a refused retirement abandons the batch's payload, as
+ * col_rel_destroy() abandons a relation it cannot retire, and retires the
+ * descriptor.  An abandoned SPILLED payload keeps its spill segment, and
+ * with it the spill store, alive. */
 static void
 tdd_channel_abandon_refused(void *ctx, wl_tdd_batch_t *batch, int rc)
 {
@@ -7509,6 +7553,8 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
     rc = tdd_create_channel(coord, W, nrels);
     if (rc != 0)
         goto done;
+    const uint64_t held_cap = tdd_held_cap_bytes(coord);
+    coord->tdd_consumer.held_cap = held_cap;
     if (owner_exchange_mode) {
         rc = wl_columnar_eval_tdd_owner_lifetime_create(coord, ctxs, W, nrels);
         if (rc != 0)
@@ -7787,10 +7833,14 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                     goto done;
                 }
 #endif
+                /* The held cap applies as batches are taken, so the
+                 * consumer spills while the producers run. */
+                const wl_tdd_hold_t hold = { coord, held_cap,
+                                             &coord->tdd_consumer };
                 consumer_rc = wl_columnar_eval_tdd_channel_collect(
                     coord->tdd_channel, &coord->mem_ledger,
                     coord->tdd_channel_lists, W, nrels,
-                    &coord->tdd_channel_discard, &delivered);
+                    &coord->tdd_channel_discard, &delivered, &hold);
                 /* Collect ends the round before it returns, with two
                  * exceptions: invalid arguments, which this cancel covers,
                  * and a second pump error after collect has cancelled the
@@ -7886,15 +7936,15 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             }
 
             /* Issue #1373: the round is complete and every producer has
-             * been joined, so payloads may be read now.  Coalesce each
-             * (worker, relation) list of batches into its matrix slot.
+             * been joined.  Coalesce each (worker, relation) list of
+             * batches into its matrix slot, reading spilled batches back.
              * worker_delta_rows counts the rows the batches carried. */
             {
                 uint64_t queue_t0 = now_ns();
                 wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
                 rc = wl_columnar_eval_tdd_channel_coalesce_all(coord,
                         coord->tdd_channel, coord->tdd_channel_lists,
-                        ctxs, W, nrels, &sink);
+                        ctxs, W, nrels, &sink, &coord->tdd_consumer);
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;
                 if (coord->tdd_audit.enabled)
                     coord->tdd_audit.worker_delta_rows += delivered;

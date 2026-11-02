@@ -744,6 +744,20 @@ test_tdd_channel_round_exe = executable(
 test('tdd_channel_round', test_tdd_channel_round_exe, suite: 'unit',
      timeout: 180)
 
+# Issue #1373: the consumer-held cap.  Public sessions with an enforcing
+# governor and a spill store under the build tree spill the batches they
+# hold beyond WIRELOG_TDD_HELD_BYTES and read them back when they stage.
+test_tdd_channel_held_exe = executable(
+  'test_tdd_channel_held', files('test_tdd_channel_held.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TDD_CHANNEL_TEST_HOOKS=1'],
+)
+test('tdd_channel_held', test_tdd_channel_held_exe,
+     env: ['WL_TDD_CHANNEL_SPILL_DIR=' + meson.current_build_dir()],
+     suite: 'unit', timeout: 180)
+
 # Issue #508: bench_argv shim unit tests. Header-only, portable by
 # construction; runs on every platform including MSVC.
 test_bench_argv_exe = executable(

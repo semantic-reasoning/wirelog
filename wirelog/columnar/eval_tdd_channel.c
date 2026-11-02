@@ -259,17 +259,37 @@ tdd_batch_schema_matches(const wl_tdd_batch_t *batch, const col_rel_t *slot)
     return true;
 }
 
+/* Whether @schema has the column count and types of @payload. */
+static bool
+tdd_schema_matches_payload(const col_rel_t *schema,
+    const wl_columnar_batch_payload_t *payload)
+{
+    uint32_t ncols = 0;
+    uint32_t nrows = 0;
+    const wirelog_column_type_t *types =
+        wl_columnar_batch_payload_schema(payload, &ncols, &nrows);
+    if (schema->ncols != ncols || (ncols && !types))
+        return false;
+    for (uint32_t c = 0; c < ncols; c++)
+        if (tdd_rel_type(schema, c) != types[c])
+            return false;
+    return true;
+}
+
 /* Create the empty slot under the coordinator's governor with timestamps
  * and room for @rows rows.  Its schema is @model's when a RESIDENT batch
- * exists, else the first payload's. */
+ * exists, else @schema's when it matches the first payload, else the first
+ * payload's column types alone. */
 static int
 tdd_slot_create(wl_col_session_t *coord, const char *name,
-    const col_rel_t *model, const wl_tdd_batch_t *head, uint32_t rows,
-    col_rel_t **out)
+    const col_rel_t *model, const col_rel_t *schema,
+    const wl_tdd_batch_t *head, uint32_t rows, col_rel_t **out)
 {
     wl_columnar_memory_governor_ref_t *gov = coord->memory_governor;
     col_rel_t *slot = NULL;
     int rc;
+    if (!model && schema && tdd_schema_matches_payload(schema, head->payload))
+        model = schema;
     if (model) {
         rc = wl_columnar_relation_new_like_governed_checked_mode(
             name ? name : model->name, model, gov, true, &slot);
@@ -304,7 +324,8 @@ tdd_slot_create(wl_col_session_t *coord, const char *name,
 int
 wl_columnar_eval_tdd_coalesce_slot(wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **list, uint32_t nworkers,
-    const char *name, const wl_tdd_refusal_sink_t *sink, col_rel_t **out_slot)
+    const char *name, const col_rel_t *schema,
+    const wl_tdd_refusal_sink_t *sink, col_rel_t **out_slot)
 {
     if (!coord || !ch || !list || !out_slot || *out_slot || !sink
         || !sink->fn)
@@ -354,8 +375,8 @@ wl_columnar_eval_tdd_coalesce_slot(wl_col_session_t *coord,
     }
 
     col_rel_t *slot = NULL;
-    int rc = tdd_slot_create(coord, name, model, head, (uint32_t)total,
-            &slot);
+    int rc = tdd_slot_create(coord, name, model, schema, head,
+            (uint32_t)total, &slot);
     for (const wl_tdd_batch_t *b = head; rc == 0 && b; b = b->next) {
         if (!tdd_batch_schema_matches(b, slot)) {
             rc = EPROTO;
@@ -696,11 +717,16 @@ tdd_collect_pump(wl_tdd_channel_t *ch, bool cancelled, wl_tdd_batch_t **out,
 int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
-    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows)
+    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows,
+    const wl_tdd_hold_t *hold)
 {
-    if (!ch || !lists || nworkers == 0 || !discard)
+    if (!ch || !lists || nworkers == 0 || !discard
+        || (hold && (!hold->coord || !hold->stats)))
         return EINVAL;
     int rc = 0;
+    uint64_t held = hold
+        ? wl_columnar_eval_tdd_held_bytes(lists, nworkers, nrels, UINT32_MAX)
+        : 0;
     bool cancelled = false;
     bool discarding = false;
     for (;;) {
@@ -753,6 +779,9 @@ wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
         size_t index = (size_t)batch->rel_idx * nworkers + batch->worker;
         batch->next = lists[index];
         lists[index] = batch;
+        if (hold)
+            held = wl_columnar_eval_tdd_hold_batch(hold, lists, nworkers,
+                    nrels, batch, held);
     }
 }
 
@@ -771,11 +800,125 @@ tdd_list_reverse(wl_tdd_batch_t **list)
     *list = reversed;
 }
 
+static uint64_t
+tdd_add_saturated(uint64_t a, uint64_t b)
+{
+    return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+}
+
+uint64_t
+wl_columnar_eval_tdd_held_bytes(wl_tdd_batch_t *const *lists,
+    uint32_t nworkers, uint32_t nrels, uint32_t skip_rel)
+{
+    uint64_t held = 0;
+    if (!lists)
+        return 0;
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        if (ri == skip_rel)
+            continue;
+        for (uint32_t w = 0; w < nworkers; w++) {
+            const wl_tdd_batch_t *b = lists[(size_t)ri * nworkers + w];
+            for (; b; b = b->next)
+                if (b->kind == WL_TDD_BATCH_RESIDENT)
+                    held = tdd_add_saturated(held, b->charge);
+        }
+    }
+    return held;
+}
+
+/*
+ * The held RESIDENT batch with the largest charge over every relation but
+ * @skip_rel; with @spillable, only among batches not marked unspillable.
+ */
+static wl_tdd_batch_t *
+tdd_held_largest(wl_tdd_batch_t **lists, uint32_t nworkers, uint32_t nrels,
+    uint32_t skip_rel, bool spillable)
+{
+    wl_tdd_batch_t *best = NULL;
+    for (uint32_t ri = 0; ri < nrels; ri++) {
+        if (ri == skip_rel)
+            continue;
+        for (uint32_t w = 0; w < nworkers; w++) {
+            wl_tdd_batch_t *b = lists[(size_t)ri * nworkers + w];
+            for (; b; b = b->next) {
+                if (b->kind != WL_TDD_BATCH_RESIDENT
+                    || (spillable
+                    && (b->flags & WL_TDD_BATCH_FLAG_UNSPILLABLE)))
+                    continue;
+                if (!best || b->charge > best->charge)
+                    best = b;
+            }
+        }
+    }
+    return best;
+}
+
+uint64_t
+wl_columnar_eval_tdd_spill_held(wl_col_session_t *coord,
+    wl_tdd_batch_t **lists, uint32_t nworkers, uint32_t nrels,
+    uint32_t skip_rel, uint64_t target, wl_tdd_consumer_stats_t *stats)
+{
+    uint64_t held = wl_columnar_eval_tdd_held_bytes(lists, nworkers, nrels,
+            skip_rel);
+    if (!coord || !lists || !coord->spill_store || !coord->memory_governor)
+        return held;
+    while (held > target) {
+        wl_tdd_batch_t *batch = tdd_held_largest(lists, nworkers, nrels,
+                skip_rel, true);
+        if (!batch)
+            break;
+        /* A successful spill replaces the charge with the payload floor. */
+        uint64_t charge = batch->charge;
+        wl_columnar_spill_status_t status = WL_COLUMNAR_SPILL_INVALID;
+        int rc = wl_columnar_eval_tdd_batch_spill(batch,
+                coord->memory_governor, coord->spill_store, &status);
+        if (rc == 0) {
+            held = held > charge ? held - charge : 0;
+            if (stats)
+                stats->consumer_spills++;
+            continue;
+        }
+        /* A batch without timestamps comes back unmarked; mark every
+         * failure so the loop never picks the batch again. */
+        batch->flags |= WL_TDD_BATCH_FLAG_UNSPILLABLE;
+        if (stats)
+            stats->consumer_spill_fail[(size_t)status
+                < WL_TDD_SPILL_STATUS_SLOTS
+                ? (size_t)status : (size_t)WL_COLUMNAR_SPILL_INVALID]++;
+    }
+    return held;
+}
+
+uint64_t
+wl_columnar_eval_tdd_hold_batch(const wl_tdd_hold_t *hold,
+    wl_tdd_batch_t **lists, uint32_t nworkers, uint32_t nrels,
+    const wl_tdd_batch_t *batch, uint64_t held)
+{
+    wl_tdd_consumer_stats_t *stats = hold->stats;
+    if (batch->kind != WL_TDD_BATCH_RESIDENT)
+        return held;
+    held = tdd_add_saturated(held, batch->charge);
+    if (held > stats->round_held_peak_bytes)
+        stats->round_held_peak_bytes = held;
+    if (batch->charge > stats->max_batch_charge)
+        stats->max_batch_charge = batch->charge;
+    if (held > hold->cap) {
+        if (hold->coord->spill_store && hold->coord->memory_governor)
+            held = wl_columnar_eval_tdd_spill_held(hold->coord, lists,
+                    nworkers, nrels, UINT32_MAX, hold->cap, stats);
+        if (held > hold->cap)
+            stats->held_over_cap++;
+    }
+    if (held > stats->max_held_bytes)
+        stats->max_held_bytes = held;
+    return held;
+}
+
 int
 wl_columnar_eval_tdd_channel_coalesce_all(wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
     col_eval_tdd_worker_ctx_t *ctxs, uint32_t nworkers, uint32_t nrels,
-    const wl_tdd_refusal_sink_t *sink)
+    const wl_tdd_refusal_sink_t *sink, wl_tdd_consumer_stats_t *stats)
 {
     if (!coord || !ch || !lists || !ctxs || !sink || !sink->fn)
         return EINVAL;
@@ -795,8 +938,24 @@ wl_columnar_eval_tdd_channel_coalesce_all(wl_col_session_t *coord,
             tdd_list_reverse(list);
             const char *name = ctxs[w].sp
                 ? ctxs[w].sp->relations[ri].delta_name : NULL;
+            /* A slot of spilled batches takes the schema of worker w's
+             * relation ri, which the ordinary path creates its deltas
+             * like.  In owner and global-read mode an adopted slot is
+             * created like the relation plan's result instead, so the two
+             * kinds of slot need only be compatible under the exchanges'
+             * tdd_relation_schema_compatible(), which accepts a declared
+             * width of 0 against any other. */
+            const col_rel_t *schema = ctxs[w].sp && ctxs[w].worker_sess
+                ? session_find_rel(ctxs[w].worker_sess,
+                    ctxs[w].sp->relations[ri].name) : NULL;
+            uint64_t spilled = 0;
+            for (const wl_tdd_batch_t *b = *list; b; b = b->next)
+                if (b->kind == WL_TDD_BATCH_SPILLED)
+                    spilled++;
             rc = wl_columnar_eval_tdd_coalesce_slot(coord, ch, list, nworkers,
-                    name, sink, &ctxs[w].delta_rels[ri]);
+                    name, schema, sink, &ctxs[w].delta_rels[ri]);
+            if (rc == 0 && stats)
+                stats->rehydrated_batches += spilled;
             if (rc != 0)
                 wl_columnar_eval_tdd_discard_list(ch, list, sink);
         }
