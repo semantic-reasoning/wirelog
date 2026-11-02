@@ -4893,6 +4893,25 @@ wl_columnar_relation_scalar_retirement_cancel(
     return rc;
 }
 
+/* Genuine preexisting READY writers only. This observes authority; it does
+ * not create claims, consume a receipt or poll its original attempt. */
+int
+wl_columnar_relation_scalar_retirement_ready_validate(
+    const wl_columnar_relation_scalar_retirement_t *s,
+    const col_rel_t *expected,
+    col_relation_snapshot_t snapshot)
+{
+    if (!s || !expected || s->storage.identity != (uintptr_t)&s->storage
+        || !s->ready || s->committed || s->phase != 2 || s->column
+        || s->storage.relation != expected) return EINVAL;
+    int rc =
+        wl_columnar_relation_managed_gate_round_validate(&s->storage.gate_round,
+            expected);
+    if (rc) return rc;
+    return wl_columnar_relation_snapshot_equal(snapshot,
+               wl_columnar_relation_snapshot(expected)) ? 0 : EINVAL;
+}
+
 int
 wl_columnar_relation_scalar_retirement_commit(
     wl_columnar_relation_scalar_retirement_t *s)

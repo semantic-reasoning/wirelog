@@ -1220,3 +1220,96 @@ frame-status180 and old context wrapper215. The host outer139 and inner180
 are separate existing protocol regions; no whole STATUS-call256 claim is made.
 These observations supply a prerequisite for later prepared unary exclusion;
 cache/strict/cap/shared and general transaction acceptance remain outstanding.
+
+
+### Prepared unary replacement: Mode A ownership precursor
+
+The internal prepared receipt now owns a real exclusion marker on the actual
+numeric frame. This extends the preceding observation foundation; it does not
+yet select prepared publication from JOIN_DECIDE, cache insertion or the session
+transaction dispatcher. The first constructor admits borrowed old relations or
+owned old relations with an already prepared scalar retirement. Owned inputs
+without that real retirement refuse before marker installation or original
+debit. The caller first drives the existing scalar initializer and preparation;
+paid validation later checks the actual final-address, native, two-writer
+retirement, rather than treating eligibility flags as authority.
+
+The caller surrenders existing mutable loans before beginning. While marked,
+new stack/result/context loans, generic commit, scalar mutation, numeric parent
+progress/ACK, constructors and checked frame cleanup refuse. Copied observation
+remains available. This is internal serialized ownership, not a new public
+session-destruction admission gate: the caller must retain the actual
+session/frame/parent through receipt ACK.
+
+Preparation captures the seven-field old/output entries, compares fixed aliases
+and one real stack entry per action, then acquires actual descriptor/storage
+readers in separate steps. A partially acquired descriptor is retained and
+released through its genuine token. Owned old input uses the existing scalar
+writers instead of acquiring conflicting readers. Validation checks entry,
+snapshot, canonical storage, generation, token and native ownership again before
+sealing. The final latch pays its own128 and an additional real future128.
+The callback-free no-fail leaf moves all seven old fields to retired, installs
+the candidate, clears its former slot and records committed success; it does no
+allocation, polling, charging or cleanup.
+
+Distinct live funding drives cancellation, one reader-release action at a time,
+fixed work clearing and ACK after the original ends. Each action checks funding
+before its checkpoint and charges the saved generation afterwards. ACK clears
+the marker and all frame/parent/control/token authority before dropping its own
+original-control reference. ACKED history queries use local receipt bytes only,
+including after frame/control destruction. The actual numeric parent retains
+another original reference, so the receipt cannot legitimately be its sole
+reference while that parent remains alive.
+
+A zero-result cancellation is RESUME only from genuinely prepared/sealed state
+without a saved error. It removes the receipt's leases/marker without publishing
+or changing either entry. ABORT preserves the first error for the trusted caller,
+which must pass it to the existing owned funded scalar finish; generic commit
+does not provide a universal post-ACK error guard. A late cancellation after
+the no-fail commit preserves committed success. Borrowed retired segmented
+entries release only their owned segment array in one paid128 action, then clear
+the borrowed entry in a following action; relation ownership and scalar READY
+authority do not change during that array-only step.
+
+Copied inspection/status/key/query outputs cannot overlap known active frame,
+prepared receipt or numeric parent storage. Host request storage is checked
+before reading its reply pointer; reply storage is checked before initialization.
+The typed private-binding getter likewise refuses protected output before its
+ordinary NULL initialization. Status rechecks current owner ranges after its
+checkpoint: a genuine newly created receipt at the former external output
+address cannot be overwritten. Unmarked in-frame cleanup-key bootstrap remains
+valid. These checks compare known owner ranges, not arbitrary opaque allocation
+sizes, and return no mutation capability.
+
+Numeric tests cover real success, ABORT and RESUME for borrowed/owned READY
+inputs, original/lower-stack/result aliases, partial descriptor cleanup,
+exact/one-short preparation and funded cleanup, copied/native/reentrant
+refusal, active funding/original generation turnover and ACKED reuse. Serial
+tests reach a genuine generated composed parent, prepare its actual unary
+replacement, retain STATUS767/768 behavior, reject parent mutation, then finish
+the real parent and compare output. This fixture manually exercises Mode A at
+that real boundary; it does not prove automatic Mode B or cache selection.
+
+These fixed source regions remain separate from nominal debits: INIT is at most
+252 within256, reader acquisition125 within128, old/output validation174/159
+within192, no-fail replacement35 plus a conservative caller suffix16 within its
+prepaid128, reader drain117 within128 and receipt ACK125 within192. Existing
+ended-metadata cleanup is exactly192 within192, so these helpers do not add
+shared validation to it. The observation-only range helper expands its first
+frame comparison directly; constructor geometry remains separate. With the
+complete four-binding/six-pair validation, numeric STATUS is at most376 and
+composed STATUS exactly384 within their unchanged384 fees. The latter has no
+spare capacity. Existing native/control/allocator boundaries remain qualified;
+these inventories do not establish a whole session turn bound. Legacy
+private-binding setup callers still require their own containing-route audit,
+rather than inheriting a fictional whole-call384 proof from STATUS.
+
+The binding getter also checks the live record's stored session when the supplied
+session differs, before normalizing output. A wrong supplied session combined
+with a wrong frame, control, ID or native thread cannot hide that actual
+session's protected receipt. This is read-only range exclusion, not mutation
+authority: full numeric/private-binding validation still runs once afterward.
+NULL/nonself owners intentionally return EINVAL without changing output because
+their output association is unproven; genuine self owners with safe external
+output retain NULL normalization on ordinary argument errors. Caller-owned
+record/session storage must remain live; this is not arbitrary pointer validation.

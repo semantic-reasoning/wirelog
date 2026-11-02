@@ -1076,10 +1076,23 @@ wl_columnar_eval_plan_numeric_private_bindings_get(const void *owner,
     wl_col_session_t *session, wl_evaluation_control_t *control, uint64_t id,
     const wl_columnar_eval_private_bindings_t **out)
 {
-    if (!out) return EINVAL;
-    *out = NULL;
     const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
-    if (!record || record->identity != owner || record->frame != frame
+    if (!out || (uintptr_t)out > UINTPTR_MAX - sizeof(*out)
+        || (record && !wl_columnar_eval_stack_copy_ranges_disjoint(record,
+        sizeof(*record), out, sizeof(*out)))
+        || !wl_columnar_eval_stack_marked_copy_output(session, out,
+        sizeof(*out))) return EINVAL;
+    /* Reject absent or nonself owners before output normalization.
+     * This refusal intentionally leaves unproven output untouched. */
+    if (!record || record->identity != owner) return EINVAL;
+    /* A mismatching supplied session must not hide the actual marker.
+     * This is read-only exclusion, independent of supplied frame/control/id
+     * and native authorization; the complete validator still runs below. */
+    if (record->session != session
+        && !wl_columnar_eval_stack_marked_copy_output(record->session, out,
+        sizeof(*out))) return EINVAL;
+    *out = NULL;
+    if (record->frame != frame
         || record->session != session || record->control != control
         || record->attempt_id != id
         || wl_columnar_eval_plan_numeric_validate(record))
@@ -1255,6 +1268,7 @@ wl_columnar_eval_plan_numeric_attempt_begin(
     if (!record || record->identity || record->phase || !plan || !plan->ops
         || begin >= end || end > plan->op_count || !frame || !session
         || !control || !id) return EINVAL;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(frame)) return EBUSY;
     int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
     if (rc) return rc;
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
@@ -1654,6 +1668,7 @@ wl_columnar_eval_plan_numeric_source_attempt_begin(
         || session->retraction_right_pass || session->tdd_input_run
         || session->tdd_subpass_active || session->tdd_outbound_only_active
         || session->diff_operators_active) return ENOTSUP;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(frame)) return EBUSY;
     int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
     if (rc) return rc;
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
@@ -1705,6 +1720,8 @@ wl_columnar_eval_plan_numeric_attempt_step(
 {
     int rc = wl_columnar_eval_plan_numeric_validate(record);
     if (rc) return rc;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame)) return EBUSY;
     bool empty_child = false;
     if (record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_CHILD) {
         rc = wl_columnar_filter_empty_end_pending_owned(record->frame, record,
@@ -1837,6 +1854,8 @@ wl_columnar_eval_plan_numeric_consume_result(
 {
     int rc = wl_columnar_eval_plan_numeric_validate(record);
     if (rc) return rc;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame)) return EBUSY;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_PENDING) return EBUSY;
     rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
             record->control);
@@ -1880,6 +1899,9 @@ wl_columnar_eval_plan_numeric_attempt_status(
     if (!status) return EINVAL;
     int rc = wl_columnar_eval_plan_numeric_validate(record);
     if (rc) return rc;
+    /* Validation proves the frame's numeric owner is this exact record. */
+    if (!wl_columnar_eval_stack_protocol_copy_output(record->frame, status,
+        sizeof(*status))) return EINVAL;
     rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
@@ -1900,6 +1922,8 @@ wl_columnar_eval_plan_numeric_attempt_ack(
 {
     int rc = wl_columnar_eval_plan_numeric_validate(record);
     if (rc) return rc;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame)) return EBUSY;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_DONE
         || record->source_initialized || record->source_bare ||
         !record->control)
@@ -1938,6 +1962,7 @@ wl_columnar_eval_plan_numeric_stack_attempt_begin(
         || begin >= end || end > plan->op_count || !frame || !session
         || !control || !id || !expected_depth
         || expected_depth > COL_STACK_MAX) return EINVAL;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(frame)) return EBUSY;
     int rc = wl_columnar_eval_plan_numeric_fund(funding, funding_id, control);
     if (rc) return rc;
     if (wl_evaluation_control_active_attempt_id(control) != id) return EINVAL;
@@ -2068,6 +2093,7 @@ wl_columnar_eval_plan_numeric_composed_attempt_begin_internal(
         && !controlled_materialized_batch_fallback)
         || session->join_output_shared_count || session->coordinator
         || session->num_workers > 1) return ENOTSUP;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(frame)) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_fund(funding, funding_id, control);
     if (rc) return rc;
     /* Two independently named first256 capacities: original pin retirement
@@ -2763,6 +2789,8 @@ wl_columnar_eval_plan_numeric_lftj_metadata_cleanup_ended(
     wl_evaluation_control_t *funding,
     uint64_t funding_id, int *result)
 {
+    if (r &&
+        wl_columnar_eval_stack_frame_mutation_blocked(r->frame)) return EBUSY;
     if (!r || r->composed_busy) return r ? EBUSY : EINVAL;
     if (!wl_columnar_eval_plan_metadata_result_disjoint(r,
         result)) return EINVAL;
@@ -2813,6 +2841,8 @@ wl_columnar_eval_plan_numeric_lftj_metadata_ack_ended(
     wl_evaluation_control_t *funding,
     uint64_t funding_id, int *result)
 {
+    if (r &&
+        wl_columnar_eval_stack_frame_mutation_blocked(r->frame)) return EBUSY;
     if (!r || r->composed_busy) return r ? EBUSY : EINVAL;
     if (!wl_columnar_eval_plan_metadata_result_disjoint(r,
         result)) return EINVAL;
@@ -3332,6 +3362,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_source(
 {
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame)) return EBUSY;
     if (record->join_host || record->join_host_admitted
         || record->join_host_governor) return EBUSY;
     switch (record->phase) {
@@ -3424,7 +3456,9 @@ wl_columnar_eval_plan_numeric_composed_consume_result(
     wl_columnar_eval_plan_numeric_attempt_t *record, int child_protocol,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    if (record && record->composed_busy) return EBUSY;
+    if (record && (record->composed_busy
+        || wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame))) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING)
@@ -3500,6 +3534,9 @@ wl_columnar_eval_plan_numeric_composed_attempt_status(
     if (!status) return EINVAL;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
+    /* Validation proves the frame's numeric owner is this exact record. */
+    if (!wl_columnar_eval_stack_protocol_copy_output(record->frame, status,
+        sizeof(*status))) return EINVAL;
     rc = wl_columnar_eval_plan_composed_fund(funding, funding_id,
             record->control);
     if (rc) return rc;
@@ -3520,7 +3557,9 @@ wl_columnar_eval_plan_numeric_composed_abort_request(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    if (record && record->composed_busy) return EBUSY;
+    if (record && (record->composed_busy
+        || wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame))) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     /* Closure is finalized by the bounded preflight before any child owner
@@ -3549,7 +3588,9 @@ wl_columnar_eval_plan_numeric_composed_attempt_ack(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    if (record && record->composed_busy) return EBUSY;
+    if (record && (record->composed_busy
+        || wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame))) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_DONE
@@ -3587,7 +3628,9 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     wl_columnar_eval_plan_numeric_attempt_t *record,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    if (record && record->composed_busy) return EBUSY;
+    if (record && (record->composed_busy
+        || wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame))) return EBUSY;
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->composed_busy) return EBUSY;
@@ -3604,6 +3647,8 @@ wl_columnar_eval_plan_numeric_composed_cleanup_lftj(
 {
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(
+            record->frame)) return EBUSY;
     if (record->composed_busy) return EBUSY;
     record->composed_busy = true;
     rc = wl_columnar_eval_plan_numeric_composed_cleanup_lftj_body(record,
