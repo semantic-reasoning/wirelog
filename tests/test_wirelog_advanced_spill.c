@@ -2004,6 +2004,67 @@ static void composite_public_references(void)
                     }
 }
 
+static void cold_join_count_public(void)
+{
+    for (unsigned filtered = 0; filtered < 3; filtered++)
+        for (unsigned lm = 0; lm < 3; lm++)for (unsigned rm = 0; rm < 3; rm++)
+                for (unsigned empty = 0; empty < 2; empty++) {
+                    if (empty && lm == 1) continue; /* Fresh empty legacy seals refuse. */
+                    char text[512];
+                    snprintf(text, sizeof(text),
+                        ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n.decl result(n:int64)\nresult(count(y)) :- a(k,x),b(k,y)%s.\n",
+                        filtered == 1?",y>2":filtered == 2?",y>99":"");
+                    wirelog_program_t *p = parse(text);
+                    wirelog_session_t *s = NULL;
+                    wirelog_session_options_v1_t o = configured();
+                    o.spill_join_batch_bytes = 96;
+                    o.spill_join_index_bytes = 128;
+                    CHECK(wirelog_session_create_with_options(p,
+                        WIRELOG_BACKEND_DEFAULT, 1, &o, &s) == WIRELOG_OK);
+                    int64_t a[] = {1, 0, 1, 1, 1, 2, 1, 3},
+                        b[] = {1, 0, 1, 1, 1, 2, 1, 3, 1, 4, 1, 5};
+                    for (unsigned side = 0; side < 2; side++) {
+                        unsigned mode = side?rm:lm, n = side?6:empty?0:4;
+                        const char *name = side?"b":"a";
+                        int64_t *rows = side?b:a;
+                        if (mode != 2) CHECK(wirelog_session_insert(s, name,
+                                rows, n, 2) == WIRELOG_OK);
+                    }
+                    for (unsigned side = 0; side < 2; side++) {
+                        unsigned mode = side?rm:lm, n = side?6:empty?0:4;
+                        const char *name = side?"b":"a";
+                        int64_t *rows = side?b:a;
+                        if (mode == 1) CHECK(wirelog_session_seal_input(s,
+                                name) == WIRELOG_OK);
+                        if (mode == 2) {
+                            CHECK(wirelog_session_begin_cold_input(s,
+                                name) == WIRELOG_OK);
+                            for (unsigned i = 0; i < n;
+                                i +=
+                                2) CHECK(wirelog_session_append_cold_input(s,
+                                    name, rows+2*i, 2, 2) == WIRELOG_OK);
+                            CHECK(wirelog_session_finish_cold_input(s,
+                                name) == WIRELOG_OK);
+                        }
+                    }
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        cold_count_result_t raw = {0}, typed = {0};
+                        CHECK(wirelog_session_step(s) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot(s, cold_count_observe,
+                            &raw) == WIRELOG_OK);
+                        CHECK(wirelog_session_snapshot_typed(s,
+                            cold_count_typed, &typed) == WIRELOG_OK);
+                        CHECK(raw.rows == (!empty && filtered != 2) &&
+                            raw.count == (empty ||
+                            filtered == 2?0:filtered?12:24));
+                        CHECK(raw.rows == typed.rows &&
+                            raw.count == typed.count);
+                    }
+                    wirelog_session_destroy(s); wirelog_program_free(p);
+                    CHECK(!live_files());
+                }
+}
+
 int main(int argc, char **argv)
 {
     const char *modes[] = {"--budget-join", "--budget-aggregate",
@@ -2039,6 +2100,7 @@ int main(int argc, char **argv)
         fflush(stdout);
         chunked_public_budget((unsigned)workload);
     } else {
+        cold_join_count_public();
         cold_global_counts();
         cold_group_counts("count"); cold_group_counts("sum");
         cold_group_counts("min"); cold_group_counts("max");

@@ -4969,6 +4969,201 @@ static void composite_reference_chains(void)
     }
 }
 
+extern int wl_columnar_ops_test_join_reduce_fail_after;
+extern void (*wl_columnar_ops_test_join_reduce_after_batch)(wl_col_session_t *,
+    uint64_t);
+static void join_count_late_read(wl_col_session_t *s, uint64_t pairs)
+{
+    (void)s; CHECK(pairs > 0); read_fault = 1;
+    wl_columnar_ops_test_join_reduce_after_batch = NULL;
+}
+static void cold_join_count_internal(void)
+{
+    const char *text = ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n"
+        ".decl result(n:int64)\nresult(count(y)) :- a(k,x),b(k,y).\n";
+    fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+    wl_col_session_t *s = COL_SESSION(f.session);
+    int64_t left[] = {1, 0, 1, 1, 1, 2, 1, 3},
+        right[] = {1, 0, 1, 1, 1, 2, 1, 3, 1, 4, 1, 5};
+    CHECK(wl_session_insert(f.session, "a", left, 4, 2) == 0);
+    CHECK(wl_session_insert(f.session, "b", right, 6, 2) == 0);
+    wl_plan_relation_t *rp = join_body(&f, "result");
+    uint32_t ji;
+    CHECK(rp->op_count == 4 && rp->ops[1].op == WL_PLAN_OP_JOIN &&
+        rp->ops[2].op == WL_PLAN_OP_REDUCE && !rp->ops[1].project_count);
+    CHECK(wl_columnar_join_aggregate_decode(s, rp, &ji) && ji == 1);
+    CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+        NULL) == OK);
+    eval_stack_t stack; eval_stack_init(&stack);
+    /* Initialize the resident source's persistent access descriptor. */
+    CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+    eval_entry_t warm = eval_stack_pop(&stack);
+    CHECK(warm.rel->columns[0][0] == 24 && eval_stack_dispose_entry(&stack,
+        &warm) == 0);
+    uint64_t before = reserved(&f),
+        disk = wl_columnar_spill_store_bytes(s->spill_store);
+    for (unsigned fault = 0; fault < 5; fault++) {
+        if (fault ==
+            0) wl_columnar_ops_test_join_reduce_after_batch =
+                join_count_late_read;
+        if (fault == 1)wl_columnar_ops_test_join_reduce_fail_after = 4;
+        if (fault == 2)allocation_fault = 1;
+        if (fault == 3)wl_columnar_ops_test_reduce_fail_output_alloc = true;
+        wl_columnar_memory_governor_t *g =
+            wl_columnar_memory_governor_ref_get(f.governor);
+        uint64_t limit = atomic_load(&g->usable_bytes);
+        if (fault == 4)atomic_store(&g->usable_bytes, before);
+        CHECK(col_eval_relation_plan(rp, &stack,
+            s) == (fault == 0?EIO:fault == 4?ENOSPC:ENOMEM));
+        CHECK(!stack.top && reserved(&f) == before &&
+            wl_columnar_spill_store_bytes(s->spill_store) == disk);
+        atomic_store(&g->usable_bytes, limit);
+        wl_columnar_ops_test_reduce_fail_output_alloc = false;
+        wl_columnar_ops_test_join_reduce_fail_after = -1;
+        CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+        eval_entry_t e = eval_stack_pop(&stack);
+        CHECK(e.rel->nrows == 1 && e.rel->ncols == 1 &&
+            e.rel->columns[0][0] == 24);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+    }
+    for (unsigned cap = 23; cap <= 25; cap++) {
+        s->join_output_limit = cap; s->join_output_peak = 0;
+        int rc = col_eval_relation_plan(rp, &stack, s);
+        CHECK(rc == (cap <= 24?EOVERFLOW:0));
+        CHECK(s->join_output_peak == 24);
+        if (!rc) {
+            eval_entry_t e = eval_stack_pop(&stack);
+            CHECK(eval_stack_dispose_entry(&stack, &e) == 0);
+        }
+        CHECK(!stack.top && reserved(&f) == before);
+    }
+    s->join_output_limit = 0;
+    const wl_plan_op_t *saved = rp->ops; uint32_t saved_count = rp->op_count;
+    wl_plan_op_t ops[5]; memcpy(ops, saved, 4*sizeof(*ops)); rp->ops = ops;
+    for (unsigned bad = 0; bad < 4; bad++) {
+        ops[2] = saved[2];
+        if (bad == 0)ops[2].agg_fn = WIRELOG_AGG_SUM;
+        if (bad == 1)ops[2].group_by_count = 1;
+        if (bad == 2)ops[2].agg_expr.size--;
+        if (bad == 3)ops[2].agg_result_type = WL_PLAN_AGG_OPERAND_FLOAT;
+        CHECK(!wl_columnar_join_aggregate_decode(s, rp, NULL));
+        CHECK(col_eval_relation_plan(rp, &stack, s) == ENOTSUP && !stack.top);
+    }
+    /* A direct MAP can duplicate lanes without deduplicating matching pairs. */
+    uint32_t projection[] = {3, 3};
+    ops[4] = saved[3]; ops[3] = saved[2];
+    unsigned char expr[] = {WL_PLAN_EXPR_VAR, 4, 0, 'c', 'o', 'l', '0'};
+    ops[3].agg_expr.data = expr; ops[3].agg_expr.size = sizeof(expr);
+    ops[2] = (wl_plan_op_t){.op = WL_PLAN_OP_MAP, .project_count = 2,
+                            .project_indices = projection};
+    rp->op_count = 5;
+    CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+    eval_entry_t e = eval_stack_pop(&stack); CHECK(e.rel->columns[0][0] == 24);
+    CHECK(eval_stack_dispose_entry(&stack, &e) == 0 && reserved(&f) == before);
+    rp->ops = saved; rp->op_count = saved_count;
+    destroy(&f);
+}
+
+static void cold_join_count_references(void)
+{
+    for (unsigned inlined = 0; inlined < 2; inlined++)
+        for (unsigned mode = 1; mode < 3; mode++)for (unsigned direction = 1;
+                direction < 4; direction++)
+                for (unsigned self = 0; self < 2; self++) {
+                    char text[700];
+                    snprintf(text, sizeof(text),
+                        "%s\n.decl b(k:int64,s:symbol,y:int64)\n.decl result(n:int64)\nresult(count(y)) :- %s,x>=0,%s.\n",
+                        inlined?".decl a(p:pair(int64,symbol) inline,x:int64)":
+                        ".decl a(k:int64,s:symbol,x:int64)",
+                        inlined?"a(pair(k,s),x)":"a(k,s,x)",
+                        self?(inlined?"a(pair(k,s),y)":"a(k,s,y)"):"b(k,s,y)");
+                    if (self && direction != 1) continue;
+                    fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+                    wl_col_session_t *s = COL_SESSION(f.session);
+                    int64_t ids[] = {wl_intern_put(s->intern, "zero"),
+                                     wl_intern_put(s->intern, "한글")};
+                    CHECK(ids[0] >= 0 && ids[1] >= 0);
+                    int64_t rows[24]; for (unsigned i = 0; i < 8; i++) {
+                        rows[3*i] = 1; rows[3*i+1] = ids[i%2]; rows[3*i+2] = i;
+                    }
+                    unsigned sides = self?1:2;
+                    for (unsigned side = 0; side < sides;
+                        side++) if (mode != 2 || !(direction&(1u<<side)))
+                            CHECK(wl_session_insert(f.session, side?"b":"a",
+                                rows, side?8:6, 3) == 0);
+                    for (unsigned side = 0; side < sides;
+                        side++) if (direction&(1u<<side)){
+                            const char *name = side?"b":"a";
+                            if (mode ==
+                                1) CHECK(wl_columnar_session_seal_join_input(
+                                        f.session, name, NULL, NULL) == OK);
+                            else {
+                                CHECK(wl_columnar_session_begin_cold_input(
+                                        f.session, name) == OK);
+                                unsigned n = side?8:6;
+                                for (unsigned i = 0; i < n;
+                                    i +=
+                                    2) CHECK(
+                                        wl_columnar_session_append_cold_input(
+                                            f.session, name, rows+3*i, 2,
+                                            3) == OK);
+                                CHECK(wl_columnar_session_finish_cold_input(
+                                        f.session, name) == OK);
+                            }
+                        }
+                    wl_plan_relation_t *rp = join_body(&f, "result");
+                    uint32_t ji;
+                    CHECK(wl_columnar_join_aggregate_decode(s, rp,
+                        &ji) && rp->ops[ji].key_count == 2);
+                    eval_stack_t stack; eval_stack_init(&stack);
+                    for (unsigned repeat = 0; repeat < 2; repeat++) {
+                        CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+                        eval_entry_t e = eval_stack_pop(&stack);
+                        CHECK(e.rel->nrows == 1 &&
+                            e.rel->columns[0][0] == (self?18:24));
+                        CHECK(eval_stack_dispose_entry(&stack, &e) == 0);
+                    }
+                    destroy(&f);
+                }
+}
+
+static void cold_join_count_limits(void)
+{
+    for (unsigned filtered = 0; filtered < 2; filtered++) {
+        char text[400];
+        snprintf(text, sizeof(text),
+            ".decl a(k:int64,x:int64)\n.decl b(k:int64,y:int64)\n.decl result(n:int64)\nresult(count(y)) :- a(k,x),b(k,y)%s.\n",
+            filtered?",y>99":"");
+        fixture_t f = fixture(text, 4*1024*1024, 1024*1024);
+        wl_col_session_t *s = COL_SESSION(f.session);
+        int64_t rows[] = {1, 0, 1, 1, 1, 2, 1, 3};
+        CHECK(wl_session_insert(f.session, "a", rows, 4, 2) == 0);
+        CHECK(wl_session_insert(f.session, "b", rows, 4, 2) == 0);
+        CHECK(wl_columnar_session_seal_join_input(f.session, "a", NULL,
+            NULL) == OK);
+        CHECK(wl_columnar_session_seal_join_input(f.session, "b", NULL,
+            NULL) == OK);
+        wl_plan_relation_t *rp = join_body(&f, "result");
+        eval_stack_t stack; eval_stack_init(&stack);
+        uint64_t before = reserved(&f); s->join_output_limit = 1;
+        CHECK(col_eval_relation_plan(rp, &stack, s) == EOVERFLOW && !stack.top);
+        CHECK(s->join_output_peak > 0 && reserved(&f) == before);
+        s->join_output_limit = 0;
+        stack.top = COL_STACK_MAX;
+        CHECK(wl_columnar_join_aggregate(s, rp, &stack, 1, "a") == ENOBUFS);
+        CHECK(stack.top == COL_STACK_MAX && reserved(&f) == before);
+        stack.top = 0;
+        CHECK(col_eval_relation_plan(rp, &stack, s) == 0);
+        eval_entry_t e = eval_stack_pop(&stack);
+        CHECK(e.rel->nrows == (filtered?0u:1u));
+        if (!filtered)CHECK(e.rel->columns[0][0] == 16);
+        CHECK(eval_stack_dispose_entry(&stack,
+            &e) == 0 && reserved(&f) == before);
+        destroy(&f);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *modes[] = {"--budget-join", "--budget-aggregate",
@@ -4995,6 +5190,8 @@ int main(int argc, char **argv)
         fflush(stdout);
         chunked_causal_budget((unsigned)workload);
     } else {
+        cold_join_count_internal(); cold_join_count_references();
+        cold_join_count_limits();
         composite_reference_failures(); composite_reference_chains();
         cold_virtual_key_names(); composite_numeric_admission();
         composite_computed_tail_refused();

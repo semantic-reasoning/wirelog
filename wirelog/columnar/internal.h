@@ -5048,6 +5048,20 @@ bool wl_columnar_eval_plan_cold_aggregate_decode(
     wl_columnar_eval_plan_cold_aggregate_t *out);
 int wl_columnar_ops_cold_aggregate(const wl_plan_relation_t *plan,
     eval_stack_t *stack, wl_col_session_t *session);
+/* A complete one-JOIN reduction audit, shared by retirement and execution. */
+bool wl_columnar_join_aggregate_decode(const wl_col_session_t *session,
+    const wl_plan_relation_t *plan, uint32_t *join_index);
+int wl_columnar_join_aggregate(wl_col_session_t *session,
+    const wl_plan_relation_t *plan, eval_stack_t *stack, uint32_t join_index,
+    const char *cold_left);
+int wl_columnar_ops_join_aggregate(const wl_plan_relation_t *plan,
+    uint32_t join_index, wl_columnar_continuation_t *continuation,
+    wl_col_session_t *session, uint32_t width,
+    const wirelog_column_type_t *types, col_rel_t **out);
+bool wl_columnar_eval_plan_aggregate_column(const wl_plan_expr_buffer_t *expr,
+    uint32_t width, uint32_t *column);
+bool wl_columnar_join_output_count_limit(wl_col_session_t *session,
+    uint64_t total, uint64_t added);
 
 /* Shared schema lookup semantics, including the resident col<N> fallback. */
 int wl_columnar_relation_schema_column_index(uint32_t ncols,
