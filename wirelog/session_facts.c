@@ -292,3 +292,153 @@ wl_session_load_input_files(wl_session_t *sess,
 
     return 0;
 }
+
+/* ======================================================================== */
+/* Host source origin certification (Issue #2321)                           */
+/* ======================================================================== */
+
+static bool
+source_relation_is_private(const char *name)
+{
+    return name[0] == '$' || (name[0] == '_' && name[1] == '_');
+}
+
+int
+wl_source_origin_capture(const struct wirelog_program *prog,
+    wl_source_origin_t *origin)
+{
+    uint32_t eligible = 0;
+
+    if (!origin)
+        return EINVAL;
+    origin->names = NULL;
+    origin->count = 0;
+    if (!prog)
+        return EINVAL;
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
+        if (rel->name && rel->has_decl && rel->fact_count == 0
+            && !rel->fact_data)
+            eligible++;
+    }
+    if (eligible == 0)
+        return 0;
+    origin->names = (char **)calloc(eligible, sizeof(*origin->names));
+    if (!origin->names)
+        return ENOMEM;
+    for (uint32_t i = 0; i < prog->relation_count; i++) {
+        const wl_ir_relation_info_t *rel = &prog->relations[i];
+        if (!rel->name || !rel->has_decl || rel->fact_count != 0
+            || rel->fact_data)
+            continue;
+        size_t len = strlen(rel->name) + 1;
+        char *copy = (char *)malloc(len);
+        if (!copy) {
+            wl_source_origin_free(origin);
+            return ENOMEM;
+        }
+        memcpy(copy, rel->name, len);
+        origin->names[origin->count++] = copy;
+    }
+    return 0;
+}
+
+void
+wl_source_origin_free(wl_source_origin_t *origin)
+{
+    if (!origin)
+        return;
+    for (uint32_t i = 0; i < origin->count; i++)
+        free(origin->names[i]);
+    free((void *)origin->names);
+    origin->names = NULL;
+    origin->count = 0;
+}
+
+void
+wl_source_origin_revoke(wl_source_origin_t *origin, const char *relation)
+{
+    if (!origin || !relation)
+        return;
+    for (uint32_t i = 0; i < origin->count; i++)
+        if (origin->names[i] && strcmp(origin->names[i], relation) == 0) {
+            free(origin->names[i]);
+            origin->names[i] = NULL;
+        }
+}
+
+static bool
+source_origin_certifies(const wl_source_origin_t *origin, const char *relation)
+{
+    for (uint32_t i = 0; origin && i < origin->count; i++)
+        if (origin->names[i] && strcmp(origin->names[i], relation) == 0)
+            return true;
+    return false;
+}
+
+wirelog_source_query_status_t
+wl_source_query_resolve(const struct wirelog_program *prog,
+    const wl_source_origin_t *origin, const wl_intern_t *intern,
+    const char *relation, uint32_t expected_ncols, const int64_t *lanes,
+    uint32_t nlanes, uint32_t *width_out)
+{
+    const wl_ir_relation_info_t *rel = NULL;
+
+    if (width_out)
+        *width_out = 0;
+    if (!prog || !relation || !width_out || (nlanes != 0 && !lanes))
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+
+    /* Identity. */
+    if (relation[0] == '\0' || source_relation_is_private(relation))
+        return WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION;
+    for (uint32_t i = 0; i < prog->relation_count; i++)
+        if (prog->relations[i].name
+            && strcmp(prog->relations[i].name, relation) == 0) {
+            rel = &prog->relations[i];
+            break;
+        }
+    if (!rel)
+        return WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION;
+    /* Compiler-generated relations carry a width but no user .decl. */
+    if (!rel->has_decl)
+        return WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION;
+
+    /* Full schema: an integer key never makes other lanes safe. */
+    if (rel->column_count == 0)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    if (!rel->columns)
+        return WIRELOG_SOURCE_QUERY_INTERNAL_ERROR;
+    if (rel->has_float_compound_slots || rel->has_float_facts)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    for (uint32_t c = 0; c < rel->column_count; c++) {
+        const wirelog_column_t *col = &rel->columns[c];
+        if (col->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+            return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+        if (col->type != WIRELOG_TYPE_INT64
+            && col->type != WIRELOG_TYPE_STRING)
+            return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    }
+    if (wl_ir_relation_physical_width(rel) != rel->column_count)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+
+    /* Origin: certified at construction and still free of inline facts. */
+    if (rel->fact_count != 0 || rel->fact_data
+        || !source_origin_certifies(origin, relation))
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+
+    /* Arity. */
+    if (expected_ncols != 0 && expected_ncols != rel->column_count)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    if (nlanes > rel->column_count)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+
+    /* Value domains: a STRING lane must name an existing intern entry. */
+    for (uint32_t c = 0; c < nlanes; c++)
+        if (rel->columns[c].type == WIRELOG_TYPE_STRING
+            && !wl_intern_reverse(intern, lanes[c]))
+            return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+
+    *width_out = rel->column_count;
+    return WIRELOG_SOURCE_QUERY_OK;
+}

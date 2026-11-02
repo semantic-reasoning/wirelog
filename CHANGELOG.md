@@ -6,6 +6,15 @@ All notable changes to wirelog are documented in this file.
 
 ### Added
 
+- `wirelog_session_source_count()` reports how many times the host inserted a
+  tuple into a relation and has not removed it, without evaluating: a rule
+  head's host input rather than its derived rows, pending inserts included.
+  It returns the new `wirelog_source_query_status_t`
+  (`WIRELOG_SOURCE_QUERY_VERSION 1`) with an explicit `max_rows` bound, and
+  refuses inline-fact relations, non-INT64/STRING schemas, cold or sealed
+  input, controlled sessions and callback re-entry instead of answering
+  zero (#2321).
+
 - Cold JOIN streams support grouped COUNT and direct INT64 MIN/MAX, with
   admitted batch/group floors and a same-budget materialization control (#1372).
 

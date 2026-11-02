@@ -83,6 +83,33 @@ typedef enum {
  * @session_set_delta_cb: Set delta callback on updates.
  * @session_snapshot: Batch execution evaluating full rules synchronously.
  */
+/* Host source inspection request (Issue #2321).  ADMIT checks only the
+ * session state; VALIDATE also selects and checks the relation's source
+ * storage without reading rows; COUNT counts the rows equal to all @ncols
+ * lanes; KEY reports whether any row's first lane equals lanes[0]. */
+typedef enum {
+    WL_SOURCE_QUERY_ADMIT = 0,
+    WL_SOURCE_QUERY_VALIDATE,
+    WL_SOURCE_QUERY_COUNT,
+    WL_SOURCE_QUERY_KEY,
+} wl_source_query_mode_t;
+
+typedef struct wl_source_query {
+    wl_source_query_mode_t mode;
+    const char *relation; /* NULL for ADMIT */
+    /* COUNT: @ncols lanes.  KEY: one lane.  Unused otherwise. */
+    const int64_t *lanes;
+    /* Declared physical width, already validated against the program. */
+    uint32_t ncols;
+    /* Physical source rows the scan may examine; no implicit default. */
+    uint64_t max_rows;
+} wl_source_query_t;
+
+typedef struct wl_source_query_result {
+    uint64_t count;
+    bool exists;
+} wl_source_query_result_t;
+
 typedef struct {
     const char *name;
 
@@ -154,6 +181,13 @@ typedef struct {
     /* Opt in explicitly before a controlled SNAPSHOT may evaluate fresh or
      * dirty inputs. A read-only completed-snapshot backend need not opt in. */
     bool session_controlled_snapshot_evaluates;
+    /* Optional read-only host source inspection (Issue #2321).  Called with
+     * an inspection reservation held (wl_session_inspection_begin).  Must not
+     * allocate history-sized state, evaluate, invoke callbacks, fill caches or
+     * change any relation.  Backends without it answer UNSUPPORTED. */
+    wirelog_source_query_status_t (*session_source_query)(
+        wl_session_t *session, const struct wl_source_query *query,
+        struct wl_source_query_result *result);
 } wl_compute_backend_t;
 
 /**

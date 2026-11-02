@@ -98,5 +98,6 @@ wirelog_session_set_delta_cb
 wirelog_session_set_typed_delta_cb
 wirelog_session_snapshot
 wirelog_session_snapshot_typed
+wirelog_session_source_count
 wirelog_session_step
 wirelog_version_string

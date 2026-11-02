@@ -981,3 +981,61 @@ wl_session_budget_denied(wl_session_t *session)
     wl_session_operation_end(session);
     return denied;
 }
+
+wirelog_source_query_status_t
+wl_session_inspection_begin(wl_session_t *session)
+{
+    wl_session_admission_t *admission;
+    bool busy;
+
+    if (!session)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    /* Controlled sessions are outside v1.  Refuse before the lock so the
+     * control, its fuel and attempt identity stay exactly as they were. */
+    if (session->evaluation_control)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    if (wl_session_delta_callback_is_current(session))
+        return WIRELOG_SOURCE_QUERY_BUSY;
+    admission = session->operation_admission;
+    if (!admission)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    if (wl_session_admission_lock(admission) != 0)
+        return WIRELOG_SOURCE_QUERY_INTERNAL_ERROR;
+    /* Unlike wl_session_operation_begin(), a nested reservation is refused:
+     * any active operation means a callback may be calling back in, or
+     * another call is mid-flight. */
+    busy = admission->closing || admission->active_operations != 0
+        || admission->controlled_step_pending
+        || admission->controlled_step_complete
+        || admission->exclusive_attempt;
+    if (!busy)
+        admission->active_operations++;
+    wl_session_checked_unlock(admission);
+    if (busy)
+        return WIRELOG_SOURCE_QUERY_BUSY;
+    if (session->input_sealed || session->input_load_failed) {
+        wl_session_operation_end(session);
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    }
+    return WIRELOG_SOURCE_QUERY_OK;
+}
+
+void
+wl_session_inspection_end(wl_session_t *session)
+{
+    if (session)
+        wl_session_operation_end(session);
+}
+
+wirelog_source_query_status_t
+wl_session_source_query(wl_session_t *session, const wl_source_query_t *query,
+    wl_source_query_result_t *result)
+{
+    if (!session || !query || !result)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    result->count = 0;
+    result->exists = false;
+    if (!session->backend || !session->backend->session_source_query)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    return session->backend->session_source_query(session, query, result);
+}
