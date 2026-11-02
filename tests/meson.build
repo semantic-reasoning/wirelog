@@ -126,6 +126,7 @@ testlib_prod_src = files(
     '../wirelog/columnar/eval_tdd_insert.c',
     '../wirelog/columnar/eval_tdd_plan.c',
     '../wirelog/columnar/eval_tdd_queue.c',
+    '../wirelog/columnar/tdd_channel.c',
     '../wirelog/columnar/expr.c',
     '../wirelog/columnar/filter.c',
     '../wirelog/columnar/frontier.c',
@@ -689,6 +690,19 @@ test_tdd_multi_batch_protocol_exe = executable(
 )
 test('tdd_multi_batch_protocol', test_tdd_multi_batch_protocol_exe,
      suite: 'unit')
+
+# Issue #1373: byte-bounded TDD batch channel.  The unit test compiles the
+# channel with its test hooks; the library copy has none.
+test_tdd_channel_exe = executable(
+  'test_tdd_channel',
+  files('test_tdd_channel.c', '../wirelog/columnar/tdd_channel.c',
+        '../wirelog/columnar/memory_governor.c',
+        '../wirelog/evaluation_control.c') + thread_src,
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [threads_dep],
+  c_args: ['-DWL_TDD_CHANNEL_TEST_HOOKS=1'],
+)
+test('tdd_channel', test_tdd_channel_exe, suite: 'unit', timeout: 60)
 
 # Issue #508: bench_argv shim unit tests. Header-only, portable by
 # construction; runs on every platform including MSVC.
@@ -2100,6 +2114,7 @@ backend_src = files(
   '../wirelog/columnar/eval_dedup.c',
   '../wirelog/columnar/eval_delta.c',
   '../wirelog/columnar/eval_tdd_queue.c',
+  '../wirelog/columnar/tdd_channel.c',
   '../wirelog/columnar/eval_tdd_plan.c',
   '../wirelog/columnar/eval_tdd_insert.c',
   '../wirelog/columnar/eval_plan.c',
