@@ -922,6 +922,9 @@ int wl_columnar_relation_scalar_retirement_init_reset(
 /* Parent authenticates uncommitted receipt lifetime/native ownership. Release
  * its genuine writer claims only, invalidate READY, then parent enters CLEAR.
  * Scalar storage is cleared later with separate actual funding. */
+int wl_columnar_relation_scalar_retirement_ready_validate(
+    const wl_columnar_relation_scalar_retirement_t *, const col_rel_t *,
+    col_relation_snapshot_t);
 int wl_columnar_relation_scalar_retirement_release_claims_controlled(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
     uint64_t);
@@ -8036,6 +8039,128 @@ typedef struct {
     bool ready, retained, committed;
 } wl_columnar_eval_serial_framed_status_t;
 
+/* A prepared receipt owns only leases, exclusion and one control reference.
+ * Prior mutable loans are surrendered through ACK. Owned original inputs
+ * require genuine preexisting scalar READY; callers consume ABORT history
+ * into the existing numeric-owned funded finish, never generic publication. */
+typedef enum {
+    WL_COLUMNAR_EVAL_STACK_PREPARED_INERT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_HEAD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ALIAS_FIXED,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ALIAS_ROWS,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OLD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ACQUIRE_OUTPUT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_VALIDATE_OLD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_VALIDATE_OUTPUT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_READY,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_OLD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_OUTPUT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_SEAL_LATCH,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_COMMITTED_DRAIN,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_CANCEL_SANITIZE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_DRAIN_OUTPUT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_DRAIN_OLD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED
+} wl_columnar_eval_stack_unary_prepared_phase_t;
+
+typedef enum {
+    WL_COLUMNAR_EVAL_STACK_PREPARED_NONE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ABORT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_RESUME
+} wl_columnar_eval_stack_unary_prepared_disposition_t;
+
+typedef struct {
+    eval_entry_t original, output;
+    col_relation_snapshot_t old_snapshot, output_snapshot;
+    const col_rel_t *old_canonical, *output_canonical;
+    uint64_t old_identity, old_generation, output_identity, output_generation;
+    wl_columnar_source_access_reader_t old_reader, output_reader;
+} wl_columnar_eval_stack_unary_prepared_work_t;
+
+typedef struct wl_columnar_eval_stack_unary_prepared {
+    struct wl_columnar_eval_stack_unary_prepared *identity;
+    wl_columnar_eval_stack_cleanup_frame_t *frame;
+    wl_col_session_t *session;
+    const wl_columnar_eval_plan_numeric_attempt_t *numeric_owner;
+    const wl_plan_relation_t *plan;
+    const wl_plan_op_t *operation;
+    wl_evaluation_control_t *control;
+    uint64_t control_identity, attempt_id;
+    wl_columnar_eval_stack_unary_prepared_work_t work;
+    uint32_t numeric_cursor, top, index, alias_cursor;
+    wl_columnar_eval_plan_numeric_phase_t numeric_phase;
+    wl_columnar_eval_stack_unary_prepared_phase_t phase;
+    wl_columnar_eval_stack_unary_prepared_disposition_t disposition;
+#if defined(WL_HAVE_C11_THREADS)
+    thrd_t owner_thread;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
+    int first_result, cleanup_result;
+    bool thread_valid, busy, control_ref, scalar_ready;
+    bool old_held, output_held, alias_complete, needs_sanitize;
+    bool commit_prepaid, committed, result_saved;
+} wl_columnar_eval_stack_unary_prepared_t;
+
+typedef struct {
+    wl_columnar_eval_stack_unary_prepared_phase_t phase;
+    wl_columnar_eval_stack_unary_prepared_disposition_t disposition;
+    uint32_t alias_cursor;
+    int first_result, cleanup_result;
+    bool committed, result_saved, alias_complete, old_held, output_held;
+} wl_columnar_eval_stack_unary_prepared_status_t;
+
+int wl_columnar_eval_stack_unary_prepared_begin(
+    wl_columnar_eval_stack_unary_prepared_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *);
+int wl_columnar_eval_stack_unary_prepared_step(
+    wl_columnar_eval_stack_unary_prepared_t *);
+int wl_columnar_eval_stack_unary_prepared_cancel(
+    wl_columnar_eval_stack_unary_prepared_t *, int, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_prepared_drain(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_prepared_ack(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_prepared_query(
+    const wl_columnar_eval_stack_unary_prepared_t *,
+    wl_columnar_eval_stack_unary_prepared_status_t *);
+/* Original SEALED capability, prepaid COMMIT128, external serialization and
+ * immediate callback-free publisher admission are mandatory preconditions. */
+void wl_columnar_eval_stack_unary_commit_prepared_nofail(
+    wl_columnar_eval_stack_unary_prepared_t *);
+/* Copied exclusion observation only; never independent mutation authority. */
+bool wl_columnar_eval_stack_frame_mutation_blocked(
+    const wl_columnar_eval_stack_cleanup_frame_t *);
+int wl_columnar_eval_stack_numeric_writable(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+int wl_columnar_eval_stack_framed_writable(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
+    const wl_columnar_eval_serial_framed_attempt_t *);
+#ifdef WL_SESSION_TEST_HOOKS
+extern void (*wl_columnar_eval_stack_test_unary_prepared_checkpoint)(
+    wl_columnar_eval_stack_unary_prepared_t *);
+/* Test-only copied observation; addresses are comparison tokens, never loans. */
+typedef struct {
+    const void *relation, *segments, *continuation;
+    uint32_t segment_count;
+    unsigned kind, phase;
+    int first_result;
+    bool owned, is_delta, committed, result_saved;
+} wl_columnar_eval_stack_test_unary_observation_t;
+int wl_columnar_eval_stack_test_unary_observe(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *,
+    wl_columnar_eval_stack_test_unary_observation_t *);
+#endif
+
 enum { WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK = 384 };
 
 /* Copied observations only. Opaque addresses are comparison tokens, never
@@ -8044,6 +8169,7 @@ typedef struct {
     const void *plan, *session, *control, *private_bindings, *capture_out;
     uint64_t attempt_id, operation_identity;
     bool capture_only, controlled_materialized_batch_fallback, abort_supported;
+    bool prepared_unary_present;
     wl_columnar_eval_cleanup_receipt_key_t cleanup_receipt_key;
     wl_columnar_eval_serial_framed_status_t status;
 } wl_columnar_eval_serial_framed_view_t;
@@ -8121,6 +8247,15 @@ struct wl_columnar_eval_serial_framed_host_request {
 /* Serialized caller keeps session/control handles live. Copied outputs must
  * be external to the whole frame and disjoint from each other. Status keeps
  * its existing384 fee; the containing host retains its separate384 fee. */
+/* Known protocol-owner storage is never a destination for copied outputs.
+ * protocol_copy_output requires an already authenticated live frame.
+ * marked_copy_output derives its frame only from the actual live session. */
+bool wl_columnar_eval_stack_copy_ranges_disjoint(const void *, size_t,
+    const void *, size_t);
+bool wl_columnar_eval_stack_protocol_copy_output(
+    const wl_columnar_eval_stack_cleanup_frame_t *, const void *, size_t);
+bool wl_columnar_eval_stack_marked_copy_output(const wl_col_session_t *,
+    const void *, size_t);
 int wl_columnar_eval_stack_framed_authenticate(
     const wl_columnar_eval_stack_cleanup_frame_t *, const wl_col_session_t *,
     const wl_columnar_eval_serial_framed_attempt_t *);

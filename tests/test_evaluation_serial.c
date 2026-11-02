@@ -13685,6 +13685,264 @@ test_framed_status_real_retirement(void)
         }
 }
 
+static void
+framed_prepared_until(wl_columnar_eval_stack_unary_prepared_t *p,
+    wl_columnar_eval_stack_unary_prepared_phase_t phase)
+{
+    for (unsigned turn = 0; ; ++turn) {
+        wl_columnar_eval_stack_unary_prepared_status_t status;
+        CHECK(!wl_columnar_eval_stack_unary_prepared_query(p, &status));
+        if (status.phase == phase) return;
+        CHECK(turn < 1000 && !wl_columnar_eval_stack_unary_prepared_step(p));
+    }
+}
+
+static grant_t
+framed_prepared_grant(uint64_t limit, int *owner)
+{
+    grant_t grant = {0};
+    grant.control = control_new(limit, owner);
+    CHECK(!wl_evaluation_control_begin(grant.control, owner));
+    grant.id = wl_evaluation_control_active_attempt_id(grant.control);
+    return grant;
+}
+
+static uint64_t
+framed_prepared_grant_end(grant_t *grant, int *owner)
+{
+    (void)wl_evaluation_control_finish(grant->control, owner, 0, 0);
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant->control, &report));
+    CHECK(!wl_evaluation_control_detach(grant->control, owner));
+    wl_evaluation_control_release(grant->control);
+    return report.consumed;
+}
+
+static wl_columnar_eval_stack_unary_prepared_t *framed_checkpoint_prepared;
+static const wl_columnar_eval_plan_numeric_attempt_t *framed_checkpoint_parent;
+
+static void
+framed_checkpoint_begin_prepared(wl_columnar_eval_stack_cleanup_frame_t *frame,
+    wl_col_session_t *session)
+{
+    CHECK(session->cleanup_active == frame);
+    CHECK(!wl_columnar_eval_stack_unary_prepared_begin(
+            framed_checkpoint_prepared,
+            frame, framed_checkpoint_parent));
+}
+
+static void
+test_framed_actual_prepared_exclusion(void)
+{
+    entry_fixture_t f; entry_init(&f, entry_simple, entry_rows, 4, 1, 0);
+    wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
+    wl_columnar_eval_stack_cleanup_frame_t *frame = NULL;
+    eval_stack_t *stack = NULL;
+    for (unsigned turn = 0; ; ++turn) {
+        CHECK(turn < 10000);
+        ctx = entry_context(&f);
+        if (ctx && ctx->child_bound &&
+            ctx->child.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY) {
+            frame = f.session->cleanup_active;
+            stack = wl_columnar_eval_stack_cleanup_stack(frame);
+            if (stack && stack->top == 1 && ctx->child.cursor < ctx->child.end
+                && ctx->child.plan->ops[ctx->child.cursor].op ==
+                WL_PLAN_OP_CONSOLIDATE) break;
+        }
+        CHECK(!entry_turn(&f, false, 0));
+    }
+    wl_columnar_eval_plan_numeric_attempt_t *child = &ctx->child;
+    CHECK(!wl_columnar_eval_stack_unary_begin_attempt_owned(frame, f.operation,
+        f.id, child));
+    col_rel_t *old = stack->items[0].rel;
+    CHECK(old && old->ncols == 1 && old->nrows == 4);
+    col_rel_t **slot = NULL;
+    CHECK(!wl_columnar_eval_stack_unary_output_owned(frame, &slot, child));
+    CHECK(
+        !wl_columnar_relation_new_like_governed_checked_mode_attempt_controlled(
+            "prepared framed clone", old, f.session->memory_governor, false,
+            slot, f.operation, f.id));
+    for (uint32_t r = 0; r < old->nrows; ++r) {
+        int64_t row[] = {old->columns[0][r]};
+        CHECK(!col_rel_append_row(*slot, row));
+    }
+    if (stack->items[0].owned) {
+        bool ready = false;
+        for (unsigned turn = 0; !ready; ++turn) {
+            CHECK(turn < 1000);
+            CHECK(!wl_columnar_eval_stack_unary_prepare_scalar_retirement_owned(
+                    frame, child, &ready));
+        }
+    }
+    wl_columnar_eval_serial_framed_attempt_t *saved = malloc(sizeof(*saved));
+    CHECK(saved); memcpy(saved, ctx, sizeof(*saved));
+    const wl_columnar_eval_cleanup_receipt_key_t key = ctx->cleanup_receipt_key;
+    wl_columnar_eval_serial_framed_host_request_t previous = f.previous;
+    wl_columnar_eval_stack_unary_prepared_t prepared = {0};
+    /* Before the status hook, this is ordinary disjoint external storage.
+     * The genuine hook creates its actual owner; copying must recheck it. */
+    int hook_owner = 0;
+    grant_t hook_grant = framed_prepared_grant(0, &hook_owner);
+    wl_columnar_eval_cleanup_receipt_key_t hook_key;
+    memset(&hook_key, 0x39, sizeof(hook_key));
+    wl_columnar_eval_cleanup_receipt_key_t hook_key_before = hook_key;
+    framed_checkpoint_prepared = &prepared; framed_checkpoint_parent = child;
+    wl_columnar_eval_stack_test_framed_status_checkpoint =
+        framed_checkpoint_begin_prepared;
+    CHECK(wl_columnar_eval_stack_framed_status(frame, f.session,
+        (void *)&prepared,
+        &hook_key, hook_grant.control, hook_grant.id) == EINVAL);
+    wl_columnar_eval_stack_test_framed_status_checkpoint = NULL;
+    framed_checkpoint_prepared = NULL; framed_checkpoint_parent = NULL;
+    CHECK(prepared.identity == &prepared &&
+        prepared.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_HEAD
+        && !memcmp(&hook_key, &hook_key_before, sizeof(hook_key))
+        && framed_prepared_grant_end(&hook_grant, &hook_owner) == 384);
+    framed_prepared_until(&prepared, WL_COLUMNAR_EVAL_STACK_PREPARED_READY);
+    wl_columnar_eval_serial_framed_view_t view;
+    CHECK(!wl_columnar_eval_stack_framed_inspect(frame, f.session, &view)
+        && view.prepared_unary_present && view.plan == f.relation
+        && foundation_key_equal(&view.cleanup_receipt_key, &key));
+    CHECK(!wl_columnar_eval_stack_framed_authenticate(frame, f.session, ctx)
+        && !wl_columnar_eval_stack_numeric_owner(frame, child));
+    /* The marker's receipt is genuinely separate from the frame allocation.
+     * Copied observation cannot write through it or its numeric parent. */
+    CHECK(wl_columnar_eval_stack_framed_inspect(frame, f.session,
+        (void *)&prepared) == EINVAL);
+    CHECK(wl_columnar_eval_stack_framed_inspect(frame, f.session,
+        (void *)&child->phase) == EINVAL);
+    wl_columnar_eval_stack_unary_prepared_t receipt_before;
+    memcpy(&receipt_before, &prepared, sizeof(prepared));
+    int alias_owner = 0;
+    grant_t alias_grant = framed_prepared_grant(0, &alias_owner);
+    wl_columnar_eval_serial_framed_status_t alias_status;
+    wl_columnar_eval_cleanup_receipt_key_t alias_key;
+    CHECK(wl_columnar_eval_stack_framed_status(frame, f.session,
+        (void *)&prepared,
+        &alias_key, alias_grant.control, alias_grant.id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_framed_status(frame, f.session, &alias_status,
+        (void *)&prepared, alias_grant.control, alias_grant.id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_framed_status(frame, f.session,
+        (void *)&child->phase,
+        &alias_key, alias_grant.control, alias_grant.id) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_key_for_frame(frame,
+        (void *)&prepared) == EINVAL);
+    CHECK(wl_columnar_eval_stack_cleanup_receipt_read(f.session, &key,
+        (void *)&prepared) == EINVAL);
+    CHECK(wl_columnar_eval_stack_test_unary_observe(frame, child,
+        (void *)&prepared) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_status(child,
+        (void *)&prepared,
+        alias_grant.control, alias_grant.id) == EINVAL);
+    CHECK(wl_columnar_eval_plan_numeric_private_bindings_get(child, frame,
+        f.session,
+        f.operation, f.id, &child->private_bindings) == EINVAL);
+    wl_columnar_eval_serial_framed_host_request_t alias_request = previous;
+    alias_request.reply = (void *)&prepared;
+    CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session, false,
+        &alias_request) == EINVAL);
+    alias_request.reply = (void *)&child->phase;
+    CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session, false,
+        &alias_request) == EINVAL);
+    /* Request bytes are receipt bytes, not a valid request to interpret.
+     * Refusal must precede even reading a reply pointer from that storage. */
+    CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session, false,
+        (void *)&prepared) == EINVAL);
+    CHECK(!framed_prepared_grant_end(&alias_grant, &alias_owner));
+    CHECK(!memcmp(&receipt_before, &prepared,
+        sizeof(prepared)) && !memcmp(saved, ctx, sizeof(*saved)));
+    wl_columnar_eval_serial_framed_attempt_t *loan = NULL;
+    CHECK(wl_columnar_eval_stack_framed_context(frame, f.session,
+        &loan) == EBUSY && !loan);
+    uint64_t before, after;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &before));
+    for (unsigned exact = 0; exact < 2; ++exact) {
+        int owner = 0;
+        grant_t grant = framed_prepared_grant(exact ? 768 : 767, &owner);
+        wl_columnar_eval_serial_framed_host_reply_t reply;
+        wl_columnar_eval_serial_framed_host_request_t request = previous;
+        request.funding = grant.control; request.funding_id = grant.id;
+        request.operation = f.operation; request.operation_id = f.id;
+        request.operation_identity = f.operation_identity;
+        request.reply = &reply;
+        request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_STATUS;
+        int rc = wl_columnar_eval_serial_framed_relation(f.relation, f.session,
+                false, &request);
+        CHECK(rc == (exact ? 0 : WL_EVALUATION_CONTROL_WORK_LIMIT)
+            && reply.kind == WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_STATUS
+            && foundation_key_equal(&reply.cleanup_receipt_key, &key));
+        if (exact) foundation_status_check(&reply.status, ctx);
+        else CHECK(reply.status.phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_INERT);
+        CHECK(framed_prepared_grant_end(&grant,
+            &owner) == (exact ? 768u : 384u));
+    }
+    int owner = 0; grant_t grant = framed_prepared_grant(0, &owner);
+    wl_columnar_eval_serial_framed_host_reply_t reply;
+    wl_columnar_eval_serial_framed_host_request_t request = previous;
+    request.funding = grant.control; request.funding_id = grant.id;
+    request.operation = f.operation; request.operation_id = f.id;
+    request.operation_identity = f.operation_identity; request.reply = &reply;
+    request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ADVANCE;
+    CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session, false,
+        &request) == EBUSY);
+    request.action = WL_COLUMNAR_EVAL_SERIAL_FRAMED_ABORT;
+    CHECK(wl_columnar_eval_serial_framed_relation(f.relation, f.session, false,
+        &request) == EBUSY);
+    CHECK(wl_columnar_eval_serial_framed_attempt_step(ctx, grant.control,
+        grant.id) == EBUSY);
+    CHECK(wl_columnar_eval_serial_framed_consume_result(ctx, 0, grant.control,
+        grant.id) == EBUSY);
+    CHECK(wl_columnar_eval_serial_framed_attempt_publish(ctx, grant.control,
+        grant.id) == EBUSY);
+    CHECK(wl_columnar_eval_serial_framed_attempt_discard(ctx, grant.control,
+        grant.id) == EBUSY);
+    int semantic = 12345; bool committed = true;
+    CHECK(wl_columnar_eval_serial_framed_attempt_close(ctx, &semantic,
+        &committed,
+        grant.control, grant.id) == EBUSY && semantic == 12345 && committed);
+    CHECK(!framed_prepared_grant_end(&grant, &owner));
+    CHECK(!memcmp(saved, ctx, sizeof(*saved)) && !memcmp(&previous, &f.previous,
+        sizeof(previous)));
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation, f.id,
+        &after) && before == after);
+    free(saved);
+    framed_prepared_until(&prepared, WL_COLUMNAR_EVAL_STACK_PREPARED_SEALED);
+    wl_columnar_eval_stack_unary_commit_prepared_nofail(&prepared);
+    grant = framed_prepared_grant(0, &owner);
+    for (unsigned turn = 0; ; ++turn) {
+        wl_columnar_eval_stack_unary_prepared_status_t status;
+        CHECK(!wl_columnar_eval_stack_unary_prepared_query(&prepared, &status));
+        if (status.phase == WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY) break;
+        CHECK(turn < 1000 &&
+            !wl_columnar_eval_stack_unary_prepared_drain(&prepared,
+            grant.control, grant.id));
+    }
+    CHECK(!wl_columnar_eval_stack_unary_prepared_ack(&prepared, grant.control,
+        grant.id));
+    bool done = false;
+    for (unsigned turn = 0; !done; ++turn) {
+        CHECK(turn < 10000);
+        CHECK(!wl_columnar_eval_stack_unary_finish_scalar_funded_owned(frame, 0,
+            child,
+            grant.control, grant.id, &semantic, &done) && !semantic);
+    }
+    CHECK(!wl_columnar_eval_stack_unary_reset_owned(frame, child));
+    CHECK(framed_prepared_grant_end(&grant, &owner));
+    CHECK(!wl_columnar_eval_stack_framed_inspect(frame, f.session,
+        &view) && !view.prepared_unary_present);
+    entry_complete(&f);
+    CHECK(!f.reply.execution_result && f.reply.committed);
+    col_rel_t *output = session_rel_hash_lookup(f.session, "output");
+    CHECK(output && output->nrows == 3 && output->ncols == 1
+        && output->columns[0][0] == 1 && output->columns[0][1] == 2 &&
+        output->columns[0][2] == 3);
+    entry_destroy(&f);
+    wl_columnar_eval_stack_unary_prepared_status_t status;
+    CHECK(!wl_columnar_eval_stack_unary_prepared_query(&prepared,
+        &status) && status.committed && !status.first_result);
+}
+
 int
 main(void)
 {
@@ -13700,6 +13958,7 @@ main(void)
     test_staging_native_pending_admission();
     test_session_retirement_initialization_stops();
     test_framed_lftj_retirement_funding();
+    test_framed_actual_prepared_exclusion();
     test_framed_copied_observations();
     test_framed_observation_native_and_turnover();
     test_framed_status_real_retirement();

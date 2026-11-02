@@ -3609,12 +3609,16 @@ wl_columnar_filter_empty_end_pending_owned(
     bool *pending)
 {
     if (!pending) return EINVAL;
-    *pending = false;
     wl_columnar_filter_context_t *ctx = NULL;
     wl_columnar_relation_empty_source_t *source = NULL;
     int rc = wl_columnar_filter_empty_end_context(frame, owner, &ctx, &source);
-    if (!rc) *pending = source != NULL;
-    return rc;
+    if (rc) {
+        if (!wl_columnar_eval_stack_frame_mutation_blocked(frame))
+            *pending = false;
+        return rc;
+    }
+    *pending = source != NULL;
+    return 0;
 }
 
 int

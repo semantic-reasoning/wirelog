@@ -78,6 +78,15 @@ wl_columnar_eval_serial_framed_validate(
 }
 
 static int
+wl_columnar_eval_serial_framed_validate_writable(
+    const wl_columnar_eval_serial_framed_attempt_t *ctx)
+{
+    if (!ctx) return EINVAL;
+    return wl_columnar_eval_stack_framed_writable(ctx->frame, ctx->session,
+               ctx);
+}
+
+static int
 wl_columnar_eval_serial_framed_fund(wl_evaluation_control_t *funding,
     uint64_t id, const wl_evaluation_control_t *operation)
 {
@@ -148,6 +157,7 @@ wl_columnar_eval_serial_framed_attempt_begin_internal(
         return EINVAL;
     if (capture_only != (private_bindings != NULL)
         || capture_only != (capture_out != NULL)) return EINVAL;
+    if (wl_columnar_eval_stack_frame_mutation_blocked(frame)) return EBUSY;
     bool ordinary_capture = capture_only && private_bindings->dynamic_entries;
     if (ordinary_capture && !wl_columnar_session_observed_bindings_authorized(
             session, private_bindings)) return EINVAL;
@@ -353,7 +363,7 @@ wl_columnar_eval_serial_framed_attempt_step(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    int rc = wl_columnar_eval_serial_framed_validate_writable(ctx);
     if (rc) return rc;
     if (ctx->phase == WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING) return EBUSY;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
@@ -643,7 +653,7 @@ wl_columnar_eval_serial_framed_consume_result(
     wl_columnar_eval_serial_framed_attempt_t *ctx, int child_protocol,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    int rc = wl_columnar_eval_serial_framed_validate_writable(ctx);
     if (rc) return rc;
     if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_PENDING
         || !ctx->pending_funding || ctx->pending_funding == funding
@@ -742,7 +752,7 @@ wl_columnar_eval_serial_framed_attempt_publish(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    int rc = wl_columnar_eval_serial_framed_validate_writable(ctx);
     if (rc) return rc;
     if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY) return EBUSY;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
@@ -762,7 +772,7 @@ wl_columnar_eval_serial_framed_attempt_discard(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    int rc = wl_columnar_eval_serial_framed_validate_writable(ctx);
     if (rc) return rc;
     if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_READY) return EBUSY;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
@@ -790,7 +800,7 @@ wl_columnar_eval_serial_framed_attempt_close(
     wl_columnar_eval_serial_framed_attempt_t *ctx, int *result, bool *committed,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
-    int rc = wl_columnar_eval_serial_framed_validate(ctx);
+    int rc = wl_columnar_eval_serial_framed_validate_writable(ctx);
     if (rc || !result || !committed) return rc ? rc : EINVAL;
     if (ctx->phase != WL_COLUMNAR_EVAL_SERIAL_FRAMED_DONE) return EBUSY;
     rc = wl_columnar_eval_serial_framed_fund(funding, funding_id, ctx->control);
@@ -1220,6 +1230,7 @@ wl_columnar_eval_serial_framed_abort_step(
     wl_columnar_eval_serial_framed_attempt_t *ctx,
     wl_evaluation_control_t *funding, uint64_t funding_id)
 {
+    if (wl_columnar_eval_stack_frame_mutation_blocked(ctx->frame)) return EBUSY;
     if (!ctx->abort_requested) {
         if (!ctx->abort_supported) return ENOTSUP;
         if (!ctx->primary_result)
@@ -1294,6 +1305,18 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
     wl_col_session_t *sess, bool recursive,
     const wl_columnar_eval_serial_framed_host_request_t *request)
 {
+    /* Check the request before reading its reply pointer, and the reply
+     * before its ordinary reset can touch any live protected owner. */
+    if (request) {
+        if (!wl_columnar_eval_stack_marked_copy_output(sess, request,
+            sizeof(*request))) return EINVAL;
+        if (request->reply
+            && (!wl_columnar_eval_stack_marked_copy_output(sess,
+            request->reply, sizeof(*request->reply))
+            || !wl_columnar_eval_stack_copy_ranges_disjoint(request,
+            sizeof(*request), request->reply, sizeof(*request->reply))))
+            return EINVAL;
+    }
     if (request && request->reply) {
         request->reply->kind = WL_COLUMNAR_EVAL_SERIAL_FRAMED_REPLY_REJECTED;
         request->reply->execution_result = EINVAL;
@@ -1365,6 +1388,7 @@ wl_columnar_eval_serial_framed_relation(const wl_plan_relation_t *rp,
                 }
                 return protocol;
             }
+            if (view.prepared_unary_present) return EBUSY;
             /* Ordinary mutation retains its actual mutable context loan.
              * Inspection and getter are callback-free; no observation grants
              * independent mutation authority. */
