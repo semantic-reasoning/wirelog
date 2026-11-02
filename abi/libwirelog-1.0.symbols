@@ -9,6 +9,7 @@ wirelog_easy_close
 wirelog_easy_insert
 wirelog_easy_insert_sym
 wirelog_easy_intern
+wirelog_easy_lookup_symbol
 wirelog_easy_make_compound
 wirelog_easy_open
 wirelog_easy_open_opts
@@ -17,6 +18,9 @@ wirelog_easy_remove
 wirelog_easy_remove_sym
 wirelog_easy_set_delta_cb
 wirelog_easy_snapshot
+wirelog_easy_source_count
+wirelog_easy_source_key_exists
+wirelog_easy_source_validate
 wirelog_easy_step
 wirelog_error_string
 wirelog_evaluate

@@ -5700,3 +5700,25 @@ window. These measurements are fixture/build-specific; intern storage,
 pre-JOIN prefixes, reader/key state, distinct groups and final output remain
 independent governed floors. Dedicated default/unit/TSan budget registrations
 run serially outside the duplicated regular/environment tests.
+
+## Host source inspection memory (#2321)
+
+Source inspection reads the resident source rows that inserts already store
+-- a rule head's `$in$` seed shadow or a plain relation's own rows -- and
+keeps no ledger, mirror or index of its own. A query allocates nothing,
+reserves nothing through the governor, and does not clear budget-denial
+diagnostics: it compares columns in place with O(1) auxiliary state, for
+O(min(rows, max_rows) * width) work on an exact count and
+O(min(rows, max_rows)) on a key query, plus metadata and name lookups.
+Origin certification is one owned copy of each host-only relation's name,
+captured once when the session is created, independent of history size.
+
+`tests/test_easy_source_inspection.c` records the evidence. After histories
+of 2,000 and 40,000 inserted rows (half removed again, with evaluation in
+between), a count and a key query make no `malloc`, `calloc`, `realloc`,
+`aligned_alloc` or `posix_memalign` call on the querying thread (the scan
+runs synchronously there) at either scale, counted by interposing those
+functions in the test executable (glibc, unsanitized builds), so the queries
+allocate no transient heap state through them. The governor's reserved bytes
+and, where `mallinfo2` is available, the allocator's in-use bytes also change
+by exactly 0, while the exact count still matches the history.

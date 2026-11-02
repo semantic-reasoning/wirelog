@@ -439,6 +439,50 @@ test_single_rule_idb_is_set_valued(void)
     return rc;
 }
 
+/* T9 (issue #2321): host source inspection refuses a relation that has an
+ * inline fact -- before the lazy build loads it and after -- because its
+ * stored rows are not host input alone, while a host-only relation beside
+ * it is answered.  Through the production library, public API only. */
+static int
+test_inline_fact_relation_refused_by_source_inspection(void)
+{
+    static const char *src =
+        ".decl seeded(x: int64)\n"
+        ".decl hosted(x: int64)\n"
+        "seeded(1).\n";
+
+    wirelog_easy_session_t *s = NULL;
+    wirelog_error_t err = wirelog_easy_open(src, &s);
+    if (err != WIRELOG_OK || !s) {
+        fprintf(stderr, "T9 open err=%d\n", err);
+        return 1;
+    }
+    int rc = 0;
+    int64_t one = 1;
+    uint64_t n = 7;
+    for (int built = 0; built < 2; built++) {
+        n = 7;
+        if (wirelog_easy_source_count(s, "seeded", &one, 1, UINT64_MAX, &n)
+            != WIRELOG_SOURCE_QUERY_UNSUPPORTED || n != 0) {
+            fprintf(stderr, "T9: seeded not refused (built=%d)\n", built);
+            rc = 1;
+        }
+        if (wirelog_easy_source_count(s, "hosted", &one, 1, UINT64_MAX, &n)
+            != WIRELOG_SOURCE_QUERY_OK || n != (uint64_t)built) {
+            fprintf(stderr, "T9: hosted count %llu (built=%d)\n",
+                (unsigned long long)n, built);
+            rc = 1;
+        }
+        if (!built && wirelog_easy_insert(s, "hosted", &one, 1)
+            != WIRELOG_OK) {
+            fprintf(stderr, "T9: insert failed\n");
+            rc = 1;
+        }
+    }
+    wirelog_easy_close(s);
+    return rc;
+}
+
 int
 main(void)
 {
@@ -451,6 +495,7 @@ main(void)
     failures += test_inline_compound_handle_fact_rejected();
     failures += test_inline_compound_flat_fact_destructures_exactly();
     failures += test_single_rule_idb_is_set_valued();
+    failures += test_inline_fact_relation_refused_by_source_inspection();
     if (failures == 0)
         printf("test_wl_easy_inline_facts: OK\n");
     else

@@ -384,6 +384,107 @@ wirelog_easy_snapshot(wirelog_easy_session_t *s, const char *relation,
     wirelog_on_tuple_fn cb,
     void *user_data);
 
+/*
+ * Host source inspection (Issue #2321, WIRELOG_SOURCE_QUERY_VERSION 1).
+ *
+ * The easy counterparts of wirelog_session_source_count(),
+ * wirelog_session_source_key_exists(), wirelog_session_source_validate()
+ * and wirelog_session_lookup_symbol() in <wirelog/wirelog-advanced.h>, with
+ * the same source, origin, admission, precedence, work and value contract
+ * documented there.  In short: they report what the host inserted with
+ * wirelog_easy_insert() (or _insert_sym()) and has not removed -- a rule
+ * head's host input, never its derived rows -- without evaluating, invoking
+ * callbacks or interning; relations with inline facts in the program,
+ * schemas other than scalar `int64` / `symbol` / `string`, and names
+ * starting with `$` or `__` are refused; @max_rows bounds the rows examined;
+ * and every non-OK status leaves the outputs reset and is never absence.
+ *
+ * Easy-specific behaviour:
+ *
+ * - These calls never build the lazy session.  Before the first call that
+ *   builds it (insert, remove, step, snapshot, set_delta_cb, make_compound,
+ *   or an eager open), nothing has been loaded: a supported relation answers
+ *   count 0 / exists false after full validation, and lookup reads the
+ *   program's intern table.  Inline facts, even on other relations, are not
+ *   loaded by inspecting.
+ * - If that lazy build failed (plan, session creation or inline-fact load),
+ *   every inspection call answers WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED
+ *   until a later building call succeeds.  Inspection never retries the
+ *   build and never clears that state itself; arguments it rejects first are
+ *   still INVALID_ARGUMENT.
+ * - STRING lanes are IDs from wirelog_easy_intern() or
+ *   wirelog_easy_lookup_symbol(); lookup does not intern.
+ */
+
+/**
+ * wirelog_easy_source_count:
+ * @s:         Open session.
+ * @relation:  Relation name.
+ * @tuple:     Exactly @ncols lanes.
+ * @ncols:     The relation's declared width.
+ * @max_rows:  Maximum source rows to examine.
+ * @out_count: (out) Source occurrences equal to @tuple; reset to 0 on
+ *             entry, meaningful only on WIRELOG_SOURCE_QUERY_OK.
+ *
+ * Count host source occurrences of @tuple; see the section comment above.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_easy_source_count(wirelog_easy_session_t *s, const char *relation,
+    const int64_t *tuple, uint32_t ncols, uint64_t max_rows,
+    uint64_t *out_count);
+
+/**
+ * wirelog_easy_source_key_exists:
+ * @s:          Open session.
+ * @relation:   Relation name.
+ * @first_key:  First-column value.
+ * @max_rows:   Maximum source rows to examine.
+ * @out_exists: (out) True when some source occurrence has @first_key first;
+ *              reset to false on entry, meaningful only on OK.
+ *
+ * Report first-column key presence after validating the whole schema; true
+ * may be answered early, false only after the full source.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_easy_source_key_exists(wirelog_easy_session_t *s,
+    const char *relation, int64_t first_key, uint64_t max_rows,
+    bool *out_exists);
+
+/**
+ * wirelog_easy_source_validate:
+ * @s:              Open session.
+ * @relation:       Relation name.
+ * @expected_ncols: Width the caller will query with; must be positive.
+ *
+ * Validate session state, relation identity, schema, origin, width and
+ * source storage without reading rows, allocating or building the session.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_easy_source_validate(wirelog_easy_session_t *s, const char *relation,
+    uint32_t expected_ncols);
+
+/**
+ * wirelog_easy_lookup_symbol:
+ * @s:         Open session.
+ * @symbol:    NUL-terminated symbol text.
+ * @out_id:    (out) Intern ID; reset to -1, meaningful only when found.
+ * @out_found: (out) True when interned; reset to false.
+ *
+ * Look @symbol up without interning it.  Not found is OK with *@out_found
+ * false.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_easy_lookup_symbol(wirelog_easy_session_t *s, const char *symbol,
+    int64_t *out_id, bool *out_found);
+
 #ifdef __cplusplus
 }
 #endif

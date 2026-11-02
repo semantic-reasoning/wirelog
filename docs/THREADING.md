@@ -2275,3 +2275,30 @@ not change the COMMITTED-token physical-retirement contract.
 | `memory_governor.c:wl_columnar_memory_reserved_trim_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce reserved credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_reserved_trim_advance#7` | token state | `atomic_store_explicit` | release | Publish the trimmed token after aggregate credit succeeds |
 | `arrangement.c:wl_columnar_arrangement_diff_attempt_prepare` | registry token state | `atomic_load_explicit` | acquire | Validate the old registry accounting before the host publication cutoff |
+
+## Host source inspection admission (#2321)
+
+The eight source-inspection entry points (`wirelog_session_source_*`,
+`wirelog_session_lookup_symbol` and their `wirelog_easy_*` counterparts) add
+no lock, atomic or cross-call guarantee. Sessions stay single-owner and
+externally serialized; a host that queries and then removes must hold its own
+ownership across both calls.
+
+Each call on a built session takes one reservation through
+`wl_session_inspection_begin()` (`wirelog/session.c`); an easy session that
+is not built, or whose build failed, has none to take. Unlike the ordinary
+operation gate, it refuses a nested reservation: while `active_operations` is
+nonzero -- which it is for the whole of every insert, remove, step, snapshot
+and callback-replacement call, and so for every delta, snapshot, typed-bridge
+or extension callback those calls run -- the inspection answers
+`WIRELOG_SOURCE_QUERY_BUSY` and the outer operation continues unaffected. A
+call made from the thread that is inside a delta callback is refused the same
+way before the lock is taken. Controlled sessions are refused as
+`WIRELOG_SOURCE_QUERY_UNSUPPORTED` before the admission lock, so no control,
+fuel or attempt state moves. An easy session that has not built its inner
+session yet has no admission state and no callback that could re-enter it;
+its queries read program metadata only.
+
+The scan reads the selected relation's columns without taking its source
+gate; it refuses as BUSY when that gate is held, and relies on external
+serialization for the rest. `WL_LOG` and destroy rules are unchanged.

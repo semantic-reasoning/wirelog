@@ -41,6 +41,14 @@ Current guidance:
 The enum is intentionally small today. Future work may refine taxonomy and
 mapping, but this document does not freeze a full code-by-code policy.
 
+Host source inspection (#2321) returns its own
+`wirelog_source_query_status_t` rather than `wirelog_error_t`, so that a
+refusal can be told apart from a valid zero. `WIRELOG_SOURCE_QUERY_OK` is
+the only success; `BUSY`, `UNSUPPORTED`, `WORK_LIMIT` and the other values
+leave the outputs reset and are never an answer of absence. The values are
+pinned in `wirelog/wirelog-types.h` and advertised by
+`WIRELOG_SOURCE_QUERY_VERSION`.
+
 ## Diagnostics and WL_LOG
 
 `WL_LOG` is a runtime, section-filtered diagnostic facility documented in the
