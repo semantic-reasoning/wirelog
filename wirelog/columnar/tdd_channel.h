@@ -187,7 +187,8 @@ wl_tdd_channel_publish(wl_tdd_channel_t *ch, wl_tdd_batch_t *batch,
 
 /* Task wrapper: close lane @lane with @rc.  Reclaims an outstanding
  * reservation and every PRODUCER-state descriptor of the lane; if anything
- * was reclaimed while @rc is 0, the lane and the channel record EPROTO. */
+ * was reclaimed while @rc is 0, the lane records EPROTO, and so does the
+ * channel unless it already holds an error. */
 void
 wl_tdd_channel_close_lane(wl_tdd_channel_t *ch, uint32_t lane, int rc);
 

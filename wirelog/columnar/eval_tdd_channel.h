@@ -196,23 +196,35 @@ wl_columnar_eval_tdd_channel_publish_delta(struct col_eval_tdd_worker_ctx *ctx,
     uint32_t rel_idx, uint32_t eff_iter);
 
 /*
- * Consumer, after the producers are joined: pump @ch until it reports the
- * round complete.  Each taken batch's charge is freed from @ledger (when
- * set) under WL_MEM_SUBSYS_CHANNEL, its rows are added to *@rows (when set),
- * and it is pushed onto lists[rel_idx * @nworkers + worker], so each list
- * holds its batches newest first.  A batch whose relation is not below
- * @nrels, or whose worker is not below @nworkers, is destroyed (a refused
- * retirement goes to @sink) and makes the call return EPROTO after the
- * round has been pumped to its end; its rows are not counted.  Returns 0,
- * EINVAL, EPROTO, or the channel's error: when the round is cancelled or
- * unbalanced, and when it completed with an error recorded on the channel
- * (an orphan reclaimed on a lane that returned 0).  The lists keep what was
- * collected either way.
+ * Consumer: pump @ch until the round ends, while its producers may still be
+ * running.  The call touches descriptors only, never a payload, and disposes
+ * of no batch.  Each taken batch's charge is freed from @ledger (when set)
+ * under WL_MEM_SUBSYS_CHANNEL.  A batch is pushed onto
+ * lists[rel_idx * @nworkers + worker], so each list holds its batches newest
+ * first, and its rows are added to *@rows (when set).
+ *
+ * Once the round cannot succeed the call keeps pumping in discard mode, so
+ * producers still make progress, and pushes every later batch onto
+ * *@discard instead; the caller disposes that list after the producers are
+ * joined.  Discard mode starts when a lane has closed with an error, when a
+ * batch names a relation not below @nrels or a worker not below @nworkers
+ * (that batch is discarded too and the call returns EPROTO), or when pump
+ * reports an error.  On a pump error the call cancels the channel with that
+ * error and keeps pumping until every lane has closed.
+ *
+ * The call returns once pump reports the round COMPLETE or CANCELLED.  The
+ * only earlier returns are EINVAL for invalid arguments and a second pump
+ * error after the cancel, which pump does not report while the channel is
+ * cancelled.  Returns 0, EPROTO, the pump error, or the channel's error:
+ * for a cancelled round, and for a completed round with an error recorded
+ * on the channel (an orphan reclaimed on a lane that returned 0).  The lists
+ * keep what was collected either way, and batches still queued after a
+ * cancel stay in the channel.
  */
 int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
-    uint32_t nrels, const wl_tdd_refusal_sink_t *sink, uint64_t *rows);
+    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows);
 
 /*
  * Consumer: coalesce every list built by wl_columnar_eval_tdd_channel_collect()
@@ -236,6 +248,17 @@ wl_columnar_eval_tdd_channel_discard_lists(wl_tdd_channel_t *ch,
     wl_tdd_batch_t **lists, size_t count, const wl_tdd_refusal_sink_t *sink);
 
 #ifdef WL_SESSION_TEST_HOOKS
+/* Test hook, called on the coordinator thread before each pump of
+ * wl_columnar_eval_tdd_channel_collect() until the round is cancelled.  A
+ * non-zero return is handled as a pump error with that value. */
+extern int (*wl_columnar_eval_test_before_pump)(wl_tdd_channel_t *ch);
+
+/* Test hook, called on a worker thread before a delta for @rel_idx is
+ * reserved on the channel.  A non-zero return is returned by
+ * wl_columnar_eval_tdd_channel_reserve_delta() in place of reserving. */
+extern int (*wl_columnar_eval_test_channel_reserve)(
+    struct wl_col_session_t *worker, uint32_t rel_idx);
+
 /* Test hook, called on a worker thread for every published delta of @rows
  * rows: return the number of batches to publish it as, 0 or 1 for one.  The
  * count is capped at WL_TDD_CHANNEL_TEST_SPLIT_MAX and at @rows.  Setting

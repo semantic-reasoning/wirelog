@@ -263,6 +263,30 @@ build_label(void)
 /* Test 1: WL_MEM_REPORT does not change results                            */
 /* ======================================================================== */
 
+/*
+ * Whether two runs of one workload reached the same ledger peaks.  Every
+ * subsystem but CHANNEL must peak identically.  The coordinator pumps the
+ * TDD channel while the workers publish (#1373), so how many bytes are
+ * queued at once, and with it the CHANNEL peak, depends on scheduling; the
+ * total peak may therefore differ by at most the larger CHANNEL peak.
+ */
+static bool
+peaks_match(const wl_columnar_mem_stats_t *a, const wl_columnar_mem_stats_t *b)
+{
+    int count = 0;
+    (void)wl_columnar_mem_subsys_name(0, &count);
+    for (int s = 0; s < count; s++)
+        if (s != WL_MEM_SUBSYS_CHANNEL
+            && a->subsys_peak_bytes[s] != b->subsys_peak_bytes[s])
+            return false;
+    uint64_t channel = a->subsys_peak_bytes[WL_MEM_SUBSYS_CHANNEL];
+    if (b->subsys_peak_bytes[WL_MEM_SUBSYS_CHANNEL] > channel)
+        channel = b->subsys_peak_bytes[WL_MEM_SUBSYS_CHANNEL];
+    uint64_t diff = a->peak_bytes > b->peak_bytes
+        ? a->peak_bytes - b->peak_bytes : b->peak_bytes - a->peak_bytes;
+    return diff <= channel;
+}
+
 static int
 test_report_identity(uint32_t workers)
 {
@@ -300,7 +324,7 @@ test_report_identity(uint32_t workers)
             FAIL("tuples/iterations differ across WL_MEM_REPORT levels");
             return 1;
         }
-        if (res[i].stats.peak_bytes != res[0].stats.peak_bytes) {
+        if (!peaks_match(&res[i].stats, &res[0].stats)) {
             FAIL("ledger peak differs across WL_MEM_REPORT levels");
             return 1;
         }

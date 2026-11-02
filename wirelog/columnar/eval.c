@@ -144,9 +144,9 @@ tdd_reserve_channel(wl_col_session_t *coord, uint32_t workers,
 
 /*
  * Create the stratum's channel and its side buffers under one governed
- * reservation.  The channel's capacity is unbounded: the consumer starts
- * pumping only after every producer has been joined, so a producer must
- * never wait for space.
+ * reservation.  The coordinator pumps the channel while the workers
+ * produce; the capacity is unbounded, so a reservation never waits for
+ * space.
  */
 static int
 tdd_create_channel(wl_col_session_t *coord, uint32_t workers,
@@ -220,14 +220,39 @@ tdd_channel_abandon_refused(void *ctx, wl_tdd_batch_t *batch, int rc)
     wl_tdd_channel_retire((wl_tdd_channel_t *)ctx, batch);
 }
 
+/* Whether @ch has a lane open, so a producer may still be running. */
+static bool
+tdd_channel_round_open(wl_tdd_channel_t *ch)
+{
+    wl_tdd_channel_stats_t stats;
+    wl_tdd_channel_stats(ch, &stats);
+    return stats.lanes_open != 0;
+}
+
+/* The error the channel recorded for its round, 0 if none. */
+static int
+tdd_channel_error(wl_tdd_channel_t *ch)
+{
+    wl_tdd_channel_stats_t stats;
+    wl_tdd_channel_stats(ch, &stats);
+    return stats.channel_rc;
+}
+
 void
 wl_columnar_eval_tdd_dispose_channel(wl_col_session_t *coord)
 {
     if (!coord || coord->tdd_owner_lifetime)
         return;
     wl_tdd_channel_t *ch = coord->tdd_channel;
+    /* With a lane still open everything stays attached: a running producer
+     * may still touch the channel, and the batches it published must not be
+     * disposed before it is joined. */
+    if (ch && tdd_channel_round_open(ch))
+        return;
     if (ch) {
         wl_tdd_refusal_sink_t refusal = { tdd_channel_abandon_refused, ch };
+        wl_columnar_eval_tdd_discard_list(ch, &coord->tdd_channel_discard,
+            &refusal);
         wl_columnar_eval_tdd_channel_discard_lists(ch,
             coord->tdd_channel_lists, coord->tdd_channel_list_count,
             &refusal);
@@ -235,9 +260,51 @@ wl_columnar_eval_tdd_dispose_channel(wl_col_session_t *coord)
         wl_tdd_channel_discard_all(ch, wl_columnar_eval_tdd_discard_sink,
             &discard);
     }
-    /* With a lane still open everything stays attached: a running producer
-     * may still touch the channel. */
     (void)tdd_channel_release(coord);
+}
+
+/* Cancel @ch if a round is open, so producers waiting for space return and
+ * a later drain of their tasks completes (I1). */
+static void
+tdd_channel_cancel_open_round(wl_tdd_channel_t *ch)
+{
+    if (ch && tdd_channel_round_open(ch))
+        wl_tdd_channel_cancel(ch, ECANCELED);
+}
+
+void
+wl_columnar_eval_tdd_channel_cancel_for_teardown(wl_col_session_t *sess)
+{
+    if (!sess)
+        return;
+    tdd_channel_cancel_open_round(sess->tdd_channel);
+    if (sess->tdd_owner_lifetime
+        && sess->tdd_owner_lifetime->channel != sess->tdd_channel)
+        tdd_channel_cancel_open_round(sess->tdd_owner_lifetime->channel);
+}
+
+/*
+ * The error of a joined round (#1373): the first worker rc, in worker
+ * order, that is neither 0 nor ECANCELED; otherwise the channel's error;
+ * otherwise the consumer's; otherwise ECANCELED when a worker saw the
+ * cancel, and 0 when nothing failed.
+ */
+static int
+tdd_round_select_rc(const col_eval_tdd_worker_ctx_t *ctxs, uint32_t W,
+    int channel_rc, int consumer_rc)
+{
+    bool cancelled = false;
+    for (uint32_t w = 0; w < W; w++) {
+        if (ctxs[w].rc == ECANCELED)
+            cancelled = true;
+        else if (ctxs[w].rc != 0)
+            return ctxs[w].rc;
+    }
+    if (channel_rc != 0)
+        return channel_rc;
+    if (consumer_rc != 0)
+        return consumer_rc;
+    return cancelled ? ECANCELED : 0;
 }
 
 #ifdef WL_TEST_ALLOC_WRAP
@@ -303,8 +370,8 @@ tdd_channel_refusal_sink(wl_col_session_t *coord)
     return sink;
 }
 
-/* Move every batch the lifetime's channel still holds, queued or on a
- * consumer list, onto the retained list.  Allocates nothing. */
+/* Move every batch the lifetime's channel still holds, queued, discarded or
+ * on a consumer list, onto the retained list.  Allocates nothing. */
 static void
 wl_columnar_eval_tdd_owner_lifetime_capture(wl_col_session_t *coord,
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime)
@@ -312,6 +379,15 @@ wl_columnar_eval_tdd_owner_lifetime_capture(wl_col_session_t *coord,
     wl_tdd_channel_t *ch = lifetime->channel;
     if (!ch)
         return;
+    if (coord->tdd_channel == ch) {
+        wl_tdd_batch_t *batch = coord->tdd_channel_discard;
+        coord->tdd_channel_discard = NULL;
+        while (batch) {
+            wl_tdd_batch_t *next = batch->next;
+            tdd_lifetime_retain(lifetime, batch);
+            batch = next;
+        }
+    }
     if (coord->tdd_channel == ch && coord->tdd_channel_lists) {
         for (size_t i = 0; i < coord->tdd_channel_list_count; i++) {
             wl_tdd_batch_t *batch = coord->tdd_channel_lists[i];
@@ -377,6 +453,10 @@ wl_columnar_eval_tdd_owner_lifetime_quiesce(wl_col_session_t *coord)
         return 0;
     if (!coord->wq)
         return EBUSY;
+    /* The driver left this round without joining it, so nobody pumps: a
+     * producer waiting for space returns only once the channel is
+     * cancelled (I1). */
+    tdd_channel_cancel_open_round(lifetime->channel);
     int rc = wl_workqueue_drain(coord->wq);
     if (rc != 0)
         return rc;
@@ -2098,6 +2178,10 @@ void (*wl_columnar_eval_test_outbound_before_publish)(wl_col_session_t *,
 /* Issue #1373: report relation @ri as grown in an outbound subpass. */
 bool (*wl_columnar_eval_test_outbound_head_growth)(wl_col_session_t *,
     uint32_t);
+/* Issue #1373: in owner mode, return true to leave a dispatched round
+ * without pumping or joining it, as a driver that skipped its round close
+ * would; the teardown paths must then end the round (I1). */
+bool (*wl_columnar_eval_test_abandon_round)(wl_col_session_t *);
 #endif
 
 /* Construct the worst-case outgoing image before a worker changes its source.
@@ -7605,16 +7689,20 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (rc != 0)
                 goto done;
 
-            /* DISPATCH */
+            /* SUBMIT.  The tasks wait behind the closed dispatch gate, so
+             * none runs before the dispatch below. */
             bool submit_ok = true;
             uint64_t dispatch_t0 = now_ns();
             for (uint32_t w = 0; w < W; w++) {
                 if (WL_COLUMNAR_EVAL_SUBMIT(coord->wq, tdd_worker_channel_fn,
                     &ctxs[w]) != 0) {
-                    /* Tasks that were never queued close their lanes here;
-                     * the queued ones run in the drain and close their own.
-                     * The capacity is unbounded, so none of them waits. */
+                    /* Tasks that were never queued close their lanes here.
+                     * The cancel comes before the drain (I1), so each queued
+                     * task closes its own lane with ECANCELED without
+                     * running its subpass, and none can wait for space
+                     * while nobody pumps. */
                     wl_tdd_channel_close_unstarted(coord->tdd_channel, w, W);
+                    wl_tdd_channel_cancel(coord->tdd_channel, ENOMEM);
                     int drain_rc = wl_workqueue_drain(coord->wq);
                     owner_dispatch_quiesced = drain_rc == 0;
                     if (owner_dispatch_quiesced && coord->tdd_owner_lifetime)
@@ -7643,18 +7731,56 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 goto done;
             }
 
-            /* BARRIER */
+            /* DISPATCH, then pump the channel on this thread while the
+             * workers produce, then join them (BARRIER).  After the
+             * dispatch, every wait_all or drain of this round follows a
+             * COMPLETE pump or a cancel of the channel (I1): a producer
+             * may be waiting for space that only the pump frees. */
             uint64_t wait_t0 = now_ns();
-            int wait_rc = wl_workqueue_wait_all(coord->wq);
+            int consumer_rc = 0;
+            uint64_t delivered = 0;
+            bool dispatched = wl_workqueue_dispatch(coord->wq) == 0;
+            if (dispatched) {
+#ifdef WL_SESSION_TEST_HOOKS
+                /* Owner mode keeps the task contexts across an exit that
+                 * skips the join, so only there may a test leave the round
+                 * open for the teardown paths to close. */
+                if (coord->tdd_owner_lifetime
+                    && wl_columnar_eval_test_abandon_round
+                    && wl_columnar_eval_test_abandon_round(coord)) {
+                    rc = EIO;
+                    goto done;
+                }
+#endif
+                consumer_rc = wl_columnar_eval_tdd_channel_collect(
+                    coord->tdd_channel, &coord->mem_ledger,
+                    coord->tdd_channel_lists, W, nrels,
+                    &coord->tdd_channel_discard, &delivered);
+                /* Collect ends the round before it returns, except on
+                 * invalid arguments; the cancel covers that case. */
+                if (consumer_rc != 0)
+                    wl_tdd_channel_cancel(coord->tdd_channel, consumer_rc);
+            }
+            /* Only a missing queue refuses the dispatch or the join.  A
+             * refused dispatch ran nothing, so after the cancel the drain
+             * runs each task, which closes its lane without running. */
+            int wait_rc = dispatched ? wl_workqueue_wait_all(coord->wq) : -1;
             owner_dispatch_quiesced = wait_rc == 0;
+            if (wait_rc != 0) {
+                wl_tdd_channel_cancel(coord->tdd_channel, ECANCELED);
+                owner_dispatch_quiesced = wl_workqueue_drain(coord->wq) == 0;
+            }
             if (coord->tdd_owner_lifetime)
                 coord->tdd_owner_lifetime->dispatch_active
                     = !owner_dispatch_quiesced;
+            /* Once the producers are joined, the batches taken in discard
+             * mode can be disposed. */
+            if (owner_dispatch_quiesced) {
+                wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
+                wl_columnar_eval_tdd_discard_list(coord->tdd_channel,
+                    &coord->tdd_channel_discard, &sink);
+            }
             if (wait_rc != 0) {
-                int drain_rc = wl_workqueue_drain(coord->wq);
-                owner_dispatch_quiesced = drain_rc == 0;
-                if (owner_dispatch_quiesced && coord->tdd_owner_lifetime)
-                    coord->tdd_owner_lifetime->dispatch_active = false;
                 rc = wait_rc;
                 goto done;
             }
@@ -7688,15 +7814,19 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
             if (wl_columnar_eval_test_subpass_boundary)
                 wl_columnar_eval_test_subpass_boundary(coord, eff_iter, false);
 #endif
-            /* Collect first worker error */
+            /* Pick the round's error (#1373): a worker's own failure
+             * first, then the channel's, then the consumer's.  A worker
+             * that only saw the cancel reports ECANCELED, which explains
+             * nothing, so its status is not recorded either. */
+            rc = tdd_round_select_rc(ctxs, W,
+                    tdd_channel_error(coord->tdd_channel), consumer_rc);
             for (uint32_t w = 0; w < W; w++) {
-                record_worker_expr_status(coord, ctxs[w].worker_sess,
-                    ctxs[w].rc);
-                if (ctxs[w].rc != 0 && rc == 0)
-                    rc = ctxs[w].rc;
                 wl_col_session_t *worker = ctxs[w].worker_sess;
-                if (ctxs[w].rc != 0 && worker->memory_budget_denied)
-                    coord->memory_budget_denied = true;
+                if (ctxs[w].rc != ECANCELED) {
+                    record_worker_expr_status(coord, worker, ctxs[w].rc);
+                    if (ctxs[w].rc != 0 && worker->memory_budget_denied)
+                        coord->memory_budget_denied = true;
+                }
                 if (rc == 0 &&
                     (worker->cleanup_active || worker->cleanup_pending
                     || worker->delta_rollback))
@@ -7716,21 +7846,16 @@ col_eval_stratum_tdd_recursive(const wl_plan_stratum_t *sp,
                 goto done;
             }
 
-            /* Issue #1373: every producer has been joined, so pump the
-            * channel until the round is complete, then coalesce each
-            * (worker, relation) list of batches into its matrix slot.
-            * worker_delta_rows counts the rows the batches carried. */
+            /* Issue #1373: the round is complete and every producer has
+             * been joined, so payloads may be read now.  Coalesce each
+             * (worker, relation) list of batches into its matrix slot.
+             * worker_delta_rows counts the rows the batches carried. */
             {
                 uint64_t queue_t0 = now_ns();
                 wl_tdd_refusal_sink_t sink = tdd_channel_refusal_sink(coord);
-                uint64_t delivered = 0;
-                rc = wl_columnar_eval_tdd_channel_collect(coord->tdd_channel,
-                        &coord->mem_ledger, coord->tdd_channel_lists, W, nrels,
-                        &sink, &delivered);
-                if (rc == 0)
-                    rc = wl_columnar_eval_tdd_channel_coalesce_all(coord,
-                            coord->tdd_channel, coord->tdd_channel_lists,
-                            ctxs, W, nrels, &sink);
+                rc = wl_columnar_eval_tdd_channel_coalesce_all(coord,
+                        coord->tdd_channel, coord->tdd_channel_lists,
+                        ctxs, W, nrels, &sink);
                 coord->tdd_queue_drain_ns += now_ns() - queue_t0;
                 if (coord->tdd_audit.enabled)
                     coord->tdd_audit.worker_delta_rows += delivered;

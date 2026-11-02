@@ -2571,6 +2571,7 @@ wl_columnar_session_cleanup_ready_quiescent(wl_col_session_t *sess)
     /* Worker frame lists are thread-confined until this barrier. Never inspect
      * them before submitted callbacks have finished, including drain failure. */
     if (sess->wq) {
+        wl_columnar_eval_tdd_channel_cancel_for_teardown(sess);
         int rc = wl_workqueue_drain(sess->wq);
         if (rc != 0)
             return rc;
@@ -5292,7 +5293,10 @@ col_session_destroy(wl_session_t *session)
 
     /* A failed owner-mode dispatch retains worker callback contexts in its
      * lifetime record. Quiesce them before the rotation hook can release any
-     * backing state they may still reference. */
+     * backing state they may still reference.  A TDD round left open in any
+     * mode is cancelled first, so the drains below cannot wait on a producer
+     * that nobody pumps for. */
+    wl_columnar_eval_tdd_channel_cancel_for_teardown(sess);
     if (sess->tdd_owner_lifetime) {
         int quiesce_rc
             = wl_columnar_eval_tdd_owner_lifetime_quiesce(sess);
@@ -5697,6 +5701,7 @@ col_worker_session_create(wl_col_session_t *coordinator,
     out_worker->tdd_channel = NULL;
     out_worker->tdd_channel_lists = NULL;
     out_worker->tdd_channel_list_count = 0;
+    out_worker->tdd_channel_discard = NULL;
     /* This struct began as a copy of the coordinator, so clear the flag
      * rather than inherit a value.  Nothing reads it before col_eval_stratum
      * writes it, so no observation depends on this -- but it is not a fold

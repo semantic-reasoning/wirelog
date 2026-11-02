@@ -56,6 +56,15 @@ wl_columnar_session_get_tdd_decision_stats(wl_session_t *, uint32_t *,
 
 static bool owner_partial_submit_armed;
 static unsigned owner_partial_submit_count;
+/* T4 (#1373): the submit call that fails, and what the drained tasks did.
+ * The drain runs them on this thread; the counters are atomic anyway so a
+ * task that ran on a worker thread could not race the reads. */
+static unsigned owner_partial_submit_fail_at = 2;
+static bool partial_probe_armed;
+static void (*partial_probe_fn)(void *);
+static wl_atomic_u64 partial_probe_runs;
+static wl_atomic_u64 partial_probe_cancelled;
+static wl_atomic_u64 partial_probe_subpass_starts;
 
 /* #1977: when armed, every TDD sub-pass runs through a trampoline that
  * checks the worker restores delta_seeded on its successful fall-through
@@ -84,6 +93,18 @@ seeded_probe_trampoline(void *arg)
         seeded_probe_leaked[worker->worker_id]++;
 }
 
+/* Record how a task that was submitted before the failing submit ended. */
+static void
+partial_probe_trampoline(void *arg)
+{
+    col_eval_tdd_worker_ctx_t *ctx = (col_eval_tdd_worker_ctx_t *)arg;
+    partial_probe_fn(arg);
+    atomic_fetch_add_explicit(&partial_probe_runs, 1, memory_order_relaxed);
+    if (ctx->rc == ECANCELED)
+        atomic_fetch_add_explicit(&partial_probe_cancelled, 1,
+            memory_order_relaxed);
+}
+
 /* Enable the production TDD submission path while keeping this test's
  * dispatch hook deterministic. */
 int
@@ -91,8 +112,12 @@ wl_columnar_eval_test_submit(wl_work_queue_t *wq, void (*fn)(void *),
     void *ctx)
 {
     if (owner_partial_submit_armed
-        && ++owner_partial_submit_count == 2)
+        && ++owner_partial_submit_count == owner_partial_submit_fail_at)
         return ENOMEM;
+    if (partial_probe_armed) {
+        partial_probe_fn = fn;
+        return wl_workqueue_submit(wq, partial_probe_trampoline, ctx);
+    }
     if (seeded_probe_armed) {
         seeded_probe_fn = fn;
         return wl_workqueue_submit(wq, seeded_probe_trampoline, ctx);
@@ -125,6 +150,10 @@ static bool owner_queue_hold_armed;
 static bool owner_queue_hold_fired;
 static col_rel_t *owner_queue_relation;
 static wl_columnar_source_access_reader_t owner_queue_reader;
+/* A valid batch published just before the invalid one: the consumer lists
+ * it, so the failed round's capture must move a non-empty consumer list. */
+static col_rel_t *owner_listed_relation;
+static wl_columnar_source_access_reader_t owner_listed_reader;
 
 static bool
 teardown_reach_matches_oracle(const wl_col_session_t *coord,
@@ -260,6 +289,9 @@ wl_columnar_eval_test_before_worker_cleanup(wl_col_session_t *coord)
 void
 wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
 {
+    if (partial_probe_armed)
+        atomic_fetch_add_explicit(&partial_probe_subpass_starts, 1,
+            memory_order_relaxed);
     /* Worker zero invokes this hook serially across TDD rounds, and the
      * coordinator reads the result only after the workqueue barrier. */
     if (!owner_queue_hold_armed || !worker || worker->worker_id != 0
@@ -270,9 +302,37 @@ wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
     owner_queue_hold_fired = true;
     wl_col_session_t *coord = worker->coordinator;
     wl_tdd_channel_t *ch = coord->tdd_channel;
-    /* One row, so the batch charges bytes: the channel refuses an empty
+    /* One row, so each batch charges bytes: the channel refuses an empty
      * reservation. */
     int64_t row = 1;
+    col_rel_t *listed = col_rel_new_auto("listed_retained_delta", 1);
+    wl_tdd_batch_t *listed_batch = NULL;
+    if (!listed || col_rel_append_row(listed, &row) != 0
+        || col_rel_source_reader_acquire_transferable(listed,
+        &owner_listed_reader) != 0) {
+        col_rel_destroy(listed);
+        owner_queue_hold_fired = false;
+        return;
+    }
+    if (wl_tdd_channel_batch_new(ch, worker->worker_id, 0, worker,
+        &listed_batch) != 0) {
+        (void)col_rel_source_reader_release(&owner_listed_reader);
+        col_rel_destroy(listed);
+        owner_queue_hold_fired = false;
+        return;
+    }
+    if (wl_tdd_channel_reserve(ch, listed_batch,
+        col_rel_transport_bytes(listed)) != 0) {
+        wl_tdd_channel_batch_abandon(ch, listed_batch);
+        (void)col_rel_source_reader_release(&owner_listed_reader);
+        col_rel_destroy(listed);
+        owner_queue_hold_fired = false;
+        return;
+    }
+    owner_listed_relation = listed;
+    wl_mem_ledger_alloc(&coord->mem_ledger, WL_MEM_SUBSYS_CHANNEL,
+        listed_batch->charge);
+    wl_tdd_channel_publish(ch, listed_batch, listed, listed->nrows);
     col_rel_t *relation = col_rel_new_auto("queued_retained_delta", 1);
     if (!relation || col_rel_append_row(relation, &row) != 0
         || col_rel_source_reader_acquire_transferable(relation,
@@ -281,9 +341,10 @@ wl_columnar_eval_test_tdd_worker_start(wl_col_session_t *worker)
         owner_queue_hold_fired = false;
         return;
     }
-    /* An invalid rel_idx keeps the batch out of the worker matrix while
-     * the real worker output still flows; it is published on worker zero's
-     * lane exactly as a producer publishes, ledger charge included. */
+    /* An invalid rel_idx keeps the batch out of the worker matrix and fails
+     * the round with EPROTO once the real worker output has flowed; it is
+     * published on worker zero's lane exactly as a producer publishes,
+     * ledger charge included. */
     wl_tdd_batch_t *batch = NULL;
     int rc = wl_tdd_channel_batch_new(ch, worker->worker_id, UINT32_MAX,
             worker, &batch);
@@ -802,10 +863,12 @@ fail:
     return 1;
 }
 
-/* Inject one channel batch from a real worker producer.  The reader
- * forces owner cleanup to keep the captured batch on the lifetime's
- * retained list; a fresh quiescent retry releases it once the reader is
- * dropped. */
+/* Inject one channel batch from a real worker producer.  Its invalid
+ * relation fails the round, and the reader forces owner cleanup to keep the
+ * discarded batch on the lifetime's retained list; a fresh quiescent retry
+ * releases it once the reader is dropped.  (Before #1373 a partial
+ * submission failed the round; a drained task no longer runs its subpass,
+ * so it cannot publish, and run_partial_submission_cancels() covers that.) */
 static int
 run_owner_queue_lifetime_retry(void)
 {
@@ -847,13 +910,15 @@ run_owner_queue_lifetime_retry(void)
 
     memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
     owner_queue_relation = NULL;
+    memset(&owner_listed_reader, 0, sizeof(owner_listed_reader));
+    owner_listed_relation = NULL;
     owner_queue_hold_fired = false;
-    owner_partial_submit_count = 0;
-    owner_partial_submit_armed = true;
     owner_queue_hold_armed = true;
-    rc = snapshot_oracle(session, 5050, true);
-    owner_partial_submit_armed = false;
+    oracle_t failed = { .rows = 0, .valid = true, .first_edge_present = true };
+    rc = wl_session_snapshot(session, collect_reach, &failed);
     owner_queue_hold_armed = false;
+    /* The round fails with EPROTO; the refused disposal can surface as
+     * EBUSY from the worker cleanup instead. */
     if (rc == 0 || !owner_queue_hold_fired
         || !owner_queue_reader.owner || !owner_queue_relation
         || !columnar->tdd_owner_lifetime) {
@@ -863,11 +928,21 @@ run_owner_queue_lifetime_retry(void)
     wl_columnar_eval_tdd_owner_lifetime_t *lifetime
         = columnar->tdd_owner_lifetime;
     unsigned retained = 0;
-    for (const wl_tdd_batch_t *b = lifetime->retained; b; b = b->next)
+    unsigned listed_retained = 0;
+    for (const wl_tdd_batch_t *b = lifetime->retained; b; b = b->next) {
         retained += b->payload == (void *)owner_queue_relation;
-    for (size_t i = 0; i < lifetime->matrix_slots; i++)
+        listed_retained += b->payload == (void *)owner_listed_relation;
+    }
+    for (size_t i = 0; i < lifetime->matrix_slots; i++) {
         retained += lifetime->relations[i] == owner_queue_relation ? 2u : 0u;
-    if (retained != 1 || lifetime->channel != columnar->tdd_channel) {
+        listed_retained += lifetime->relations[i] == owner_listed_relation
+            ? 2u : 0u;
+    }
+    /* The listed batch was on a consumer list when the round failed; the
+     * capture moved it to the retained list, where its held reader keeps
+     * it. */
+    if (retained != 1 || listed_retained != 1 || !owner_listed_relation
+        || lifetime->channel != columnar->tdd_channel) {
         rc = EPROTO;
         goto cleanup;
     }
@@ -884,6 +959,12 @@ run_owner_queue_lifetime_retry(void)
         goto cleanup;
     }
     memset(&owner_queue_reader, 0, sizeof(owner_queue_reader));
+    if (col_rel_source_reader_release(&owner_listed_reader) != 0) {
+        memset(&owner_listed_reader, 0, sizeof(owner_listed_reader));
+        rc = EIO;
+        goto cleanup;
+    }
+    memset(&owner_listed_reader, 0, sizeof(owner_listed_reader));
     rc = wl_columnar_session_cleanup_ready_quiescent(columnar);
     if (rc != 0 || columnar->tdd_owner_lifetime || columnar->tdd_channel) {
         rc = EPROTO;
@@ -902,6 +983,139 @@ cleanup:
     owner_queue_hold_armed = false;
     if (owner_queue_reader.owner)
         (void)col_rel_source_reader_release(&owner_queue_reader);
+    if (owner_listed_reader.owner)
+        (void)col_rel_source_reader_release(&owner_listed_reader);
+    if (session)
+        wl_session_destroy(session);
+    if (plan)
+        wl_plan_free(plan);
+    if (program && !fixture_held)
+        wirelog_program_free(program);
+    return rc == 0 ? 0 : 1;
+fail:
+    if (plan)
+        wl_plan_free(plan);
+    if (program && !fixture_held)
+        wirelog_program_free(program);
+    return 1;
+}
+
+static uint64_t
+governor_reserved(const wl_col_session_t *columnar)
+{
+    return columnar->memory_governor
+           ? wl_columnar_memory_reserved(
+        wl_columnar_memory_governor_ref_get(columnar->memory_governor))
+           : 0;
+}
+
+/* T4 (#1373): the third submit of the first recursive round fails.  The
+ * channel is cancelled before the drain, so the two tasks already queued
+ * close their lanes with ECANCELED without running their subpasses.  The
+ * snapshot fails with ENOMEM, the channel and its CHANNEL charge are gone,
+ * the governor is back at its baseline, and a retry succeeds. */
+static int
+run_partial_submission_cancels(void)
+{
+    const char *source =
+        ".decl edge(x: int32, y: int32)\n"
+        ".decl reach(x: int32, y: int32, p: pair/2 inline)\n"
+        "reach(x,y,7,8) :- edge(x,y).\n"
+        "reach(x,z,a,b) :- reach(x,y,a,b), edge(y,z).\n";
+    wirelog_error_t error;
+    wirelog_program_t *program = wirelog_parse_string(source, &error);
+    wl_plan_t *plan = NULL;
+    wl_session_t *session = NULL;
+    bool fixture_held = false;
+    int rc = 0;
+    if (!program)
+        return 1;
+    wl_fusion_apply(program, NULL);
+    wl_jpp_apply(program, NULL);
+    wl_sip_apply(program, NULL);
+    rc = wl_plan_from_program(program, &plan);
+    if (rc != 0 || !plan)
+        goto fail;
+    plan_fixture_hold(program);
+    fixture_held = true;
+    rc = wl_session_create(wl_backend_columnar(), plan, 8, &session);
+    if (rc != 0)
+        goto fail;
+    wl_col_session_t *columnar = COL_SESSION(session);
+    int64_t facts[200];
+    for (int i = 0; i < 100; i++) {
+        facts[i * 2] = (int64_t)i;
+        facts[i * 2 + 1] = (int64_t)i + 1;
+    }
+    rc = wl_session_insert(session, "edge", facts, 100, 2);
+    if (rc != 0)
+        goto cleanup;
+    /* The baseline is taken after a snapshot whose first submit fails, so
+     * the first evaluation's one-time effects on the governor are in it
+     * and the measured failure differs from it only by its queued tasks. */
+    owner_partial_submit_count = 0;
+    owner_partial_submit_fail_at = 1;
+    owner_partial_submit_armed = true;
+    oracle_t warmup = { .rows = 0, .valid = true, .first_edge_present = true };
+    int warmup_rc = wl_session_snapshot(session, collect_reach, &warmup);
+    owner_partial_submit_armed = false;
+    if (warmup_rc != ENOMEM || columnar->tdd_audit.submitted_tasks != 0) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    wl_mem_ledger_snapshot_t baseline_ledger;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &baseline_ledger);
+    uint64_t baseline_reserved = governor_reserved(columnar);
+
+    atomic_store_explicit(&partial_probe_runs, 0, memory_order_relaxed);
+    atomic_store_explicit(&partial_probe_cancelled, 0, memory_order_relaxed);
+    atomic_store_explicit(&partial_probe_subpass_starts, 0,
+        memory_order_relaxed);
+    owner_partial_submit_count = 0;
+    owner_partial_submit_fail_at = 3;
+    owner_partial_submit_armed = true;
+    partial_probe_armed = true;
+    oracle_t failed = { .rows = 0, .valid = true, .first_edge_present = true };
+    int snapshot_rc = wl_session_snapshot(session, collect_reach, &failed);
+    partial_probe_armed = false;
+    owner_partial_submit_armed = false;
+    owner_partial_submit_fail_at = 2;
+    uint64_t runs = atomic_load_explicit(&partial_probe_runs,
+            memory_order_relaxed);
+    uint64_t cancelled = atomic_load_explicit(&partial_probe_cancelled,
+            memory_order_relaxed);
+    uint64_t starts = atomic_load_explicit(&partial_probe_subpass_starts,
+            memory_order_relaxed);
+    wl_mem_ledger_snapshot_t after_ledger;
+    wl_mem_ledger_snapshot(&columnar->mem_ledger, &after_ledger);
+    uint64_t after_reserved = governor_reserved(columnar);
+    fprintf(stderr, "partial submission: rc=%d submitted=%" PRIu64
+        " rounds=%" PRIu64 " ran=%" PRIu64 " cancelled=%" PRIu64
+        " subpasses=%" PRIu64 " channel=%" PRIu64 "/%" PRIu64
+        " reserved=%" PRIu64 "/%" PRIu64 "\n", snapshot_rc,
+        columnar->tdd_audit.submitted_tasks,
+        columnar->tdd_audit.completed_rounds, runs, cancelled, starts,
+        after_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL],
+        baseline_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL], after_reserved,
+        baseline_reserved);
+    /* The audit proves the failing submit was the recursive driver's: two
+     * tasks were queued and no round completed. */
+    if (snapshot_rc != ENOMEM || columnar->tdd_audit.submitted_tasks != 2
+        || columnar->tdd_audit.completed_rounds != 0 || runs != 2
+        || cancelled != 2 || starts != 0 || columnar->tdd_channel
+        || columnar->tdd_owner_lifetime || columnar->mem_channel_side_bytes
+        || columnar->tdd_channel_reservation.bytes
+        || after_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
+        != baseline_ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
+        || after_reserved != baseline_reserved) {
+        rc = EPROTO;
+        goto cleanup;
+    }
+    rc = snapshot_oracle(session, 5050, true);
+cleanup:
+    partial_probe_armed = false;
+    owner_partial_submit_armed = false;
+    owner_partial_submit_fail_at = 2;
     if (session)
         wl_session_destroy(session);
     if (plan)
@@ -944,6 +1158,8 @@ main(void)
         rc = run_teardown_refusal_gate();
     if (rc == 0)
         rc = run_owner_queue_lifetime_retry();
+    if (rc == 0)
+        rc = run_partial_submission_cancels();
     if (saved_threshold) {
         setenv("WIRELOG_TDD_MIN_ROWS_PER_WORKER", saved_threshold, 1);
         free(saved_threshold);

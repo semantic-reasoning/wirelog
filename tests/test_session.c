@@ -7220,10 +7220,12 @@ hold_outbound_frame(wl_col_session_t *worker, eval_stack_t *stack,
     eval_entry_t *result)
 {
     if (worker->worker_id == worker_frame_target && result->seg_count == 2) {
-        wl_mem_ledger_snapshot_t ledger;
-        wl_mem_ledger_snapshot(&worker->coordinator->mem_ledger, &ledger);
-        outbound_frame_prefix = ledger.subsys_bytes[WL_MEM_SUBSYS_CHANNEL]
-            > worker->coordinator->mem_channel_side_bytes;
+        /* The coordinator pumps while workers run (#1373), so a published
+         * prefix may already have been taken and its CHANNEL charge freed;
+         * the channel's publication count records it either way. */
+        wl_tdd_channel_stats_t stats;
+        wl_tdd_channel_stats(worker->coordinator->tdd_channel, &stats);
+        outbound_frame_prefix = stats.published > 0;
     }
     if (worker_frame_storage < 5) {
         hold_worker_frame(worker, stack, result);

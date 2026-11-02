@@ -189,7 +189,8 @@ testlib_prod_src = files(
     '../wirelog/wirelog-easy.c',
     '../wirelog/wirelog_advanced.c',
   ) + thread_src
-testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TEST_RELATION_RESIZE_HOOK=1',
+testlib_prod_c_args = ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TDD_CHANNEL_TEST_HOOKS=1',
+                       '-DWL_TEST_RELATION_RESIZE_HOOK=1',
                        '-DWL_COLUMNAR_MEM_LEDGER_PUBLICATION_TEST_HOOKS=1',
                        '-DWL_TEST_JOIN_CACHE_HOOK=1',
                        '-DWL_TEST_JOIN_BATCH_DESCRIPTOR_HOOKS=1',
@@ -727,6 +728,19 @@ test_tdd_channel_split_exe = executable(
 )
 test('tdd_channel_split', test_tdd_channel_split_exe, suite: 'unit',
      timeout: 120)
+
+# Issue #1373: how a TDD round ends at session level -- rc selection and
+# the teardown cancel of a round the driver left open (I1).  The channel's
+# test hooks give the hooks a condition-based wait.
+test_tdd_channel_round_exe = executable(
+  'test_tdd_channel_round', files('test_tdd_channel_round.c'),
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+  link_with: [testlib_prod],
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1', '-DWL_TDD_CHANNEL_TEST_HOOKS=1'],
+)
+test('tdd_channel_round', test_tdd_channel_round_exe, suite: 'unit',
+     timeout: 180)
 
 # Issue #508: bench_argv shim unit tests. Header-only, portable by
 # construction; runs on every platform including MSVC.

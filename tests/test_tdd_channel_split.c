@@ -13,7 +13,7 @@
  * rows are tolerated end to end: downstream head dedup would hide a missing
  * cross-batch consolidation, which the coalesce unit tests pin instead
  * (test_tdd_channel_spill coalesce_overlap_dedup, test_tdd_multiworker
- * test_reconstruct_duplicate).
+ * test_channel_delivery_duplicate).
  */
 #define _POSIX_C_SOURCE 200809L
 

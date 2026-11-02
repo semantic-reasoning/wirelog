@@ -558,8 +558,10 @@ fixture_deliver(channel_fixture_t *f, col_eval_tdd_worker_ctx_t *ctxs,
     for (uint32_t w = 0; w < f->workers; w++)
         wl_tdd_channel_close_lane(f->ch, w, 0);
     wl_tdd_refusal_sink_t sink = { fixture_refusal, f };
+    wl_tdd_batch_t *discard = NULL;
     int rc = wl_columnar_eval_tdd_channel_collect(f->ch, &f->coord->mem_ledger,
-            f->lists, f->workers, f->nrels, &sink, rows);
+            f->lists, f->workers, f->nrels, &discard, rows);
+    wl_columnar_eval_tdd_discard_list(f->ch, &discard, &sink);
     if (rc == 0)
         rc = wl_columnar_eval_tdd_channel_coalesce_all(f->coord, f->ch,
                 f->lists, ctxs, f->workers, f->nrels, &sink);
@@ -671,7 +673,7 @@ fixture_publish_new(channel_fixture_t *f, uint32_t lane, uint32_t rel_idx,
 }
 
 static int
-test_reconstruct_empty(void)
+test_channel_delivery_empty(void)
 {
     TEST("channel delivery: an empty round leaves the matrix unchanged");
 
@@ -699,7 +701,7 @@ test_reconstruct_empty(void)
 }
 
 static int
-test_reconstruct_single(void)
+test_channel_delivery_single(void)
 {
     TEST("channel delivery: one batch is adopted into one slot");
 
@@ -731,7 +733,7 @@ test_reconstruct_single(void)
 }
 
 static int
-test_reconstruct_full_matrix(void)
+test_channel_delivery_full_matrix(void)
 {
     TEST("channel delivery: full W*nrels matrix filled correctly");
 
@@ -766,7 +768,7 @@ test_reconstruct_full_matrix(void)
 }
 
 static int
-test_reconstruct_sparse(void)
+test_channel_delivery_sparse(void)
 {
     TEST("channel delivery: sparse batches, rest remain NULL");
 
@@ -819,7 +821,7 @@ row_mask(const col_rel_t *rel)
 }
 
 static int
-test_reconstruct_duplicate(void)
+test_channel_delivery_duplicate(void)
 {
     TEST("channel delivery: several batches per slot are owned exactly once");
 
@@ -855,8 +857,9 @@ test_reconstruct_duplicate(void)
         return 1;
     }
 
-    /* A batch naming a relation outside the stratum is disposed once and
-     * fails the round; the valid slot published beside it still arrives. */
+    /* A batch naming a relation outside the stratum fails the round and
+     * goes to the discard list, where the caller disposes it once; the
+     * valid slot published before it still arrives. */
     memset(dr, 0, sizeof(dr));
     ok = fixture_open(&f, 1, 4);
     col_rel_t *valid = ok ? fixture_publish_new(&f, 0, 3, 5, 1) : NULL;
@@ -864,9 +867,12 @@ test_reconstruct_duplicate(void)
     rows = 0;
     wl_tdd_refusal_sink_t sink = { fixture_refusal, &f };
     if (ok && valid && invalid) {
+        wl_tdd_batch_t *discard = NULL;
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         ok = wl_columnar_eval_tdd_channel_collect(f.ch, &f.coord->mem_ledger,
-                f.lists, 1, 4, &sink, &rows) == EPROTO && rows == 1;
+                f.lists, 1, 4, &discard, &rows) == EPROTO && rows == 1
+            && discard && !discard->next && discard->payload == invalid;
+        wl_columnar_eval_tdd_discard_list(f.ch, &discard, &sink);
         ok = ok && wl_columnar_eval_tdd_channel_coalesce_all(f.coord, f.ch,
                 f.lists, ctxs, 1, 4, &sink) == 0;
     } else {
@@ -907,14 +913,19 @@ test_channel_orphan_and_occupied_slot(void)
     ok = ok && valid && wl_tdd_channel_batch_new(f.ch, 0, 1, NULL,
             &orphan) == 0;
     int collect_rc = -1;
+    wl_tdd_batch_t *discard = NULL;
     if (ok) {
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         collect_rc = wl_columnar_eval_tdd_channel_collect(f.ch,
-                &f.coord->mem_ledger, f.lists, 1, 3, &sink, &rows);
+                &f.coord->mem_ledger, f.lists, 1, 3, &discard, &rows);
+        /* The orphan failed its lane before the take, so the valid batch is
+         * discarded, not listed, and its rows are not counted. */
+        ok = discard && !discard->next && discard->payload == valid;
         /* The driver disposes the lists after a failed collect. */
+        wl_columnar_eval_tdd_discard_list(f.ch, &discard, &sink);
         wl_columnar_eval_tdd_channel_discard_lists(f.ch, f.lists, 3, &sink);
     }
-    ok = ok && collect_rc == EPROTO && rows == 2;
+    ok = ok && collect_rc == EPROTO && rows == 0;
     ok = fixture_close(&f, ctxs) && ok;
     if (!ok) {
         FAIL("an orphan on a clean lane did not fail the collect");
@@ -932,7 +943,8 @@ test_channel_orphan_and_occupied_slot(void)
         dr[1] = occupant;
         wl_tdd_channel_close_lane(f.ch, 0, 0);
         ok = wl_columnar_eval_tdd_channel_collect(f.ch, &f.coord->mem_ledger,
-                f.lists, 1, 3, &sink, &rows) == 0 && rows == 3;
+                f.lists, 1, 3, &discard, &rows) == 0 && rows == 3
+            && discard == NULL;
         ok = ok && wl_columnar_eval_tdd_channel_coalesce_all(f.coord, f.ch,
                 f.lists, ctxs, 1, 3, &sink) == EPROTO;
         ok = ok && dr[0] == first && dr[1] == occupant && dr[2] == NULL;
@@ -1136,7 +1148,7 @@ test_tdd_matrix_size_boundaries(void)
 }
 
 static void
-test_tdd_queue_discard_large_dimensions(void)
+test_tdd_channel_discard_listed_and_queued(void)
 {
     TEST("TDD channel disposal drains queued and listed batches");
 
@@ -1207,17 +1219,17 @@ main(void)
     printf("\n=== channel transport tests (Issue #410, #1373) ===\n");
     test_queue_only_w1();
     test_queue_only_w4();
-    test_reconstruct_empty();
-    test_reconstruct_single();
-    test_reconstruct_full_matrix();
-    test_reconstruct_sparse();
-    test_reconstruct_duplicate();
+    test_channel_delivery_empty();
+    test_channel_delivery_single();
+    test_channel_delivery_full_matrix();
+    test_channel_delivery_sparse();
+    test_channel_delivery_duplicate();
     test_channel_orphan_and_occupied_slot();
     test_channel_side_sizing_boundaries();
     test_channel_side_footprint_boundaries();
     test_channel_four_workers_no_loss();
     test_tdd_matrix_size_boundaries();
-    test_tdd_queue_discard_large_dimensions();
+    test_tdd_channel_discard_listed_and_queued();
     test_discard_drains_all_messages();
 
     printf("\nPassed: %d/%d\n", tests_passed, tests_run);
