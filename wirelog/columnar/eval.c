@@ -455,9 +455,10 @@ wl_columnar_eval_delta_queue_capacity(uint32_t nrels, uint32_t *out)
      * 2^31 is its largest non-wrapping request on the current base. */
     if (nrels > (UINT32_C(1) << 30))
         return EOVERFLOW;
-    /* Each worker can emit an outbound and an ordinary delta per relation
-     * before the coordinator drains the queue. The SPSC ring uses all of
-     * its slots, so 2*nrels covers that conservative maximum. */
+    /* A conservative bound: each worker publishes at most one delta per
+     * relation per subpass (an outbound subpass refuses ordinary growth with
+     * EPROTO), and 2*nrels slots leave room for twice that.  The SPSC ring
+     * uses all of its slots. */
     *out = nrels > 0 ? nrels * 2u : 2u;
     return 0;
 }
@@ -1997,6 +1998,9 @@ void (*wl_columnar_eval_test_outbound_after_plan)(wl_col_session_t *,
     eval_stack_t *, eval_entry_t *);
 void (*wl_columnar_eval_test_outbound_before_publish)(wl_col_session_t *,
     eval_entry_t *);
+/* Issue #1373: report relation @ri as grown in an outbound subpass. */
+bool (*wl_columnar_eval_test_outbound_head_growth)(wl_col_session_t *,
+    uint32_t);
 #endif
 
 /* Construct the worst-case outgoing image before a worker changes its source.
@@ -2496,8 +2500,25 @@ tdd_worker_subpass_fn(void *arg)
      * Use col_rel_new_like (heap) so deltas survive delta_pool_reset. */
     for (uint32_t ri = 0; ri < nrels; ri++) {
         col_rel_t *r = session_find_rel(sess, sp->relations[ri].name);
-        if (!r || snap[ri] >= r->nrows)
+        bool grew = r && snap[ri] < r->nrows;
+#ifdef WL_SESSION_TEST_HOOKS
+        if (ctx->outbound_only && wl_columnar_eval_test_outbound_head_growth
+            && wl_columnar_eval_test_outbound_head_growth(sess, ri))
+            grew = true;
+#endif
+        if (!grew)
             continue;
+        /* Outbound frames publish their private deltas and never append to
+         * the worker's head.  Growth here would become a second delta for
+         * this worker and relation, and the coordinator keeps one delta per
+         * slot: global read installs the later one and destroys the frame's,
+         * owner capture parks the later one unexchanged.  Refuse it instead
+         * (#1373). */
+        if (ctx->outbound_only) {
+            ctx->rc = EPROTO;
+            free(snap);
+            TDD_WORKER_RETURN();
+        }
 
         wl_col_session_t *coord = sess->coordinator;
         if (!coord || !coord->delta_queue || !ctx->delta_rels
