@@ -282,7 +282,7 @@ cleanup:
 }
 
 static void
-test_tdd_queue_create_failure(void)
+test_tdd_channel_create_failure(void)
 {
     TEST("channel allocation failure stops before worker dispatch and retries");
     wl_columnar_memory_resolution_t resolution = { 0 };
@@ -5481,7 +5481,7 @@ main(void)
     else FAIL("32-column streaming parity or allocation");
 #ifdef WL_TEST_ALLOC_WRAP
     test_tdd_channel_side_admission();
-    test_tdd_queue_create_failure();
+    test_tdd_channel_create_failure();
 #endif
     TEST("dedup init allocation failure rolls back its token");
     if (test_dedup_init_allocation_rollback() == 0)

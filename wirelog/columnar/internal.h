@@ -2905,6 +2905,10 @@ typedef struct wl_col_session_t {
      * or until the driver's cleanup disposes of them. */
     wl_tdd_batch_t **tdd_channel_lists;
     size_t tdd_channel_list_count;
+    /* Batches taken from tdd_channel in discard mode, once its round
+     * cannot succeed, linked through batch->next.  They are disposed after
+     * the round's producers are joined, or by the driver's cleanup. */
+    wl_tdd_batch_t *tdd_channel_discard;
     /* Set true inside tdd_worker_subpass_fn so col_op_variable AUTO heuristic
      * always uses the broadcast delta (which may be >= local partition size).
      * False everywhere else, including retraction paths. */
@@ -6266,13 +6270,19 @@ typedef struct col_eval_tdd_worker_ctx {
     int rc;                        /* OUT: return code                */
 } col_eval_tdd_worker_ctx_t;
 
-/* Release the coordinator's TDD channel and its side buffers: every batch
- * still queued or on a consumer list is discarded.  A queued batch's CHANNEL
- * charge is freed here; a listed batch's was freed when it was collected.
- * A no-op while an owner lifetime record holds the channel; the record
- * releases it instead.  If a lane is still open the channel is left
- * attached, because a running producer may still touch it. */
+/* Release the coordinator's TDD channel and its side buffers.  Every batch
+ * still queued, on a consumer list or on the discard list is disposed, and
+ * each queued batch's CHANNEL charge is freed (a taken batch's was freed at
+ * its take).  A no-op while an owner lifetime record holds the channel; the
+ * record releases it instead.  Also a no-op while a lane is open, because a
+ * running producer may still touch the channel. */
 void wl_columnar_eval_tdd_dispose_channel(wl_col_session_t *coord);
+
+/* Teardown: cancel the coordinator's TDD channel, and the one its owner
+ * lifetime record holds, if a round is open, so a producer waiting for
+ * space returns and a following drain of the workqueue completes.  Call it
+ * before any teardown wait on the workqueue. */
+void wl_columnar_eval_tdd_channel_cancel_for_teardown(wl_col_session_t *sess);
 
 /*
  * COL_FILTER_SEL_SLACK:

@@ -392,6 +392,11 @@ wl_columnar_eval_tdd_coalesce_slot(wl_col_session_t *coord,
     return 0;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_test_channel_reserve)(wl_col_session_t *worker,
+    uint32_t rel_idx);
+#endif
+
 /* The bytes a delta charges against the channel: its transport bytes,
  * which a stamped non-empty delta keeps above zero.  EOVERFLOW when they
  * cannot be represented. */
@@ -415,7 +420,13 @@ wl_columnar_eval_tdd_channel_reserve_delta(wl_col_session_t *sess,
     wl_tdd_channel_t *ch = sess->coordinator->tdd_channel;
     wl_tdd_batch_t *batch = NULL;
     uint64_t charge = 0;
-    int rc = tdd_delta_charge(delta, &charge);
+    int rc = 0;
+#ifdef WL_SESSION_TEST_HOOKS
+    if (wl_columnar_eval_test_channel_reserve)
+        rc = wl_columnar_eval_test_channel_reserve(sess, rel_idx);
+#endif
+    if (rc == 0)
+        rc = tdd_delta_charge(delta, &charge);
     if (rc == 0)
         rc = wl_tdd_channel_batch_new(ch, sess->worker_id, rel_idx, sess,
                 &batch);
@@ -657,18 +668,45 @@ tdd_channel_cancel_rc(wl_tdd_channel_t *ch)
     return stats.channel_rc != 0 ? stats.channel_rc : ECANCELED;
 }
 
+#ifdef WL_SESSION_TEST_HOOKS
+int (*wl_columnar_eval_test_before_pump)(wl_tdd_channel_t *ch);
+#endif
+
+/* One pump, preceded by the test hook while the round is not cancelled. */
+static wl_tdd_pump_result_t
+tdd_collect_pump(wl_tdd_channel_t *ch, bool cancelled, wl_tdd_batch_t **out,
+    int *err)
+{
+#ifdef WL_SESSION_TEST_HOOKS
+    if (!cancelled && wl_columnar_eval_test_before_pump) {
+        int hook_rc = wl_columnar_eval_test_before_pump(ch);
+        if (hook_rc != 0) {
+            *out = NULL;
+            *err = hook_rc;
+            return WL_TDD_PUMP_ERROR;
+        }
+    }
+#else
+    (void)cancelled;
+#endif
+    return wl_tdd_channel_pump(ch, out, err);
+}
+
 int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
-    uint32_t nrels, const wl_tdd_refusal_sink_t *sink, uint64_t *rows)
+    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows)
 {
-    if (!ch || !lists || nworkers == 0 || !sink || !sink->fn)
+    if (!ch || !lists || nworkers == 0 || !discard)
         return EINVAL;
     int rc = 0;
+    bool cancelled = false;
+    bool discarding = false;
     for (;;) {
         wl_tdd_batch_t *batch = NULL;
         int err = 0;
-        wl_tdd_pump_result_t result = wl_tdd_channel_pump(ch, &batch, &err);
+        wl_tdd_pump_result_t result = tdd_collect_pump(ch, cancelled, &batch,
+                &err);
         if (result == WL_TDD_PUMP_COMPLETE) {
             /* An orphan reclaimed on a lane that returned 0 leaves its
              * EPROTO on the channel; a completed round must report it. */
@@ -678,14 +716,35 @@ wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
         }
         if (result == WL_TDD_PUMP_CANCELLED)
             return rc != 0 ? rc : tdd_channel_cancel_rc(ch);
-        if (result != WL_TDD_PUMP_DATA)
-            return rc != 0 ? rc : (err != 0 ? err : EPROTO);
+        if (result != WL_TDD_PUMP_DATA) {
+            if (err == 0)
+                err = EPROTO;
+            if (rc == 0)
+                rc = err;
+            /* Pump reports no error once the channel is cancelled; stop
+             * rather than spin if it ever does. */
+            if (cancelled)
+                return rc;
+            /* Producers blocked on space return once cancelled; keep
+             * pumping until every lane has closed, so the caller's join
+             * cannot wait on a producer nobody serves. */
+            wl_tdd_channel_cancel(ch, err);
+            cancelled = true;
+            discarding = true;
+            continue;
+        }
         if (ledger)
             wl_mem_ledger_free(ledger, WL_MEM_SUBSYS_CHANNEL, batch->charge);
-        if (batch->rel_idx >= nrels || batch->worker >= nworkers) {
-            wl_columnar_eval_tdd_batch_discard(ch, batch, sink);
-            if (rc == 0)
-                rc = EPROTO;
+        bool valid = batch->rel_idx < nrels && batch->worker < nworkers;
+        if (!valid && rc == 0)
+            rc = EPROTO;
+        if (!discarding && (!valid || wl_tdd_channel_failed_lanes(ch)))
+            discarding = true;
+        if (discarding) {
+            /* The round fails; the caller disposes the batch after the
+             * join, as it does every list. */
+            batch->next = *discard;
+            *discard = batch;
             continue;
         }
         if (rows)

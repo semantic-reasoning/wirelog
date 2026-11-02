@@ -2347,8 +2347,8 @@ channel.
   `wl_tdd_channel_close_lane`. That call returns an outstanding reservation
   and reclaims every descriptor the producer left unpublished. A producer
   that returns early therefore cannot keep the consumer waiting. If it
-  returned 0 with a batch unpublished, the lane and the channel record
-  EPROTO.
+  returned 0 with a batch unpublished, the lane records EPROTO, and so does
+  the channel unless it already holds an error.
 
 ### Admission
 
@@ -2385,14 +2385,50 @@ allocates nothing.
 
 `col_eval_stratum_tdd_recursive` creates one channel per stratum, with
 one lane per worker, and begins a round per sub-pass. Each worker task
-runs inside `tdd_worker_channel_fn`, which closes the task's lane with its
-rc after the subpass returns. The coordinator submits the W tasks, waits
-for them at `wl_workqueue_wait_all`, and only then pumps the channel to
-COMPLETE and coalesces each (worker, relation) list into the delta matrix.
-Because nothing pumps before the join, this path creates the channel with
-an unbounded capacity, so a reservation does not wait for space. A
-producer stops touching a delta once it is published, and the consumer
-touches payloads only after the join. In owner mode a batch whose
-retirement is refused stays on the owner lifetime record's retained list,
-and the record keeps the channel until those batches are retired, because
-a taken batch retires through the channel that issued it.
+runs inside `tdd_worker_channel_fn`. If the channel is already cancelled
+when the task starts, the wrapper closes the task's lane with ECANCELED
+without running the subpass; otherwise it runs the subpass and then closes
+the lane with the subpass's rc.
+
+The coordinator submits the W tasks behind the closed dispatch gate, opens
+the gate with `wl_workqueue_dispatch`, pumps the channel on its own thread
+while the workers produce, and joins them at `wl_workqueue_wait_all`.
+Before the join the consumer touches descriptors only: it moves each taken
+batch onto its (worker, relation) list and disposes of nothing. A producer
+stops touching a delta once it is published. Only after the join does the
+coordinator read payloads, when it coalesces each list into the delta
+matrix. The capacity is unbounded on this path, so a reservation does not
+wait for space.
+
+A worker error does not cancel the round. Once a lane has closed with an
+error, the consumer keeps pumping in discard mode, so the other workers
+run to their natural end, and every batch it takes from then on goes to
+the coordinator's discard list, which is disposed after the join.
+
+**I1.** After the dispatch, every `wl_workqueue_wait_all` or
+`wl_workqueue_drain` of a round follows a pump that reported COMPLETE or a
+`wl_tdd_channel_cancel`, because a producer may be waiting for space that
+only the pump frees. The sites are:
+
+- A failed submit closes the lanes whose tasks were never queued and
+  cancels the channel before it drains the queued tasks, which then close
+  their lanes without running.
+- A pump error cancels the channel, and the consumer keeps pumping until
+  every lane has closed.
+- A failed dispatch or join cancels the channel before the drain.
+- `wl_columnar_eval_tdd_owner_lifetime_quiesce` cancels an open round
+  before it drains. Session destroy and
+  `wl_columnar_session_cleanup_ready_quiescent` call
+  `wl_columnar_eval_tdd_channel_cancel_for_teardown` before they drain the
+  workqueue.
+
+**Error of a round.** After the join, the round's rc is the first worker
+rc, in worker order, that is neither 0 nor ECANCELED; otherwise the
+channel's error; otherwise the consumer's; otherwise ECANCELED if a worker
+saw the cancel. A worker that only saw the cancel records neither its
+expression status nor a budget denial on the coordinator.
+
+In owner mode a batch whose retirement is refused stays on the owner
+lifetime record's retained list, and the record keeps the channel until
+those batches are retired, because a taken batch retires through the
+channel that issued it.
