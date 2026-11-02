@@ -513,8 +513,8 @@ test_worker_delta_spill(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, "$d", &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, "$d", NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && slot->nrows == 8 && log.count == 0);
     for (uint32_t i = 0; i < 8; i++)
         check_row(slot, i, 100 + (int64_t)i, ts(6, 4, 0, 1));
@@ -556,8 +556,8 @@ test_coalesce_seq_order(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && log.count == 0 && retired_count(ch) == 3);
     /* Differing iterations: no dedup, rows stay in seq order. */
     CHECK(slot->nrows == 5);
@@ -577,8 +577,8 @@ test_coalesce_seq_order(void)
     take_all(ch, 1, b, &n, 1);
     list = link_list(b, 1);
     slot = NULL;
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(slot == only && !list && retired_count(ch) == 4);
     CHECK(col_rel_destroy_checked(slot) == 0);
 
@@ -593,8 +593,8 @@ test_coalesce_seq_order(void)
     take_all(ch, 1, b, &n, 1);
     list = link_list(b, 1);
     slot = NULL;
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == EPROTO);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == EPROTO);
     CHECK(list == b[0] && !slot && b[0]->payload == bare);
     CHECK(b[0]->state == WL_TDD_BATCH_CONSUMER);
     wl_columnar_eval_tdd_discard_list(ch, &list, &sink);
@@ -631,8 +631,8 @@ test_coalesce_overlap_dedup(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && log.count == 0);
     /* {3,1,2} + {4,3} + {2,9}: each of 1, 2, 3, 4, 9 exactly once. */
     CHECK(slot->nrows == 5);
@@ -678,8 +678,8 @@ test_coalesce_signed_kept(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && slot->nrows == 3);
     check_row(slot, 0, 7, s0[0]);
     check_row(slot, 1, 7, s1[0]);
@@ -716,8 +716,8 @@ test_coalesce_uniform_negative_kept(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && slot->nrows == 2);
     check_row(slot, 0, 7, s[0]);
     check_row(slot, 1, 7, s[0]);
@@ -755,16 +755,16 @@ test_coalesce_invalid_list(void)
     wl_tdd_batch_t *mixed[2] = { b[0], b[2] };
     void *mixed_payloads[2] = { payloads[0], payloads[2] };
     wl_tdd_batch_t *list = link_list(mixed, 2);
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == EINVAL);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == EINVAL);
     CHECK(slot == NULL);
     check_list_intact(list, mixed, mixed_payloads, 2);
 
     wl_tdd_batch_t *reversed[2] = { b[1], b[0] };
     void *reversed_payloads[2] = { payloads[1], payloads[0] };
     list = link_list(reversed, 2);
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == EINVAL);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == EINVAL);
     CHECK(slot == NULL);
     check_list_intact(list, reversed, reversed_payloads, 2);
 
@@ -791,8 +791,8 @@ test_coalesce_invalid_list(void)
     wl_tdd_batch_t *workers[2] = { lane0, lane1_second };
     void *worker_payloads[2] = { lane0->payload, lane1_second->payload };
     list = link_list(workers, 2);
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, &sink,
-        &slot) == EINVAL);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, NULL,
+        &sink, &slot) == EINVAL);
     CHECK(slot == NULL);
     check_list_intact(list, workers, worker_payloads, 2);
     list = link_list(b, 3);
@@ -892,8 +892,8 @@ test_coalesce_failure_owned(void)
     wl_columnar_memory_reservation_init(&hold);
     CHECK(wl_columnar_memory_reserve(raw, budget - baseline, &hold));
     coord->memory_budget_denied = false;
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, &sink,
-        &slot) == ENOSPC);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL, NULL,
+        &sink, &slot) == ENOSPC);
     CHECK(coord->memory_budget_denied);
     CHECK(wl_columnar_memory_rollback(&hold));
     CHECK(!slot && reserved(g) == baseline);
@@ -901,8 +901,8 @@ test_coalesce_failure_owned(void)
 
     /* 2. A failure after the first batch was appended: the spilled batch
      * names worker 1 in a one-worker round. */
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == EPROTO);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == EPROTO);
     CHECK(!slot && reserved(g) == baseline);
     check_list_intact(list, b, payloads, 3);
     for (uint32_t i = 0; i < 2; i++)
@@ -918,7 +918,7 @@ test_coalesce_failure_owned(void)
         CHECK(wl_columnar_memory_reserve(raw, budget - baseline - room,
             &hold));
         rc = wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL,
-                &sink, &slot);
+                NULL, &sink, &slot);
         CHECK(wl_columnar_memory_rollback(&hold));
         if (rc != 0) {
             CHECK(rc == ENOSPC);
@@ -942,8 +942,8 @@ test_coalesce_failure_owned(void)
         NULL) == 0);
     list = link_list(b, 2);
     slot = NULL;
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == EPROTO);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == EPROTO);
     wl_columnar_eval_tdd_discard_list(ch, &list, &sink);
     CHECK(!list && log.count == 0);
     CHECK(wl_columnar_spill_store_bytes(coord->spill_store) == 0);
@@ -981,8 +981,8 @@ test_refusal_sink(void)
     sink_log_t log;
     memset(&log, 0, sizeof(log));
     wl_tdd_refusal_sink_t sink = { record_refusal, &log };
-    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, &sink,
-        &slot) == 0);
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 1, NULL, NULL,
+        &sink, &slot) == 0);
     CHECK(!list && slot && slot->nrows == 2);
     CHECK(log.count == 1 && log.batches[0] == b[1] && log.rcs[0] == EBUSY);
     CHECK(b[1]->state == WL_TDD_BATCH_CONSUMER && b[1]->payload == r1);
@@ -1014,6 +1014,360 @@ test_refusal_sink(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Held cap: consumer spill as batches are taken                       */
+/* ------------------------------------------------------------------ */
+
+/* Push @batch onto lists[rel * workers + worker], as collect does. */
+static void
+hold(wl_tdd_batch_t **lists, uint32_t workers, wl_tdd_batch_t *batch)
+{
+    wl_tdd_batch_t **list = &lists[batch->rel_idx * workers + batch->worker];
+    batch->next = *list;
+    *list = batch;
+}
+
+static void
+test_held_cap_pass(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 28);
+    wl_session_t *session = make_session(g);
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *cg = coord->memory_governor;
+    wl_tdd_channel_t *ch = open_channel(cg, 2);
+    const int64_t v[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    col_delta_timestamp_t s0[8], s1[8];
+    for (uint32_t i = 0; i < 8; i++) {
+        s0[i] = ts(1, 4, 0, 1);
+        s1[i] = ts(1, 4, 1, 1);
+    }
+    /* Relation 0: two rows on lane 0, eight on lane 1.  Relation 1: four
+     * rows on lane 0, and on lane 1 a relation without timestamps whose
+     * room for 64 rows makes it the largest charge of all. */
+    publish(ch, 0, 0, make_rel(cg, "a", v, s0, 2));
+    publish(ch, 1, 0, make_rel(cg, "a", v, s1, 8));
+    publish(ch, 0, 1, make_rel(cg, "b", v, s0, 4));
+    col_rel_t *bare = NULL;
+    CHECK(wl_columnar_relation_new_auto_governed("bare", 2, 64, false, cg,
+        &bare) == 0);
+    int64_t row[2] = { 9, 0 };
+    CHECK(col_rel_append_row(bare, row) == 0 && !bare->timestamps);
+    publish(ch, 1, 1, bare);
+    wl_tdd_batch_t *b[4];
+    uint32_t n = 0;
+    take_all(ch, 2, b, &n, 4);
+    CHECK(n == 4);
+    uint64_t c2 = b[0]->charge, c8 = b[1]->charge, c4 = b[2]->charge;
+    uint64_t cbare = b[3]->charge;
+    CHECK(cbare > c8 && c8 > c4 && c4 > c2);
+    uint64_t held0 = c2 + c8 + c4 + cbare;
+
+    /* Under the cap a take spills nothing. */
+    wl_tdd_batch_t *lists[4] = { NULL, NULL, NULL, NULL };
+    wl_tdd_consumer_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    uint64_t cap = held0 - c8;
+    const wl_tdd_hold_t policy = { coord, cap, &stats };
+    uint64_t held = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        hold(lists, 2, b[i]);
+        held = wl_columnar_eval_tdd_hold_batch(&policy, lists, 2, 2, b[i],
+                held);
+    }
+    CHECK(held == c2 + c8 + c4);
+    CHECK(stats.consumer_spills == 0 && stats.max_held_bytes == held);
+    CHECK(wl_columnar_eval_tdd_held_bytes(lists, 2, 2, UINT32_MAX) == held);
+    CHECK(wl_columnar_eval_tdd_held_bytes(lists, 2, 2, 1) == c2 + c8);
+    CHECK(wl_columnar_eval_tdd_held_bytes(lists, 2, 2, 0) == c4);
+
+    /* The fourth take goes over.  The largest batch cannot be spilled (no
+     * timestamps); it is marked and the next largest goes, which brings
+     * the held bytes under. */
+    hold(lists, 2, b[3]);
+    held = wl_columnar_eval_tdd_hold_batch(&policy, lists, 2, 2, b[3], held);
+    CHECK(held == held0 - c8);
+    CHECK(b[3]->kind == WL_TDD_BATCH_RESIDENT && b[3]->payload == bare);
+    CHECK(b[3]->flags & WL_TDD_BATCH_FLAG_UNSPILLABLE);
+    CHECK(b[1]->kind == WL_TDD_BATCH_SPILLED);
+    CHECK(b[0]->kind == WL_TDD_BATCH_RESIDENT && !b[0]->flags);
+    CHECK(b[2]->kind == WL_TDD_BATCH_RESIDENT && !b[2]->flags);
+    CHECK(stats.consumer_spills == 1);
+    CHECK(stats.consumer_spill_fail[WL_COLUMNAR_SPILL_INVALID] == 1);
+    CHECK(stats.round_held_peak_bytes == held0);
+    CHECK(stats.max_batch_charge == cbare);
+    CHECK(stats.max_held_bytes == held0 - c8 && stats.max_held_bytes <= cap);
+    CHECK(stats.held_over_cap == 0);
+    CHECK(wl_columnar_eval_tdd_held_bytes(lists, 2, 2, UINT32_MAX)
+        == held0 - c8);
+
+    /* A target of 0 spills what can be spilled; the unspillable batch is
+     * not tried again. */
+    CHECK(wl_columnar_eval_tdd_spill_held(coord, lists, 2, 2, UINT32_MAX, 0,
+        &stats) == cbare);
+    CHECK(b[0]->kind == WL_TDD_BATCH_SPILLED);
+    CHECK(b[2]->kind == WL_TDD_BATCH_SPILLED);
+    CHECK(b[3]->kind == WL_TDD_BATCH_RESIDENT);
+    CHECK(stats.consumer_spills == 3);
+    CHECK(stats.consumer_spill_fail[WL_COLUMNAR_SPILL_INVALID] == 1);
+    CHECK(wl_columnar_eval_tdd_held_bytes(lists, 2, 2, UINT32_MAX) == cbare);
+
+    /* Without a spill store nothing is spilled, and a take over the cap
+     * counts a pass that ended over it. */
+    CHECK(wl_tdd_channel_begin_round(ch, 4, 2) == 0);
+    wl_tdd_batch_t *lone[1];
+    publish(ch, 0, 0, make_rel(cg, "c", v, s0, 3));
+    take_all(ch, 2, lone, &n, 1);
+    wl_tdd_batch_t *lone_lists[2] = { lone[0], NULL };
+    lone[0]->next = NULL;
+    wl_columnar_spill_store_t *store = coord->spill_store;
+    coord->spill_store = NULL;
+    wl_tdd_consumer_stats_t empty;
+    memset(&empty, 0, sizeof(empty));
+    const wl_tdd_hold_t storeless = { coord, 0, &empty };
+    CHECK(wl_columnar_eval_tdd_hold_batch(&storeless, lone_lists, 2, 1,
+        lone[0], 0) == lone[0]->charge);
+    CHECK(wl_columnar_eval_tdd_spill_held(coord, lone_lists, 2, 1,
+        UINT32_MAX, 0, &empty) == lone[0]->charge);
+    coord->spill_store = store;
+    CHECK(lone[0]->kind == WL_TDD_BATCH_RESIDENT && !lone[0]->flags);
+    CHECK(empty.consumer_spills == 0 && empty.held_over_cap == 1);
+    CHECK(empty.max_held_bytes == lone[0]->charge);
+
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    wl_columnar_eval_tdd_channel_discard_lists(ch, lists, 4, &sink);
+    wl_columnar_eval_tdd_channel_discard_lists(ch, lone_lists, 2, &sink);
+    CHECK(log.count == 0 && retired_count(ch) == 5);
+    CHECK(wl_columnar_spill_store_bytes(coord->spill_store) == 0);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+    wl_session_destroy(session);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* Collect applies the held cap as it takes each batch: with a cap of 0
+ * every timestamped batch is spilled before the next pump, and the rows
+ * still come back at coalesce.  Without a hold policy collect leaves every
+ * batch resident. */
+static void
+test_collect_hold(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 28);
+    wl_session_t *session = make_session(g);
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *cg = coord->memory_governor;
+    wl_tdd_channel_t *ch = open_channel(cg, 2);
+    const int64_t v[4] = { 1, 2, 3, 4 };
+    col_delta_timestamp_t s0[4], s1[4];
+    for (uint32_t i = 0; i < 4; i++) {
+        s0[i] = ts(1, 4, 0, 1);
+        s1[i] = ts(1, 4, 1, 1);
+    }
+    col_rel_t *r[3] = { make_rel(cg, "a", v, s0, 4),
+                        make_rel(cg, "a", v, s1, 2),
+                        make_rel(cg, "b", v, s1, 3) };
+    uint64_t largest = 0;
+    for (uint32_t i = 0; i < 3; i++)
+        if (col_rel_transport_bytes(r[i]) > largest)
+            largest = col_rel_transport_bytes(r[i]);
+    publish(ch, 0, 0, r[0]);
+    publish(ch, 1, 0, r[1]);
+    publish(ch, 1, 1, r[2]);
+    wl_tdd_channel_close_lane(ch, 0, 0);
+    wl_tdd_channel_close_lane(ch, 1, 0);
+
+    wl_tdd_batch_t *lists[4] = { NULL, NULL, NULL, NULL };
+    wl_tdd_batch_t *discard = NULL;
+    uint64_t rows = 0;
+    wl_tdd_consumer_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    const wl_tdd_hold_t policy = { coord, 0, &stats };
+    CHECK(wl_columnar_eval_tdd_channel_collect(ch, NULL, lists, 2, 2,
+        &discard, &rows, &policy) == 0);
+    CHECK(rows == 9 && !discard);
+    CHECK(lists[0] && lists[1] && !lists[2] && lists[3]);
+    for (uint32_t i = 0; i < 4; i++)
+        for (const wl_tdd_batch_t *b = lists[i]; b; b = b->next)
+            CHECK(b->kind == WL_TDD_BATCH_SPILLED);
+    CHECK(stats.consumer_spills == 3 && stats.held_over_cap == 0);
+    CHECK(stats.max_held_bytes == 0);
+    CHECK(stats.round_held_peak_bytes == largest);
+    CHECK(stats.max_batch_charge == largest);
+
+    /* The spilled rows come back when the slots are staged. */
+    col_eval_tdd_worker_ctx_t ctxs[2];
+    col_rel_t *slots[2][2];
+    memset(ctxs, 0, sizeof(ctxs));
+    memset(slots, 0, sizeof(slots));
+    for (uint32_t w = 0; w < 2; w++)
+        ctxs[w].delta_rels = slots[w];
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    CHECK(wl_columnar_eval_tdd_channel_coalesce_all(coord, ch, lists, ctxs, 2,
+        2, &sink, &stats) == 0);
+    CHECK(stats.rehydrated_batches == 3 && log.count == 0);
+    CHECK(slots[0][0] && slots[0][0]->nrows == 4);
+    CHECK(slots[1][0] && slots[1][0]->nrows == 2);
+    CHECK(!slots[0][1] && slots[1][1] && slots[1][1]->nrows == 3);
+    for (uint32_t w = 0; w < 2; w++)
+        for (uint32_t ri = 0; ri < 2; ri++)
+            if (slots[w][ri])
+                CHECK(col_rel_destroy_checked(slots[w][ri]) == 0);
+
+    /* Without a policy the batch stays resident. */
+    CHECK(wl_tdd_channel_begin_round(ch, 4, 2) == 0);
+    publish(ch, 0, 1, make_rel(cg, "b", v, s0, 1));
+    wl_tdd_channel_close_lane(ch, 0, 0);
+    wl_tdd_channel_close_lane(ch, 1, 0);
+    CHECK(wl_columnar_eval_tdd_channel_collect(ch, NULL, lists, 2, 2,
+        &discard, &rows, NULL) == 0);
+    CHECK(lists[2] && lists[2]->kind == WL_TDD_BATCH_RESIDENT);
+    wl_columnar_eval_tdd_channel_discard_lists(ch, lists, 4, &sink);
+    CHECK(log.count == 0 && retired_count(ch) == 4);
+    CHECK(wl_columnar_spill_store_bytes(coord->spill_store) == 0);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+    wl_session_destroy(session);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* A delta created like @schema, as the ordinary worker path creates its
+ * deltas like the worker's relation, holding (values[i], values[i] / 4.0)
+ * stamped with stamps[i]. */
+static col_rel_t *
+make_like(wl_columnar_memory_governor_ref_t *g, const col_rel_t *schema,
+    const int64_t *values, const col_delta_timestamp_t *stamps, uint32_t n)
+{
+    col_rel_t *r = NULL;
+    CHECK(wl_columnar_relation_new_like_governed_checked(&r, "$d$edge",
+        schema, g) == 0);
+    CHECK(col_rel_enable_timestamps(r) == 0);
+    for (uint32_t i = 0; i < n; i++) {
+        double f = (double)values[i] / 4.0;
+        int64_t row[2];
+        row[0] = values[i];
+        memcpy(&row[1], &f, sizeof(f));
+        CHECK(col_rel_append_row(r, row) == 0);
+    }
+    CHECK(r->timestamps && r->timestamp_capacity >= n);
+    for (uint32_t i = 0; i < n; i++)
+        r->timestamps[i] = stamps[i];
+    return r;
+}
+
+/* A missing type array reads as INT64. */
+static wirelog_column_type_t
+tdd_type(const col_rel_t *r, uint32_t c)
+{
+    return r->column_types ? r->column_types[c] : WIRELOG_TYPE_INT64;
+}
+
+/* Two slots must agree on the schema metadata the owner and global-read
+ * exchanges compare across workers. */
+static void
+check_same_schema(const col_rel_t *a, const col_rel_t *b)
+{
+    CHECK(a->ncols == b->ncols && a->declared_ncols == b->declared_ncols);
+    CHECK((a->col_names == NULL) == (b->col_names == NULL));
+    for (uint32_t c = 0; a->col_names && c < a->ncols; c++) {
+        CHECK((a->col_names[c] == NULL) == (b->col_names[c] == NULL));
+        CHECK(!a->col_names[c] || strcmp(a->col_names[c], b->col_names[c])
+            == 0);
+    }
+    for (uint32_t c = 0; c < a->ncols; c++)
+        CHECK(tdd_type(a, c) == tdd_type(b, c));
+    CHECK(a->compound_kind == b->compound_kind
+        && a->compound_count == b->compound_count
+        && a->has_graph_column == b->has_graph_column);
+}
+
+/* A slot built only from SPILLED batches takes its schema from @schema.
+ * Here both deltas are created like @schema, as on the ordinary worker
+ * path, so the adopted slot and the spilled one agree on every field the
+ * exchanges compare (U3-R9).  Owner and global-read rounds, whose adopted
+ * deltas are created like the plan result, are covered by the mixed runs
+ * in test_tdd_channel_held.c. */
+static void
+test_coalesce_schema_template(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 28);
+    wl_session_t *session = make_session(g);
+    wl_col_session_t *coord = COL_SESSION(session);
+    wl_columnar_memory_governor_ref_t *cg = coord->memory_governor;
+    wl_tdd_channel_t *ch = open_channel(cg, 2);
+    const char *names[2] = { "src", "weight" };
+    wirelog_column_type_t types[2] = { WIRELOG_TYPE_INT64,
+                                       WIRELOG_TYPE_FLOAT };
+    col_rel_t *schema = NULL;
+    CHECK(wl_columnar_relation_new_named_governed("edge", 2, names, 1, false,
+        cg, &schema) == 0);
+    CHECK(col_rel_set_column_types(schema, types, 2) == 0);
+    schema->declared_ncols = 2;
+    const int64_t v[3] = { 4, 5, 6 };
+    const col_delta_timestamp_t s0[3] = { ts(1, 4, 0, 1), ts(1, 4, 0, 1),
+                                          ts(1, 4, 0, 1) };
+    const col_delta_timestamp_t s1[3] = { ts(1, 4, 1, 1), ts(1, 4, 1, 1),
+                                          ts(1, 4, 1, 1) };
+    col_rel_t *adopted = make_like(cg, schema, v, s0, 3);
+    publish(ch, 0, 0, adopted);
+    publish(ch, 1, 0, make_like(cg, schema, v, s1, 3));
+    wl_tdd_batch_t *b[2];
+    uint32_t n = 0;
+    take_all(ch, 2, b, &n, 2);
+    CHECK(n == 2 && b[1]->worker == 1);
+    CHECK(wl_columnar_eval_tdd_batch_spill(b[1], cg, coord->spill_store,
+        NULL) == 0);
+    sink_log_t log;
+    memset(&log, 0, sizeof(log));
+    wl_tdd_refusal_sink_t sink = { record_refusal, &log };
+    wl_tdd_batch_t *list = link_list(&b[0], 1);
+    col_rel_t *slot0 = NULL;
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL,
+        schema, &sink, &slot0) == 0);
+    CHECK(slot0 == adopted);
+    list = link_list(&b[1], 1);
+    col_rel_t *slot = NULL;
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL,
+        schema, &sink, &slot) == 0);
+    CHECK(slot && !list && slot->nrows == 3 && log.count == 0);
+    CHECK(slot->col_names && slot->col_names[0] && slot->col_names[1]
+        && strcmp(slot->col_names[0], "src") == 0
+        && strcmp(slot->col_names[1], "weight") == 0);
+    CHECK(slot->declared_ncols == 2 && strcmp(slot->name, "edge") == 0);
+    check_same_schema(slot0, slot);
+    for (uint32_t i = 0; i < 3; i++)
+        check_row(slot, i, v[i], s1[i]);
+    CHECK(col_rel_destroy_checked(slot0) == 0);
+    CHECK(col_rel_destroy_checked(slot) == 0);
+
+    /* A template that does not match the payload's schema is not used. */
+    CHECK(wl_tdd_channel_begin_round(ch, 4, 2) == 0);
+    col_rel_t *wide = NULL;
+    CHECK(wl_columnar_relation_new_auto_governed("wide", 3, 1, false, cg,
+        &wide) == 0);
+    publish(ch, 0, 0, make_rel(cg, "$d$edge", v, s0, 3));
+    take_all(ch, 2, b, &n, 1);
+    CHECK(wl_columnar_eval_tdd_batch_spill(b[0], cg, coord->spill_store,
+        NULL) == 0);
+    list = link_list(b, 1);
+    slot = NULL;
+    CHECK(wl_columnar_eval_tdd_coalesce_slot(coord, ch, &list, 2, NULL,
+        wide, &sink, &slot) == 0);
+    CHECK(slot && slot->ncols == 2 && slot->nrows == 3);
+    CHECK(slot && strcmp(slot->name, "$tdd_slot") == 0);
+    CHECK(col_rel_destroy_checked(slot) == 0);
+    CHECK(col_rel_destroy_checked(wide) == 0);
+    CHECK(col_rel_destroy_checked(schema) == 0);
+
+    CHECK(wl_columnar_spill_store_bytes(coord->spill_store) == 0);
+    CHECK(wl_tdd_channel_destroy(ch) == 0);
+    wl_session_destroy(session);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* ------------------------------------------------------------------ */
 
 typedef struct {
     const char *name;
@@ -1034,6 +1388,9 @@ static const test_case_t tests[] = {
     { "spill_untimestamped_refused", test_spill_untimestamped_refused },
     { "coalesce_failure_owned", test_coalesce_failure_owned },
     { "refusal_sink", test_refusal_sink },
+    { "held_cap_pass", test_held_cap_pass },
+    { "collect_hold", test_collect_hold },
+    { "coalesce_schema_template", test_coalesce_schema_template },
 };
 
 static void

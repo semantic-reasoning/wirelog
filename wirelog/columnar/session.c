@@ -7569,6 +7569,7 @@ static void
 col_session_reset_snapshot_profile(wl_col_session_t *sess)
 {
     memset(&sess->tdd_audit, 0, sizeof(sess->tdd_audit));
+    memset(&sess->tdd_consumer, 0, sizeof(sess->tdd_consumer));
     sess->consolidation_ns = 0;
     sess->kfusion_ns = 0;
     sess->kfusion_alloc_ns = 0;

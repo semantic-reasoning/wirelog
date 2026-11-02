@@ -563,6 +563,19 @@ once, apart from one batch larger than the capacity, which is admitted into
 an empty channel. Producers wait for space while the coordinator takes
 batches; the batches it has taken are not counted against the capacity.
 
+The batches the coordinator has taken are held until the round's producers
+are joined and the batches are coalesced into the delta matrix. While the
+round runs, each take is followed by a cap pass: when the charges of the
+resident batches held exceed the held cap and the session has a spill store
+(`spill_directory`), the coordinator spills the largest of them until they
+fit. The held cap is a quarter of an enforcing budget, or none when no
+budget is enforced. `WIRELOG_TDD_HELD_BYTES=<bytes>` overrides it with a
+positive decimal that fits in 64 bits; any other value is ignored. A batch
+whose spill fails stays resident and governed, so the held bytes can exceed
+the cap; `held_over_cap` in the consumer statistics counts the passes that
+ended over it. The coalesce after the join reads every spilled batch back,
+so the cap does not bound the delta matrix the round leaves.
+
 The ledger's RELATION worker-share hint can still trigger join backpressure
 at 80% (`wl_mem_ledger_should_backpressure(RELATION, 80)`). The governor also
 admits covered allocations and reports refusals upstream. The legacy
@@ -689,7 +702,7 @@ the evaluation stack. Paths below are relative to `wirelog/columnar/`.
 | Differential arrangement | Session owns persistent index; transaction owns unpublished replacement; pin binds source snapshot | Replacement/invalidation cannot overwrite a leased index; abort discards staged work; final release applies deferred reset | `diff_arrangement.c`, `diff_join_batch.c` |
 | Filtered-relation cache | Cache owns filtered relation; explicit cache pins defer replacement | Last pin release destroys an invalidated entry; immediate-release lookup wrapper does not retain a pin for its caller | `filter.c` |
 | Materialization cache | Cache exclusively owns accepted heap results; lookup pin protects copying | JOIN exposes an independent copy to the stack; eviction/clear waits for pins and destroys the cached result once | `cache.c`, `join.c` |
-| Delta transport payload | Producer transfers an owned relation to the channel at publish, then to the coordinator matrix | A (worker, relation) slot may receive several batches; coalescing unions them into one matrix slot; discard destroys each owned queued or listed payload; owner mode keeps refused retirements on the lifetime's retained list | `eval_tdd_channel.c`, `eval.c` |
+| Delta transport payload | Producer transfers an owned relation to the channel at publish, then to the coordinator matrix | A (worker, relation) slot may receive several batches; the held cap may replace a taken batch's relation with its spilled payload, which coalescing reads back; coalescing unions them into one matrix slot; discard destroys each owned queued or listed payload; owner mode keeps refused retirements on the lifetime's retained list | `eval_tdd_channel.c`, `eval.c` |
 | Continuation scratch and published batches | Producer owns scratch and input/index leases; synchronous sink owns committed output | Cursor advances at publication commit; destroy releases producer state; no asynchronous lifetime is implied for scratch-backed payloads | `continuation.c`, `join_batch.c`, `diff_join_batch.c` |
 | Delta-step rollback snapshots | Session owns admitted metadata, copied names and flat rows; stable relation identities prevent restoration into replacement registrations; a GC-only compound hold preserves handle IDs | Capture completes before detachment; checked restoration retains refused backups; successful evaluation or recovery releases them once; teardown discards pending backups after evaluator cleanup | `eval_delta.c`, `relation.c`, `session.c` |
 

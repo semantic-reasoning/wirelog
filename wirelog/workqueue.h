@@ -126,12 +126,13 @@ wl_workqueue_create(uint32_t num_workers);
 
 /**
  * wl_workqueue_thread_count:
- * @wq: Work queue handle.  Must not be NULL.
+ * @wq: Work queue handle, or NULL.
  *
  * The number of worker threads in the pool, which is below the
- * @num_workers passed to wl_workqueue_create() when the OS refused some.
- * At most this many submitted items run on worker threads at once;
- * wl_workqueue_drain() also runs items on its caller's thread.
+ * @num_workers passed to wl_workqueue_create() when the OS refused some;
+ * 0 for a NULL @wq.  At most this many submitted items run on worker
+ * threads at once; wl_workqueue_drain() also runs items on its caller's
+ * thread.
  */
 uint32_t
 wl_workqueue_thread_count(const wl_work_queue_t *wq);

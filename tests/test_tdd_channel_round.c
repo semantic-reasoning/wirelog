@@ -888,7 +888,7 @@ set_env(const char *name, const char *value)
 #define MiB (UINT64_C(1024) * 1024)
 
 /* The channel capacity a session with these settings gets, read from the
- * channel of its first joined round; 0 when no round was joined. */
+ * channel after its last joined round; 0 when no round was joined. */
 static uint64_t
 observed_cap(const char *budget, const char *override, uint32_t *mode,
     uint64_t *budget_bytes)

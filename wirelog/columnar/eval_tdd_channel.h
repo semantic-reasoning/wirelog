@@ -52,6 +52,52 @@ typedef struct {
     wl_mem_ledger_t *ledger;
 } wl_tdd_discard_ctx_t;
 
+/* One counter per wl_columnar_spill_status_t value. */
+#define WL_TDD_SPILL_STATUS_SLOTS ((size_t)WL_COLUMNAR_SPILL_CLOSED + 1u)
+
+/*
+ * Consumer-side accounting of the TDD channel (#1373).  The coordinator
+ * owns it and is its only writer.  "Held" bytes are the charges of the
+ * RESIDENT batches the consumer has taken and not yet staged; a SPILLED
+ * batch holds no resident payload and is not counted.
+ *
+ * - held_cap: the cap in force for the last stratum.
+ * - round_held_peak_bytes: the most held bytes right after a take, before
+ *   the cap pass that follows it.
+ * - max_held_bytes: the most held bytes left after a take and its cap
+ *   pass.
+ * - max_batch_charge: the largest charge of a batch taken onto a list.
+ * - held_over_cap: cap passes that ended above their target, because no
+ *   batch was left that could be spilled or the session has no spill
+ *   store.
+ * - consumer_spills: batches spilled by the consumer.
+ * - consumer_spill_fail[s]: spill attempts that failed with status s;
+ *   a batch without timestamps counts as WL_COLUMNAR_SPILL_INVALID.
+ * - rehydrated_batches: SPILLED batches read back into a staged slot.
+ */
+typedef struct {
+    uint64_t held_cap;
+    uint64_t round_held_peak_bytes;
+    uint64_t max_held_bytes;
+    uint64_t max_batch_charge;
+    uint64_t held_over_cap;
+    uint64_t consumer_spills;
+    uint64_t consumer_spill_fail[WL_TDD_SPILL_STATUS_SLOTS];
+    uint64_t rehydrated_batches;
+} wl_tdd_consumer_stats_t;
+
+/*
+ * The held cap wl_columnar_eval_tdd_channel_collect() applies while the
+ * round's producers run (#1373): spills go to @coord's spill store under
+ * its governor, @cap is the held cap and @stats, which must not be NULL,
+ * receives the counts.
+ */
+typedef struct {
+    struct wl_col_session_t *coord;
+    uint64_t cap;
+    wl_tdd_consumer_stats_t *stats;
+} wl_tdd_hold_t;
+
 /* The errno a spill status maps to, as the cold-relation reader maps it:
  * MEMORY -> ENOSPC, ALLOCATION -> ENOMEM, IO/QUOTA/CAPACITY -> EIO,
  * OVERFLOW -> EOVERFLOW, BUSY -> EBUSY, any other failure -> ENOTSUP. */
@@ -103,9 +149,16 @@ wl_columnar_eval_tdd_batch_rehydrate(const wl_tdd_batch_t *batch,
  *   of +1, the slot is consolidated with wl_columnar_eval_delta_consolidate();
  *   otherwise every row is kept with its own timestamp.
  *
+ * A fresh slot takes its schema (column names, types, declared width and
+ * the other metadata wl_columnar_relation_new_like_governed_checked_mode()
+ * copies) from the first RESIDENT relation, or from @schema when every
+ * batch is SPILLED.  @schema may be NULL; a slot of SPILLED batches then
+ * gets only the payload's column types.  A @schema whose column count or
+ * types differ from the payload's is not used.
+ *
  * An adopted relation keeps its own name.  A fresh slot is named @name, or
- * after the first RESIDENT relation when @name is NULL, or "$tdd_slot" when
- * every batch is SPILLED and @name is NULL.  *@out_slot must be NULL on
+ * after the relation its schema came from when @name is NULL, or
+ * "$tdd_slot" when it has no such relation.  *@out_slot must be NULL on
  * entry.
  *
  * Success: *@out_slot is the slot (NULL for an empty list) and *@list is
@@ -129,8 +182,54 @@ wl_columnar_eval_tdd_batch_rehydrate(const wl_tdd_batch_t *batch,
 int
 wl_columnar_eval_tdd_coalesce_slot(struct wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **list, uint32_t nworkers,
-    const char *name, const wl_tdd_refusal_sink_t *sink,
-    struct col_rel **out_slot);
+    const char *name, const struct col_rel *schema,
+    const wl_tdd_refusal_sink_t *sink, struct col_rel **out_slot);
+
+/* The held bytes of lists[ri * @nworkers + w] over every relation ri below
+ * @nrels except @skip_rel (pass UINT32_MAX to count them all): the summed
+ * charge of their RESIDENT batches. */
+uint64_t
+wl_columnar_eval_tdd_held_bytes(wl_tdd_batch_t *const *lists,
+    uint32_t nworkers, uint32_t nrels, uint32_t skip_rel);
+
+/*
+ * Consumer: spill held RESIDENT batches of every relation but @skip_rel,
+ * largest charge first, until their held bytes are at most @target or no
+ * batch is left to try, and return the held bytes left.  Spills go to
+ * @coord's spill store under its governor; without both nothing is
+ * spilled.  The call may run while the round's producers do: a producer
+ * no longer touches a delta once it has published it.
+ *
+ * A batch is tried at most once per round: a failed spill marks it
+ * WL_TDD_BATCH_FLAG_UNSPILLABLE, and so does a batch without timestamps
+ * (EINVAL), so a pass makes at most one attempt per held batch and ends.
+ * A marked batch stays resident and governed.  MEMORY and ALLOCATION are
+ * not retried either, although memory freed later in the round might let
+ * a retry succeed: each attempt runs at most one capture on the pump
+ * thread, and one attempt per batch bounds that work.  BUSY would mean a
+ * published delta still had a lease or a borrow, which docs/THREADING.md
+ * argues it does not.  Successes and failures are counted in @stats
+ * (optional).
+ */
+uint64_t
+wl_columnar_eval_tdd_spill_held(struct wl_col_session_t *coord,
+    wl_tdd_batch_t **lists, uint32_t nworkers, uint32_t nrels,
+    uint32_t skip_rel, uint64_t target, wl_tdd_consumer_stats_t *stats);
+
+/*
+ * Consumer, the cap pass after @batch was pushed onto @lists: @held is the
+ * held bytes before the take, to which a RESIDENT @batch adds its charge.
+ * When the sum exceeds @hold->cap, held batches are spilled with
+ * wl_columnar_eval_tdd_spill_held() (nothing is spilled without a spill
+ * store), and held_over_cap is counted when the held bytes still exceed
+ * the cap.  Records round_held_peak_bytes, max_batch_charge and
+ * max_held_bytes, and returns the held bytes left.  Nothing fails: a batch
+ * that cannot be spilled stays resident, governed as before.
+ */
+uint64_t
+wl_columnar_eval_tdd_hold_batch(const wl_tdd_hold_t *hold,
+    wl_tdd_batch_t **lists, uint32_t nworkers, uint32_t nrels,
+    const wl_tdd_batch_t *batch, uint64_t held);
 
 /*
  * Dispose a CONSUMER batch: destroy its relation (RESIDENT) or release its
@@ -197,11 +296,15 @@ wl_columnar_eval_tdd_channel_publish_delta(struct col_eval_tdd_worker_ctx *ctx,
 
 /*
  * Consumer: pump @ch until the round ends, while its producers may still be
- * running.  The call touches descriptors only, never a payload, and disposes
- * of no batch.  Each taken batch's charge is freed from @ledger (when set)
- * under WL_MEM_SUBSYS_CHANNEL.  A batch is pushed onto
- * lists[rel_idx * @nworkers + worker], so each list holds its batches newest
- * first, and its rows are added to *@rows (when set).
+ * running.  The call disposes of no batch.  Each taken batch's charge is
+ * freed from @ledger (when set) under WL_MEM_SUBSYS_CHANNEL.  A batch is
+ * pushed onto lists[rel_idx * @nworkers + worker], so each list holds its
+ * batches newest first, and its rows are added to *@rows (when set).
+ *
+ * With @hold, each batch pushed onto a list is followed by its cap pass,
+ * wl_columnar_eval_tdd_hold_batch(), before the next pump, so a batch may
+ * be spilled while producers still run.  Without @hold the call touches
+ * descriptors only, never a payload.
  *
  * Once the round cannot succeed the call keeps pumping in discard mode, so
  * producers still make progress, and pushes every later batch onto
@@ -224,22 +327,26 @@ wl_columnar_eval_tdd_channel_publish_delta(struct col_eval_tdd_worker_ctx *ctx,
 int
 wl_columnar_eval_tdd_channel_collect(wl_tdd_channel_t *ch,
     wl_mem_ledger_t *ledger, wl_tdd_batch_t **lists, uint32_t nworkers,
-    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows);
+    uint32_t nrels, wl_tdd_batch_t **discard, uint64_t *rows,
+    const wl_tdd_hold_t *hold);
 
 /*
  * Consumer: coalesce every list built by wl_columnar_eval_tdd_channel_collect()
  * into ctxs[w].delta_rels[ri] with wl_columnar_eval_tdd_coalesce_slot(), in
- * seq order, naming each slot after relation ri's delta in ctxs[w].sp.
- * Unless an argument is invalid (EINVAL), every list is empty on return.  On
- * failure the remaining lists are destroyed (a refused retirement goes to
- * @sink), slots already built stay in the matrix for the caller's cleanup,
- * and the error is returned; a slot that is already occupied gives EPROTO.
+ * seq order, naming each slot after relation ri's delta in ctxs[w].sp and
+ * taking its schema from relation ri in worker w's session when every batch
+ * was spilled.  The SPILLED batches of each list that coalesces are added to
+ * @stats->rehydrated_batches (@stats is optional).  Unless an argument is
+ * invalid (EINVAL), every list is empty on return.  On failure the remaining
+ * lists are destroyed (a refused retirement goes to @sink), slots already
+ * built stay in the matrix for the caller's cleanup, and the error is
+ * returned; a slot that is already occupied gives EPROTO.
  */
 int
 wl_columnar_eval_tdd_channel_coalesce_all(struct wl_col_session_t *coord,
     wl_tdd_channel_t *ch, wl_tdd_batch_t **lists,
     struct col_eval_tdd_worker_ctx *ctxs, uint32_t nworkers, uint32_t nrels,
-    const wl_tdd_refusal_sink_t *sink);
+    const wl_tdd_refusal_sink_t *sink, wl_tdd_consumer_stats_t *stats);
 
 /* Dispose every batch on lists[0..@count) through
  * wl_columnar_eval_tdd_discard_list() and leave each list empty. */
