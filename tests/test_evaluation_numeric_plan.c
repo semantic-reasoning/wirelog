@@ -4280,6 +4280,184 @@ test_composed_source_cleanup_pre_action_phases(void)
     }
 }
 
+typedef struct {
+    fixture_t *fixture;
+    wl_columnar_join_setup_result_t result, getter_result, handoff_result;
+} composed_join_setup_peer_t;
+
+static void *
+composed_join_setup_wrong_thread(void *argument)
+{
+    composed_join_setup_peer_t *peer = argument;
+    fixture_t *f = peer->fixture;
+    int owner = 0;
+    wl_evaluation_control_t *grant = control_new(256, &owner);
+    peer->result = wl_columnar_join_op_attempt_start_funded(
+        &f->record.plan->ops[f->record.cursor], f->frame, &f->session,
+        f->operation, f->operation_id, &f->record.child_status, &f->record,
+        grant, wl_evaluation_control_active_attempt_id(grant));
+    const wl_columnar_eval_private_bindings_t *bindings = NULL;
+    peer->getter_result =
+        wl_columnar_eval_plan_numeric_private_bindings_get_funded(&f->record,
+            f->frame, &f->session, f->operation, f->operation_id, grant,
+            wl_evaluation_control_active_attempt_id(grant), &bindings);
+    peer->handoff_result =
+        wl_columnar_eval_plan_numeric_composed_join_setup_handoff(&f->record,
+            f->frame, &f->session, f->operation, f->operation_id,
+            &f->record.plan->ops[f->record.cursor]);
+    CHECK(!bindings);
+    CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(grant, &owner));
+    wl_evaluation_control_release(grant);
+    return NULL;
+}
+
+/* Refuse at every genuine setup boundary on the same constructor-created
+ * READY owner. Completed metadata is paid; the stack/context remain untouched
+ * until a later fully funded call performs the original forward/child work. */
+static void
+composed_join_setup_refusals(fixture_t *f, bool static_four)
+{
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    CHECK(!wl_columnar_eval_stack_numeric_setup_nonstream(f->frame,
+        &f->record));
+    wl_columnar_eval_plan_numeric_attempt_t copied = f->record;
+    CHECK(wl_columnar_eval_stack_numeric_setup_nonstream(f->frame,
+        &copied) == EBUSY);
+    wl_columnar_join_setup_result_t handoff =
+        wl_columnar_eval_plan_numeric_composed_join_setup_handoff(&f->record,
+            f->frame, &f->session, f->operation, f->operation_id,
+            &f->record.plan->ops[f->record.cursor]);
+    CHECK(handoff.protocol == EINVAL
+        && handoff.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
+        && f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    handoff = wl_columnar_eval_plan_numeric_composed_join_setup_handoff(&copied,
+            f->frame, &f->session, f->operation, f->operation_id, NULL);
+    CHECK(handoff.protocol == EBUSY
+        && handoff.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID);
+    int refused_owner = 0;
+    wl_evaluation_control_t *refused_grant = control_new(127, &refused_owner);
+    uint64_t refused_id =
+        wl_evaluation_control_active_attempt_id(refused_grant);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&copied,
+        refused_grant, refused_id) == EINVAL);
+    uint64_t unchanged;
+    CHECK(!wl_evaluation_control_test_active_consumed(refused_grant,
+        refused_id, &unchanged) && !unchanged);
+    wl_evaluation_control_request_cancel(refused_grant);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+        refused_grant, refused_id) == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        && !f->record.semantic_result);
+    CHECK(wl_evaluation_control_finish(refused_grant, &refused_owner, 0, 0)
+        == WL_EVALUATION_CONTROL_CANCELLED);
+    CHECK(!wl_evaluation_control_detach(refused_grant, &refused_owner));
+    wl_evaluation_control_release(refused_grant);
+    int turnover_owner = 0;
+    wl_evaluation_control_t *turnover = control_new(0, &turnover_owner);
+    uint64_t old_funding_id = wl_evaluation_control_active_attempt_id(turnover);
+    CHECK(!wl_evaluation_control_finish(turnover, &turnover_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(turnover));
+    CHECK(!wl_evaluation_control_begin(turnover, &turnover_owner));
+    CHECK(wl_evaluation_control_active_attempt_id(turnover) != old_funding_id);
+    CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+        turnover, old_funding_id) == EINVAL);
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        && !f->record.semantic_result);
+    CHECK(!wl_evaluation_control_finish(turnover, &turnover_owner, 0, 0));
+    wl_evaluation_control_report_t successor;
+    CHECK(!wl_evaluation_control_report(turnover, &successor)
+        && successor.attempt_id != old_funding_id && !successor.consumed);
+    CHECK(!wl_evaluation_control_detach(turnover, &turnover_owner));
+    wl_evaluation_control_release(turnover);
+    const uint64_t plain[] = {384, 512, 704, 832, 896, 1024};
+    const uint64_t bound[] = {384, 512, 704, 832, 896, 960, 992, 1056,
+                              1088, 1120, 1184, 1216, 1248, 1280, 1344, 1472};
+    const uint64_t *ends = static_four ? bound : plain;
+    unsigned count = static_four ? sizeof(bound) / sizeof(bound[0])
+        : sizeof(plain) / sizeof(plain[0]);
+    eval_stack_t *stack = NULL;
+    CHECK(!wl_columnar_eval_stack_operator_stack_owned(f->frame,
+        &f->session, &stack, &f->record));
+    eval_stack_t before = *stack;
+    wl_columnar_filter_context_t *ctx = NULL;
+    CHECK(!wl_columnar_eval_stack_filter_context_owned(f->frame, &ctx,
+        &f->record));
+    wl_columnar_filter_context_t inert = *ctx;
+    wl_columnar_filter_status_t status = f->record.child_status;
+    uint32_t cursor = f->record.cursor;
+    uint64_t original_before, original_after;
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+        f->operation_id, &original_before));
+    int mixed_owner = 0;
+    wl_evaluation_control_t *mixed_original = control_new(0, &mixed_owner);
+    uint64_t mixed_id = wl_evaluation_control_active_attempt_id(mixed_original);
+    wl_columnar_join_setup_result_t mixed =
+        wl_columnar_join_op_attempt_start_funded(
+        &f->record.plan->ops[f->record.cursor], f->frame, &f->session,
+        mixed_original, mixed_id, &f->record.child_status, &f->record,
+        f->operation, f->operation_id);
+    CHECK(mixed.protocol == EINVAL
+        && mixed.outcome == WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED);
+    const wl_columnar_eval_private_bindings_t *mixed_output =
+        (const void *)&f->record;
+    mixed = wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+        &f->record, f->frame, &f->session, mixed_original, mixed_id,
+        f->operation, f->operation_id, &mixed_output);
+    CHECK(mixed.protocol == EINVAL
+        && mixed.outcome == WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED
+        && mixed_output == (const void *)&f->record);
+    CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+        f->operation_id, &original_after) && original_after == original_before);
+    CHECK(!wl_evaluation_control_charge_attempt(mixed_original, mixed_id, 0));
+    CHECK(!wl_evaluation_control_finish(mixed_original, &mixed_owner, 0, 0));
+    wl_evaluation_control_report_t mixed_report;
+    CHECK(!wl_evaluation_control_report(mixed_original, &mixed_report)
+        && !mixed_report.consumed && !mixed_report.result);
+    CHECK(!wl_evaluation_control_detach(mixed_original, &mixed_owner));
+    wl_evaluation_control_release(mixed_original);
+
+    for (unsigned i = 0; i < count; ++i) {
+        int owner = 0;
+        wl_evaluation_control_t *grant = control_new(ends[i] - 1, &owner);
+        uint64_t id = wl_evaluation_control_active_attempt_id(grant);
+        CHECK(wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+            grant, id) == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+            && f->record.cursor == cursor && !f->record.composed_busy
+            && !f->record.semantic_result
+            && !memcmp(stack, &before, sizeof(before))
+            && !memcmp(ctx, &inert, sizeof(inert))
+            && !memcmp(&f->record.child_status, &status, sizeof(status)));
+        CHECK(!wl_evaluation_control_charge_attempt(f->operation,
+            f->operation_id, 0));
+        CHECK(!wl_evaluation_control_test_active_consumed(f->operation,
+            f->operation_id, &original_after)
+            && original_before == original_after);
+        CHECK(wl_evaluation_control_finish(grant, &owner, 0, 0)
+            == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        wl_evaluation_control_report_t report;
+        CHECK(!wl_evaluation_control_report(grant, &report)
+            && report.consumed == (i ? ends[i - 1] : 0));
+        CHECK(!wl_evaluation_control_detach(grant, &owner));
+        wl_evaluation_control_release(grant);
+    }
+    int owner = 0;
+    wl_evaluation_control_t *grant = control_new(ends[count - 1], &owner);
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_step(&f->record,
+        grant, wl_evaluation_control_active_attempt_id(grant)));
+    CHECK(f->record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+        && f->record.pending_action ==
+        WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+    CHECK(!wl_evaluation_control_finish(grant, &owner, 0, 0));
+    wl_evaluation_control_report_t report;
+    CHECK(!wl_evaluation_control_report(grant, &report)
+        && report.consumed == ends[count - 1]);
+    CHECK(!wl_evaluation_control_detach(grant, &owner));
+    wl_evaluation_control_release(grant);
+    f->pending_protocol = 0;
+}
+
 static void
 composed_lftj_until_reader(fixture_t *f)
 {
@@ -4714,6 +4892,249 @@ test_composed_private_input_binding(void)
         && join->ops[0].op == WL_PLAN_OP_VARIABLE
         && join->ops[1].op == WL_PLAN_OP_JOIN
         && !strcmp(join->ops[1].right_relation, "b"));
+    /* The unbound route exercises HEADER/FINISH even without entries. */
+    col_rel_t *plain_a = composed_source("a", 1, a_values, 2, false);
+    col_rel_t *plain_b = composed_source("b", 1, b_private_values, 2, false);
+    col_rel_t *plain_registry[] = {plain_a, plain_b};
+    composed_fixture(&f, plain_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    composed_begin(&f, join, plain_registry, 2, 0);
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+    uint64_t ready_work;
+    CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+        f.operation_id, &ready_work));
+    composed_join_setup_refusals(&f, false);
+    composed_run(&f);
+    CHECK(!f.record.semantic_result);
+    stack = wl_columnar_eval_stack_cleanup_stack(f.frame);
+    CHECK(stack->top == 1 && stack->items[0].rel->nrows == 1
+        && stack->items[0].rel->columns[0][0] == 1);
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    col_rel_destroy(plain_b);
+
+    /* Sticky original stops are semantic, unlike the funding-only refusals
+    * above. Only parent and DISPATCH are paid; no positive original setup
+    * or child action may be spent after the saved original has stopped. */
+    for (unsigned limited = 0; limited < 2; ++limited) {
+        plain_a = composed_source("a", 1, a_values, 2, false);
+        plain_b = composed_source("b", 1, b_private_values, 2, false);
+        col_rel_t *stopped_registry[] = {plain_a, plain_b};
+        composed_fixture(&f, plain_a, limited ? ready_work : 0);
+        f.session.base.evaluation_control = f.operation;
+        composed_begin(&f, join, stopped_registry, 2, 0);
+        composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+        int stop = limited ? WL_EVALUATION_CONTROL_WORK_LIMIT
+            : WL_EVALUATION_CONTROL_CANCELLED;
+        if (limited) CHECK(wl_evaluation_control_charge_attempt(f.operation,
+                f.operation_id, 1) == stop);
+        else {
+            CHECK(!composed_abort_request(&f, 0));
+            /* The complete funded getter must establish owner authority
+             * before interpreting even a stopped supplied control. */
+            int getter_owner = 0;
+            wl_evaluation_control_t *getter_funding = control_new(128,
+                    &getter_owner);
+            const wl_columnar_eval_private_bindings_t *getter_output =
+                (const void *)&f.record;
+            wl_columnar_join_setup_result_t getter_refused =
+                wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+                NULL, f.frame, &f.session, f.operation, f.operation_id,
+                getter_funding,
+                wl_evaluation_control_active_attempt_id(getter_funding),
+                &getter_output);
+            CHECK(getter_refused.protocol == EINVAL
+                && getter_refused.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
+                && getter_output == (const void *)&f.record);
+            CHECK(!wl_evaluation_control_finish(getter_funding,
+                &getter_owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(getter_funding,
+                &getter_owner));
+            wl_evaluation_control_release(getter_funding);
+            int stopped_foreign_owner = 0, checked_getter_owner = 0;
+            wl_evaluation_control_t *stopped_foreign = control_new(0,
+                    &stopped_foreign_owner);
+            wl_evaluation_control_request_cancel(stopped_foreign);
+            wl_evaluation_control_t *checked_getter = control_new(128,
+                    &checked_getter_owner);
+            getter_output = (const void *)&f.record;
+            getter_refused =
+                wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+                &f.record, f.frame, &f.session, stopped_foreign,
+                wl_evaluation_control_active_attempt_id(stopped_foreign),
+                checked_getter,
+                wl_evaluation_control_active_attempt_id(checked_getter),
+                &getter_output);
+            CHECK(getter_refused.protocol == EINVAL
+                && getter_refused.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
+                && !getter_output);
+            /* An invalid association must not latch the requested foreign
+             * cancellation by probing it. Its real finish remains successful. */
+            CHECK(!wl_evaluation_control_finish(stopped_foreign,
+                &stopped_foreign_owner, 0, 0));
+            wl_evaluation_control_report_t foreign_report;
+            CHECK(!wl_evaluation_control_report(stopped_foreign,
+                &foreign_report) && !foreign_report.result
+                && !foreign_report.consumed);
+            CHECK(!wl_evaluation_control_detach(stopped_foreign,
+                &stopped_foreign_owner));
+            CHECK(!wl_evaluation_control_finish(checked_getter,
+                &checked_getter_owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(checked_getter,
+                &checked_getter_owner));
+            wl_evaluation_control_release(stopped_foreign);
+            wl_evaluation_control_release(checked_getter);
+            composed_join_setup_peer_t peer = { .fixture = &f };
+            wl_thread_t peer_thread;
+            CHECK(!wl_thread_create(&peer_thread,
+                composed_join_setup_wrong_thread, &peer));
+            CHECK(!wl_thread_join(&peer_thread));
+            CHECK(peer.result.protocol == EINVAL
+                && peer.result.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID);
+            CHECK(peer.getter_result.protocol == EINVAL
+                && peer.getter_result.outcome ==
+                WL_COLUMNAR_JOIN_SETUP_INVALID);
+            CHECK(peer.handoff_result.protocol == EINVAL
+                && peer.handoff_result.outcome ==
+                WL_COLUMNAR_JOIN_SETUP_INVALID);
+            /* A real abort request sets the genuine owner's abort intent.
+             * Supplying another active control to the full checked sibling
+             * must refuse before probing or cancelling that control. */
+            int foreign_owner = 0, proof_owner = 0;
+            wl_evaluation_control_t *foreign = control_new(0, &foreign_owner);
+            wl_evaluation_control_t *proof = control_new(128, &proof_owner);
+            uint64_t foreign_id =
+                wl_evaluation_control_active_attempt_id(foreign);
+            wl_columnar_join_setup_result_t refused =
+                wl_columnar_join_op_attempt_start_funded(&join->ops[1],
+                    f.frame, &f.session, foreign, foreign_id,
+                    &f.record.child_status,
+                    &f.record, proof,
+                    wl_evaluation_control_active_attempt_id(proof));
+            CHECK(!wl_evaluation_control_charge_attempt(foreign, foreign_id,
+                0));
+            CHECK(refused.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
+                && refused.protocol == EINVAL);
+            CHECK(!wl_evaluation_control_finish(foreign, &foreign_owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(foreign, &foreign_owner));
+            CHECK(!wl_evaluation_control_finish(proof, &proof_owner, 0, 0));
+            CHECK(!wl_evaluation_control_detach(proof, &proof_owner));
+            wl_evaluation_control_release(foreign);
+            wl_evaluation_control_release(proof);
+        }
+        int grant_owner = 0;
+        wl_evaluation_control_t *grant = control_new(1024, &grant_owner);
+        CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+            grant, wl_evaluation_control_active_attempt_id(grant)));
+        uint64_t after;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            f.operation_id, &after) && after == ready_work);
+        CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+            && f.record.semantic_result == stop && !f.record.composed_busy);
+        CHECK(!wl_evaluation_control_finish(grant, &grant_owner, 0, 0));
+        wl_evaluation_control_report_t paid;
+        CHECK(!wl_evaluation_control_report(grant, &paid)
+            && paid.consumed == 512 && !paid.result);
+        CHECK(!wl_evaluation_control_detach(grant, &grant_owner));
+        wl_evaluation_control_release(grant);
+        composed_run(&f);
+        session_rel_free_hash(&f.session);
+        composed_close(&f);
+        col_rel_destroy(plain_b);
+    }
+
+    const uint64_t original_allowances[] = {127, 128, 319, 320};
+    for (unsigned boundary = 0; boundary < 4; ++boundary) {
+        bool forwarded = boundary != 0;
+        bool exact = boundary == 3;
+        plain_a = composed_source("a", 1, a_values, 2, false);
+        plain_b = composed_source("b", 1, b_private_values, 2, false);
+        col_rel_t *child_registry[] = {plain_a, plain_b};
+        composed_fixture(&f, plain_a,
+            ready_work + original_allowances[boundary]);
+        f.session.base.evaluation_control = f.operation;
+        composed_begin(&f, join, child_registry, 2, 0);
+        composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+        wl_columnar_filter_context_t *ctx = NULL;
+        CHECK(!wl_columnar_eval_stack_filter_context_owned(f.frame, &ctx,
+            &f.record));
+        CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT && !ctx->pin_owned);
+        int grant_owner = 0;
+        wl_evaluation_control_t *grant = control_new(1024, &grant_owner);
+        CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+            grant, wl_evaluation_control_active_attempt_id(grant)));
+        if (forwarded) CHECK(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+                && f.record.pending_action ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY);
+        else CHECK(f.record.phase ==
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+                && f.record.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+        uint64_t admitted;
+        CHECK(!wl_evaluation_control_test_active_consumed(f.operation,
+            f.operation_id, &admitted)
+            && admitted == ready_work + (forwarded ? 128 : 0)
+            + (exact ? 192 : 0));
+        CHECK(ctx->join_initialized == (exact != 0)
+            && ctx->pin_owned == (exact != 0));
+        if (forwarded &&
+            !exact) CHECK(ctx->stage == WL_COLUMNAR_FILTER_STAGE_INERT
+                && f.record.child_status.progress ==
+                WL_COLUMNAR_FILTER_PROGRESS_DONE
+                && f.record.child_status.semantic_result ==
+                WL_EVALUATION_CONTROL_WORK_LIMIT);
+        CHECK(!wl_evaluation_control_finish(grant, &grant_owner, 0, 0));
+        wl_evaluation_control_report_t paid;
+        CHECK(!wl_evaluation_control_report(grant, &paid)
+            && paid.consumed == 1024);
+        CHECK(!wl_evaluation_control_detach(grant, &grant_owner));
+        wl_evaluation_control_release(grant);
+        f.pending_protocol = 0;
+        composed_run(&f);
+        CHECK(f.record.semantic_result == WL_EVALUATION_CONTROL_WORK_LIMIT);
+        session_rel_free_hash(&f.session);
+        composed_close(&f);
+        col_rel_destroy(plain_b);
+    }
+
+    plain_a = composed_source("a", 1, a_values, 2, false);
+    plain_b = composed_source("b", 1, b_private_values, 2, false);
+    col_rel_t *successor_registry[] = {plain_a, plain_b};
+    composed_fixture(&f, plain_a, 0);
+    f.session.base.evaluation_control = f.operation;
+    composed_begin(&f, join, successor_registry, 2, 0);
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    CHECK(!wl_evaluation_control_reset(f.operation));
+    CHECK(!wl_evaluation_control_begin(f.operation, &f.operation_owner));
+    uint64_t successor_id =
+        wl_evaluation_control_active_attempt_id(f.operation);
+    CHECK(successor_id != f.operation_id);
+    int successor_grant_owner = 0;
+    wl_evaluation_control_t *successor_grant = control_new(1024,
+            &successor_grant_owner);
+    CHECK(!wl_columnar_eval_plan_numeric_composed_attempt_step(&f.record,
+        successor_grant,
+        wl_evaluation_control_active_attempt_id(successor_grant)));
+    CHECK(f.record.phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE
+        && f.record.semantic_result == EINVAL);
+    CHECK(!wl_evaluation_control_finish(successor_grant,
+        &successor_grant_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(successor_grant,
+        &successor_grant_owner));
+    wl_evaluation_control_release(successor_grant);
+    composed_run(&f);
+    CHECK(!composed_host_turn(&f, true));
+    CHECK(!wl_evaluation_control_finish(f.operation, &f.operation_owner, 0, 0));
+    wl_evaluation_control_report_t successor_report;
+    CHECK(!wl_evaluation_control_report(f.operation, &successor_report)
+        && successor_report.attempt_id == successor_id
+        && !successor_report.consumed && !successor_report.result);
+    session_rel_free_hash(&f.session);
+    composed_close(&f);
+    col_rel_destroy(plain_b);
+
     col_rel_t *private_a = composed_source("private-a", 1, a_values, 2,
             false);
     col_rel_t *private_b = composed_source("private-b", 1,
@@ -4741,6 +5162,8 @@ test_composed_private_input_binding(void)
             &f.record, join, 0, join->op_count, f.frame, &f.session, 0,
             f.operation, f.operation_id, f.funding, f.funding_id,
             &join_bindings));
+    composed_until(&f, WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY, 1);
+    composed_join_setup_refusals(&f, true);
     composed_run(&f);
     CHECK(!f.record.semantic_result
         && f.record.completed == join->op_count);
@@ -10249,6 +10672,25 @@ test_prepared_unary_authority_and_query(void)
                 && !bindings);
         }
     }
+    int getter_owner = 0;
+    wl_evaluation_control_t *getter_grant = control_new(0, &getter_owner);
+    uint64_t getter_id = wl_evaluation_control_active_attempt_id(getter_grant);
+    wl_columnar_join_setup_result_t getter_result =
+        wl_columnar_eval_plan_numeric_private_bindings_get_funded(&f->record,
+            f->frame, &f->session, f->operation, f->operation_id, getter_grant,
+            getter_id, &f->record.private_bindings);
+    CHECK(getter_result.protocol == EINVAL
+        && getter_result.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID);
+    getter_result = wl_columnar_eval_plan_numeric_private_bindings_get_funded(
+        &f->record, f->frame, wrong_session, f->operation, f->operation_id,
+        getter_grant, getter_id, (void *)p);
+    CHECK(getter_result.protocol == EINVAL
+        && getter_result.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID
+        && !memcmp(&receipt_before, p, sizeof(receipt_before))
+        && !memcmp(&parent_before, &f->record, sizeof(parent_before)));
+    CHECK(!wl_evaluation_control_finish(getter_grant, &getter_owner, 0, 0));
+    CHECK(!wl_evaluation_control_detach(getter_grant, &getter_owner));
+    wl_evaluation_control_release(getter_grant);
     free(wrong_session);
     /* Unproven owners cannot establish that output storage is external.
      * They refuse without applying ordinary self-owned error normalization. */

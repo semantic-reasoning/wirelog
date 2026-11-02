@@ -185,6 +185,15 @@ checkpoint(wl_evaluation_control_t *control, unsigned event,
         wl_columnar_eval_serial_framed_attempt_t *ctx = NULL;
         CHECK(!wl_columnar_eval_stack_framed_context(active->frame, session,
             &ctx));
+        wl_columnar_eval_plan_numeric_attempt_t *r = &ctx->child;
+        CHECK(r->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING
+            && r->pending_action ==
+            WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_JOIN_BATCH);
+        CHECK(wl_columnar_eval_stack_numeric_setup_nonstream(active->frame,
+            r) == EBUSY);
+        wl_columnar_eval_plan_numeric_attempt_t copy = *r;
+        CHECK(wl_columnar_eval_stack_numeric_setup_nonstream(active->frame,
+            &copy) == EBUSY);
         wl_columnar_filter_context_t *consumer = NULL;
         CHECK(!wl_columnar_eval_stack_filter_context_owned(active->frame,
             &consumer, &ctx->child));

@@ -884,6 +884,16 @@ wl_columnar_eval_stack_numeric_owner(
     return 0;
 }
 
+int
+wl_columnar_eval_stack_numeric_setup_nonstream(
+    wl_columnar_eval_stack_cleanup_frame_t *frame, const void *owner)
+{
+    if (!owner) return EINVAL;
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, owner);
+    if (rc) return rc;
+    return frame->stream_host ? EBUSY : 0;
+}
+
 bool
 wl_columnar_eval_stack_frame_mutation_blocked(
     const wl_columnar_eval_stack_cleanup_frame_t *frame)

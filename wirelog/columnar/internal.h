@@ -7785,6 +7785,75 @@ int wl_columnar_eval_plan_numeric_composed_attempt_begin_bound(
     wl_col_session_t *, uint32_t, wl_evaluation_control_t *, uint64_t,
     wl_evaluation_control_t *, uint64_t,
     const wl_columnar_eval_private_bindings_t *);
+/* Synchronous setup results carry no owning receipt or pointer authority. */
+typedef enum {
+    WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED,
+    WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED,
+    WL_COLUMNAR_JOIN_SETUP_INVALID,
+    WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED
+} wl_columnar_join_setup_outcome_t;
+typedef struct {
+    int protocol;
+    wl_columnar_join_setup_outcome_t outcome;
+} wl_columnar_join_setup_result_t;
+enum {
+    WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK = 384,
+    WL_COLUMNAR_JOIN_SETUP_DISPATCH_WORK = 128,
+    WL_COLUMNAR_JOIN_SETUP_STACK_WORK = 192,
+    WL_COLUMNAR_JOIN_SETUP_HEADER_WORK = 128,
+    WL_COLUMNAR_JOIN_SETUP_ENTRY_WORK = 64,
+    WL_COLUMNAR_JOIN_SETUP_PAIR_WORK = 32,
+    WL_COLUMNAR_JOIN_SETUP_DYNAMIC_WORK = 64,
+    WL_COLUMNAR_JOIN_SETUP_FINISH_WORK = 64,
+    WL_COLUMNAR_JOIN_SETUP_PRECHILD_WORK = 128,
+    WL_COLUMNAR_JOIN_SETUP_MAX_WORK = WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK
+        + WL_COLUMNAR_JOIN_SETUP_DISPATCH_WORK +
+        WL_COLUMNAR_JOIN_SETUP_STACK_WORK
+        + WL_COLUMNAR_JOIN_SETUP_HEADER_WORK
+        + WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX *
+        WL_COLUMNAR_JOIN_SETUP_ENTRY_WORK
+        + WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX
+        * (WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX - 1) / 2
+        * WL_COLUMNAR_JOIN_SETUP_PAIR_WORK
+        + WL_COLUMNAR_JOIN_SETUP_FINISH_WORK +
+        WL_COLUMNAR_JOIN_SETUP_PRECHILD_WORK
+};
+/* Portable constant-expression checks, including the MSVC C frontend. */
+typedef char wl_columnar_join_setup_supported_max_t[
+        (WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX == 4u
+        && WL_COLUMNAR_JOIN_SETUP_MAX_WORK == 1472) ? 1 : -1];
+typedef char wl_columnar_join_setup_quantum_t[
+        (WL_COLUMNAR_JOIN_SETUP_DISPATCH_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_STACK_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_HEADER_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_ENTRY_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_PAIR_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_DYNAMIC_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_FINISH_WORK <= 256
+        && WL_COLUMNAR_JOIN_SETUP_PRECHILD_WORK <= 256) ? 1 : -1];
+wl_columnar_join_setup_result_t wl_columnar_join_setup_head(
+    wl_evaluation_control_t *, uint64_t, wl_evaluation_control_t *, uint64_t,
+    uint64_t);
+wl_columnar_join_setup_result_t wl_columnar_join_setup_tail(
+    wl_evaluation_control_t *, uint64_t, wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_numeric_setup_nonstream(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *);
+wl_columnar_join_setup_result_t
+    wl_columnar_eval_plan_numeric_composed_join_setup_handoff(
+    wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, const wl_plan_op_t *);
+wl_columnar_join_setup_result_t
+    wl_columnar_eval_plan_numeric_private_bindings_get_funded(const void *,
+    wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
+    wl_evaluation_control_t *, uint64_t, wl_evaluation_control_t *, uint64_t,
+    const wl_columnar_eval_private_bindings_t **);
+wl_columnar_join_setup_result_t wl_columnar_join_op_attempt_start_funded(
+    const wl_plan_op_t *, wl_columnar_eval_stack_cleanup_frame_t *,
+    wl_col_session_t *, wl_evaluation_control_t *, uint64_t,
+    wl_columnar_filter_status_t *, wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
+
 int wl_columnar_eval_plan_numeric_private_bindings_get(const void *,
     const wl_columnar_eval_stack_cleanup_frame_t *, wl_col_session_t *,
     wl_evaluation_control_t *, uint64_t,

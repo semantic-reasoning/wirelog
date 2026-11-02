@@ -1230,9 +1230,9 @@ call.
 | `pending_full_input_eval` | `col_controlled_step_recursive_drive`, `col_session_insert`, `col_session_remove`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_observed_action` | PRESERVE |
 | `has_evaluated` | `col_controlled_step_recursive_drive`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_eval_stratum_tdd_recursive`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_session_cold_busy`, `wl_columnar_session_cold_loader`, `wl_columnar_session_observed_action` | PRESERVE |
 | `snapshot_stable_valid` | `col_controlled_step_recursive_drive`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `session_note_inserted_input`, `wl_columnar_session_observed_action`, `wl_columnar_session_note_iteration_cap` | `col_session_snapshot_impl` | PRESERVE |
-| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_host_forward`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
+| `delta_seeded` | `insert_clone_prepare`, `tdd_worker_subpass_fn` | `col_op_variable`, `has_empty_forced_delta`, `tdd_worker_subpass_fn`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_host_forward`, `wl_columnar_eval_plan_numeric_source_select`, `wl_columnar_eval_plan_composed_source_select`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `last_removed_relation` | `col_session_remove_incremental`, `col_worker_session_create`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `col_controlled_step_staging_prepare`, `wl_columnar_session_cold_busy`, `wl_columnar_session_observed_action` | PRESERVE |
-| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned`, `wl_columnar_join_probe_op_attempt_start_owned`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
+| `retraction_seeded` | `col_session_step_impl`, `col_stratum_step_retraction_nonrecursive`, `col_stratum_step_with_delta`, `insert_clone_prepare`, `session_retraction_cleanup`, `col_controlled_step_staging_finish`, `wl_columnar_session_observed_action` | `col_controlled_step_static_preflight`, `wl_columnar_filter_consolidate_attempt_start_owned`, `col_op_variable`, `col_session_snapshot_impl`, `col_stratum_step_with_delta`, `has_empty_forced_delta`, `wl_columnar_eval_nonrec_relation_parallel`, `wl_columnar_join_select_right`, `wl_columnar_join_op_attempt_start_owned_initialize`, `wl_columnar_join_probe_op_attempt_start_owned_initialize`, `wl_columnar_eval_plan_numeric_source_attempt_begin`, `wl_columnar_eval_tdd_plan_prepare_inputs`, `wl_columnar_eval_tdd_plan_prepare_insert`, `wl_columnar_ops_reduce_attempt_start_owned`, `wl_columnar_merge_concat_attempt_start_owned`, `wl_columnar_eval_plan_numeric_composed_attempt_begin_internal`, `wl_columnar_eval_serial_framed_relation`, `wl_columnar_join_spill_eligible`, `wl_columnar_session_cold_mode` | PRESERVE |
 | `plain_step_completion_pending` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_session_insert`, `col_session_insert_incremental`, `col_session_make_compound`, `col_session_remove`, `col_session_remove_incremental`, `col_session_snapshot_impl`, `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_cold_busy` | PRESERVE -- with `plain_step_completion_phase` this is the resume token |
 | `plain_step_completion_phase` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_eval_resume_nonrecursive_completion`, `wl_columnar_session_note_iteration_cap` | `col_session_step_impl`, `wl_columnar_eval_resume_nonrecursive_completion` | PRESERVE |
 | `plain_step_completion_step_context` | `col_session_snapshot_impl`, `col_session_step_impl`, `col_worker_session_create`, `wl_columnar_session_note_iteration_cap` | `col_eval_stratum_tdd_nonrecursive`, `col_session_step_impl` | PRESERVE |
@@ -1452,12 +1452,36 @@ Consumer actions require one actual384 host funding payment. Direct composed
 pays384, and the facade pays another384: real-session grants1152/1151 prove the
 full chain and its nested root's remaining768/767 capacity. This is not a
 standalone root activation or an active consumed-work sample. Normal session
-grants remain5 or8 payments. Other new host actions use one dispatch unit plus
-the actual delegated cleanup grant. Original work never restarts on a batch
+grants retain the five- or eight-payment floor. ADVANCE additionally takes the
+maximum of that floor and the facade/root plus the largest selected ordinary
+JOIN setup: 2240 units for the normal route, or the existing 3072 floor for
+recursive/general routes. This is available capacity, not admitted work.
+Other new host actions use one dispatch unit plus the actual delegated cleanup
+grant. Original work never restarts on a batch
 boundary or a refused host grant. Constructor/compiler internals poll and bill
 the original attempt synchronously; these calls do not promise a hard total
 turn quantum. Physical allocator/free and mandatory cleanup boundaries retain
 their existing cooperative contracts.
+
+An ordinary JOIN or nonstream SEMIJOIN/ANTIJOIN at composed READY retains the
+full public owner proof and its separate 384 payment. Setup then admits actual
+DISPATCH128, STACK192, binding HEADER128, binding FINISH64 and PRECHILD128
+actions. A static binding adds ENTRY64 per entry and PAIR32 per earlier pair;
+a dynamic binding adds a separate DYNAMIC64 authorization action. Each action
+polls the saved original and funding generations at its boundaries. These
+synchronous proofs retain no new receipt or authority across a return.
+
+A later setup funding refusal preserves READY, stack, context and output;
+completed metadata payments remain consumed and a fresh retry repeats that
+work. The original positive forward128 and first child192 follow complete
+setup proof. Original stop is a semantic result and begins RELEASE; a funding
+stop is a protocol refusal. No-binding setup consumes 1024 including its parent
+payment, or 1792 including facade and root. The four-static-binding maximum is
+1472 internally and 2240 through the full chain. Unused grant capacity is not
+unused admitted work: only the current new action, at most192, can be admitted
+before a stop prevents its work. The earlier completed parent384 retains its
+specific existing fixed-host qualification. This does not promise a total
+synchronous turn quantum or qualify other READY classifiers and pipeline setup.
 
 For controlled STEP, the initial plan and registry proof is resumable. A call charges at most 64 plan-proof and scheduler actions combined.
 Each action advances a bounded cursor, processing at most one plan descriptor,

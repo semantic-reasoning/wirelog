@@ -879,7 +879,6 @@ has_empty_forced_delta(const wl_plan_relation_t *rp, wl_col_session_t *sess,
  * selection adds2 before that poll, financing63+252=315 within384. These are
  * logical source slots under MEMORY.md's exclusions, not elapsed time. */
 enum {
-    WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK = 384,
     WL_COLUMNAR_EVAL_PLAN_NUMERIC_FORWARD_WORK = 128
 };
 
@@ -1109,6 +1108,149 @@ wl_columnar_eval_plan_numeric_private_bindings_get(const void *owner,
     return 0;
 }
 
+/* Only the current action is admitted. Completed metadata fees survive a
+ * later refusal, but no proof or ownership token survives this activation. */
+wl_columnar_join_setup_result_t
+wl_columnar_join_setup_head(wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id, uint64_t work)
+{
+    if (!funding || funding == control || !funding_id)
+        return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                  WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, work);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return (wl_columnar_join_setup_result_t){ rc, rc
+               ? WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED
+               : WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED };
+}
+
+wl_columnar_join_setup_result_t
+wl_columnar_join_setup_tail(wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id)
+{
+    int rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED };
+    rc = wl_evaluation_control_charge_attempt(funding, funding_id, 0);
+    return (wl_columnar_join_setup_result_t){ rc, rc
+               ? WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED
+               : WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED };
+}
+
+/* Only the complete HEADER in this activation can reach this private head.
+ * Pointer/nonzero arguments stay immutable; active generations never do, so
+ * both exact saved-ID charges remain mandatory for every actual action. */
+static wl_columnar_join_setup_result_t
+wl_columnar_eval_plan_binding_progress_head(wl_evaluation_control_t *control,
+    uint64_t id, wl_evaluation_control_t *funding, uint64_t funding_id,
+    uint64_t work)
+{
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id, work);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return (wl_columnar_join_setup_result_t){ rc, rc
+               ? WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED
+               : WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED };
+}
+
+wl_columnar_join_setup_result_t
+wl_columnar_eval_plan_numeric_private_bindings_get_funded(const void *owner,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t id,
+    wl_evaluation_control_t *funding, uint64_t funding_id,
+    const wl_columnar_eval_private_bindings_t **out)
+{
+    const wl_columnar_eval_plan_numeric_attempt_t *record = owner;
+    if (!out || (uintptr_t)out > UINTPTR_MAX - sizeof(*out)
+        || (record && !wl_columnar_eval_stack_copy_ranges_disjoint(record,
+        sizeof(*record), out, sizeof(*out)))
+        || !wl_columnar_eval_stack_marked_copy_output(session, out,
+        sizeof(*out))) goto invalid;
+    if (!record || record->identity != owner) goto invalid;
+    if (record->session != session
+        && !wl_columnar_eval_stack_marked_copy_output(record->session, out,
+        sizeof(*out))) goto invalid;
+    if (!funding || funding == control || !funding_id
+        || funding == record->control)
+        return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                  WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    int rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+            WL_COLUMNAR_JOIN_SETUP_HEADER_WORK);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_FUNDING_REFUSED };
+    *out = NULL;
+    if (record->frame != frame || record->session != session
+        || record->control != control || record->attempt_id != id
+        || !control || !id
+        || wl_columnar_eval_stack_numeric_owner(frame, record)
+        || session->cleanup_active != frame) goto invalid;
+    const wl_columnar_eval_private_bindings_t *bindings =
+        record->private_bindings;
+    if (bindings && (bindings->identity != (uintptr_t)bindings
+        || bindings->session != session || bindings->plan != record->plan
+        || bindings->control != control || bindings->attempt_id != id
+        || !bindings->count || (!bindings->dynamic_entries
+        && bindings->count > WL_COLUMNAR_EVAL_PRIVATE_BINDING_MAX)))
+        goto invalid;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED };
+    wl_columnar_join_setup_result_t result =
+        wl_columnar_join_setup_tail(control, id, funding, funding_id);
+    if (result.protocol) return result;
+    if (bindings && bindings->dynamic_entries) {
+        result = wl_columnar_eval_plan_binding_progress_head(control, id,
+                funding, funding_id,
+                WL_COLUMNAR_JOIN_SETUP_DYNAMIC_WORK);
+        if (result.protocol) return result;
+        if (!wl_columnar_session_observed_bindings_authorized(session,
+            bindings)) goto invalid;
+        result = wl_columnar_join_setup_tail(control, id, funding, funding_id);
+        if (result.protocol) return result;
+    }
+    for (uint32_t i = 0; bindings && !bindings->dynamic_entries
+        && i < bindings->count; ++i) {
+        result = wl_columnar_eval_plan_binding_progress_head(control, id,
+                funding, funding_id,
+                WL_COLUMNAR_JOIN_SETUP_ENTRY_WORK);
+        if (result.protocol) return result;
+        const wl_columnar_eval_private_binding_t *entry = &bindings->entries[i];
+        if (!wl_columnar_eval_plan_private_entry_valid(entry)) goto invalid;
+        result = wl_columnar_join_setup_tail(control, id, funding, funding_id);
+        if (result.protocol) return result;
+        for (uint32_t j = 0; j < i; ++j) {
+            result = wl_columnar_eval_plan_binding_progress_head(control, id,
+                    funding,
+                    funding_id, WL_COLUMNAR_JOIN_SETUP_PAIR_WORK);
+            if (result.protocol) return result;
+            if (!wl_columnar_eval_plan_private_pair_distinct(
+                    &bindings->entries[j], entry)) goto invalid;
+            result = wl_columnar_join_setup_tail(control, id, funding,
+                    funding_id);
+            if (result.protocol) return result;
+        }
+    }
+    result = wl_columnar_eval_plan_binding_progress_head(control, id, funding,
+            funding_id,
+            WL_COLUMNAR_JOIN_SETUP_FINISH_WORK);
+    if (result.protocol) return result;
+    if (wl_columnar_eval_stack_numeric_owner(frame, record)
+        || (bindings && (bindings->identity != (uintptr_t)bindings
+        || bindings->session != session || bindings->plan != record->plan
+        || bindings->control != control || bindings->attempt_id != id)))
+        goto invalid;
+    result = wl_columnar_join_setup_tail(control, id, funding, funding_id);
+    if (result.protocol) return result;
+    *out = bindings;
+    return result;
+invalid:
+    return (wl_columnar_join_setup_result_t){ EINVAL,
+                                              WL_COLUMNAR_JOIN_SETUP_INVALID };
+}
+
 static int
 wl_columnar_eval_plan_numeric_forward(
     wl_columnar_eval_plan_numeric_attempt_t *record)
@@ -1120,6 +1262,42 @@ wl_columnar_eval_plan_numeric_forward(
     if (rc) return rc;
     return wl_evaluation_control_active_attempt_id(record->control)
            == record->attempt_id ? 0 : EINVAL;
+}
+
+wl_columnar_join_setup_result_t
+wl_columnar_eval_plan_numeric_composed_join_setup_handoff(
+    wl_columnar_eval_plan_numeric_attempt_t *record,
+    wl_columnar_eval_stack_cleanup_frame_t *frame, wl_col_session_t *session,
+    wl_evaluation_control_t *control, uint64_t attempt_id,
+    const wl_plan_op_t *op)
+{
+    if (!record) return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                           WL_COLUMNAR_JOIN_SETUP_INVALID };
+    int rc = wl_columnar_eval_stack_numeric_owner(frame, record);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_INVALID };
+    if (!record->composed_busy || !record->composed_mode
+        || record->phase != WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        || record->session != session || record->control != control
+        || record->attempt_id != attempt_id || !record->plan
+        || !record->plan->ops || record->cursor < record->begin
+        || record->cursor >= record->end
+        || record->cursor >= record->plan->op_count
+        || op !=
+        &record->plan->ops[record->cursor]) return (
+            wl_columnar_join_setup_result_t){ EINVAL,
+                                              WL_COLUMNAR_JOIN_SETUP_INVALID };
+    if (op->op != WL_PLAN_OP_JOIN && op->op != WL_PLAN_OP_SEMIJOIN
+        && op->op !=
+        WL_PLAN_OP_ANTIJOIN) return (wl_columnar_join_setup_result_t){ EINVAL,
+                                                                       WL_COLUMNAR_JOIN_SETUP_INVALID };
+    rc = wl_columnar_eval_plan_numeric_forward(record);
+    if (rc) return (wl_columnar_join_setup_result_t){ rc,
+                                                      WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED };
+    record->pending_action = record->phase;
+    record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_PENDING;
+    return (wl_columnar_join_setup_result_t){ 0,
+                                              WL_COLUMNAR_JOIN_SETUP_CHILD_DISPATCHED };
 }
 
 /* The parsed one-edge and two-edge recursive reachability rules lower to
@@ -3636,11 +3814,39 @@ wl_columnar_eval_plan_numeric_composed_attempt_step(
     int rc = wl_columnar_eval_plan_composed_validate(record);
     if (rc) return rc;
     if (record->composed_busy) return EBUSY;
+    bool setup = record->phase == WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_READY
+        && record->plan && record->plan->ops
+        && record->cursor >= record->begin && record->cursor < record->end
+        && record->cursor < record->plan->op_count
+        && (record->plan->ops[record->cursor].op == WL_PLAN_OP_SEMIJOIN
+        || record->plan->ops[record->cursor].op == WL_PLAN_OP_ANTIJOIN
+        || (record->plan->ops[record->cursor].op == WL_PLAN_OP_JOIN
+        && (!record->controlled_materialized_batch_fallback
+        || record->join_host_declined)));
+    if (setup) {
+        if (!funding || funding == record->control || !funding_id)
+            return EINVAL;
+        rc = wl_evaluation_control_charge_attempt(funding, funding_id,
+                WL_COLUMNAR_EVAL_PLAN_NUMERIC_HOST_WORK);
+        if (rc) return rc;
+    }
     record->composed_busy = true;
-    rc =
-        wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
-        record,
-        funding, funding_id);
+    if (setup) {
+        wl_columnar_join_setup_result_t result =
+            wl_columnar_join_op_attempt_start_funded(
+            &record->plan->ops[record->cursor], record->frame, record->session,
+            record->control, record->attempt_id, &record->child_status, record,
+            funding, funding_id);
+        rc = result.protocol;
+        if (result.outcome == WL_COLUMNAR_JOIN_SETUP_ORIGINAL_STOPPED
+            || result.outcome == WL_COLUMNAR_JOIN_SETUP_INVALID) {
+            if (!record->semantic_result) record->semantic_result = rc;
+            record->phase = WL_COLUMNAR_EVAL_PLAN_NUMERIC_COMPOSE_RELEASE;
+            rc = 0;
+        }
+    } else rc =
+            wl_columnar_eval_plan_numeric_composed_attempt_step_validated_body(
+            record, funding, funding_id);
     record->composed_busy = false; return rc;
 }
 
