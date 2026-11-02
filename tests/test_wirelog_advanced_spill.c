@@ -2004,8 +2004,20 @@ static void composite_public_references(void)
                     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *modes[] = {"--budget-join", "--budget-aggregate",
+                           "--budget-composite"};
+    int workload = -1;
+    if (argc == 2)
+        for (unsigned i = 0; i < 3; i++)
+            if (!strcmp(argv[1], modes[i])) workload = (int)i;
+    if (argc > 2 || (argc == 2 && workload < 0)) {
+        fprintf(stderr,
+            "usage: %s [--budget-join|--budget-aggregate|--budget-composite]\n",
+            argv[0]);
+        return 2;
+    }
     /* Issue #2287: a session created with a nonzero WIRELOG_JOIN_BATCH_BYTES
      * refuses wirelog_session_seal_join_input, so clear the inherited knob
      * and its _STRICT companion before the first session exists. */
@@ -2022,23 +2034,30 @@ int main(void)
         test_tmpdir());
     CHECK(mkdtemp(directory));
 #endif
-    cold_global_counts();
-    cold_group_counts("count"); cold_group_counts("sum");
-    cold_group_counts("min"); cold_group_counts("max");
-    cold_integer_aggregates();
-    composite_public_numeric(); composite_public_references();
-    chunked_public_scans(); chunked_public_joins();
-    chunked_public_references(); chunked_public_budget(false);
-    chunked_public_budget(true); chunked_public_budget(2);
-    inline_public_projections(); inline_public_joins();
-    reference_public_joins();
-    reference_public_projections();
-    join_directions(); join_chains();
-    descriptors(); lifecycle(); refusals(); typed_projection(); inline_facts();
-    sealed_sets(); standalone_reads(); output_floor(); mixed_projection();
-    public_scan_join();
-    unsupported_filters();
-    join_batch_knob();
+    if (workload >= 0) {
+        printf("cold input budget workload: %s\n", modes[workload]);
+        fflush(stdout);
+        chunked_public_budget((unsigned)workload);
+    } else {
+        cold_global_counts();
+        cold_group_counts("count"); cold_group_counts("sum");
+        cold_group_counts("min"); cold_group_counts("max");
+        cold_integer_aggregates();
+        composite_public_numeric(); composite_public_references();
+        chunked_public_scans(); chunked_public_joins();
+        chunked_public_references();
+
+        inline_public_projections(); inline_public_joins();
+        reference_public_joins();
+        reference_public_projections();
+        join_directions(); join_chains();
+        descriptors(); lifecycle(); refusals(); typed_projection();
+        inline_facts();
+        sealed_sets(); standalone_reads(); output_floor(); mixed_projection();
+        public_scan_join();
+        unsupported_filters();
+        join_batch_knob();
+    }
 #ifdef _WIN32
     CHECK(_rmdir(directory) == 0);
 #else
