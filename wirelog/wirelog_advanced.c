@@ -44,6 +44,8 @@ struct wirelog_session {
     wirelog_on_typed_tuple_fn typed_delta_cb;
     void *typed_delta_data;
     bool typed_callback_failed;
+    /* Relations whose source rows only host calls wrote (Issue #2321). */
+    wl_source_origin_t source_origin;
 };
 
 static const wirelog_column_type_t *session_relation_types(
@@ -398,6 +400,13 @@ session_typed_rows(wirelog_session_t *session, const char *relation,
                 physical_nlanes);
         if (rc != 0) {
             budget_denied = wl_session_budget_denied(session->inner);
+            /* Issue #2321: undoing a typed remove re-inserts each earlier
+             * row, including one whose remove matched nothing, and undoing
+             * an insert removes an equal occurrence rather than the one
+             * appended.  The relation's stored rows may then no longer be
+             * the result of host requests, so stop certifying it. */
+            if (r > 0)
+                wl_source_origin_revoke(&session->source_origin, relation);
             for (uint32_t rollback = 0; rollback < r; rollback++) {
                 int inverse = remove
                     ? wl_session_insert(session->inner, relation,
@@ -472,6 +481,15 @@ wirelog_session_create_impl(wirelog_program_t *program,
             : WIRELOG_ERR_EXEC;
     }
 
+    /* Issue #2321: certify host-only relations from this same program
+     * before its inline facts are loaded. */
+    wl_source_origin_t origin;
+    if (wl_source_origin_capture(program, &origin) != 0) {
+        wl_session_destroy(inner);
+        wl_plan_free(plan);
+        return WIRELOG_ERR_MEMORY;
+    }
+
     /* Issue #718 contract: inline `.dl` facts must be observable in
      * snapshots and IDB derivations without further host action.  Seed
      * them eagerly here (delta callback is not yet installed, so the
@@ -482,6 +500,7 @@ wirelog_session_create_impl(wirelog_program_t *program,
         wirelog_error_t load_error
             = (wirelog_error_t)wl_facade_session_error_code_with_budget(
                 rc, 0, wl_session_budget_denied(inner));
+        wl_source_origin_free(&origin);
         wl_session_destroy(inner);
         wl_plan_free(plan);
         return load_error;
@@ -490,6 +509,7 @@ wirelog_session_create_impl(wirelog_program_t *program,
     wirelog_session_t *s
         = (wirelog_session_t *)calloc(1, sizeof(wirelog_session_t));
     if (!s) {
+        wl_source_origin_free(&origin);
         wl_session_destroy(inner);
         wl_plan_free(plan);
         return WIRELOG_ERR_MEMORY;
@@ -497,6 +517,7 @@ wirelog_session_create_impl(wirelog_program_t *program,
     s->prog = program;
     s->plan = plan;
     s->inner = inner;
+    s->source_origin = origin;
     *out = s;
     return WIRELOG_OK;
 }
@@ -632,6 +653,7 @@ wirelog_session_destroy(wirelog_session_t *session)
         wl_session_destroy(session->inner);
     if (session->plan)
         wl_plan_free(session->plan);
+    wl_source_origin_free(&session->source_origin);
     /* session->prog is borrowed; caller frees after destroy. */
     free(session);
 }
@@ -924,3 +946,64 @@ wirelog_session_make_compound_typed(wirelog_session_t *session,
         return WIRELOG_ERR_MEMORY;
     return WIRELOG_ERR_EXEC;
 }
+
+/* ======================================================================== */
+/* Host source inspection (Issue #2321)                                     */
+/* ======================================================================== */
+
+/* Admit, validate @relation against the program and its certified origin,
+ * then run @q.  Admission precedes identity and schema checks, so a call
+ * from a callback is BUSY whatever it names. */
+static wirelog_source_query_status_t
+session_source_query(wirelog_session_t *session, wl_source_query_t *q,
+    uint32_t expected_ncols, uint32_t nlanes, wl_source_query_result_t *out)
+{
+    wirelog_source_query_status_t st
+        = wl_session_inspection_begin(session->inner);
+    if (st != WIRELOG_SOURCE_QUERY_OK)
+        return st;
+    wl_source_query_t admit = { .mode = WL_SOURCE_QUERY_ADMIT };
+    st = wl_session_source_query(session->inner, &admit, out);
+    if (st == WIRELOG_SOURCE_QUERY_OK && q->mode != WL_SOURCE_QUERY_ADMIT)
+        st = wl_source_query_resolve(session->prog, &session->source_origin,
+                COL_SESSION(session->inner)->intern, q->relation,
+                expected_ncols, q->lanes, nlanes, &q->ncols);
+    if (st == WIRELOG_SOURCE_QUERY_OK && q->mode != WL_SOURCE_QUERY_ADMIT)
+        st = wl_session_source_query(session->inner, q, out);
+    wl_session_inspection_end(session->inner);
+    return st;
+}
+
+wirelog_source_query_status_t
+wirelog_session_source_count(wirelog_session_t *session, const char *relation,
+    const int64_t *tuple, uint32_t ncols, uint64_t max_rows,
+    uint64_t *out_count)
+{
+    if (out_count)
+        *out_count = 0;
+    if (!session || !session->inner || !relation || !tuple || !out_count
+        || ncols == 0)
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    wl_source_query_t q = {
+        .mode = WL_SOURCE_QUERY_COUNT,
+        .relation = relation,
+        .lanes = tuple,
+        .max_rows = max_rows,
+    };
+    wl_source_query_result_t result = { 0 };
+    wirelog_source_query_status_t st = session_source_query(session, &q,
+            ncols, ncols, &result);
+    if (st == WIRELOG_SOURCE_QUERY_OK)
+        *out_count = result.count;
+    return st;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Tests inspect the inner session to prove a query changed nothing. */
+wl_session_t *wirelog_session_testhook_inner(wirelog_session_t *session);
+wl_session_t *
+wirelog_session_testhook_inner(wirelog_session_t *session)
+{
+    return session ? session->inner : NULL;
+}
+#endif

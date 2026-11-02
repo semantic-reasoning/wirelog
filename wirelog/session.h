@@ -336,6 +336,32 @@ wl_session_snapshot(wl_session_t *session, wirelog_on_tuple_fn callback,
 bool
 wl_session_budget_denied(wl_session_t *session);
 
+/*
+ * Host source inspection admission (Issue #2321).
+ *
+ * wl_session_inspection_begin() admits a read-only inspection only at a
+ * quiescent boundary: it refuses a controlled session (UNSUPPORTED, before
+ * touching the admission lock, so no control, fuel or attempt state moves),
+ * a call made from a delta callback or while any other operation is active
+ * (BUSY: every callback-producing call holds an operation reservation for
+ * its whole length), a closing session or a retained controlled attempt
+ * (BUSY), and a session whose input is sealed or whose streamed load failed
+ * (UNSUPPORTED).  On OK the caller holds one operation reservation and must
+ * release it with wl_session_inspection_end().
+ *
+ * wl_session_source_query() dispatches one request to the backend while the
+ * reservation is held.  It never clears budget-denial diagnostics.
+ */
+wirelog_source_query_status_t
+wl_session_inspection_begin(wl_session_t *session);
+
+void
+wl_session_inspection_end(wl_session_t *session);
+
+wirelog_source_query_status_t
+wl_session_source_query(wl_session_t *session, const wl_source_query_t *query,
+    wl_source_query_result_t *result);
+
 #ifdef __cplusplus
 }
 #endif

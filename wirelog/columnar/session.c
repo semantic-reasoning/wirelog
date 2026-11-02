@@ -1856,6 +1856,160 @@ wl_columnar_session_seed_rows(wl_col_session_t *sess, const char *relation)
     return session_seed_shadow(sess, relation);
 }
 
+/*
+ * Host source inspection (Issue #2321).
+ *
+ * The authoritative source of a relation is its seed shadow when it is a
+ * rule head -- never the head itself, which also holds derived rows -- and
+ * the relation itself otherwise.  Every row of either is one accepted host
+ * occurrence: base_nrows only separates committed rows from inserts not yet
+ * evaluated, and a successful removal has already compacted its rows out.
+ * `$out$` retired rows, `$r$` staged retractions and deltas are evaluation
+ * bookkeeping, not extra occurrences, and are never read.
+ *
+ * Nothing here allocates, sorts, consolidates, fills a cache, builds the
+ * relation hash or bumps a view generation.
+ */
+
+/* session_find_rel() builds the relation hash on first use; inspection must
+ * not.  Fall back to a linear scan on a hash miss as session_find_rel()
+ * does, which also covers a hash left incomplete by a failed insert. */
+static col_rel_t *
+session_find_rel_readonly(wl_col_session_t *sess, const char *name)
+{
+    if (sess->rel_hash_nbuckets > 0) {
+        col_rel_t *rel = session_rel_hash_lookup(sess, name);
+        if (rel)
+            return rel;
+    }
+    for (uint32_t i = 0; i < sess->nrels; i++)
+        if (sess->rels[i] && strcmp(sess->rels[i]->name, name) == 0)
+            return sess->rels[i];
+    return NULL;
+}
+
+#ifdef WL_SESSION_TEST_HOOKS
+/* Starting value of an exact count, to reach the overflow path without a
+ * history of UINT64_MAX rows.  Not source-semantic evidence. */
+uint64_t wl_columnar_source_query_testhook_count_bias;
+#endif
+
+static wirelog_source_query_status_t
+col_session_source_admit(const wl_col_session_t *sess)
+{
+    /* Activity latches: an evaluation, publication, cleanup or rollback is
+     * in flight.  The generic admission already refuses nested calls; these
+     * catch a backend phase that outlives its operation.  A step that failed
+     * and is retryable (plain_step_completion_pending, a retained delta
+     * observer) is quiescent: inserts and removes refuse in that state, so
+     * the source rows are those last committed. */
+    if (sess->plain_step_completion_active || sess->delta_publish_active
+        || sess->delta_observer_prepare || sess->delta_observer_build
+        || sess->cleanup_active || sess->tdd_input_run
+        || wl_columnar_eval_delta_rollback_active(sess)
+        || wl_columnar_eval_delta_observer_active(sess)
+        || wl_columnar_session_cold_pending(sess))
+        return WIRELOG_SOURCE_QUERY_BUSY;
+    return WIRELOG_SOURCE_QUERY_OK;
+}
+
+static wirelog_source_query_status_t
+col_session_source_query(wl_session_t *session, const wl_source_query_t *q,
+    wl_source_query_result_t *out)
+{
+    wl_col_session_t *sess = COL_SESSION(session);
+    wirelog_source_query_status_t st;
+    col_rel_t *src;
+    uint64_t visited = 0;
+    uint64_t count = 0;
+
+    st = col_session_source_admit(sess);
+    if (st != WIRELOG_SOURCE_QUERY_OK || q->mode == WL_SOURCE_QUERY_ADMIT)
+        return st;
+    if (!q->relation || q->ncols == 0
+        || ((q->mode == WL_SOURCE_QUERY_COUNT
+        || q->mode == WL_SOURCE_QUERY_KEY) && !q->lanes))
+        return WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT;
+    if (wl_columnar_session_cold_find(sess, q->relation))
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+
+    /* Select the authoritative storage without creating anything. */
+    if (session_plan_has_rule_head(sess->plan, q->relation)) {
+        char name[256];
+        if (session_seed_shadow_name(q->relation, name, sizeof(name)) != 0)
+            return WIRELOG_SOURCE_QUERY_OVERFLOW;
+        /* A head's shadow is registered before the first row is appended
+         * to the head, and is only ever truncated afterwards; inline facts
+         * are refused upstream.  No shadow therefore means no accepted
+         * input. */
+        src = session_find_rel_readonly(sess, name);
+    } else {
+        /* A relation the session never registered refused every insert
+         * (ENOENT), so it has no accepted input either. */
+        src = session_find_rel_readonly(sess, q->relation);
+    }
+    if (!src || src->nrows == 0) {
+        if (src && src->ncols != 0 && src->ncols != q->ncols)
+            return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+        if (q->mode == WL_SOURCE_QUERY_VALIDATE)
+            return WIRELOG_SOURCE_QUERY_OK;
+        return src && wl_columnar_source_access_gate_busy(&src->source_access)
+               ? WIRELOG_SOURCE_QUERY_BUSY : WIRELOG_SOURCE_QUERY_OK;
+    }
+
+    /* Storage checks, still without reading a row. */
+    if (wl_columnar_source_access_gate_busy(&src->source_access))
+        return WIRELOG_SOURCE_QUERY_BUSY;
+    /* A head first written at a width its `.decl` contradicts. */
+    if (src->ncols != q->ncols)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    if (!src->columns)
+        return WIRELOG_SOURCE_QUERY_INTERNAL_ERROR;
+    /* Weighted rows (timestamps carry a multiplicity), compound storage and
+     * retained retraction backups are not plain occurrence lists. */
+    if (src->timestamps || src->retract_backup_columns
+        || src->compound_kind != WIRELOG_COMPOUND_KIND_NONE)
+        return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    /* NULL lane types mean untyped 64-bit lanes (every seed shadow, and
+     * every relation declared without FLOAT or STRING lanes). */
+    if (src->column_types)
+        for (uint32_t c = 0; c < src->ncols; c++)
+            if (src->column_types[c] != WIRELOG_TYPE_INT64
+                && src->column_types[c] != WIRELOG_TYPE_STRING)
+                return WIRELOG_SOURCE_QUERY_UNSUPPORTED;
+    if (q->mode == WL_SOURCE_QUERY_VALIDATE)
+        return WIRELOG_SOURCE_QUERY_OK;
+
+#ifdef WL_SESSION_TEST_HOOKS
+    count = wl_columnar_source_query_testhook_count_bias;
+#endif
+    for (uint32_t ri = 0; ri < src->nrows; ri++) {
+        /* Count the visit before reading the row: max_rows == 0 permits
+         * only answers that need no row. */
+        if (visited == q->max_rows)
+            return WIRELOG_SOURCE_QUERY_WORK_LIMIT;
+        visited++;
+        if (q->mode == WL_SOURCE_QUERY_KEY) {
+            if (col_rel_get(src, ri, 0) == q->lanes[0]) {
+                out->exists = true;
+                return WIRELOG_SOURCE_QUERY_OK;
+            }
+            continue;
+        }
+        uint32_t c = 0;
+        while (c < src->ncols && col_rel_get(src, ri, c) == q->lanes[c])
+            c++;
+        if (c != src->ncols)
+            continue;
+        if (count == UINT64_MAX)
+            return WIRELOG_SOURCE_QUERY_OVERFLOW;
+        count++;
+    }
+    if (q->mode == WL_SOURCE_QUERY_COUNT)
+        out->count = count;
+    return WIRELOG_SOURCE_QUERY_OK;
+}
+
 /* Copy to rule head @r's retired rows each requested row @state marks as held
  * by @r and not as cancelling an uncommitted insert.  Call before the removal
  * changes @r, and before any relation registration is prepared, since this
@@ -13486,6 +13640,7 @@ static const wl_compute_backend_t col_backend = {
         col_session_controlled_mutation_admit,
     .session_controlled_mutation_committed =
         col_session_controlled_mutation_committed,
+    .session_source_query = col_session_source_query,
 };
 
 const wl_compute_backend_t *

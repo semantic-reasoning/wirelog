@@ -505,6 +505,76 @@ wirelog_session_make_compound_typed(wirelog_session_t *session,
     const wirelog_typed_compound_arg_v1_t *args, uint32_t arg_count,
     uint64_t *handle_out);
 
+/*
+ * Host source inspection (Issue #2321, WIRELOG_SOURCE_QUERY_VERSION 1).
+ *
+ * These calls report what the host has put into a relation through
+ * wirelog_session_insert() and not yet taken out through
+ * wirelog_session_remove() -- the source, not the model.  They never
+ * evaluate, invoke a callback, intern a symbol, or change the session.
+ *
+ * Source: for a rule head, the rows the host inserted into it (never the
+ * rows rules derived); for any other relation, its stored rows.  Inserts not
+ * yet evaluated count; removed rows do not.  Each stored copy counts once.
+ *
+ * Supported relations: user-declared, positive width, every column a scalar
+ * `int64` or `symbol`/`string` (other integer widths are UNSUPPORTED), and no
+ * inline facts for that relation in the program the session was created
+ * from.  A relation that had any inline fact stays UNSUPPORTED even after
+ * every fact is removed; facts on other relations do not matter.  A typed
+ * batch (wirelog_session_insert_typed / _remove_typed) that fails after
+ * applying a row also makes its relation UNSUPPORTED for the session's
+ * lifetime, because its rollback can leave rows no host call requested.
+ * Cold, loading or sealed sources and controlled sessions are UNSUPPORTED.
+ *
+ * Admission: call from the session's owner between operations.  A call made
+ * from inside a callback, or while another operation is running, is BUSY and
+ * leaves that operation intact.  A step that failed and may be retried
+ * leaves the source unchanged and may be inspected.  No lock spans calls:
+ * a host that queries and then removes must hold its own ownership across
+ * both.
+ *
+ * Precedence: outputs are reset first (when non-NULL); then NULL handles,
+ * pointers and zero arity are INVALID_ARGUMENT; then BUSY / UNSUPPORTED
+ * session states; then relation identity (UNKNOWN_RELATION); then full
+ * schema and origin (UNSUPPORTED); then arity and STRING-lane IDs
+ * (INVALID_ARGUMENT); only then storage emptiness and the row limit.
+ *
+ * Work: @max_rows bounds the physical source rows examined; there is no
+ * default.  0 allows only answers that need no row (an empty source); a
+ * nonempty source then gives WORK_LIMIT.  UINT64_MAX is effectively
+ * unbounded.  Finishing on the last permitted row is OK.  WORK_LIMIT
+ * publishes nothing; the call is not resumable.  Cost is
+ * O(min(rows, max_rows) * width) plus metadata lookups, with O(1) auxiliary
+ * memory; @max_rows is not a time deadline.
+ *
+ * Values use the representation of wirelog_session_insert(): INT64 lanes
+ * as-is, STRING lanes as this session's intern IDs.  IDs are not portable
+ * between sessions.
+ */
+
+/**
+ * wirelog_session_source_count:
+ * @session:   Session.
+ * @relation:  Relation name.
+ * @tuple:     Exactly @ncols lanes.
+ * @ncols:     The relation's declared width.
+ * @max_rows:  Maximum source rows to examine.
+ * @out_count: (out) Number of source occurrences equal to @tuple.  Reset to
+ *             0 on entry; meaningful only on WIRELOG_SOURCE_QUERY_OK.
+ *
+ * Count the host source occurrences of @tuple in @relation, after a complete
+ * scan.  See the section comment above for the source, admission,
+ * precedence and work contract.
+ *
+ * Returns: WIRELOG_SOURCE_QUERY_OK, or the failure status; a failure is
+ * never absence.
+ */
+WIRELOG_API wirelog_source_query_status_t
+wirelog_session_source_count(wirelog_session_t *session, const char *relation,
+    const int64_t *tuple, uint32_t ncols, uint64_t max_rows,
+    uint64_t *out_count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5762,6 +5762,28 @@ test_wirelog_advanced_exe = executable(
 
 test('wirelog_advanced', test_wirelog_advanced_exe)
 
+# Issue #2321: non-evaluating host source inspection.
+test_source_inspection_exe = executable(
+  'test_source_inspection',
+  files('test_source_inspection.c'),
+  parser_src,
+  ir_src,
+  optimizer_src,
+  backend_src,
+  io_src,
+  arena_src,
+  thread_src,
+  workqueue_src,
+  '../wirelog/wirelog-easy.c',
+  '../wirelog/api_facade.c',
+  '../wirelog/wirelog_advanced.c',
+  c_args: ['-DWL_SESSION_TEST_HOOKS=1'],
+  include_directories: [wirelog_inc, wirelog_src_inc],
+  dependencies: [nanoarrow_dep, threads_dep, xxhash_dep, mbedtls_dep, math_dep],
+)
+
+test('source_inspection', test_source_inspection_exe)
+
 # Installed-header host contract exercised against the production library.
 test_wirelog_advanced_spill_exe = executable(
   'test_wirelog_advanced_spill', files('test_wirelog_advanced_spill.c'),

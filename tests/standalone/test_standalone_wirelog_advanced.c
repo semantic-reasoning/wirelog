@@ -6,8 +6,18 @@
  * pulls).  Failure = the header has an internal-only forward
  * declaration leaking into its visible API. */
 #include "wirelog/wirelog-advanced.h"
+
+/* Issue #2321: the source-inspection feature macro and declarations come
+ * with this header alone.  sizeof does not evaluate its operand, so this
+ * stays a compile-only check with no link dependency. */
+#if !defined(WIRELOG_SOURCE_QUERY_VERSION) || WIRELOG_SOURCE_QUERY_VERSION < 1
+#error "wirelog-advanced.h must declare WIRELOG_SOURCE_QUERY_VERSION >= 1"
+#endif
+
 int
 main(void)
 {
-    return 0;
+    wirelog_source_query_status_t st = WIRELOG_SOURCE_QUERY_OK;
+    (void)sizeof(&wirelog_session_source_count);
+    return (int)st;
 }

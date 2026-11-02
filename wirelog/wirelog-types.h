@@ -276,6 +276,63 @@ typedef struct {
 } wirelog_schema_t;
 
 /* ======================================================================== */
+/* Host Source Inspection                                                   */
+/* ======================================================================== */
+
+/**
+ * WIRELOG_SOURCE_QUERY_VERSION:
+ *
+ * Feature macro for the non-evaluating host source inspection entry points
+ * (Issue #2321).  Its presence means wirelog_source_query_status_t and the
+ * source-inspection functions of this release are declared.  A consumer that
+ * links a system package should also check that the symbols resolve.
+ */
+#define WIRELOG_SOURCE_QUERY_VERSION 1
+
+/**
+ * wirelog_source_query_status_t:
+ *
+ * Result of a host source inspection call.  Every value other than
+ * WIRELOG_SOURCE_QUERY_OK is a failure: the call's outputs keep the reset
+ * values (count 0, exists false, found false, id -1) and must not be read as
+ * an answer, in particular not as absence.
+ *
+ * @WIRELOG_SOURCE_QUERY_OK:               The answer is in the outputs.
+ * @WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT: NULL handle or output, wrong
+ *     arity, or a STRING lane that is not an ID in the session's intern table.
+ * @WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION: No relation of that name, or a
+ *     private or generated relation.
+ * @WIRELOG_SOURCE_QUERY_UNSUPPORTED:      The relation or session is outside
+ *     the inspected subset: a schema lane other than scalar INT64 or STRING,
+ *     a zero-width relation, a relation with inline program facts, a cold or
+ *     sealed source, a controlled session, or a relation whose stored rows can
+ *     no longer be attributed to host calls.
+ * @WIRELOG_SOURCE_QUERY_BUSY:             Called from a callback, during
+ *     another operation, or while the source is being rewritten.
+ * @WIRELOG_SOURCE_QUERY_WORK_LIMIT:       Answering needs more source rows
+ *     than max_rows allows.  Nothing partial is reported.
+ * @WIRELOG_SOURCE_QUERY_OVERFLOW:         A count, width or name length does
+ *     not fit its representation.
+ * @WIRELOG_SOURCE_QUERY_MEMORY:           An allocation needed to answer
+ *     failed.
+ * @WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED: The easy session's lazy
+ *     initialization failed and has not since succeeded.
+ * @WIRELOG_SOURCE_QUERY_INTERNAL_ERROR:   An internal invariant does not hold.
+ */
+typedef enum {
+    WIRELOG_SOURCE_QUERY_OK = 0,
+    WIRELOG_SOURCE_QUERY_INVALID_ARGUMENT = 1,
+    WIRELOG_SOURCE_QUERY_UNKNOWN_RELATION = 2,
+    WIRELOG_SOURCE_QUERY_UNSUPPORTED = 3,
+    WIRELOG_SOURCE_QUERY_BUSY = 4,
+    WIRELOG_SOURCE_QUERY_WORK_LIMIT = 5,
+    WIRELOG_SOURCE_QUERY_OVERFLOW = 6,
+    WIRELOG_SOURCE_QUERY_MEMORY = 7,
+    WIRELOG_SOURCE_QUERY_INITIALIZATION_FAILED = 8,
+    WIRELOG_SOURCE_QUERY_INTERNAL_ERROR = 9,
+} wirelog_source_query_status_t;
+
+/* ======================================================================== */
 /* Stratification                                                           */
 /* ======================================================================== */
 
