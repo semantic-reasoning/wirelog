@@ -228,7 +228,7 @@ These exist so struct fields can be declared portably; the audit in
 
 Every `atomic_*` call site in `wirelog/` production sources. Counted
 mechanically by `scripts/ci/check-threading-doc.sh`; row count must
-match the script's count (currently **438**).
+match the script's count (currently **451**).
 
 Format: `file:function[#N]` | field | operation | order | justification.
 
@@ -665,7 +665,7 @@ concurrent alias removals cannot underflow the count.
 | `session.c:session_pool_rel_promote#3` | `src->storage_alias_borrows` | `atomic_store_explicit` | relaxed | Leave the closed pool tombstone with no child aliases |
 
 112 + 21 + 37 = **170 atomic call sites** in the summarized groups; the full
-symbol-anchored inventory below covers 438 sites.
+symbol-anchored inventory below covers 451 sites.
 
 The `#N` suffix counts all atomic sites in a symbol, regardless of operation;
 the first site remains unsuffixed. `scripts/ci/check-threading-doc.sh` uses
@@ -1752,7 +1752,7 @@ DONE. If a stop leaves the receipt holding a claim, its caller preserves that
 receipt and resumes with a fresh live maintenance attempt; it cannot abandon or
 reinitialize the receipt/token while the claim remains held.
 
-The complete current atomic-source inventory contains 438 call sites.
+The complete current atomic-source inventory contains 451 call sites.
 
 ### Caller-attempt-bound single mutation admission
 
@@ -2276,6 +2276,28 @@ not change the COMMITTED-token physical-retirement contract.
 | `memory_governor.c:wl_columnar_memory_reserved_trim_advance#6` | governor reserved bytes | `atomic_compare_exchange_strong_explicit` | acq_rel/acquire | Reduce reserved credit with one retryable aggregate CAS |
 | `memory_governor.c:wl_columnar_memory_reserved_trim_advance#7` | token state | `atomic_store_explicit` | release | Publish the trimmed token after aggregate credit succeeds |
 | `arrangement.c:wl_columnar_arrangement_diff_attempt_prepare` | registry token state | `atomic_load_explicit` | acquire | Validate the old registry accounting before the host publication cutoff |
+
+### Controlled host lease and finite transfer observations
+
+These observations validate existing native-thread and generation-bound leases;
+acquire loads do not create a new lifetime pin. The finite ledger unlock
+publishes completed counter changes using the platform-selected release operation.
+
+| Source anchor | Object | Atomic operation | Ordering | Synchronization purpose |
+| --- | --- | --- | --- | --- |
+| `cache.c:wl_columnar_cache_digest_source_valid` | `reader.secondary_owner->state (relation descriptor gate)` | `atomic_load_explicit` | acquire | Validate genuine cache digest descriptor/storage reader holds against live nonzero non-WRITER gate state after snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `cache.c:wl_columnar_cache_digest_source_valid#2` | `reader.owner->state (resolved canonical storage gate)` | `atomic_load_explicit` | acquire | Validate genuine cache digest descriptor/storage reader holds against live nonzero non-WRITER gate state after snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `eval_stack.c:wl_columnar_eval_stack_prepared_reader_valid` | `reader.secondary_owner->state (relation descriptor gate)` | `atomic_load_explicit` | acquire | Validate actual prepared unary descriptor/storage reader authority after native/snapshot/canonical identity and generation proof; observation checks an existing lease, never creates a lifetime pin |
+| `eval_stack.c:wl_columnar_eval_stack_prepared_reader_valid#2` | `reader.owner->state (resolved canonical storage gate)` | `atomic_load_explicit` | acquire | Validate actual prepared unary descriptor/storage reader authority after native/snapshot/canonical identity and generation proof; observation checks an existing lease, never creates a lifetime pin |
+| `lftj.c:wl_columnar_lftj_input_held` | `reader.secondary_owner->state (relation descriptor gate)` | `atomic_load_explicit` | acquire | Validate actual LFTJ descriptor/storage reader holds after native/snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `lftj.c:wl_columnar_lftj_input_held#2` | `reader.owner->state (resolved canonical storage gate)` | `atomic_load_explicit` | acquire | Validate actual LFTJ descriptor/storage reader holds after native/snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `relation.c:wl_columnar_relation_cache_copy_source_valid` | `reader.secondary_owner->state (relation descriptor gate)` | `atomic_load_explicit` | acquire | Validate actual cache scalar-copy descriptor/storage reader holds after native/snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `relation.c:wl_columnar_relation_cache_copy_source_valid#2` | `reader.owner->state (resolved canonical storage gate)` | `atomic_load_explicit` | acquire | Validate actual cache scalar-copy descriptor/storage reader holds after native/snapshot/canonical-owner proof; observation checks an existing lease, never creates a lifetime pin |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_transfer_unlock` | `ledger.writer_gate` | `atomic_exchange_explicit` | release (MSVC branch) | Publish completion and drop the actual held finite-transfer ledger writer; neutral exchange is platform-selected release implementation |
+| `mem_ledger_publication.c:wl_columnar_mem_ledger_publication_transfer_unlock#2` | `ledger.writer_gate` | `atomic_store_explicit` | release (non-MSVC branch) | Publish completed finite-transfer counter updates before another ledger writer may acquire |
+| `relation.c:wl_columnar_relation_empty_source_shape` | `descriptor.storage_alias_borrows` | `atomic_load_explicit` | acquire | Require no storage aliases when classifying the genuine zero-payload self-owned empty source under its real descriptor lease |
+| `relation.c:wl_columnar_relation_empty_source_shape#2` | `descriptor.descriptor_reservation.state` | `atomic_load_explicit` | acquire | Require actual COMMITTED descriptor reservation before accepting governed empty-source metadata |
+| `relation.c:wl_columnar_relation_empty_source_shape#3` | `descriptor.descriptor_reservation.owner_bits` | `atomic_load_explicit` | acquire | Require descriptor token ownership to name the actual descriptor alongside identity/governor/byte proof |
 
 ## Host source inspection admission (#2321)
 

@@ -4880,6 +4880,176 @@ wl_columnar_relation_scalar_retirement_prepare(
     return rc ? rc : EAGAIN;
 }
 
+/* Finite sibling: one managed token per real turn. Old prepare phases and
+ * callers keep their original protocol; 16..20 belong only to this sibling. */
+int
+wl_columnar_relation_scalar_retirement_prepare_finite(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage || s->committed)
+        return EINVAL;
+    if (s->ready) return 0;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 1);
+    if (rc) return rc;
+    col_rel_t *r = s->storage.relation;
+    if (!r) return EINVAL;
+    struct ArrowSchema expected_schema;
+    ArrowSchemaInit(&expected_schema);
+    if (s->phase == WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD) {
+        rc = wl_evaluation_control_charge_attempt(control, id, 192);
+        if (rc) return rc;
+        col_rel_payload_shape_t shape = {
+            .ncols = r->ncols, .owned_columns = s->owned_columns,
+            .column_capacity = r->capacity,
+            .timestamp_capacity = r->timestamp_capacity,
+            .merge_capacity = r->merge_buf_cap,
+            .active_table = r->columns != NULL,
+            .merge_table = r->merge_columns != NULL,
+            .scratch = r->row_scratch != NULL
+        };
+        uint64_t bytes;
+        if (!col_rel_payload_shape_bytes(&shape, &bytes)
+            || bytes > r->retained_reserved_bytes) return EINVAL;
+        s->column = 0; s->phase = 2; s->ready = true;
+        return wl_evaluation_control_charge_attempt(control, id, 0);
+    }
+    if (s->phase == 0) {
+        wl_columnar_source_access_gate_request_t requests[2] = {
+            {&r->descriptor_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER},
+            {&r->source_access, WL_COLUMNAR_SOURCE_ACCESS_GATE_WRITER}
+        };
+        rc = wl_columnar_source_access_gate_round_acquire(
+            &s->storage.gate_round, requests, 1, 1);
+        if (rc) return rc;
+        s->phase = 1;
+    } else if (s->phase == 1) {
+        if (r->pool_owned || r->arena_owned || r->retract_backup_columns
+            || r->retract_backup_timestamps ||
+            r->retract_backup_timestamp_capacity
+            || r->retract_backup_nrows || r->retract_backup_base_nrows
+            || r->retract_backup_capacity || r->retract_backup_sorted_nrows
+            || r->col_shared || r->compound_kind != WIRELOG_COMPOUND_KIND_NONE
+            || r->compound_count || r->compound_arity_map ||
+            r->compound_arity_len
+            || r->inline_physical_offset || r->memory_budget_denial_pending
+            || r->pool_name_reserved_bytes
+            || r->deferred_relation_next || r->deferred_relation_session
+            || r->storage_owner != r || !r->relation_identity
+            || r->storage_owner_identity != r->relation_identity
+            || r->storage_owner_generation != r->storage_generation
+            || col_rel_storage_alias_borrow_count(r)
+            || r->schema.dictionary || r->schema.private_data
+            || (r->schema_ok && (r->schema.release != expected_schema.release
+            || r->schema.n_children != r->ncols
+            || (r->ncols && (!r->schema.children || !r->col_names))))
+            || (!r->schema_ok && (r->schema.release || r->schema.children
+            || r->schema.n_children || r->col_names))) return ENOTSUP;
+        if ((r->timestamps != NULL) != (r->timestamp_capacity != 0)
+            || (r->timestamps && r->timestamp_capacity < r->nrows)
+            || !wl_columnar_memory_size_mul(r->timestamp_capacity,
+            sizeof(col_delta_timestamp_t), &s->timestamp_bytes)
+            || (!r->mem_ledger && r->ledger_ts_bytes)) return EINVAL;
+        if (r->timestamps) {
+            const void *ts = r->timestamps;
+            if (ts == (const void *)r || ts == (const void *)r->columns
+                || ts == (const void *)r->merge_columns
+                || ts == (const void *)r->row_scratch
+                || ts == (const void *)r->col_names
+                || ts == (const void *)r->column_types
+                || ts == (const void *)r->dedup_slots
+                || ts == (const void *)r->name
+                || ts == (const void *)r->schema.children
+                || ts == (const void *)r->schema.name
+                || ts == (const void *)r->schema.format
+                || ts == (const void *)r->schema.metadata) return EINVAL;
+        }
+        s->storage.governor = r->memory_governor
+            ? wl_columnar_memory_governor_ref_get(r->memory_governor) : NULL;
+        s->phase = 16;
+    } else if (s->phase >= 16 && s->phase < 20) {
+        size_t i = s->phase - 16;
+        uint64_t *bytes;
+        wl_columnar_memory_reservation_t *token =
+            wl_columnar_relation_managed_token_at(r, i, &bytes);
+        if (s->storage.governor
+                ? !wl_columnar_relation_managed_token_valid(token,
+            s->storage.governor, r, *bytes)
+                : (*bytes || !wl_columnar_relation_managed_empty_token(token)))
+            return EINVAL;
+        s->phase++;
+    } else if (s->phase == 20) {
+        if (!wl_columnar_relation_managed_empty_token(
+                &r->pool_name_reservation))
+            return ENOTSUP;
+        s->ledger = r->mem_ledger;
+        /* Deferred accounting can leave either unbilled storage or an unpaid
+         * refund after raw consolidation already freed the stamp array.
+         * The recorded charge is authoritative, independently of live bytes. */
+        s->ledger_timestamp_bytes = r->ledger_ts_bytes;
+        s->phase = 2;
+    } else if (s->phase == 2) {
+        if (s->column == r->ncols) {
+            if ((r->timestamps || s->ledger_timestamp_bytes)
+                && s->storage.governor) {
+                /* Pending proof owns real writers, but is not READY. */
+                s->phase = WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD;
+                rc = wl_evaluation_control_charge_attempt(control, id, 0);
+                return rc ? rc : EAGAIN;
+            }
+            s->column = 0;
+            s->ready = true;
+            return wl_evaluation_control_charge_attempt(control, id, 0);
+        }
+        uint32_t c = s->column;
+        if ((r->nrows && (!r->columns || !r->columns[c]))
+            || (r->column_types && (r->column_types[c] < WIRELOG_TYPE_INT32
+            || r->column_types[c] > WIRELOG_TYPE_BOOL))) return ENOTSUP;
+        if (r->schema_ok) {
+            const struct ArrowSchema *child = r->schema.children[c];
+            if (!child || child->n_children || child->dictionary
+                || child->private_data ||
+                child->release != expected_schema.release
+                || !r->col_names[c])
+                return ENOTSUP;
+            if (r->timestamps) {
+                const void *ts = r->timestamps;
+                if (ts == (const void *)child
+                    || ts == (const void *)child->name
+                    || ts == (const void *)child->format
+                    || ts == (const void *)child->metadata) return EINVAL;
+            }
+        }
+        if (r->timestamps
+            && ((r->columns && (void *)r->timestamps == r->columns[c])
+            || (r->merge_columns
+            && (void *)r->timestamps == r->merge_columns[c])
+            || (r->col_names
+            && (void *)r->timestamps == r->col_names[c]))) return EINVAL;
+        if (r->columns && r->columns[c]) {
+            ++s->owned_columns;
+            uint64_t bytes = (uint64_t)r->capacity * sizeof(int64_t);
+            if (!wl_columnar_memory_size_add(s->ledger_bytes, bytes,
+                &s->ledger_bytes)) return EOVERFLOW;
+        }
+        s->prior_column = 0;
+        s->phase = 3;
+    } else if (s->phase == 3) {
+        /* Reject duplicate backing pointers before any irreversible free. */
+        if (s->prior_column < s->column) {
+            uint32_t a = s->prior_column++, b = s->column;
+            if ((r->columns && r->columns[a]
+                && r->columns[a] == r->columns[b])
+                || (r->merge_columns && r->merge_columns[a]
+                && r->merge_columns[a] == r->merge_columns[b])) return EINVAL;
+        } else {
+            s->column++; s->phase = 2;
+        }
+    } else return EINVAL;
+    rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    return rc ? rc : EAGAIN;
+}
+
 int
 wl_columnar_relation_scalar_retirement_cancel(
     wl_columnar_relation_scalar_retirement_t *s)
@@ -5051,6 +5221,53 @@ wl_columnar_relation_scalar_retirement_step(
     }
     rc = wl_evaluation_control_charge_attempt(control, id, 0);
     return rc ? rc : EAGAIN;
+}
+
+/* Complete one ledger attempt without retaining stack publication storage,
+ * funding or a held gate. The caller prepays its metadata128 separately;
+ * ledger prepare109, initial/apply/release166 and one round28 are real debits. */
+int
+wl_columnar_relation_scalar_retirement_ledger_step_finite(
+    wl_columnar_relation_scalar_retirement_t *s,
+    wl_evaluation_control_t *control, uint64_t id)
+{
+    if (!s || s->storage.identity != (uintptr_t)&s->storage
+        || !s->committed || s->phase != 12 || !s->storage.relation
+        || !s->storage.gate_round.thread_valid
+        || !wl_columnar_source_access_gate_round_thread_equal(
+            &s->storage.gate_round)) return EINVAL;
+    int rc = wl_evaluation_control_charge_attempt(control, id, 0);
+    if (rc) return rc;
+    col_rel_t *r = s->storage.relation;
+    if (s->ledger && (s->ledger_bytes || s->ledger_timestamp_bytes)) {
+        wl_columnar_mem_ledger_publication_prepared_t ledger = {0};
+        wl_columnar_mem_ledger_publication_request_t requests[2] = {
+            {WL_MEM_SUBSYS_RELATION, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+             s->ledger_bytes},
+            {WL_MEM_SUBSYS_TIMESTAMP, WL_COLUMNAR_MEM_LEDGER_PUBLICATION_FREE,
+             s->ledger_timestamp_bytes}
+        };
+        unsigned count = s->ledger_timestamp_bytes ? 2 : 1;
+        rc = wl_columnar_mem_ledger_publication_prepare_controlled(
+            s->ledger, requests, count, &ledger, control);
+        if (!rc) rc =
+                wl_columnar_mem_ledger_publication_try_acquire_controlled(
+                &ledger);
+        if (rc) {
+            if (ledger.phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_READY
+                || ledger.phase == WL_COLUMNAR_MEM_LEDGER_PUBLICATION_HELD) {
+                if (wl_columnar_mem_ledger_publication_cancel(&ledger)) abort();
+            }
+            return rc;
+        }
+        /* No callback, debit or poll between our gate claim and release. */
+        if (wl_columnar_mem_ledger_publication_apply(&ledger)
+            || wl_columnar_mem_ledger_publication_release(&ledger)) abort();
+    }
+    r->ledger_ts_bytes = 0; r->mem_ledger = NULL; s->ledger = NULL;
+    s->ledger_bytes = s->ledger_timestamp_bytes = 0;
+    s->phase = 10;
+    return EAGAIN;
 }
 
 /* Checked destruction and retirement leave the descriptor token embedded

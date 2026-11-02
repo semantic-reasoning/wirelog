@@ -2926,6 +2926,68 @@ test_resumable_retirement_authority(void)
     PASS();
 }
 
+static unsigned retirement_turnover_hits;
+static uint64_t retirement_turnover_id;
+
+static void
+retirement_turnover_before_credit(wl_evaluation_control_t *control,
+    wl_columnar_memory_governor_t *governor, uint64_t old, bool overflow)
+{
+    (void)governor; (void)old;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!overflow && !retirement_turnover_hits++);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        !wl_evaluation_control_finish(control, &controlled_owner, 0, 0)
+        && !wl_evaluation_control_reset(control)
+        && !wl_evaluation_control_begin(control, &controlled_owner));
+    retirement_turnover_id = wl_evaluation_control_active_attempt_id(control);
+}
+
+static void
+test_resumable_retirement_credit_turnover(void)
+{
+    TEST("credit checkpoint rejects restarted cleanup generation before CAS");
+    wl_columnar_memory_governor_t governor;
+    wl_columnar_memory_reservation_t token;
+    wl_columnar_memory_retirement_receipt_t receipt = {0};
+    controlled_governor(&governor, 128);
+    wl_columnar_memory_reservation_init(&token);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        wl_columnar_memory_reserve(&governor, 7, &token));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        !wl_columnar_memory_retirement_begin(&token, &governor, NULL,
+        WL_COLUMNAR_MEMORY_RETIRE_ROLLBACK_RESERVED, &receipt));
+    wl_evaluation_control_t *control = controlled_begin(0);
+    uint64_t id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        !wl_columnar_memory_retirement_step(&receipt, control, id)
+        && !wl_columnar_memory_retirement_step(&receipt, control, id)
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT);
+    retirement_turnover_hits = 0;
+    wl_columnar_memory_governor_test_before_total_cas =
+        retirement_turnover_before_credit;
+    int rc = wl_columnar_memory_retirement_step(&receipt, control, id);
+    wl_columnar_memory_governor_test_before_total_cas = NULL;
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        rc == EINVAL && retirement_turnover_hits == 1 &&
+        retirement_turnover_id != id
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_CREDIT
+        && atomic_load_explicit(&token.state, memory_order_acquire)
+        == WL_COLUMNAR_MEMORY_RESERVATION_RETIREMENT_CLAIMED
+        && wl_columnar_memory_reserved(&governor) == 7
+        );
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(!controlled_end(control, 0));
+    control = controlled_begin(0);
+    id = wl_evaluation_control_active_attempt_id(control);
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        !wl_columnar_memory_retirement_step(&receipt, control, id)
+        && !wl_columnar_memory_reserved(&governor)
+        && receipt.phase == WL_COLUMNAR_MEMORY_RETIREMENT_DONE
+        && !wl_columnar_memory_retirement_acknowledge(&receipt));
+    WL_COLUMNAR_MEMORY_GOVERNOR_CHECK(
+        controlled_end(control, 0) == WL_COLUMNAR_MEMORY_RETIREMENT_STEP_WORK);
+    PASS();
+}
+
 static void
 test_resumable_retirement_contention(void)
 {
@@ -3797,6 +3859,7 @@ main(void)
     test_resumable_reservation_retirement();
     test_resumable_retirement_authority();
     test_resumable_retirement_contention();
+    test_resumable_retirement_credit_turnover();
     test_resumable_retirement_claim_and_underflow();
     test_resumable_retirement_invalid_shapes();
     test_attempt_admission_raw_twins();

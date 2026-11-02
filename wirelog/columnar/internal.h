@@ -872,6 +872,18 @@ int wl_columnar_relation_scalar_retirement_begin(
 int wl_columnar_relation_scalar_retirement_prepare(
     wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
     uint64_t);
+/* Finite preparation splits the four token validations into separate turns.
+ * Ledger step handles phase12 once; caller funds metadata128 and immediately
+ * drains/cancels every local ledger publication before returning. */
+enum {
+    WL_COLUMNAR_RELATION_SCALAR_FINITE_PAYLOAD = 21
+};
+int wl_columnar_relation_scalar_retirement_prepare_finite(
+    wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_relation_scalar_retirement_ledger_step_finite(
+    wl_columnar_relation_scalar_retirement_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_relation_scalar_retirement_cancel(
     wl_columnar_relation_scalar_retirement_t *);
 int wl_columnar_relation_scalar_retirement_commit(
@@ -8075,13 +8087,27 @@ typedef enum {
     WL_COLUMNAR_EVAL_STACK_PREPARED_DRAIN_OLD,
     WL_COLUMNAR_EVAL_STACK_PREPARED_CLEAR_WORK,
     WL_COLUMNAR_EVAL_STACK_PREPARED_ACK_READY,
-    WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED
+    WL_COLUMNAR_EVAL_STACK_PREPARED_ACKED,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_HEAD,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SEGMENTS,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_SELECT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_INIT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_PREPARE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_COMMIT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DISPOSE,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_SCALAR,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_CLEAR_WORK,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_INIT,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLAIMS,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_CLEAR,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINE_RESTORE
 } wl_columnar_eval_stack_unary_prepared_phase_t;
 
 typedef enum {
     WL_COLUMNAR_EVAL_STACK_PREPARED_NONE,
     WL_COLUMNAR_EVAL_STACK_PREPARED_ABORT,
-    WL_COLUMNAR_EVAL_STACK_PREPARED_RESUME
+    WL_COLUMNAR_EVAL_STACK_PREPARED_RESUME,
+    WL_COLUMNAR_EVAL_STACK_PREPARED_FINISH_DECLINED
 } wl_columnar_eval_stack_unary_prepared_disposition_t;
 
 typedef struct {
@@ -8143,6 +8169,23 @@ int wl_columnar_eval_stack_unary_prepared_join_begin(
     wl_columnar_eval_stack_unary_prepared_t *,
     wl_columnar_eval_stack_cleanup_frame_t *,
     const wl_columnar_eval_plan_numeric_attempt_t *);
+/* Rebind a genuine ACKED receipt at actual quiescent ordinary JOIN FINISH.
+ * Only distinct cleanup funding is charged. These typed steps may make multiple
+ * genuine subadmissions; no whole-call256 bound is implied. Decline is legal
+ * only before relation retirement commit/borrowed clear and preserves the
+ * remaining owner, never already freed segment metadata. ACK uses the existing
+ * terminal API; automatic driver selection is a separate integration. */
+int wl_columnar_eval_stack_unary_prepared_join_finish_begin(
+    wl_columnar_eval_stack_unary_prepared_t *,
+    wl_columnar_eval_stack_cleanup_frame_t *,
+    const wl_columnar_eval_plan_numeric_attempt_t *,
+    wl_evaluation_control_t *, uint64_t);
+int wl_columnar_eval_stack_unary_prepared_join_finish_step(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
+int wl_columnar_eval_stack_unary_prepared_join_finish_decline(
+    wl_columnar_eval_stack_unary_prepared_t *, wl_evaluation_control_t *,
+    uint64_t);
 int wl_columnar_eval_stack_unary_prepared_step(
     wl_columnar_eval_stack_unary_prepared_t *);
 int wl_columnar_eval_stack_unary_prepared_cancel(
@@ -8175,14 +8218,21 @@ extern void (*wl_columnar_eval_stack_test_unary_prepared_checkpoint)(
 /* Test-only copied observation; addresses are comparison tokens, never loans. */
 typedef struct {
     const void *relation, *segments, *continuation;
-    uint32_t segment_count;
-    unsigned kind, phase;
+    const void *snapshot_relation, *snapshot_segments;
+    uint32_t segment_count, snapshot_segment_count;
+    unsigned kind, phase, scalar_phase, scalar_init_phase, managed_phase;
     int first_result;
-    bool owned, is_delta, committed, result_saved;
+    bool owned, is_delta, committed, result_saved, scalar_started, scalar_ready;
+    bool scalar_ledger_pending, credit_started[4], credit_empty[4];
 } wl_columnar_eval_stack_test_unary_observation_t;
 int wl_columnar_eval_stack_test_unary_observe(
     wl_columnar_eval_stack_cleanup_frame_t *, const void *,
     wl_columnar_eval_stack_test_unary_observation_t *);
+/* Test fixture transfers one genuine malloc-owned segment array on success.
+ * Only authentic quiescent uncommitted FINISH; no phase/owner flags are seeded. */
+int wl_columnar_eval_stack_test_unary_output_segments_owned(
+    wl_columnar_eval_stack_cleanup_frame_t *, const void *, uint32_t *,
+    uint32_t);
 #endif
 
 enum { WL_COLUMNAR_EVAL_SERIAL_FRAMED_HOST_WORK = 384 };

@@ -1367,3 +1367,91 @@ precursor; its generic owned disposal is not certified as bounded scalar cleanup
 Automatic receipt storage, selection and funding, a bounded context FINISH
 adapter, actual cache policy integration and the containing-route audit of
 legacy binding callers remain separate required work for the grouped issues.
+
+### Context-owned bounded ordinary JOIN FINISH
+
+A separate typed FINISH lease now reuses the genuine ACKED prepared receipt at
+its original address. Actual CONTROL first releases the context's original pin
+and reaches quiescent FINISH. The new constructor authenticates that frame and
+numeric owner, retains the original allocation, and installs the existing
+prepared marker using distinct live cleanup funding. It never polls or charges
+the original attempt or its successor. Header proof authenticates ordinary JOIN,
+the cleared decision history and actual private output before changing cleanup
+state. Different SEMI/ANTI contexts receive no context writes and can drain only
+the attempted lease.
+
+The lease preserves original unary control/ID binding until the existing parent
+RESET. It clears the context's private output borrow, uses the real staged scalar
+initializer, acquires actual descriptor/storage writers, validates columns and
+prior-pointer pairs, and earns genuine READY. A finite preparation sibling checks
+one managed token per phase16..19, then the pool/accounting header in20. Governed
+timestamp or recorded timestamp debt takes a separate pending phase21. That phase
+charges a real additional192 before constructing the exact checked payload shape.
+It restores phase2/column0/READY only after the original overflow and retained
+capacity checks succeed. No caller phase or READY flag supplies this authority.
+
+Scalar retirement commit transfers actual destruction authority, then clears the
+selected entry, its shadow, the saved private borrow and historical unary snapshot
+before any later descriptor free. Disposal advances one column, schema child,
+pointer, managed credit or terminal claim action at a time. The bridge routes
+ledger phase12 through an additive one-CAS acquisition sibling. Its local
+publication is immediately applied/released or cancelled before return; neither
+a held gate nor funding/stack publication borrower survives the call. The actual
+governor CREDIT checkpoint now rechecks the saved cleanup ID after its hook and
+before credit CAS, retaining the claim if the cleanup generation changed.
+
+Segment disposal is an irreversible legal cleanup prefix. The selected entry and
+shadow lose that array, and only a matching historical snapshot loses its segment
+fields, before free in one callback-free action. A different live original ABORT
+array remains intact. Pre-retirement decline resets actual initializer state,
+releases genuine writer claims, clears scalar state and restores the remaining
+legal FINISH owner/private relation borrow. It never recreates a freed array.
+After relation retirement commit or borrowed-entry terminal clear, decline
+refuses; cleanup retains its debt through completion. A declined receipt preserves
+its causal cleanup error separately from the original first semantic result.
+Supported scalar cleanup reaches physical DONE, clears actual scalar authority
+and advances context RESET before marker/ref ACK. ACKED history uses local bytes.
+
+Each real action has its own source ledger. Constructor204/256, header149/192,
+segment81/128, selection94/128, scalar commit189/192, non-ledger disposal160/256,
+ledger wrapper120/128, scalar clear at most210/256, claim release188/256,
+decline restoration70/128, work clear98/128 and existing ACK125/192 fit their
+admissions. Complete step scaffolding is at most64, including fee selection,
+error/disposition handling and busy/return tails. Payload body including its
+actual caller tail is191/192, with no room for uncounted additions. Its unchanged
+generic formula expands all three grids, timestamp products, scratch and checked
+sums; the local zero backup fields justify the separately documented bound.
+
+Initializer calls make genuine metadata192/128 plus BOOT128, ZERO256, BIND192
+or RESET128 admissions. Payload makes metadata128 + entry1 + payload192.
+Ledger makes metadata128 + prepare109 + future166 + one round28; the166 is
+initial26 + apply117 + release23. Scalar debt/phase suffix belongs to wrapper
+metadata, not that same ledger credit. These are bounded multiple-admission calls,
+not a claim that each whole call costs at most256. Existing raw scalar and looping
+ledger APIs retain their separate qualifications; they are not recertified here.
+
+Numeric fixtures use actual preceding JOIN-owned inputs, CHILD and genuine
+FINISH-producing PENDING, success/ABORT/RESUME, original finish/reset/successor,
+and65-column owned retirement. Per-call fresh cleanup controls are destroyed on
+return. Literal exact/one-short schedules cover initialization, preparation,
+payload, ledger, managed credit, decline and ACK, with actual pending tuples
+unchanged until consume-first. Timestamp storage for the bridge boundary fixture
+is constructed by the checked timestamp API on a real owned intermediate before
+the next unary claims it; this does not claim ordinary JOIN naturally emits
+timestamped output. Separate scalar-leaf constructors cover mixed signed/unsigned,
+float/bool, narrow/wide and governed/timestamp combinations with peer ledger debt.
+
+Real pool construction tests unsupported segmented decline through genuine
+writer refusal and legal generic remaining FINISH. Ordinary JOIN naturally has
+segmentless heap output: the distinct ABORT arrays test is explicitly a manual
+internal fixture using checked compound-schema construction and a hooks-only
+ownership transfer before marker installation. It seeds no phase, native owner,
+READY, relation ownership or pool flag. Copied observations verify snapshot lifetime;
+foreign/copy/output geometry, reentry and actual outer/initializer/PRECAS/CREDIT
+funding turnover tests verify authority and first-result preservation.
+
+This is still manually selected primitive integration. Automatic receipt storage,
+selection and funding through the actual session driver, cache/policy acceptance,
+shared/cap rollback and the reachable containing-route audit remain required.
+Unsupported decline's legal generic disposer is not a bounded fallback acceptance
+claim, and no broader issue or coverage row closes from this lease alone.
