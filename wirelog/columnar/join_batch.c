@@ -132,16 +132,27 @@ col_join_batch_record_fallback(wl_col_session_t *sess,
             col_join_batch_eligibility_name(reason));
 }
 
-#define COL_JOIN_BATCH_SESSION_RUN_SLOTS \
-        (sizeof(((wl_col_session_t *)0)->join_batch_runs) / sizeof(uint32_t))
+/* Both per-route counter arrays are indexed by the route enum, and the
+ * worker fold walks both up to COL_JOIN_BATCH_RUN_ROUTES. */
+#define COL_JOIN_BATCH_SESSION_SLOTS(field) \
+        (sizeof(((wl_col_session_t *)0)->field) \
+        / sizeof(((wl_col_session_t *)0)->field[0]))
 #if defined(_MSC_VER)
 typedef char col_join_batch_run_routes_check_
-    [(COL_JOIN_BATCH_RUN_ROUTES == COL_JOIN_BATCH_SESSION_RUN_SLOTS) ? 1 : -1];
+    [(COL_JOIN_BATCH_RUN_ROUTES
+        == COL_JOIN_BATCH_SESSION_SLOTS(join_batch_runs)) ? 1 : -1];
+typedef char col_join_batch_worker_run_routes_check_
+    [(COL_JOIN_BATCH_RUN_ROUTES
+        == COL_JOIN_BATCH_SESSION_SLOTS(join_batch_worker_runs)) ? 1 : -1];
 #else
-_Static_assert(COL_JOIN_BATCH_RUN_ROUTES == COL_JOIN_BATCH_SESSION_RUN_SLOTS,
+_Static_assert(COL_JOIN_BATCH_RUN_ROUTES
+    == COL_JOIN_BATCH_SESSION_SLOTS(join_batch_runs),
     "join_batch_runs has one counter per route");
+_Static_assert(COL_JOIN_BATCH_RUN_ROUTES
+    == COL_JOIN_BATCH_SESSION_SLOTS(join_batch_worker_runs),
+    "join_batch_worker_runs has one counter per route");
 #endif
-#undef COL_JOIN_BATCH_SESSION_RUN_SLOTS
+#undef COL_JOIN_BATCH_SESSION_SLOTS
 
 static uint32_t
 join_batch_saturating_add(uint32_t a, uint32_t b)
