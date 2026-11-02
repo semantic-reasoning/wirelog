@@ -10791,6 +10791,97 @@ cleanup:
 #undef GLOBAL_CHECK
 }
 
+extern bool (*wl_columnar_eval_test_outbound_head_growth)(wl_col_session_t *,
+    uint32_t);
+static wl_atomic_u64 outbound_growth_workers;
+static wl_atomic_u64 outbound_growth_owner;
+
+/* Report the head as grown on outbound workers only, and record which
+ * workers asked and whether the round ran in owner mode. */
+static bool
+outbound_grow_head(wl_col_session_t *worker, uint32_t ri)
+{
+    (void)ri;
+    record_actual_worker(&outbound_growth_workers, worker->worker_id);
+    if (worker->coordinator && worker->coordinator->tdd_owner_lifetime)
+        atomic_store_explicit(&outbound_growth_owner, 1,
+            memory_order_relaxed);
+    return worker->tdd_outbound_only_active;
+}
+
+/* Issue #1373: an outbound worker must not turn head growth into a second
+ * delta for the same worker and relation: the coordinator would exchange
+ * at most one of the two.  The worker now fails the stratum with EPROTO,
+ * in global-read mode (join on col1) and in owner mode (join on col0). */
+static void
+test_outbound_head_growth_refused(uint32_t workers, bool owner)
+{
+    TEST(owner ? "owner-mode outbound head growth is refused with EPROTO"
+                : "global-read outbound head growth is refused with EPROTO");
+    uint32_t key = 0, projection[] = { 0, 1 };
+    const char *keys[] = { owner ? "col0" : "col1" };
+    wl_plan_op_exchange_t exchange = { .num_workers = 1,
+                                       .key_col_idxs = &key,
+                                       .key_col_count = 1 };
+    wl_plan_op_t output_ops[] = {
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "output" },
+        { .op = WL_PLAN_OP_JOIN, .right_relation = "input", .left_keys = keys,
+          .right_keys = keys, .key_count = 1, .project_indices = projection,
+          .project_count = 2 },
+        { .op = WL_PLAN_OP_VARIABLE, .relation_name = "input" },
+        { .op = WL_PLAN_OP_CONCAT },
+        { .op = WL_PLAN_OP_EXCHANGE, .opaque_data = &exchange }
+    };
+    wl_plan_relation_t relations[] = {
+        { .name = "output", .delta_name = "$d$output", .ops = output_ops,
+          .op_count = 5 }
+    };
+    wl_plan_stratum_t stratum = { .relations = relations, .relation_count = 1,
+                                  .is_recursive = true };
+    const char *edb[] = { "input" };
+    wl_plan_t plan = { .strata = &stratum, .stratum_count = 1,
+                       .edb_relations = edb, .edb_count = 1 };
+    wl_session_t *session = NULL;
+    int64_t *values = NULL;
+    tuple_collector_t tuples = { 0 };
+    const char *failure = NULL;
+    atomic_store_explicit(&outbound_growth_workers, 0, memory_order_relaxed);
+    atomic_store_explicit(&outbound_growth_owner, 0, memory_order_relaxed);
+#define GROWTH_CHECK(condition, message) \
+        do { if (!(condition)) { failure = message; goto cleanup; } } while (0)
+    GROWTH_CHECK(wl_session_create(wl_backend_columnar(), &plan, workers,
+        &session) == 0, "growth session");
+    uint32_t input_rows = workers * 4096;
+    values = malloc((size_t)input_rows * 2 * sizeof(*values));
+    GROWTH_CHECK(values, "growth input allocation");
+    for (uint32_t i = 0; i < input_rows * 2; i++) values[i] = 42;
+    GROWTH_CHECK(wl_session_insert(session, "input", values, input_rows,
+        2) == 0, "growth input");
+    wl_columnar_eval_test_outbound_head_growth = outbound_grow_head;
+    int rc = wl_session_snapshot(session, collect_tuple, &tuples);
+    wl_columnar_eval_test_outbound_head_growth = NULL;
+    wl_col_session_t *coord = COL_SESSION(session);
+    GROWTH_CHECK(atomic_load_explicit(&outbound_growth_workers,
+        memory_order_relaxed) == (UINT64_C(1) << workers) - 1,
+        "every outbound worker reached the check");
+    GROWTH_CHECK((atomic_load_explicit(&outbound_growth_owner,
+        memory_order_relaxed) != 0) == owner, "the intended mode ran");
+    GROWTH_CHECK(rc == EPROTO, "head growth fails the stratum with EPROTO");
+    GROWTH_CHECK(tuples.count == 0, "no tuple is delivered");
+    GROWTH_CHECK(coord->tdd_workers_count == 0 && coord->delta_queue == NULL
+        && coord->mem_channel_ring_bytes == 0,
+        "workers and the queue are torn down after the refusal");
+cleanup:
+    wl_columnar_eval_test_outbound_head_growth = NULL;
+    free(values);
+    wl_session_destroy(session);
+    if (failure) {
+        FAIL(failure); return;
+    }
+    PASS();
+#undef GROWTH_CHECK
+}
+
 /* Issue #2092: a nonrecursive stratum `pre` completes ahead of the
  * global-read stratum, which then reads it and fails.  The retry clears
  * `pre` before re-deriving it, so it holds exactly one copy of `input`. */
@@ -17563,6 +17654,8 @@ main(void)
         test_global_read_publication(workers, 0, 9, 1, false);
 #endif
         test_global_read_publication(workers, 1, 0, 1, true);
+        test_outbound_head_growth_refused(workers, false);
+        test_outbound_head_growth_refused(workers, true);
         test_global_read_publication(workers, 1, 1, 1, true);
         test_global_read_publication(workers, 1, 3, 1, true);
         test_global_read_prefix_retry(workers, 1);
