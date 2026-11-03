@@ -282,6 +282,40 @@ run_fixture(const char *src, const char *data, passes_t passes,
     return out;
 }
 
+/* Insert @data, step once and report how many workers the step used.  The
+ * width is read before any snapshot, which resets it. */
+static int
+step_width(const char *src, const char *data, uint32_t workers,
+    uint32_t *max_active)
+{
+    wirelog_error_t err;
+    wl_plan_t *plan = NULL;
+    wl_session_t *sess = NULL;
+    const char *cursor = data;
+    int rc;
+
+    *max_active = 0;
+    wirelog_program_t *prog = wirelog_parse_string(src, &err);
+    if (!prog)
+        return -1;
+    rc = wl_plan_from_program(prog, &plan);
+    plan_fixture_hold(prog);
+    if (rc == 0)
+        rc = wl_session_create(wl_backend_columnar(), plan, workers, &sess);
+    if (rc == 0)
+        rc = insert_rows(sess, &cursor);
+    if (rc == 0)
+        rc = wl_session_step(sess);
+    if (sess) {
+        wl_columnar_session_get_tdd_worker_width_stats(sess, NULL,
+            max_active);
+        wl_session_destroy(sess);
+    }
+    if (plan)
+        wl_plan_free(plan);
+    return rc;
+}
+
 /* Sort the space-separated rows of @expected into @buf. */
 static void
 expected_text(const char *expected, char *buf, size_t size)
@@ -655,10 +689,11 @@ test_cached_join_matches_its_operation(void)
         "e0 4 23 11|e2 21 4", "|a(21,21) a(21,23) a(23,21) a(23,23)");
 }
 
-/* Two occurrences of the same join still share a cached result.  Only the
- * snapshot path is checked: a step at two and at four workers returns
- * EINVAL on this program on main as well, where p has no columns before its
- * first evaluation. */
+/* Two occurrences of the same join still share a cached result.  The model
+ * is checked after a snapshot and after a step.  A step at two and at four
+ * workers used to return EINVAL here (#2240): the worker's private image of
+ * p was refused because p carried an appended tail that its run metadata
+ * did not cover yet. */
 static void
 test_same_join_still_shares_cache(void)
 {
@@ -671,7 +706,29 @@ test_same_join_still_shares_cache(void)
 
     check_fixture_modes("same join: model", src, data,
         "p(1,2) p(1,4) p(1,6) p(2,3) p(2,5) p(2,7) p(3,4) p(3,6) "
-        "p(4,5) p(4,7) p(5,6) p(6,7)", false);
+        "p(4,5) p(4,7) p(5,6) p(6,7)", true);
+    check_fixture("same join: two inserts with a step between", src,
+        "e 1 2; e 2 3; e 3 4|e 4 5; e 5 6; e 6 7",
+        "p(1,2) p(1,4) p(2,3) p(3,4)|"
+        "p(1,2) p(1,4) p(1,6) p(2,3) p(2,5) p(2,7) p(3,4) p(3,6) "
+        "p(4,5) p(4,7) p(5,6) p(6,7)");
+    TEST("same join: a step runs on two or more workers");
+    int parallel_failures = 0;
+    for (size_t wi = 1; wi < WORKER_COUNTS; wi++) {
+        /* main() sets WIRELOG_TDD_MIN_ROWS_PER_WORKER=1, so six rows are
+         * enough to spread the stratum over every worker. */
+        uint32_t active = 0;
+        int step_rc = step_width(src, data, worker_counts[wi], &active);
+        if (step_rc != 0 || active < 2) {
+            printf("\n    W=%u: rc=%d max_active=%u", worker_counts[wi],
+                step_rc, active);
+            parallel_failures++;
+        }
+    }
+    if (parallel_failures == 0)
+        PASS();
+    else
+        FAIL("the step did not run on two or more workers");
     TEST("same join: the cache is hit at one worker");
     run_t r = run_fixture(src, data, PASSES_NONE, 1, false);
     if (r.rc != 0) {
