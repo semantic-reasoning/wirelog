@@ -1164,15 +1164,19 @@ test_string_over_cap(void)
 /*
  * A snapshot with two recursive TDD strata: tc over the DAG, then u, which
  * joins tc with step edges tc does not hold, so u's one round publishes
- * nothing and stages nothing.  Under a 1-byte held cap tc's batches spill.
- * The audit of u, the last stratum, must count only u's own spills and
- * staging peak, which are 0, while the snapshot's consumer counts include
- * tc's.
+ * nothing and stages nothing.  The audit of u, the last stratum, must
+ * count only u's own consumer events, which are none, while the
+ * snapshot's consumer counts include tc's.  Under a 1-byte held cap tc's
+ * batches spill and stage; with a 1-byte spill quota as well none can
+ * spill, so tc's cap passes end over the cap.  tc is the only relation of
+ * its stratum, so none of its stagings has other relations to spill and
+ * stage_over_cap stays 0 throughout.
  */
 static void
 test_audit_per_stratum(void)
 {
-    static const run_config_t cfg = { "1", false, true };
+    static const run_config_t spilling = { "1", false, true, 0, 0 };
+    static const run_config_t starved = { "1", false, true, 0, 1 };
     static const program_t p = { "two-strata",
                                  ".decl step(x: int32, y: int32)\n"
                                  ".decl u(x: int32, y: int32)\n"
@@ -1188,37 +1192,56 @@ test_audit_per_stratum(void)
     CHECK(rc == 0 && serial.count > 0, "two strata: serial rc=%d rows=%zu",
         rc, serial.count);
     (void)sort_has_duplicate(&serial);
-    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
-        uint32_t workers = widths[wi];
-        collect_t got = { 0 };
-        memset(&info, 0, sizeof(info));
-        rc = run_program(&p, false, workers, &cfg, &got, &info);
-        const wl_tdd_consumer_stats_t *c = &info.consumer;
-        bool dup = sort_has_duplicate(&got);
-        fprintf(stderr, "  two strata W=%u: strategy=%s selected=%u "
-            "spills=%llu/%llu stage_peak=%llu/%llu rows=%zu/%zu\n", workers,
-            info.strategy ? info.strategy : "(none)", info.selected,
-            (unsigned long long)info.audit_spills,
-            (unsigned long long)c->consumer_spills,
-            (unsigned long long)info.audit_stage_peak,
-            (unsigned long long)c->stage_peak_bytes, got.count, serial.count);
-        CHECK(rc == 0, "two strata W=%u: rc=%d", workers, rc);
-        CHECK(info.strategy && strcmp(info.strategy, "owner") == 0
-            && info.selected == workers,
-            "two strata W=%u: last stratum strategy %s on %u workers",
-            workers, info.strategy ? info.strategy : "(none)", info.selected);
-        CHECK(info.audit_spills == 0 && c->consumer_spills > 0,
-            "two strata W=%u: audit spills %llu of %llu", workers,
-            (unsigned long long)info.audit_spills,
-            (unsigned long long)c->consumer_spills);
-        CHECK(info.audit_stage_peak == 0 && c->stage_peak_bytes > 0,
-            "two strata W=%u: audit stage peak %llu of %llu", workers,
-            (unsigned long long)info.audit_stage_peak,
-            (unsigned long long)c->stage_peak_bytes);
-        CHECK(!dup && same_set(&got, &serial),
-            "two strata W=%u: %zu rows, serial %zu", workers, got.count,
-            serial.count);
-        free(got.rows);
+    for (int k = 0; k < 2; k++) {
+        bool spill = k == 0;
+        const char *kind = spill ? "spilling" : "starved";
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            uint32_t workers = widths[wi];
+            collect_t got = { 0 };
+            memset(&info, 0, sizeof(info));
+            rc = run_program(&p, false, workers, spill ? &spilling : &starved,
+                    &got, &info);
+            const wl_tdd_consumer_stats_t *c = &info.consumer;
+            bool dup = sort_has_duplicate(&got);
+            fprintf(stderr, "  two strata %s W=%u: strategy=%s selected=%u "
+                "spills=%llu/%llu over_cap=%llu/%llu "
+                "stage_over_cap=%llu/%llu stage_peak=%llu/%llu "
+                "rows=%zu/%zu\n", kind, workers,
+                info.strategy ? info.strategy : "(none)", info.selected,
+                (unsigned long long)info.audit_spills,
+                (unsigned long long)c->consumer_spills,
+                (unsigned long long)info.audit_held_over_cap,
+                (unsigned long long)c->held_over_cap,
+                (unsigned long long)info.audit_stage_over_cap,
+                (unsigned long long)c->stage_over_cap,
+                (unsigned long long)info.audit_stage_peak,
+                (unsigned long long)c->stage_peak_bytes, got.count,
+                serial.count);
+            CHECK(rc == 0, "two strata %s W=%u: rc=%d", kind, workers, rc);
+            CHECK(info.strategy && strcmp(info.strategy, "owner") == 0
+                && info.selected == workers,
+                "two strata %s W=%u: last stratum strategy %s on %u workers",
+                kind, workers, info.strategy ? info.strategy : "(none)",
+                info.selected);
+            CHECK(info.audit_spills == 0 && info.audit_held_over_cap == 0
+                && info.audit_stage_over_cap == 0
+                && info.audit_stage_peak == 0,
+                "two strata %s W=%u: u's audit counts tc's events", kind,
+                workers);
+            if (spill) {
+                CHECK(c->consumer_spills > 0 && c->stage_peak_bytes > 0,
+                    "two strata %s W=%u: tc did not spill and stage", kind,
+                    workers);
+            } else {
+                CHECK(c->consumer_spills == 0 && c->held_over_cap > 0,
+                    "two strata %s W=%u: tc's cap passes were not over the "
+                    "cap", kind, workers);
+            }
+            CHECK(!dup && same_set(&got, &serial),
+                "two strata %s W=%u: %zu rows, serial %zu", kind, workers,
+                got.count, serial.count);
+            free(got.rows);
+        }
     }
     free(serial.rows);
 }
@@ -1436,6 +1459,26 @@ static bool stage_fault_fired;
 static uint32_t stage_fault_workers;
 static uint64_t stage_deltas_seen;     /* workers with rows in $d$a */
 static uint64_t stage_deltas_governed; /* of those, governed ones */
+static uint64_t stage_parts_seen;      /* partitions the exchanges made */
+static uint64_t stage_parts_governed;  /* of those, under the governor */
+
+extern void (*wl_columnar_eval_test_after_govern_parts)(wl_col_session_t *,
+    col_rel_t *const *, uint32_t);
+
+/* Count the partitions an exchange has put under the governor, and those
+ * that carry the session's. */
+static void
+stage_parts_hook(wl_col_session_t *coord, col_rel_t *const *parts,
+    uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        if (!parts[i])
+            continue;
+        stage_parts_seen++;
+        if (parts[i]->memory_governor == coord->memory_governor)
+            stage_parts_governed++;
+    }
+}
 
 /* When relation 1 is staged, every exchange but the owner one has
  * installed relation a's new delta on the workers that receive rows; owner
@@ -1484,7 +1527,9 @@ check_stage_bound(const char *name, uint32_t workers,
  * slots with no staging over the cap, release owner mode's private slots
  * before the commit, and leave the results exact, in the owner,
  * global-read, BDX, self-join broadcast, hash scatter and replicate
- * exchanges.
+ * exchanges.  The four that partition a relation, all but the self-join
+ * broadcast and the replicate exchange, must put each partition under the
+ * session's governor.
  */
 static void
 test_stage_bound(void)
@@ -1526,15 +1571,20 @@ test_stage_bound(void)
             memset(&info, 0, sizeof(info));
             stage_deltas_seen = 0;
             stage_deltas_governed = 0;
+            stage_parts_seen = 0;
+            stage_parts_governed = 0;
             wl_columnar_eval_test_after_stage = stage_observe_hook;
+            wl_columnar_eval_test_after_govern_parts = stage_parts_hook;
             rc = run_mutual(p, false, workers, &cfg, &got, &info);
             wl_columnar_eval_test_after_stage = NULL;
+            wl_columnar_eval_test_after_govern_parts = NULL;
             wl_columnar_eval_test_channel_split = NULL;
             bool dup = sort_has_duplicate(&got);
             fprintf(stderr, "  %s W=%u: strategy=%s selected=%u cap=%s "
                 "spills=%llu stage_spills=%llu over_cap=%llu "
                 "stage_peak=%llu max_stage=%llu private=%llu/%llu "
-                "deltas=%llu/%llu rows=%zu/%zu\n", p->name, workers,
+                "deltas=%llu/%llu parts=%llu/%llu rows=%zu/%zu\n", p->name,
+                workers,
                 info.strategy ? info.strategy : "(none)", info.selected,
                 held, (unsigned long long)c->consumer_spills,
                 (unsigned long long)c->stage_spills,
@@ -1544,7 +1594,9 @@ test_stage_bound(void)
                 (unsigned long long)c->owner_private_released,
                 (unsigned long long)c->owner_private_at_commit,
                 (unsigned long long)stage_deltas_governed,
-                (unsigned long long)stage_deltas_seen, got.count,
+                (unsigned long long)stage_deltas_seen,
+                (unsigned long long)stage_parts_governed,
+                (unsigned long long)stage_parts_seen, got.count,
                 serial.count);
             CHECK(rc == 0, "%s W=%u: rc=%d", p->name, workers, rc);
             CHECK(info.selected == workers && info.strategy
@@ -1574,6 +1626,13 @@ test_stage_bound(void)
             bool owner = strcmp(p->strategy, "owner") == 0;
             CHECK(owner || stage_deltas_governed > 0,
                 "%s W=%u: no installed delta is governed", p->name, workers);
+            bool partitions = strcmp(p->strategy, "replicate") != 0
+                && (strcmp(p->strategy, "aligned") != 0 || p->linear);
+            CHECK(!partitions || (stage_parts_seen > 0
+                && stage_parts_governed == stage_parts_seen),
+                "%s W=%u: %llu of %llu exchange partitions governed",
+                p->name, workers, (unsigned long long)stage_parts_governed,
+                (unsigned long long)stage_parts_seen);
             CHECK(!(p->linear || strcmp(p->strategy, "global_read") == 0)
                 || stage_deltas_governed == stage_deltas_seen,
                 "%s W=%u: %llu of %llu installed deltas governed", p->name,

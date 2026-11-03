@@ -1015,6 +1015,65 @@ test_refusal_sink(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Owner lifetime: an aliased relation is destroyed once               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The owner lifetime record's disposal keeps its defence against
+ * malformed aliases (#1373): a relation named by two matrix slots, by a
+ * matrix slot and a retained batch, or by two retained batches is
+ * destroyed once.  No evaluation builds such aliases, so the record is
+ * built by hand around a channel whose three taken batches are retained,
+ * with one alias of each kind.  A second destroy of any of them is a
+ * use after free, which ASan reports.
+ */
+static void
+test_lifetime_aliases(void)
+{
+    wl_columnar_memory_governor_ref_t *g = governor(UINT64_C(1) << 28);
+    wl_session_t *session = make_session(g);
+    wl_col_session_t *coord = COL_SESSION(session);
+    uint64_t baseline = reserved(g);
+    wl_tdd_channel_t *ch = open_channel(g, 1);
+    const int64_t v[2] = { 1, 2 };
+    const col_delta_timestamp_t s[2] = { ts(1, 4, 0, 1), ts(1, 4, 0, 1) };
+    for (int i = 0; i < 3; i++)
+        publish(ch, 0, 0, make_rel(g, "alias", v, s, 2));
+    wl_tdd_batch_t *taken[3];
+    uint32_t n = 0;
+    take_all(ch, 1, taken, &n, 3);
+    CHECK(n == 3);
+    /* The third retained batch names the second's relation. */
+    CHECK(col_rel_destroy_checked(taken[2]->payload) == 0);
+    taken[2]->payload = taken[1]->payload;
+    col_rel_t *shared = make_rel(g, "alias-slot", v, s, 2);
+
+    const size_t slots = 4;
+    wl_columnar_eval_tdd_owner_lifetime_t *lifetime = calloc(1,
+            sizeof(*lifetime) + slots * sizeof(col_rel_t *));
+    CHECK(lifetime);
+    wl_columnar_memory_reservation_init(&lifetime->reservation);
+    lifetime->worker_count = 1;
+    lifetime->relation_count = (uint32_t)slots;
+    lifetime->matrix_slots = slots;
+    lifetime->channel = ch;
+    /* Two matrix slots name one relation, and a third names the first
+     * retained batch's. */
+    lifetime->relations[0] = shared;
+    lifetime->relations[2] = shared;
+    lifetime->relations[1] = taken[0]->payload;
+    lifetime->retained = link_list(taken, 3);
+    coord->tdd_owner_lifetime = lifetime;
+
+    CHECK(wl_columnar_eval_tdd_owner_lifetime_retry(coord) == 0);
+    CHECK(coord->tdd_owner_lifetime == NULL);
+    CHECK(reserved(g) == baseline);
+    wl_session_destroy(session);
+    CHECK(reserved(g) == 0);
+    wl_columnar_memory_governor_ref_release(g);
+}
+
+/* ------------------------------------------------------------------ */
 /* An evaluation stop reaches a producer blocked for space             */
 /* ------------------------------------------------------------------ */
 
@@ -1703,6 +1762,7 @@ static const test_case_t tests[] = {
     { "coalesce_schema_template", test_coalesce_schema_template },
     { "stage_relation", test_stage_relation },
     { "collect_stop", test_collect_stop },
+    { "lifetime_aliases", test_lifetime_aliases },
 };
 
 static void
